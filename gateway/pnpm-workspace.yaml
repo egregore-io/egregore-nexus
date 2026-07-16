@@ -1,0 +1,6 @@
+packages:
+  - gateway
+  - webconsole
+
+allowBuilds:
+  esbuild: true

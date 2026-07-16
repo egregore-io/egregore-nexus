@@ -1,0 +1,46 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "useDefineForClassFields": true,
+
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "allowImportingTsExtensions": false,
+    "skipLibCheck": true,
+    "noEmit": true,
+
+    "types": ["vite/client", "vitest/globals", "@testing-library/jest-dom", "node"],
+
+    "baseUrl": ".",
+    "paths": {
+      "@app/*": ["src/app/*"],
+      "@modules/*": ["src/modules/*"],
+      "@server/*": ["src/server/*"],
+      "@shared/*": ["src/shared/*"],
+      "@drizzle/*": ["src/drizzle/*"]
+    }
+  },
+  "include": [
+    "src",
+    "vite.config.ts",
+    "vitest.setup.ts",
+    "drizzle.config.ts",
+    "scripts",
+    "webconsole/client.tsx",
+    "webconsole/router.ts",
+    "webconsole/vite.config.ts"
+  ],
+  "exclude": ["node_modules", ".output", ".nitro", "dist", "prototype"]
+}

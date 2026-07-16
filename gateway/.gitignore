@@ -1,0 +1,13 @@
+node_modules
+.output
+.nitro
+.vinxi
+.vite
+dist
+*.local
+.env
+.env.*
+!.env.example
+.DS_Store
+.nexus-dev.db
+*.tsbuildinfo

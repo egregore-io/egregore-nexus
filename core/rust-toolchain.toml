@@ -1,0 +1,5 @@
+# Pinned toolchain for the Nexus workspace (Task 18). Edition 2021; a stable channel keeps the
+# daemon + acceptance suite reproducible across machines and CI.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

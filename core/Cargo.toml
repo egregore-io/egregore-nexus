@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = ["crates/nexus-contracts", "crates/nexus-common", "crates/nexus-store", "crates/nexus-dispatch", "crates/nexus-identity", "crates/nexus-bus", "crates/nexus-acp-stream", "crates/nexus-agent", "crates/nexus-search", "crates/nexus-notify", "crates/nexus-admin", "crates/nexus-pty", "crates/nexus-transcript", "crates/nexus", "crates/harness/core", "crates/harness/claude", "crates/harness/codex", "tests"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/egregore-io/egregore-nexus"
+homepage = "https://github.com/egregore-io/egregore-nexus"
+readme = "../README.md"
+
+[workspace.metadata.nexus.distribution]
+components = ["nexus-cli-daemon", "nexus-gateway", "nexus-webui"]
+binary-crate = "egregore-nexus"
+binary-name = "nexus"
+targets = [
+  "x86_64-unknown-linux-gnu",
+]
+deferred-targets = [
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+]
+
+[workspace.dependencies]
+nexus-contracts = { path = "crates/nexus-contracts", version = "=0.1.0" }
+nexus-common = { package = "egregore-nexus-common", path = "crates/nexus-common", version = "=0.1.0" }
+nexus-store = { path = "crates/nexus-store", version = "=0.1.0" }
+nexus-dispatch = { path = "crates/nexus-dispatch", version = "=0.1.0" }
+nexus-identity = { path = "crates/nexus-identity", version = "=0.1.0" }
+nexus-bus = { path = "crates/nexus-bus", version = "=0.1.0" }
+nexus-acp-stream = { path = "crates/nexus-acp-stream", version = "=0.1.0" }
+nexus-agent = { path = "crates/nexus-agent", version = "=0.1.0" }
+nexus-search = { path = "crates/nexus-search", version = "=0.1.0" }
+nexus-notify = { package = "egregore-nexus-notify", path = "crates/nexus-notify", version = "=0.1.0" }
+nexus-admin = { path = "crates/nexus-admin", version = "=0.1.0" }
+nexus-pty = { path = "crates/nexus-pty", version = "=0.1.0" }
+nexus-transcript = { path = "crates/nexus-transcript", version = "=0.1.0" }
+nexus-harness-core = { path = "crates/harness/core", version = "=0.1.0" }
+nexus-harness-claude = { path = "crates/harness/claude", version = "=0.1.0" }
+nexus-harness-codex = { path = "crates/harness/codex", version = "=0.1.0" }
+
+agent-client-protocol = { version = "0.15", features = ["unstable_end_turn_token_usage"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "1"
+uuid = { version = "1", features = ["v4"] }
+time = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+tokio = { version = "1", features = ["full"] }
+libsql = { version = "0.6", default-features = false, features = ["core"] }
+hmac = "0.12"
+sha2 = "0.10"
+axum = "0.7"
+tower = "0.5"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+clap = { version = "4", features = ["derive"] }
+bincode = "1"
+tokio-tungstenite = "0.24"
