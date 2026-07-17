@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Task 9: approval-relay integration test.
 //!
 //! Verifies that `spawn_codex_forwarder` — when the fake server emits an

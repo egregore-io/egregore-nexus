@@ -800,6 +800,7 @@ fn terminal_endpoint_manifest_rejects_wrong_session_id() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn launch_exposes_terminal_socket_for_raw_pty_runtime() {
     use crate::daemon::terminal_socket::{
@@ -883,6 +884,7 @@ fn terminal_endpoint_is_absent_without_a_pty_backend() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn terminal_socket_rejects_bad_auth_token() {
     use crate::daemon::terminal_socket::{

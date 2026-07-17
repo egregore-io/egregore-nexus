@@ -12,9 +12,14 @@
 //   The client sends the WS handshake HTTP upgrade over the raw unix byte stream,
 //   using the dummy URI "ws://localhost/rpc" (bytes never leave the machine).
 
-use nexus_harness_codex::{CodexRpcError, JsonRpc, Notification};
+use nexus_harness_codex::JsonRpc;
+#[cfg(unix)]
+use nexus_harness_codex::{CodexRpcError, Notification};
+#[cfg(unix)]
 use std::path::PathBuf;
-use tokio::net::{TcpListener, TcpStream, UnixListener};
+#[cfg(unix)]
+use tokio::net::UnixListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -27,6 +32,7 @@ use futures::StreamExt;
 
 /// Bind a UnixListener, accept one connection, upgrade it to WebSocket,
 /// then call `handler` with the resulting stream.
+#[cfg(unix)]
 async fn spawn_ws_server<F, Fut>(path: PathBuf, handler: F)
 where
     F: FnOnce(tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>) -> Fut + Send + 'static,
@@ -42,6 +48,7 @@ where
     });
 }
 
+#[cfg(unix)]
 fn sock_path(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "nexus-codex-jsonrpc-test-{}-{}.sock",
@@ -55,6 +62,7 @@ fn sock_path(tag: &str) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// Echo server: for any request `{id, method, params}`, reply `{id, result: {method}}`.
+#[cfg(unix)]
 async fn echo_server(mut ws: tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>) {
     while let Some(Ok(msg)) = ws.next().await {
         let text = match msg {
@@ -97,6 +105,7 @@ async fn tcp_echo_server(mut ws: tokio_tungstenite::WebSocketStream<TcpStream>) 
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn request_resolves_with_correlated_result() {
     let path = sock_path("req");
@@ -137,6 +146,7 @@ async fn loopback_websocket_endpoint_resolves_with_correlated_result() {
 // ---------------------------------------------------------------------------
 
 /// Server that pushes one unsolicited notification, then drains without crashing.
+#[cfg(unix)]
 async fn notification_then_echo_server(
     mut ws: tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
 ) {
@@ -159,6 +169,7 @@ async fn notification_then_echo_server(
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn unsolicited_notification_arrives_on_channel() {
     let path = sock_path("notif");

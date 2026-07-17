@@ -11,6 +11,10 @@ on:
 jobs:
   gateway-lifecycle-platform:
     name: Gateway lifecycle (${{ matrix.os }})
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     strategy:
       fail-fast: false
       matrix:
@@ -28,6 +32,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install boundary gate dependencies
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Boundary gate self-test
         run: scripts/test-nexus-boundary-gate
       - name: Boundary gate

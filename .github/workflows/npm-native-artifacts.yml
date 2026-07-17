@@ -12,6 +12,10 @@ permissions:
 jobs:
   native:
     name: ${{ matrix.target }} (${{ matrix.support }})
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     strategy:
       fail-fast: false
       matrix:
@@ -65,6 +69,8 @@ jobs:
             -p nexus-harness-claude --test adapter builtin_real_adapter_resolves_documented_acp_command
           cargo test --locked --manifest-path core/Cargo.toml \
             -p nexus-harness-codex --test codex_adapter codex_resolves_pinned_app_server_acp_command_without_legacy_flags
+          cargo test --locked --manifest-path core/Cargo.toml \
+            -p nexus-harness-codex --test executable
       - name: Verify WSL lifecycle contracts
         if: matrix.target == 'linux-x64-gnu'
         shell: bash

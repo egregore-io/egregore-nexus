@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 // Framing confirmed from:
 //   codex-rs/app-server-client/src/remote.rs:738-783 (connect_unix_socket_endpoint)
 //     — connects a raw UnixStream, then calls `client_async_with_config` with the
