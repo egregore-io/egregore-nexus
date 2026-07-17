@@ -1,10 +1,10 @@
 import { createClient, type Client } from "@libsql/client";
 import { randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { removeTempPath } from "../../test/removeTempPath";
 import { migrateGatewayStore } from "../store/migrations";
 import { applyCanonicalProjection } from "./apply";
 
@@ -24,7 +24,7 @@ describe("canonical Gateway projection application", () => {
   });
   afterEach(async () => {
     db.close();
-    await rm(dbPath, { force: true });
+    await removeTempPath(dbPath);
   });
 
   it("commits a materialized message and cursor in one transaction", async () => {

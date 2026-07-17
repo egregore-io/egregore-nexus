@@ -1,8 +1,4 @@
 import { createClient } from "@libsql/client";
-import { randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import { handle } from "./router";
@@ -10,8 +6,7 @@ import { migrateGatewayStore } from "../store/migrations";
 
 describe("public canonical Gateway reads", () => {
   it("serves migrated REST resources without constructing the daemon read view", async () => {
-    const path = join(tmpdir(), `nexus-canonical-api-${randomUUID()}.db`);
-    const db = createClient({ url: `file:${path}` });
+    const db = createClient({ url: ":memory:" });
     await migrateGatewayStore(db);
     await db.batch([
       "INSERT INTO identities VALUES ('a_ada','ada',NULL,'agent','agent','{}',1)",
@@ -68,7 +63,6 @@ describe("public canonical Gateway reads", () => {
     expect(legacyDb).not.toHaveBeenCalled();
 
     db.close();
-    await rm(path, { force: true });
   });
 
   it("serves a projected thread message even when the Gateway missed the earlier thread registry event", async () => {

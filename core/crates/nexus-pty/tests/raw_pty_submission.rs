@@ -3,10 +3,20 @@ use std::time::{Duration, Instant};
 use nexus_pty::{HarnessInput as _, PtySession};
 use portable_pty::{CommandBuilder, PtySize};
 
+#[cfg(unix)]
+fn passive_terminal_command() -> CommandBuilder {
+    CommandBuilder::new("cat")
+}
+
+#[cfg(windows)]
+fn passive_terminal_command() -> CommandBuilder {
+    CommandBuilder::new("cmd.exe")
+}
+
 #[tokio::test]
 async fn raw_pty_waits_for_a_large_paste_to_commit_before_submitting() {
     let session = PtySession::spawn(
-        CommandBuilder::new("cat"),
+        passive_terminal_command(),
         PtySize {
             rows: 24,
             cols: 80,

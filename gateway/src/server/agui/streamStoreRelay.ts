@@ -42,6 +42,8 @@ interface DoorbellDeps {
 interface StreamStoreRelayDeps {
   storePath?: string;
   client?: Client;
+  clientFactory?: (storePath: string) => Client;
+  epochFactory?: (storePath: string) => Promise<string | null>;
   doorbell?: StreamStoreDoorbell;
   heartbeatMs?: number;
   /** Backwards-compatible test alias for the heartbeat cadence. */
@@ -71,6 +73,7 @@ export interface RawStreamChunk {
 interface RawStreamDeps {
   storePath?: string;
   doorbell?: StreamStoreDoorbell;
+  clientFactory?: (storePath: string) => Client;
   heartbeatMs?: number;
   afterId?: number;
 }
@@ -244,23 +247,35 @@ function createReadClient(storePath: string): Client {
   return createClient({ url: fileUrl(storePath) });
 }
 
+function releaseTailClient(state: TailState): void {
+  state.client?.close();
+  state.client = undefined;
+}
+
+function resetTailClient(state: TailState): void {
+  releaseTailClient(state);
+  state.epoch = undefined;
+}
+
 async function ensureClient(
   state: TailState,
   storePath: string,
   firstCursor: number,
+  clientFactory: (storePath: string) => Client = createReadClient,
+  epochFactory: (storePath: string) => Promise<string | null> = storeEpoch,
 ): Promise<Client | null> {
-  const epoch = await storeEpoch(storePath);
+  const epoch = await epochFactory(storePath);
   if (!epoch) {
-    state.client = undefined;
-    state.epoch = undefined;
+    resetTailClient(state);
     return null;
   }
-  if (!state.client || state.epoch !== epoch) {
-    state.client = createReadClient(storePath);
+  if (state.epoch !== epoch) {
+    releaseTailClient(state);
     state.cursor = state.openedOnce ? 0 : firstCursor;
     state.epoch = epoch;
     state.openedOnce = true;
   }
+  state.client ??= clientFactory(storePath);
   return state.client;
 }
 
@@ -302,23 +317,34 @@ export function createStreamStoreRelay(
     let paused = false;
 
     const drainOnce = async (): Promise<void> => {
-      const client = deps.client ?? (await ensureClient(state, storePath, afterId));
+      const client = deps.client
+        ?? (await ensureClient(
+          state,
+          storePath,
+          afterId,
+          deps.clientFactory,
+          deps.epochFactory,
+        ));
       if (!client) return;
-      const rows = await client.execute({
-        sql:
-          "SELECT id, session_id, kind, data FROM stream_events " +
-          "WHERE session_id = ? AND id > ? ORDER BY id ASC",
-        args: [sessionId, state.cursor],
-      });
-      for (const row of rows.rows) {
-        if (closed || paused) return;
-        const mapped = streamRowToEvent(row);
-        if (onEvent(mapped.event) === false) {
-          paused = true;
-          return;
+      try {
+        const rows = await client.execute({
+          sql:
+            "SELECT id, session_id, kind, data FROM stream_events " +
+            "WHERE session_id = ? AND id > ? ORDER BY id ASC",
+          args: [sessionId, state.cursor],
+        });
+        for (const row of rows.rows) {
+          if (closed || paused) return;
+          const mapped = streamRowToEvent(row);
+          if (onEvent(mapped.event) === false) {
+            paused = true;
+            return;
+          }
+          state.cursor = mapped.id;
+          if (mapped.kind === "turn_end") deps.onTurnEnd?.(mapped.id);
         }
-        state.cursor = mapped.id;
-        if (mapped.kind === "turn_end") deps.onTurnEnd?.(mapped.id);
+      } finally {
+        if (!deps.client) releaseTailClient(state);
       }
     };
 
@@ -363,6 +389,7 @@ export function createStreamStoreRelay(
         closed = true;
         unsubscribe();
         clearInterval(timer);
+        if (!deps.client) resetTailClient(state);
       },
     };
   };
@@ -524,19 +551,23 @@ export function observeRawStream(
       let queued = false;
 
       const drainOnce = async (): Promise<void> => {
-        const client = await ensureClient(state, storePath, afterId);
+        const client = await ensureClient(state, storePath, afterId, deps.clientFactory);
         if (!client) return;
-        const rows = await client.execute({
-          sql:
-            "SELECT id, session_id, chunk FROM stream_raw " +
-            "WHERE session_id = ? AND id > ? ORDER BY id ASC",
-          args: [sessionId, state.cursor],
-        });
-        for (const row of rows.rows) {
-          if (closed) return;
-          const chunk = rawRowToChunk(row);
-          controller.enqueue(textEncoder.encode(encodeRawSse(chunk)));
-          state.cursor = chunk.id;
+        try {
+          const rows = await client.execute({
+            sql:
+              "SELECT id, session_id, chunk FROM stream_raw " +
+              "WHERE session_id = ? AND id > ? ORDER BY id ASC",
+            args: [sessionId, state.cursor],
+          });
+          for (const row of rows.rows) {
+            if (closed) return;
+            const chunk = rawRowToChunk(row);
+            controller.enqueue(textEncoder.encode(encodeRawSse(chunk)));
+            state.cursor = chunk.id;
+          }
+        } finally {
+          releaseTailClient(state);
         }
       };
 
@@ -570,6 +601,7 @@ export function observeRawStream(
         closed = true;
         unsubscribe();
         clearInterval(timer);
+        resetTailClient(state);
       };
       void drain();
     },

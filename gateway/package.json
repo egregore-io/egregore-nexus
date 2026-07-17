@@ -1,6 +1,6 @@
 {
   "name": "@egregore/nexus-gateway",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": false,
   "bin": {
     "nexus": "scripts/nexus.mjs",
@@ -47,7 +47,7 @@
     "prepack": "npm run build:gateway-package && npm run webconsole:build",
     "postpack": "node -e \"const fs=require('node:fs'); for (const path of ['dist-gateway','webconsole/dist']) fs.rmSync(path,{recursive:true,force:true})\"",
     "webconsole:dev": "pnpm --dir webconsole dev",
-    "webconsole:build": "pnpm --dir webconsole build",
+    "webconsole:build": "node webconsole/build-webconsole.mjs",
     "webconsole:test": "pnpm --dir webconsole test",
     "webconsole:typecheck": "pnpm --dir webconsole typecheck",
     "smoke:mcp-reject": "node scripts/gateway-mcp-reject-smoke.mjs",
@@ -59,7 +59,7 @@
     "db:pull": "drizzle-kit pull"
   },
   "dependencies": {
-    "@egregore/nexus-cli": "0.1.1",
+    "@egregore/nexus-cli": "0.1.2",
     "@ag-ui/client": "^0.0.57",
     "@ag-ui/encoder": "^0.0.57",
     "@libsql/client": "^0.17.4",

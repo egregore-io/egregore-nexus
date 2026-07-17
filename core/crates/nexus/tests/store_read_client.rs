@@ -308,6 +308,7 @@ async fn read_client_resolves_raw_pty_descriptor_when_endpoint_manifest_exists()
         .await
         .unwrap();
     assert_eq!(descriptor.backend, "raw-pty");
+    assert_eq!(descriptor.argv[0], "nexus");
     assert_eq!(descriptor.argv[1], "terminal-client");
     assert_eq!(descriptor.argv[2], ada.session_id.0);
     assert!(descriptor.liveness_argv.is_none());

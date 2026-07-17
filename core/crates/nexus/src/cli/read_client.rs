@@ -1013,17 +1013,18 @@ impl ReadClient {
     }
 }
 
-/// Attach descriptor for a raw daemon-owned PTY runtime: exec this same `nexus` binary's hidden
-/// socket terminal client. Liveness is carried by the manifest+socket themselves — a dead daemon
-/// fails the connect loudly instead of a probe lying about it.
+/// Attach descriptor for a raw daemon-owned PTY runtime. Resolve the stable `nexus` launcher in
+/// the attaching operator's environment because package upgrades may unlink a live daemon's
+/// executable. Liveness is carried by the manifest and socket.
 fn raw_pty_attach_descriptor(session: &SessionId) -> PtyAttachDescriptor {
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "nexus".to_string());
     PtyAttachDescriptor {
         session_id: session.clone(),
         backend: "raw-pty".to_string(),
-        argv: vec![exe, "terminal-client".to_string(), session.0.clone()],
+        argv: vec![
+            "nexus".to_string(),
+            "terminal-client".to_string(),
+            session.0.clone(),
+        ],
         liveness_argv: None,
     }
 }

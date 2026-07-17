@@ -1,9 +1,5 @@
 import { createClient } from "@libsql/client";
-import { randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import { migrateGatewayStore } from "../store/migrations";
 import {
@@ -18,15 +14,8 @@ import {
 } from "./canonical";
 
 describe("canonical Gateway REST reads", () => {
-  const paths: string[] = [];
-  afterEach(async () => {
-    await Promise.all(paths.splice(0).map((path) => rm(path, { force: true })));
-  });
-
   it("serves threads, DMs, topics, notifications and opaque cursor pages", async () => {
-    const dbPath = join(tmpdir(), `nexus-canonical-read-${randomUUID()}.db`);
-    paths.push(dbPath);
-    const db = createClient({ url: `file:${dbPath}` });
+    const db = createClient({ url: ":memory:" });
     await migrateGatewayStore(db);
     await db.batch([
       "INSERT INTO identities VALUES ('a_ada','ada',NULL,'agent','agent','{}',1)",
@@ -62,9 +51,7 @@ describe("canonical Gateway REST reads", () => {
   });
 
   it("resolves an agent-session name from Gateway-owned identity/runtime state", async () => {
-    const dbPath = join(tmpdir(), `nexus-canonical-session-${randomUUID()}.db`);
-    paths.push(dbPath);
-    const db = createClient({ url: `file:${dbPath}` });
+    const db = createClient({ url: ":memory:" });
     await migrateGatewayStore(db);
     await db.batch([
       `INSERT INTO identities VALUES

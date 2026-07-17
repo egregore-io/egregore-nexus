@@ -1380,6 +1380,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn adopted_pipe_output_replays_existing_pane_contents() {
         let session_name = format!("nexus-adopt-pipe-{}", nanos());

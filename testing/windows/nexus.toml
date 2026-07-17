@@ -6,6 +6,10 @@ timeout_seconds = 18000
 [env]
 CI = "1"
 NEXUS_HOME = "C:\\w\\data\\${RUN_ID}\\nexus"
+CARGO_BUILD_JOBS = "4"
+RUST_TEST_THREADS = "4"
+CARGO_INCREMENTAL = "1"
+CARGO_TARGET_DIR = "C:\\w\\cache\\cargo-target"
 
 [[sources]]
 name = "egregore-nexus"
@@ -30,14 +34,6 @@ command = '''
 '''
 
 [[steps]]
-name = "rust-compile"
-workdir = "C:\\w\\src\\egregore-nexus\\core"
-timeout_seconds = 7200
-command = '''
-& cargo.exe test --workspace --no-run
-'''
-
-[[steps]]
 name = "rust-tests"
 workdir = "C:\\w\\src\\egregore-nexus\\core"
 timeout_seconds = 7200
@@ -54,11 +50,24 @@ command = '''
 '''
 
 [[steps]]
+name = "npm-cli-smoke"
+workdir = "C:\\w\\src\\egregore-nexus"
+timeout_seconds = 900
+command = '''
+$nativeRoot = "packages\nexus-cli\native\win32-x64-msvc"
+New-Item -ItemType Directory -Force -Path $nativeRoot | Out-Null
+Copy-Item "C:\w\cache\cargo-target\release\nexus.exe" (Join-Path $nativeRoot "nexus.exe") -Force
+& node.exe packages/nexus-cli/bin/nexus.mjs --version
+& node.exe packages/nexus-cli/bin/nexus.mjs daemon install --help
+& node.exe scripts/nexus-cli-command-surface-smoke.mjs packages/nexus-cli/bin/nexus.mjs
+'''
+
+[[steps]]
 name = "gateway-install"
 workdir = "C:\\w\\src\\egregore-nexus"
 timeout_seconds = 3600
 command = '''
-& pnpm.cmd --dir gateway install --frozen-lockfile
+& pnpm.cmd --store-dir C:\w\cache\pnpm-store --dir gateway install --frozen-lockfile --prefer-offline
 '''
 
 [[steps]]
@@ -69,12 +78,12 @@ command = '''
 & pnpm.cmd --dir gateway typecheck
 & pnpm.cmd --dir gateway test
 & pnpm.cmd --dir gateway build:gateway-package
-& pnpm.cmd --dir gateway build
+& pnpm.cmd --dir gateway webconsole:build
 '''
 
 [[artifacts]]
 name = "nexus-exe"
-path = "C:\\w\\src\\egregore-nexus\\core\\target\\release\\nexus.exe"
+path = "C:\\w\\cache\\cargo-target\\release\\nexus.exe"
 required = true
 
 [[artifacts]]
@@ -84,5 +93,5 @@ required = true
 
 [[artifacts]]
 name = "gateway-web"
-path = "C:\\w\\src\\egregore-nexus\\gateway\\dist"
+path = "C:\\w\\src\\egregore-nexus\\gateway\\webconsole\\dist"
 required = true

@@ -20,7 +20,7 @@ const targets = [
   "win32-x64-msvc",
 ];
 
-if (cli.version !== "0.1.1") throw new Error(`wrong CLI correction version: ${cli.version}`);
+if (cli.version !== "0.1.2") throw new Error(`wrong CLI correction version: ${cli.version}`);
 if (cli.name !== "@egregore/nexus-cli") throw new Error(`wrong CLI package name: ${cli.name}`);
 if (!cli.files?.includes("lib/platform-target.mjs")) throw new Error("platform resolver is not packed");
 if (!cli.files?.includes("native")) throw new Error("native binaries are not packed");
@@ -112,8 +112,11 @@ set -e
 test "$PACKAGED_STATUS" -eq 23
 test "$(cat "$TMP/packaged-args")" = "gateway status"
 
+mkdir -p "$TMP/missing-assembly"
+cp -R "$ROOT/packages/nexus-cli/bin" "$ROOT/packages/nexus-cli/lib" \
+  "$TMP/missing-assembly/"
 if HOME="$TMP/empty-home" CARGO_HOME="$TMP/empty-cargo" \
-  node "$ROOT/packages/nexus-cli/bin/nexus.mjs" --help \
+  node "$TMP/missing-assembly/bin/nexus.mjs" --help \
   >"$TMP/missing.out" 2>"$TMP/missing.err"; then
   echo "expected missing native Nexus binary failure" >&2
   exit 1

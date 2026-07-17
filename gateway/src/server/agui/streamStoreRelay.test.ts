@@ -1,9 +1,9 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 import { createClient, type Client } from "@libsql/client";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   createStreamStoreDoorbell,
@@ -19,8 +19,10 @@ import {
 } from "@server/agui/agentSessionProjection";
 import type { DaemonPushConnector } from "@server/agui/daemonPushRelay.mjs";
 import type { WsEvent } from "@shared/types";
+import { removeTempPath } from "../../test/removeTempPath";
 
 const tempDirs: string[] = [];
+const fixtureClients = new Set<Client>();
 
 async function createFixtureStore(): Promise<{ client: Client; path: string }> {
   const dir = await mkdtemp(join(tmpdir(), "nexus-stream-store-"));
@@ -32,6 +34,7 @@ async function createFixtureStore(): Promise<{ client: Client; path: string }> {
 
 async function initStreamStore(path: string): Promise<Client> {
   const client = createClient({ url: `file:${path}` });
+  fixtureClients.add(client);
   await client.batch([
     `CREATE TABLE stream_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,16 +55,9 @@ async function initStreamStore(path: string): Promise<Client> {
   return client;
 }
 
-async function removeStreamStore(path: string): Promise<void> {
-  await Promise.all([
-    rm(path, { force: true }),
-    rm(`${path}-wal`, { force: true }),
-    rm(`${path}-shm`, { force: true }),
-  ]);
-}
-
 async function createMaterializedStore(): Promise<Client> {
   const db = createClient({ url: ":memory:" });
+  fixtureClients.add(db);
   await db.batch([
     `CREATE TABLE agent_session_turns (
       id TEXT PRIMARY KEY,
@@ -215,9 +211,11 @@ async function waitFor(predicate: () => boolean, timeoutMs = 300): Promise<void>
 }
 
 afterEach(async () => {
+  for (const client of fixtureClients) client.close();
+  fixtureClients.clear();
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
-    if (dir) await rm(dir, { recursive: true, force: true });
+    if (dir) await removeTempPath(dir, { recursive: true });
   }
 });
 
@@ -232,7 +230,7 @@ describe("streamStoreRelay lane 1", () => {
       resolveStreamStorePath({
         XDG_RUNTIME_DIR: "/run/user/1000",
       } as NodeJS.ProcessEnv),
-    ).toBe("/run/user/1000/nexus-stream.db");
+    ).toBe(join("/run/user/1000", "nexus-stream.db"));
   });
 
   it("tails agent.update rows for one session from a fixture file store", async () => {
@@ -360,6 +358,26 @@ describe("streamStoreRelay lane 1", () => {
     });
   });
 
+  it("releases a relay-owned stream-store client between drains", async () => {
+    const { path } = await createFixtureStore();
+    const close = vi.fn();
+    const client = {
+      execute: vi.fn(async () => ({ rows: [] })),
+      close,
+    } as unknown as Client;
+    const relay = createStreamStoreRelay("s_ada", {
+      storePath: path,
+      heartbeatMs: 60_000,
+      clientFactory: () => client,
+    })({ onEvent: () => {} });
+
+    await relay.ready;
+    expect(close).toHaveBeenCalledOnce();
+    relay.close();
+
+    expect(close).toHaveBeenCalledOnce();
+  });
+
   it("drains a doorbell wake that arrives while lane 1 is already draining", async () => {
     let wake: (() => void) | undefined;
     const doorbell: StreamStoreDoorbell = {
@@ -484,8 +502,8 @@ describe("streamStoreRelay lane 1", () => {
     expect(accepted.at(-1)).toBe("turn_end");
   });
 
-  it("resets the stream cursor when the named store file is recreated", async () => {
-    const { client, path } = await createFixtureStore();
+  it("resets the stream cursor when the named store epoch changes", async () => {
+    const path = join(tmpdir(), "nexus-stream.db");
     let watchListener: ((eventType: string, filename: string | Buffer | null) => void) | undefined;
     const doorbell = createStreamStoreDoorbell(path, {
       debounceMs: 1,
@@ -494,23 +512,44 @@ describe("streamStoreRelay lane 1", () => {
         return { close() {} };
       },
     });
+    let epoch = "first";
+    const first = {
+      execute: vi.fn(async () => ({
+        rows: [{
+          id: 1,
+          session_id: "s_ada",
+          kind: "text",
+          data: '{"text":"before restart"}',
+        }],
+      })),
+      close: vi.fn(),
+    } as unknown as Client;
+    const second = {
+      execute: vi.fn(async () => ({
+        rows: [{
+          id: 1,
+          session_id: "s_ada",
+          kind: "text",
+          data: '{"text":"after restart"}',
+        }],
+      })),
+      close: vi.fn(),
+    } as unknown as Client;
+    const clients = [first, second];
     const seen: WsEvent[] = [];
     const relay = createStreamStoreRelay("s_ada", {
       storePath: path,
       doorbell,
       heartbeatMs: 60_000,
+      epochFactory: async () => epoch,
+      clientFactory: () => clients.shift()!,
     })({
       onEvent: (ev) => seen.push(ev),
     });
     await relay.ready;
+    expect(seen).toHaveLength(1);
 
-    await insertStreamEvent(client, "s_ada", "text", { text: "before restart" });
-    watchListener?.("change", `${basename(path)}-wal`);
-    await waitFor(() => seen.length === 1);
-
-    await removeStreamStore(path);
-    const replacement = await initStreamStore(path);
-    await insertStreamEvent(replacement, "s_ada", "text", { text: "after restart" });
+    epoch = "second";
     watchListener?.("rename", basename(path));
     await waitFor(() => seen.length === 2);
 
@@ -521,6 +560,12 @@ describe("streamStoreRelay lane 1", () => {
       "before restart",
       "after restart",
     ]);
+    expect(first.execute).toHaveBeenCalledWith(
+      expect.objectContaining({ args: ["s_ada", 0] }),
+    );
+    expect(second.execute).toHaveBeenCalledWith(
+      expect.objectContaining({ args: ["s_ada", 0] }),
+    );
   });
 
   it("keeps materialized fallback from double-emitting turns already closed by the stream lane", async () => {
@@ -834,5 +879,22 @@ describe("streamStoreRelay lane 1", () => {
         encoding: "base64",
       },
     ]);
+  });
+
+  it("closes a raw-lane store client when its reader disconnects", async () => {
+    const { path } = await createFixtureStore();
+    const close = vi.fn();
+    const execute = vi.fn(async () => ({ rows: [] }));
+    const stream = observeRawStream("s_ada", {
+      storePath: path,
+      heartbeatMs: 60_000,
+      clientFactory: () => ({ execute, close }) as unknown as Client,
+    });
+    const reader = stream.getReader();
+
+    await waitFor(() => execute.mock.calls.length > 0);
+    await reader.cancel();
+
+    expect(close).toHaveBeenCalledOnce();
   });
 });
