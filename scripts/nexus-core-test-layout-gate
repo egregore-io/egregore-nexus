@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Read-only release gate: production Rust source under core/crates/**/src must
+# not carry inline tests. Put tests in crate-level tests/ files instead.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/nexus-core-test-layout-gate [REPO_ROOT]
+
+Rejects inline tests in production Rust source under core/crates/**/src.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+cd "$ROOT"
+
+if [[ ! -d core/crates ]]; then
+  echo "error: run from the egregore-nexus repo root, or pass the repo root as argv[1]" >&2
+  exit 2
+fi
+
+if ! command -v rg >/dev/null 2>&1; then
+  echo "error: rg is required for this gate" >&2
+  exit 2
+fi
+
+ALLOW_FILE="$ROOT/scripts/nexus-core-test-layout-gate.allow"
+
+set +e
+hits="$(
+  rg --color never --line-number \
+    --glob '**/src/**/*.rs' \
+    --glob '!**/tests/**' \
+    -e '#[[:space:]]*\[[[:space:]]*cfg[[:space:]]*\([[:space:]]*test[[:space:]]*\)[[:space:]]*\]' \
+    -e '#[[:space:]]*\[[[:space:]]*([A-Za-z0-9_]+::)*test([[:space:]]*\(|[[:space:]]*\])' \
+    -e '#[[:space:]]*\[[[:space:]]*rstest([[:space:]]*\(|[[:space:]]*\])' \
+    -e '^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+tests[[:space:]]*\{' \
+    core/crates
+)"
+status=$?
+set -e
+
+if [[ "$status" -eq 0 ]]; then
+  if [[ -f "$ALLOW_FILE" ]]; then
+    hits="$(
+      awk -F: '
+        NR == FNR {
+          if ($0 != "" && $0 !~ /^#/) {
+            split($0, baseline, "|")
+            if (baseline[1] != "" && baseline[2] ~ /^[0-9]+$/) {
+              allow[baseline[1]] = baseline[2] + 0
+            }
+          }
+          next
+        }
+        {
+          path = $1
+          sub("^\\./", "", path)
+          count[path] += 1
+          lines[path] = lines[path] $0 "\n"
+        }
+        END {
+          for (path in count) {
+            # A grandfathered production file may shrink, but it may never accumulate another
+            # inline-test marker. Path-only exemptions made this gate silently permit that growth.
+            if (!(path in allow) || count[path] > allow[path]) {
+              printf "%s", lines[path]
+            }
+          }
+        }
+      ' "$ALLOW_FILE" - <<<"$hits"
+    )"
+  fi
+
+  if [[ -z "$hits" ]]; then
+    echo "PASS core test layout gate: no new inline tests found under core/crates/**/src."
+    exit 0
+  fi
+
+  echo "FAIL core test layout gate: inline tests found in production core source."
+  echo
+  printf '%s\n' "$hits"
+  echo
+  echo "Move these tests to separate files under the owning crate's tests/ directory"
+  echo "or to a dedicated test crate. Grandfathered files are capped at the marker count"
+  echo "recorded as path|count in scripts/nexus-core-test-layout-gate.allow; they may shrink"
+  echo "but must not accumulate new #[cfg(test)], #[test], #[tokio::test], #[rstest], or mod tests."
+  exit 1
+fi
+
+if [[ "$status" -eq 1 ]]; then
+  echo "PASS core test layout gate: no inline tests found under core/crates/**/src."
+  exit 0
+fi
+
+echo "error: rg failed while scanning core source" >&2
+exit "$status"

@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GATE="$ROOT/scripts/nexus-architecture-ownership-gate"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+new_fixture() {
+  local name="$1"
+  local fixture="$TMP/$name"
+  mkdir -p \
+    "$fixture/gateway/src/app" \
+    "$fixture/gateway/src/modules/pane" \
+    "$fixture/gateway/src/routes/api" \
+    "$fixture/gateway/src/routes" \
+    "$fixture/gateway/src/server/gateway" \
+    "$fixture/gateway/scripts" \
+    "$fixture/core/crates/nexus/src"
+  printf '%s\n' "$fixture"
+}
+
+expect_rejected() {
+  local name="$1"
+  local relative_path="$2"
+  local source="$3"
+  local expected="$4"
+  local fixture output
+  fixture="$(new_fixture "$name")"
+  mkdir -p "$(dirname "$fixture/$relative_path")"
+  printf '%s\n' "$source" >"$fixture/$relative_path"
+
+  if output="$($GATE "$fixture" 2>&1)"; then
+    echo "FAIL $name: violating fixture passed" >&2
+    exit 1
+  fi
+  if [[ "$output" != *"$expected"* ]]; then
+    echo "FAIL $name: diagnostic did not contain '$expected'" >&2
+    printf '%s\n' "$output" >&2
+    exit 1
+  fi
+}
+
+expect_allowed() {
+  local fixture output
+  fixture="$(new_fixture allowed)"
+  cat >"$fixture/gateway/src/server/gateway/daemon-client.ts" <<'EOF'
+import { callDaemonCommand } from "@server/daemon/ipc";
+export const gatewayDb = "file:/tmp/gateway.db";
+export const send = callDaemonCommand;
+EOF
+  cat >"$fixture/gateway/src/app/client.ts" <<'EOF'
+export const historyUrl = "/api/v1/threads/design/messages";
+export const sessionUrl = "/api/v1/agent-sessions/s_1/events?view=nexus";
+export const terminalUrl = "/api/v1/agent-sessions/s_1/events?view=terminal";
+EOF
+  cat >"$fixture/gateway/src/routes/api/session.ts" <<'EOF'
+import { callDaemonQuery } from "@server/daemon/ipc";
+export const load = callDaemonQuery;
+EOF
+
+  if ! output="$($GATE "$fixture" 2>&1)"; then
+    echo "FAIL allowed: valid ownership fixture was rejected" >&2
+    printf '%s\n' "$output" >&2
+    exit 1
+  fi
+}
+
+expect_rejected \
+  webui-daemon-import \
+  gateway/src/modules/pane/chat.ts \
+  'import { callDaemonQuery } from "@server/daemon/ipc";' \
+  'gateway/src/modules/pane/chat.ts'
+
+expect_rejected \
+  webui-drizzle-import \
+  gateway/src/app/history.ts \
+  'import { getReadDb } from "@drizzle/client";' \
+  'gateway/src/app/history.ts'
+
+expect_rejected \
+  webui-daemon-env \
+  gateway/src/routes/thread.tsx \
+  'const socket = process.env.NEXUS_DAEMON_SOCKET ?? process.env.NEXUS_HOME;' \
+  'gateway/src/routes/thread.tsx'
+
+expect_rejected \
+  webui-daemon-db-env \
+  gateway/src/app/config.ts \
+  'const url = process.env.NEXUS_DB_URL ?? process.env.NEXUS_DB_PATH;' \
+  'gateway/src/app/config.ts'
+
+expect_rejected \
+  thread-agui-history \
+  gateway/src/modules/pane/thread.ts \
+  'const stream = "/api/agui/observe?thread=design";' \
+  'gateway/src/modules/pane/thread.ts'
+
+expect_rejected \
+  dm-agui-history \
+  gateway/src/modules/pane/dm.ts \
+  'const stream = "/api/agui/observe?dm=ada";' \
+  'gateway/src/modules/pane/dm.ts'
+
+expect_rejected \
+  runtime-sqld \
+  gateway/scripts/start.mjs \
+  'spawn("sqld", ["--http-listen-addr", "127.0.0.1:4141"]);' \
+  'gateway/scripts/start.mjs'
+
+expect_rejected \
+  runtime-hrana \
+  core/crates/nexus/src/launch.rs \
+  'let transport = connect_transport("Hrana");' \
+  'core/crates/nexus/src/launch.rs'
+
+expect_rejected \
+  runtime-network-libsql \
+  gateway/src/server/gateway/store.ts \
+  'const url = "libsql://remote.invalid";' \
+  'gateway/src/server/gateway/store.ts'
+
+expect_rejected \
+  raw-model-doc \
+  gateway/src/app/help.ts \
+  'const help = "lane=raw streams semantic model text";' \
+  'gateway/src/app/help.ts'
+
+expect_rejected \
+  gateway-daemon-db \
+  gateway/src/server/gateway/store.ts \
+  'const db = "file:/home/user/.nexus/nexus.db";' \
+  'gateway/src/server/gateway/store.ts'
+
+expect_allowed
+
+echo "PASS architecture ownership fixture gate"

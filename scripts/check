@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# The one-command green gate. "Suite green" means THIS passes — run it before
+# every commit and paste its tail in your checkpoint.
+#
+# Usage:
+#   scripts/check              # everything: rust fmt + tests, gateway typecheck + tests
+#   scripts/check rust         # rust only
+#   scripts/check rust -p nexus-identity        # focused crate (args pass through)
+#   scripts/check rust-workspace                # compile every Rust workspace test target
+#   scripts/check acceptance                    # run the acceptance suite
+#   scripts/check core-test-layout              # fail if core production source contains inline tests
+#   scripts/check cargo-targets                 # fail if workspace binary target names collide
+#   scripts/check release-identity              # v0.1 license/version/internal naming contract
+#   scripts/check architecture                  # daemon/Gateway/WebUI ownership boundary
+#   scripts/check boundaries                    # harness isolation boundary (shrink-only)
+#   scripts/check gateway      # gateway only
+#   scripts/check gateway useAgentSession       # focused vitest filter
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/check [all|rust|rust-workspace|acceptance|core-test-layout|cargo-targets|release-identity|architecture|boundaries|load|gateway] [extra args]
+EOF
+}
+
+case "${1:-}" in
+  -h|--help|help) usage; exit 0 ;;
+esac
+
+cd "$(dirname "$0")/.."
+
+MODE="${1:-all}"
+shift || true
+
+rust_gate() {
+  echo "── rust: fmt ─────────────────────────────"
+  (cd core && cargo fmt --all -- --check)
+  echo "── rust: tests $* ────────────────────────"
+  (cd core && cargo test "$@")
+}
+
+rust_workspace_compile_gate() {
+  echo "── rust: workspace compile ───────────────"
+  (cd core && cargo test --workspace --no-run)
+}
+
+acceptance_gate() {
+  echo "── rust: acceptance ──────────────────────"
+  (cd core && cargo test -p nexus-acceptance)
+}
+
+core_test_layout_gate() {
+  echo "── rust: core test layout ────────────────"
+  scripts/nexus-core-test-layout-gate
+}
+
+cargo_target_name_gate() {
+  echo "── rust: Cargo target names ───────────────"
+  scripts/nexus-cargo-target-name-gate
+}
+
+release_identity_gate() {
+  echo "── release: v0.1 identity ─────────────────"
+  scripts/nexus-v010-release-identity-gate
+}
+
+architecture_ownership_gate() {
+  echo "── architecture: ownership ────────────────"
+  scripts/nexus-architecture-ownership-gate
+}
+
+boundary_gate() {
+  echo "── architecture: harness boundary ─────────"
+  scripts/nexus-boundary-gate
+}
+
+gateway_gate() {
+  echo "── gateway: typecheck ────────────────────"
+  pnpm --dir gateway typecheck
+  echo "── gateway: vitest $* ────────────────────"
+  if (($#)); then
+    pnpm --dir gateway test "$@"
+  else
+    pnpm --dir gateway test
+  fi
+}
+
+case "$MODE" in
+  rust)           rust_gate "$@" ;;
+  rust-workspace) rust_workspace_compile_gate ;;
+  acceptance)     acceptance_gate ;;
+  core-test-layout) core_test_layout_gate ;;
+  cargo-targets)    cargo_target_name_gate ;;
+  release-identity) release_identity_gate ;;
+  architecture)    architecture_ownership_gate ;;
+  boundaries)      boundary_gate ;;
+  # Load-regression gate: full incident-replay run in the isolated docker env (phases 1-6,
+  # ~10-15 min). NOT part of `all` — run before every deploy: scripts/check load
+  load) python3 scripts/test-nexus-load-gate && exec python3 -u scripts/nexus-load-gate run --skip-docker-build "$@" ;;
+  gateway|front)  gateway_gate "$@" ;;
+  all)            architecture_ownership_gate; boundary_gate; cargo_target_name_gate; rust_gate; gateway_gate ;;
+  *) usage >&2; exit 64 ;;
+esac
+echo "── check: GREEN ──────────────────────────"

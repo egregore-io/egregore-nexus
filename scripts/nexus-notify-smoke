@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Send one signed watchdog notification through the installed Nexus gateway."""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+SOURCE = "nexus-endurance-smoke"
+TOPIC = "nexus.endurance.smoke"
+
+
+def state_path() -> Path:
+    override = os.environ.get("NEXUS_NOTIFY_STATE")
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".nexus" / f"{SOURCE}.json"
+
+
+def run_json(
+    *args: str,
+    check: bool = True,
+    operator: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    if operator:
+        for name in (
+            "NEXUS_NAME",
+            "NEXUS_CLIENT_KEY",
+            "NEXUS_PROJECT",
+            "NEXUS_AGENT",
+            "NEXUS_AGENT_ID",
+            "NEXUS_SESSION_ID",
+            "NEXUS_RUNTIME_ID",
+        ):
+            env.pop(name, None)
+    result = subprocess.run(
+        ["nexus", *args],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"nexus {' '.join(args)} failed: {detail}")
+    return result
+
+
+def write_state(path: Path, payload: dict[str, str]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+
+
+def source_token() -> str:
+    path = state_path()
+    if path.exists():
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        token = saved.get("token")
+        if isinstance(token, str) and token:
+            return token
+
+    source = run_json(
+        "source", "show", SOURCE, "--json", check=False, operator=True
+    )
+    if source.returncode == 0:
+        # Tokens are intentionally shown only once. An older smoke source may predate this local
+        # secret file, so rotate it exactly once and persist the replacement for every later run.
+        result = run_json("source", "rotate", SOURCE, "--json", operator=True)
+    else:
+        result = run_json(
+            "source",
+            "register",
+            SOURCE,
+            "--topic",
+            TOPIC,
+            "--json",
+            operator=True,
+        )
+    response = json.loads(result.stdout)
+    token = response.get("token")
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("Nexus did not return the source token")
+    write_state(path, {"source": SOURCE, "topic": TOPIC, "token": token})
+    return token
+
+
+def gateway_url() -> str:
+    override = os.environ.get("NEXUS_GATEWAY_URL")
+    if override:
+        return override.rstrip("/")
+    discovery = Path.home() / ".nexus" / "gateway.json"
+    payload: dict[str, Any] = json.loads(discovery.read_text(encoding="utf-8"))
+    url = payload.get("url")
+    if not isinstance(url, str) or not url:
+        raise RuntimeError(f"gateway discovery has no URL: {discovery}")
+    return url.rstrip("/")
+
+
+def push(message: str) -> str:
+    token = source_token()
+    marker = f"NEXUS_NOTIFICATION_SMOKE_{time.time_ns()}"
+    raw = json.dumps(
+        {
+            "summary": "Nexus endurance watchdog",
+            "body": f"{message}\n\nMarker: {marker}",
+            "meta": {"marker": marker},
+        },
+        separators=(",", ":"),
+    )
+    timestamp = str(int(time.time() * 1000))
+    signature = "sha256=" + hmac.new(
+        token.encode(), f"{timestamp}.{raw}".encode(), hashlib.sha256
+    ).hexdigest()
+    source = urllib.parse.quote(SOURCE, safe="")
+    topic = urllib.parse.quote(TOPIC, safe="")
+    request = urllib.request.Request(
+        f"{gateway_url()}/api/v1/sources/{source}/push?topic={topic}",
+        data=raw.encode(),
+        headers={
+            "Content-Type": "application/json",
+            "X-Nexus-Timestamp": timestamp,
+            "X-Nexus-Signature": signature,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if response.status not in (200, 201, 202):
+                raise RuntimeError(f"gateway rejected notification: HTTP {response.status}")
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors="replace")
+        raise RuntimeError(
+            f"gateway rejected notification: HTTP {error.code}: {detail}"
+        ) from error
+    return marker
+
+
+def main() -> None:
+    if any(argument in {"-h", "--help"} for argument in sys.argv[1:]):
+        print(
+            "Usage: scripts/nexus-notify-smoke [MESSAGE...]\n\n"
+            "Sends one signed watchdog notification through the installed Nexus gateway."
+        )
+        return
+    message = " ".join(sys.argv[1:]).strip() or "Manual Nexus notification smoke"
+    print(push(message))
+
+
+if __name__ == "__main__":
+    main()

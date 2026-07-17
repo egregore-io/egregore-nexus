@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""Generate checksums, an SBOM, and source-bound provenance for Nexus 0.1.0 artifacts."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote
+
+
+ROOT = Path(__file__).resolve().parent.parent
+VERSION = "0.1.0"
+NPM_VERSION = "0.1.1"
+NPM_MANIFESTS = (
+    ROOT / "packages/nexus/package.json",
+    ROOT / "packages/nexus-cli/package.json",
+    ROOT / "gateway/package.json",
+    ROOT / "gateway/webconsole/package.json",
+)
+
+
+def command_json(command: list[str], cwd: Path) -> object:
+    try:
+        output = subprocess.check_output(command, cwd=cwd, text=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError(f"release metadata command failed: {' '.join(command)}: {error}") from error
+    return json.loads(output)
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def cargo_components() -> tuple[list[dict[str, object]], set[str]]:
+    metadata = command_json(
+        ["cargo", "metadata", "--locked", "--format-version", "1"], ROOT / "core"
+    )
+    assert isinstance(metadata, dict)
+    packages = {package["id"]: package for package in metadata["packages"]}
+    nodes = {node["id"]: node for node in metadata["resolve"]["nodes"]}
+    root_id = next(
+        package_id
+        for package_id, package in packages.items()
+        if package["name"] == "egregore-nexus" and package["version"] == VERSION
+    )
+
+    reachable: set[str] = set()
+    pending = [root_id]
+    while pending:
+        package_id = pending.pop()
+        if package_id in reachable:
+            continue
+        reachable.add(package_id)
+        for dependency in nodes[package_id]["deps"]:
+            kinds = {entry.get("kind") for entry in dependency["dep_kinds"]}
+            if None in kinds or "build" in kinds:
+                pending.append(dependency["pkg"])
+
+    components = []
+    for package_id in sorted(
+        reachable,
+        key=lambda item: (packages[item]["name"], packages[item]["version"]),
+    ):
+        package = packages[package_id]
+        component: dict[str, object] = {
+            "type": "application" if package_id == root_id else "library",
+            "bom-ref": f"pkg:cargo/{quote(package['name'])}@{package['version']}",
+            "name": package["name"],
+            "version": package["version"],
+            "purl": f"pkg:cargo/{quote(package['name'])}@{package['version']}",
+            "properties": [{"name": "nexus:ecosystem", "value": "cargo"}],
+        }
+        if package.get("license"):
+            component["licenses"] = [{"expression": package["license"]}]
+        components.append(component)
+
+    workspace_ids = set(metadata["workspace_members"])
+    expected_crates = {
+        f"{package['name']}-{VERSION}.crate"
+        for package_id, package in packages.items()
+        if package_id in workspace_ids and package.get("publish") == ["crates-io"]
+    }
+    return components, expected_crates
+
+
+def npm_components() -> list[dict[str, object]]:
+    packages: dict[tuple[str, str], str | None] = {}
+    pnpm_root = ROOT / "gateway/node_modules/.pnpm"
+    if not pnpm_root.is_dir():
+        raise RuntimeError(
+            "gateway dependencies are not installed; run pnpm --dir gateway install --frozen-lockfile"
+        )
+    manifests: list[Path] = []
+    for bundle in pnpm_root.iterdir():
+        modules = bundle / "node_modules"
+        if not modules.is_dir():
+            continue
+        for entry in modules.iterdir():
+            if entry.name.startswith("@") and entry.is_dir():
+                manifests.extend(package / "package.json" for package in entry.iterdir())
+            else:
+                manifests.append(entry / "package.json")
+    for manifest_path in manifests:
+        if not manifest_path.is_file():
+            continue
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        name = manifest.get("name")
+        version = manifest.get("version")
+        if not isinstance(name, str) or not isinstance(version, str):
+            continue
+        license_name = manifest.get("license")
+        if isinstance(license_name, dict):
+            license_name = license_name.get("type")
+        packages[(name, version)] = license_name if isinstance(license_name, str) else None
+    for manifest_path in NPM_MANIFESTS:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        packages[(manifest["name"], manifest["version"])] = manifest.get("license")
+
+    components = []
+    for (name, version), license_name in sorted(packages.items()):
+        encoded_name = quote(name, safe="/")
+        component: dict[str, object] = {
+            "type": "application" if name.startswith("@egregore/nexus") else "library",
+            "bom-ref": f"pkg:npm/{encoded_name}@{version}",
+            "name": name,
+            "version": version,
+            "purl": f"pkg:npm/{encoded_name}@{version}",
+            "properties": [
+                {"name": "nexus:ecosystem", "value": "npm"},
+                {"name": "nexus:scope", "value": "installed-build-or-runtime"},
+            ],
+        }
+        if license_name:
+            component["licenses"] = [{"expression": license_name}]
+        components.append(component)
+    return components
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate Nexus 0.1.0 checksums, CycloneDX SBOM, and SLSA provenance."
+    )
+    parser.add_argument("--artifacts", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--revision", required=True)
+    parser.add_argument(
+        "--allow-dirty",
+        action="store_true",
+        help="Allow a dirty source checkout for a non-final fixture run.",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if not re.fullmatch(r"[0-9a-f]{40}", args.revision):
+        print("error: --revision must be a full lowercase Git SHA", file=sys.stderr)
+        return 2
+    head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+    ).strip()
+    if head != args.revision:
+        print(f"error: revision {args.revision} does not match checkout HEAD {head}", file=sys.stderr)
+        return 2
+    dirty = bool(
+        subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=all"], cwd=ROOT, text=True
+        ).strip()
+    )
+    if dirty and not args.allow_dirty:
+        print("error: final release evidence requires a clean source checkout", file=sys.stderr)
+        return 2
+
+    artifacts_root = args.artifacts.resolve()
+    artifact_paths = sorted(
+        (path for path in artifacts_root.rglob("*") if path.is_file()),
+        key=lambda path: path.relative_to(artifacts_root).as_posix(),
+    )
+    if not artifact_paths:
+        print("error: artifact directory is empty", file=sys.stderr)
+        return 2
+    artifact_names = {path.name for path in artifact_paths}
+    cargo, expected_crates = cargo_components()
+    expected_npm = {
+        f"egregore-nexus-{NPM_VERSION}.tgz",
+        f"egregore-nexus-cli-{NPM_VERSION}.tgz",
+        f"egregore-nexus-gateway-{NPM_VERSION}.tgz",
+    }
+    missing = sorted((expected_crates | expected_npm) - artifact_names)
+    if missing:
+        print("error: release artifact set is incomplete: " + ", ".join(missing), file=sys.stderr)
+        return 2
+
+    subjects = []
+    checksum_lines = []
+    for path in artifact_paths:
+        relative = path.relative_to(artifacts_root).as_posix()
+        digest = sha256(path)
+        checksum_lines.append(f"{digest}  {relative}")
+        subjects.append({"name": relative, "digest": {"sha256": digest}})
+
+    args.output.mkdir(parents=True, exist_ok=True)
+    (args.output / "SHA256SUMS").write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
+    components = sorted(cargo + npm_components(), key=lambda item: str(item["bom-ref"]))
+    sbom = {
+        "bomFormat": "CycloneDX",
+        "specVersion": "1.5",
+        "version": 1,
+        "metadata": {
+            "component": {
+                "type": "application",
+                "name": "egregore-nexus-release",
+                "version": VERSION,
+            }
+        },
+        "components": components,
+    }
+    (args.output / "nexus-0.1.0.cdx.json").write_text(
+        json.dumps(sbom, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    provenance = {
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": subjects,
+        "predicateType": "https://slsa.dev/provenance/v1",
+        "predicate": {
+            "buildDefinition": {
+                "buildType": "https://github.com/egregore-io/egregore-nexus/v0.1.0",
+                "externalParameters": {"version": VERSION, "sourceDirty": dirty},
+                "resolvedDependencies": [
+                    {
+                        "uri": f"git+https://github.com/egregore-io/egregore-nexus@{args.revision}",
+                        "digest": {"gitCommit": args.revision},
+                    }
+                ],
+            },
+            "runDetails": {
+                "builder": {"id": "scripts/nexus-v010-release-evidence"},
+                "metadata": {
+                    "invocationId": hashlib.sha256(
+                        "\n".join(checksum_lines).encode("utf-8")
+                    ).hexdigest(),
+                    "generatedAt": datetime.now(timezone.utc).isoformat(),
+                },
+            },
+        },
+    }
+    (args.output / "nexus-0.1.0.intoto.jsonl").write_text(
+        json.dumps(provenance, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    print(
+        json.dumps(
+            {
+                "status": "pass",
+                "revision": args.revision,
+                "artifacts": len(subjects),
+                "components": len(components),
+                "output": str(args.output.resolve()),
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

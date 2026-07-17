@@ -1,0 +1,629 @@
+#!/usr/bin/env python3
+"""Basic v0.1 WebSocket release acceptance against the disposable Docker candidate.
+
+This is deliberately a small transport gate, not an adversarial WebSocket soak. It proves the
+real local gateway can acknowledge a subscription, surface committed DM/thread/notification
+messages and a daemon-pushed lifecycle transition, reconnect from an exact message cursor without
+duplicate presentation, and reject an invalid subscription explicitly. Latency evidence is written
+as JSON for the release report.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import subprocess
+import time
+from pathlib import Path
+from typing import Any, Callable
+from urllib.parse import urlencode
+
+
+class GateFailure(RuntimeError):
+    pass
+
+
+Frame = tuple[float, dict[str, Any]]
+
+
+def receiver_listener_command(
+    *,
+    container: str,
+    nexus: str,
+    receiver: str,
+    client_key: str,
+    project: str,
+    nexus_home: str,
+) -> list[str]:
+    """Build one held drain which durably acknowledges one fixture delivery batch.
+
+    WebSocket lanes are presentation observers, not harness inbox consumers. The cutoff fixture
+    therefore owns an ordinary receiver listener alongside the browser lane so its synthetic
+    messages cannot become release-gate dead letters after the browser has observed them.
+    """
+    return [
+        "docker",
+        "exec",
+        "-e",
+        f"NEXUS_NAME={receiver}",
+        "-e",
+        f"NEXUS_CLIENT_KEY={client_key}",
+        "-e",
+        f"NEXUS_PROJECT={project}",
+        "-e",
+        "NEXUS_AGENT=other",
+        "-e",
+        f"NEXUS_HOME={nexus_home}",
+        "-e",
+        "NEXUS_NO_AUTOSTART=1",
+        "-e",
+        "TOKIO_WORKER_THREADS=2",
+        container,
+        nexus,
+        "listen",
+        "--json",
+        "--once",
+        "--timeout-ms",
+        "15000",
+        "--max",
+        "16",
+    ]
+
+
+def start_receiver_drain(command: list[str]) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def finish_receiver_drain(
+    process: subprocess.Popen[str], expected_message_id: str, label: str
+) -> None:
+    try:
+        stdout, stderr = process.communicate(timeout=20)
+    except subprocess.TimeoutExpired as error:
+        process.kill()
+        process.communicate()
+        raise GateFailure(f"{label}: receiver listener timed out") from error
+    if process.returncode != 0:
+        raise GateFailure(
+            f"{label}: receiver listener failed rc={process.returncode}: "
+            f"{stderr.strip() or stdout.strip()}"
+        )
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as error:
+        raise GateFailure(f"{label}: receiver listener returned non-JSON: {stdout!r}") from error
+    if expected_message_id not in payload.get("messageIds", []):
+        raise GateFailure(
+            f"{label}: receiver listener did not acknowledge {expected_message_id}; "
+            f"payload={payload!r}"
+        )
+
+
+class Lane:
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.socket: Any = None
+        self.frames: list[Frame] = []
+        self.error: BaseException | None = None
+        self._changed = asyncio.Event()
+        self._reader: asyncio.Task[None] | None = None
+
+    async def connect(self) -> float:
+        started = time.monotonic()
+        self.socket = await websockets.connect(self.url, open_timeout=10, close_timeout=3)
+        self._reader = asyncio.create_task(self._read(), name=f"ws-cutoff:{self.url}")
+        return (time.monotonic() - started) * 1000
+
+    async def _read(self) -> None:
+        try:
+            async for raw in self.socket:
+                try:
+                    frame = json.loads(str(raw))
+                except json.JSONDecodeError:
+                    continue
+                self.frames.append((time.time() * 1000, frame))
+                self._changed.set()
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:  # Connection loss is evidence for a waiting assertion.
+            self.error = error
+            self._changed.set()
+
+    async def send(self, frame: dict[str, Any]) -> None:
+        await self.socket.send(json.dumps(frame, separators=(",", ":")))
+
+    async def send_raw(self, payload: str) -> None:
+        await self.socket.send(payload)
+
+    async def wait_for(
+        self,
+        predicate: Callable[[dict[str, Any]], bool],
+        *,
+        after_index: int = 0,
+        timeout: float = 15,
+        label: str,
+    ) -> Frame:
+        deadline = time.monotonic() + timeout
+        while True:
+            for item in self.frames[after_index:]:
+                if predicate(item[1]):
+                    return item
+            if self.error is not None:
+                raise GateFailure(f"{label}: socket failed: {self.error}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                tail = [frame for _, frame in self.frames[-8:]]
+                raise GateFailure(f"{label}: timed out; recent frames={tail!r}")
+            self._changed.clear()
+            try:
+                await asyncio.wait_for(self._changed.wait(), remaining)
+            except asyncio.TimeoutError as error:
+                tail = [frame for _, frame in self.frames[-8:]]
+                raise GateFailure(f"{label}: timed out; recent frames={tail!r}") from error
+
+    async def close(self) -> None:
+        if self.socket is not None:
+            await self.socket.close()
+        if self._reader is not None:
+            self._reader.cancel()
+            await asyncio.gather(self._reader, return_exceptions=True)
+
+
+def run(
+    container: str,
+    nexus: str,
+    *args: str,
+    env: dict[str, str] | None = None,
+    timeout: float = 30,
+) -> dict[str, Any]:
+    command = ["docker", "exec"]
+    for key, value in (env or {}).items():
+        command.extend(["-e", f"{key}={value}"])
+    command.extend([container, nexus, *args])
+    result = subprocess.run(command, text=True, capture_output=True, timeout=timeout)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise GateFailure(f"{' '.join(args)} failed rc={result.returncode}: {detail}")
+    if not result.stdout.strip():
+        return {}
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise GateFailure(f"{' '.join(args)} returned non-JSON: {result.stdout!r}") from error
+
+
+def message_id(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key in ("messageId", "message_id"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate:
+                return candidate
+            if isinstance(candidate, dict):
+                nested = candidate.get("0")
+                if isinstance(nested, str) and nested:
+                    return nested
+        for nested in value.values():
+            found = message_id(nested)
+            if found:
+                return found
+    if isinstance(value, list):
+        for nested in value:
+            found = message_id(nested)
+            if found:
+                return found
+    return None
+
+
+def session_id(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key in ("sessionId", "session_id"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        for nested in value.values():
+            found = session_id(nested)
+            if found:
+                return found
+    return None
+
+
+def content_marker(marker: str) -> Callable[[dict[str, Any]], bool]:
+    return lambda frame: (
+        frame.get("type") == "TEXT_MESSAGE_CONTENT" and marker in str(frame.get("delta", ""))
+    )
+
+
+def start_for_message(lane: Lane, message: str) -> Frame:
+    for item in lane.frames:
+        if item[1].get("type") == "TEXT_MESSAGE_START" and item[1].get("messageId") == message:
+            return item
+    raise GateFailure(f"message {message} had content but no TEXT_MESSAGE_START")
+
+
+def visible_latency_ms(lane: Lane, content: Frame) -> float:
+    message = content[1].get("messageId")
+    _, start = start_for_message(lane, str(message))
+    created_at = start.get("createdAt")
+    if not isinstance(created_at, (int, float)) or created_at <= 0:
+        raise GateFailure(f"message {message} is missing a stable createdAt timestamp")
+    return max(0.0, content[0] - float(created_at))
+
+
+def qs(base: str, **params: Any) -> str:
+    return f"{base}?{urlencode(params)}"
+
+
+def run_suffix(candidate: str, nonce: int) -> str:
+    return f"{candidate}-{nonce}"
+
+
+async def gate(args: argparse.Namespace) -> dict[str, Any]:
+    suffix = run_suffix(args.candidate, time.time_ns())
+    receiver = f"ws-receiver{suffix}"
+    lifecycle = f"ws-lifecycle{suffix}"
+    thread = f"ws-cutoff-{suffix}"
+    actor_env = {
+        "NEXUS_NAME": receiver,
+        "NEXUS_CLIENT_KEY": f"ws-receiver-key-{suffix}",
+        "NEXUS_PROJECT": args.project,
+        "NEXUS_AGENT": "other",
+        "NEXUS_HOME": args.nexus_home,
+        "NEXUS_NO_AUTOSTART": "1",
+        "TOKIO_WORKER_THREADS": "2",
+    }
+    listener_command = receiver_listener_command(
+        container=args.container,
+        nexus=args.nexus_bin,
+        receiver=receiver,
+        client_key=actor_env["NEXUS_CLIENT_KEY"],
+        project=args.project,
+        nexus_home=args.nexus_home,
+    )
+    run(
+        args.container,
+        args.nexus_bin,
+        "register",
+        "--name",
+        receiver,
+        "--agent",
+        "other",
+        "--project",
+        args.project,
+        "--client-key",
+        actor_env["NEXUS_CLIENT_KEY"],
+        "--json",
+        env=actor_env,
+    )
+    run(
+        args.container,
+        args.nexus_bin,
+        "thread",
+        "new",
+        thread,
+        "--project",
+        args.project,
+        "--member",
+        receiver,
+        "--json",
+    )
+
+    base = f"ws://127.0.0.1:{args.host_port}/api/agui/ws"
+    events = Lane(base)
+    dm = Lane(qs(base, dm=receiver))
+    thread_lane = Lane(qs(base, thread=thread))
+    connect_latencies = await asyncio.gather(
+        events.connect(), dm.connect(), thread_lane.connect()
+    )
+
+    subscription_started = time.monotonic()
+    await events.send({"t": "subscribe", "topic": "sys.fleet.status", "afterSeq": 0})
+    await events.wait_for(
+        lambda frame: frame.get("t") == "subscribe.ack"
+        and frame.get("topic") == "sys.fleet.status",
+        timeout=10,
+        label="fleet subscription acknowledgement",
+    )
+    subscribe_ack_ms = (time.monotonic() - subscription_started) * 1000
+
+    ping_index = len(events.frames)
+    await events.send({"t": "ping"})
+    await events.wait_for(
+        lambda frame: frame.get("t") == "pong",
+        after_index=ping_index,
+        timeout=5,
+        label="websocket ping/pong",
+    )
+
+    malformed_index = len(events.frames)
+    await events.send_raw("{not-json")
+    await events.wait_for(
+        lambda frame: frame.get("t") == "input.err"
+        and frame.get("error") == "frame must be JSON",
+        after_index=malformed_index,
+        timeout=5,
+        label="malformed frame isolation",
+    )
+    post_malformed_index = len(events.frames)
+    await events.send({"t": "ping"})
+    await events.wait_for(
+        lambda frame: frame.get("t") == "pong",
+        after_index=post_malformed_index,
+        timeout=5,
+        label="socket remains live after malformed frame",
+    )
+
+    invalid_index = len(events.frames)
+    await events.send({"t": "subscribe", "topic": "thread.invalid", "afterSeq": 0})
+    await events.wait_for(
+        lambda frame: frame.get("t") == "subscribe.err",
+        after_index=invalid_index,
+        timeout=5,
+        label="invalid subscription error",
+    )
+
+    dm_marker = f"WS_DM_{time.time_ns()}"
+    dm_index = len(dm.frames)
+    dm_drain = start_receiver_drain(listener_command)
+    await dm.send({
+        "t": "input",
+        "mode": "bus",
+        "target": {"verb": "dm", "name": receiver},
+        "text": dm_marker,
+        "clientMessageId": f"cm-{dm_marker}",
+    })
+    await dm.wait_for(
+        lambda frame: frame.get("t") == "input.ack"
+        and frame.get("clientMessageId") == f"cm-{dm_marker}",
+        after_index=dm_index,
+        label="DM input acknowledgement",
+    )
+    dm_content = await dm.wait_for(
+        content_marker(dm_marker), after_index=dm_index, label="live DM visibility"
+    )
+    dm_id = str(dm_content[1].get("messageId"))
+    await asyncio.to_thread(finish_receiver_drain, dm_drain, dm_id, "DM delivery settlement")
+
+    notification_marker = f"WS_NOTIFICATION_{time.time_ns()}"
+    notification_index = len(dm.frames)
+    notification_drain = start_receiver_drain(listener_command)
+    notification_ack = await asyncio.to_thread(
+        run,
+        args.container,
+        args.nexus_bin,
+        "notify",
+        "--target",
+        receiver,
+        "--idempotency-key",
+        f"ws-cutoff-notify-{suffix}-{notification_marker}",
+        notification_marker,
+        "--json",
+    )
+    notification_content = await dm.wait_for(
+        content_marker(notification_marker),
+        after_index=notification_index,
+        label="live notification visibility",
+    )
+    notification_id = str(notification_content[1].get("messageId"))
+    acknowledged_notification_id = message_id(notification_ack)
+    if acknowledged_notification_id != notification_id:
+        raise GateFailure(
+            f"notification ack id {acknowledged_notification_id!r} != event id {notification_id!r}"
+        )
+    await asyncio.to_thread(
+        finish_receiver_drain,
+        notification_drain,
+        notification_id,
+        "notification delivery settlement",
+    )
+
+    first_marker = f"WS_THREAD_FIRST_{time.time_ns()}"
+    first_drain = start_receiver_drain(listener_command)
+    first_ack = await asyncio.to_thread(
+        run,
+        args.container,
+        args.nexus_bin,
+        "post",
+        thread,
+        "-m",
+        first_marker,
+        "--json",
+    )
+    first_content = await thread_lane.wait_for(
+        content_marker(first_marker), label="first live thread visibility"
+    )
+    first_id = str(first_content[1].get("messageId"))
+    if message_id(first_ack) != first_id:
+        raise GateFailure(f"thread ack id {message_id(first_ack)!r} != event id {first_id!r}")
+    await asyncio.to_thread(
+        finish_receiver_drain, first_drain, first_id, "first thread delivery settlement"
+    )
+    await thread_lane.wait_for(
+        lambda frame: frame.get("type") == "TEXT_MESSAGE_END"
+        and frame.get("messageId") == first_id,
+        label="first thread completion",
+    )
+    _, first_start = start_for_message(thread_lane, first_id)
+    cursor = first_start.get("cursor")
+    if not isinstance(cursor, dict) or not cursor.get("createdAt") or not cursor.get("rowid"):
+        raise GateFailure(f"thread event {first_id} is missing its exact reconnect cursor")
+
+    await thread_lane.close()
+    reconnect = Lane(qs(
+        base,
+        thread=thread,
+        after=int(cursor["createdAt"]),
+        afterRowid=int(cursor["rowid"]),
+    ))
+    reconnect_ms = await reconnect.connect()
+    second_marker = f"WS_THREAD_SECOND_{time.time_ns()}"
+    second_drain = start_receiver_drain(listener_command)
+    second_ack = await asyncio.to_thread(
+        run,
+        args.container,
+        args.nexus_bin,
+        "post",
+        thread,
+        "-m",
+        second_marker,
+        "--json",
+    )
+    second_content = await reconnect.wait_for(
+        content_marker(second_marker), label="post-reconnect live thread visibility"
+    )
+    second_id = str(second_content[1].get("messageId"))
+    if message_id(second_ack) != second_id:
+        raise GateFailure(f"reconnect ack id {message_id(second_ack)!r} != event id {second_id!r}")
+    await asyncio.to_thread(
+        finish_receiver_drain, second_drain, second_id, "second thread delivery settlement"
+    )
+    await asyncio.sleep(1)
+    replayed_first = [
+        frame for _, frame in reconnect.frames if frame.get("messageId") == first_id
+    ]
+    second_starts = [
+        frame for _, frame in reconnect.frames
+        if frame.get("type") == "TEXT_MESSAGE_START" and frame.get("messageId") == second_id
+    ]
+    if replayed_first:
+        raise GateFailure(f"reconnect replayed already-presented message {first_id}")
+    if len(second_starts) != 1:
+        raise GateFailure(f"message {second_id} presented {len(second_starts)} times after reconnect")
+
+    lifecycle_index = len(events.frames)
+    lifecycle_env = {
+        "NEXUS_NAME": lifecycle,
+        "NEXUS_CLIENT_KEY": f"ws-lifecycle-key-{suffix}",
+        "NEXUS_PROJECT": args.project,
+        "NEXUS_AGENT": "other",
+        "NEXUS_HOME": args.nexus_home,
+        "NEXUS_NO_AUTOSTART": "1",
+    }
+    lifecycle_registration = await asyncio.to_thread(
+        run,
+        args.container,
+        args.nexus_bin,
+        "register",
+        "--name",
+        lifecycle,
+        "--agent",
+        "other",
+        "--project",
+        args.project,
+        "--client-key",
+        lifecycle_env["NEXUS_CLIENT_KEY"],
+        "--json",
+        env=lifecycle_env,
+    )
+    lifecycle_session = session_id(lifecycle_registration)
+    if not lifecycle_session:
+        raise GateFailure("lifecycle registration did not return a session id")
+    lifecycle_event = await events.wait_for(
+        lambda frame: frame.get("type") == "developer.event"
+        and frame.get("event", {}).get("topic") == "sys.fleet.status"
+        and frame.get("event", {}).get("sessionId") == lifecycle_session
+        and frame.get("event", {}).get("lifecycle") in {"spawned", "status"},
+        after_index=lifecycle_index,
+        timeout=10,
+        label="live fleet lifecycle event",
+    )
+
+    evidence = {
+        "status": "pass",
+        "candidate": args.candidate,
+        "fixtureSuffix": suffix,
+        "container": args.container,
+        "gateway": f"http://127.0.0.1:{args.host_port}",
+        "checks": {
+            "connect": "pass",
+            "subscribe_ack": "pass",
+            "ping_pong": "pass",
+            "malformed_frame_isolated": "pass",
+            "dm_visible": "pass",
+            "thread_visible": "pass",
+            "notification_visible": "pass",
+            "fleet_status_live": "pass",
+            "reconnect_exact_cursor": "pass",
+            "duplicate_presentation": "zero",
+            "invalid_subscription_explicit": "pass",
+        },
+        "latencyMs": {
+            "connectMax": round(max(connect_latencies), 3),
+            "subscribeAck": round(subscribe_ack_ms, 3),
+            "dmCommittedToVisible": round(visible_latency_ms(dm, dm_content), 3),
+            "notificationCommittedToVisible": round(
+                visible_latency_ms(dm, notification_content), 3
+            ),
+            "threadCommittedToVisible": round(
+                visible_latency_ms(thread_lane, first_content), 3
+            ),
+            "reconnect": round(reconnect_ms, 3),
+            "reconnectThreadCommittedToVisible": round(
+                visible_latency_ms(reconnect, second_content), 3
+            ),
+        },
+        "messageIds": {
+            "dm": dm_id,
+            "notification": notification_id,
+            "threadBeforeReconnect": first_id,
+            "threadAfterReconnect": second_id,
+        },
+        "cursor": cursor,
+        "fleetEvent": lifecycle_event[1].get("event"),
+        "frameCounts": {
+            "events": len(events.frames),
+            "dm": len(dm.frames),
+            "threadBeforeReconnect": len(thread_lane.frames),
+            "threadAfterReconnect": len(reconnect.frames),
+        },
+    }
+    for lane in (events, dm, reconnect):
+        await lane.close()
+    return evidence
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--candidate", required=True)
+    parser.add_argument("--container", default="nexus-v010-load51")
+    parser.add_argument("--host-port", default="4551")
+    parser.add_argument("--project", default="endurance")
+    parser.add_argument("--nexus-bin", default="/tmp/nexus-target/debug/nexus")
+    parser.add_argument("--nexus-home", default="/tmp/nexus-home")
+    parser.add_argument("--output", type=Path, required=True)
+    return parser.parse_args()
+
+
+def main() -> int:
+    global websockets
+    args = parse_args()
+    try:
+        import websockets as websockets_module
+    except ModuleNotFoundError:
+        print("error: nexus-v010-ws-cutoff-gate requires the Python websockets package")
+        return 2
+    websockets = websockets_module
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        evidence = asyncio.run(gate(args))
+    except BaseException as error:
+        evidence = {
+            "status": "fail",
+            "candidate": args.candidate,
+            "error": str(error),
+        }
+        args.output.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
+        print(json.dumps(evidence, indent=2, sort_keys=True))
+        return 1
+    args.output.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
+    print(json.dumps(evidence, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

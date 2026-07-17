@@ -1,0 +1,35 @@
+{
+  "name": "@egregore/nexus-cli",
+  "version": "0.1.1",
+  "private": false,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Egregore Nexus CLI and local transport daemon with automatic native installation.",
+  "bin": {
+    "nexus": "bin/nexus.mjs"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.mjs"
+  },
+  "files": [
+    "bin/nexus.mjs",
+    "lib",
+    "scripts/postinstall.mjs",
+    "native"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/egregore-io/egregore-nexus.git",
+    "directory": "packages/nexus-cli"
+  },
+  "homepage": "https://github.com/egregore-io/egregore-nexus#readme",
+  "bugs": {
+    "url": "https://github.com/egregore-io/egregore-nexus/issues"
+  }
+}

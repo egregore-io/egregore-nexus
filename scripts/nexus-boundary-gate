@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Enforce the harness isolation boundary: concrete harness knowledge (claude,
+# codex, opencode, hermes) belongs in core/crates/harness/* behind the
+# nexus-harness-core traits. Grandfathered offenders are recorded as
+# shrink-only ceilings in scripts/nexus-boundary-gate.allow.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/nexus-boundary-gate [REPO_ROOT]
+
+Checks the harness isolation boundary:
+  deps  - only crates/harness/* (and grandfathered manifests) may reference
+          concrete harness crates or reach into crates/harness/ by path.
+  names - core production sources outside crates/harness/* must not mention
+          concrete harness names beyond the recorded ceilings.
+
+Ceilings in scripts/nexus-boundary-gate.allow may decrease, never increase.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+cd "$ROOT"
+
+ALLOW_FILE="scripts/nexus-boundary-gate.allow"
+
+if ! command -v rg >/dev/null 2>&1; then
+  echo "error: rg is required for the boundary gate" >&2
+  exit 2
+fi
+
+if [[ ! -f "$ALLOW_FILE" ]]; then
+  echo "error: missing $ALLOW_FILE" >&2
+  exit 2
+fi
+
+declare -A allow_ceiling
+declare -A allow_seen
+while IFS='|' read -r key ceiling; do
+  [[ -z "$key" || "$key" == \#* ]] && continue
+  allow_ceiling["$key"]="$ceiling"
+  allow_seen["$key"]=0
+done <"$ALLOW_FILE"
+
+violations=0
+
+check_counts() {
+  local kind="$1"
+  local what="$2"
+  local file count ceiling key
+  while IFS=: read -r file count; do
+    [[ -z "$file" ]] && continue
+    key="$kind $file"
+    ceiling="${allow_ceiling[$key]:-0}"
+    allow_seen["$key"]=1
+    if ((count > ceiling)); then
+      if ((ceiling == 0)); then
+        echo "boundary violation ($kind): $file has $count $what; new files must stay harness-clean" >&2
+      else
+        echo "boundary violation ($kind): $file has $count $what; ceiling is $ceiling and may only decrease" >&2
+      fi
+      violations=1
+    elif ((count < ceiling)); then
+      echo "note ($kind): $file is at $count/$ceiling — ratchet the ceiling down in $ALLOW_FILE"
+    fi
+  done
+}
+
+# deps: concrete harness crates and path reaches into crates/harness/ from
+# manifests outside the harness tree. The workspace root manifest (member and
+# workspace.dependencies declarations) and the integration test crate are
+# structural and exempt.
+scan_deps() {
+  rg --color never --count-matches \
+    -e 'nexus-harness-(claude|codex)' \
+    -e 'crates/harness/' \
+    --glob 'Cargo.toml' \
+    --glob '!core/Cargo.toml' \
+    --glob '!core/crates/harness/**' \
+    --glob '!core/tests/**' \
+    core 2>/dev/null || true
+}
+
+# names: concrete harness names in core production sources outside the harness
+# tree. Test sources live in tests/ directories per the core test layout gate
+# and are exempt.
+scan_names() {
+  rg --color never --count-matches --ignore-case \
+    -e '\b(claude|codex|opencode|hermes)\b' \
+    --glob '*.rs' \
+    --glob '!core/crates/harness/**' \
+    --glob '!**/tests/**' \
+    core/crates 2>/dev/null || true
+}
+
+check_counts dep 'harness manifest reference(s)' < <(scan_deps)
+check_counts name 'harness name reference(s)' < <(scan_names)
+
+for key in "${!allow_seen[@]}"; do
+  if [[ "${allow_seen[$key]}" == 0 ]]; then
+    echo "note: allowlist entry '$key' no longer matches anything — remove it from $ALLOW_FILE"
+  fi
+done
+
+if ((violations)); then
+  echo "boundary gate: FAIL — see docs/coding-standards.md#boundaries" >&2
+  exit 1
+fi
+
+echo "boundary gate: OK"

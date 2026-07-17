@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/nexus-v010-release-identity-gate
+
+Checks the v0.1.0 version, license, and internal naming contract.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
+export NEXUS_RELEASE_GATE_ROOT="$ROOT"
+
+python3 - <<'PY'
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+root = pathlib.Path(os.environ["NEXUS_RELEASE_GATE_ROOT"])
+failures: list[str] = []
+
+license_path = root / "LICENSE"
+if not license_path.is_file():
+    failures.append("missing root LICENSE")
+else:
+    license_text = license_path.read_text(encoding="utf-8")
+    for marker in ("Apache License", "Version 2.0, January 2004"):
+        if marker not in license_text:
+            failures.append(f"LICENSE is missing canonical marker: {marker}")
+
+metadata = json.loads(
+    subprocess.check_output(
+        ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+        cwd=root / "core",
+        text=True,
+    )
+)
+workspace_ids = set(metadata["workspace_members"])
+workspace_packages = [p for p in metadata["packages"] if p["id"] in workspace_ids]
+workspace_package_names = {package["name"] for package in workspace_packages}
+distribution = metadata.get("metadata", {}).get("nexus", {}).get("distribution", {})
+if distribution.get("binary-crate") != "egregore-nexus":
+    failures.append("Cargo distribution metadata must name egregore-nexus as the binary crate")
+if distribution.get("binary-name") != "nexus":
+    failures.append("Cargo distribution metadata must name nexus as the binary")
+expected_targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+expected_hardened_targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+expected_experimental_targets = [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+if distribution.get("targets") != expected_targets:
+    failures.append("Cargo distribution targets must include the complete native npm set")
+if distribution.get("hardened-targets") != expected_hardened_targets:
+    failures.append("Linux and Windows must be the hardened native release targets")
+if distribution.get("experimental-targets") != expected_experimental_targets:
+    failures.append("macOS targets must remain explicitly experimental")
+if distribution.get("wsl-target") != "x86_64-unknown-linux-gnu":
+    failures.append("WSL must select the hardened Linux x64 native target")
+for package in sorted(workspace_packages, key=lambda p: p["name"]):
+    if package["version"] != "0.1.0":
+        failures.append(
+            f"Cargo package {package['name']} reports {package['version']} (expected 0.1.0)"
+        )
+    if package["name"] == "nexus-acceptance":
+        if package.get("publish") != []:
+            failures.append("nexus-acceptance must remain unpublished")
+        continue
+    if package.get("publish") != ["crates-io"]:
+        failures.append(f"Cargo package {package['name']} is not crates.io-publishable")
+    for dependency in package["dependencies"]:
+        if (
+            dependency["name"] in workspace_package_names
+            and dependency["req"] != "=0.1.0"
+        ):
+            failures.append(
+                f"Cargo package {package['name']} does not exactly pin "
+                f"{dependency['name']} to =0.1.0"
+            )
+
+package_names = workspace_package_names
+if "nexus-dispatch" not in package_names:
+    failures.append("Cargo workspace is missing nexus-dispatch")
+if "nexus-realtime" in package_names:
+    failures.append("Cargo workspace still contains nexus-realtime")
+
+for relative in ("gateway/gateway/package.json",):
+    manifest = json.loads((root / relative).read_text(encoding="utf-8"))
+    if manifest.get("version") != "0.1.0":
+        failures.append(
+            f"{relative} reports {manifest.get('version')!r} (expected '0.1.0')"
+        )
+    if manifest.get("license") != "Apache-2.0":
+        failures.append(
+            f"{relative} reports {manifest.get('license')!r} (expected 'Apache-2.0')"
+        )
+
+native_targets = (
+    "linux-x64-gnu",
+    "linux-arm64-gnu",
+    "darwin-x64",
+    "darwin-arm64",
+    "win32-x64-msvc",
+)
+public_npm = (
+    "packages/nexus/package.json",
+    "packages/nexus-cli/package.json",
+    "gateway/package.json",
+)
+internal_npm = ("gateway/webconsole/package.json",)
+for relative in public_npm + internal_npm:
+    manifest = json.loads((root / relative).read_text(encoding="utf-8"))
+    if manifest.get("version") != "0.1.1":
+        failures.append(
+            f"{relative} reports {manifest.get('version')!r} (expected '0.1.1')"
+        )
+    if manifest.get("license") != "Apache-2.0":
+        failures.append(
+            f"{relative} reports {manifest.get('license')!r} (expected 'Apache-2.0')"
+        )
+for relative in public_npm:
+    manifest = json.loads((root / relative).read_text(encoding="utf-8"))
+    if manifest.get("private") is True or manifest.get("publishConfig", {}).get("access") != "public":
+        failures.append(f"{relative} is not explicitly public")
+
+cli_manifest = json.loads((root / "packages/nexus-cli/package.json").read_text(encoding="utf-8"))
+if cli_manifest.get("optionalDependencies"):
+    failures.append("@egregore/nexus-cli must not publish platform implementation packages")
+if "native" not in cli_manifest.get("files", []):
+    failures.append("@egregore/nexus-cli does not include embedded native binaries")
+for target in native_targets:
+    if (root / f"packages/nexus-cli-{target}").exists():
+        failures.append(f"separate native npm package still exists: {target}")
+
+gateway_manifest = json.loads((root / "gateway/package.json").read_text(encoding="utf-8"))
+if gateway_manifest.get("dependencies", {}).get("@egregore/nexus-cli") != "0.1.1":
+    failures.append("@egregore/nexus-gateway must install @egregore/nexus-cli")
+if gateway_manifest.get("bin", {}).get("nexus") != "scripts/nexus.mjs":
+    failures.append("@egregore/nexus-gateway must expose the nexus command")
+
+routing_path = root / "core/crates/nexus/src/daemon/routing.rs"
+dispatch_path = root / "core/crates/nexus/src/daemon/dispatch.rs"
+if not routing_path.is_file():
+    failures.append("daemon routing implementation is missing routing.rs")
+if dispatch_path.exists():
+    failures.append("daemon routing implementation still uses dispatch.rs")
+
+search = subprocess.run(
+    [
+        "rg",
+        "-n",
+        "nexus-realtime|nexus_realtime",
+        "core/Cargo.toml",
+        "core/crates",
+        "core/deny.toml",
+        "--glob",
+        "!Cargo.lock",
+        "--glob",
+        "!target/**",
+    ],
+    cwd=root,
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+if search.returncode not in (0, 1):
+    failures.append(f"stale-name scan failed: {search.stderr.strip()}")
+elif search.returncode == 0:
+    failures.append("live Cargo/Rust sources retain stale dispatch names:\n" + search.stdout.strip())
+
+if failures:
+    print("FAIL Nexus v0.1.0 release identity gate", file=sys.stderr)
+    for failure in failures:
+        print(f"- {failure}", file=sys.stderr)
+    raise SystemExit(1)
+
+print("PASS Nexus v0.1.0 release identity gate")
+PY

@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Verify the optional Linux-hosted Windows validation entrypoint."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+ENTRYPOINT = ROOT / "scripts" / "nexus-windows-validation"
+RECIPE = ROOT / "testing" / "windows" / "nexus.toml"
+
+
+def main() -> int:
+    failures: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="nexus-windows-validation-") as raw:
+        temporary = Path(raw)
+        call_log = temporary / "call.log"
+        lab_config = temporary / "lab.toml"
+        lab_config.write_text("schema = 1\n", encoding="utf-8")
+        fake_lab = temporary / "windows-lab"
+        fake_lab.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' \"$@\" > {str(call_log)!r}\n",
+            encoding="utf-8",
+        )
+        fake_lab.chmod(0o755)
+
+        result = subprocess.run(
+            [str(ENTRYPOINT), "--dry-run"],
+            cwd=ROOT,
+            env={
+                **os.environ,
+                "NEXUS_WINDOWS_LAB_BIN": str(fake_lab),
+                "NEXUS_WINDOWS_LAB_CONFIG": str(lab_config),
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            failures.append(f"launcher exited {result.returncode}: {result.stderr!r}")
+        elif call_log.read_text(encoding="utf-8").splitlines() != [
+            "--config",
+            str(lab_config),
+            "run",
+            str(RECIPE),
+            "--dry-run",
+        ]:
+            failures.append("launcher did not forward the canonical recipe and arguments")
+
+        missing = subprocess.run(
+            [str(ENTRYPOINT), "--dry-run"],
+            cwd=ROOT,
+            env={
+                **os.environ,
+                "NEXUS_WINDOWS_LAB_BIN": str(temporary / "missing-windows-lab"),
+                "NEXUS_WINDOWS_LAB_CONFIG": str(lab_config),
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if missing.returncode == 0 or "egregore-windows-lab" not in missing.stderr:
+            failures.append("missing lab error is not actionable")
+
+        missing_config = subprocess.run(
+            [str(ENTRYPOINT), "--dry-run"],
+            cwd=ROOT,
+            env={
+                **os.environ,
+                "NEXUS_WINDOWS_LAB_BIN": str(fake_lab),
+                "NEXUS_WINDOWS_LAB_CONFIG": str(temporary / "missing-lab.toml"),
+            },
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if missing_config.returncode == 0 or "lab.toml" not in missing_config.stderr:
+            failures.append("missing lab configuration error is not actionable")
+
+    recipe = RECIPE.read_text(encoding="utf-8")
+    required_fragments = (
+        'schema = 1',
+        'network = "internet"',
+        'path = "../.."',
+        'name = "rust-tests"',
+        'name = "gateway-gates"',
+        'name = "nexus-exe"',
+        'name = "gateway-headless"',
+        'name = "gateway-web"',
+    )
+    missing_fragments = [fragment for fragment in required_fragments if fragment not in recipe]
+    if missing_fragments:
+        failures.append(f"recipe is missing required contract fragments: {missing_fragments}")
+
+    if failures:
+        print("FAIL optional Windows validation contract")
+        for failure in failures:
+            print(f"- {failure}")
+        return 1
+    print("PASS optional Windows validation contract")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

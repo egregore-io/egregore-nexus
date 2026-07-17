@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/nexus-listener-soak-gate
+
+Runs the disposable Docker listener delivery soak gate.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+CONTAINER=${NEXUS_ENDURANCE_CONTAINER:-nexus-v010-load51}
+NEXUS_BIN=/tmp/nexus-target/debug/nexus
+PROJECT=listener-soak
+LISTENER=listener-soak-target
+SENDER=listener-soak-sender
+MARKER="LISTENER_SOAK_$(date +%s%N)"
+OUT="$ROOT/output/listener-soak"
+
+die() {
+  printf 'listener-soak: FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+running=$(docker ps --filter label=egregore-nexus-test=true --format '{{.Names}}')
+[ "$(printf '%s\n' "$running" | sed '/^$/d' | wc -l)" -eq 1 ] \
+  || die "expected exactly one running validation container"
+[ "$running" = "$CONTAINER" ] || die "sole validation container is $running, expected $CONTAINER"
+
+rm -rf "$OUT"
+mkdir -p "$OUT"
+docker restart "$CONTAINER" >/dev/null
+
+docker exec --user 0:0 "$CONTAINER" bash -c '
+  set -euo pipefail
+  rm -rf /tmp/nexus-home
+  rm -f /dev/shm/nexus-stream.db*
+  install -d -m 0755 -o 1000 -g 1000 /tmp/nexus-home
+'
+
+docker exec --user 1000:1000 \
+  -e NEXUS_HOME=/tmp/nexus-home \
+  -e NEXUS_DB_PATH=/tmp/nexus-home/nexus.db \
+  -e NEXUS_STREAM_DB_PATH=/dev/shm/nexus-stream.db \
+  "$CONTAINER" bash -c '
+    nohup /tmp/nexus-target/debug/nexus daemon run >/tmp/nexus-home/daemon.log 2>&1 &
+  '
+
+operator() {
+  docker exec --user 1000:1000 \
+    -e NEXUS_HOME=/tmp/nexus-home \
+    -e NEXUS_NO_AUTOSTART=1 \
+    "$CONTAINER" "$NEXUS_BIN" "$@"
+}
+
+for _ in $(seq 1 100); do
+  operator daemon status >/dev/null 2>&1 && break
+  sleep .1
+done
+operator daemon status >"$OUT/daemon-status.txt" 2>&1 || {
+  docker cp "$CONTAINER:/tmp/nexus-home/daemon.log" "$OUT/daemon.log" >/dev/null 2>&1 || true
+  die "embedded daemon did not become ready"
+}
+
+as_identity() {
+  local name=$1
+  local key=$2
+  shift 2
+  docker exec --user 1000:1000 \
+    -e "NEXUS_NAME=$name" \
+    -e "NEXUS_CLIENT_KEY=$key" \
+    -e "NEXUS_PROJECT=$PROJECT" \
+    -e NEXUS_AGENT=other \
+    -e NEXUS_HOME=/tmp/nexus-home \
+    -e NEXUS_NO_AUTOSTART=1 \
+    "$CONTAINER" "$NEXUS_BIN" "$@"
+}
+
+as_identity "$LISTENER" ck_listener_soak register --name "$LISTENER" --kind app \
+  --agent other --project "$PROJECT" --client-key ck_listener_soak --json >"$OUT/listener.json"
+as_identity "$SENDER" ck_sender_soak register --name "$SENDER" --kind app \
+  --agent other --project "$PROJECT" --client-key ck_sender_soak --json >"$OUT/sender.json"
+
+docker exec --detach --user 1000:1000 \
+  -e "NEXUS_NAME=$LISTENER" \
+  -e NEXUS_CLIENT_KEY=ck_listener_soak \
+  -e "NEXUS_PROJECT=$PROJECT" \
+  -e NEXUS_AGENT=other \
+  -e NEXUS_HOME=/tmp/nexus-home \
+  -e NEXUS_NO_AUTOSTART=1 \
+  "$CONTAINER" bash -c '
+    /tmp/nexus-target/debug/nexus listen --json --once --timeout-ms 10000 \
+      >/tmp/nexus-home/listener.out 2>/tmp/nexus-home/listener.err
+    echo $? >/tmp/nexus-home/listener.rc
+  '
+
+sleep 1.5
+started_ns=$(date +%s%N)
+as_identity "$SENDER" ck_sender_soak send --to "$LISTENER" -m "$MARKER" --json \
+  >"$OUT/send.json"
+ended_ns=$(date +%s%N)
+send_ms=$(((ended_ns - started_ns) / 1000000))
+
+for _ in $(seq 1 150); do
+  docker exec --user 1000:1000 "$CONTAINER" test -f /tmp/nexus-home/listener.rc && break
+  sleep .1
+done
+docker exec --user 1000:1000 "$CONTAINER" test -f /tmp/nexus-home/listener.rc \
+  || die "held listener did not finish"
+docker cp "$CONTAINER:/tmp/nexus-home/listener.out" "$OUT/listener.out" >/dev/null
+docker cp "$CONTAINER:/tmp/nexus-home/listener.err" "$OUT/listener.err" >/dev/null
+[ "$(grep -Fc "$MARKER" "$OUT/listener.out")" -eq 1 ] \
+  || die "held listener did not receive the canary exactly once"
+
+operator --json admin dlq list --for "$LISTENER" --limit 100 >"$OUT/dlq.json"
+python3 - "$OUT/dlq.json" <<'PY' || die "target has dead-lettered rows"
+import json, sys
+payload = json.load(open(sys.argv[1], encoding="utf-8"))
+if int(payload.get("total", len(payload.get("rows", [])))) != 0:
+    raise SystemExit(1)
+PY
+[ "$send_ms" -lt 5000 ] || die "write canary took ${send_ms}ms"
+
+printf 'listener-soak: PASS embedded=true send_ms=%s dlq=0 marker=%s\n' \
+  "$send_ms" "$MARKER" | tee "$OUT/summary.txt"

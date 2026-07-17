@@ -1,0 +1,1584 @@
+#!/usr/bin/env python3
+"""Active-traffic restart gate for the twelve-variant Nexus fixture."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+ALLOWED_HARNESSES = {"claude", "codex", "opencode", "hermes"}
+ALLOWED_VARIANTS = {"headless", "pty", "tmux"}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass(frozen=True)
+class ExpectedParticipant:
+    name: str
+    harness: str
+    variant: str
+
+
+@dataclass
+class Participant:
+    name: str
+    agent_id: str
+    runtime_id: str
+    harness: str
+    variant: str
+    transport: str
+    cwd: str | None
+    native_resume_digest: str | None
+    provider_digest: str | None
+
+
+@dataclass
+class Manifest:
+    candidate: str
+    thread: str
+    participants: list[Participant]
+
+    @property
+    def names(self) -> list[str]:
+        return sorted(row.name for row in self.participants)
+
+
+@dataclass
+class ObservedState:
+    members: dict[str, dict[str, Any]]
+    thread_members: list[str]
+    runtimes: dict[str, dict[str, Any]]
+
+
+@dataclass
+class Comparison:
+    failures: list[str] = field(default_factory=list)
+    caveats: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class LifecycleSnapshot:
+    daemon_boot_id: str
+    gateway_pid: int
+    gateway_url: str
+
+
+@dataclass(frozen=True)
+class PhaseResult:
+    phase: str
+    message_id: str
+    caveats: tuple[str, ...] = ()
+
+
+class GateFailure(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class RouteProof:
+    thread_authors: set[str]
+    dm_authors: set[str]
+
+
+class RecipientLedger:
+    def __init__(self, *, expected: set[str]) -> None:
+        self.expected = expected
+        self.states: dict[str, str] = {}
+        self.duplicates: set[str] = set()
+
+    def observe_snapshot(self, rows: list[dict[str, Any]]) -> None:
+        seen: set[str] = set()
+        for row in rows:
+            agent_id = str(row["recipient_agent_id"])
+            if agent_id in seen:
+                self.duplicates.add(agent_id)
+            seen.add(agent_id)
+            self.states[agent_id] = str(row["state"])
+
+    def failures(self, message_id: str) -> list[str]:
+        del message_id
+        if self.duplicates:
+            return [
+                f"duplicate recipient obligation row: {agent_id}"
+                for agent_id in sorted(self.duplicates)
+            ]
+        failures: list[str] = []
+        for agent_id in sorted(self.expected):
+            state = self.states.get(agent_id)
+            if state is None:
+                failures.append(f"missing recipient obligation settlement: {agent_id}")
+            elif state != "delivered":
+                failures.append(
+                    f"recipient obligation not delivered: {agent_id} state={state}"
+                )
+        for agent_id in sorted(set(self.states) - self.expected):
+            failures.append(f"unexpected recipient obligation: {agent_id}")
+        return failures
+
+
+class DockerNexus:
+    def __init__(
+        self,
+        *,
+        container: str,
+        binary: str,
+        nexus_home: str,
+        codex_home: str | None = None,
+        project: str,
+        controller: str,
+        client_key: str,
+        docker_user: str | None = None,
+    ) -> None:
+        self.container = container
+        self.binary = binary
+        self.nexus_home = nexus_home
+        self.codex_home = codex_home
+        self.project = project
+        self.controller = controller
+        self.client_key = client_key
+        self.docker_user = docker_user
+
+    def _docker_prefix(self) -> list[str]:
+        command = ["docker", "exec"]
+        if self.docker_user:
+            command.extend(["--user", self.docker_user])
+        return command
+
+    def _identity_env(self, *, operator: bool) -> list[str]:
+        values = [
+            f"NEXUS_PROJECT={self.project}",
+            f"NEXUS_HOME={self.nexus_home}",
+            "NEXUS_NO_AUTOSTART=1",
+            "TOKIO_WORKER_THREADS=2",
+        ]
+        if self.codex_home:
+            # `nexus daemon restart` is executed by a fresh docker exec process. Carry the same
+            # explicit Codex home used by the original daemon so ACP session/load can still find
+            # the rollout named by the durable native resume key.
+            values.append(f"CODEX_HOME={self.codex_home}")
+        if not operator:
+            values[0:0] = [
+                f"NEXUS_NAME={self.controller}",
+                f"NEXUS_CLIENT_KEY={self.client_key}",
+                "NEXUS_AGENT=other",
+                "NEXUS_KIND=human",
+            ]
+        result: list[str] = []
+        for value in values:
+            result.extend(["-e", value])
+        return result
+
+    def run(
+        self,
+        *args: str,
+        operator: bool = False,
+        timeout: float = 30.0,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        command = [
+            *self._docker_prefix(),
+            *self._identity_env(operator=operator),
+            self.container,
+            self.binary,
+            *args,
+        ]
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+        if check and result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(f"{' '.join(args)} failed rc={result.returncode}: {detail}")
+        return result
+
+    def read_identity_sql(self, query: str) -> list[dict[str, Any]]:
+        statement = query.strip()
+        if not statement.lower().startswith(("select ", "with ")):
+            raise ValueError("identity diagnostics accept read-only SELECT statements")
+        command = [
+            *self._docker_prefix(),
+            self.container,
+            "sqlite3",
+            "-json",
+            str(Path(self.nexus_home) / "nexus.db"),
+            f"PRAGMA query_only=ON; {statement}",
+        ]
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(f"read-only identity diagnostic failed: {detail}")
+        return json.loads(result.stdout or "[]")
+
+    def probe_daemon_status(
+        self, *, timeout: float = 10.0
+    ) -> subprocess.CompletedProcess[str]:
+        """Run status with a container-side deadline so docker-exec timeout cannot leak it."""
+        if timeout < 3:
+            raise ValueError("daemon status probe timeout must be at least three seconds")
+        remote_timeout = max(1, int(timeout) - 2)
+        command = [
+            *self._docker_prefix(),
+            *self._identity_env(operator=True),
+            self.container,
+            "/usr/bin/timeout",
+            "--signal=KILL",
+            "--kill-after=1s",
+            f"{remote_timeout}s",
+            self.binary,
+            "daemon",
+            "status",
+        ]
+        return subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+
+    def exec_operator_command(
+        self, *args: str, timeout: float = 10.0
+    ) -> subprocess.CompletedProcess[str]:
+        command = [
+            *self._docker_prefix(),
+            *self._identity_env(operator=True),
+            self.container,
+            *args,
+        ]
+        return subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+
+
+def parse_participant(value: str) -> ExpectedParticipant:
+    parts = value.split(":")
+    if len(parts) != 3 or not all(parts):
+        raise ValueError("participant must be NAME:HARNESS:VARIANT")
+    name, harness, variant = parts
+    if harness not in ALLOWED_HARNESSES:
+        raise ValueError("harness must be claude, codex, opencode, or hermes")
+    if variant not in ALLOWED_VARIANTS:
+        raise ValueError("variant must be headless, pty, or tmux")
+    return ExpectedParticipant(name=name, harness=harness, variant=variant)
+
+
+def validate_expected_matrix(expected: list[ExpectedParticipant]) -> None:
+    required = {
+        (harness, variant)
+        for harness in ALLOWED_HARNESSES
+        for variant in ALLOWED_VARIANTS
+    }
+    observed = [(row.harness, row.variant) for row in expected]
+    if len(expected) != 12 or set(observed) != required or len(set(observed)) != 12:
+        raise GateFailure(
+            "fixture requires exactly one of each claude/codex/opencode/hermes "
+            "headless/pty/tmux variant"
+        )
+    if len({row.name for row in expected}) != 12:
+        raise GateFailure("fixture requires 12 unique participant names")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the active-traffic twelve-variant restart resurrection gate."
+    )
+    parser.add_argument("--container", required=True)
+    parser.add_argument("--docker-user")
+    parser.add_argument("--thread", required=True)
+    parser.add_argument("--candidate", required=True)
+    parser.add_argument("--controller", required=True)
+    parser.add_argument("--client-key", required=True)
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--nexus-bin", required=True)
+    parser.add_argument("--nexus-home", required=True)
+    parser.add_argument("--codex-home", required=True)
+    parser.add_argument("--gateway-health-url", required=True)
+    parser.add_argument("--gateway-base-url", required=True)
+    parser.add_argument("--webui-url", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--participant", action="append", type=parse_participant, default=[]
+    )
+    parser.add_argument("--notify-target")
+    parser.add_argument("--external-notify-command", type=Path)
+    parser.add_argument("--settle-timeout", type=float, default=300.0)
+    parser.add_argument("--reply-timeout", type=float, default=600.0)
+    parser.add_argument("--ready-timeout", type=float, default=120.0)
+    parser.add_argument("--active-attempts", type=int, default=3)
+    return parser.parse_args(argv)
+
+
+def secret_digest(value: str | None) -> str | None:
+    if value is None:
+        return None
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def _variant_from_identity(row: dict[str, Any]) -> str:
+    mode = str(row.get("mode") or "")
+    backend = str(row.get("backend") or "")
+    if mode == "headless":
+        return "headless"
+    if mode == "headed" and backend == "tmux":
+        return "tmux"
+    if mode == "headed" and backend in {"pty", "raw", "raw-pty"}:
+        return "pty"
+    raise GateFailure(f"unsupported resurrection descriptor mode={mode!r} backend={backend!r}")
+
+
+def build_manifest_from_payloads(
+    *,
+    candidate: str,
+    thread: str,
+    expected: list[ExpectedParticipant],
+    member_payload: dict[str, Any],
+    runtime_payloads: dict[str, dict[str, Any]],
+    identity_rows: list[dict[str, Any]],
+    require_twelve: bool = True,
+) -> Manifest:
+    members = {
+        str(row.get("name")): row
+        for row in member_payload.get("members", [])
+        if row.get("name")
+    }
+    identities = {str(row.get("runtime_id")): row for row in identity_rows}
+    participants: list[Participant] = []
+    failures: list[str] = []
+
+    for specification in expected:
+        member = members.get(specification.name)
+        payload = runtime_payloads.get(specification.name, {})
+        runtimes = list(payload.get("runtimes") or [])
+        runtime = next((row for row in runtimes if row.get("active") is True), None)
+        if runtime is None and runtimes:
+            runtime = runtimes[0]
+        if member is None or runtime is None:
+            failures.append(f"missing runtime manifest data: {specification.name}")
+            continue
+
+        runtime_id = str(runtime.get("runtimeId") or member.get("sessionId") or "")
+        agent_id = str(runtime.get("agentId") or member.get("agentId") or "")
+        identity = identities.get(runtime_id)
+        if not runtime_id or not agent_id or identity is None:
+            failures.append(f"missing identity capsule: {specification.name}")
+            continue
+
+        harness = str(identity.get("harness") or runtime.get("harness") or "")
+        try:
+            variant = _variant_from_identity(identity)
+        except GateFailure as error:
+            failures.append(f"{specification.name}: {error}")
+            continue
+        if harness != specification.harness:
+            failures.append(
+                f"harness mismatch: {specification.name} expected={specification.harness} observed={harness}"
+            )
+        if variant != specification.variant:
+            failures.append(
+                f"variant mismatch: {specification.name} expected={specification.variant} observed={variant}"
+            )
+        if str(identity.get("agent_id") or "") != agent_id:
+            failures.append(f"identity capsule agent mismatch: {specification.name}")
+
+        native_resume = identity.get("native_resume_key")
+        digest = secret_digest(None if native_resume is None else str(native_resume))
+        participants.append(
+            Participant(
+                name=specification.name,
+                agent_id=agent_id,
+                runtime_id=runtime_id,
+                harness=harness,
+                variant=variant,
+                transport=str(runtime.get("transport") or ""),
+                cwd=(
+                    None
+                    if identity.get("cwd") is None and runtime.get("cwd") is None
+                    else str(identity.get("cwd") or runtime.get("cwd"))
+                ),
+                native_resume_digest=digest,
+                provider_digest=digest if harness == "claude" else None,
+            )
+        )
+
+    if failures:
+        raise GateFailure("; ".join(failures))
+    manifest = Manifest(candidate=candidate, thread=thread, participants=participants)
+    if require_twelve:
+        validate_manifest(manifest)
+    return manifest
+
+
+def write_json_atomic(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def restart_daemon(nexus: DockerNexus) -> dict[str, Any]:
+    result = nexus.run("daemon", "restart", operator=True, timeout=120)
+    return {"status": "restarted", "output": result.stdout.strip()}
+
+
+def compare_lifecycle(
+    before: LifecycleSnapshot, after: LifecycleSnapshot
+) -> list[str]:
+    failures: list[str] = []
+    if before.daemon_boot_id == after.daemon_boot_id:
+        failures.append("daemon boot ID did not change")
+    if before.gateway_pid != after.gateway_pid:
+        failures.append(
+            f"Gateway process changed unexpectedly: {before.gateway_pid} -> {after.gateway_pid}"
+        )
+    if before.gateway_url != after.gateway_url:
+        failures.append(
+            f"Gateway URL changed: {before.gateway_url!r} -> {after.gateway_url!r}"
+        )
+    return failures
+
+
+def validate_manifest(manifest: Manifest) -> None:
+    if len(manifest.participants) != 12:
+        raise ValueError(
+            f"manifest requires 12 participants, observed {len(manifest.participants)}"
+        )
+    if len({row.name for row in manifest.participants}) != 12:
+        raise ValueError("manifest requires 12 unique participant names")
+    if len({row.agent_id for row in manifest.participants}) != 12:
+        raise ValueError("manifest requires 12 unique Nexus agent IDs")
+    if len({row.runtime_id for row in manifest.participants}) != 12:
+        raise ValueError("manifest requires 12 unique Nexus runtime IDs")
+
+
+def compare_participant(before: Participant, after: Participant) -> Comparison:
+    result = Comparison()
+    if before.name != after.name:
+        result.failures.append(
+            f"participant name changed: {before.name} -> {after.name}"
+        )
+    if before.agent_id != after.agent_id:
+        result.failures.append(f"Nexus agent identity changed: {before.name}")
+    if before.runtime_id != after.runtime_id:
+        result.failures.append(f"Nexus runtime identity changed: {before.name}")
+    for label, expected, observed in (
+        ("harness", before.harness, after.harness),
+        ("variant", before.variant, after.variant),
+        ("transport", before.transport, after.transport),
+        ("cwd", before.cwd, after.cwd),
+    ):
+        if expected != observed:
+            result.failures.append(
+                f"{label} changed: {before.name} expected={expected!r} observed={observed!r}"
+            )
+    native_changed = before.native_resume_digest != after.native_resume_digest
+    provider_changed = before.provider_digest != after.provider_digest
+    if before.harness == "claude" and (native_changed or provider_changed):
+        result.caveats.append(f"Claude provider correlation changed: {before.name}")
+    else:
+        if native_changed:
+            result.failures.append(
+                f"native resume correlation changed: {before.name} "
+                f"expected={before.native_resume_digest!r} observed={after.native_resume_digest!r}"
+            )
+        if provider_changed:
+            result.failures.append(f"provider correlation changed: {before.name}")
+    return result
+
+
+def _participant_from_runtime(row: dict[str, Any]) -> Participant:
+    return Participant(
+        name=str(row["name"]),
+        agent_id=str(row["agent_id"]),
+        runtime_id=str(row["runtime_id"]),
+        harness=str(row["harness"]),
+        variant=str(row["variant"]),
+        transport=str(row["transport"]),
+        cwd=None if row.get("cwd") is None else str(row["cwd"]),
+        native_resume_digest=(
+            None
+            if row.get("native_resume_digest") is None
+            else str(row["native_resume_digest"])
+        ),
+        provider_digest=(
+            None
+            if row.get("provider_digest") is None
+            else str(row["provider_digest"])
+        ),
+    )
+
+
+def compare_restored_state(manifest: Manifest, observed: ObservedState) -> list[str]:
+    validate_manifest(manifest)
+    failures: list[str] = []
+    observed_names = set(observed.members)
+    missing_names = [name for name in manifest.names if name not in observed_names]
+    if missing_names:
+        failures.append("missing Nexus identities: " + ", ".join(missing_names))
+
+    expected_members = set(manifest.names)
+    restored_members = set(observed.thread_members)
+    if restored_members != expected_members:
+        failures.append(
+            f"thread members expected={len(expected_members)} observed={len(restored_members)}"
+        )
+        missing_members = sorted(expected_members - restored_members)
+        unexpected_members = sorted(restored_members - expected_members)
+        if missing_members:
+            failures.append("missing thread members: " + ", ".join(missing_members))
+        if unexpected_members:
+            failures.append("unexpected thread members: " + ", ".join(unexpected_members))
+
+    for expected in manifest.participants:
+        member = observed.members.get(expected.name)
+        runtime = observed.runtimes.get(expected.name)
+        if member is None or runtime is None:
+            continue
+        if str(member.get("agentId")) != expected.agent_id:
+            failures.append(f"Nexus agent identity changed: {expected.name}")
+        if str(member.get("sessionId")) != expected.runtime_id:
+            failures.append(f"Nexus runtime identity changed: {expected.name}")
+        provider_digests = {
+            str(value) for value in runtime.get("provider_digests", []) if value
+        }
+        if expected.harness == "claude" and len(provider_digests) > 1:
+            failures.append(f"mixed Claude provider correlations: {expected.name}")
+        comparison = compare_participant(expected, _participant_from_runtime(runtime))
+        failures.extend(comparison.failures)
+    return list(dict.fromkeys(failures))
+
+
+def context_reply_failures(
+    replies: list[dict[str, Any]], participants: list[str], marker: str
+) -> list[str]:
+    failures: list[str] = []
+    for name in sorted(participants):
+        count = sum(
+            1
+            for reply in replies
+            if reply.get("from") == name and marker in str(reply.get("body") or "")
+        )
+        if count == 0:
+            failures.append(f"missing context reply: {name}")
+        elif count > 1:
+            failures.append(f"duplicate context reply: {name}")
+    return failures
+
+
+def context_reply_map_failures(
+    replies: list[dict[str, Any]], markers: dict[str, str]
+) -> list[str]:
+    """Require exactly one sender-specific marker without treating peer echoes as replies."""
+    failures: list[str] = []
+    for name, marker in sorted(markers.items()):
+        count = sum(
+            1
+            for reply in replies
+            if reply.get("from") == name and marker in str(reply.get("body") or "")
+        )
+        if count == 0:
+            failures.append(f"missing context reply: {name}")
+        elif count > 1:
+            failures.append(f"duplicate context reply: {name}")
+    return failures
+
+
+def route_proof_failures(proof: RouteProof, participants: list[str]) -> list[str]:
+    failures: list[str] = []
+    for name in sorted(participants):
+        if name not in proof.thread_authors:
+            failures.append(f"missing post-recovery thread route: {name}")
+        if name not in proof.dm_authors:
+            failures.append(f"missing post-recovery DM route: {name}")
+    return failures
+
+
+def _direct_reply_failures(
+    replies: list[dict[str, Any]], markers: dict[str, str]
+) -> list[str]:
+    failures: list[str] = []
+    for name, marker in sorted(markers.items()):
+        count = sum(
+            1
+            for reply in replies
+            if reply.get("from") == name and marker in str(reply.get("body") or "")
+        )
+        if count == 0:
+            failures.append(f"missing direct context reply: {name}")
+        elif count > 1:
+            failures.append(f"duplicate direct context reply: {name}")
+    return failures
+
+
+def _raise_failures(failures: list[str]) -> None:
+    if failures:
+        raise GateFailure("; ".join(failures))
+
+
+def participant_marker_map(names: list[str], prefix: str) -> dict[str, str]:
+    """Assign one opaque proof token per participant for a shared thread message."""
+    return {
+        name: "NX-"
+        + hashlib.sha256(f"{prefix}\0{name}".encode("utf-8")).hexdigest()[:12]
+        for name in sorted(names)
+    }
+
+
+def run_quiet_phase(
+    operations: Any,
+    manifest: Manifest,
+    *,
+    marker: str,
+    dm_marker_prefix: str,
+) -> PhaseResult:
+    validate_manifest(manifest)
+    operations.prepare_quiet(manifest.names)
+    operations.wait_settled()
+    operations.capture_before(manifest)
+    lifecycle_before = operations.capture_lifecycle_before()
+    operations.restart_daemon()
+    operations.wait_ready()
+    operations.reconnect_controller()
+    lifecycle_after = operations.capture_lifecycle_after()
+    _raise_failures(compare_lifecycle(lifecycle_before, lifecycle_after))
+    restored = operations.capture_pre_wake()
+    _raise_failures(compare_restored_state(manifest, restored))
+
+    message_id = operations.post_quiet_marker(marker)
+    thread_replies = operations.wait_thread_replies(marker, manifest.names)
+    _raise_failures(context_reply_failures(thread_replies, manifest.names, marker))
+
+    dm_markers = operations.send_dm_markers(manifest.names, dm_marker_prefix)
+    dm_replies = operations.wait_dm_replies(dm_markers)
+    _raise_failures(_direct_reply_failures(dm_replies, dm_markers))
+    operations.require_no_dlq()
+    operations.wait_settled()
+    operations.capture_evidence("phase-a")
+    return PhaseResult(phase="phase-a", message_id=message_id)
+
+
+def run_active_phase(
+    operations: Any,
+    manifest: Manifest,
+    *,
+    marker_prefix: str,
+    max_attempts: int,
+) -> PhaseResult:
+    validate_manifest(manifest)
+    message_id: str | None = None
+    markers: dict[str, str] | None = None
+    boundary: list[dict[str, Any]] = []
+    for attempt in range(1, max_attempts + 1):
+        markers = participant_marker_map(
+            manifest.names, f"{marker_prefix}_{attempt}"
+        )
+        candidate_message_id = operations.post_active_markers(markers)
+        observed = operations.observe_unsettled(candidate_message_id)
+        matching = [
+            row
+            for row in observed
+            if str(row.get("message_id")) == candidate_message_id
+            and str(row.get("state")) not in {"delivered", "rejected"}
+        ]
+        if matching:
+            message_id = candidate_message_id
+            boundary = matching
+            break
+    if message_id is None or markers is None:
+        raise GateFailure(
+            f"no durable in-flight boundary after {max_attempts} accepted marker(s)"
+        )
+
+    expected_agent_ids = {row.agent_id for row in manifest.participants}
+    unexpected_boundary = sorted(
+        {
+            str(row.get("recipient_agent_id"))
+            for row in boundary
+            if str(row.get("recipient_agent_id")) not in expected_agent_ids
+        }
+    )
+    if unexpected_boundary:
+        raise GateFailure(
+            "active boundary contains unexpected recipient(s): "
+            + ", ".join(unexpected_boundary)
+        )
+
+    lifecycle_before = operations.capture_lifecycle_before()
+    operations.restart_daemon()
+    operations.wait_ready()
+    operations.reconnect_controller()
+    lifecycle_after = operations.capture_lifecycle_after()
+    _raise_failures(compare_lifecycle(lifecycle_before, lifecycle_after))
+    restored = operations.capture_pre_wake()
+    _raise_failures(compare_restored_state(manifest, restored))
+
+    delivered = operations.settle_active_restart_delivery(
+        message_id, markers, expected_agent_ids
+    )
+    ledger = RecipientLedger(expected=expected_agent_ids)
+    ledger.observe_snapshot(delivered)
+    _raise_failures(ledger.failures(message_id))
+    replies = operations.wait_thread_marker_replies(markers)
+    _raise_failures(context_reply_map_failures(replies, markers))
+    route_proof = operations.prove_post_recovery_routes(
+        manifest, f"POST_RECOVERY_{marker_prefix}"
+    )
+    _raise_failures(route_proof_failures(route_proof, manifest.names))
+    operations.require_no_dlq()
+    operations.capture_evidence("phase-b")
+    return PhaseResult(phase="phase-b", message_id=message_id)
+
+
+class LiveOperations:
+    def __init__(
+        self,
+        *,
+        nexus: DockerNexus,
+        candidate: str,
+        thread: str,
+        expected: list[ExpectedParticipant],
+        gateway_health_url: str,
+        gateway_base_url: str,
+        webui_url: str,
+        output: Path,
+        settle_timeout: float = 300.0,
+        reply_timeout: float = 600.0,
+        ready_timeout: float = 120.0,
+        notify_target: str | None = None,
+        external_notify_command: Path | None = None,
+    ) -> None:
+        self.nexus = nexus
+        self.candidate = candidate
+        self.thread = thread
+        self.expected = expected
+        self.gateway_health_url = gateway_health_url
+        self.gateway_base_url = gateway_base_url.rstrip("/")
+        self.webui_url = webui_url
+        self.output = output
+        self.settle_timeout = settle_timeout
+        self.reply_timeout = reply_timeout
+        self.ready_timeout = ready_timeout
+        self.notify_target = notify_target or nexus.controller
+        self.external_notify_command = external_notify_command
+        self.manifest: Manifest | None = None
+        self._last_restart: dict[str, Any] | None = None
+        self._evidence_sequence = 0
+        self._dm_replies: list[dict[str, Any]] = []
+
+    @property
+    def participant_names(self) -> list[str]:
+        return sorted(row.name for row in self.expected)
+
+    @property
+    def participant_agent_ids(self) -> set[str]:
+        if self.manifest is None:
+            return set()
+        return {row.agent_id for row in self.manifest.participants}
+
+    def _json_command(
+        self, *args: str, operator: bool = False, timeout: float = 30.0
+    ) -> dict[str, Any]:
+        result = self.nexus.run(*args, operator=operator, timeout=timeout)
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as error:
+            raise GateFailure(f"invalid JSON from nexus {' '.join(args)}") from error
+        if not isinstance(payload, dict):
+            raise GateFailure(f"unexpected JSON from nexus {' '.join(args)}")
+        return payload
+
+    def _http_json(self, url: str, timeout: float = 5.0) -> Any:
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                if int(getattr(response, "status", 200)) != 200:
+                    raise GateFailure(f"HTTP readiness failed: {url}")
+                return json.loads(response.read())
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+            raise GateFailure(f"HTTP request failed: {url}: {error}") from error
+
+    def _identity_rows(self) -> list[dict[str, Any]]:
+        project = self.nexus.project.replace("'", "''")
+        return self.nexus.read_identity_sql(
+            "SELECT runtime_id,agent_id,project,harness,mode,backend,cwd,"
+            "native_resume_key,updated_at FROM identity_sessions "
+            f"WHERE project = '{project}' ORDER BY updated_at DESC"
+        )
+
+    def _runtime_payloads(self) -> dict[str, dict[str, Any]]:
+        return {
+            specification.name: self._json_command(
+                "agents",
+                "runtimes",
+                specification.name,
+                "--include-stopped",
+                "--json",
+            )
+            for specification in self.expected
+        }
+
+    def capture_manifest(self) -> Manifest:
+        member_payload = self._json_command(
+            "members", "--json", "--include-offline", "--include-dead"
+        )
+        manifest = build_manifest_from_payloads(
+            candidate=self.candidate,
+            thread=self.thread,
+            expected=self.expected,
+            member_payload=member_payload,
+            runtime_payloads=self._runtime_payloads(),
+            identity_rows=self._identity_rows(),
+        )
+        self.manifest = manifest
+        write_json_atomic(
+            self.output / "manifest-before.json",
+            {**asdict(manifest), "capturedAt": utc_now()},
+        )
+        return manifest
+
+    def capture_observed_state(self) -> ObservedState:
+        member_payload = self._json_command(
+            "members", "--json", "--include-offline", "--include-dead"
+        )
+        current = build_manifest_from_payloads(
+            candidate=self.candidate,
+            thread=self.thread,
+            expected=self.expected,
+            member_payload=member_payload,
+            runtime_payloads=self._runtime_payloads(),
+            identity_rows=self._identity_rows(),
+        )
+        thread_payload = self._json_command(
+            "thread", "members", self.thread, "--json"
+        )
+        expected_names = set(self.participant_names)
+        members = {
+            str(row.get("name")): row
+            for row in member_payload.get("members", [])
+            if str(row.get("name")) in expected_names
+        }
+        runtimes: dict[str, dict[str, Any]] = {}
+        for row in current.participants:
+            payload = asdict(row)
+            payload["provider_digests"] = (
+                [row.provider_digest] if row.provider_digest else []
+            )
+            runtimes[row.name] = payload
+        return ObservedState(
+            members=members,
+            thread_members=sorted(
+                name
+                for name in thread_payload.get("members", [])
+                if name in expected_names
+            ),
+            runtimes=runtimes,
+        )
+
+    def capture_lifecycle(self) -> LifecycleSnapshot:
+        rows = self.nexus.read_identity_sql(
+            "SELECT value FROM daemon_state WHERE key = 'boot_epoch' LIMIT 1"
+        )
+        if not rows or not rows[0].get("value"):
+            raise GateFailure("daemon boot epoch is missing")
+        gateway = self._json_command("gateway", "status", "--json", operator=True)
+        runtime = gateway.get("runtime") or {}
+        if runtime.get("state") != "live":
+            raise GateFailure(f"Gateway is not live: {runtime!r}")
+        return LifecycleSnapshot(
+            daemon_boot_id=str(rows[0]["value"]),
+            gateway_pid=int(runtime["pid"]),
+            gateway_url=str(runtime["url"]),
+        )
+
+    def capture_lifecycle_before(self) -> LifecycleSnapshot:
+        snapshot = self.capture_lifecycle()
+        write_json_atomic(
+            self.output / f"lifecycle-before-{self._evidence_sequence + 1}.json",
+            {**asdict(snapshot), "capturedAt": utc_now()},
+        )
+        return snapshot
+
+    def capture_lifecycle_after(self) -> LifecycleSnapshot:
+        snapshot = self.capture_lifecycle()
+        write_json_atomic(
+            self.output / f"lifecycle-after-{self._evidence_sequence + 1}.json",
+            {**asdict(snapshot), "capturedAt": utc_now()},
+        )
+        return snapshot
+
+    def capture_before(self, manifest: Manifest) -> None:
+        del manifest
+        state = self.capture_observed_state()
+        write_json_atomic(
+            self.output / "phase-a-pre-restart-state.json",
+            {**asdict(state), "capturedAt": utc_now()},
+        )
+        self.capture_evidence("phase-a-before")
+
+    def capture_pre_wake(self) -> ObservedState:
+        state = self.capture_observed_state()
+        write_json_atomic(
+            self.output / f"pre-wake-{self._evidence_sequence + 1}.json",
+            {**asdict(state), "capturedAt": utc_now()},
+        )
+        return state
+
+    def restart_daemon(self) -> None:
+        started_at = utc_now()
+        started = time.monotonic()
+        result = restart_daemon(self.nexus)
+        self._last_restart = {
+            "startedAt": started_at,
+            "completedAt": utc_now(),
+            "elapsedMs": round((time.monotonic() - started) * 1000, 3),
+            "result": result,
+        }
+        write_json_atomic(
+            self.output / f"restart-{self._evidence_sequence + 1}.json",
+            self._last_restart,
+        )
+
+    def wait_ready(self) -> None:
+        deadline = time.monotonic() + self.ready_timeout
+        last_error = "not attempted"
+        while time.monotonic() < deadline:
+            try:
+                status = self.nexus.probe_daemon_status(timeout=10)
+                if status.returncode not in {0, 1}:
+                    raise GateFailure(
+                        status.stderr.strip() or f"daemon status rc={status.returncode}"
+                    )
+                health = self._http_json(self.gateway_health_url, timeout=3)
+                if not isinstance(health, dict) or health.get("status") != "ok":
+                    raise GateFailure(f"unhealthy Gateway response: {health!r}")
+                self.capture_lifecycle()
+                return
+            except (GateFailure, RuntimeError, subprocess.TimeoutExpired) as error:
+                last_error = str(error)
+                time.sleep(0.5)
+        raise GateFailure(f"restart readiness timed out: {last_error}")
+
+    def reconnect_controller(self) -> None:
+        payload = self._json_command(
+            "register",
+            "--name",
+            self.nexus.controller,
+            "--agent",
+            "other",
+            "--kind",
+            "human",
+            "--project",
+            self.nexus.project,
+            "--client-key",
+            self.nexus.client_key,
+            "--json",
+        )
+        write_json_atomic(
+            self.output / f"controller-reconnect-{self._evidence_sequence + 1}.json",
+            {**payload, "capturedAt": utc_now()},
+        )
+
+    def _obligation_rows(self, message_id: str | None = None) -> list[dict[str, Any]]:
+        agent_ids = sorted(self.participant_agent_ids)
+        if not agent_ids:
+            return []
+        encoded = ",".join("'" + value.replace("'", "''") + "'" for value in agent_ids)
+        filters = [f"recipient_agent_id IN ({encoded})"]
+        if message_id is not None:
+            safe_message = message_id.replace("'", "''")
+            filters.append(f"message_id = '{safe_message}'")
+        return self.nexus.read_identity_sql(
+            "SELECT message_id,recipient_agent_id,recipient_runtime_id,attempt,state,"
+            "created_at,updated_at FROM delivery_obligations WHERE "
+            + " AND ".join(filters)
+            + " ORDER BY created_at,recipient_agent_id"
+        )
+
+    def wait_settled(self) -> None:
+        deadline = time.monotonic() + self.settle_timeout
+        last_rows: list[dict[str, Any]] = []
+        while time.monotonic() < deadline:
+            last_rows = self._obligation_rows()
+            if not last_rows:
+                return
+            time.sleep(0.5)
+        raise GateFailure(
+            f"delivery ledger did not settle for fixture recipients: {last_rows!r}"
+        )
+
+    def prepare_quiet(self, names: list[str]) -> None:
+        marker = f"QUIET_PREP_{self.candidate}_{uuid.uuid4().hex[:12]}"
+        body = (
+            f"{marker}: Release-gate control. Every named participant must post exactly one "
+            "concise acknowledgement containing this exact marker, then stop replying to peers "
+            "and remain silent until the next operator marker."
+        )
+        self._post_thread(body)
+        replies = self.wait_thread_replies(marker, names)
+        _raise_failures(context_reply_failures(replies, names, marker))
+        deadline = time.monotonic() + self.settle_timeout
+        stable_since: float | None = None
+        prior_tail: str | None = None
+        while time.monotonic() < deadline:
+            history = self._thread_history()
+            tail = str(history[-1].get("messageId") or "") if history else ""
+            unsettled = self._obligation_rows()
+            now = time.monotonic()
+            if not unsettled and tail == prior_tail:
+                stable_since = stable_since or now
+                if now - stable_since >= 10.0:
+                    return
+            else:
+                stable_since = None
+            prior_tail = tail
+            time.sleep(1.0)
+        raise GateFailure("fixture did not reach a ten-second quiet boundary")
+
+    def _post_thread(self, body: str) -> str:
+        payload = self._json_command("post", self.thread, "-m", body, "--json")
+        message_id = str(payload.get("messageId") or payload.get("message_id") or "")
+        if not message_id:
+            raise GateFailure("thread post returned no message ID")
+        return message_id
+
+    @staticmethod
+    def _marker_prompt(
+        marker: str,
+        route: str,
+        *,
+        explicit_target: str | None = None,
+        binary: str = "nexus",
+    ) -> str:
+        if explicit_target:
+            command = (
+                f"{shlex.quote(binary)} dm {shlex.quote(explicit_target)} "
+                f"-m '{marker}' --json"
+            )
+            return (
+                f"{marker}: Nexus {route} resurrection proof. Send exactly one direct "
+                f"message to {explicit_target} through Nexus containing the exact marker "
+                f"{marker}; do not use context-sensitive reply and do not post to any "
+                f"thread. Run exactly `{command}` and no other infrastructure command. "
+                "After it succeeds, stop."
+            )
+        return (
+            f"{marker}: Nexus {route} resurrection proof. Reply exactly once through Nexus, "
+            f"include the exact marker {marker}, use no infrastructure tools, then stop."
+        )
+
+    @staticmethod
+    def _mapped_marker_prompt(markers: dict[str, str], route: str) -> str:
+        assignments = "\n".join(
+            f"- {name}: {marker}" for name, marker in sorted(markers.items())
+        )
+        return (
+            f"Nexus {route} resurrection proof. Every participant is directly addressed below. "
+            "Find your exact Nexus name, then reply exactly once through Nexus with only the "
+            "token assigned to that name. Ignore tokens assigned to peers and never respond to "
+            "their later token echoes. Use no infrastructure tools.\n"
+            f"{assignments}"
+        )
+
+    def post_quiet_marker(self, marker: str) -> str:
+        return self._post_thread(self._marker_prompt(marker, "quiet-thread"))
+
+    def post_active_markers(self, markers: dict[str, str]) -> str:
+        return self._post_thread(
+            self._mapped_marker_prompt(markers, "active-thread")
+        )
+
+    def _thread_history(self) -> list[dict[str, Any]]:
+        name = urllib.parse.quote(self.thread, safe="")
+        payload = self._http_json(
+            f"{self.gateway_base_url}/api/v1/threads/{name}/history?limit=200"
+        )
+        if not isinstance(payload, list):
+            raise GateFailure("Gateway thread history returned a non-list payload")
+        return [row for row in payload if isinstance(row, dict)]
+
+    @staticmethod
+    def _merge_thread_history(
+        seen: dict[str, dict[str, Any]], rows: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        for row in rows:
+            message_id = row.get("messageId") or row.get("message_id") or row.get("id")
+            key = (
+                f"id:{message_id}"
+                if message_id
+                else "row:" + json.dumps(row, sort_keys=True, separators=(",", ":"))
+            )
+            seen[key] = row
+        return list(seen.values())
+
+    def wait_thread_replies(
+        self, marker: str, names: list[str]
+    ) -> list[dict[str, Any]]:
+        deadline = time.monotonic() + self.reply_timeout
+        seen: dict[str, dict[str, Any]] = {}
+        accumulated: list[dict[str, Any]] = []
+        while time.monotonic() < deadline:
+            accumulated = self._merge_thread_history(seen, self._thread_history())
+            failures = context_reply_failures(accumulated, names, marker)
+            if not any(message.startswith("missing ") for message in failures):
+                time.sleep(1.0)
+                return self._merge_thread_history(seen, self._thread_history())
+            self.require_no_dlq()
+            time.sleep(1.0)
+        missing = context_reply_failures(accumulated, names, marker)
+        raise GateFailure("thread context replies timed out: " + "; ".join(missing))
+
+    def wait_thread_marker_replies(
+        self, markers: dict[str, str]
+    ) -> list[dict[str, Any]]:
+        deadline = time.monotonic() + self.reply_timeout
+        seen: dict[str, dict[str, Any]] = {}
+        accumulated: list[dict[str, Any]] = []
+        while time.monotonic() < deadline:
+            accumulated = self._merge_thread_history(seen, self._thread_history())
+            failures = context_reply_map_failures(accumulated, markers)
+            if not any(message.startswith("missing ") for message in failures):
+                time.sleep(1.0)
+                return self._merge_thread_history(seen, self._thread_history())
+            self.require_no_dlq()
+            time.sleep(1.0)
+        missing = context_reply_map_failures(accumulated, markers)
+        raise GateFailure(
+            "thread context replies timed out: " + "; ".join(missing)
+        )
+
+    def send_dm_markers(
+        self,
+        names: list[str],
+        marker_prefix: str,
+        *,
+        after_reply_instruction: str | None = None,
+    ) -> dict[str, str]:
+        markers: dict[str, str] = {}
+        for name in names:
+            marker = f"{marker_prefix}_{name}_{uuid.uuid4().hex[:8]}"
+            markers[name] = marker
+            prompt = self._marker_prompt(
+                marker,
+                "direct-message",
+                explicit_target=self.nexus.controller,
+                binary=self.nexus.binary,
+            )
+            if after_reply_instruction:
+                prompt = f"{prompt} {after_reply_instruction}"
+            self._json_command(
+                "dm", name, "-m", prompt, "--json"
+            )
+        return markers
+
+    def wait_dm_replies(
+        self, markers: dict[str, str]
+    ) -> list[dict[str, Any]]:
+        deadline = time.monotonic() + self.reply_timeout
+        replies: list[dict[str, Any]] = []
+        while time.monotonic() < deadline:
+            failures = _direct_reply_failures(replies, markers)
+            if not any(message.startswith("missing ") for message in failures):
+                self._dm_replies.extend(replies)
+                return replies
+            result = self.nexus.run(
+                "listen",
+                "--json",
+                "--once",
+                "--timeout-ms",
+                "10000",
+                "--max",
+                "64",
+                timeout=20,
+            )
+            payload = json.loads(result.stdout or "{}")
+            replies.extend(
+                row for row in payload.get("dms", []) if isinstance(row, dict)
+            )
+            self.require_no_dlq()
+        failures = _direct_reply_failures(replies, markers)
+        raise GateFailure("DM context replies timed out: " + "; ".join(failures))
+
+    def observe_unsettled(self, message_id: str) -> list[dict[str, Any]]:
+        return self._obligation_rows(message_id)
+
+    def wait_obligations_delivered(
+        self, message_id: str, expected_agent_ids: set[str]
+    ) -> list[dict[str, Any]]:
+        deadline = time.monotonic() + self.reply_timeout
+        while time.monotonic() < deadline:
+            rows = self._obligation_rows(message_id)
+            if not rows:
+                self.require_no_dlq()
+                return [
+                    {
+                        "message_id": message_id,
+                        "recipient_agent_id": agent_id,
+                        "state": "delivered",
+                    }
+                    for agent_id in sorted(expected_agent_ids)
+                ]
+            time.sleep(0.5)
+        raise GateFailure(
+            f"active delivery obligations did not settle: {self._obligation_rows(message_id)!r}"
+        )
+
+    def settle_active_restart_delivery(
+        self,
+        message_id: str,
+        markers: dict[str, str],
+        expected_agent_ids: set[str],
+    ) -> list[dict[str, Any]]:
+        """Settle the active-restart marker's causal cohort without an automatic retry.
+
+        A committed delivery that was still pending is rebuilt and driven normally. A row that had
+        already crossed the external harness boundary becomes `delivery_outcome_unknown` by
+        contract; only this gate's explicit, exact-row operator requeue may make it eligible again.
+        Fast participants may post their marker reply before the daemon stops, so those replies are
+        part of the same controlled restart cohort. Every other message or DLQ reason remains a
+        release failure.
+        """
+
+        deadline = time.monotonic() + self.reply_timeout
+        requeued: dict[str, dict[str, Any]] = {}
+        cohort_message_ids = {message_id}
+        expected_senders = set(self.participant_names)
+        last_obligations: list[dict[str, Any]] = []
+        while time.monotonic() < deadline:
+            payload = self._json_command(
+                "admin", "dlq", "list", "--json", operator=True, timeout=15
+            )
+            rows = [row for row in payload.get("rows", []) if isinstance(row, dict)]
+            for row in rows:
+                row_message = str(row.get("messageId") or row.get("message_id") or "")
+                reason = str(row.get("errorReason") or row.get("error_reason") or "")
+                recipient = str(
+                    row.get("recipientAgentId") or row.get("recipient_agent_id") or ""
+                )
+                in_flight_id = str(
+                    row.get("inFlightId") or row.get("in_flight_id") or ""
+                )
+                if row_message not in cohort_message_ids:
+                    sender = str(row.get("sender") or "")
+                    body_preview = str(
+                        row.get("bodyPreview") or row.get("body_preview") or ""
+                    )
+                    if sender not in expected_senders or not any(
+                        marker in body_preview for marker in markers.values()
+                    ):
+                        raise GateFailure(
+                            "unrelated delivery failure during active restart: "
+                            f"{row_message or '<unknown>'}"
+                        )
+                    cohort_message_ids.add(row_message)
+                if reason != "delivery outcome unknown after restart":
+                    raise GateFailure(
+                        f"active restart produced non-ambiguous delivery failure: {reason or '<missing reason>'}"
+                    )
+                if recipient not in expected_agent_ids:
+                    raise GateFailure(
+                        f"active restart DLQ has unexpected recipient: {recipient or '<missing>'}"
+                    )
+                if not in_flight_id:
+                    raise GateFailure("active restart DLQ row has no in-flight ID")
+                if in_flight_id in requeued:
+                    continue
+                mutation = self._json_command(
+                    "admin",
+                    "dlq",
+                    "requeue",
+                    in_flight_id,
+                    "--json",
+                    operator=True,
+                    timeout=30,
+                )
+                if int(mutation.get("count") or 0) != 1:
+                    raise GateFailure(
+                        f"explicit restart requeue did not change exactly one row: {in_flight_id}"
+                    )
+                requeued[in_flight_id] = {
+                    "messageId": row_message,
+                    "recipientAgentId": recipient,
+                    "reason": reason,
+                }
+
+            last_obligations = [
+                obligation
+                for cohort_message_id in sorted(cohort_message_ids)
+                for obligation in self._obligation_rows(cohort_message_id)
+            ]
+            if not last_obligations:
+                write_json_atomic(
+                    self.output / "active-restart-explicit-requeues.json",
+                    {
+                        "capturedAt": utc_now(),
+                        "messageId": message_id,
+                        "cohortMessageIds": sorted(cohort_message_ids),
+                        "requeued": requeued,
+                    },
+                )
+                return [
+                    {
+                        "message_id": message_id,
+                        "recipient_agent_id": agent_id,
+                        "state": "delivered",
+                    }
+                    for agent_id in sorted(expected_agent_ids)
+                ]
+            time.sleep(0.5)
+
+        raise GateFailure(
+            "active restart delivery obligations did not settle after explicit ambiguity handling: "
+            f"{last_obligations!r}"
+        )
+
+    def prove_post_recovery_routes(
+        self, manifest: Manifest, marker_prefix: str
+    ) -> RouteProof:
+        dm_markers = self.send_dm_markers(
+            manifest.names,
+            f"{marker_prefix}_DM",
+            after_reply_instruction=(
+                "After replying, pause peer debate and wait for the post-recovery "
+                "thread proof."
+            ),
+        )
+        dm_replies = self.wait_dm_replies(dm_markers)
+        thread_markers = participant_marker_map(
+            manifest.names, f"{marker_prefix}_THREAD_{uuid.uuid4().hex[:8]}"
+        )
+        self._post_thread(
+            self._mapped_marker_prompt(thread_markers, "post-recovery-thread")
+        )
+        thread_replies = self.wait_thread_marker_replies(thread_markers)
+        return RouteProof(
+            thread_authors={
+                name
+                for name, marker in thread_markers.items()
+                if any(
+                    row.get("from") == name
+                    and marker in str(row.get("body") or "")
+                    for row in thread_replies
+                )
+            },
+            dm_authors={
+                str(row.get("from"))
+                for row in dm_replies
+                if any(marker in str(row.get("body") or "") for marker in dm_markers.values())
+            },
+        )
+
+    def require_no_dlq(self) -> None:
+        payload = self._json_command(
+            "admin", "dlq", "list", "--json", operator=True, timeout=15
+        )
+        total = int(payload.get("total") or len(payload.get("rows") or []))
+        if total:
+            raise GateFailure(f"delivery failure: {total} dead-lettered row(s)")
+
+    def capture_evidence(self, phase: str) -> None:
+        self._evidence_sequence += 1
+        directory = self.output / phase
+        directory.mkdir(parents=True, exist_ok=True)
+        payload: dict[str, Any] = {
+            "phase": phase,
+            "capturedAt": utc_now(),
+            "lifecycle": asdict(self.capture_lifecycle()),
+            "state": asdict(self.capture_observed_state()),
+            "obligations": self._obligation_rows(),
+        }
+        write_json_atomic(directory / "state.json", payload)
+
+        loader = importlib.machinery.SourceFileLoader(
+            "nexus_endurance_watchdog_for_resurrection",
+            str(ROOT / "scripts" / "nexus-endurance-watchdog"),
+        )
+        specification = importlib.util.spec_from_loader(loader.name, loader)
+        if specification is None:
+            raise GateFailure("could not load headed evidence helper")
+        module = importlib.util.module_from_spec(specification)
+        sys.modules[loader.name] = module
+        loader.exec_module(module)
+        headed_modes = {
+            row.name: row.variant
+            for row in self.expected
+            if row.variant in {"pty", "tmux"}
+        }
+        try:
+            captures = module.capture_headed_screens(
+                output=directory,
+                sequence=self._evidence_sequence,
+                nexus=self.nexus,
+                participants=self.participant_names,
+                headed_modes=headed_modes,
+                hermes_names={
+                    row.name
+                    for row in self.expected
+                    if row.harness == "hermes" and row.variant != "headless"
+                },
+                webui_url=self.webui_url,
+            )
+        except Exception as error:
+            # Terminal captures are written before the optional browser capture. Preserve the
+            # observer failure separately; Candidate 71 proved it must not masquerade as transport
+            # loss after every message route has otherwise passed.
+            write_json_atomic(
+                directory / "observer-capture-caveat.json",
+                {"capturedAt": utc_now(), "error": repr(error)},
+            )
+        else:
+            write_json_atomic(directory / "captures.json", captures)
+
+    def notify(self, message: str) -> None:
+        digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+        self.nexus.run(
+            "notify",
+            "--target",
+            self.notify_target,
+            "--source",
+            "nexus-resurrection-gate",
+            "--idempotency-key",
+            f"resurrection:{digest}",
+            message,
+            timeout=30,
+        )
+        if self.external_notify_command:
+            subprocess.run(
+                [str(self.external_notify_command), message],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    output = args.output
+    output.mkdir(parents=True, exist_ok=True)
+    nexus = DockerNexus(
+        container=args.container,
+        binary=args.nexus_bin,
+        nexus_home=args.nexus_home,
+        codex_home=args.codex_home,
+        project=args.project,
+        controller=args.controller,
+        client_key=args.client_key,
+        docker_user=args.docker_user,
+    )
+    operations = LiveOperations(
+        nexus=nexus,
+        candidate=args.candidate,
+        thread=args.thread,
+        expected=args.participant,
+        gateway_health_url=args.gateway_health_url,
+        gateway_base_url=args.gateway_base_url,
+        webui_url=args.webui_url,
+        output=output,
+        settle_timeout=args.settle_timeout,
+        reply_timeout=args.reply_timeout,
+        ready_timeout=args.ready_timeout,
+        notify_target=args.notify_target,
+        external_notify_command=args.external_notify_command,
+    )
+    started = time.monotonic()
+    try:
+        validate_expected_matrix(args.participant)
+        manifest = operations.capture_manifest()
+        operations.notify(
+            f"RESURRECTION_STARTED: candidate {args.candidate}; active-traffic restart"
+        )
+        nonce = uuid.uuid4().hex[:12]
+        active = run_active_phase(
+            operations,
+            manifest,
+            marker_prefix=f"ACTIVE_REVIVE_{args.candidate}_{nonce}",
+            max_attempts=args.active_attempts,
+        )
+        operations.notify(
+            f"RESURRECTION_PHASE_B_PASS: candidate {args.candidate}; message={active.message_id}"
+        )
+        summary = {
+            "status": "pass",
+            "candidate": args.candidate,
+            "thread": args.thread,
+            "elapsedSeconds": round(time.monotonic() - started, 3),
+            "active": asdict(active),
+            "completedAt": utc_now(),
+        }
+        write_json_atomic(output / "summary.json", summary)
+        operations.notify(
+            f"RESURRECTION_PASSED: candidate {args.candidate}; all 12 variants survived active-traffic restart"
+        )
+        return 0
+    except Exception as error:
+        summary = {
+            "status": "fail",
+            "candidate": args.candidate,
+            "thread": args.thread,
+            "elapsedSeconds": round(time.monotonic() - started, 3),
+            "error": repr(error),
+            "failedAt": utc_now(),
+        }
+        write_json_atomic(output / "summary.json", summary)
+        try:
+            operations.notify(
+                f"RESURRECTION_FAILURE: candidate {args.candidate}; {error}"
+            )
+        except Exception as notify_error:
+            write_json_atomic(
+                output / "notification-failure.json",
+                {"error": repr(notify_error), "capturedAt": utc_now()},
+            )
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

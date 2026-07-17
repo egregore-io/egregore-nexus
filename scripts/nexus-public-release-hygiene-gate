@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Scan a Nexus public tree for private workflow, attribution, and state artifacts."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+FORBIDDEN_EXACT_PATHS = {
+    ".env",
+    "CLAUDE.md",
+    "nexus.db",
+}
+FORBIDDEN_PATH_PREFIXES = (
+    "internal/",
+    "docs/audits/",
+    "docs/incidents/",
+    "docs/plans/",
+    "docs/postmortems/",
+    "docs/superpowers/",
+)
+FORBIDDEN_ARCHIVE_SUFFIXES = (
+    ".7z",
+    ".db",
+    ".log",
+    ".pid",
+    ".sock",
+    ".sqlite",
+    ".sqlite3",
+    ".tar",
+    ".tar.gz",
+    ".tgz",
+    ".zip",
+)
+CONTENT_RULES = (
+    (
+        "operator_local_path",
+        re.compile(r"/home/earldennison|C:\\Users\\Earl|\.config/superpowers"),
+    ),
+    (
+        "private_workflow_reference",
+        re.compile(
+            r"(?:^|[\s`'\"(])internal/|docs/superpowers/|docs/TasksPreLaunch(?:\W|$)"
+        ),
+    ),
+    (
+        "internal_persona",
+        re.compile(
+            r"(?<![A-Za-z])(?:Earl(?:\s+Tan)?|Bob|Mona|Paul|lenskeeper|viola|wren)(?![A-Za-z])",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "decision_attribution",
+        re.compile(
+            r"\b[A-Z][A-Za-z]+(?:'s)?\s+(?:ruling|directs|trace)\b"
+            r"|\b[A-Z][A-Za-z]+[- ]approved\b|\bCanon:\s+[A-Z][A-Za-z]+\b"
+        ),
+    ),
+    (
+        "assistant_attribution",
+        re.compile(
+            r"\b(?:generated|written|created)\s+(?:by|with)\s+"
+            r"(?:AI|Codex|Claude|ChatGPT)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "embedded_private_key",
+        re.compile(r"-----BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY-----"),
+    ),
+    (
+        "embedded_access_token",
+        re.compile(r"\b(?:ghp_[A-Za-z0-9]{30,}|sk-[A-Za-z0-9_-]{20,})\b"),
+    ),
+)
+CANDIDATE_NARRATION = re.compile(r"\bcandidate(?:\s+|[-_])#?\d+\b", re.IGNORECASE)
+LEGACY_RELEASE_CONTRACT = re.compile(r"\blegacy\b", re.IGNORECASE)
+DOCUMENT_SUFFIXES = {".md", ".rst", ".txt"}
+CONTENT_SCAN_EXEMPT = {
+    "scripts/nexus-public-release-hygiene-gate",
+    "scripts/test-nexus-public-release-hygiene-gate",
+}
+
+
+@dataclass(frozen=True)
+class Finding:
+    code: str
+    path: str
+    line: int | None = None
+    excerpt: str | None = None
+
+
+def listed_paths(root: Path, paths_file: Path | None) -> list[str]:
+    if paths_file is not None:
+        return sorted(
+            line.strip()
+            for line in paths_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    result = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=root,
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    return sorted(
+        raw.decode("utf-8") for raw in result.stdout.split(b"\0") if raw
+    )
+
+
+def path_findings(relative: str) -> list[Finding]:
+    findings: list[Finding] = []
+    if relative in FORBIDDEN_EXACT_PATHS or relative.startswith(FORBIDDEN_PATH_PREFIXES):
+        findings.append(Finding("forbidden_path", relative))
+    lowered = relative.lower()
+    if lowered.endswith(FORBIDDEN_ARCHIVE_SUFFIXES):
+        findings.append(Finding("forbidden_archive", relative))
+    return findings
+
+
+def content_findings(root: Path, relative: str) -> list[Finding]:
+    if relative in CONTENT_SCAN_EXEMPT:
+        return []
+    path = root / relative
+    if not path.is_file():
+        return [Finding("missing_path", relative)]
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return []
+
+    findings: list[Finding] = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        excerpt = line.strip()[:240]
+        for code, pattern in CONTENT_RULES:
+            if pattern.search(line):
+                findings.append(Finding(code, relative, line_number, excerpt))
+        if path.suffix.lower() in DOCUMENT_SUFFIXES and CANDIDATE_NARRATION.search(line):
+            findings.append(
+                Finding("candidate_narration", relative, line_number, excerpt)
+            )
+        if path.suffix.lower() in DOCUMENT_SUFFIXES and LEGACY_RELEASE_CONTRACT.search(line):
+            findings.append(
+                Finding("legacy_release_contract", relative, line_number, excerpt)
+            )
+    return findings
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=ROOT)
+    parser.add_argument("--paths-file", type=Path)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    root = args.root.resolve()
+    try:
+        paths = listed_paths(root, args.paths_file)
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"public release hygiene gate failed to enumerate paths: {error}", file=sys.stderr)
+        return 2
+
+    findings: list[Finding] = []
+    for relative in paths:
+        findings.extend(path_findings(relative))
+        findings.extend(content_findings(root, relative))
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "ok": not findings,
+                    "paths": len(paths),
+                    "findings": [asdict(finding) for finding in findings],
+                },
+                indent=2,
+            )
+        )
+    elif findings:
+        print(f"FAIL public release hygiene gate: {len(findings)} finding(s)")
+        for finding in findings:
+            location = finding.path
+            if finding.line is not None:
+                location += f":{finding.line}"
+            detail = f": {finding.excerpt}" if finding.excerpt else ""
+            print(f"- {finding.code}\t{location}{detail}")
+    else:
+        print(f"PASS public release hygiene gate: {len(paths)} paths")
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

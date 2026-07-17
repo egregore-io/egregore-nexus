@@ -1,0 +1,1415 @@
+#!/usr/bin/env python3
+"""Load-regression gate: replay past incidents under synthetic load, assert none recur.
+
+Public operating guidance: docs/release-regression.md
+
+Runs entirely against the isolated docker env (scripts/nexus-docker-test-env): real embedded-store
+daemon + gateway, never the live ~/.nexus. Actors are real registered agents driven by
+scripts — consumers run `nexus listen --json` (the actual agent drain loop), senders use the CLI
+and real WS input frames, and two bare WS sockets watch the events lane. No model traffic, ever.
+
+Checks are named for catalog incidents. No latency SLOs: a check fails
+only when a past failure signature reappears (plus coarse 30s liveness bounds so hangs count).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import signal
+import sys
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_OUTPUT_DIR = ROOT / ".nexus" / "load-gate" / "latest"
+
+# Wedge signatures that are an instant gate failure wherever they appear in daemon/gateway
+# logs. Each string is a distinct past incident class — see the catalog before touching.
+INSTANT_FAIL_SIGNATURES = (
+    "no transaction is active",        # catalog #6 (begin/pin race, savepoint class)
+    "database table is locked",        # catalog #1-#4 wedge families
+    "cannot release savepoint",        # catalog #2
+    "no such savepoint",               # catalog #2
+    "invalid baton",                   # catalog #7 idle-stream expiry
+    "panicked at",                     # any Rust panic
+)
+
+# Signatures tolerated up to a budget (known open noise, ratchet down over time).
+DEFAULT_BUDGETS = {
+    "unsupported statement": 5,  # catalog #5 residual MCP-path noise (open)
+}
+
+
+@dataclass
+class SendRecord:
+    """One logical message the gate sent: body carries `LG:<msg_id>:` for receipt matching."""
+
+    msg_id: str
+    sender: str
+    kind: str  # post | dm | publish
+    targets: frozenset[str]  # recipient names expected to receive it (empty for publish)
+    t: float
+
+
+@dataclass
+class Receipt:
+    """One observation of a message arriving at a recipient's drain loop."""
+
+    recipient: str
+    row_id: str  # durable messages.id as seen by the recipient
+    t: float
+
+
+class Ledger:
+    """Send/receipt bookkeeping behind the completeness and duplicate audits.
+
+    Completeness (catalog #14/#21): every send reaches every expected live recipient.
+    Duplicates: a recipient seeing one msg_id twice (catalog #18) or one msg_id mapping to
+    more than one durable row id (catalog #19, one send -> two messages).
+    """
+
+    def __init__(self) -> None:
+        self.sends: dict[str, SendRecord] = {}
+        self.receipts: dict[str, list[Receipt]] = defaultdict(list)
+
+    def record_send(
+        self, msg_id: str, sender: str, kind: str, targets: set[str], t: float | None = None
+    ) -> None:
+        self.sends[msg_id] = SendRecord(
+            msg_id=msg_id,
+            sender=sender,
+            kind=kind,
+            targets=frozenset(targets),
+            t=time.monotonic() if t is None else t,
+        )
+
+    def record_receipt(
+        self, msg_id: str, recipient: str, row_id: str, t: float | None = None
+    ) -> None:
+        self.receipts[msg_id].append(
+            Receipt(recipient=recipient, row_id=row_id, t=time.monotonic() if t is None else t)
+        )
+
+    def missing(self) -> list[tuple[str, str]]:
+        """(msg_id, recipient) pairs that never received a recorded send."""
+        out = []
+        for msg_id, send in sorted(self.sends.items()):
+            seen = {r.recipient for r in self.receipts.get(msg_id, [])}
+            for recipient in sorted(send.targets - seen):
+                out.append((msg_id, recipient))
+        return out
+
+    def duplicates(self, allowed: set[str] | None = None) -> list[str]:
+        """Human-readable duplicate findings; `allowed` msg_ids are exempt (bounded
+        at-least-once redelivery after a restart, catalog #27)."""
+        allowed = allowed or set()
+        out = []
+        for msg_id, receipts in sorted(self.receipts.items()):
+            if msg_id in allowed:
+                continue
+            per_recipient: dict[str, int] = defaultdict(int)
+            for r in receipts:
+                per_recipient[r.recipient] += 1
+            for recipient, n in sorted(per_recipient.items()):
+                if n > 1:
+                    out.append(f"{msg_id}: recipient {recipient} received {n}x (#18)")
+            row_ids = {r.row_id for r in receipts}
+            if len(row_ids) > 1:
+                out.append(f"{msg_id}: {len(row_ids)} distinct durable rows {sorted(row_ids)} (#19)")
+        return out
+
+    def receipts_for(self, msg_id: str) -> list[Receipt]:
+        return list(self.receipts.get(msg_id, []))
+
+
+@dataclass
+class Finding:
+    signature: str
+    count: int
+    sample: str
+    over_budget: bool
+
+
+def scan_logs(text: str, budgets: dict[str, int] | None = None) -> list[Finding]:
+    """Scan pulled container logs for past-incident signatures.
+
+    Instant-fail signatures produce an over-budget Finding on the first hit; budgeted
+    signatures only when the count exceeds their allowance.
+    """
+    budgets = DEFAULT_BUDGETS if budgets is None else budgets
+    findings: list[Finding] = []
+    lines = text.splitlines()
+    for signature in INSTANT_FAIL_SIGNATURES:
+        hits = [ln for ln in lines if signature in ln]
+        if hits:
+            findings.append(
+                Finding(signature=signature, count=len(hits), sample=hits[0][:500], over_budget=True)
+            )
+    for signature, budget in budgets.items():
+        hits = [ln for ln in lines if signature in ln]
+        if hits:
+            findings.append(
+                Finding(
+                    signature=signature,
+                    count=len(hits),
+                    sample=hits[0][:500],
+                    over_budget=len(hits) > budget,
+                )
+            )
+    return findings
+
+
+@dataclass
+class Check:
+    name: str
+    ok: bool
+    evidence: str = ""
+
+
+class Summary:
+    """Named per-incident check results -> summary.json + human report + exit code."""
+
+    def __init__(self, profile: dict | None = None) -> None:
+        self.checks: list[Check] = []
+        self.profile = profile or {}
+        self.info: dict[str, object] = {}
+
+    def check(self, name: str, ok: bool, evidence: str = "") -> None:
+        self.checks.append(Check(name=name, ok=bool(ok), evidence=evidence))
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.checks) and all(c.ok for c in self.checks)
+
+    def to_dict(self) -> dict:
+        return {
+            "status": "pass" if self.ok else "fail",
+            "profile": self.profile,
+            "info": self.info,
+            "checks": [
+                {"name": c.name, "status": "pass" if c.ok else "FAIL", "evidence": c.evidence}
+                for c in self.checks
+            ],
+            "failures": [c.name for c in self.checks if not c.ok],
+        }
+
+    def write(self, output_dir: Path) -> None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "summary.json").write_text(
+            json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+    def render(self) -> str:
+        d = self.to_dict()
+        out = [f"status={d['status']}"]
+        for c in d["checks"]:
+            line = f"  {c['status']:4}  {c['name']}"
+            if c["evidence"] and c["status"] == "FAIL":
+                line += f"  — {c['evidence'][:200]}"
+            out.append(line)
+        if d["failures"]:
+            out.append("failures=" + ",".join(d["failures"]))
+        return "\n".join(out)
+
+
+def body_for(msg_id: str, filler: str = "load-gate synthetic traffic") -> str:
+    """Message body carrying the ledger key; receipts parse it back out."""
+    return f"LG:{msg_id}: {filler}"
+
+
+def msg_id_from_body(body: str) -> str | None:
+    """Inverse of body_for; None for non-gate traffic."""
+    if not body.startswith("LG:"):
+        return None
+    rest = body[3:]
+    idx = rest.find(":")
+    if idx <= 0:
+        return None
+    return rest[:idx]
+
+
+def parse_ps_cpu_seconds(time_field: str) -> int | None:
+    """Parse a `ps -o time` field ([[dd-]hh:]mm:ss) into CPU seconds; None if malformed."""
+    days = 0
+    if "-" in time_field:
+        day_part, time_field = time_field.split("-", 1)
+        try:
+            days = int(day_part)
+        except ValueError:
+            return None
+    parts = time_field.split(":")
+    try:
+        seconds = sum(int(x) * m for x, m in zip(reversed(parts), (1, 60, 3600)))
+    except ValueError:
+        return None
+    return days * 86400 + seconds
+
+
+# Processes allowed inside the container at audit time (phase 6, catalog #12): the stack
+# itself plus driver/plumbing. A harness process here means a launch escaped the gate.
+CENSUS_ALLOWED = (
+    "nexus daemon",
+    "socat",
+    "gateway-serve",
+    "node ",
+    "bash",
+    "sh -c",
+    "sleep infinity",
+    "ps -eo",
+    "python3",
+    "grep",
+)
+CENSUS_FORBIDDEN = ("codex", "claude", "opencode", "hermes", "tmux", "app-server")
+
+
+def census_violettions(ps_output: str) -> list[str]:
+    """Container process census: forbidden harness patterns anywhere, or commands outside
+    the allowed set. Zombies are skipped — the container's `sleep infinity` init never
+    reaps, so every past build/test leaves a harmless `<defunct>` corpse. Returns
+    human-readable violations."""
+    out: list[str] = []
+    for line in ps_output.strip().splitlines()[1:]:  # skip header
+        if "<defunct>" in line:
+            continue
+        args = line.split(None, 1)[1] if len(line.split(None, 1)) > 1 else line
+        lowered = args.lower()
+        if any(bad in lowered for bad in CENSUS_FORBIDDEN):
+            out.append(f"forbidden harness process: {args[:120]}")
+        elif not any(allowed in args for allowed in CENSUS_ALLOWED):
+            out.append(f"unexpected process: {args[:120]}")
+    return out
+
+
+def split_json_objects(buffer: str) -> tuple[list[dict], str]:
+    """Split a stream of concatenated (pretty-printed) JSON objects.
+
+    `nexus listen --json` prints one pretty-printed JSON object per batch; objects arrive
+    interleaved across reads, so we brace-scan (string/escape aware) and return every complete
+    object plus the unconsumed tail.
+    """
+    objects: list[dict] = []
+    depth = 0
+    in_string = False
+    escape = False
+    start = None
+    consumed = 0
+    for i, ch in enumerate(buffer):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    chunk = buffer[start : i + 1]
+                    try:
+                        objects.append(json.loads(chunk))
+                    except json.JSONDecodeError:
+                        pass  # malformed chunk: drop, keep scanning
+                    consumed = i + 1
+                    start = None
+    return objects, buffer[consumed:]
+
+
+# ---------------------------------------------------------------------------
+# Docker test-env plumbing
+# ---------------------------------------------------------------------------
+
+import os
+import shlex
+import subprocess
+
+
+CONTAINER = os.environ.get("NEXUS_DOCKER_TEST_NAME", "nexus-test")
+HOST_PORT = os.environ.get("NEXUS_DOCKER_TEST_PORT", "4510")
+NEXUS_BIN = "/tmp/nexus-target/debug/nexus"
+DOCKER_ENV = ROOT / "scripts" / "nexus-docker-test-env"
+# TTL must dominate worst-case consumer drain latency under load (run-9 lesson: a 10s TTL
+# dead-lettered the slowest live consumer's mail mid-run). 120s still lets the phase-4 ghost
+# check observe TTL->DLQ well inside the gate window.
+GATE_DAEMON_ENV = {
+    "NEXUS_DELIVERY_TTL_MS": "120000",
+    "NEXUS_DELIVERY_SWEEP_INTERVAL_MS": "10000",
+}
+
+
+@dataclass
+class Actor:
+    name: str
+    client_key: str
+    agent_id: str = ""
+    credential: str = ""
+
+
+@dataclass
+class Fleet:
+    actors: list[Actor]
+    ghost: Actor
+    threads: dict[str, list[str]]  # thread name -> member actor names
+    topic: str = "load.topic"
+
+    def by_name(self, name: str) -> Actor:
+        if name == self.ghost.name:
+            return self.ghost
+        return next(a for a in self.actors if a.name == name)
+
+
+class GateError(RuntimeError):
+    pass
+
+
+class Env:
+    """Everything the gate does to the container: CLI as an actor, raw bash, DB reads,
+    daemon bounce with gate env, log pulls."""
+
+    def __init__(self, container: str = CONTAINER, host_port: str = HOST_PORT) -> None:
+        self.container = container
+        self.host_port = host_port
+
+    def actor_env_args(self, actor: Actor) -> list[str]:
+        env = {
+            "NEXUS_NAME": actor.name,
+            "NEXUS_CLIENT_KEY": actor.client_key,
+            "NEXUS_PROJECT": "load",
+            "NEXUS_AGENT": "other",
+        }
+        out: list[str] = []
+        for k, v in env.items():
+            out += ["-e", f"{k}={v}"]
+        return out
+
+    def nexus(self, actor: Actor, *args: str, timeout: int = 30, check: bool = True) -> str:
+        cmd = ["docker", "exec", *self.actor_env_args(actor), self.container, NEXUS_BIN, *args]
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+        if check and proc.returncode != 0:
+            raise GateError(
+                f"nexus {' '.join(args)} as {actor.name} failed rc={proc.returncode}: "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        return proc.stdout
+
+    def operator_nexus(self, *args: str, timeout: int = 30) -> str:
+        """Run the CLI as the container's zero-auth local operator (admin tier) — no
+        NEXUS_* env. Needed for admin-gated surfaces (credentials create, admin rename)."""
+        cmd = ["docker", "exec", self.container, NEXUS_BIN, *args]
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout)
+        if proc.returncode != 0:
+            raise GateError(
+                f"operator nexus {' '.join(args)} failed rc={proc.returncode}: "
+                f"{proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        return proc.stdout
+
+    def nexus_popen_args(self, actor: Actor, *args: str) -> list[str]:
+        """argv for a long-running actor process (e.g. `listen --json`)."""
+        return ["docker", "exec", *self.actor_env_args(actor), self.container, NEXUS_BIN, *args]
+
+    def bash(self, script: str, timeout: int = 120, check: bool = True) -> str:
+        proc = subprocess.run(
+            ["docker", "exec", self.container, "bash", "-c", script],
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+        if check and proc.returncode != 0:
+            raise GateError(f"container bash failed rc={proc.returncode}: {proc.stderr.strip()}")
+        return proc.stdout
+
+    def db_query(self, sql: str) -> list[list]:
+        """Read-only forensic SQL against the daemon-owned embedded test file."""
+        script = (
+            "import json,sqlite3;"
+            "con=sqlite3.connect('file:/tmp/nexus-home/nexus.db?mode=ro',uri=True);"
+            f"print(json.dumps(con.execute({sql!r}).fetchall()))"
+        )
+        out = self.bash(f"python3 -c {shlex.quote(script)}")
+        return json.loads(out)
+
+    def pull_logs(self) -> dict[str, str]:
+        logs = {}
+        for name, path in (
+            ("daemon", "/tmp/nexus-home/daemon.log"),
+            ("gateway-proxy", "/tmp/nexus-home/gateway-proxy.log"),
+        ):
+            logs[name] = self.bash(f"cat {path} 2>/dev/null || true", check=False)
+        return logs
+
+    def daemon_pid(self) -> str:
+        return self.bash("cat /tmp/nexus-home/daemon.pid").strip()
+
+    def quiesce(self) -> None:
+        """Kill in-container gate consumers (best-effort). `docker exec` children do NOT
+        die with the host driver — a SIGKILL'd run once left 6 `nexus listen` loops burning host
+        cores for hours (N16, 2026-07-10). Called from run_gate's
+        finally AND as a backstop at the start of every run."""
+        self.bash("pkill -f 'nexus listen' 2>/dev/null; true", check=False)
+
+    def reset_state(self) -> None:
+        """Wipe the daemon-owned embedded store for a clean-state run without rebuilding."""
+        # A prior headed gate can leave tmux/plugin sidecars after their daemon parent exits.
+        # Restarting the one disposable container is the only complete process-tree boundary and
+        # prevents those children from contaminating the process census or consuming resources.
+        restarted = subprocess.run(
+            ["docker", "restart", self.container],
+            text=True,
+            capture_output=True,
+            timeout=120,
+        )
+        if restarted.returncode != 0:
+            raise GateError(
+                f"container process reap failed rc={restarted.returncode}: "
+                f"{restarted.stderr.strip() or restarted.stdout.strip()}"
+            )
+        self.bash(
+            "set -uo pipefail; "
+            "for f in daemon.pid; do "
+            "  pid=$(cat /tmp/nexus-home/$f 2>/dev/null || true); "
+            "  [ -n \"$pid\" ] && kill \"$pid\" 2>/dev/null; "
+            "done; sleep 1; "
+            "rm -rf /tmp/nexus-home/nexus.db /tmp/nexus-home/nexus.db-shm "
+            "/tmp/nexus-home/nexus.db-wal /dev/shm/nexus-stream.db "
+            "/tmp/nexus-home/daemon.log "
+            "/tmp/nexus-home/gateway.json /tmp/nexus-home/gateway.log; true",
+            check=False,
+        )
+        self.bash(
+            "set -euo pipefail; "
+            "mkdir -p /tmp/nexus-home; "
+            "nohup socat TCP-LISTEN:4100,fork,reuseaddr,bind=0.0.0.0 "
+            "TCP:127.0.0.1:4101 > /tmp/nexus-home/gateway-proxy.log 2>&1 & "
+            "echo $! > /tmp/nexus-home/gateway-proxy.pid"
+        )
+
+    def restart_daemon(self, extra_env: dict[str, str] | None = None) -> None:
+        """Bounce the disposable gateway and daemon together, applying the gate env.
+
+        The load scenario asserts WebSocket reconnection after this boundary. Since the
+        gateway is now independently installed, stop it explicitly before the daemon so
+        no stale gateway child can retain the gateway port across the restart.
+        """
+        env = dict(GATE_DAEMON_ENV)
+        env.update(extra_env or {})
+        exports = " ".join(f"export {k}={shlex.quote(v)};" for k, v in env.items())
+        self.bash(
+            f"{NEXUS_BIN} gateway stop --force >/dev/null 2>&1 || true",
+            check=False,
+        )
+        self.bash(
+            "set -euo pipefail; "
+            "pid=$(cat /tmp/nexus-home/daemon.pid 2>/dev/null || true); "
+            "if [ -n \"$pid\" ]; then kill \"$pid\" 2>/dev/null || true; "
+            "for _ in $(seq 1 50); do kill -0 \"$pid\" 2>/dev/null || break; sleep 0.2; done; "
+            "kill -9 \"$pid\" 2>/dev/null || true; fi"
+        )
+        self.bash(
+            "set -euo pipefail; "
+            'export NEXUS_STREAM_DB_PATH="${NEXUS_STREAM_DB_PATH:-/dev/shm/nexus-stream.db}"; '
+            'export NEXUS_DB_PATH="${NEXUS_DB_PATH:-/tmp/nexus-home/nexus.db}"; '
+            # Debug-build daemons overflow the default 2MB tokio worker stacks at boot
+            # (deep poll chains; release is unaffected). Root cause tracked separately —
+            # without this the container daemon aborts within seconds.
+            "export RUST_MIN_STACK=33554432; "
+            + exports
+            + " cd /work/egregore-nexus; "
+            f"nohup {NEXUS_BIN} daemon >> /tmp/nexus-home/daemon.log 2>&1 & "
+            'echo "$!" > /tmp/nexus-home/daemon.pid'
+        )
+        self.bash(f"{NEXUS_BIN} gateway start >/tmp/nexus-home/gateway-start.log")
+        self.wait_healthy()
+
+    def wait_healthy(self, timeout_s: int = 60) -> None:
+        deadline = time.monotonic() + timeout_s
+        url = f"http://127.0.0.1:{self.host_port}/api/v1/health"
+        import urllib.request
+
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(url, timeout=2) as resp:
+                    daemon = subprocess.run(
+                        [
+                            "docker",
+                            "exec",
+                            self.container,
+                            NEXUS_BIN,
+                            "members",
+                            "--include-offline",
+                        ],
+                        text=True,
+                        capture_output=True,
+                        timeout=2,
+                    )
+                    if resp.status == 200 and daemon.returncode == 0:
+                        return
+            except Exception:
+                pass
+            time.sleep(0.5)
+        raise GateError(f"gateway/daemon not healthy within {timeout_s}s ({url})")
+
+    def up(self, fresh: bool, skip_build: bool) -> None:
+        if fresh:
+            subprocess.run([str(DOCKER_ENV), "down"], check=False, capture_output=True, text=True)
+        if not skip_build:
+            proc = subprocess.run([str(DOCKER_ENV), "build"], capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise GateError(f"docker build failed: {proc.stderr[-2000:]}")
+        proc = subprocess.run([str(DOCKER_ENV), "up"], capture_output=True, text=True, timeout=1800)
+        if proc.returncode != 0:
+            raise GateError(f"docker up failed: {proc.stderr[-2000:] or proc.stdout[-2000:]}")
+
+
+CRED_ANNOUNCE = "credential"
+
+
+def parse_credential_line(line: str) -> tuple[str, str, str]:
+    """Parse `agents credentials create` output: `{agent_id} credential {cred_id} secret {secret}`."""
+    parts = line.split()
+    if len(parts) < 5 or parts[1] != CRED_ANNOUNCE or parts[3] != "secret":
+        raise GateError(f"unexpected credentials output: {line!r}")
+    return parts[0], parts[2], parts[4]
+
+
+def registration_actors(
+    actors: list[Actor], ghost: Actor, *, include_ghost: bool
+) -> list[Actor]:
+    """Actors allowed to assert liveness during one registration pass.
+
+    The initial pass registers the dead-target control so it is addressable. A post-restart
+    re-adoption pass must exclude it: re-registering is authenticated activity and would make the
+    supposedly dead control online immediately before the presence assertion.
+    """
+    return [*actors, *([ghost] if include_ghost else [])]
+
+
+def provision(env: Env, n_agents: int, *, include_ghost: bool = True) -> Fleet:
+    """Register actors + ghost, mint adopt credentials, create the load threads."""
+    actors = [Actor(name=f"lg{i:02d}", client_key=f"ck_lg{i:02d}") for i in range(1, n_agents + 1)]
+    ghost = Actor(name="lgghost", client_key="ck_lgghost")
+
+    for actor in registration_actors(actors, ghost, include_ghost=include_ghost):
+        env.nexus(
+            actor,
+            "register",
+            "--name",
+            actor.name,
+            "--agent",
+            "other",
+            "--project",
+            "load",
+            "--client-key",
+            actor.client_key,
+        )
+    for actor in actors:  # ghost gets no credential: it must never re-adopt
+        line = (
+            env.operator_nexus("agents", "credentials", "create", actor.name)
+            .strip()
+            .splitlines()[-1]
+        )
+        actor.agent_id, _cred_id, actor.credential = parse_credential_line(line)
+
+    names = [a.name for a in actors]
+    threads = {
+        "load-a": names[: max(1, min(4, len(names)))] + [ghost.name],
+        "load-b": names[: max(1, min(6, len(names)))],
+        "load-c": names,
+    }
+    for thread, members in threads.items():
+        creator = actors[0]
+        member_flags: list[str] = []
+        for m in members:
+            member_flags += ["--member", m]
+        try:
+            env.nexus(creator, "thread", "new", thread, *member_flags)
+        except GateError as error:
+            # Idempotent reruns against a reused container: the thread already exists.
+            if "already bound" not in str(error) and "already exists" not in str(error):
+                raise
+    fleet = Fleet(actors=actors, ghost=ghost, threads=threads)
+    # Topic subscribers: publishes need observable recipients for the completeness audit.
+    for actor in actors[: min(3, len(actors))]:
+        try:
+            env.nexus(actor, "subscribe", fleet.topic)
+        except GateError as error:
+            if "already" not in str(error):
+                raise
+    return fleet
+
+
+# ---------------------------------------------------------------------------
+# Actors: consumers on the real drain loop, senders over CLI + WS, events lane
+# ---------------------------------------------------------------------------
+
+import asyncio
+import random
+
+
+class Consumer:
+    """One actor's real drain loop: `nexus listen --json` inside the container. Receipts are
+    parsed from the pretty-printed batch JSON stream and recorded in the ledger — this is the
+    same path a live agent uses, so pending→delivered→acked is driven for real."""
+
+    def __init__(self, env: Env, actor: Actor, ledger: Ledger) -> None:
+        self.env = env
+        self.actor = actor
+        self.ledger = ledger
+        self.proc: asyncio.subprocess.Process | None = None
+        self.task: asyncio.Task | None = None
+        self.received = 0
+        self.errors: list[str] = []
+
+    async def start(self) -> None:
+        self.proc = await asyncio.create_subprocess_exec(
+            *self.env.nexus_popen_args(self.actor, "listen", "--json"),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        self.task = asyncio.create_task(self._pump(), name=f"consumer-{self.actor.name}")
+        # Drain stderr CONCURRENTLY: an unread stderr pipe fills and blocks the child mid-write,
+        # stalling its drain loop (run-10 lesson — one 'deaf' consumer per run, always the
+        # chattiest). Keep the last lines only for the consumers-clean check.
+        self.stderr_task = asyncio.create_task(self._pump_stderr(), name=f"stderr-{self.actor.name}")
+
+    async def _pump_stderr(self) -> None:
+        assert self.proc and self.proc.stderr
+        while True:
+            line = await self.proc.stderr.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", "replace").strip()
+            # Recovery warnings ("warn: listen step failed ... retrying") are the resilience
+            # WORKING, not a failure; only unrecovered errors count.
+            if text.startswith("error"):
+                self.errors.append(text[:300])
+                del self.errors[:-5]
+
+    async def _pump(self) -> None:
+        assert self.proc and self.proc.stdout
+        buffer = ""
+        while True:
+            chunk = await self.proc.stdout.read(65536)
+            if not chunk:
+                break
+            buffer += chunk.decode("utf-8", "replace")
+            objects, buffer = split_json_objects(buffer)
+            for batch in objects:
+                for message in [*batch.get("dms", []), *batch.get("threads", [])]:
+                    msg_id = msg_id_from_body(message.get("body", ""))
+                    if msg_id is None:
+                        continue
+                    row_id = message.get("id", "")
+                    if isinstance(row_id, dict):
+                        row_id = row_id.get("0") or json.dumps(row_id)
+                    self.ledger.record_receipt(msg_id, self.actor.name, str(row_id))
+                    self.received += 1
+
+    async def stop(self) -> None:
+        if self.task:
+            self.task.cancel()
+        if getattr(self, "stderr_task", None):
+            self.stderr_task.cancel()
+        if self.proc and self.proc.returncode is None:
+            self.proc.kill()
+            await self.proc.wait()
+
+
+class EventsLane:
+    """Bare WS socket on the dedicated events lane: subscribe frames only, no observe target.
+    Collects durable developer-event envelopes for the #63 serve-path check."""
+
+    def __init__(self, host_port: str, topics: list[str]) -> None:
+        self.url = f"ws://127.0.0.1:{host_port}/api/agui/ws"
+        self.topics = topics
+        self.envelopes: dict[str, list[dict]] = {t: [] for t in topics}
+        self.errors: list[str] = []
+        self.task: asyncio.Task | None = None
+        self._stop = asyncio.Event()
+
+    async def start(self) -> None:
+        self.task = asyncio.create_task(self._run(), name="events-lane")
+
+    async def _run(self) -> None:
+        import websockets
+
+        try:
+            async with websockets.connect(self.url, open_timeout=10) as socket:
+                for topic in self.topics:
+                    await socket.send(json.dumps({"t": "subscribe", "topic": topic, "afterSeq": 0}))
+                while not self._stop.is_set():
+                    try:
+                        raw = await asyncio.wait_for(socket.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    frame = json.loads(raw)
+                    if frame.get("t") in ("subscribe.err",):
+                        self.errors.append(json.dumps(frame)[:300])
+                    if frame.get("type") == "developer.event":
+                        event = frame.get("event", {})
+                        topic = event.get("topic", "")
+                        if topic in self.envelopes:
+                            self.envelopes[topic].append(event)
+        except Exception as error:  # connection-level failure IS a finding
+            self.errors.append(f"events lane: {error!r}"[:300])
+
+    async def stop(self) -> None:
+        self._stop.set()
+        if self.task:
+            try:
+                await asyncio.wait_for(self.task, timeout=5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                self.task.cancel()
+
+
+class WsSender:
+    """A WS session-input sender for the #58 bare-legacy-frame compat check: bare
+    `{t:"input",text}` frames on a `?thread=`-scoped socket must ack, never `input.err`."""
+
+    def __init__(self, host_port: str, thread: str) -> None:
+        self.url = f"ws://127.0.0.1:{host_port}/api/agui/ws?thread={thread}"
+        self.acks = 0
+        self.errors: list[str] = []
+        self.socket = None
+
+    async def connect(self) -> None:
+        import websockets
+
+        self.socket = await websockets.connect(self.url, open_timeout=10)
+
+    async def send_bare(self, text: str, timeout: float = 30.0) -> None:
+        assert self.socket
+        await self.socket.send(json.dumps({"t": "input", "text": text}))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            raw = await asyncio.wait_for(self.socket.recv(), timeout=deadline - time.monotonic())
+            frame = json.loads(raw)
+            if frame.get("t") == "input.ack":
+                self.acks += 1
+                return
+            if frame.get("t") == "input.err":
+                self.errors.append(frame.get("error", "")[:300])
+                return
+        self.errors.append("no ack within timeout")
+
+    async def close(self) -> None:
+        if self.socket:
+            await self.socket.close()
+
+
+async def run_phases(env: Env, fleet: Fleet, summary: Summary, args: argparse.Namespace) -> Ledger:
+    """Phases 1-2: mixed load with bursts, then the idle gap. Later phases extend this."""
+    ledger = Ledger()
+    run_started = time.monotonic()
+    rng = random.Random(args.seed)
+    # Per-run nonce baked into every msg_id: the traffic MIX stays seed-deterministic, but ids
+    # must be globally unique across runs — a reused container replays prior runs' leftovers,
+    # and colliding ids masquerade as #19 duplicates (run-7 forensics: "dup" rows 303s apart).
+    run_nonce = f"{int(time.time()) & 0xFFFFFF:06x}"
+    live_names = {a.name for a in fleet.actors}
+
+    consumers = [Consumer(env, a, ledger) for a in fleet.actors]
+    for consumer in consumers:
+        await consumer.start()
+    lane = EventsLane(env.host_port, ["sys.agent.lifecycle", f"sys.thread.load-a"])
+    await lane.start()
+    await asyncio.sleep(2)  # subscriptions settle
+
+    topic_subscribers = {a.name for a in fleet.actors[: min(3, len(fleet.actors))]}
+    thread_names = list(fleet.threads)
+
+    def cli_send(actor: Actor, kind: str) -> None:
+        msg_id = f"{run_nonce}{rng.getrandbits(48):012x}"
+        body = body_for(msg_id)
+        started = time.monotonic()
+        if kind == "post":
+            thread = rng.choice([t for t, m in fleet.threads.items() if actor.name in m])
+            env.nexus(actor, "post", thread, "-m", body, timeout=35)
+            targets = (set(fleet.threads[thread]) - {actor.name, fleet.ghost.name}) & live_names
+        elif kind == "dm":
+            recipient = rng.choice([a for a in fleet.actors if a.name != actor.name])
+            env.nexus(actor, "dm", recipient.name, "-m", body, timeout=35)
+            targets = {recipient.name}
+        else:
+            env.nexus(actor, "publish", fleet.topic, "-m", body, timeout=35)
+            targets = topic_subscribers - {actor.name}
+        elapsed = time.monotonic() - started
+        ledger.record_send(msg_id, actor.name, kind, targets, t=started)
+        if elapsed > 30:
+            summary.check(f"send-liveness-{msg_id}", False, f"{kind} took {elapsed:.1f}s (#9)")
+
+    # Ghost DMs early: these are the TTL->DLQ probe (#24) — deliberately excluded from the
+    # completeness audit (the ghost never listens).
+    ghost_msg_ids = []
+    for _ in range(3):
+        msg_id = f"{run_nonce}{rng.getrandbits(48):012x}"
+        env.nexus(fleet.actors[0], "dm", fleet.ghost.name, "-m", body_for(msg_id), timeout=35)
+        ghost_msg_ids.append(msg_id)
+    summary.info["ghost_msg_ids"] = ghost_msg_ids
+
+    # Phase 1: mixed steady load with bursts of 5.
+    send_errors = 0
+    total = max(10, args.messages)
+    sent = 0
+    while sent < total:
+        burst = min(5, total - sent) if rng.random() < 0.3 else 1
+        for _ in range(burst):
+            actor = rng.choice(fleet.actors)
+            roll = rng.random()
+            kind = "post" if roll < 0.7 else ("dm" if roll < 0.9 else "publish")
+            try:
+                cli_send(actor, kind)
+            except (GateError, Exception) as error:  # noqa: BLE001 — every failure is evidence
+                send_errors += 1
+                if send_errors <= 5:
+                    summary.check(f"send-error-{sent}", False, str(error)[:300])
+            sent += 1
+        await asyncio.sleep(0.05 if burst > 1 else 0.15)
+    summary.check("sends-complete-#6", send_errors == 0, f"{send_errors} of {sent} sends failed")
+
+    # WS bare-frame compat (#58): a handful of legacy frames on a thread-scoped socket.
+    ws = WsSender(env.host_port, "load-a")
+    ws_msg_ids = []
+    try:
+        await ws.connect()
+        for _ in range(5):
+            msg_id = f"{run_nonce}{rng.getrandbits(48):012x}"
+            await ws.send_bare(body_for(msg_id))
+            ws_msg_ids.append(msg_id)
+        await ws.close()
+    except Exception as error:  # noqa: BLE001
+        ws.errors.append(repr(error)[:300])
+    summary.check(
+        "ws-bare-input-acks-#58",
+        ws.acks == 5 and not ws.errors,
+        f"acks={ws.acks} errors={ws.errors[:2]}",
+    )
+    summary.info["ws_msg_ids"] = ws_msg_ids
+
+    # Phase 2: idle gap — total silence, then resume through the same daemon IPC client.
+    await asyncio.sleep(30)
+    try:
+        cli_send(fleet.actors[0], "post")
+        post_gap_ok = True
+    except Exception as error:  # noqa: BLE001
+        post_gap_ok = False
+        summary.check("idle-gap-resume-#7", False, str(error)[:300])
+    if post_gap_ok:
+        summary.check("idle-gap-resume-#7", True)
+
+    async def drain(ceiling_s: float = 360, stall_s: float = 45) -> None:
+        """Progress-based drain: wait while receipts still grow; stop on stall/ceiling.
+        stall must exceed listen's max backoff (8s) with margin."""
+        ceiling = time.monotonic() + ceiling_s
+        last_count = -1
+        last_progress = time.monotonic()
+        while time.monotonic() < ceiling and ledger.missing():
+            count = sum(len(r) for r in ledger.receipts.values())
+            if count > last_count:
+                last_count = count
+                last_progress = time.monotonic()
+            elif time.monotonic() - last_progress > stall_s:
+                break
+            if any(c.proc and c.proc.returncode is not None for c in consumers):
+                break  # a dead consumer can never drain its mail; stop waiting on it
+            await asyncio.sleep(2)
+
+    await drain()
+
+    # ---------------- Phase 3: daemon restart mid-run (#25/#27/#41, #29 clean stop) --------
+    allowed_redelivery: set[str] = set()
+    if not args.no_restart:
+        # Snapshot unacked LG deliveries BEFORE the bounce: bounded at-least-once redelivery
+        # is allowed ONLY for these (#27); anything else re-delivered is a dup regression.
+        # Bounded at-least-once redelivery (#27) can hit any message whose SUBSCRIPTION batch
+        # was un-acked at the bounce — invisible from in_flight state alone (a message can be
+        # acked while its durable batch is not). Allow every pre-restart id; post-restart
+        # sends stay strict.
+        allowed_redelivery = set(ledger.sends)
+        summary.info["restart_allowed_redelivery"] = len(allowed_redelivery)
+
+        # #29 (N18): a graceful daemon stop must exit CLEAN — no error tombstone or deploy
+        # script abort between stop and start.
+        log_len_before = int(
+            env.bash("wc -c < /tmp/nexus-home/daemon.log 2>/dev/null || echo 0").strip() or 0
+        )
+        env.bash(
+            "pid=$(cat /tmp/nexus-home/daemon.pid 2>/dev/null); "
+            "[ -n \"$pid\" ] && kill -TERM \"$pid\"; "
+            "for _ in $(seq 1 50); do kill -0 \"$pid\" 2>/dev/null || exit 0; sleep 0.5; done; "
+            "exit 1",
+            timeout=40,
+            check=False,
+        )
+        shutdown_tail = env.bash(
+            f"tail -c +{log_len_before + 1} /tmp/nexus-home/daemon.log 2>/dev/null || true",
+            check=False,
+        )
+        tombstones = [
+            ln
+            for ln in shutdown_tail.splitlines()
+            if ln.startswith("error:") or "unsupported statement" in ln
+        ]
+        summary.check(
+            "clean-shutdown-#29",
+            not tombstones,
+            f"shutdown wrote error tombstones: {tombstones[:2]}",
+        )
+
+        env.restart_daemon()
+        # The events lane's WS died with the bounced gateway; phase 4 asserts a rename event
+        # arrives on it, so reconnect (afterSeq=0 replays the durable ring — no event loss).
+        await lane.stop()
+        lane = EventsLane(env.host_port, ["sys.agent.lifecycle", "sys.thread.load-a"])
+        await lane.start()
+        await asyncio.sleep(2)
+        # #41: idempotent re-registration after the bounce — any 'name already bound' is the
+        # re-adoption regression.
+        try:
+            provision(env, args.agents, include_ghost=False)
+            summary.check("re-adoption-clean-#41", True)
+        except GateError as error:
+            summary.check("re-adoption-clean-#41", False, str(error)[:300])
+
+        # #25: post-restart traffic reaches EVERY consumer (their listen loops survive the
+        # bounce via N14 retry + fresh subscription; no consumer restart on the driver side).
+        before_counts = {c.actor.name: c.received for c in consumers}
+        for i in range(max(12, 3 * len(fleet.actors))):
+            actor = fleet.actors[i % len(fleet.actors)]
+            try:
+                cli_send(actor, "post")
+            except Exception as error:  # noqa: BLE001
+                summary.check(f"post-restart-send-{i}", False, str(error)[:200])
+            await asyncio.sleep(0.1)
+        await drain(ceiling_s=240)
+        deaf = [
+            c.actor.name
+            for c in consumers
+            if c.received == before_counts[c.actor.name]
+        ]
+        summary.check(
+            "post-restart-delivery-#25",
+            not deaf,
+            f"consumers with ZERO post-restart receipts: {deaf}",
+        )
+
+    # ---------------- Phase 4: lifecycle stimuli (#24 ghost TTL->DLQ, #43 rename, #31) -----
+    # Mid-run rename: a live actor changes name; its drain loop is identity-keyed so traffic
+    # must keep flowing, and a rename lifecycle event must reach the events lane.
+    rename_target = fleet.actors[1] if len(fleet.actors) > 1 else fleet.actors[0]
+    old_name, new_name = rename_target.name, f"{rename_target.name}r"
+    try:
+        env.operator_nexus("admin", "rename", old_name, new_name)
+        # Membership/identity follow the stable agent id; retarget the ledger label so
+        # future sends expect the new name.
+        rename_target.name = new_name
+        summary.info["renames"] = {old_name: new_name}
+        for thread_members in fleet.threads.values():
+            if old_name in thread_members:
+                thread_members[thread_members.index(old_name)] = new_name
+        # The old listen loop authenticated as the OLD name; a rename invalidates that
+        # caller binding (run-1 finding: it dies "caller does not match registered client
+        # key"). Restart the drain loop under the new name — the real-agent flow.
+        renamed_consumer = next(c for c in consumers if c.actor is rename_target)
+        await renamed_consumer.stop()
+        await renamed_consumer.start()
+        renamed_ok = True
+    except GateError as error:
+        renamed_ok = False
+        summary.check("mid-run-rename-#43", False, f"admin rename failed: {error}"[:300])
+    if renamed_ok:
+        # Post-rename traffic must reach the renamed consumer's (old) drain loop. Receipts
+        # are recorded under the actor object's CURRENT name.
+        live_names.discard(old_name)
+        live_names.add(new_name)
+        before = next(c.received for c in consumers if c.actor is rename_target)
+        for _ in range(4):
+            sender = fleet.actors[0] if fleet.actors[0] is not rename_target else fleet.actors[-1]
+            try:
+                cli_send(sender, "post")
+            except Exception as error:  # noqa: BLE001
+                summary.check("mid-run-rename-#43", False, f"post-rename send failed: {error}"[:200])
+                renamed_ok = False
+                break
+            await asyncio.sleep(0.2)
+    if renamed_ok:
+        await drain(ceiling_s=120)
+        after = next(c.received for c in consumers if c.actor is rename_target)
+        lifecycle_dump = json.dumps(lane.envelopes.get("sys.agent.lifecycle", []))
+        summary.check(
+            "mid-run-rename-#43",
+            after > before and '"rename"' in lifecycle_dump,
+            f"receipts {before}->{after}; rename event on lane: {'yes' if 'rename' in lifecycle_dump else 'NO'}",
+        )
+
+    # #24: ghost mail must dead-letter via TTL — and NOTHING else may. Wait out the TTL
+    # window for the ghost's phase-1 DMs (sent at run start; TTL 120s + sweep 10s).
+    ghost_deadline = time.monotonic() + 150
+    ghost_states: list[list] = []
+    while time.monotonic() < ghost_deadline:
+        ghost_states = env.db_query(
+            "SELECT f.state, COUNT(*) FROM in_flight f "
+            "JOIN sessions s ON s.session_id = f.recipient_session "
+            "WHERE s.name = 'lgghost' GROUP BY f.state"
+        )
+        undead = {s for s, _ in ghost_states} & {"pending", "notified"}
+        if ghost_states and not undead:
+            break
+        await asyncio.sleep(10)
+    ghost_final = {s: n for s, n in ghost_states}
+    summary.check(
+        "ghost-ttl-dlq-#24",
+        bool(ghost_final) and not ({"pending", "notified"} & set(ghost_final)),
+        f"ghost delivery states after TTL window: {ghost_final}",
+    )
+    stray_dead = env.db_query(
+        "SELECT s.name, COUNT(*) FROM in_flight f "
+        "JOIN sessions s ON s.session_id = f.recipient_session "
+        "WHERE f.state IN ('error','dead_letter') AND s.name <> 'lgghost' GROUP BY s.name"
+    )
+    summary.check(
+        "ttl-dlq-scoped-#24",
+        not stray_dead,
+        f"NON-ghost dead-lettered mail: {stray_dead}",
+    )
+
+    # #31: roster truth while the listeners are still alive — every live actor online
+    # (listen refreshes heartbeats), the ghost never online.
+    roster_rows = env.db_query(
+        "SELECT name, COALESCE(presence,'offline') FROM sessions WHERE name LIKE 'lg%'"
+    )
+    roster = {name: presence for name, presence in roster_rows}
+    offline_live = [a.name for a in fleet.actors if roster.get(a.name) != "online"]
+    summary.check(
+        "presence-truth-#31",
+        not offline_live and roster.get("lgghost") != "online",
+        f"live-but-offline: {offline_live}; ghost: {roster.get('lgghost')}",
+    )
+
+    # ---------------- Phase 5: probes (#57 wrong-path WS) -----------------------------------
+    # A WS upgrade on the WRONG path must be refused fast, never hang the socket.
+    async def wrong_path_probe() -> str | None:
+        import websockets
+
+        try:
+            socket = await asyncio.wait_for(
+                websockets.connect(f"ws://127.0.0.1:{env.host_port}/ws", open_timeout=5),
+                timeout=5,
+            )
+        except Exception:  # refusal (HTTP error / timeout handshake reject) is the PASS
+            return None
+        # An accepted socket on a bogus path must at least close promptly.
+        try:
+            await asyncio.wait_for(socket.recv(), timeout=5)
+            return "wrong-path WS accepted AND stayed open"
+        except asyncio.TimeoutError:
+            return "wrong-path WS accepted and hung (no close within 5s)"
+        except Exception:
+            return None
+        finally:
+            try:
+                await socket.close()
+            except Exception:
+                pass
+
+    wrong_path = await wrong_path_probe()
+    summary.check("wrong-path-ws-#57", wrong_path is None, wrong_path or "")
+
+    # ---------------- N16b: consumer CPU audit (busy-poll regression) -----------------------
+    # An idle `nexus listen` loop must not pin a core (six consumers once burned six CPUs).
+    run_wall_s = max(1.0, time.monotonic() - run_started)
+    cpu_rows = env.bash(
+        "ps -eo pid,time,args | grep 'nexus listen' | grep -v grep || true", check=False
+    )
+    hot: list[str] = []
+    for line in cpu_rows.strip().splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        cpu_s = parse_ps_cpu_seconds(parts[1])
+        if cpu_s is not None and cpu_s > 0.25 * run_wall_s:
+            hot.append(f"pid {parts[0]} burned {cpu_s}s CPU over {run_wall_s:.0f}s wall")
+    summary.check("listen-idle-cpu-N16b", not hot, "; ".join(hot[:3]))
+
+    # Capture consumer liveness BEFORE stopping them: our own shutdown kill (rc=-9) must not
+    # masquerade as a mid-run death (run-13 lesson — first all-functional-green run "failed"
+    # on our own SIGKILLs).
+    dead = [
+        f"{c.actor.name} exited rc={c.proc.returncode} after {c.received} receipts"
+        for c in consumers
+        if c.proc and c.proc.returncode is not None
+    ]
+    for consumer in consumers:
+        await consumer.stop()
+    await lane.stop()
+
+    missing = ledger.missing()
+    summary.check(
+        "delivery-completeness-#14-#21",
+        not missing,
+        f"{len(missing)} undelivered pairs, first: {missing[:5]}",
+    )
+    dupes = ledger.duplicates(allowed=allowed_redelivery)
+    summary.check("no-duplicates-#18-#19", not dupes, "; ".join(dupes[:5]))
+
+    # Failure forensics: when either audit fails, capture enough store truth to adjudicate
+    # driver-bug vs daemon-bug without rerunning — the whole point of a regression gate.
+    if missing or dupes:
+        forensics: dict[str, object] = {"missing": missing[:50], "dupes": dupes[:20]}
+        suspect_ids = sorted({m for m, _ in missing[:20]} | {d.split(":")[0] for d in dupes[:10]})
+        rows = []
+        for msg_id in suspect_ids[:15]:
+            like = f"%LG:{msg_id}:%"
+            try:
+                rows += env.db_query(
+                    "SELECT m.message_id, m.idempotency_key, m.from_name, m.thread_id, "
+                    "m.created_at, f.recipient_session, f.state, f.error_reason "
+                    "FROM messages m "
+                    "LEFT JOIN in_flight f ON f.message_id = m.message_id "
+                    f"WHERE m.body LIKE '{like}'"
+                )
+            except GateError as error:
+                forensics.setdefault("db_errors", []).append(str(error)[:200])  # type: ignore[union-attr]
+        forensics["store_rows"] = rows
+        # Per-consumer receipt counts expose a starving recipient at a glance.
+        per_recipient: dict[str, int] = {}
+        for receipts in ledger.receipts.values():
+            for r in receipts:
+                per_recipient[r.recipient] = per_recipient.get(r.recipient, 0) + 1
+        forensics["receipts_per_consumer"] = per_recipient
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        (args.output_dir / "forensics.json").write_text(
+            json.dumps(forensics, indent=2, default=str) + "\n", encoding="utf-8"
+        )
+        print(f"forensics written: {args.output_dir}/forensics.json")
+    for topic in lane.envelopes:
+        summary.check(
+            f"events-lane-{topic}-#63",
+            len(lane.envelopes[topic]) > 0,
+            f"0 durable envelopes on {topic}; lane errors: {lane.errors[:2]}",
+        )
+    consumer_errors = [f"{c.actor.name}: {e}" for c in consumers for e in c.errors]
+    summary.check(
+        "consumers-clean",
+        not consumer_errors and not dead,
+        "; ".join([*dead, *consumer_errors][:4]),
+    )
+    return ledger
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="mode", required=True)
+    run = sub.add_parser("run", help="run the gate against the docker test env")
+    run.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    run.add_argument("--fresh", action="store_true", help="recreate the container (clean DB)")
+    run.add_argument("--skip-docker-build", action="store_true")
+    run.add_argument("--agents", type=int, default=12)
+    run.add_argument("--messages", type=int, default=600)
+    run.add_argument("--seed", type=int, default=1)
+    run.add_argument("--unsupported-budget", type=int, default=DEFAULT_BUDGETS["unsupported statement"])
+    run.add_argument("--provision-only", action="store_true", help="provision actors and exit")
+    run.add_argument("--no-restart", action="store_true", help="skip the phase-3 daemon bounce")
+    report = sub.add_parser("report", help="print the latest summary")
+    report.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    return parser
+
+
+def main() -> int:
+    # `timeout(1)` sends SIGTERM, which by default kills python WITHOUT running finally
+    # blocks — exactly how run 15's abort left the container burning (N16). Convert it
+    # to SystemExit so run_gate's finally-quiesce runs.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+    args = build_parser().parse_args()
+    if args.mode == "report":
+        summary = json.loads((args.output_dir / "summary.json").read_text(encoding="utf-8"))
+        print(f"status={summary['status']}")
+        for c in summary["checks"]:
+            print(f"  {c['status']:4}  {c['name']}" + (f"  — {c['evidence'][:200]}" if c["status"] == "FAIL" and c.get("evidence") else ""))
+        return 0 if summary["status"] == "pass" else 1
+    from_run = run_gate(args)  # implemented incrementally; see plan tasks 3-8
+    return from_run
+
+
+def run_phase6_audits(env: Env, ledger: Ledger, summary: Summary, args: argparse.Namespace) -> None:
+    """Post-run audits against store + container truth (catalog #1/#2/#3/#10/#12/#14/#67)."""
+    # Consumers were stopped driver-side, but `docker exec` children survive the client —
+    # quiesce the in-container listen loops BEFORE the census counts them as strays.
+    env.quiesce()
+    time.sleep(1)
+    # Log scan: past-incident signatures anywhere in daemon/proxy logs.
+    logs = env.pull_logs()
+    over_budget: list[str] = []
+    for name, text in logs.items():
+        for finding in scan_logs(text, {**DEFAULT_BUDGETS, "unsupported statement": args.unsupported_budget}):
+            if finding.over_budget:
+                over_budget.append(f"{name}: {finding.signature} x{finding.count}: {finding.sample[:120]}")
+    summary.check("log-scan-#2-#6-#7", not over_budget, "; ".join(over_budget[:3]))
+
+    # Container process census (#12): nothing harness-shaped may be running.
+    ps_output = env.bash("ps -eo pid,args", check=False)
+    violations = census_violettions(ps_output)
+    summary.check("process-census-#12", not violations, "; ".join(violations[:3]))
+
+    # DB bounds (#1/#19 at store level): exactly one durable messages row per gate send
+    # (ledger sends + ghost DMs + WS bare frames). More means one-send-two-rows.
+    ghost_ids = summary.info.get("ghost_msg_ids", []) or []
+    ws_ids = summary.info.get("ws_msg_ids", []) or []
+    expected_rows = len(ledger.sends) + len(ghost_ids) + len(ws_ids)
+    (row_count,) = env.db_query("SELECT COUNT(*) FROM messages WHERE body LIKE 'LG:%'")[0]
+    summary.check(
+        "db-message-bounds-#1-#19",
+        row_count == expected_rows,
+        f"durable LG rows {row_count} != sends recorded {expected_rows}",
+    )
+
+    # Cross-check (#14): every ACKED delivery for our messages has a matching ledger receipt
+    # — an acked row nobody observed means the drain loop lied.
+    acked = env.db_query(
+        "SELECT m.body, s.name FROM in_flight f "
+        "JOIN messages m ON m.message_id = f.message_id "
+        "JOIN sessions s ON s.session_id = f.recipient_session "
+        "WHERE f.state = 'acked' AND m.body LIKE 'LG:%'"
+    )
+    renames: dict = summary.info.get("renames", {}) or {}
+    unobserved: list[str] = []
+    for body, recipient in acked:
+        mid = msg_id_from_body(body)
+        if mid is None or mid in set(ghost_ids) or mid in set(ws_ids):
+            continue
+        observed = {r.recipient for r in ledger.receipts_for(mid)}
+        # A renamed actor's early receipts were recorded under its OLD name; the store
+        # reports its CURRENT name. Either label counts as observed.
+        aliases = {recipient} | {old for old, new in renames.items() if new == recipient}
+        if mid in ledger.sends and not (aliases & observed):
+            unobserved.append(f"{mid}->{recipient}")
+    summary.check(
+        "ack-receipt-crosscheck-#14",
+        not unobserved,
+        f"acked in store but never observed: {unobserved[:5]}",
+    )
+
+    # Command intents (#67): the lanes must end drained — zero pending at exit. Tolerate a
+    # short settle window: a consumer killed mid-submit leaves one intent the worker still
+    # has to claim+finish.
+    try:
+        pending_intents = -1
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            pending_intents = env.db_query(
+                "SELECT COUNT(*) FROM command_intents WHERE status = 'pending'"
+            )[0][0]
+            if pending_intents == 0:
+                break
+            time.sleep(2)
+        summary.check(
+            "intent-lanes-drained-#67",
+            pending_intents == 0,
+            f"{pending_intents} command intents still pending 20s after run end",
+        )
+    except (GateError, IndexError, ValueError) as error:
+        summary.check("intent-lanes-drained-#67", False, f"audit query failed: {error}"[:200])
+
+    # Write-lane canary (N24): one authenticated idempotent register must complete through daemon
+    # IPC within five seconds. This exercises the real sole-owner write path without opening the
+    # embedded file from a second client.
+    canary_started = time.monotonic()
+    try:
+        canary = env.nexus(
+            Actor(name="lg01", client_key="ck_lg01"),
+            "register",
+            "--name",
+            "lg01",
+            "--agent",
+            "other",
+            "--project",
+            "load",
+            "--client-key",
+            "ck_lg01",
+            timeout=5,
+        )
+        canary_ok = bool(canary.strip())
+    except (GateError, subprocess.TimeoutExpired) as error:
+        canary = str(error)
+        canary_ok = False
+    canary_elapsed_ms = int((time.monotonic() - canary_started) * 1000)
+    summary.check(
+        "write-lane-canary-N24",
+        canary_ok and canary_elapsed_ms < 5_000,
+        f"daemon-owned write canary {canary_elapsed_ms}ms: {canary[-200:]}",
+    )
+
+    # False dead-letters (N25): no delivery may end 'error' with the completion-timeout
+    # reason. That reason means the daemon gave up awaiting turn completion for mail the
+    # harness had ACCEPTED — the 07-11 class where live codex agents answered on the bus
+    # while their deliveries were recorded as failed. Zero tolerance in a gate run.
+    (false_dlq,) = env.db_query(
+        "SELECT COUNT(*) FROM in_flight WHERE state = 'error' "
+        "AND error_reason = 'turn completion timeout'"
+    )[0]
+    summary.check(
+        "no-completion-timeout-deadletters-N25",
+        false_dlq == 0,
+        f"{false_dlq} deliveries dead-lettered as 'turn completion timeout'",
+    )
+
+    # Daemon env (#10): the daemon must own the embedded file and expose no remote URL.
+    daemon_env = env.bash(
+        "pid=$(cat /tmp/nexus-home/daemon.pid 2>/dev/null); "
+        "tr '\\0' '\\n' < /proc/$pid/environ 2>/dev/null | grep '^NEXUS_DB_\\(PATH\\|URL\\)=' || true",
+        check=False,
+    ).strip()
+    summary.check(
+        "daemon-env-embedded-owner-#10",
+        "NEXUS_DB_PATH=/tmp/nexus-home/nexus.db" in daemon_env
+        and "NEXUS_DB_URL=" not in daemon_env,
+        f"daemon store env: {daemon_env or '<unset>'}",
+    )
+
+
+def run_gate(args: argparse.Namespace) -> int:
+    env = Env()
+    print(f"gate: ensuring docker env (container={env.container} port={env.host_port})")
+    env.up(fresh=args.fresh, skip_build=args.skip_docker_build)
+    try:
+        print("gate: resetting container store (clean state, no rebuild)")
+        env.reset_state()
+        print("gate: bouncing daemon with gate env (TTL 120s, sweep 10s)")
+        env.restart_daemon()
+        print(f"gate: provisioning {args.agents} actors + ghost + threads")
+        fleet = provision(env, args.agents)
+        roster = env.nexus(fleet.actors[0], "members", "--include-offline")
+        print(roster)
+        if args.provision_only:
+            print("gate: provision-only requested; done")
+            return 0
+
+        summary = Summary(
+            profile={"agents": args.agents, "messages": args.messages, "seed": args.seed}
+        )
+        phases = "1-2" if args.no_restart else "1-5"
+        print(f"gate: running phases {phases} ({args.messages} messages)")
+        ledger = asyncio.run(run_phases(env, fleet, summary, args))
+        print("gate: running phase 6 audits")
+        run_phase6_audits(env, ledger, summary, args)
+        summary.write(args.output_dir)
+        print(summary.render())
+        return 0 if summary.ok else 1
+    finally:
+        # Abort-safe teardown (N16): whatever path exits this run — pass, fail, exception,
+        # Ctrl-C, or `timeout` SIGTERM — no consumer loop may outlive it in the container.
+        env.quiesce()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

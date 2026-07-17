@@ -1,0 +1,1165 @@
+#!/usr/bin/env python3
+"""Evidence-first public v0.1 release validation for an isolated Nexus container.
+
+This runner deliberately keeps the test ledger separate from the release verdict. Every public
+CLI facet must have a behavior result, including bounded interactive and platform-limited facets.
+Bus and WebSocket probes use the same ledger but are classified as next-cutoff exploration.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import datetime as dt
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Iterable
+
+
+PUBLIC_LEAF_COMMANDS = {
+    "register",
+    "launch",
+    "whoami",
+    "rename",
+    "resume",
+    "attach",
+    "pty-attach",
+    "members",
+    "threads",
+    "topics",
+    "dm",
+    "post",
+    "reply",
+    "publish",
+    "send",
+    "push",
+    "status",
+    "subscribe",
+    "unsubscribe",
+    "search",
+    "history",
+    "read",
+    "listen",
+    "mcp",
+    "thread new",
+    "thread join",
+    "thread leave",
+    "thread rename",
+    "thread archive",
+    "thread delete",
+    "thread members",
+    "source register",
+    "source ls",
+    "source show",
+    "source enable",
+    "source disable",
+    "source rotate",
+    "source rm",
+    "admin route",
+    "admin spawn",
+    "admin remove",
+    "admin delete",
+    "admin rename",
+    "admin assign",
+    "admin channel create",
+    "admin channel delete",
+    "admin channel set-route",
+    "admin assign-role",
+    "admin assign-project",
+    "admin grant-tier",
+    "admin group assign",
+    "admin monitor",
+    "admin dlq list",
+    "admin dlq requeue",
+    "admin dlq purge",
+    "agents list",
+    "agents create",
+    "agents show",
+    "agents grant-access",
+    "agents revoke-access",
+    "agents transfer-owner",
+    "agents credentials create",
+    "agents credentials revoke",
+    "agents runtimes",
+    "daemon run",
+    "daemon start",
+    "daemon stop",
+    "daemon restart",
+    "daemon status",
+    "daemon logs",
+    "daemon doctor",
+    "daemon install",
+    "daemon uninstall",
+}
+
+CODEX_ACP_FACETS = {
+    "codex-acp-command",
+    "codex-acp-adapter",
+    "codex-acp-launch",
+    "codex-acp-restart",
+}
+
+
+_INTERACTIVE = {"attach", "pty-attach", "daemon run", "daemon logs", "mcp"}
+_PLATFORM = {"daemon install", "daemon uninstall"}
+_NEXT_CUTOFF: set[str] = set()
+COMMAND_CLASSIFICATION = {
+    command: (
+        "bounded-interactive"
+        if command in _INTERACTIVE
+        else "platform-limited"
+        if command in _PLATFORM
+        else "next-cutoff"
+        if command in _NEXT_CUTOFF
+        else "release"
+    )
+    for command in PUBLIC_LEAF_COMMANDS
+}
+
+
+_JSON_SECRET = re.compile(
+    r'(?i)("(?:token|secret|credential|api[_-]?key|access[_-]?token|refresh[_-]?token)"\s*:\s*")([^"\\]+)(")'
+)
+_BEARER = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+\-/=]{12,}")
+
+
+def redact(text: str) -> str:
+    """Remove credentials while retaining stable Nexus ids needed for correlation."""
+
+    text = _JSON_SECRET.sub(r"\1[REDACTED]\3", text)
+    return _BEARER.sub(r"\1[REDACTED]", text)
+
+
+def output_text(value: str | bytes | None) -> str:
+    """Normalize subprocess output, including TimeoutExpired's byte payloads."""
+
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def summarize_codex_agui_events(events: Iterable[dict[str, Any]], marker: str) -> dict[str, int]:
+    """Reconstruct assistant messages from deltas and summarize terminal run events."""
+
+    roles: dict[str, str] = {}
+    messages: dict[str, list[str]] = {}
+    event_list = list(events)
+    for event in event_list:
+        message_id = event.get("messageId")
+        event_type = event.get("type")
+        if event_type == "TEXT_MESSAGE_START" and isinstance(message_id, str):
+            roles[message_id] = str(event.get("role", ""))
+        elif event_type == "TEXT_MESSAGE_CONTENT" and isinstance(message_id, str):
+            messages.setdefault(message_id, []).append(str(event.get("delta", "")))
+    assistant_messages = [
+        "".join(deltas)
+        for message_id, deltas in messages.items()
+        if roles.get(message_id) == "assistant"
+    ]
+    return {
+        "assistantMarkerCount": assistant_messages.count(marker),
+        "runFinishedCount": sum(event.get("type") == "RUN_FINISHED" for event in event_list),
+        "runErrorCount": sum(event.get("type") == "RUN_ERROR" for event in event_list),
+    }
+
+
+def summarize_codex_agui_file(path: Path, marker: str) -> dict[str, int]:
+    events: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.startswith("data: "):
+            continue
+        try:
+            event = json.loads(line[6:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return summarize_codex_agui_events(events, marker)
+
+
+@dataclasses.dataclass
+class Result:
+    label: str
+    command: str
+    facet: str
+    classification: str
+    status: str
+    exit_code: int | None
+    started_at: str
+    finished_at: str
+    expected: str = ""
+    stdout: str = ""
+    stderr: str = ""
+    evidence: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass
+class Ledger:
+    commit: str
+    container: str
+    results: list[Result] = dataclasses.field(default_factory=list)
+
+    def record(self, result: Result) -> Result:
+        self.results.append(result)
+        return result
+
+    @property
+    def missing_behavior_facets(self) -> list[str]:
+        covered = {
+            result.facet
+            for result in self.results
+            if result.label.startswith("behavior:") and result.status in {"pass", "fail", "limited"}
+        }
+        return sorted(PUBLIC_LEAF_COMMANDS - covered)
+
+    @property
+    def complete(self) -> bool:
+        return not self.missing_behavior_facets
+
+    @property
+    def release_failures(self) -> list[str]:
+        return [
+            result.label
+            for result in self.results
+            if result.classification == "release" and result.status == "fail"
+        ]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schemaVersion": 1,
+            "generatedAt": utc_now(),
+            "commit": self.commit,
+            "container": self.container,
+            "complete": self.complete,
+            "missingBehaviorFacets": self.missing_behavior_facets,
+            "releaseFailures": self.release_failures,
+            "counts": {
+                status: sum(result.status == status for result in self.results)
+                for status in ("pass", "fail", "limited", "skip")
+            },
+            "results": [dataclasses.asdict(result) for result in self.results],
+        }
+
+    def write(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.to_dict(), indent=2) + "\n", encoding="utf-8")
+
+
+@dataclasses.dataclass
+class CodexAcpLedger(Ledger):
+    @property
+    def missing_behavior_facets(self) -> list[str]:
+        covered = {
+            result.facet
+            for result in self.results
+            if result.label.startswith("behavior:") and result.status == "pass"
+        }
+        return sorted(CODEX_ACP_FACETS - covered)
+
+
+class Runner:
+    def __init__(self, container: str, output: Path, commit: str) -> None:
+        self.container = container
+        self.output = output
+        self.ledger = Ledger(commit=commit, container=container)
+        self.nexus = "/tmp/nexus-target/debug/nexus"
+
+    def docker_args(self, argv: Iterable[str], env: dict[str, str] | None = None) -> list[str]:
+        args = ["docker", "exec", "-i"]
+        for key, value in (env or {}).items():
+            args.extend(["--env", f"{key}={value}"])
+        return [*args, self.container, self.nexus, *argv]
+
+    def command(
+        self,
+        *,
+        label: str,
+        facet: str,
+        argv: Iterable[str],
+        expected: str,
+        allowed_exit: set[int] | None = None,
+        env: dict[str, str] | None = None,
+        stdin: str | None = None,
+        timeout: float = 20.0,
+        limited: bool = False,
+    ) -> tuple[Result, str, str]:
+        args = self.docker_args(argv, env)
+        started = utc_now()
+        try:
+            completed = subprocess.run(
+                args,
+                input=stdin,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+            exit_code: int | None = completed.returncode
+            stdout_raw, stderr_raw = completed.stdout, completed.stderr
+            okay = exit_code in (allowed_exit or {0})
+            status = "limited" if limited and okay else "pass" if okay else "fail"
+        except subprocess.TimeoutExpired as error:
+            exit_code = None
+            stdout_raw = output_text(error.stdout)
+            stderr_raw = output_text(error.stderr)
+            status = "limited" if limited else "fail"
+        result = Result(
+            label=label,
+            command="nexus " + " ".join(argv),
+            facet=facet,
+            classification=COMMAND_CLASSIFICATION.get(facet, "release"),
+            status=status,
+            exit_code=exit_code,
+            started_at=started,
+            finished_at=utc_now(),
+            expected=expected,
+            stdout=redact(stdout_raw),
+            stderr=redact(stderr_raw),
+        )
+        self.ledger.record(result)
+        return result, stdout_raw, stderr_raw
+
+    @staticmethod
+    def require(result: Result, condition: bool, detail: str) -> None:
+        result.evidence.setdefault("assertions", []).append({"pass": condition, "detail": detail})
+        if not condition:
+            result.status = "fail"
+
+    def record_process(
+        self,
+        *,
+        label: str,
+        facet: str,
+        argv: list[str],
+        expected: str,
+        process: subprocess.Popen[str],
+        started_at: str,
+        timeout: float,
+        limited: bool = False,
+    ) -> tuple[Result, str, str]:
+        try:
+            stdout_raw, stderr_raw = process.communicate(timeout=timeout)
+            exit_code: int | None = process.returncode
+            okay = exit_code == 0
+            status = "limited" if limited and okay else "pass" if okay else "fail"
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout_raw, stderr_raw = process.communicate()
+            exit_code = None
+            status = "limited" if limited else "fail"
+        result = Result(
+            label=label,
+            command="nexus " + " ".join(argv),
+            facet=facet,
+            classification=COMMAND_CLASSIFICATION.get(facet, "release"),
+            status=status,
+            exit_code=exit_code,
+            started_at=started_at,
+            finished_at=utc_now(),
+            expected=expected,
+            stdout=redact(stdout_raw),
+            stderr=redact(stderr_raw),
+        )
+        self.ledger.record(result)
+        return result, stdout_raw, stderr_raw
+
+    def bounded_command(
+        self,
+        *,
+        label: str,
+        facet: str,
+        argv: list[str],
+        expected: str,
+        seconds: int,
+    ) -> Result:
+        """Run a long-lived CLI inside GNU timeout so the child receives the terminating signal."""
+
+        args = [
+            "docker",
+            "exec",
+            "-i",
+            self.container,
+            "timeout",
+            "--signal=TERM",
+            "--kill-after=2s",
+            str(seconds),
+            self.nexus,
+            *argv,
+        ]
+        started = utc_now()
+        completed = subprocess.run(args, text=True, capture_output=True, timeout=seconds + 10, check=False)
+        okay = completed.returncode in {0, 124}
+        result = Result(
+            label=label,
+            command="nexus " + " ".join(argv),
+            facet=facet,
+            classification=COMMAND_CLASSIFICATION.get(facet, "bounded-interactive"),
+            status="limited" if okay else "fail",
+            exit_code=completed.returncode,
+            started_at=started,
+            finished_at=utc_now(),
+            expected=expected,
+            stdout=redact(completed.stdout),
+            stderr=redact(completed.stderr),
+            evidence={"boundSeconds": seconds, "expectedTimeoutExit": 124},
+        )
+        self.ledger.record(result)
+        return result
+
+    def require_exact_binary(self) -> bool:
+        """Fail closed when the executable under test is not built from the ledger commit."""
+
+        result, stdout, _ = self.command(
+            label="fixture:exact-binary",
+            facet="fixture",
+            argv=["--version"],
+            expected="The executable revision is the exact source commit named by this ledger.",
+        )
+        matches = f"(revision {self.ledger.commit})" in stdout
+        self.require(
+            result,
+            matches,
+            f"binary revision matches {self.ledger.commit}",
+        )
+        return result.status == "pass"
+
+    def write(self) -> None:
+        self.ledger.write(self.output / "cli-ledger.json")
+
+    def container_shell(
+        self,
+        *,
+        label: str,
+        facet: str,
+        script: str,
+        expected: str,
+        timeout: float,
+    ) -> Result:
+        started = utc_now()
+        try:
+            completed = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    "-i",
+                    "-e",
+                    "CARGO_BUILD_JOBS=2",
+                    "-e",
+                    "CARGO_TARGET_DIR=/tmp/nexus-target",
+                    self.container,
+                    "bash",
+                    "-lc",
+                    script,
+                ],
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+            exit_code: int | None = completed.returncode
+            stdout_raw, stderr_raw = completed.stdout, completed.stderr
+            status = "pass" if exit_code == 0 else "fail"
+        except subprocess.TimeoutExpired as error:
+            exit_code = None
+            stdout_raw = output_text(error.stdout)
+            stderr_raw = output_text(error.stderr)
+            status = "fail"
+        result = Result(
+            label=label,
+            command=f"docker exec {self.container} bash -lc <{facet}>",
+            facet=facet,
+            classification="release",
+            status=status,
+            exit_code=exit_code,
+            started_at=started,
+            finished_at=utc_now(),
+            expected=expected,
+            stdout=redact(stdout_raw),
+            stderr=redact(stderr_raw),
+        )
+        self.ledger.record(result)
+        return result
+
+
+class CodexAcpRunner(Runner):
+    def __init__(self, container: str, output: Path, commit: str) -> None:
+        super().__init__(container, output, commit)
+        self.ledger = CodexAcpLedger(commit=commit, container=container)
+
+    def write(self) -> None:
+        self.ledger.write(self.output / "codex-acp-ledger.json")
+
+
+def codex_model_setup() -> str:
+    """Pin the cheap release-gate model inside the disposable container only."""
+
+    return r"""
+python3 - <<'PY'
+import os
+from pathlib import Path
+
+path = Path(os.environ["CODEX_HOME"]) / "config.toml"
+path.parent.mkdir(parents=True, exist_ok=True)
+text = path.read_text(encoding="utf-8") if path.exists() else ""
+lines = text.splitlines()
+replacement = 'model = "gpt-5.6-luna"'
+for index, line in enumerate(lines):
+    if line.startswith("model = "):
+        lines[index] = replacement
+        break
+else:
+    lines.insert(0, replacement)
+path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+"""
+
+
+def codex_probe_script(*, name: str, marker: str, evidence_dir: str) -> str:
+    """Return a fail-closed real launch + AG-UI event assertion for one unique session."""
+
+    name_q = shlex.quote(name)
+    marker_q = shlex.quote(marker)
+    evidence_q = shlex.quote(evidence_dir)
+    return fr"""
+set -euo pipefail
+{codex_model_setup()}
+gate_dir={evidence_q}
+name={name_q}
+marker={marker_q}
+mkdir -p "$gate_dir"
+
+/tmp/nexus-target/debug/nexus --json launch \
+  --headless --detach \
+  --name "$name" \
+  --project acp-release-gate \
+  codex >"$gate_dir/launch.json"
+
+python3 - "$gate_dir/launch.json" "$name" "$gate_dir/session-id" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+launch_path, expected_name, session_path = sys.argv[1:]
+payload = json.loads(Path(launch_path).read_text(encoding="utf-8"))
+assert payload.get("name") == expected_name, payload
+session_id = payload.get("sessionId")
+assert isinstance(session_id, str) and session_id.startswith("s_"), payload
+Path(session_path).write_text(session_id + "\n", encoding="utf-8")
+PY
+
+observe="$gate_dir/observe.sse"
+session_id=$(tr -d '\n' <"$gate_dir/session-id")
+curl -NsS \
+  "http://127.0.0.1:4101/api/v1/agent-sessions/$session_id/events?view=agui" \
+  >"$observe" &
+observer_pid=$!
+sleep 0.25
+kill -0 "$observer_pid"
+/tmp/nexus-target/debug/nexus dm "$name" --message "Reply exactly $marker and nothing else." >/dev/null
+complete=0
+for _ in $(seq 1 180); do
+  if python3 - "$observe" "$marker" <<'PY'
+import runpy
+import sys
+from pathlib import Path
+
+path, marker = sys.argv[1:]
+module = runpy.run_path("/work/egregore-nexus/scripts/nexus-v01-release-validation")
+summary = module["summarize_codex_agui_file"](Path(path), marker)
+if summary["runErrorCount"]:
+    raise SystemExit(2)
+raise SystemExit(0 if summary["assistantMarkerCount"] == 1 and summary["runFinishedCount"] else 1)
+PY
+  then
+    complete=1
+    break
+  else
+    probe_status=$?
+    if test "$probe_status" -eq 2; then
+      break
+    fi
+  fi
+  if ! kill -0 "$observer_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 1
+done
+kill "$observer_pid" 2>/dev/null || true
+wait "$observer_pid" 2>/dev/null || true
+test "$complete" -eq 1
+
+python3 - "$observe" "$marker" <<'PY'
+import json
+import runpy
+import sys
+from pathlib import Path
+
+path, marker = sys.argv[1:]
+module = runpy.run_path("/work/egregore-nexus/scripts/nexus-v01-release-validation")
+summary = module["summarize_codex_agui_file"](Path(path), marker)
+summary["sessionId"] = Path(path).with_name("session-id").read_text(encoding="utf-8").strip()
+print(json.dumps(summary, sort_keys=True))
+assert summary["assistantMarkerCount"] == 1, summary
+assert summary["runFinishedCount"] == 1, summary
+assert summary["runErrorCount"] == 0, summary
+PY
+"""
+
+
+def git_commit(repo: Path) -> str:
+    return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+
+
+def inventory() -> None:
+    for command in sorted(PUBLIC_LEAF_COMMANDS):
+        print(f"{COMMAND_CLASSIFICATION[command]:19} {command}")
+
+
+def daemon_ready_script() -> str:
+    """Start and verify the complete disposable local stack for public CLI behavior."""
+
+    return r"""
+set -euo pipefail
+nexus=/tmp/nexus-target/debug/nexus
+gateway=/work/egregore-nexus/gateway/scripts/nexus-gateway.mjs
+export PATH=/tmp/nexus-target/debug:/host-node/bin:/usr/local/bin:/usr/bin:/bin:/host-cargo-bin:/host-local-bin:/home/tester/.bun/bin
+export NEXUS_HOME=/tmp/nexus-home
+export NEXUS_DB_PATH=/tmp/nexus-home/nexus.db
+export NEXUS_GATEWAY_DB=file:/tmp/nexus-home/gateway.db
+export NEXUS_GATEWAY_BIND=127.0.0.1
+export NEXUS_GATEWAY_PORT=4101
+export NEXUS_GATEWAY_BIN="$gateway"
+
+cd /work/egregore-nexus/gateway
+pnpm run build:gateway-package >/dev/null
+
+daemon_running() {
+  local status_output
+  if status_output=$("$nexus" daemon status 2>&1); then
+    return 0
+  fi
+  printf '%s\n' "$status_output" | grep -q '^daemon: running$'
+}
+
+status_output=$("$nexus" daemon status 2>&1) || true
+if printf '%s\n' "$status_output" | grep -q '^daemon: running$' && \
+   printf '%s\n' "$status_output" | grep -q 'RESTART PENDING'; then
+  "$nexus" daemon restart
+elif ! printf '%s\n' "$status_output" | grep -q '^daemon: running$'; then
+  start_output=$("$nexus" daemon start 2>&1) || {
+    if ! daemon_running; then
+      printf '%s\n' "$start_output" >&2
+      exit 1
+    fi
+  }
+fi
+for _ in $(seq 1 60); do
+  if daemon_running; then
+    break
+  fi
+  sleep 0.25
+done
+daemon_running || {
+  "$nexus" daemon status
+  exit 1
+}
+
+gateway_status=$("$nexus" --json gateway status 2>/dev/null || true)
+if ! printf '%s\n' "$gateway_status" | grep -q '"state": "live"'; then
+  # Simulate a stale gateway discovery PID reused by the supervising shell. This is the
+  # reboot/PID-reuse failure mode that must never cause ordinary `gateway start` to signal an
+  # unrelated process.
+  python3 - "$NEXUS_HOME/gateway.json" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+Path(sys.argv[1]).write_text(
+    json.dumps(
+        {
+            "pid": os.getppid(),
+            "url": "http://localhost:4101",
+        }
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PY
+  "$nexus" --json gateway start >/dev/null
+fi
+for _ in $(seq 1 60); do
+  if daemon_running && \
+     "$nexus" --json gateway status 2>/dev/null | grep -q '"state": "live"'; then
+    exit 0
+  fi
+  sleep 0.25
+done
+"$nexus" daemon status
+"$nexus" --json gateway status
+exit 1
+"""
+
+
+def actor_env(name: str, client_key: str, project: str) -> dict[str, str]:
+    return {
+        "NEXUS_NAME": name,
+        "NEXUS_AGENT": "other",
+        "NEXUS_PROJECT": project,
+        "NEXUS_CLIENT_KEY": client_key,
+    }
+
+
+def parse_json(text: str) -> Any:
+    return json.loads(text)
+
+
+def run_cli(runner: Runner) -> None:
+    """Execute the public CLI surface against disposable fixtures in one isolated container."""
+
+    if not runner.require_exact_binary():
+        return
+
+    preflight = runner.container_shell(
+        label="fixture:daemon-ready",
+        facet="fixture",
+        expected="The disposable daemon is started and healthy before public commands run.",
+        timeout=30.0,
+        script=daemon_ready_script(),
+    )
+    if preflight.status != "pass":
+        return
+
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%m%d%H%M%S")
+    project = f"rv-{stamp}"
+    alpha = f"rv-alpha-{stamp}"
+    beta = f"rv-beta-{stamp}"
+    alpha_key = f"ck_{alpha}"
+    beta_key = f"ck_{beta}"
+    alpha_env = actor_env(alpha, alpha_key, project)
+    beta_env = actor_env(beta, beta_key, project)
+
+    def case(
+        facet: str,
+        argv: list[str],
+        expected: str,
+        *,
+        env: dict[str, str] | None = None,
+        allowed_exit: set[int] | None = None,
+        stdin: str | None = None,
+        timeout: float = 20.0,
+        limited: bool = False,
+        suffix: str = "",
+    ) -> tuple[Result, str, str]:
+        label = f"behavior:{facet}" + (f":{suffix}" if suffix else "")
+        return runner.command(
+            label=label,
+            facet=facet,
+            argv=argv,
+            expected=expected,
+            allowed_exit=allowed_exit,
+            env=env,
+            stdin=stdin,
+            timeout=timeout,
+            limited=limited,
+        )
+
+    # Registration and ambient identity.
+    r, out, _ = case(
+        "register",
+        ["--json", "register", "--name", alpha, "--agent", "other", "--project", project, "--client-key", alpha_key],
+        "Registers one externally drained transport identity and returns stable ids.",
+    )
+    alpha_registration = parse_json(out) if r.status == "pass" else {}
+    runner.require(r, bool(alpha_registration.get("agentId")), "register returned agentId")
+    alpha_agent_id = alpha_registration.get("agentId", "")
+
+    r, out, _ = runner.command(
+        label="fixture:register-beta",
+        facet="fixture",
+        argv=["--json", "register", "--name", beta, "--agent", "other", "--project", project, "--client-key", beta_key],
+        expected="Creates the second transport fixture.",
+    )
+    beta_registration = parse_json(out) if r.status == "pass" else {}
+    beta_agent_id = beta_registration.get("agentId", "")
+
+    r, out, _ = case("whoami", ["--json", "whoami"], "Resolves the caller by id and includes its display name.", env=alpha_env)
+    runner.require(r, parse_json(out).get("name") == alpha if r.status == "pass" else False, "whoami returned alpha")
+
+    renamed = f"rv-renamed-{stamp}"
+    r, _, _ = case("rename", ["--json", "rename", renamed], "Renames the caller without changing stable identity.", env=alpha_env)
+    if r.status == "pass":
+        alpha = renamed
+        alpha_env = actor_env(alpha, alpha_key, project)
+
+    case("status", ["--json", "status", "busy", "--work", "v0.1 release validation"], "Persists status/current work.", env=alpha_env)
+    case("members", ["--json", "members", "--include-offline"], "Lists directory, presence and current work.", env=alpha_env)
+    case("threads", ["--json", "threads"], "Lists visible threads.", env=alpha_env)
+    case("topics", ["--json", "topics"], "Lists topics including Pub.", env=alpha_env)
+
+    # Threads and Message Post. A real pull listener owns beta's inbox before the DM, proving the
+    # `listen` behavior and creating durable reply context for the subsequent `reply` command.
+    thread = f"rv-thread-{stamp}"
+    case("thread new", ["--json", "thread", "new", thread, "--project", project, "--member", beta], "Creates a named thread with an initial member.")
+    case("thread join", ["--json", "thread", "join", thread], "Caller joins and becomes eligible for fanout.", env=alpha_env)
+    case("thread members", ["--json", "thread", "members", thread], "Lists thread membership.", env=alpha_env)
+
+    listen_argv = ["--json", "listen", "--timeout-ms", "5000", "--max", "10", "--once"]
+    listen_started = utc_now()
+    listener = subprocess.Popen(
+        runner.docker_args(listen_argv, beta_env),
+        text=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    time.sleep(0.5)
+    r, out, _ = case("dm", ["--json", "dm", beta, "-m", f"CLI DM receipt {stamp}"], "Commits one DM and fans out to the addressed identity.", env=alpha_env)
+    dm_ack = parse_json(out) if r.status == "pass" else {}
+    dm_message_id = dm_ack.get("messageId", "")
+    listen_result, listen_out, _ = runner.record_process(
+        label="behavior:listen",
+        facet="listen",
+        argv=listen_argv,
+        expected="A pull-owned inbox receives the DM once and acks it.",
+        process=listener,
+        started_at=listen_started,
+        timeout=8.0,
+    )
+    try:
+        listen_payload = parse_json(listen_out)
+    except Exception:
+        listen_payload = {}
+    runner.require(listen_result, dm_message_id in listen_payload.get("messageIds", []), "listen returned the sent DM id")
+
+    case("reply", ["--json", "reply", "-m", f"CLI contextual reply {stamp}"], "Replies into beta's last delivered DM context.", env=beta_env)
+    case("post", ["--json", "post", thread, "-m", f"CLI thread post {stamp}"], "Fans a thread post to current members.", env=alpha_env)
+    case("send", ["--json", "send", "--to", beta, "-m", f"CLI generic send {stamp}"], "Server resolves the generic target as a DM.", env=alpha_env)
+
+    topic = f"rv-topic-{stamp}"
+    case("subscribe", ["--json", "subscribe", topic, "--group", "rv-consumers"], "Adds caller topic subscription and optional group.", env=beta_env)
+    case("publish", ["--json", "publish", topic, "-m", f"CLI topic publish {stamp}"], "Publishes to the subscribed topic.", env=alpha_env)
+    case("unsubscribe", ["--json", "unsubscribe", topic], "Removes the topic subscription.", env=beta_env)
+
+    r, out, _ = case("history", ["--json", "history", "--with", beta, "--limit", "20"], "Returns scoped, bounded DM history.", env=alpha_env)
+    runner.require(r, f"CLI DM receipt {stamp}" in out, "history includes the original DM body")
+    case("search", ["--json", "search", "receipt", "--fts", "--with", beta, "--limit", "10"], "Searches within the caller-visible DM scope.", env=alpha_env)
+    case("read", ["--json", "read", dm_message_id], "Reads one authorized full message body by id.", env=alpha_env)
+
+    case("thread leave", ["--json", "thread", "leave", thread], "Caller leaves the thread.", env=alpha_env)
+    case("thread join", ["--json", "thread", "join", thread], "Caller can rejoin after leaving.", env=alpha_env, suffix="rejoin")
+    renamed_thread = f"rv-thread-renamed-{stamp}"
+    case("thread rename", ["--json", "thread", "rename", thread, renamed_thread], "Operator renames the thread.")
+    case("thread archive", ["--json", "thread", "archive", renamed_thread], "Archives the thread from active delivery/listing.")
+    case("thread delete", ["--json", "thread", "delete", renamed_thread], "Deletes the thread registry and memberships.")
+
+    # Notification source lifecycle and local trusted push. The inline-message case also proves the
+    # root `--json` output flag no longer collides with push's historical JSON-stdin input flag.
+    source = f"rv-source-{stamp}"
+    source_topic = f"rv-source-topic-{stamp}"
+    case("source register", ["--json", "source", "register", source, "--topic", source_topic], "Registers a source and returns its token once.")
+    case("source ls", ["--json", "source", "ls"], "Lists registered sources.")
+    case("source show", ["--json", "source", "show", source], "Shows source state without returning the token.")
+    case("source disable", ["--json", "source", "disable", source], "Disables source ingestion.")
+    case("source enable", ["--json", "source", "enable", source], "Re-enables source ingestion.")
+    case("source rotate", ["--json", "source", "rotate", source], "Rotates and returns a replacement token once.")
+    case("subscribe", ["--json", "subscribe", source_topic], "Subscribes alpha for the source notification probe.", env=alpha_env, suffix="source-route")
+    r, out, _ = case("push", ["--json", "push", source, "-m", f"CLI source push {stamp}"], "Accepts a trusted local source event, queues its notification route, and emits machine JSON.")
+    try:
+        push_payload = parse_json(out)
+    except Exception:
+        push_payload = {}
+    runner.require(r, push_payload.get("topic") == source_topic, "push returned its routed topic as JSON")
+
+    # Topic administration covers every ChannelOp value.
+    channel = f"rv-channel-{stamp}"
+    case("admin channel create", ["--json", "admin", "channel", "create", channel], "Creates an operator-managed topic.")
+    case("admin channel set-route", ["--json", "admin", "channel", "set-route", channel, "--source", source], "Associates a source route with the topic.")
+    case("admin channel delete", ["--json", "admin", "channel", "delete", channel], "Deletes the managed topic.")
+
+    # `admin route` needs an audit id, which local source push does not expose. Exercise the full
+    # command/daemon policy path with an explicit nonexistent id and require the truthful failure.
+    case("admin route", ["--json", "admin", "route", "n_missing_release_fixture", "--to", alpha], "Rejects an unknown notification audit id without creating a route.", allowed_exit={1}, limited=True)
+
+    time.sleep(0.5)
+    r, out, _ = case("admin dlq list", ["--json", "admin", "dlq", "list", "--for", alpha, "--limit", "20"], "Lists terminal notification deliveries for the target.")
+    try:
+        dlq_payload = parse_json(out)
+        dlq_rows = dlq_payload.get("rows", dlq_payload if isinstance(dlq_payload, list) else [])
+    except Exception:
+        dlq_rows = []
+    in_flight_id = dlq_rows[0].get("inFlightId") if dlq_rows else None
+    if in_flight_id:
+        case("admin dlq requeue", ["--json", "admin", "dlq", "requeue", in_flight_id], "Explicitly requeues one terminal delivery.")
+        time.sleep(0.5)
+        case("admin dlq purge", ["--json", "admin", "dlq", "purge", "--for", alpha, "--yes"], "Explicitly purges terminal delivery rows for the fixture.")
+    else:
+        case("admin dlq requeue", ["--json", "admin", "dlq", "requeue", "if_missing"], "Confirms an idempotent zero-row requeue without broad mutation.", allowed_exit={0}, limited=True)
+        case("admin dlq purge", ["--json", "admin", "dlq", "purge", "if_missing", "--yes"], "Confirms an idempotent zero-row purge without broad mutation.", allowed_exit={0}, limited=True)
+
+    case("source rm", ["--json", "source", "rm", source], "Removes the source.")
+
+    # Durable identities, credentials and ACLs.
+    managed = f"rv-managed-{stamp}"
+    r, out, _ = case("agents create", ["--json", "agents", "create", managed, "--harness", "other", "--project", project, "--role", "worker"], "Creates a durable managed identity.")
+    managed_payload = parse_json(out) if r.status == "pass" else {}
+    managed_agent_id = managed_payload.get("agent", {}).get("agentId", "")
+    case("agents list", ["--json", "agents", "list"], "Lists managed identities in caller scope.")
+    case("agents show", ["--json", "agents", "show", managed], "Shows stable identity metadata.")
+    case("agents runtimes", ["--json", "agents", "runtimes", managed, "--include-stopped"], "Lists runtime rows, including stopped ones.")
+    case("agents grant-access", ["--json", "agents", "grant-access", managed, alpha_agent_id, "viewer", "--project", project], "Grants delegated viewer access.")
+    case("agents revoke-access", ["--json", "agents", "revoke-access", managed, alpha_agent_id, "--project", project], "Revokes delegated access.")
+    r, out, _ = case("agents credentials create", ["--json", "agents", "credentials", "create", managed, "--purpose", "runtime", "--label", "release-validation"], "Creates a one-time runtime credential.")
+    credential_payload = parse_json(out) if r.status == "pass" else {}
+    credential_id = credential_payload.get("credentialId") or credential_payload.get("credential", {}).get("credentialId")
+    if credential_id:
+        case("agents credentials revoke", ["--json", "agents", "credentials", "revoke", credential_id], "Revokes the runtime credential.")
+    else:
+        case("agents credentials revoke", ["--json", "agents", "credentials", "revoke", "c_missing"], "Rejects an unknown credential id.", allowed_exit={1}, limited=True)
+    case("agents transfer-owner", ["--json", "agents", "transfer-owner", managed, alpha_agent_id, "--project", project], "Transfers managed identity ownership to a stable principal id.")
+
+    # Admin mutation surface. Keep beta as the disposable named target.
+    case("admin assign-role", ["--json", "admin", "assign-role", beta, "release-probe"], "Sets beta's display role.")
+    case("admin assign-project", ["--json", "admin", "assign-project", beta, "--project", project], "Assigns beta's active project.")
+    case("admin grant-tier", ["--json", "admin", "grant-tier", beta, "admin"], "Grants durable admin tier from the local operator.")
+    case("admin group assign", ["--json", "admin", "group", "assign", "release-testers", beta, "--project", project], "Assigns beta to a Message Post policy group.")
+    beta_renamed = f"rv-beta-renamed-{stamp}"
+    case("admin rename", ["--json", "admin", "rename", beta, beta_renamed], "Renames another identity through the admin path.")
+    beta = beta_renamed
+    beta_env = actor_env(beta, beta_key, project)
+    case("admin monitor", ["--json", "admin", "monitor", "--scope", project], "Returns an event-feed snapshot without follow mode.")
+
+    # Spawn a headed OpenCode fixture without a prompt: it exercises daemon-owned process launch
+    # but cannot spend model tokens. Omitting --name creates the staged identity needed by assign.
+    spawn_cwd = f"/tmp/nexus-release-spawn-{stamp}"
+    subprocess.run(["docker", "exec", runner.container, "mkdir", "-p", spawn_cwd], check=False)
+    r, out, _ = case("admin spawn", ["--json", "admin", "spawn", "opencode", "--cwd", spawn_cwd, "--project", project], "Starts a daemon-owned headed harness without invoking a model.", timeout=30.0)
+    spawn_payload = parse_json(out) if r.status == "pass" else {}
+    spawned_session = spawn_payload.get("sessionId", "")
+    staged_name = f"rv-staged-{stamp}"
+    if spawned_session:
+        case("admin assign", ["--json", "admin", "assign", spawned_session, staged_name], "Assigns a name to the staged identity.")
+        case("resume", ["--json", "resume", spawned_session], "Does not duplicate an already-live runtime.", allowed_exit={0, 1}, limited=True)
+        case("attach", ["--json", "attach", spawned_session], "Resolves the live descriptor by stable session id; non-TTY attach is bounded.", allowed_exit={0, 1}, timeout=2.0, limited=True)
+        case("pty-attach", ["--json", "pty-attach", spawned_session], "Resolves a daemon-owned PTY; non-TTY attach is bounded.", allowed_exit={0, 1}, timeout=2.0, limited=True)
+        case("admin remove", ["--json", "admin", "remove", staged_name, "--kill"], "Detaches the runtime and terminates its process.")
+        case("admin delete", ["--json", "admin", "delete", staged_name], "Deletes the disposable identity/runtime rows.")
+    else:
+        for facet, argv in (
+            ("admin assign", ["--json", "admin", "assign", "s_missing", staged_name]),
+            ("resume", ["--json", "resume", "s_missing"]),
+            ("attach", ["--json", "attach", "s_missing"]),
+            ("pty-attach", ["--json", "pty-attach", "s_missing"]),
+        ):
+            case(facet, argv, "Fails closed for a nonexistent disposable target.", allowed_exit={1}, limited=True)
+        case(
+            "admin remove",
+            ["--json", "admin", "remove", "s_missing", "--kill"],
+            "Returns a truthful idempotent not_found result for a nonexistent runtime.",
+        )
+        case(
+            "admin delete",
+            ["--json", "admin", "delete", "s_missing"],
+            "Idempotently deletes a nonexistent disposable identity.",
+        )
+
+    # `launch` is fully exercised by the four-harness live matrix. The CLI stage checks the public
+    # parser without spending a model turn and leaves an explicit limited marker to be superseded.
+    case("launch", ["launch", "--help"], "Public launch parser is present; live behavior is recorded in harness-ledger.json.", limited=True)
+
+    # MCP stdio protocol handshake (initialize + tools/list), then EOF for clean shutdown.
+    mcp_input = "\n".join(
+        [
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+            "",
+        ]
+    )
+    r, out, _ = case("mcp", ["mcp", "--as", alpha, "--project", project, "--client-key", alpha_key, "--agent", "other"], "Completes MCP initialize and exposes the bus tool registry.", stdin=mcp_input, timeout=5.0)
+    runner.require(r, '"name":"dm"' in out or '"name": "dm"' in out, "MCP tools/list contains dm")
+
+    # Daemon lifecycle is last because it deliberately perturbs the disposable runtime.
+    case("daemon status", ["daemon", "status"], "Reports the isolated daemon healthy.")
+    case("daemon doctor", ["daemon", "doctor"], "Runs read-only lifecycle preflight.", allowed_exit={0, 1})
+    case("daemon restart", ["daemon", "restart"], "Restarts the disposable daemon and returns healthy.", timeout=70.0)
+    case("daemon stop", ["daemon", "stop"], "Stops the disposable daemon gracefully.", timeout=60.0)
+    runner.bounded_command(
+        label="behavior:daemon run",
+        facet="daemon run",
+        argv=["daemon", "run"],
+        expected="Foreground daemon starts; validation sends TERM inside the container after readiness.",
+        seconds=2,
+    )
+    time.sleep(0.5)
+    case("daemon start", ["daemon", "start"], "Starts the daemon detached after the bounded foreground run.", timeout=20.0)
+    runner.bounded_command(
+        label="behavior:daemon logs",
+        facet="daemon logs",
+        argv=["daemon", "logs"],
+        expected="Tails daemon logs; validation sends TERM inside the container.",
+        seconds=2,
+    )
+    case("daemon install", ["daemon", "install"], "Installs and starts the native per-user service; platform execution stays limited inside the release container.", allowed_exit={0, 1}, limited=True)
+    case("daemon uninstall", ["daemon", "uninstall"], "Stops and removes the native per-user service; platform execution stays limited inside the release container.", allowed_exit={0, 1}, limited=True)
+
+    runner.write()
+
+
+def run_codex_acp(runner: CodexAcpRunner) -> None:
+    """Certify the maintained Codex ACP path with hermetic and real-container evidence."""
+
+    if not runner.require_exact_binary():
+        return
+
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%m%d%H%M%S")
+    gate_root = f"/tmp/nexus-home/v01-acp-gate/{stamp}"
+
+    runner.container_shell(
+        label="behavior:codex-acp-command",
+        facet="codex-acp-command",
+        expected=(
+            "The exact maintained @agentclientprotocol/codex-acp command contract passes and "
+            "current runtime/operator docs contain no retired Zed adapter flags."
+        ),
+        timeout=180.0,
+        script=r"""
+set -euo pipefail
+cd /work/egregore-nexus/core
+/usr/local/cargo/bin/cargo test \
+  -p nexus-harness-codex \
+  --test codex_adapter \
+  -- --test-threads=1
+if grep -En \
+  '@zed-industries/codex-acp|NEXUS_CODEX_REASONING_SUMMARY|NEXUS_CODEX_RAW_REASONING' \
+  crates/harness/codex/src/harness.rs \
+  crates/nexus-agent/RUN.md \
+  ../docs/adding-a-harness.md; then
+  exit 1
+fi
+""",
+    )
+
+    runner.container_shell(
+        label="behavior:codex-acp-adapter",
+        facet="codex-acp-adapter",
+        expected=(
+            "The maintained ACP package opens a real authenticated Codex App Server session and "
+            "returns a non-empty turn; missing auth/package/network is a failure, never a skip."
+        ),
+        timeout=300.0,
+        script=f"""
+set -euo pipefail
+{codex_model_setup()}
+mkdir -p {shlex.quote(gate_root + '/adapter-logs')}
+cd /work/egregore-nexus/core
+NEXUS_LIVE_E2E_REQUIRED=1 \
+APP_SERVER_LOGS={shlex.quote(gate_root + '/adapter-logs')} \
+/usr/local/cargo/bin/cargo test \
+  -p nexus-harness-codex \
+  --test live_smoke \
+  codex_live_one_turn \
+  -- --ignored --nocapture --test-threads=1
+""",
+    )
+
+    first_name = f"codex-acp-v010-{stamp}"
+    runner.container_shell(
+        label="behavior:codex-acp-launch",
+        facet="codex-acp-launch",
+        expected=(
+            "Detached --json launch returns a parseable stable handle and the gateway records "
+            "exactly one assistant message reconstructed from streamed deltas, one RUN_FINISHED, "
+            "and no RUN_ERROR."
+        ),
+        timeout=240.0,
+        script=codex_probe_script(
+            name=first_name,
+            marker="NEXUS_CODEX_ACP_OK",
+            evidence_dir=f"{gate_root}/launch",
+        ),
+    )
+
+    second_name = f"codex-acp-v010-restart-{stamp}"
+    runner.container_shell(
+        label="behavior:codex-acp-restart",
+        facet="codex-acp-restart",
+        expected=(
+            "After a real isolated daemon restart, a fresh default Codex launch still uses the "
+            "maintained ACP path and completes exactly once without RUN_ERROR."
+        ),
+        timeout=330.0,
+        script=f"""
+set -euo pipefail
+/tmp/nexus-target/debug/nexus daemon restart
+for _ in $(seq 1 60); do
+  if /tmp/nexus-target/debug/nexus daemon status >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+/tmp/nexus-target/debug/nexus daemon status >/dev/null
+{codex_probe_script(
+    name=second_name,
+    marker="NEXUS_CODEX_ACP_RESTART_OK",
+    evidence_dir=f"{gate_root}/restart",
+)}
+""",
+    )
+
+    runner.write()
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mode", choices=("inventory", "architecture", "cli", "codex-acp"))
+    parser.add_argument("--container", default="nexus-v01-validation")
+    parser.add_argument("--output", type=Path, default=Path("output/v0.1-release-validation/evidence"))
+    parser.add_argument("--unit-only", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main() -> int:
+    args = parse_args()
+    if args.mode == "inventory":
+        inventory()
+        return 0
+    repo = Path(__file__).resolve().parent.parent
+    if args.mode == "architecture":
+        env = {
+            **dict(os.environ),
+            "NEXUS_VALIDATION_CONTAINER": args.container,
+            "NEXUS_ARCHITECTURE_OUTPUT": str(args.output / "gateway-architecture.json"),
+        }
+        command = [str(repo / "scripts" / "nexus-gateway-architecture-integration")]
+        if args.unit_only:
+            command.append("--unit-only")
+        return subprocess.run(command, cwd=repo, env=env, check=False).returncode
+    runner: Runner
+    if args.mode == "codex-acp":
+        runner = CodexAcpRunner(args.container, args.output, git_commit(repo))
+        run = run_codex_acp
+    else:
+        runner = Runner(args.container, args.output, git_commit(repo))
+        run = run_cli
+    try:
+        run(runner)
+    finally:
+        runner.write()
+    print(json.dumps(runner.ledger.to_dict(), indent=2))
+    return 0 if runner.ledger.complete and not runner.ledger.release_failures else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

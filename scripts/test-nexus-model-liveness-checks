@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Smoke tests for model/liveness stopgap scripts using temporary SQLite DBs."""
+
+from __future__ import annotations
+
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+MODEL_SCRIPT = ROOT / "scripts" / "nexus-model-check"
+LIVE_SCRIPT = ROOT / "scripts" / "nexus-liveness-check"
+NOW_MS = 1_783_160_000_000
+
+
+def init_daemon(path: Path, cwd: Path) -> None:
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(
+            f"""
+            CREATE TABLE sessions (
+              session_id TEXT PRIMARY KEY,
+              name TEXT,
+              agent TEXT,
+              transport TEXT,
+              presence TEXT,
+              last_heartbeat INTEGER,
+              client_key TEXT,
+              cwd TEXT,
+              project TEXT,
+              harness_session_id TEXT
+            );
+            CREATE TABLE opencode_runtime_state (
+              runtime_id TEXT PRIMARY KEY,
+              opencode_db_path TEXT,
+              opencode_session_id TEXT
+            );
+            CREATE TABLE claude_runtime_state (
+              runtime_id TEXT PRIMARY KEY,
+              bridge_dir TEXT
+            );
+            CREATE TABLE hermes_runtime_state (
+              runtime_id TEXT PRIMARY KEY,
+              hermes_db_path TEXT,
+              hermes_session_id TEXT
+            );
+            INSERT INTO sessions VALUES
+              ('s_oc', 'dean', 'opencode', 'acp', 'online', {NOW_MS - 1000}, 'ck_dean', '{cwd}', 'default', 'ses_dean'),
+              ('s_old', 'oscar', 'opencode', 'acp', 'offline', {NOW_MS - 1000}, 'ck_oscar', '{cwd}', 'default', 'ses_oscar');
+            """
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def init_opencode(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(path)
+    try:
+        con.executescript(
+            """
+            CREATE TABLE session (
+              id TEXT PRIMARY KEY,
+              agent TEXT,
+              model TEXT
+            );
+            INSERT INTO session VALUES
+              ('ses_dean', 'nexus', '{"id":"gpt-5.5","providerID":"openai","variant":"high"}'),
+              ('ses_oscar', 'nexus', '{"id":"gpt-5.5","providerID":"openai","variant":"high"}');
+            """
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def run(check: bool, *cmd: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, *cmd],
+        cwd=ROOT,
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def main() -> int:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        daemon = tmp_path / "nexus.db"
+        cwd = tmp_path / "project"
+        init_daemon(daemon, cwd)
+        init_opencode(cwd / ".nexus" / "opencode" / "acp" / "default" / "dean" / "opencode.db")
+        init_opencode(cwd / ".nexus" / "opencode" / "acp" / "default" / "oscar" / "opencode.db")
+
+        model = run(True, str(MODEL_SCRIPT), "--db", str(daemon))
+        assert "NOTE: excluding 1 offline session(s)" in model.stdout
+        assert "dean" in model.stdout
+        assert "gpt-5.5 high" in model.stdout
+        assert "oc-acp" in model.stdout
+        assert "oscar" in model.stdout  # appears in the explicit exclusion note
+
+        all_model = run(True, str(MODEL_SCRIPT), "--db", str(daemon), "--all")
+        assert "oscar" in all_model.stdout
+        assert all_model.stdout.count("oc-acp") == 2
+
+        live = run(
+            False,
+            str(LIVE_SCRIPT),
+            "--db",
+            str(daemon),
+            "--now-ms",
+            str(NOW_MS),
+        )
+        assert live.returncode == 1
+        assert "NOTE: excluding 1 offline session(s)" in live.stdout
+        assert "dean" in live.stdout
+        assert "DEGRADED" in live.stdout
+        assert "oscar" in live.stdout  # appears in the explicit exclusion note
+
+        all_live = run(
+            False,
+            str(LIVE_SCRIPT),
+            "--db",
+            str(daemon),
+            "--now-ms",
+            str(NOW_MS),
+            "--all",
+        )
+        assert all_live.returncode == 1
+        assert "oscar" in all_live.stdout
+        assert "OFFLINE" in all_live.stdout
+
+    print("nexus model/liveness smoke tests passed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,177 @@
+name: npm-native-artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: ${{ matrix.target }} (${{ matrix.support }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64-gnu
+            support: release baseline
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+            executable: nexus
+          - target: linux-arm64-gnu
+            support: release baseline
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            executable: nexus
+          - target: darwin-x64
+            support: experimental package
+            runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            executable: nexus
+          - target: darwin-arm64
+            support: experimental package
+            runner: macos-15
+            rust_target: aarch64-apple-darwin
+            executable: nexus
+          - target: win32-x64-msvc
+            support: release baseline
+            runner: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            executable: nexus.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        if: matrix.target == 'win32-x64-msvc'
+        with:
+          version: 11
+      - name: Select native Rust target
+        shell: bash
+        run: rustup target add "${{ matrix.rust_target }}"
+      - name: Verify native harness command contracts
+        shell: bash
+        run: |
+          cargo test --locked --manifest-path core/Cargo.toml \
+            -p nexus-harness-core --test native_programs --test opencode_executable
+          cargo test --locked --manifest-path core/Cargo.toml \
+            -p nexus-agent --test harness_bootstrap
+          cargo test --locked --manifest-path core/Cargo.toml \
+            -p nexus-harness-claude --test adapter builtin_real_adapter_resolves_documented_acp_command
+          cargo test --locked --manifest-path core/Cargo.toml \
+            -p nexus-harness-codex --test codex_adapter codex_resolves_pinned_app_server_acp_command_without_legacy_flags
+      - name: Verify WSL lifecycle contracts
+        if: matrix.target == 'linux-x64-gnu'
+        shell: bash
+        run: |
+          cargo test --locked --manifest-path core/Cargo.toml \
+            -p egregore-nexus --test daemon_ipc wsl_ambient_whoami_resolves_renamed_agent_by_stable_identity
+          cargo test --locked --manifest-path core/Cargo.toml \
+            -p egregore-nexus --test daemon_service_install wsl_install_transfers_a_running_self_daemon_to_systemd
+      - name: Verify Windows local transport
+        if: matrix.target == 'win32-x64-msvc'
+        shell: bash
+        run: |
+          cargo test --locked --manifest-path core/Cargo.toml \
+            -p egregore-nexus --test gateway_stream_socket gateway_stream_named_pipe_listener_accepts_client
+          pnpm --dir gateway install --frozen-lockfile
+          pnpm --dir gateway exec vitest run src/server/agui/daemonPushRelay.test.ts --maxWorkers=2
+      - name: Build native Nexus
+        shell: bash
+        run: >-
+          cargo build --locked --release --manifest-path core/Cargo.toml
+          -p egregore-nexus --bin nexus --target "${{ matrix.rust_target }}"
+      - name: Stage and execute packaged launcher
+        shell: bash
+        run: |
+          scripts/nexus-pack-native-npm \
+            --target "${{ matrix.target }}" \
+            --binary "core/target/${{ matrix.rust_target }}/release/${{ matrix.executable }}" \
+            --output packages/nexus-cli
+          node packages/nexus-cli/bin/nexus.mjs --version
+          node packages/nexus-cli/bin/nexus.mjs daemon install --help
+          node scripts/nexus-cli-command-surface-smoke.mjs packages/nexus-cli/bin/nexus.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexus-native-${{ matrix.target }}
+          path: packages/nexus-cli/native/
+          if-no-files-found: error
+          retention-days: 1
+
+  npm-tarballs:
+    name: Three public npm tarballs
+    needs: native
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: gateway/pnpm-lock.yaml
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nexus-native-*
+          path: packages/nexus-cli/native
+          merge-multiple: true
+      - name: Verify complete native set
+        shell: bash
+        run: |
+          chmod 755 \
+            packages/nexus-cli/native/linux-x64-gnu/nexus \
+            packages/nexus-cli/native/linux-arm64-gnu/nexus \
+            packages/nexus-cli/native/darwin-x64/nexus \
+            packages/nexus-cli/native/darwin-arm64/nexus
+          test -x packages/nexus-cli/native/linux-x64-gnu/nexus
+          test -x packages/nexus-cli/native/linux-arm64-gnu/nexus
+          test -x packages/nexus-cli/native/darwin-x64/nexus
+          test -x packages/nexus-cli/native/darwin-arm64/nexus
+          test -f packages/nexus-cli/native/win32-x64-msvc/nexus.exe
+      - name: Verify installer guidance
+        run: node --test packages/nexus-cli/tests/*.test.mjs
+      - name: Build Gateway and WebUI
+        run: pnpm --dir gateway install --frozen-lockfile
+      - name: Pack exactly three public packages
+        shell: bash
+        run: |
+          mkdir -p dist/npm
+          npm pack ./packages/nexus-cli --pack-destination dist/npm --silent
+          npm pack ./gateway --pack-destination dist/npm --silent
+          npm pack ./packages/nexus --pack-destination dist/npm --silent
+          test "$(find dist/npm -maxdepth 1 -name '*.tgz' -printf '.' | wc -c)" -eq 3
+          tar -tf dist/npm/egregore-nexus-cli-0.1.1.tgz | grep -q 'native/win32-x64-msvc/nexus.exe'
+      - name: Smoke complete umbrella install
+        shell: bash
+        run: |
+          npm install --prefix dist/npm-smoke --ignore-scripts --no-audit --no-fund \
+            ./dist/npm/egregore-nexus-cli-0.1.1.tgz \
+            ./dist/npm/egregore-nexus-gateway-0.1.1.tgz \
+            ./dist/npm/egregore-nexus-0.1.1.tgz
+          dist/npm-smoke/node_modules/.bin/nexus daemon install --help
+          npm install --global --prefix dist/npm-global-smoke --ignore-scripts --no-audit --no-fund \
+            ./dist/npm/egregore-nexus-cli-0.1.1.tgz \
+            ./dist/npm/egregore-nexus-gateway-0.1.1.tgz \
+            ./dist/npm/egregore-nexus-0.1.1.tgz
+          dist/npm-global-smoke/bin/nexus daemon install --help
+          npm install --global --prefix dist/npm-path-smoke --foreground-scripts --no-audit --no-fund \
+            ./dist/npm/egregore-nexus-cli-0.1.1.tgz \
+            ./dist/npm/egregore-nexus-gateway-0.1.1.tgz \
+            ./dist/npm/egregore-nexus-0.1.1.tgz >dist/npm-path-smoke.log
+          grep -Fq 'Nexus installed successfully, but its command directory is not on PATH' \
+            dist/npm-path-smoke.log
+          grep -Fq "$PWD/dist/npm-path-smoke/bin" dist/npm-path-smoke.log
+          dist/npm-path-smoke/bin/nexus daemon install --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexus-npm-0.1.1
+          path: dist/npm/*.tgz
+          if-no-files-found: error
+          retention-days: 1

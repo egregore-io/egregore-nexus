@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+node --input-type=module - "$ROOT" <<'NODE'
+import fs from "node:fs";
+import path from "node:path";
+import { platformTarget } from "./packages/nexus-cli/lib/platform-target.mjs";
+
+const root = process.argv[2];
+const cli = JSON.parse(fs.readFileSync(path.join(root, "packages/nexus-cli/package.json"), "utf8"));
+const targets = [
+  "linux-x64-gnu",
+  "linux-arm64-gnu",
+  "darwin-x64",
+  "darwin-arm64",
+  "win32-x64-msvc",
+];
+
+if (cli.version !== "0.1.1") throw new Error(`wrong CLI correction version: ${cli.version}`);
+if (cli.name !== "@egregore/nexus-cli") throw new Error(`wrong CLI package name: ${cli.name}`);
+if (!cli.files?.includes("lib/platform-target.mjs")) throw new Error("platform resolver is not packed");
+if (!cli.files?.includes("native")) throw new Error("native binaries are not packed");
+if (Object.keys(cli.optionalDependencies ?? {}).length !== 0) {
+  throw new Error("platform implementation packages must not be published");
+}
+for (const target of targets) {
+  if (fs.existsSync(path.join(root, `packages/nexus-cli-${target}`, "package.json"))) {
+    throw new Error(`${target}: platform package still exists`);
+  }
+}
+
+const cases = [
+  [{ platform: "linux", arch: "x64", glibcVersionRuntime: "2.39" }, "linux-x64-gnu"],
+  [{ platform: "linux", arch: "arm64", glibcVersionRuntime: "2.39" }, "linux-arm64-gnu"],
+  [{ platform: "linux", arch: "x64", glibcVersionRuntime: "2.39", wslDistroName: "Ubuntu" }, "linux-x64-gnu"],
+  [{ platform: "darwin", arch: "x64" }, "darwin-x64"],
+  [{ platform: "darwin", arch: "arm64" }, "darwin-arm64"],
+  [{ platform: "win32", arch: "x64" }, "win32-x64-msvc"],
+  [{ platform: "linux", arch: "x64" }, undefined],
+  [{ platform: "linux", arch: "riscv64", glibcVersionRuntime: "2.39" }, undefined],
+  [{ platform: "win32", arch: "arm64" }, undefined],
+];
+for (const [input, expected] of cases) {
+  const actual = platformTarget(input);
+  if (actual !== expected) throw new Error(`${JSON.stringify(input)} resolved to ${actual}, expected ${expected}`);
+}
+NODE
+
+cat >"$TMP/nexus-native.c" <<'C'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+    puts("nexus 0.1.0 (revision launcher-test)");
+    return 0;
+  }
+  const char *path = getenv("NEXUS_LAUNCHER_ARGS");
+  if (path != NULL) {
+    FILE *output = fopen(path, "w");
+    if (output == NULL) return 24;
+    for (int i = 1; i < argc; i++) {
+      if (i > 1) fputc(' ', output);
+      fputs(argv[i], output);
+    }
+    fputc('\n', output);
+    fclose(output);
+  }
+  return 23;
+}
+C
+cc -g -Wl,--build-id -o "$TMP/nexus-native" "$TMP/nexus-native.c"
+
+cat >"$TMP/wrong-version" <<'SH'
+#!/usr/bin/env sh
+echo 'nexus 10.1.0 (revision wrong-version)'
+SH
+chmod +x "$TMP/wrong-version"
+if "$ROOT/scripts/nexus-pack-native-npm" \
+  --binary "$TMP/wrong-version" --output "$TMP/wrong-pack" >/dev/null 2>&1; then
+  echo "expected native packer to reject a non-0.1.0 binary" >&2
+  exit 1
+fi
+
+set +e
+NEXUS_NATIVE_BIN="$TMP/nexus-native" NEXUS_LAUNCHER_ARGS="$TMP/args" \
+  node "$ROOT/packages/nexus-cli/bin/nexus.mjs" daemon status
+STATUS=$?
+set -e
+test "$STATUS" -eq 23
+test "$(cat "$TMP/args")" = "daemon status"
+
+mkdir -p "$TMP/packs" "$TMP/install" "$TMP/cli-assembly"
+cp -R "$ROOT/packages/nexus-cli/." "$TMP/cli-assembly/"
+"$ROOT/scripts/nexus-pack-native-npm" \
+  --binary "$TMP/nexus-native" --output "$TMP/cli-assembly" >/dev/null
+CLI_TARBALL=$(cd "$TMP/cli-assembly" && npm pack --pack-destination "$TMP/packs" --silent)
+(cd "$TMP/install" && npm init -y >/dev/null && \
+  npm install --ignore-scripts "$TMP/packs/$CLI_TARBALL" >/dev/null)
+
+set +e
+HOME="$TMP/empty-home" CARGO_HOME="$TMP/empty-cargo" \
+  NEXUS_LAUNCHER_ARGS="$TMP/packaged-args" \
+  "$TMP/install/node_modules/.bin/nexus" gateway status
+PACKAGED_STATUS=$?
+set -e
+test "$PACKAGED_STATUS" -eq 23
+test "$(cat "$TMP/packaged-args")" = "gateway status"
+
+if HOME="$TMP/empty-home" CARGO_HOME="$TMP/empty-cargo" \
+  node "$ROOT/packages/nexus-cli/bin/nexus.mjs" --help \
+  >"$TMP/missing.out" 2>"$TMP/missing.err"; then
+  echo "expected missing native Nexus binary failure" >&2
+  exit 1
+fi
+grep -q 'cargo install egregore-nexus' "$TMP/missing.err"
+
+echo "nexus npm launcher fixtures: PASS"

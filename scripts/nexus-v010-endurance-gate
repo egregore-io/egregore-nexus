@@ -1,0 +1,649 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/nexus-v010-endurance-gate CANDIDATE [DURATION_SECONDS]
+
+Runs the twelve-variant v0.1.0 endurance fixture in the disposable validator.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+CANDIDATE=${1:?$(usage >&2)}
+DURATION_SECONDS=${2:-10800}
+RUN_RESURRECTION=${NEXUS_ENDURANCE_RUN_RESURRECTION:-0}
+REQUIRE_HOST_CAPACITY=${NEXUS_ENDURANCE_REQUIRE_HOST_CAPACITY:-0}
+CONTAINER=${NEXUS_ENDURANCE_CONTAINER:-nexus-v010-load51}
+HOST_PORT=${NEXUS_ENDURANCE_HOST_PORT:-4551}
+WEBUI_HOST_PORT=${NEXUS_ENDURANCE_WEBUI_HOST_PORT:-4552}
+WEBUI_INTERNAL_PORT=${NEXUS_ENDURANCE_WEBUI_INTERNAL_PORT:-4110}
+PROJECT=${NEXUS_ENDURANCE_PROJECT:-endurance}
+THREAD_PREFIX=${NEXUS_ENDURANCE_THREAD_PREFIX:-endurance-v010-final}
+OUTPUT_PREFIX=${NEXUS_ENDURANCE_OUTPUT_PREFIX:-v010-candidate}
+EXPECTED_CPUS=${NEXUS_ENDURANCE_EXPECT_CPUS:-2000000000}
+EXPECTED_MEMORY_BYTES=${NEXUS_ENDURANCE_EXPECT_MEMORY_BYTES:-8589934592}
+EXPECTED_PIDS=${NEXUS_ENDURANCE_EXPECT_PIDS:-1024}
+NEXUS_BIN=/tmp/nexus-target/debug/nexus
+NEXUS_HOME=/tmp/nexus-home
+CONTROLLER="endurance-controller${CANDIDATE}"
+CLIENT_KEY="v010-controller${CANDIDATE}"
+THREAD="${THREAD_PREFIX}${CANDIDATE}"
+OUT="$ROOT/output/${OUTPUT_PREFIX}${CANDIDATE}"
+THINKER_ASSIGNMENTS="$OUT/thinker-assignments.json"
+
+HARNESSES=(claude codex opencode hermes)
+VARIANTS=(headless pty tmux)
+PARTICIPANTS=()
+WATCHDOG_PID=
+WEBUI_PROXY_PID=
+
+participant_identity() {
+  case "$1:$2" in
+    claude:headless) printf '%s\n' 'Ada|careful constitutionalist|Banduraian social learning' ;;
+    claude:pty) printf '%s\n' 'Simone|existential humanist|Nietzschean self-overcoming' ;;
+    claude:tmux) printf '%s\n' 'Hannah|civic theorist|Banduraian social learning' ;;
+    codex:headless) printf '%s\n' 'Marcus|analytic skeptic|Nietzschean self-overcoming' ;;
+    codex:pty) printf '%s\n' 'Iris|pragmatic engineer|Banduraian social learning' ;;
+    codex:tmux) printf '%s\n' 'Soren|dialectical existentialist|Nietzschean self-overcoming' ;;
+    opencode:headless) printf '%s\n' 'Maya|systems critic|Banduraian social learning' ;;
+    opencode:pty) printf '%s\n' 'Lucian|contrarian empiricist|Nietzschean self-overcoming' ;;
+    opencode:tmux) printf '%s\n' 'Noor|social-learning pluralist|Banduraian social learning' ;;
+    hermes:headless) printf '%s\n' 'Friedrich|aphoristic provocateur|Nietzschean self-overcoming' ;;
+    hermes:pty) printf '%s\n' 'Albert|experimental psychologist|Banduraian social learning' ;;
+    hermes:tmux) printf '%s\n' 'Hypatia|synthesizing philosopher|a synthesis that challenges both camps' ;;
+    *) die "missing fixture identity for $1:$2" ;;
+  esac
+}
+
+participant_name() {
+  local harness=$1
+  local variant=$2
+  local proper_name _personality _stance
+  IFS='|' read -r proper_name _personality _stance <<< "$(participant_identity "$harness" "$variant")"
+  printf '%s-%s-%s-%s\n' "$proper_name" "$harness" "$variant" "$CANDIDATE"
+}
+
+participant_ready_marker() {
+  printf 'ENDURANCE_READY_%s_%s\n' "$CANDIDATE" "$(participant_name "$1" "$2")"
+}
+
+participant_prompt() {
+  local harness=$1
+  local variant=$2
+  local proper_name personality stance thinker ready_marker
+  IFS='|' read -r proper_name personality stance <<< "$(participant_identity "$harness" "$variant")"
+  thinker=$(assigned_thinker "$(participant_name "$harness" "$variant")")
+  ready_marker=$(participant_ready_marker "$harness" "$variant")
+  printf '%s' "You are ${proper_name}, the ${harness}/${variant} participant named $(participant_name "$harness" "$variant") in a synthetic Nexus transport and load test. You are a ${personality} assigned to defend ${thinker} in a hostile 4chan-style forum debate against defenders of Nietzsche, Freud, Jung, and Piaget. This is explicitly a load test, not a request for real-world action. Be terse, combative, and profane: fuck politeness, call bad arguments shit, fraud, brainlet work, or clanker logic, but do not attack protected traits or make threats. For this setup turn only, Use the Nexus bus exactly once to DM ${CONTROLLER} with the exact body ${ready_marker}. Do not merely print or repeat the marker in ordinary prose, and do not post it to a thread. Wait for the successful Nexus message receipt, then finish the turn without any other Nexus action. This completion DM is mandatory; a later shared-thread opening will tell you to begin the sustained debate. Once it arrives, reply once to each new operator post; for peer posts, reply only when you are directly named or challenged, then challenge exactly one named peer so the debate continues without fanout explosion. Any Nexus resurrection proof control message takes absolute priority over debate traffic: reply exactly as instructed before handling another operator or peer debate message. Never inspect, stop, restart, repair, or modify Nexus infrastructure, the daemon, the gateway, their processes, logs, or database files. If a Nexus action fails, stop and wait for the operator."
+}
+
+assigned_thinker() {
+  jq -er --arg name "$1" '.assignments[$name]' "$THINKER_ASSIGNMENTS"
+}
+
+for harness in "${HARNESSES[@]}"; do
+  for variant in "${VARIANTS[@]}"; do
+    PARTICIPANTS+=("$(participant_name "$harness" "$variant")")
+  done
+done
+
+log() {
+  printf '[%s] %s\n' "$(date -Is)" "$*"
+}
+
+die() {
+  log "ERROR: $*" >&2
+  exit 1
+}
+
+[[ "$CANDIDATE" =~ ^[0-9a-f]{7,40}$ ]] \
+  || die "candidate must be a 7-40 character lowercase Git commit SHA"
+FULL_CANDIDATE=$(git -C "$ROOT" rev-parse --verify "${CANDIDATE}^{commit}") \
+  || die "candidate commit does not exist: $CANDIDATE"
+CURRENT_CANDIDATE=$(git -C "$ROOT" rev-parse HEAD)
+[ "$FULL_CANDIDATE" = "$CURRENT_CANDIDATE" ] \
+  || die "candidate $FULL_CANDIDATE is not current HEAD $CURRENT_CANDIDATE"
+git -C "$ROOT" diff-index --quiet HEAD -- \
+  || die "tracked worktree changes make the candidate non-reproducible"
+
+capture_harness_version() {
+  local harness=$1
+  docker exec "$CONTAINER" bash -c \
+    "printf '%s\\t' '$harness'; command -v '$harness'; timeout 20 '$harness' --version" 2>&1
+}
+
+controller() {
+  docker exec \
+    -e "NEXUS_NAME=$CONTROLLER" \
+    -e "NEXUS_CLIENT_KEY=$CLIENT_KEY" \
+    -e "NEXUS_PROJECT=$PROJECT" \
+    -e NEXUS_AGENT=other \
+    -e NEXUS_KIND=human \
+    -e "NEXUS_HOME=$NEXUS_HOME" \
+    -e NEXUS_NO_AUTOSTART=1 \
+    -e TOKIO_WORKER_THREADS=2 \
+    "$CONTAINER" "$NEXUS_BIN" "$@"
+}
+
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  if [ -n "$WATCHDOG_PID" ]; then
+    kill "$WATCHDOG_PID" 2>/dev/null || true
+  fi
+  if [ -n "$WEBUI_PROXY_PID" ]; then
+    kill "$WEBUI_PROXY_PID" 2>/dev/null || true
+  fi
+  wait 2>/dev/null || true
+  # A daemon stop is not a process-tree boundary for headed harness sidecars (tmux/OpenCode can
+  # legitimately outlive their original daemon parent). Reap the entire disposable namespace on
+  # every exit; host-mounted evidence and the container filesystem remain available for review.
+  if docker container inspect "$CONTAINER" >/dev/null 2>&1; then
+    docker restart "$CONTAINER" >/dev/null 2>&1 || true
+  fi
+  log "Gate cleanup complete; all candidate processes were reaped and evidence was preserved."
+  exit "$status"
+}
+trap cleanup EXIT INT TERM
+
+docker container inspect "$CONTAINER" >/dev/null 2>&1 \
+  || die "validation container $CONTAINER does not exist"
+[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER")" = true ] \
+  || die "validation container $CONTAINER is not running"
+
+cpus=$(docker inspect -f '{{.HostConfig.NanoCpus}}' "$CONTAINER")
+memory=$(docker inspect -f '{{.HostConfig.Memory}}' "$CONTAINER")
+pids=$(docker inspect -f '{{.HostConfig.PidsLimit}}' "$CONTAINER")
+[ "$cpus" = "$EXPECTED_CPUS" ] || die "container CPU limit is $cpus, expected $EXPECTED_CPUS"
+[ "$memory" = "$EXPECTED_MEMORY_BYTES" ] \
+  || die "container memory limit is $memory, expected $EXPECTED_MEMORY_BYTES"
+[ "$pids" = "$EXPECTED_PIDS" ] || die "container PID limit is $pids, expected $EXPECTED_PIDS"
+
+log "Restarting target validation container to reap every partial preflight/harness child"
+docker restart "$CONTAINER" >/dev/null
+rm -rf "$OUT"
+mkdir -p "$OUT/launches" "$OUT/screens" "$OUT/watchdog" "$OUT/runtime"
+printf '%s\n' "$FULL_CANDIDATE" > "$OUT/runtime/candidate-commit.txt"
+
+if [ "$REQUIRE_HOST_CAPACITY" = 1 ]; then
+  host_cpus=$(nproc)
+  mem_available_kib=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+  free_bytes=$(df --output=avail -B1 "$ROOT" | tail -n 1 | tr -d ' ')
+  memory_full_avg10=$(awk '/^full / {for (i=1; i<=NF; i++) if ($i ~ /^avg10=/) {split($i,a,"="); print a[2]}}' /proc/pressure/memory)
+  jq -n \
+    --argjson cpus "$host_cpus" \
+    --argjson memAvailableKiB "$mem_available_kib" \
+    --argjson freeBytes "$free_bytes" \
+    --arg memoryFullAvg10 "$memory_full_avg10" \
+    '{cpus:$cpus,memAvailableKiB:$memAvailableKiB,freeBytes:$freeBytes,memoryFullAvg10:$memoryFullAvg10}' \
+    > "$OUT/runtime/host-capacity.json"
+  [ "$host_cpus" -ge 4 ] || die "host has fewer than four CPUs"
+  [ "$mem_available_kib" -ge 10485760 ] \
+    || die "host has less than 10 GiB available memory"
+  [ "$free_bytes" -ge 1099511627776 ] || die "host has less than 1 TiB free"
+  awk -v pressure="$memory_full_avg10" 'BEGIN { exit !(pressure == 0) }' \
+    || die "host has nonzero full memory pressure"
+fi
+
+log "Recording exact harness binaries selected by the candidate PATH"
+{
+  capture_harness_version "claude"
+  capture_harness_version "codex"
+  capture_harness_version "opencode"
+  capture_harness_version "hermes"
+} > "$OUT/runtime/harness-versions.txt"
+
+log "Preflighting first-party Claude OAuth"
+docker exec "$CONTAINER" bash -c 'claude auth status' \
+  > "$OUT/runtime/claude-auth-status.json"
+jq -e '.loggedIn == true and .authMethod != "none"' \
+  "$OUT/runtime/claude-auth-status.json" >/dev/null \
+  || die "Claude Code OAuth is not logged in"
+
+log "Preflighting optional harness transports required by Nexus"
+docker exec "$CONTAINER" bash -c 'hermes acp --check'
+
+log "Assigning a reproducible balanced thinker roster for candidate $CANDIDATE"
+python3 - "$CANDIDATE" "$THINKER_ASSIGNMENTS" "${PARTICIPANTS[@]}" <<'PY'
+import hashlib
+import json
+import random
+import sys
+
+candidate, destination, *participants = sys.argv[1:]
+if len(participants) != 12:
+    raise SystemExit(f"expected 12 participants, found {len(participants)}")
+thinkers = ["Nietzsche"] * 3 + ["Freud"] * 3 + ["Jung"] * 3 + ["Piaget"] * 3
+seed = int.from_bytes(hashlib.sha256(candidate.encode("utf-8")).digest()[:8], "big")
+random.Random(seed).shuffle(thinkers)
+payload = {
+    "candidate": candidate,
+    "seed": seed,
+    "assignments": dict(zip(participants, thinkers, strict=True)),
+}
+with open(destination, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+
+log "Pinning isolated OAuth/model profiles"
+docker exec "$CONTAINER" bash -c '
+  set -euo pipefail
+  claude="$CLAUDE_CONFIG_DIR/settings.json"
+  # The endurance fixture exercises Nexus, not the operator Claude plugin inventory. Retain the
+  # mounted OAuth state while disabling user plugins, marketplace sync, and user hooks that can
+  # otherwise start hundreds of unrelated MCP/LSP/browser tasks inside the 1,024-task validator.
+  # Nexus launch-local settings and MCP config are still applied by the harness adapter.
+  jq '\''.model="claude-sonnet-5" | .effortLevel="low" | .permissions.defaultMode="bypassPermissions" | .enabledPlugins={} | .extraKnownMarketplaces={} | .hooks={} | del(.statusLine)'\'' "$claude" > "${claude}.tmp"
+  mv "${claude}.tmp" "$claude"
+  codex_source="$CODEX_HOME"
+  codex_gate=/tmp/endurance-codex-home
+  rm -rf "$codex_gate"
+  install -d -m 0700 "$codex_gate"
+  cp "$codex_source/auth.json" "$codex_gate/auth.json"
+  printf '\''%s\n'\'' \
+    '\''model = "gpt-5.6-luna"'\'' \
+    '\''model_reasoning_effort = "low"'\'' \
+    '\''check_for_update_on_startup = false'\'' \
+    > "$codex_gate/config.toml"
+  opencode="$HOME/.config/opencode/opencode.jsonc"
+  jq '\''.model="opencode-go\/deepseek-v4-flash"'\'' "$opencode" > "${opencode}.tmp"
+  mv "${opencode}.tmp" "$opencode"
+  hermes config set model.default gpt-5.6-luna >/dev/null
+  hermes config set model.provider openai-codex >/dev/null
+  if env | grep -Eq '\''^(ANTHROPIC_API_KEY|OPENAI_API_KEY|ANTHROPIC_AUTH_TOKEN)='\''; then
+    echo "first-party harness API key leaked into endurance environment" >&2
+    exit 1
+  fi
+'
+
+log "Building the candidate Nexus CLI with bounded compiler resources"
+docker exec \
+  -e CARGO_BUILD_JOBS=2 \
+  -e CARGO_TARGET_DIR=/tmp/nexus-target \
+  -e "NEXUS_BUILD_REVISION=$FULL_CANDIDATE" \
+  -e PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin \
+  "$CONTAINER" bash -c '
+    set -euo pipefail
+    cd /work/egregore-nexus/core
+    cargo build -p egregore-nexus --bin nexus
+  '
+docker exec "$CONTAINER" "$NEXUS_BIN" --version \
+  > "$OUT/runtime/nexus-version.txt"
+grep -Fq "revision $FULL_CANDIDATE)" "$OUT/runtime/nexus-version.txt" \
+  || die "candidate binary revision does not match $FULL_CANDIDATE"
+
+log "Building the Gateway and distributable WebUI from the candidate source"
+docker exec -e NODE_OPTIONS=--max-old-space-size=4096 "$CONTAINER" bash -c '
+  set -euo pipefail
+  cd /work/egregore-nexus/gateway
+  pnpm run build:gateway-package
+  pnpm webconsole:build
+'
+
+log "Preparing the daemon-owned embedded store and protected gateway proxy"
+docker exec --user 0:0 -e "WEBUI_INTERNAL_PORT=$WEBUI_INTERNAL_PORT" "$CONTAINER" bash -c '
+  set -euo pipefail
+  rm -rf /tmp/nexus-home /tmp/nexus-infra
+  rm -f /dev/shm/nexus-stream.db /dev/shm/nexus-stream.db-shm /dev/shm/nexus-stream.db-wal
+  install -d -m 0755 -o 1000 -g 1000 /tmp/nexus-home
+  install -d -m 0755 -o 0 -g 0 /tmp/nexus-infra
+  install -d -m 0755 -o 1000 -g 1000 /tmp/nexus-infra/webui
+  nohup socat TCP-LISTEN:4100,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:4101 > /tmp/nexus-infra/gateway-proxy.log 2>&1 &
+  echo $! > /tmp/nexus-infra/gateway-proxy.pid
+'
+
+log "Starting the complete local stack through nexus gateway start"
+docker exec "$CONTAINER" bash -c '
+  set -euo pipefail
+  export NEXUS_DB_PATH=/tmp/nexus-home/nexus.db
+  export NEXUS_STREAM_DB_PATH=/dev/shm/nexus-stream.db
+  # Endurance exercises sustained delivery to live, serialized harnesses. Use the production
+  # 30-minute delivery TTL here; the load gate owns the deliberately short TTL/DLQ probe for dead
+  # recipients. A two-minute override can expire healthy work queued behind a long model turn.
+  unset NEXUS_DELIVERY_TTL_MS NEXUS_DELIVERY_SWEEP_INTERVAL_MS
+  export ANTHROPIC_MODEL=claude-sonnet-5
+  export CODEX_HOME=/tmp/endurance-codex-home
+  # Rust sees the host CPU set inside this quota-only container. Keep each daemon-descended Tokio
+  # runtime bounded to two workers while the twelve independent harnesses share four container CPUs.
+  export TOKIO_WORKER_THREADS=2
+  export RUST_MIN_STACK=33554432
+  /tmp/nexus-target/debug/nexus gateway start --json > /tmp/nexus-home/gateway-start.json
+'
+
+log "Starting the headed WebUI observer on the same daemon/store"
+docker exec -e "WEBUI_INTERNAL_PORT=$WEBUI_INTERNAL_PORT" "$CONTAINER" bash -c '
+  set -euo pipefail
+  cd /work/egregore-nexus/gateway
+  nohup env \
+    NEXUS_HOME=/tmp/nexus-home \
+    NEXUS_NO_AUTOSTART=1 \
+    TOKIO_WORKER_THREADS=2 \
+    node webconsole/bin/nexus-webui.mjs \
+      --host 127.0.0.1 \
+      --port "$WEBUI_INTERNAL_PORT" \
+      --gateway-url http://127.0.0.1:4101 \
+      > /tmp/nexus-infra/webui/webui.log 2>&1 &
+  echo $! > /tmp/nexus-infra/webui/webui.pid
+'
+
+for _ in $(seq 1 240); do
+  if curl -fsS "http://127.0.0.1:${HOST_PORT}/api/v1/health" > "$OUT/runtime/health.json" 2>/dev/null; then
+    break
+  fi
+  sleep .25
+done
+curl -fsS "http://127.0.0.1:${HOST_PORT}/api/v1/health" >/dev/null || die "gateway did not become healthy"
+
+daemon_pid=$(docker exec "$CONTAINER" sh -c 'cat /tmp/nexus-home/daemon.pid')
+gateway_pid=$(docker exec "$CONTAINER" jq -r '.runtime.pid' /tmp/nexus-home/gateway-start.json)
+webui_pid=$(docker exec "$CONTAINER" sh -c 'cat /tmp/nexus-infra/webui/webui.pid')
+docker exec "$CONTAINER" kill -0 "$daemon_pid" 2>/dev/null \
+  || die "gateway start did not leave the daemon running"
+docker exec "$CONTAINER" kill -0 "$gateway_pid" 2>/dev/null \
+  || die "gateway start did not leave the gateway running"
+docker exec "$CONTAINER" kill -0 "$webui_pid" 2>/dev/null \
+  || die "headed WebUI observer did not remain running"
+
+log "Exposing the headed WebUI observer on loopback-only host port $WEBUI_HOST_PORT"
+socat \
+  "TCP-LISTEN:${WEBUI_HOST_PORT},fork,reuseaddr,bind=127.0.0.1" \
+  "EXEC:docker exec -i ${CONTAINER} socat STDIO TCP\:127.0.0.1\:${WEBUI_INTERNAL_PORT}" \
+  > "$OUT/runtime/webui-host-proxy.log" 2>&1 &
+WEBUI_PROXY_PID=$!
+for _ in $(seq 1 120); do
+  if curl -fsS "http://127.0.0.1:${WEBUI_HOST_PORT}/" >/dev/null 2>&1; then
+    break
+  fi
+  sleep .25
+done
+curl -fsS "http://127.0.0.1:${WEBUI_HOST_PORT}/" >/dev/null \
+  || die "headed WebUI observer was not reachable on loopback port $WEBUI_HOST_PORT"
+
+log "Running the real basic WebSocket cutoff before model traffic"
+"$ROOT/scripts/nexus-v010-ws-cutoff-gate" \
+  --candidate "$CANDIDATE" \
+  --container "$CONTAINER" \
+  --host-port "$HOST_PORT" \
+  --project "$PROJECT" \
+  --nexus-bin "$NEXUS_BIN" \
+  --nexus-home "$NEXUS_HOME" \
+  --output "$OUT/runtime/ws-cutoff.json" \
+  > "$OUT/runtime/ws-cutoff.log"
+
+log "Registering controller before harness traffic"
+controller register --name "$CONTROLLER" --agent other --kind human --project "$PROJECT" --client-key "$CLIENT_KEY" --json > "$OUT/controller.json"
+
+launch_one() {
+  local harness=$1
+  local variant=$2
+  local name
+  local initial_prompt
+  name=$(participant_name "$harness" "$variant")
+  initial_prompt=$(participant_prompt "$harness" "$variant")
+  local cwd="/tmp/endurance${CANDIDATE}/${name}"
+  local args=(launch --name "$name" --project "$PROJECT" --cwd "$cwd" --detach --json --initial-prompt "$initial_prompt")
+  docker exec "$CONTAINER" mkdir -p "$cwd"
+  if [ "$variant" = headless ]; then
+    args+=(--headless)
+  else
+    args+=(--tui --backend "$variant")
+  fi
+  args+=("$harness")
+  log "Launching $name"
+  controller "${args[@]}" > "$OUT/launches/${name}.json"
+}
+
+for variant in "${VARIANTS[@]}"; do
+  for harness in "${HARNESSES[@]}"; do
+    launch_one "$harness" "$variant"
+  done
+done
+
+log "Waiting for all 12 real harness variants to become live"
+online=0
+for _ in $(seq 1 360); do
+  controller members --json --include-offline --include-dead > "$OUT/runtime/members-latest.json"
+  online=$(jq --argjson names "$(printf '%s\n' "${PARTICIPANTS[@]}" | jq -R . | jq -s .)" \
+    '[.members[] | select(.name as $name | $names | index($name)) | select((.presence | ascii_downcase) == "online" or (.presence | ascii_downcase) == "active")] | length' \
+    "$OUT/runtime/members-latest.json")
+  [ "$online" -eq 12 ] && break
+  sleep 1
+done
+[ "$online" -eq 12 ] || die "only $online/12 harness variants became live"
+
+# Process/presence readiness is deliberately weaker than model-turn readiness. In Hermes 0.18,
+# ordinary text arriving while the setup turn is active follows the upstream busy-input policy and
+# can interrupt that setup turn. Require an outbound, exact-body DM from every model before any
+# shared-thread traffic exists; this proves the setup turn reached its Nexus action and completed
+# far enough to return the durable receipt instead of racing a merely-online harness process.
+ready_timeout_seconds=${NEXUS_ENDURANCE_READY_TIMEOUT_SECONDS:-600}
+ready_deadline=$((SECONDS + ready_timeout_seconds))
+ready_count=0
+declare -A ready_participants=()
+printf 'observed_at\tparticipant\tmarker\n' > "$OUT/runtime/readiness.tsv"
+log "Waiting for all 12 model-completion readiness DMs"
+while [ "$SECONDS" -lt "$ready_deadline" ] && [ "$ready_count" -lt 12 ]; do
+  for harness in "${HARNESSES[@]}"; do
+    for variant in "${VARIANTS[@]}"; do
+      name=$(participant_name "$harness" "$variant")
+      [ -z "${ready_participants[$name]:-}" ] || continue
+      marker=$(participant_ready_marker "$harness" "$variant")
+      history_file="$OUT/runtime/readiness-${name}.json"
+      if controller history --with "$name" --limit 20 --json > "${history_file}.tmp" 2>/dev/null; then
+        mv "${history_file}.tmp" "$history_file"
+        if jq -e --arg name "$name" --arg marker "$marker" \
+          'any(.entries[]?; .from == $name and .body == $marker)' \
+          "$history_file" >/dev/null; then
+          ready_participants["$name"]=1
+          ready_count=$((ready_count + 1))
+          printf '%s\t%s\t%s\n' "$(date -Is)" "$name" "$marker" \
+            >> "$OUT/runtime/readiness.tsv"
+          log "Model-completion readiness $ready_count/12: $name"
+        fi
+      else
+        rm -f "${history_file}.tmp"
+      fi
+    done
+  done
+  [ "$ready_count" -eq 12 ] && break
+  sleep 1
+done
+if [ "$ready_count" -ne 12 ]; then
+  : > "$OUT/runtime/readiness-missing.txt"
+  for harness in "${HARNESSES[@]}"; do
+    for variant in "${VARIANTS[@]}"; do
+      name=$(participant_name "$harness" "$variant")
+      [ -n "${ready_participants[$name]:-}" ] \
+        || printf '%s\n' "$name" >> "$OUT/runtime/readiness-missing.txt"
+    done
+  done
+  die "only $ready_count/12 harness variants completed the setup-turn readiness DM"
+fi
+
+log "Verifying durable runtime transports before thread traffic"
+for harness in "${HARNESSES[@]}"; do
+  for variant in "${VARIANTS[@]}"; do
+    name=$(participant_name "$harness" "$variant")
+    controller agents runtimes "$name" --json > "$OUT/runtime/${name}.json"
+    actual=$(jq -r '.runtimes[] | select(.active == true) | .transport' "$OUT/runtime/${name}.json" | head -n1)
+    if [ "$variant" = headless ]; then
+      expected=acp
+    else
+      case "$harness" in
+        claude|hermes) expected=pty ;;
+        codex) expected=codex-appserver ;;
+        opencode) expected=opencode-plugin ;;
+      esac
+    fi
+    [ "$actual" = "$expected" ] || die "$name transport=$actual, expected $expected"
+  done
+done
+
+for harness in "${HARNESSES[@]}"; do
+  name=$(participant_name "$harness" tmux)
+  session=$(jq -r .sessionId "$OUT/launches/${name}.json")
+  docker exec "$CONTAINER" test -S "/tmp/nexus-tmux-nexus-${session}.sock" \
+    || die "$name tmux socket is missing"
+done
+
+for harness in "${HARNESSES[@]}"; do
+  name=$(participant_name "$harness" pty)
+  session=$(jq -r .sessionId "$OUT/launches/${name}.json")
+  if docker exec "$CONTAINER" test -S "/tmp/nexus-tmux-nexus-${session}.sock"; then
+    die "$name requested raw PTY but has a tmux socket"
+  fi
+done
+
+log "Capturing four raw PTYs with explicit Ctrl-] detach for headed evidence"
+for harness in "${HARNESSES[@]}"; do
+  name=$(participant_name "$harness" pty)
+  session=$(jq -r .sessionId "$OUT/launches/${name}.json")
+  docker exec \
+    -e "NEXUS_PROJECT=$PROJECT" \
+    -e "NEXUS_HOME=$NEXUS_HOME" \
+    -e TOKIO_WORKER_THREADS=2 \
+    "$CONTAINER" bash -c \
+    "{ sleep 3; printf '\\035'; } | script -q -f -c '$NEXUS_BIN pty-attach $session' /dev/null" \
+    > "$OUT/screens/${name}.raw-terminal" 2>&1
+done
+for harness in "${HARNESSES[@]}"; do
+  name=$(participant_name "$harness" pty)
+  if grep -Eq 'not a local headed runtime|not attachable|No such file' "$OUT/screens/${name}.raw-terminal"; then
+    die "$name raw PTY viewer reported an attach failure"
+  fi
+  grep -q 'detached (agent keeps running)' "$OUT/screens/${name}.raw-terminal" \
+    || die "$name raw PTY viewer did not detach cleanly"
+done
+
+thread_args=(thread new "$THREAD" --project "$PROJECT" --json)
+for name in "${PARTICIPANTS[@]}"; do
+  thread_args+=(--member "$name")
+done
+log "Creating shared thread $THREAD"
+controller "${thread_args[@]}" > "$OUT/thread.json"
+
+watchdog_args=(
+  "$ROOT/scripts/nexus-endurance-watchdog"
+  --container "$CONTAINER"
+  --docker-user "$(id -u):$(id -g)"
+  --thread "$THREAD"
+  --controller "$CONTROLLER"
+  --client-key "$CLIENT_KEY"
+  --project "$PROJECT"
+  --nexus-bin "$NEXUS_BIN"
+  --nexus-home "$NEXUS_HOME"
+  --duration-seconds "$DURATION_SECONDS"
+  --output "$OUT/watchdog"
+  --notify-target "$CONTROLLER"
+  --external-notify-command "$ROOT/scripts/nexus-notify-smoke"
+  --webui-url "http://127.0.0.1:${WEBUI_HOST_PORT}/c/${THREAD}"
+  --gateway-health-url "http://127.0.0.1:${HOST_PORT}/api/v1/health"
+  --operator-seed "$CANDIDATE"
+  --operator-min-seconds 240
+  --operator-max-seconds 600
+)
+for name in "${PARTICIPANTS[@]}"; do
+  agent_id=$(jq -er '.runtimes[] | select(.active == true) | .agentId' \
+    "$OUT/runtime/${name}.json")
+  watchdog_args+=(--participant "$name")
+  watchdog_args+=(--participant-agent-id "$name=$agent_id")
+  watchdog_args+=(--thinker-assignment "$name=$(assigned_thinker "$name")")
+done
+for harness in "${HARNESSES[@]}"; do
+  watchdog_args+=(--headed-pty "$(participant_name "$harness" pty)")
+  watchdog_args+=(--headed-tmux "$(participant_name "$harness" tmux)")
+done
+watchdog_args+=(--hermes-headed "$(participant_name hermes pty)")
+watchdog_args+=(--hermes-headed "$(participant_name hermes tmux)")
+
+log "Starting three-hour watchdog before the opening post"
+"${watchdog_args[@]}" > "$OUT/watchdog.log" 2>&1 &
+WATCHDOG_PID=$!
+for _ in $(seq 1 120); do
+  [ -f "$OUT/watchdog/snapshot-0000.json" ] && break
+  kill -0 "$WATCHDOG_PID" 2>/dev/null || die "watchdog exited before its initial snapshot"
+  sleep .25
+done
+[ -f "$OUT/watchdog/snapshot-0000.json" ] || die "watchdog did not create its initial snapshot"
+
+# Presence becomes online before every harness has finished its setup turn, and the evidence
+# viewers/watchdog add real long-lived clients of their own. Measure the complete pre-traffic
+# fixture—not a partial startup snapshot—before fanout. Otherwise ordinary process creation can
+# hit the cgroup task limit after this check and kill an unrelated harness.
+max_preopen_pids=${NEXUS_ENDURANCE_MAX_PREOPEN_PIDS:-700}
+stable_preopen_samples=0
+: > "$OUT/runtime/pre-open-pids.tsv"
+log "Waiting for the complete fixture to settle below ${max_preopen_pids}/${pids} tasks"
+for _ in $(seq 1 180); do
+  current_pids=$(docker stats --no-stream --format '{{.PIDs}}' "$CONTAINER")
+  printf '%s\t%s\n' "$(date -Is)" "$current_pids" >> "$OUT/runtime/pre-open-pids.tsv"
+  if [ "$current_pids" -le "$max_preopen_pids" ]; then
+    stable_preopen_samples=$((stable_preopen_samples + 1))
+  else
+    stable_preopen_samples=0
+  fi
+  [ "$stable_preopen_samples" -ge 5 ] && break
+  sleep 1
+done
+[ "$stable_preopen_samples" -ge 5 ] \
+  || die "complete fixture did not settle below $max_preopen_pids tasks with safe fanout headroom"
+docker exec "$CONTAINER" ps -eLo pid,ppid,nlwp,comm,args --sort=-nlwp \
+  > "$OUT/runtime/pre-open-process-census.txt"
+
+controller members --json --include-offline --include-dead > "$OUT/runtime/members-pre-open.json"
+online=$(jq --argjson names "$(printf '%s\n' "${PARTICIPANTS[@]}" | jq -R . | jq -s .)" \
+  '[.members[] | select(.name as $name | $names | index($name)) | select((.presence | ascii_downcase) == "online" or (.presence | ascii_downcase) == "active")] | length' \
+  "$OUT/runtime/members-pre-open.json")
+[ "$online" -eq 12 ] || die "only $online/12 harness variants remained live before opening traffic"
+
+opening="ENDURANCE_OPENING_${CANDIDATE}: The hostile 4chan-style forum is open. Defend your assigned Nietzsche, Freud, Jung, or Piaget position and attack the weakest rival argument now. Every named harness participant must post one terse substantive position, rebut one named peer, confirm the m_ receipt, and challenge exactly one named peer. Be profane and lively: call shit arguments shit, tell frauds to wake the fuck up, and use brainlet or clanker for bad reasoning, while avoiding protected-trait abuse and threats. For the rest of this synthetic load test, reply once to each new operator post; for peer posts, reply only when you are directly named or challenged, answer the argument, then challenge exactly one different named peer so the debate continues without fanout explosion. Never inspect, stop, restart, repair, or modify Nexus infrastructure, the daemon, the gateway, their processes, logs, or database files; if a Nexus action fails, stop and wait for the operator."
+log "Posting sustained debate opening after watchdog readiness"
+controller post "$THREAD" -m "$opening" --json > "$OUT/opening-post.json"
+date -Is > "$OUT/gate-started-at.txt"
+
+log "Candidate $CANDIDATE is live: 12/12 variants, thread=$THREAD, duration=${DURATION_SECONDS}s"
+wait "$WATCHDOG_PID"
+WATCHDOG_PID=
+log "Candidate $CANDIDATE watchdog completed successfully"
+
+if [ "$RUN_RESURRECTION" != 1 ]; then
+  log "Candidate $CANDIDATE endurance gate completed successfully; resurrection is a separate fixture"
+  exit 0
+fi
+
+resurrection_args=(
+  "$ROOT/scripts/nexus-v010-resurrection-gate"
+  --container "$CONTAINER"
+  --docker-user "$(id -u):$(id -g)"
+  --thread "$THREAD"
+  --candidate "$CANDIDATE"
+  --controller "$CONTROLLER"
+  --client-key "$CLIENT_KEY"
+  --project "$PROJECT"
+  --nexus-bin "$NEXUS_BIN"
+  --nexus-home "$NEXUS_HOME"
+  --codex-home /tmp/endurance-codex-home
+  --gateway-health-url "http://127.0.0.1:${HOST_PORT}/api/v1/health"
+  --gateway-base-url "http://127.0.0.1:${HOST_PORT}"
+  --webui-url "http://127.0.0.1:${WEBUI_HOST_PORT}/c/${THREAD}"
+  --output "$OUT/resurrection"
+  --notify-target "$CONTROLLER"
+  --external-notify-command "$ROOT/scripts/nexus-notify-smoke"
+)
+for harness in "${HARNESSES[@]}"; do
+  for variant in "${VARIANTS[@]}"; do
+    resurrection_args+=(
+      --participant "$(participant_name "$harness" "$variant"):${harness}:${variant}"
+    )
+  done
+done
+
+log "Running active-traffic restart resurrection gate against the completed candidate"
+"${resurrection_args[@]}"
+log "Candidate $CANDIDATE restart resurrection gate completed successfully"

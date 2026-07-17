@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/nexus-windows-validation [windows-lab run options]
+
+Reproduce the Nexus Windows release validation recipe from a Linux host. The
+generic egregore-windows-lab tool, a sealed Windows 11 Evaluation base, QEMU,
+KVM, OVMF, and swtpm must already be configured.
+
+Examples:
+  scripts/nexus-windows-validation --dry-run
+  scripts/nexus-windows-validation
+
+Environment:
+  NEXUS_WINDOWS_LAB_BIN  Path to the windows-lab executable.
+  NEXUS_WINDOWS_LAB_CONFIG  Path to the lab's configured lab.toml.
+
+The public native Windows workflow is release-blocking; this local QEMU fixture
+provides the broader reproducible source gate and artifacts.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "error: the egregore-windows-lab controller must run on a Linux host" >&2
+  exit 2
+fi
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+recipe="$root/testing/windows/nexus.toml"
+
+lab_bin=${NEXUS_WINDOWS_LAB_BIN:-}
+if [[ -z "$lab_bin" ]]; then
+  if command -v windows-lab >/dev/null 2>&1; then
+    lab_bin=$(command -v windows-lab)
+  elif [[ -x "$root/../egregore-windows-lab/.venv/bin/windows-lab" ]]; then
+    lab_bin="$root/../egregore-windows-lab/.venv/bin/windows-lab"
+  fi
+fi
+
+if [[ -z "$lab_bin" || ! -x "$lab_bin" ]]; then
+  cat >&2 <<'EOF'
+error: egregore-windows-lab is not installed.
+Install and configure the optional lab, or set NEXUS_WINDOWS_LAB_BIN to its
+windows-lab executable. See docs/windows-validation.md.
+EOF
+  exit 2
+fi
+
+lab_config=${NEXUS_WINDOWS_LAB_CONFIG:-}
+if [[ -z "$lab_config" && -f "$root/../egregore-windows-lab/lab.toml" ]]; then
+  lab_config="$root/../egregore-windows-lab/lab.toml"
+fi
+if [[ -z "$lab_config" && -f "${XDG_CONFIG_HOME:-$HOME/.config}/egregore-windows-lab/lab.toml" ]]; then
+  lab_config="${XDG_CONFIG_HOME:-$HOME/.config}/egregore-windows-lab/lab.toml"
+fi
+if [[ -z "$lab_config" || ! -f "$lab_config" ]]; then
+  cat >&2 <<'EOF'
+error: egregore-windows-lab configuration was not found.
+Set NEXUS_WINDOWS_LAB_CONFIG to the configured lab.toml. See
+docs/windows-validation.md.
+EOF
+  exit 2
+fi
+
+exec "$lab_bin" --config "$lab_config" run "$recipe" "$@"

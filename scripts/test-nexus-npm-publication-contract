@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+WORKSPACE_MANIFEST="$ROOT/core/Cargo.toml"
+grep -Fq 'strip = "symbols"' "$WORKSPACE_MANIFEST"
+for rust_target in \
+  x86_64-unknown-linux-gnu \
+  aarch64-unknown-linux-gnu \
+  x86_64-apple-darwin \
+  aarch64-apple-darwin \
+  x86_64-pc-windows-msvc; do
+  grep -Fq "\"$rust_target\"" "$WORKSPACE_MANIFEST"
+done
+if grep -Fq 'deferred-targets' "$WORKSPACE_MANIFEST"; then
+  echo "public native npm targets must not remain marked deferred" >&2
+  exit 1
+fi
+
+GATEWAY_STREAM="$ROOT/core/crates/nexus/src/daemon/gateway_stream_socket.rs"
+GATEWAY_RELAY="$ROOT/gateway/src/server/agui/daemonPushRelay.mjs"
+if grep -Fq 'gateway stream named-pipe socket is not implemented on Windows yet' "$GATEWAY_STREAM"; then
+  echo "Windows release baseline cannot disable the daemon-to-Gateway projection pipe" >&2
+  exit 1
+fi
+if grep -Fq 'if (process.platform === "win32") return undefined' "$GATEWAY_RELAY"; then
+  echo "Windows release baseline cannot disable the Gateway projection connector" >&2
+  exit 1
+fi
+
+grep -Fq '| Linux x64 | Release baseline |' "$ROOT/docs/distribution.md"
+grep -Fq '| Windows x64 | Release baseline |' "$ROOT/docs/distribution.md"
+grep -Fq '| WSL | Release baseline |' "$ROOT/docs/distribution.md"
+grep -Fq '| macOS x64 | Experimental |' "$ROOT/docs/distribution.md"
+grep -Fq '| macOS arm64 | Experimental |' "$ROOT/docs/distribution.md"
+
+node - "$ROOT" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const root = process.argv[2];
+
+const publicPackages = new Map([
+  ["packages/nexus/package.json", "@egregore/nexus"],
+  ["packages/nexus-cli/package.json", "@egregore/nexus-cli"],
+  ["gateway/package.json", "@egregore/nexus-gateway"],
+]);
+const packages = [...publicPackages].map(([file, expectedName]) => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, file), "utf8"));
+  if (pkg.name !== expectedName) throw new Error(`${file}: expected ${expectedName}, got ${pkg.name}`);
+  if (pkg.version !== "0.1.1") throw new Error(`${pkg.name}: wrong version`);
+  if (pkg.publishConfig?.access !== "public") throw new Error(`${pkg.name}: public access is not explicit`);
+  return pkg;
+});
+for (const pkg of packages) {
+  if (pkg.repository?.url !== "git+https://github.com/egregore-io/egregore-nexus.git") {
+    throw new Error(`${pkg.name}: wrong public repository`);
+  }
+}
+const [all, cli, gateway] = packages;
+const expectedAll = {
+  "@egregore/nexus-cli": "0.1.1",
+  "@egregore/nexus-gateway": "0.1.1",
+};
+if (JSON.stringify(all.dependencies) !== JSON.stringify(expectedAll)) {
+  throw new Error("@egregore/nexus: dependency contract mismatch");
+}
+if (JSON.stringify(all.bin) !== JSON.stringify({
+  nexus: "bin/nexus.mjs",
+  "nexus-gateway": "bin/nexus-gateway.mjs",
+  "nexus-webui": "bin/nexus-webui.mjs",
+})) {
+  throw new Error("@egregore/nexus: complete command surface is missing");
+}
+if (gateway.dependencies?.["@egregore/nexus-cli"] !== "0.1.1") {
+  throw new Error("@egregore/nexus-gateway must install the CLI automatically");
+}
+if (gateway.bin?.["nexus-webui"] !== "webconsole/bin/nexus-webui.mjs") {
+  throw new Error("@egregore/nexus-gateway must carry the WebUI command");
+}
+if (!gateway.files?.includes("webconsole/dist")) {
+  throw new Error("@egregore/nexus-gateway must carry the built WebUI");
+}
+if (gateway.dependencies?.["@egregore/nexus-cli"] !== "0.1.1") {
+  throw new Error("@egregore/nexus-gateway must install nexus-cli");
+}
+if (gateway.bin?.nexus !== "scripts/nexus.mjs") {
+  throw new Error("@egregore/nexus-gateway must expose the nexus command");
+}
+
+const webui = JSON.parse(fs.readFileSync(path.join(root, "gateway/webconsole/package.json"), "utf8"));
+if (!webui.private || webui.publishConfig) {
+  throw new Error("the WebUI workspace must not be a fourth public package");
+}
+
+if (Object.keys(cli.optionalDependencies ?? {}).length !== 0) {
+  throw new Error("@egregore/nexus-cli must not publish platform implementation packages");
+}
+if (!cli.files?.includes("native")) {
+  throw new Error("@egregore/nexus-cli must carry its native binaries");
+}
+if (cli.scripts?.postinstall !== "node scripts/postinstall.mjs") {
+  throw new Error("@egregore/nexus-cli must run its non-mutating PATH guidance after install");
+}
+if (!cli.files?.includes("scripts/postinstall.mjs") || !cli.files?.includes("lib")) {
+  throw new Error("@egregore/nexus-cli must pack its PATH guidance implementation");
+}
+
+const nativeTargets = [
+  "linux-x64-gnu",
+  "linux-arm64-gnu",
+  "darwin-x64",
+  "darwin-arm64",
+  "win32-x64-msvc",
+];
+for (const target of nativeTargets) {
+  if (fs.existsSync(path.join(root, `packages/nexus-cli-${target}/package.json`))) {
+    throw new Error(`${target}: platform package must not be published separately`);
+  }
+}
+NODE
+
+WORKFLOW="$ROOT/.github/workflows/npm-native-artifacts.yml"
+if [ ! -f "$WORKFLOW" ]; then
+  echo "missing multi-platform native artifact workflow" >&2
+  exit 1
+fi
+grep -Fxq '      - main' "$WORKFLOW"
+if grep -Fq 'release/v0.1.1-artifacts' "$WORKFLOW"; then
+  echo "native artifacts must build from canonical main, not a release-only branch" >&2
+  exit 1
+fi
+for target in \
+  linux-x64-gnu linux-arm64-gnu darwin-x64 darwin-arm64 win32-x64-msvc; do
+  grep -q "$target" "$WORKFLOW"
+done
+
+STORE_MANIFEST="$ROOT/core/crates/nexus-store/Cargo.toml"
+grep -Fq "[target.'cfg(windows)'.dependencies]" "$STORE_MANIFEST"
+grep -Eq '^libsql-sys = \{ workspace = true, features = \["rusqlite"\] \}$' "$STORE_MANIFEST"
+
+grep -q 'workflow_dispatch:' "$WORKFLOW"
+grep -q 'upload-artifact' "$WORKFLOW"
+grep -q 'Smoke complete umbrella install' "$WORKFLOW"
+grep -Fq 'dist/npm-smoke/node_modules/.bin/nexus daemon install --help' "$WORKFLOW"
+grep -Fq 'npm install --global --prefix dist/npm-global-smoke' "$WORKFLOW"
+grep -Fq 'dist/npm-global-smoke/bin/nexus daemon install --help' "$WORKFLOW"
+grep -Fq 'node --test packages/nexus-cli/tests/*.test.mjs' "$WORKFLOW"
+grep -Fq 'node scripts/nexus-cli-command-surface-smoke.mjs packages/nexus-cli/bin/nexus.mjs' "$WORKFLOW"
+grep -Fq 'Verify native harness command contracts' "$WORKFLOW"
+grep -Fq -- '-p nexus-harness-core --test native_programs --test opencode_executable' "$WORKFLOW"
+grep -Fq -- '-p nexus-agent --test harness_bootstrap' "$WORKFLOW"
+grep -Fq -- '-p nexus-harness-claude --test adapter builtin_real_adapter_resolves_documented_acp_command' "$WORKFLOW"
+grep -Fq -- '-p nexus-harness-codex --test codex_adapter codex_resolves_pinned_app_server_acp_command_without_legacy_flags' "$WORKFLOW"
+grep -Fq 'Verify WSL lifecycle contracts' "$WORKFLOW"
+grep -Fq 'wsl_ambient_whoami_resolves_renamed_agent_by_stable_identity' "$WORKFLOW"
+grep -Fq 'wsl_install_transfers_a_running_self_daemon_to_systemd' "$WORKFLOW"
+grep -Fq 'Verify Windows local transport' "$WORKFLOW"
+grep -Fq 'gateway_stream_named_pipe_listener_accepts_client' "$WORKFLOW"
+grep -Fq 'daemonPushRelay.test.ts' "$WORKFLOW"
+grep -Fq 'npm install --global --prefix dist/npm-path-smoke' "$WORKFLOW"
+grep -Fq 'Nexus installed successfully, but its command directory is not on PATH' "$WORKFLOW"
+
+PACKAGE_SMOKE="$ROOT/scripts/nexus-three-facet-package-smoke"
+grep -Fq 'npm install --global --prefix "$TMP/global-install"' "$PACKAGE_SMOKE"
+grep -Fq '"$TMP/global-install/bin/nexus" daemon install --help' "$PACKAGE_SMOKE"
+grep -Fq 'npm install --global --prefix "$TMP/path-guidance-install"' "$PACKAGE_SMOKE"
+grep -Fq 'Nexus installed successfully, but its command directory is not on PATH' "$PACKAGE_SMOKE"
+grep -Fq 'node "$ROOT/scripts/nexus-cli-command-surface-smoke.mjs" "$STACK_BIN/nexus"' "$PACKAGE_SMOKE"
+if grep -Eq 'npm (publish|dist-tag)' "$WORKFLOW"; then
+  echo "native artifact workflow must not publish packages" >&2
+  exit 1
+fi
+
+cat >"$TMP/nexus.c" <<'C'
+#include <stdio.h>
+int main(int argc, char **argv) {
+  if (argc == 2 && argv[1][0] == '-' && argv[1][1] == '-') {
+    puts("nexus 0.1.0 (revision publication-contract)");
+    return 0;
+  }
+  return 0;
+}
+C
+cc -g -Wl,--build-id -o "$TMP/nexus" "$TMP/nexus.c"
+mkdir -p "$TMP/assembly"
+PACKED=$(
+  "$ROOT/scripts/nexus-pack-native-npm" \
+    --target linux-x64-gnu --binary "$TMP/nexus" --output "$TMP/assembly"
+)
+"$PACKED" --version | grep -q 'revision publication-contract'
+
+SECTIONS=$(readelf -SW "$PACKED")
+if printf '%s\n' "$SECTIONS" | grep -Eq '\.(symtab|debug_[^ ]*|comment)([[:space:]]|$)'; then
+  echo "native npm artifact retains symbol, debug, or comment sections" >&2
+  exit 1
+fi
+
+echo "nexus npm publication contract: PASS"
