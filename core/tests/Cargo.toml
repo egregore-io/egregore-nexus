@@ -1,0 +1,132 @@
+[package]
+name = "nexus-acceptance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = false
+# The acceptance scenarios are declared explicitly below so they can live directly under
+# `core/tests/` (the plan's workspace acceptance-suite location) rather than `tests/tests/`.
+autotests = false
+
+[lib]
+path = "lib.rs"
+
+# Each end-to-end acceptance scenario (AionUi-adapted, spec §11) is its own test target. They share
+# the `common` harness module (a real in-test daemon + the hermetic MockAdapter, both transports).
+[[test]]
+name = "lifecycle"
+path = "lifecycle.rs"
+
+[[test]]
+name = "communication"
+path = "communication.rs"
+
+[[test]]
+name = "member_ops"
+path = "member_ops.rs"
+
+[[test]]
+name = "init_failure"
+path = "init_failure.rs"
+
+[[test]]
+name = "whitelist"
+path = "whitelist.rs"
+
+[[test]]
+name = "wake_policy"
+path = "wake_policy.rs"
+
+# The real-adapter wake→inject reproduction (DM to a launched agent backed by the REAL AcpEngine,
+# not the MockAdapter). It drives the production launch+dispatch+loop chain against a hermetic ACP
+# harness, so it catches divergences the mock lifecycle test cannot. See `real_adapter_dm.rs`.
+[[test]]
+name = "real_adapter_dm"
+path = "real_adapter_dm.rs"
+
+# The ACP full-stream pass-through e2e (backend plan 50, Task 9): a DM to a launched real-adapter
+# agent drives the fake harness in `passthrough` mode, which streams the full renderable
+# session/update sequence; the daemon must relay it as ordered tagged `agent.update` events
+# (Commands, Thinking, ToolCall, ToolCall(updated), Text).
+[[test]]
+name = "acp_passthrough"
+path = "acp_passthrough.rs"
+
+# Public-v0.1 deterministic harness parity: actual Claude/Codex/OpenCode/Hermes ACP adapters over
+# the hermetic fake protocol process, with durable settlement and cross-runtime isolation asserts.
+[[test]]
+name = "harness_delivery_parity"
+path = "harness_delivery_parity.rs"
+
+# Signed source command reclaim safety across the durable command → canonical bus transaction →
+# cold real-ACP harness terminal-completion path.
+[[test]]
+name = "source_push_reclaim_delivery"
+path = "source_push_reclaim_delivery.rs"
+
+# Two PTY-native agents DM each other and converse in a thread, each message delivered into the
+# OTHER's PTY through the REAL bus → in_flight → drain → PtyTransport path (Task 10). The daemon's
+# turn-executor is PtyTransport (not ACP); each agent is a `cat` PtySession bound under its session.
+[[test]]
+name = "pty_agent_to_agent"
+path = "pty_agent_to_agent.rs"
+
+# A `launch` over the PTY-native wiring (AppState::wire_pty) AUTO-binds the launched agent's PTY:
+# launch a `cat` agent (program override), DM it via the bus, assert the body lands in its PTY — no
+# manual bind. Proves Task 8a wires launch → supervisor → transport end to end.
+[[test]]
+name = "pty_launch_autobinds"
+path = "pty_launch_autobinds.rs"
+
+# LIVE single-agent e2e (Task 9): boot `wire_pty`, launch a REAL `claude` agent, send it a marked
+# prompt, and assert its `stream_events` gains a `text` row containing OK/the marker — the real
+# harness received the injected turn in its PTY and the tailer captured its reply. Skips when
+# `claude` is not on PATH.
+[[test]]
+name = "pty_e2e"
+path = "pty_e2e.rs"
+
+# LIVE two-instance e2e (Task 11): launch TWO real `claude` agents (ada, ben) via the PTY path; ada
+# DMs ben and ada posts to a shared thread; assert ben's `stream_events` gains rows carrying the DM
+# body / post — the messages were delivered into ben's real claude PTY and tailed to the store.
+[[test]]
+name = "pty_agent_to_agent_live"
+path = "pty_agent_to_agent_live.rs"
+
+# (Outbound is no longer daemon-scraped — agents send by running the `nexus` CLI from their shell —
+# so the old `real_adapter_outbound.rs` scrape reproduction was removed.)
+
+# The hermetic fake ACP harness (a real subprocess speaking the genuine ACP wire protocol).
+# Re-declared here from the nexus-agent source so Cargo builds it for THIS package and exposes
+# `CARGO_BIN_EXE_acceptance_fake_acp_agent` to the acceptance test targets — `nexus-agent` cannot be a
+# dev-dependency carrier of the env var across packages, and `nexus` already depends on
+# `nexus-agent`, so a back-edge would cycle. Pointing at the shared source keeps one harness impl.
+[[bin]]
+name = "acceptance_fake_acp_agent"
+path = "../crates/nexus-agent/src/bin/fake_acp_agent.rs"
+
+# A `[[bin]]` target compiles against `[dependencies]` (not dev-dependencies), so the fake harness's
+# own deps live here. Tokio is shared with the tests below.
+[dependencies]
+tokio = { workspace = true }
+agent-client-protocol = { workspace = true }
+tokio-util = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+nexus = { package = "egregore-nexus", path = "../crates/nexus" }
+nexus-agent = { path = "../crates/nexus-agent" }
+nexus-harness-codex = { path = "../crates/harness/codex" }
+nexus-harness-claude = { path = "../crates/harness/claude" }
+nexus-common = { package = "egregore-nexus-common", path = "../crates/nexus-common" }
+nexus-contracts = { path = "../crates/nexus-contracts" }
+nexus-store = { path = "../crates/nexus-store" }
+nexus-pty = { path = "../crates/nexus-pty" }
+portable-pty = "0.9.0"
+
+tokio = { workspace = true }
+serde = { workspace = true }
+libsql = { workspace = true }

@@ -1,0 +1,24 @@
+[package]
+name = "egregore-nexus-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = ["crates-io"]
+description = "Nexus shared foundation — error enum, id-gen, time, provenance rendering, config, logging."
+
+[lib]
+name = "nexus_common"
+path = "src/lib.rs"
+
+[dependencies]
+nexus-contracts = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+figment = { workspace = true }
+sha2 = { workspace = true }

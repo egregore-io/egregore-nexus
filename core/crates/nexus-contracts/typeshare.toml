@@ -1,0 +1,6 @@
+[typescript.type_mappings]
+"i64" = "number"
+"u32" = "number"
+"f32" = "number"
+# serde_json::Value (JSON-RPC params/result) → unconstrained JSON.
+"Value" = "any"

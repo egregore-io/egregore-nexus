@@ -1,0 +1,10 @@
+{
+  "jsonrpc": "2.0",
+  "id": 21,
+  "result": {
+    "project": "default",
+    "group": "backend",
+    "name": "blake",
+    "agentId": "a_blake"
+  }
+}

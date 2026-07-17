@@ -1,0 +1,24 @@
+[package]
+name = "nexus-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = ["crates-io"]
+description = "Nexus identity: register-once handshake, name↔session binding, presence/heartbeat, privilege tiers + tier_guard (IdentityPort, backend spec §5.1/§8/§2.4)."
+
+[dependencies]
+nexus-contracts = { workspace = true }
+nexus-common = { workspace = true }
+nexus-store = { workspace = true }
+libsql = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = "3"

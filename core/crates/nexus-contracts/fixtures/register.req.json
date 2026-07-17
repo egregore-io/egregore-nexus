@@ -1,0 +1,18 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "register",
+  "params": {
+    "name": "ben",
+    "agentId": "a_ben",
+    "harness": "claude",
+    "harnessSessionId": "hs_abc",
+    "project": "egregore",
+    "clientKey": "ck_stable",
+    "runtimeCredential": "runtime_secret",
+    "tier": "agent",
+    "kind": null,
+    "role": "backend",
+    "cwd": "/home/etan/egregore"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "jsonrpc": "2.0",
+  "id": 21,
+  "method": "admin.group.assign",
+  "params": {
+    "project": "default",
+    "group": "backend",
+    "name": "blake"
+  }
+}

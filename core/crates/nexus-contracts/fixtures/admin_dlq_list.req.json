@@ -1,0 +1,10 @@
+{
+  "jsonrpc": "2.0",
+  "id": 31,
+  "method": "admin.dlq.list",
+  "params": {
+    "for": "ana",
+    "since": "1h",
+    "limit": 25
+  }
+}

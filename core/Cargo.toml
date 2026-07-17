@@ -16,13 +16,26 @@ binary-crate = "egregore-nexus"
 binary-name = "nexus"
 targets = [
   "x86_64-unknown-linux-gnu",
-]
-deferred-targets = [
   "aarch64-unknown-linux-gnu",
   "x86_64-apple-darwin",
   "aarch64-apple-darwin",
   "x86_64-pc-windows-msvc",
 ]
+hardened-targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+]
+experimental-targets = [
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+wsl-target = "x86_64-unknown-linux-gnu"
+
+[profile.release]
+# Strip symbols in every native build. Linux packaging additionally removes the ELF `.comment`
+# section before npm assembly; Mach-O and PE/COFF do not carry that ELF section.
+strip = "symbols"
 
 [workspace.dependencies]
 nexus-contracts = { path = "crates/nexus-contracts", version = "=0.1.0" }
@@ -57,6 +70,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 tokio = { version = "1", features = ["full"] }
 libsql = { version = "0.6", default-features = false, features = ["core"] }
+libsql-sys = { version = "=0.8.0", default-features = false }
 hmac = "0.12"
 sha2 = "0.10"
 axum = "0.7"

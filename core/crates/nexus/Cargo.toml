@@ -1,0 +1,67 @@
+[package]
+name = "egregore-nexus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = ["crates-io"]
+description = "Local-first transport daemon and CLI for routing messages into supported agent harnesses."
+
+[[bin]]
+name = "nexus"
+path = "src/main.rs"
+
+[lib]
+name = "nexus"
+path = "src/lib.rs"
+
+[dependencies]
+nexus-contracts = { workspace = true }
+nexus-common = { workspace = true }
+nexus-store = { workspace = true }
+nexus-dispatch = { workspace = true }
+nexus-identity = { workspace = true }
+nexus-bus = { workspace = true }
+nexus-agent = { workspace = true }
+nexus-harness-claude = { workspace = true }
+nexus-harness-core = { workspace = true }
+nexus-harness-codex = { workspace = true }
+nexus-search = { workspace = true }
+nexus-notify = { workspace = true }
+nexus-admin = { workspace = true }
+nexus-pty = { workspace = true }
+nexus-transcript = { workspace = true }
+portable-pty = "0.9.0"
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+figment = { workspace = true }
+libsql = { workspace = true }
+axum = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+libc = "0.2"
+
+[[bin]]
+# Re-expose the hermetic fake Codex app-server so nexus crate integration tests
+# get CARGO_BIN_EXE_nexus_fake_codex_app_server. Same pattern as nexus-harness-codex
+# re-using nexus-agent's fake_acp_agent source.
+name = "nexus_fake_codex_app_server"
+path = "../../crates/harness/codex/src/bin/fake_codex_app_server.rs"
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = "3"
+portable-pty = "0.9.0"
