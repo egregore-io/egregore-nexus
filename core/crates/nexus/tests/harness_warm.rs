@@ -4,7 +4,7 @@ use std::sync::Arc;
 use nexus::daemon::pty_supervisor::tmux_session_name;
 use nexus::daemon::AppState;
 use nexus_common::Config;
-use nexus_contracts::{Harness, SessionId};
+use nexus_contracts::{HarnessId, SessionId};
 #[cfg(unix)]
 use nexus_contracts::{Kind, Message, MessageId, ProjectId, Provenance, Scope};
 use nexus_harness_claude::storage::{ClaudeRuntimeLaunch, ClaudeRuntimeStateRepo};
@@ -241,7 +241,7 @@ async fn warm_treats_duplicate_claude_native_session_as_an_opaque_resume_hint() 
         .unwrap()
         .unwrap();
     let tail = state
-        .headed_revive_tail_for_row(&stale_row, Harness::Claude)
+        .headed_revive_tail_for_row(&stale_row, &HarnessId::new("claude").unwrap())
         .await
         .unwrap();
 

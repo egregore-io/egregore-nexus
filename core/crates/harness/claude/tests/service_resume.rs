@@ -7,7 +7,7 @@ use nexus_agent::service::Agent;
 use nexus_agent::Adapter;
 use nexus_contracts::{
     AgentTurnExecutionPort, AssignProjectResponse, BatchCounts, Caller, ContractError, EventSink,
-    Harness, HeartbeatResponse, IdentityPort, Kind, MemberListRequest, MemberListResponse,
+    HarnessId, HeartbeatResponse, IdentityPort, Kind, MemberListRequest, MemberListResponse,
     NexusBatch, RegisterRequest, RegisterResponse, Scope, SessionId, StatusRequest, StatusResponse,
     Whoami, WsEvent,
 };
@@ -77,7 +77,7 @@ impl EventSink for NoopSink {
 fn failing_load_registry() -> AdapterRegistry {
     let mut reg = AdapterRegistry::new();
     reg.register(
-        Harness::Claude,
+        &HarnessId::new("claude").unwrap(),
         Arc::new(|_ctx| {
             Arc::new(ClaudeAdapter::with_command(fake_command_failing_load())) as Arc<dyn Adapter>
         }),
@@ -125,7 +125,7 @@ async fn open_session_for_resume_fail_leaves_live_injectable_binding() {
             session.clone(),
             "worker1",
             "default",
-            Harness::Claude,
+            HarnessId::new("claude").unwrap(),
             None,
             vec![],
             Some("dead-resume-key"),

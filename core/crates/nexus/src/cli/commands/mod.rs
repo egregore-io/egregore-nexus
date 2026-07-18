@@ -1,10 +1,12 @@
 //! One module per cli-spec command group. Each exposes its clap `Args`/`Cmd` types and async
 //! handlers `(client, args, json) -> ExitCode`.
 //!
-//! The contract enums (`Harness`, `StatusState`, `ChannelOp`) are serde enums in `nexus-contracts`
+//! The contract enums (`StatusState`, `ChannelOp`, …) are serde enums in `nexus-contracts`
 //! and deliberately do **not** derive clap's `ValueEnum` (the contracts crate has no clap
-//! dependency). The small [`parse`] helpers here bridge a CLI token to the contract enum, matching
-//! each enum's serde lowercase wire token so the CLI and wire never drift.
+//! dependency). The small [`parse`] helpers here bridge a CLI token to the contract type, matching
+//! each type's serde lowercase wire token so the CLI and wire never drift. Harness tokens are the
+//! open-set [`nexus_contracts::HarnessId`] — any lowercase identifier a registered harness answers
+//! to, not a closed list.
 
 pub mod admin;
 pub mod agents;
@@ -28,21 +30,11 @@ pub mod webconsole;
 
 /// clap value-parsers for the contract enums (kept out of `nexus-contracts`, which has no clap dep).
 pub mod parse {
-    use nexus_contracts::{AgentAccessRole, ChannelOp, Harness, Kind, StatusState, Tier};
+    use nexus_contracts::{AgentAccessRole, ChannelOp, HarnessId, Kind, StatusState, Tier};
 
-    /// Parse a harness/runtime token (`claude`|`codex`|`opencode`|`hermes`|`pi`|`other`).
-    pub fn harness(s: &str) -> Result<Harness, String> {
-        match s.to_ascii_lowercase().as_str() {
-            "claude" => Ok(Harness::Claude),
-            "codex" => Ok(Harness::Codex),
-            "opencode" => Ok(Harness::OpenCode),
-            "hermes" => Ok(Harness::Hermes),
-            "pi" => Ok(Harness::Pi),
-            "other" => Ok(Harness::Other),
-            other => Err(format!(
-                "unknown harness '{other}' (claude|codex|opencode|hermes|pi|other)"
-            )),
-        }
+    /// Parse a harness/runtime token (open set — e.g. `claude`, `codex`, `opencode`, `hermes`).
+    pub fn harness(s: &str) -> Result<HarnessId, String> {
+        HarnessId::new(s.to_ascii_lowercase()).map_err(|e| e.to_string())
     }
 
     /// Parse a session kind token (`agent`|`app`).

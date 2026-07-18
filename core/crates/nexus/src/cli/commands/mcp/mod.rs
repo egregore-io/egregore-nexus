@@ -31,7 +31,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 use nexus_common::now;
 use nexus_contracts::{
-    codes, ContractError, DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, Harness, Kind,
+    codes, ContractError, DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, HarnessId, Kind,
     RegisterRequest, Tier, DAEMON_IPC_PROTOCOL_VERSION,
 };
 use nexus_store::Store;
@@ -201,18 +201,12 @@ pub async fn mcp_identity_for_store_with_claude_session(
     )
 }
 
-/// Parse the optional MCP `--agent` label. Unknown labels remain `Other` so manually-started MCP
-/// helpers do not fail just because a newer harness token reached an older CLI.
-fn mcp_harness(agent: Option<&str>) -> Harness {
-    match agent {
-        Some("claude") => Harness::Claude,
-        Some("codex") => Harness::Codex,
-        Some("opencode") => Harness::OpenCode,
-        Some("hermes") => Harness::Hermes,
-        Some("pi") => Harness::Pi,
-        Some("other") | None => Harness::Other,
-        Some(_) => Harness::Other,
-    }
+/// Parse the optional MCP `--agent` label. Invalid labels fall back to `other` so manually-started
+/// MCP helpers do not fail just because a malformed harness token reached an older CLI.
+fn mcp_harness(agent: Option<&str>) -> HarnessId {
+    agent
+        .and_then(|s| HarnessId::new(s).ok())
+        .unwrap_or_else(|| HarnessId::new("other").expect("builtin harness id is valid"))
 }
 
 /// Run the MCP stdio server.
@@ -615,7 +609,7 @@ mod tests {
         assert_eq!(id.project, "lens");
         assert_eq!(id.client_key, "mcp:ada");
         assert_eq!(id.harness_session_id, "mcp:ada");
-        assert!(matches!(id.harness, Harness::Other));
+        assert_eq!(id.harness.as_str(), "other");
         assert!(matches!(id.tier, Tier::Agent));
     }
 
@@ -627,7 +621,7 @@ mod tests {
         assert_eq!(id.project, "lens");
         assert_eq!(id.client_key, "s_agent");
         assert_eq!(id.harness_session_id, "s_agent");
-        assert!(matches!(id.harness, Harness::Codex));
+        assert_eq!(id.harness.as_str(), "codex");
     }
 
     #[test]

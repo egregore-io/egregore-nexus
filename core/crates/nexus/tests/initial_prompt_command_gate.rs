@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 use nexus::daemon::{command_worker, AppState};
 use nexus_common::Config;
 use nexus_contracts::{
-    AgentId, AgentTurnExecutionPort, CompactRequest, Harness, Kind, NexusBatch, PortResult,
-    PromptRequest, RegisterRequest, RemoveRequest, RemoveResponse, SessionId, SpawnRequest,
-    SpawnResponse, SteerDelivery, SteerRequest, SteerResponse, Tier, WarmRequest, WsEvent,
+    AgentId, AgentTurnExecutionPort, CompactRequest, Kind, NexusBatch, PortResult, PromptRequest,
+    RegisterRequest, RemoveRequest, RemoveResponse, SessionId, SpawnRequest, SpawnResponse,
+    SteerDelivery, SteerRequest, SteerResponse, Tier, WarmRequest, WsEvent,
 };
 use nexus_store::command_kinds;
 use nexus_store::repos::{
@@ -80,7 +80,7 @@ fn human_register(name: &str, client_key: &str) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(name.into()),
-        harness: Harness::Other,
+        harness: hid("other"),
         harness_session_id: format!("hs_{client_key}"),
         project: "default".into(),
         client_key: client_key.into(),
@@ -395,4 +395,9 @@ async fn pending_initial_prompt_blocks_agent_id_targeted_commands_with_stale_nam
     assert_eq!(exec.compact.load(Ordering::SeqCst), 1);
 
     worker.abort();
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

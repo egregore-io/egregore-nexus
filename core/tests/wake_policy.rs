@@ -9,8 +9,6 @@ mod common;
 
 use common::*;
 
-use nexus_contracts::Harness;
-
 const PROJECT: &str = "proj";
 
 /// The Nexus relaxation: an idle agent is woken by a peer DM with no human in the loop.
@@ -24,7 +22,7 @@ async fn idle_peer_wakes_with_no_human_gate() {
         "peer",
         PROJECT,
         "launch",
-        spawn(Harness::Claude, "idle_one", PROJECT),
+        spawn(hid("claude"), "idle_one", PROJECT),
     )
     .await
     .ok();
@@ -59,7 +57,7 @@ async fn coalescing_delivers_every_message() {
         "sender",
         PROJECT,
         "launch",
-        spawn(Harness::Claude, "sink", PROJECT),
+        spawn(hid("claude"), "sink", PROJECT),
     )
     .await
     .ok();
@@ -99,7 +97,7 @@ async fn paused_holds_until_resume() {
         "ctl",
         PROJECT,
         "launch",
-        spawn(Harness::Claude, "sleeper", PROJECT),
+        spawn(hid("claude"), "sleeper", PROJECT),
     )
     .await
     .ok();

@@ -1,7 +1,7 @@
 //! Cross-module round-trip: a full delivery flow exercises field-name consistency between modules.
 
 use nexus_contracts::{
-    Ack, AckThreadsRequest, BatchCounts, BatchMessage, Harness, Kind, Message, MessageId,
+    Ack, AckThreadsRequest, BatchCounts, BatchMessage, HarnessId, Kind, Message, MessageId,
     NexusBatch, ProjectId, Provenance, RegisterRequest, RegisterResponse, Scope, SendRequest,
     SendTarget, SessionId, Tier,
 };
@@ -12,7 +12,7 @@ fn full_flow_uses_consistent_top_level_names() {
     let reg = RegisterRequest {
         agent_id: None,
         name: Some("ben".into()),
-        harness: Harness::Claude,
+        harness: HarnessId::new("claude").unwrap(),
         harness_session_id: "hs".into(),
         project: "egregore".into(),
         client_key: "ck".into(),

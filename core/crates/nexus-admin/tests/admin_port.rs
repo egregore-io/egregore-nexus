@@ -6,7 +6,7 @@ use nexus_contracts::admin::{
     SpawnRequest, SpawnResponse,
 };
 use nexus_contracts::codes;
-use nexus_contracts::enums::{Harness, Tier};
+use nexus_contracts::enums::Tier;
 use nexus_contracts::events::WsEvent;
 use nexus_contracts::ids::{MessageId, SessionId};
 use nexus_contracts::notify::{NotifyRequest, NotifyResponse};
@@ -17,6 +17,7 @@ use nexus_contracts::register::{
     HeartbeatResponse, MemberListRequest, MemberListResponse, RegisterRequest, RegisterResponse,
     StatusRequest, StatusResponse, Whoami,
 };
+use nexus_contracts::HarnessId;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -167,7 +168,7 @@ fn build() -> (Admin, Arc<MockAgent>, Arc<MockNotify>, Arc<MockSink>) {
 
 fn spawn_req() -> SpawnRequest {
     SpawnRequest {
-        kind: Harness::Codex,
+        kind: HarnessId::new("codex").unwrap(),
         name: Some("dylan".into()),
         identity_policy: None,
         cwd: None,

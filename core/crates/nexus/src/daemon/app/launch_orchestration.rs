@@ -28,8 +28,8 @@ impl AppState {
             .project
             .clone()
             .unwrap_or_else(|| caller_project.to_string());
-        let route = launch_route(req.headless, self.pty.is_some(), req.kind);
-        if req.kind == nexus_contracts::Harness::Codex {
+        let route = launch_route(req.headless, self.pty.is_some(), &req.kind);
+        if req.kind.as_str() == "codex" {
             if let Some(thread_id) = req.resume.as_deref() {
                 if let Some(resume) = self
                     .resolve_codex_resume_identity(thread_id, &req, &project)
@@ -68,7 +68,7 @@ impl AppState {
                 }
             }
         }
-        let defer_existing_id_resolution = req.kind == nexus_contracts::Harness::Codex
+        let defer_existing_id_resolution = req.kind.as_str() == "codex"
             && req.resume.is_some()
             && matches!(route, LaunchRoute::Headed(_));
         if !defer_existing_id_resolution {
@@ -124,7 +124,7 @@ impl AppState {
                 &identity.agent_id,
                 identity.name.as_deref(),
                 &identity.project,
-                req.kind,
+                req.kind.clone(),
                 req.role.clone(),
                 req.cwd.clone(),
             );
@@ -203,7 +203,7 @@ impl AppState {
             &identity.agent_id,
             identity.name.as_deref(),
             &identity.project,
-            req.kind,
+            req.kind.clone(),
             &client_key,
             req.cwd.clone(),
         );
@@ -215,7 +215,7 @@ impl AppState {
             &identity.agent_id,
             identity.name.as_deref(),
             &identity.project,
-            req.kind,
+            req.kind.clone(),
             req.role.clone(),
             cwd.clone(),
         );
@@ -251,7 +251,7 @@ impl AppState {
                 session.clone(),
                 &launch_label,
                 &identity.project,
-                req.kind,
+                req.kind.clone(),
                 cwd,
                 env,
                 None, // fresh launch — a new session/new (resume is the not-fresh `ensure_live` path)
@@ -320,7 +320,7 @@ impl AppState {
         if req.initial_prompt.is_some() && req.resume.is_some() {
             return Err(Self::initial_prompt_not_fresh_error());
         }
-        if req.kind == nexus_contracts::Harness::Codex {
+        if req.kind.as_str() == "codex" {
             if let Some(thread_id) = req.resume.as_deref() {
                 if let Some(identity) = self
                     .resolve_codex_resume_identity(thread_id, &req, project)
@@ -370,7 +370,7 @@ impl AppState {
         // requested folder via `--add-dir` (transcript-slug isolation); other
         // harnesses keep the requested cwd / per-agent default.
         let launch_spec = harness_launch_spec(
-            req.kind,
+            &req.kind,
             &identity.agent_id,
             &session.0,
             req.cwd.clone(),
@@ -395,7 +395,7 @@ impl AppState {
         // Claude Code owns its native identity/session namespace. Nexus forwards an explicit
         // `--resume` key as an opaque best-effort hint and never reuses, replaces, or rejects a
         // Nexus runtime based on another row carrying the same Claude value.
-        if req.kind == nexus_contracts::Harness::OpenCode {
+        if req.kind.as_str() == "opencode" {
             if let Some(opencode_session_id) = opencode_resume_session_id(&req.harness_args) {
                 if let Some(owner) = self
                     .opencode_native_owner(opencode_session_id)
@@ -424,7 +424,7 @@ impl AppState {
         let headed_runtime = if passive_test_program {
             HeadedRuntimeKind::Screen
         } else {
-            headed_runtime_kind(req.kind)
+            headed_runtime_kind(&req.kind)
         };
 
         // Headed OpenCode runs through a native in-process plugin loaded by `opencode serve`; keep
@@ -438,7 +438,7 @@ impl AppState {
                     bus_name: Some(bus_name),
                     bus_project: Some(project.clone()),
                     bus_client_key: Some(client_key.clone()),
-                    bus_agent: Some(harness_agent_token(req.kind).to_string()),
+                    bus_agent: Some(harness_agent_token(&req.kind).to_string()),
                     ..Default::default()
                 };
                 nexus_agent::write_opencode_mcp_config(&cwd, &ctx);
@@ -452,13 +452,13 @@ impl AppState {
 
         // (0) Headed codex uses the app-server bridge (structured streaming), NOT PTY scraping.
         // This branch returns early — it never reaches `spawn_pty_reply_reader`.
-        if req.kind == nexus_contracts::Harness::Codex {
+        if req.kind.as_str() == "codex" {
             let registered = Self::runtime_descriptor(
                 &session,
                 &identity.agent_id,
                 name.as_deref(),
                 &project,
-                req.kind,
+                req.kind.clone(),
                 req.role.clone(),
                 Some(cwd.clone()),
             );
@@ -570,14 +570,14 @@ impl AppState {
         // (0b) Headed OpenCode uses a native OpenCode plugin loaded inside `opencode serve`, plus a
         // foreground `opencode attach` TUI in the requested raw PTY or tmux backend. The transport
         // binding is the plugin bridge, not terminal keystrokes.
-        if req.kind == nexus_contracts::Harness::OpenCode {
+        if req.kind.as_str() == "opencode" {
             let registered = if let Some(template) = req.initial_prompt.as_deref() {
                 let registered = Self::runtime_descriptor(
                     &session,
                     &identity.agent_id,
                     name.as_deref(),
                     &project,
-                    req.kind,
+                    req.kind.clone(),
                     req.role.clone(),
                     Some(cwd.clone()),
                 );
@@ -660,7 +660,7 @@ impl AppState {
                     &identity.agent_id,
                     name.as_deref(),
                     &project,
-                    req.kind,
+                    req.kind.clone(),
                     req.role.clone(),
                     &client_key,
                     Some(cwd.clone()),
@@ -675,7 +675,7 @@ impl AppState {
                 &identity.agent_id,
                 name.as_deref(),
                 &project,
-                req.kind,
+                req.kind.clone(),
                 req.role.clone(),
                 Some(cwd.clone()),
             );
@@ -718,7 +718,7 @@ impl AppState {
                 &identity.agent_id,
                 name.as_deref(),
                 &project,
-                req.kind,
+                req.kind.clone(),
                 req.role.clone(),
                 Some(cwd.clone()),
             );
@@ -768,7 +768,7 @@ impl AppState {
             let launch_result = supervisor
                 .launch_headed_raw_pty(
                     &session,
-                    req.kind,
+                    &req.kind,
                     &identity.agent_id,
                     name.as_deref(),
                     &project,
@@ -799,7 +799,7 @@ impl AppState {
             let launch_result = supervisor
                 .launch_headed_pty(
                     &session,
-                    req.kind,
+                    &req.kind,
                     &identity.agent_id,
                     name.as_deref(),
                     &project,
@@ -874,7 +874,7 @@ impl AppState {
                 &identity.agent_id,
                 name.as_deref(),
                 &project,
-                req.kind,
+                req.kind.clone(),
                 req.role.clone(),
                 &client_key,
                 Some(cwd.clone()),
@@ -889,7 +889,7 @@ impl AppState {
             &identity.agent_id,
             name.as_deref(),
             &project,
-            req.kind,
+            req.kind.clone(),
             req.role.clone(),
             Some(cwd.clone()),
         );

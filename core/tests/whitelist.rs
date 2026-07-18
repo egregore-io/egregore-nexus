@@ -7,7 +7,7 @@ mod common;
 
 use common::*;
 
-use nexus_contracts::{codes, Harness, SpawnResponse};
+use nexus_contracts::{codes, SpawnResponse};
 
 const PROJECT: &str = "proj";
 
@@ -25,7 +25,7 @@ async fn admin_methods_blocked_for_agent_tier() {
             "agent",
             PROJECT,
             "admin.spawn",
-            spawn(Harness::Claude, "x", PROJECT),
+            spawn(hid("claude"), "x", PROJECT),
         )
         .await;
     assert_eq!(
@@ -104,7 +104,7 @@ async fn admin_tier_allowed_to_spawn() {
             "root",
             PROJECT,
             "admin.spawn",
-            spawn(Harness::Claude, "svc", PROJECT),
+            spawn(hid("claude"), "svc", PROJECT),
         )
         .await
         .result();
@@ -141,7 +141,7 @@ async fn admin_op_does_not_inject_into_message_path() {
         "root",
         PROJECT,
         "launch",
-        spawn(Harness::Claude, "worker", PROJECT),
+        spawn(hid("claude"), "worker", PROJECT),
     )
     .await
     .ok();

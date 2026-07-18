@@ -1,14 +1,18 @@
-use nexus_contracts::enums::Harness;
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::{
     InjectError, OperatorAction, ProviderLimit, ProviderLimitReason, ResetHint,
 };
+use nexus_contracts::HarnessId;
 use serde_json::Value;
 
 use super::jsonrpc::CodexRpcError;
 
 const RPC_SOURCE: &str = "codex.app_server.rpc_error";
 const TURN_SOURCE: &str = "codex.app_server.turn_error";
+
+fn codex_harness_id() -> HarnessId {
+    HarnessId::new("codex").expect("builtin harness id is valid")
+}
 
 pub(crate) fn classify_rpc_error(
     session: &SessionId,
@@ -67,7 +71,7 @@ fn classify_structured_payload(
 
     if let Some(reason) = provider_reason(&code) {
         return Some(InjectError::ProviderLimit(ProviderLimit {
-            harness: Harness::Codex,
+            harness: codex_harness_id(),
             session: session.clone(),
             reason,
             reset_hint,
@@ -79,7 +83,7 @@ fn classify_structured_payload(
 
     operator_reason(&code).map(|reason| {
         InjectError::OperatorAction(OperatorAction {
-            harness: Harness::Codex,
+            harness: codex_harness_id(),
             session: session.clone(),
             reason,
             provider,

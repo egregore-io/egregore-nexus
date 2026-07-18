@@ -5,6 +5,9 @@
 /** One operation carried over daemon IPC. */
 export type DaemonIpcCall = DaemonIpcCallWire;
 
+/** Validated harness identifier (open set). Serializes as a bare string. */
+export type HarnessId = string;
+
 /**
  * One-shot notification target. `Auto` resolves an unqualified CLI value at daemon ingress;
  * explicit variants remove ambiguity without exposing the derived recipient fan-out.
@@ -197,25 +200,12 @@ export interface AgentAccessRevokeResponse {
 	revoked: boolean;
 }
 
-/**
- * Agent harness/runtime (backend §5). Open set — `Other(String)` is NOT used so the
- * type stays a clean TS union; unknown runtimes register a new variant in a contract bump.
- */
-export enum Harness {
-	Claude = "claude",
-	Codex = "codex",
-	OpenCode = "opencode",
-	Hermes = "hermes",
-	Pi = "pi",
-	Other = "other",
-}
-
 /** `nexus agents create <name>` — create a durable agent identity. */
 export interface AgentCreateRequest {
 	/** Globally unique display/addressing name for the first implementation pass. */
 	name: string;
 	/** Default harness used by launch/resume commands when one is not supplied. */
-	defaultHarness?: Harness;
+	defaultHarness?: HarnessId;
 	/** Project scope the agent belongs to. */
 	project?: string;
 	/** Operator-facing label; not used for authorization. */
@@ -234,7 +224,7 @@ export interface AgentRuntimeSummary {
 	/** The disposable runtime id. In the first pass this is the Nexus `SessionId`. */
 	runtimeId: SessionId;
 	agentId: AgentId;
-	harness: Harness;
+	harness: HarnessId;
 	cwd?: string;
 	transport?: string;
 	presence: Presence;
@@ -250,7 +240,7 @@ export interface AgentSummary {
 	/** Public handle. `None` means the identity is staged and not named yet. */
 	name?: string;
 	project: string;
-	defaultHarness?: Harness;
+	defaultHarness?: HarnessId;
 	role?: string;
 	tier?: string;
 	disabled: boolean;
@@ -1222,7 +1212,7 @@ export interface RegisterRequest {
 	 * resolved by `(project, name)` plus `clientKey` compatibility.
 	 */
 	agentId?: AgentId;
-	harness: Harness;
+	harness: HarnessId;
 	/** The harness's own session id (bound to `name`). */
 	harnessSessionId: string;
 	/**
@@ -1470,7 +1460,7 @@ export enum SpawnIdentityPolicy {
 }
 
 export interface SpawnRequest {
-	kind: Harness;
+	kind: HarnessId;
 	name?: string;
 	/** Whether `name` was caller-supplied identity intent or generated/implicit launch metadata. */
 	identityPolicy?: SpawnIdentityPolicy;

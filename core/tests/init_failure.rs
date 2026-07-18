@@ -10,7 +10,7 @@ mod common;
 
 use common::*;
 
-use nexus_contracts::{codes, Harness, MemberListResponse};
+use nexus_contracts::{codes, MemberListResponse};
 
 const PROJECT: &str = "proj";
 
@@ -33,7 +33,7 @@ async fn launch_with_failing_adapter_retains_member_and_loses_no_message() {
             "driver",
             PROJECT,
             "launch",
-            spawn(Harness::Claude, "broken", PROJECT),
+            spawn(hid("claude"), "broken", PROJECT),
         )
         .await;
     assert!(

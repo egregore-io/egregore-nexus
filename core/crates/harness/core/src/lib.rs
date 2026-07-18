@@ -7,7 +7,6 @@
 //! verbatim. A harness overrides only when it needs a compatibility sidecar such as Codex's
 //! `resume <thread>` app-server metadata.
 
-use nexus_contracts::Harness as HarnessKind;
 use thiserror::Error;
 
 pub mod native_executable;
@@ -32,21 +31,24 @@ impl NativeProcessPlatform {
     }
 }
 
-/// Return the native headed executable token for a supported harness and platform.
-pub const fn native_harness_program(
-    harness: HarnessKind,
+/// Return the native headed executable name for a stable harness token and platform.
+///
+/// Keyed by the open-set harness token (for example `claude` or `codex`); tokens without a
+/// provider-owned native executable return `None`.
+pub fn native_harness_program(
+    harness: &str,
     platform: NativeProcessPlatform,
 ) -> Option<&'static str> {
     match (harness, platform) {
-        (HarnessKind::Claude, NativeProcessPlatform::Unix) => Some("claude"),
-        (HarnessKind::Claude, NativeProcessPlatform::Windows) => Some("claude.exe"),
-        (HarnessKind::Codex, NativeProcessPlatform::Unix) => Some("codex"),
-        (HarnessKind::Codex, NativeProcessPlatform::Windows) => Some("codex.exe"),
-        (HarnessKind::OpenCode, NativeProcessPlatform::Unix) => Some("opencode"),
-        (HarnessKind::OpenCode, NativeProcessPlatform::Windows) => Some("opencode.exe"),
-        (HarnessKind::Hermes, NativeProcessPlatform::Unix) => Some("hermes"),
-        (HarnessKind::Hermes, NativeProcessPlatform::Windows) => Some("hermes.exe"),
-        (HarnessKind::Pi | HarnessKind::Other, _) => None,
+        ("claude", NativeProcessPlatform::Unix) => Some("claude"),
+        ("claude", NativeProcessPlatform::Windows) => Some("claude.exe"),
+        ("codex", NativeProcessPlatform::Unix) => Some("codex"),
+        ("codex", NativeProcessPlatform::Windows) => Some("codex.exe"),
+        ("opencode", NativeProcessPlatform::Unix) => Some("opencode"),
+        ("opencode", NativeProcessPlatform::Windows) => Some("opencode.exe"),
+        ("hermes", NativeProcessPlatform::Unix) => Some("hermes"),
+        ("hermes", NativeProcessPlatform::Windows) => Some("hermes.exe"),
+        _ => None,
     }
 }
 
@@ -55,18 +57,6 @@ pub const fn native_npm_runner(platform: NativeProcessPlatform) -> &'static str 
     match platform {
         NativeProcessPlatform::Unix => "npx",
         NativeProcessPlatform::Windows => "npx.cmd",
-    }
-}
-
-/// Stable provider token stored in Nexus identity, independent of executable suffixes.
-pub const fn harness_agent_token(harness: HarnessKind) -> &'static str {
-    match harness {
-        HarnessKind::Claude => "claude",
-        HarnessKind::Codex => "codex",
-        HarnessKind::OpenCode => "opencode",
-        HarnessKind::Hermes => "hermes",
-        HarnessKind::Pi => "pi",
-        HarnessKind::Other => "other",
     }
 }
 
@@ -208,11 +198,50 @@ pub enum HeadedRuntimeKind {
     HermesGateway,
 }
 
+/// How a harness consumes a stored native resume key during attach revive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeStyle {
+    /// The harness cannot be revived from a stored key.
+    Unsupported,
+    /// The key travels out-of-band as sidecar resume metadata consumed by a
+    /// structured headed backend (Codex app-server threads).
+    Sidecar,
+    /// The key is appended to the native argv behind a flag prefix,
+    /// e.g. `["--resume"]` or `["-s"]`.
+    Flag(&'static [&'static str]),
+}
+
+/// One launch's resolved cwd/argv policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HarnessLaunchSpec {
+    /// The directory the harness process spawns in.
+    pub cwd: String,
+    /// Daemon-owned private folder: created 0700 by the caller.
+    pub private_cwd: bool,
+    /// Appended to the harness argv (e.g. claude `--add-dir <target>`).
+    pub extra_args: Vec<String>,
+}
+
+impl HarnessLaunchSpec {
+    /// Status-quo policy: requested cwd verbatim, else the per-agent private default.
+    pub fn status_quo(agent_root: &str, requested_cwd: Option<String>) -> Self {
+        match requested_cwd {
+            Some(cwd) if !cwd.trim().is_empty() => Self {
+                cwd,
+                private_cwd: false,
+                extra_args: Vec::new(),
+            },
+            _ => Self {
+                cwd: agent_root.to_string(),
+                private_cwd: true,
+                extra_args: Vec::new(),
+            },
+        }
+    }
+}
+
 /// Harness launch contract shared by the daemon, CLI, and harness crates.
 pub trait Harness: Send + Sync {
-    /// Contract enum variant for this harness.
-    fn kind(&self) -> HarnessKind;
-
     /// TUI program token, for example `claude` or `codex`.
     ///
     /// Harness kinds that do not support headed launch may return an empty string; callers should
@@ -221,7 +250,12 @@ pub trait Harness: Send + Sync {
 
     /// Stable runtime token stored in Nexus identity rows and exported as `NEXUS_AGENT`.
     fn agent_token(&self) -> &'static str {
-        harness_agent_token(self.kind())
+        let program = self.program();
+        if program.is_empty() {
+            "other"
+        } else {
+            program
+        }
     }
 
     /// Runtime integration profile for headed launches.
@@ -251,6 +285,54 @@ pub trait Harness: Send + Sync {
         Ok(ResolvedTail::fresh())
     }
 
+    /// Human-facing label used in operator-visible errors, e.g. `Claude`.
+    ///
+    /// Default is the lowercase agent token; headed harnesses override with
+    /// their branded spelling.
+    fn display_name(&self) -> &'static str {
+        self.agent_token()
+    }
+
+    /// Preferred local attach backend when `nexus attach` revives this harness.
+    ///
+    /// `None` means the transport recorded on the session row already implies
+    /// the backend and attach should not force one.
+    fn attach_backend(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Whether a headless ACP row may be repaired into a headed launch by
+    /// `nexus attach` using the stored native session id.
+    fn acp_attach_revivable(&self) -> bool {
+        false
+    }
+
+    /// Whether `nexus attach` can revive this harness into a headed runtime at all.
+    ///
+    /// Requires a PTY-native interactive binary; ACP-pure kinds (empty
+    /// [`Harness::program`]) fail closed at the CLI layer.
+    fn attach_revivable(&self) -> bool {
+        !self.program().is_empty()
+    }
+
+    /// Whether Nexus records native thread bindings for this harness.
+    ///
+    /// When true, the binding rows are keyed by [`Harness::agent_token`].
+    fn has_native_thread_binding(&self) -> bool {
+        false
+    }
+
+    /// How a revive launch consumes a stored native resume key.
+    fn resume_style(&self) -> ResumeStyle {
+        ResumeStyle::Unsupported
+    }
+
+    /// Operator-facing description of the stored key named in revive errors,
+    /// e.g. `--resume session id` or `thread id`.
+    fn resume_key_description(&self) -> &'static str {
+        "native session id"
+    }
+
     /// Build the local CLI/TUI command for `nexus launch --tui`.
     fn headed_cli_command(
         &self,
@@ -274,6 +356,25 @@ pub trait Harness: Send + Sync {
         self.headed_cli_command(identity, nexus_exe, tail)
     }
 
+    /// Resolve the launch cwd/argv policy for one (agent, session) pair.
+    ///
+    /// * `agent_root` — the per-agent private default folder (daemon-owned).
+    /// * `requested_cwd` — the folder the caller asked to work in.
+    /// * `is_resume` — a resume launch; harnesses whose fresh-launch policy
+    ///   diverges must fall back to [`HarnessLaunchSpec::status_quo`] so the
+    ///   session's persisted original cwd is reused verbatim.
+    ///
+    /// Default: status quo — requested cwd verbatim, else the private root.
+    fn launch_spec(
+        &self,
+        agent_root: &str,
+        _session_id: &str,
+        requested_cwd: Option<String>,
+        _is_resume: bool,
+    ) -> HarnessLaunchSpec {
+        HarnessLaunchSpec::status_quo(agent_root, requested_cwd)
+    }
+
     /// Translate an operator slash command into a harness-native action.
     ///
     /// The default is fail-fast unsupported. Harnesses opt in only for commands whose native
@@ -283,7 +384,7 @@ pub trait Harness: Send + Sync {
         command: &SlashCommand,
     ) -> Result<SlashCommandAction, HarnessError> {
         Err(HarnessError::UnsupportedSlashCommand {
-            harness: self.kind(),
+            harness: self.agent_token().to_string(),
             command: command.display_name(),
         })
     }
@@ -292,28 +393,24 @@ pub trait Harness: Send + Sync {
 /// Minimal generic harness for runtimes that need only the default contract.
 #[derive(Debug, Clone, Copy)]
 pub struct GenericHarness {
-    kind: HarnessKind,
+    token: &'static str,
     program: &'static str,
 }
 
 impl GenericHarness {
-    /// Build a default passthrough harness.
-    pub const fn new(kind: HarnessKind, program: &'static str) -> Self {
-        Self { kind, program }
+    /// Build a default passthrough harness identified by its runtime token.
+    pub const fn new(token: &'static str, program: &'static str) -> Self {
+        Self { token, program }
     }
 }
 
 impl Harness for GenericHarness {
-    fn kind(&self) -> HarnessKind {
-        self.kind
-    }
-
     fn program(&self) -> &'static str {
         self.program
     }
 
     fn agent_token(&self) -> &'static str {
-        harness_agent_token(self.kind)
+        self.token
     }
 }
 
@@ -324,10 +421,10 @@ pub enum HarnessError {
     #[error("{0}")]
     InvalidTail(String),
     /// The harness cannot execute this slash command natively.
-    #[error("unsupported slash command {command} for {harness:?}")]
+    #[error("unsupported slash command {command} for {harness}")]
     UnsupportedSlashCommand {
-        /// Harness that rejected the command.
-        harness: HarnessKind,
+        /// Runtime agent token of the harness that rejected the command.
+        harness: String,
         /// Slash command display name, e.g. `/compact`.
         command: String,
     },
@@ -393,14 +490,14 @@ mod tests {
 
     #[test]
     fn generic_harness_rejects_slash_commands_by_default() {
-        let harness = GenericHarness::new(HarnessKind::Other, "future");
+        let harness = GenericHarness::new("other", "future");
         let command = SlashCommand::parse("/compact").expect("slash command");
         let err = harness.translate_slash_command(&command).unwrap_err();
 
         assert_eq!(
             err,
             HarnessError::UnsupportedSlashCommand {
-                harness: HarnessKind::Other,
+                harness: "other".to_string(),
                 command: "/compact".to_string(),
             }
         );

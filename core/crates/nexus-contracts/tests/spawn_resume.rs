@@ -1,10 +1,10 @@
-use nexus_contracts::{Harness, SpawnRequest};
+use nexus_contracts::{HarnessId, SpawnRequest};
 
 const RESUME_KEY: &str = "codex-thread-test";
 
 fn resumed_codex_spawn() -> SpawnRequest {
     SpawnRequest {
-        kind: Harness::Codex,
+        kind: HarnessId::new("codex").unwrap(),
         name: Some("resumed-codex".into()),
         identity_policy: None,
         cwd: None,
@@ -32,7 +32,7 @@ fn spawn_request_resume_roundtrips() {
 #[test]
 fn spawn_request_harness_args_roundtrips() {
     let req = SpawnRequest {
-        kind: Harness::Claude,
+        kind: HarnessId::new("claude").unwrap(),
         name: Some("resumed-claude".into()),
         identity_policy: None,
         cwd: Some("/tmp/project".into()),

@@ -53,20 +53,6 @@ pub enum Presence {
     Offline,
 }
 
-/// Agent harness/runtime (backend §5). Open set — `Other(String)` is NOT used so the
-/// type stays a clean TS union; unknown runtimes register a new variant in a contract bump.
-#[typeshare]
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Harness {
-    Claude,
-    Codex,
-    OpenCode,
-    Hermes,
-    Pi,
-    Other,
-}
-
 /// Per-recipient delivery state machine (backend §2.1 / §4 `in_flight.state`).
 #[typeshare]
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

@@ -5,9 +5,9 @@ use nexus::cli::store_client::StoreClient;
 use nexus::daemon::{command_worker, AppState};
 use nexus_common::{hash_runtime_credential, Config};
 use nexus_contracts::{
-    codes, AgentCredentialRevokeRequest, AgentId, Caller, ContractError, CreateThreadRequest,
-    Harness, Kind, Presence, RegisterRequest, RenameRequest, Request, SendRequest, SendTarget,
-    Tier, WsEvent, JSONRPC_VERSION,
+    codes, AgentCredentialRevokeRequest, AgentId, Caller, ContractError, CreateThreadRequest, Kind,
+    Presence, RegisterRequest, RenameRequest, Request, SendRequest, SendTarget, Tier, WsEvent,
+    JSONRPC_VERSION,
 };
 use nexus_store::command_kinds;
 use nexus_store::repos::{
@@ -27,7 +27,7 @@ fn human_register(name: &str, client_key: &str) -> RegisterRequest {
         name,
         client_key,
         "default",
-        Harness::Other,
+        hid("other"),
         Kind::Human,
         Tier::Admin,
     )
@@ -37,7 +37,7 @@ fn register_request(
     name: &str,
     client_key: &str,
     project: &str,
-    harness: Harness,
+    harness: nexus_contracts::HarnessId,
     kind: Kind,
     tier: Tier,
 ) -> RegisterRequest {
@@ -56,14 +56,15 @@ fn register_request(
     }
 }
 
-fn harness_token(harness: Harness) -> &'static str {
-    match harness {
-        Harness::Claude => "claude",
-        Harness::Codex => "codex",
-        Harness::OpenCode => "opencode",
-        Harness::Hermes => "hermes",
-        Harness::Pi => "pi",
-        Harness::Other => "other",
+fn harness_token(harness: nexus_contracts::HarnessId) -> &'static str {
+    match harness.as_str() {
+        "claude" => "claude",
+        "codex" => "codex",
+        "opencode" => "opencode",
+        "hermes" => "hermes",
+        "pi" => "pi",
+        "other" => "other",
+        other => panic!("unexpected harness id in test: {other}"),
     }
 }
 
@@ -228,7 +229,7 @@ async fn identity_attach_allows_session_owner_and_operator() {
             "ada",
             "ck_ada",
             "default",
-            Harness::Claude,
+            hid("claude"),
             Kind::Agent,
             Tier::Agent,
         ))
@@ -288,7 +289,7 @@ async fn identity_attach_rejects_other_agent_session() {
             "ada",
             "ck_ada",
             "default",
-            Harness::Claude,
+            hid("claude"),
             Kind::Agent,
             Tier::Agent,
         ))
@@ -300,7 +301,7 @@ async fn identity_attach_rejects_other_agent_session() {
             "ben",
             "ck_ben",
             "default",
-            Harness::Claude,
+            hid("claude"),
             Kind::Agent,
             Tier::Agent,
         ))
@@ -339,7 +340,7 @@ async fn command_worker_identity_attach_records_event_for_operator_command() {
             "ada",
             "ck_ada",
             "default",
-            Harness::Claude,
+            hid("claude"),
             Kind::Agent,
             Tier::Agent,
         ))
@@ -493,7 +494,7 @@ async fn authenticated_command_refreshes_active_runtime_presence() {
             "active-agent",
             "ck_active_agent",
             "default",
-            Harness::Claude,
+            hid("claude"),
             Kind::Agent,
             Tier::Agent,
         ))
@@ -698,7 +699,7 @@ async fn command_worker_rejects_runtime_client_key_after_credential_revoke() {
         "revoked",
         "ck_revoked_runtime",
         "default",
-        Harness::Claude,
+        hid("claude"),
         Kind::Agent,
         Tier::Agent,
     );
@@ -801,7 +802,7 @@ async fn rename_keeps_mcp_and_cli_env_writes_live_and_canonically_attributed() {
             "before-rename",
             "ck_rename_continuity",
             "default",
-            Harness::Claude,
+            hid("claude"),
             Kind::Agent,
             Tier::Agent,
         ))
@@ -916,7 +917,7 @@ async fn command_worker_accepts_valid_client_key_across_project_metadata() {
             "victim",
             "ck_other_project",
             "other-project",
-            Harness::Other,
+            hid("other"),
             Kind::Human,
             Tier::Admin,
         ))
@@ -972,7 +973,7 @@ async fn command_worker_rejects_mismatched_kind_and_tier_metadata() {
             "agent",
             "ck_agent",
             "default",
-            Harness::Claude,
+            hid("claude"),
             Kind::Agent,
             Tier::Agent,
         ))
@@ -1017,14 +1018,14 @@ async fn command_worker_accepts_registered_client_key_for_each_harness() {
     let state = test_state().await;
 
     for harness in [
-        Harness::Claude,
-        Harness::Codex,
-        Harness::OpenCode,
-        Harness::Hermes,
-        Harness::Pi,
-        Harness::Other,
+        hid("claude"),
+        hid("codex"),
+        hid("opencode"),
+        hid("hermes"),
+        hid("pi"),
+        hid("other"),
     ] {
-        let token = harness_token(harness);
+        let token = harness_token(harness.clone());
         let caller_name = format!("{token}_caller");
         let client_key = format!("ck_{token}");
         let command_id = format!("cmd_{token}");
@@ -1069,7 +1070,7 @@ async fn command_worker_accepts_mcp_store_client_row_with_registered_key() {
             "mcp-agent",
             "ck_mcp_agent",
             "default",
-            Harness::Claude,
+            hid("claude"),
             Kind::Agent,
             Tier::Agent,
         ))
@@ -1141,4 +1142,9 @@ async fn command_worker_accepts_web_gateway_row_with_registered_key() {
         .unwrap();
 
     assert_executed(&state, "cmd_web_gateway", "web-ingress").await;
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

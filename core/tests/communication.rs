@@ -7,7 +7,7 @@ mod common;
 
 use common::*;
 
-use nexus_contracts::{Ack, Harness, SubscribeResponse};
+use nexus_contracts::{Ack, SubscribeResponse};
 
 const PROJECT: &str = "proj";
 
@@ -23,7 +23,7 @@ async fn dm_lands_as_injected_turn_with_provenance() {
         "ana",
         PROJECT,
         "launch",
-        spawn(Harness::Claude, "worker", PROJECT),
+        spawn(hid("claude"), "worker", PROJECT),
     )
     .await
     .ok();
@@ -74,7 +74,7 @@ async fn thread_post_fans_out_to_members_but_not_the_sender() {
         "lead",
         PROJECT,
         "launch",
-        spawn(Harness::Claude, "m1", PROJECT),
+        spawn(hid("claude"), "m1", PROJECT),
     )
     .await
     .ok();
@@ -82,7 +82,7 @@ async fn thread_post_fans_out_to_members_but_not_the_sender() {
         "lead",
         PROJECT,
         "launch",
-        spawn(Harness::Claude, "m2", PROJECT),
+        spawn(hid("claude"), "m2", PROJECT),
     )
     .await
     .ok();
@@ -147,7 +147,7 @@ async fn topic_publish_fans_out_to_subscribers() {
         "pubber",
         PROJECT,
         "launch",
-        spawn(Harness::Claude, "sub1", PROJECT),
+        spawn(hid("claude"), "sub1", PROJECT),
     )
     .await
     .ok();
@@ -155,7 +155,7 @@ async fn topic_publish_fans_out_to_subscribers() {
         "pubber",
         PROJECT,
         "launch",
-        spawn(Harness::Claude, "sub2", PROJECT),
+        spawn(hid("claude"), "sub2", PROJECT),
     )
     .await
     .ok();

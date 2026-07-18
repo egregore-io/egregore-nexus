@@ -5,7 +5,7 @@ use nexus::cli::read_client::ReadClient;
 use nexus::daemon::AppState;
 use nexus_common::Config;
 use nexus_contracts::{
-    codes, Harness, Kind, MemberListRequest, Presence, RegisterRequest, SearchMode, SearchRequest,
+    codes, Kind, MemberListRequest, Presence, RegisterRequest, SearchMode, SearchRequest,
     SendRequest, SendTarget, Tier,
 };
 use nexus_harness_claude::storage::{ClaudeRuntimeLaunch, ClaudeRuntimeStateRepo};
@@ -26,7 +26,7 @@ fn human(name: &str, client_key: &str) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(name.into()),
-        harness: Harness::Other,
+        harness: hid("other"),
         harness_session_id: format!("hs_{client_key}"),
         project: "default".into(),
         client_key: client_key.into(),
@@ -38,7 +38,12 @@ fn human(name: &str, client_key: &str) -> RegisterRequest {
     }
 }
 
-fn agent(name: &str, client_key: &str, harness: Harness, cwd: &str) -> RegisterRequest {
+fn agent(
+    name: &str,
+    client_key: &str,
+    harness: nexus_contracts::HarnessId,
+    cwd: &str,
+) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(name.into()),
@@ -243,7 +248,7 @@ async fn read_client_rejects_bad_key_instead_of_falling_back_to_name() {
     let state = state().await;
     state
         .identity
-        .register(agent("remy", "ck_real_remy", Harness::Claude, "/repo"))
+        .register(agent("remy", "ck_real_remy", hid("claude"), "/repo"))
         .await
         .unwrap();
 
@@ -445,7 +450,7 @@ async fn read_client_resolves_attach_name_to_the_stable_agents_active_runtime() 
     let state = state().await;
     let registered = state
         .identity
-        .register(agent("codex", "ck_codex", Harness::Codex, "/work/old"))
+        .register(agent("codex", "ck_codex", hid("codex"), "/work/old"))
         .await
         .unwrap();
     let agent_id = registered.agent_id.unwrap();
@@ -512,7 +517,7 @@ async fn read_client_prefers_codex_sidecar_tmux_attach_target() {
     let state = state().await;
     let codex = state
         .identity
-        .register(agent("codex", "ck_codex", Harness::Codex, "/work/codex"))
+        .register(agent("codex", "ck_codex", hid("codex"), "/work/codex"))
         .await
         .unwrap();
     Sessions::new(&state.store)
@@ -573,7 +578,7 @@ async fn read_client_prefers_codex_raw_terminal_manifest_over_sidecar_tmux() {
     let state = state().await;
     let codex = state
         .identity
-        .register(agent("codex", "ck_codex", Harness::Codex, "/work/codex"))
+        .register(agent("codex", "ck_codex", hid("codex"), "/work/codex"))
         .await
         .unwrap();
     Sessions::new(&state.store)
@@ -673,7 +678,7 @@ async fn read_client_builds_claude_revive_plan_from_dead_headed_row() {
     let state = state().await;
     let hugo = state
         .identity
-        .register(agent("hugo", "ck_hugo", Harness::Claude, "/work/egregore"))
+        .register(agent("hugo", "ck_hugo", hid("claude"), "/work/egregore"))
         .await
         .unwrap();
     let sessions = Sessions::new(&state.store);
@@ -703,7 +708,7 @@ async fn read_client_builds_claude_revive_plan_from_dead_headed_row() {
 
     assert_eq!(plan.name, "hugo");
     assert_eq!(plan_by_session, plan);
-    assert_eq!(plan.spawn.kind, Harness::Claude);
+    assert_eq!(plan.spawn.kind, hid("claude"));
     assert_eq!(plan.spawn.name.as_deref(), Some("hugo"));
     assert_eq!(plan.spawn.project.as_deref(), Some("default"));
     assert_eq!(plan.spawn.cwd.as_deref(), Some("/work/egregore"));
@@ -724,7 +729,7 @@ async fn read_client_harvests_missing_claude_resume_id_before_revive_failure() {
     let bridge_dir = tmp.path().join("claude-sessions/s_hugo/bridge");
     let hugo = state
         .identity
-        .register(agent("hugo", "ck_hugo", Harness::Claude, "/work/egregore"))
+        .register(agent("hugo", "ck_hugo", hid("claude"), "/work/egregore"))
         .await
         .unwrap();
     let sessions = Sessions::new(&state.store);
@@ -772,7 +777,7 @@ async fn read_client_harvests_missing_claude_resume_id_before_revive_failure() {
         .unwrap()
         .unwrap();
 
-    assert_eq!(plan.spawn.kind, Harness::Claude);
+    assert_eq!(plan.spawn.kind, hid("claude"));
     assert_eq!(
         plan.spawn.harness_args,
         ["--resume", "claude-native-inline"]
@@ -794,7 +799,7 @@ async fn read_client_refuses_ambiguous_claude_resume_harvest_before_revive() {
     let bridge_dir = tmp.path().join("claude-sessions/s_hugo/bridge");
     let hugo = state
         .identity
-        .register(agent("hugo", "ck_hugo", Harness::Claude, "/work/egregore"))
+        .register(agent("hugo", "ck_hugo", hid("claude"), "/work/egregore"))
         .await
         .unwrap();
     let sessions = Sessions::new(&state.store);
@@ -858,12 +863,12 @@ async fn read_client_does_not_treat_duplicate_claude_resume_hint_as_identity_con
     let state = state().await;
     let clara = state
         .identity
-        .register(agent("clara", "ck_clara", Harness::Claude, "/work/lens"))
+        .register(agent("clara", "ck_clara", hid("claude"), "/work/lens"))
         .await
         .unwrap();
     let alan = state
         .identity
-        .register(agent("alan", "ck_alan", Harness::Claude, "/work/lens"))
+        .register(agent("alan", "ck_alan", hid("claude"), "/work/lens"))
         .await
         .unwrap();
     let sessions = Sessions::new(&state.store);
@@ -913,7 +918,7 @@ async fn read_client_does_not_treat_duplicate_claude_resume_hint_as_identity_con
     );
     let plan = read.attach_revive_plan("clara").await.unwrap();
 
-    assert_eq!(plan.spawn.kind, Harness::Claude);
+    assert_eq!(plan.spawn.kind, hid("claude"));
     assert_eq!(
         plan.spawn.harness_args,
         ["--resume", "claude-native-duplicate"],
@@ -926,7 +931,7 @@ async fn read_client_uses_codex_resume_key_for_revive_plan() {
     let state = state().await;
     let rex = state
         .identity
-        .register(agent("rex", "ck_rex", Harness::Codex, "/work/codex"))
+        .register(agent("rex", "ck_rex", hid("codex"), "/work/codex"))
         .await
         .unwrap();
     let sessions = Sessions::new(&state.store);
@@ -953,7 +958,7 @@ async fn read_client_uses_codex_resume_key_for_revive_plan() {
     );
     let plan = read.attach_revive_plan("rex").await.unwrap();
 
-    assert_eq!(plan.spawn.kind, Harness::Codex);
+    assert_eq!(plan.spawn.kind, hid("codex"));
     assert_eq!(plan.spawn.resume.as_deref(), Some("codex-thread-7"));
     assert!(plan.spawn.harness_args.is_empty());
 }
@@ -963,7 +968,7 @@ async fn read_client_rejects_codex_revive_when_harness_session_id_is_nexus_sessi
     let state = state().await;
     let otto = state
         .identity
-        .register(agent("otto", "ck_otto", Harness::Codex, "/work/codex"))
+        .register(agent("otto", "ck_otto", hid("codex"), "/work/codex"))
         .await
         .unwrap();
     let sessions = Sessions::new(&state.store);
@@ -1003,7 +1008,7 @@ async fn read_client_uses_codex_sidecar_thread_for_revive_plan() {
     let state = state().await;
     let rex = state
         .identity
-        .register(agent("rex", "ck_rex", Harness::Codex, "/work/codex"))
+        .register(agent("rex", "ck_rex", hid("codex"), "/work/codex"))
         .await
         .unwrap();
     let sessions = Sessions::new(&state.store);
@@ -1047,7 +1052,7 @@ async fn read_client_uses_codex_sidecar_thread_for_revive_plan() {
     );
     let plan = read.attach_revive_plan("rex").await.unwrap();
 
-    assert_eq!(plan.spawn.kind, Harness::Codex);
+    assert_eq!(plan.spawn.kind, hid("codex"));
     assert_eq!(plan.spawn.resume.as_deref(), Some("codex-thread-sidecar"));
     assert!(plan.spawn.harness_args.is_empty());
 }
@@ -1057,7 +1062,7 @@ async fn read_client_prefers_codex_sidecar_thread_over_contaminated_harness_sess
     let state = state().await;
     let otto = state
         .identity
-        .register(agent("otto", "ck_otto", Harness::Codex, "/work/codex"))
+        .register(agent("otto", "ck_otto", hid("codex"), "/work/codex"))
         .await
         .unwrap();
     let sessions = Sessions::new(&state.store);
@@ -1101,7 +1106,7 @@ async fn read_client_prefers_codex_sidecar_thread_over_contaminated_harness_sess
     );
     let plan = read.attach_revive_plan("otto").await.unwrap();
 
-    assert_eq!(plan.spawn.kind, Harness::Codex);
+    assert_eq!(plan.spawn.kind, hid("codex"));
     assert_eq!(plan.spawn.resume.as_deref(), Some("codex-thread-real"));
     assert!(plan.spawn.harness_args.is_empty());
 }
@@ -1111,7 +1116,7 @@ async fn read_client_prefers_identity_owned_codex_thread_over_sidecar_thread() {
     let state = state().await;
     let rex = state
         .identity
-        .register(agent("rex", "ck_rex", Harness::Codex, "/work/codex"))
+        .register(agent("rex", "ck_rex", hid("codex"), "/work/codex"))
         .await
         .unwrap();
     let agent_id = rex.agent_id.as_ref().expect("agent id").0.clone();
@@ -1170,7 +1175,7 @@ async fn read_client_prefers_identity_owned_codex_thread_over_sidecar_thread() {
     );
     let plan = read.attach_revive_plan("rex").await.unwrap();
 
-    assert_eq!(plan.spawn.kind, Harness::Codex);
+    assert_eq!(plan.spawn.kind, hid("codex"));
     assert_eq!(plan.spawn.resume.as_deref(), Some("codex-thread-identity"));
     assert!(plan.spawn.harness_args.is_empty());
 }
@@ -1180,7 +1185,7 @@ async fn read_client_uses_native_opencode_session_for_revive_plan() {
     let state = state().await;
     let ada = state
         .identity
-        .register(agent("ada", "ck_ada", Harness::OpenCode, "/work/opencode"))
+        .register(agent("ada", "ck_ada", hid("opencode"), "/work/opencode"))
         .await
         .unwrap();
     let sessions = Sessions::new(&state.store);
@@ -1207,7 +1212,7 @@ async fn read_client_uses_native_opencode_session_for_revive_plan() {
     );
     let plan = read.attach_revive_plan("ada").await.unwrap();
 
-    assert_eq!(plan.spawn.kind, Harness::OpenCode);
+    assert_eq!(plan.spawn.kind, hid("opencode"));
     assert_eq!(plan.spawn.harness_args, ["-s", "ses_opencode_1"]);
 }
 
@@ -1216,7 +1221,7 @@ async fn read_client_uses_native_hermes_session_for_revive_plan() {
     let state = state().await;
     let ada = state
         .identity
-        .register(agent("ada", "ck_ada", Harness::Hermes, "/work/hermes"))
+        .register(agent("ada", "ck_ada", hid("hermes"), "/work/hermes"))
         .await
         .unwrap();
     let sessions = Sessions::new(&state.store);
@@ -1256,7 +1261,7 @@ async fn read_client_uses_native_hermes_session_for_revive_plan() {
     );
     let plan = read.attach_revive_plan("ada").await.unwrap();
 
-    assert_eq!(plan.spawn.kind, Harness::Hermes);
+    assert_eq!(plan.spawn.kind, hid("hermes"));
     assert_eq!(plan.spawn.harness_args, ["--session", "hermes-session-9"]);
 }
 
@@ -1265,7 +1270,7 @@ async fn read_client_builds_claude_revive_plan_from_acp_row() {
     let state = state().await;
     let ada = state
         .identity
-        .register(agent("ada", "ck_ada", Harness::Claude, "/work/acp"))
+        .register(agent("ada", "ck_ada", hid("claude"), "/work/acp"))
         .await
         .unwrap();
     let sessions = Sessions::new(&state.store);
@@ -1289,7 +1294,7 @@ async fn read_client_builds_claude_revive_plan_from_acp_row() {
     let plan = read.attach_revive_plan("ada").await.unwrap();
 
     assert_eq!(plan.name, "ada");
-    assert_eq!(plan.spawn.kind, Harness::Claude);
+    assert_eq!(plan.spawn.kind, hid("claude"));
     assert_eq!(plan.spawn.name.as_deref(), Some("ada"));
     assert_eq!(plan.spawn.cwd.as_deref(), Some("/work/acp"));
     assert_eq!(plan.spawn.resume, None);
@@ -1305,7 +1310,7 @@ async fn read_client_does_not_build_headed_revive_plan_for_non_claude_acp_row() 
     let state = state().await;
     let rex = state
         .identity
-        .register(agent("rex", "ck_rex", Harness::Codex, "/work/acp"))
+        .register(agent("rex", "ck_rex", hid("codex"), "/work/acp"))
         .await
         .unwrap();
     Sessions::new(&state.store)
@@ -1343,7 +1348,7 @@ async fn members_hides_dead_agents_unless_include_dead() {
     let state = state().await;
     let zed = state
         .identity
-        .register(agent("zed", "ck_zed", Harness::Claude, "/tmp"))
+        .register(agent("zed", "ck_zed", hid("claude"), "/tmp"))
         .await
         .unwrap();
     let agent_id = zed.agent_id.expect("registered agent id");
@@ -1392,4 +1397,9 @@ async fn members_hides_dead_agents_unless_include_dead() {
         .expect("audit view includes the dead agent");
     assert_eq!(row.lifecycle_state.as_deref(), Some("dead"));
     assert_eq!(row.dead_reason.as_deref(), Some("revive_exhausted"));
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

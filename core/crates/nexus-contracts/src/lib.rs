@@ -41,7 +41,8 @@
 //! ## Module map
 //!
 //! - [`ids`] — string-backed id newtypes (`SessionId`, `MessageId`, `ThreadId`, `TopicId`, `ProjectId`).
-//! - [`enums`] — shared closed enums (`Kind`, `Scope`, `Tier`, `Presence`, `Harness`, `DeliveryState`).
+//! - [`enums`] — shared closed enums (`Kind`, `Scope`, `Tier`, `Presence`, `DeliveryState`).
+//! - [`harness`] — `HarnessId`, the validated open-set harness identifier.
 //! - [`agents`] — durable agent identities, runtime credentials, and runtime summaries.
 //! - [`project`] — `Project` + register-project request/response.
 //! - [`message`] — `Message` + `Provenance` (in-band tag attrs + stored crypto stamp).
@@ -68,6 +69,7 @@ pub mod daemon_ipc;
 pub mod enums;
 pub mod events;
 pub mod gateway_projection;
+pub mod harness;
 pub mod ids;
 pub mod message;
 pub mod metadata;
@@ -111,7 +113,7 @@ pub use daemon_ipc::{
     DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, DaemonIpcResponse,
     DAEMON_IPC_PROTOCOL_VERSION,
 };
-pub use enums::{AgentAccessRole, DeliveryState, Harness, Kind, Presence, Scope, Tier};
+pub use enums::{AgentAccessRole, DeliveryState, Kind, Presence, Scope, Tier};
 pub use events::{
     AgentUpdateKind, DeveloperEventEnvelope, DeveloperEventKind, DeveloperToolCallPhase,
     ToolCallData, WsEvent,
@@ -120,6 +122,7 @@ pub use gateway_projection::{
     GatewayProjectionAck, GatewayProjectionEffect, GatewayProjectionEvent, GatewayProjectionKind,
     GATEWAY_PROJECTION_VERSION,
 };
+pub use harness::{HarnessId, HarnessIdError, HARNESS_ID_MAX_LEN};
 pub use ids::{AgentId, CredentialId, MessageId, ProjectId, SessionId, ThreadId, TopicId};
 pub use message::{Message, Provenance, ProvenanceStamp, ReadRequest};
 pub use metadata::{MetadataEntityKind, MetadataGetRequest, MetadataResponse, MetadataSetRequest};

@@ -4,7 +4,7 @@ use std::time::Duration;
 use nexus::daemon::AppState;
 use nexus_agent::{Adapter, AdapterRegistry, MockAdapter};
 use nexus_common::{Config, NexusError};
-use nexus_contracts::{Harness, SpawnRequest};
+use nexus_contracts::SpawnRequest;
 use nexus_store::repos::Sessions;
 use nexus_store::Store;
 
@@ -18,7 +18,7 @@ async fn already_live_headless_agent_wake_does_not_wait_for_an_unrelated_write_l
 
     let mut registry = AdapterRegistry::new();
     registry.register(
-        Harness::Claude,
+        &hid("claude"),
         Arc::new(|_| Arc::new(MockAdapter::new()) as Arc<dyn Adapter>),
     );
     let config = Config {
@@ -29,7 +29,7 @@ async fn already_live_headless_agent_wake_does_not_wait_for_an_unrelated_write_l
     state
         .launch_agent(
             SpawnRequest {
-                kind: Harness::Claude,
+                kind: hid("claude"),
                 name: Some("live-wake-target".into()),
                 identity_policy: None,
                 cwd: Some("/tmp/nexus-live-wake-target".into()),
@@ -70,4 +70,9 @@ async fn already_live_headless_agent_wake_does_not_wait_for_an_unrelated_write_l
         .expect("an already-live target must not perform a contended presence write")
         .expect("already-live target remains reachable");
     assert_eq!(session, target.session_id);
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

@@ -32,7 +32,7 @@ impl Launcher {
     /// `agent.status=errored` and retain the session for retry (spec §11).
     pub async fn launch(&self, req: &SpawnRequest) -> Result<Arc<dyn Adapter>, AgentError> {
         let adapter = self.registry.get(
-            req.kind,
+            &req.kind,
             LaunchCtx {
                 cwd: req.cwd.clone(),
                 ..Default::default()

@@ -9,7 +9,6 @@
 import { z } from "zod";
 
 import {
-  Harness,
   StatusState,
   ChannelOp,
   Tier,
@@ -19,7 +18,9 @@ import {
 import { EMPTY_MESSAGE_BODY, hasMessageBody } from "@server/messagePost/validate";
 
 // ── enums (mirror the contract string enums) ──────────────────────────────────
-const harnessSchema = z.nativeEnum(Harness);
+const harnessSchema = z
+  .string()
+  .regex(/^[a-z][a-z0-9_-]{0,63}$/, "invalid harness id");
 const statusStateSchema = z.nativeEnum(StatusState);
 const channelOpSchema = z.nativeEnum(ChannelOp);
 const tierSchema = z.nativeEnum(Tier);

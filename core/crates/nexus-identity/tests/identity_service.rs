@@ -3,11 +3,12 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use nexus_common::{hash_runtime_credential, now, Config, NexusError};
 use nexus_contracts::admin::{AdminAssignRequest, AdminRenameRequest};
-use nexus_contracts::enums::{Harness, Presence, Tier};
+use nexus_contracts::enums::{Presence, Tier};
 use nexus_contracts::events::WsEvent;
 use nexus_contracts::ids::{AgentId, SessionId, ThreadId};
 use nexus_contracts::ports::{Caller, EventSink, IdentityPort};
 use nexus_contracts::register::{RegisterRequest, RenameRequest, StatusRequest, StatusState};
+use nexus_contracts::HarnessId;
 use nexus_contracts::MemberListRequest;
 use nexus_identity::{tier_guard, Identity};
 use nexus_store::repos::{
@@ -85,7 +86,7 @@ fn req(name: &str, client_key: &str) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(name.into()),
-        harness: Harness::Claude,
+        harness: HarnessId::new("claude").unwrap(),
         harness_session_id: format!("hs_{client_key}"),
         project: "p_demo".into(),
         client_key: client_key.into(),

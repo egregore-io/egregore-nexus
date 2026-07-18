@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use nexus_common::NexusError;
 use nexus_contracts::ids::SessionId;
-use nexus_contracts::{ContractError, Harness, Kind, SpawnIdentityPolicy, SpawnRequest, Tier};
+use nexus_contracts::{ContractError, HarnessId, Kind, SpawnIdentityPolicy, SpawnRequest, Tier};
 use nexus_harness_core::HeadedRuntimeKind;
 use nexus_store::repos::{
     AgentRef, IdentitySessions, NativeThreadBindings, NewNativeThreadBinding, Sessions,
@@ -36,7 +36,7 @@ pub enum LaunchRoute {
 /// - **Headed, pty present, no program** (Pi/Other) → [`LaunchRoute::NoTuiBinary`].
 /// - **Headed, pty absent** → [`LaunchRoute::Headless`] (degrade; preserves mock-port behaviour).
 #[doc(hidden)]
-pub fn launch_route(headless: bool, pty_present: bool, kind: Harness) -> LaunchRoute {
+pub fn launch_route(headless: bool, pty_present: bool, kind: &HarnessId) -> LaunchRoute {
     if headless {
         return LaunchRoute::Headless;
     }
@@ -79,10 +79,10 @@ pub fn launch_route(headless: bool, pty_present: bool, kind: Harness) -> LaunchR
 pub enum ReviveRoute {
     Acp,
     Pty,
-    /// Headed codex sessions restart `codex app-server`, resume the stored Codex thread id, and
+    /// Headed app-server sessions restart the server binary, resume the stored thread id, and
     /// rebind structured turn delivery under the same Nexus session id.
     CodexAppServer,
-    /// Headed OpenCode sessions restart the native-plugin bridge, resume the stored OpenCode
+    /// Headed plugin-bridge sessions restart the native-plugin bridge, resume the stored
     /// `ses_*` id, and rebind structured delivery under the same Nexus session id.
     OpenCodePlugin,
 }
@@ -117,37 +117,32 @@ pub fn teardown_route(transport: Option<&str>) -> TeardownRoute {
 }
 
 /// The harness/runtime label stored on `sessions.agent` (mirrors `nexus-identity`'s private map).
-pub(crate) fn harness_token(h: Harness) -> &'static str {
+pub(crate) fn harness_token(h: &HarnessId) -> &'static str {
     harness_agent_token(h)
 }
 
-/// Inverse of [`harness_token`]: a stored `sessions.agent` label back to a [`Harness`]. Used by the
-/// revive path to re-resolve which adapter to (re-)spawn. Unknown / legacy / NULL -> `Claude` (the
-/// historical default for pre-label rows). Keep in sync with [`harness_token`] — a new harness MUST
-/// get an arm here, or it silently revives as the wrong runtime.
+/// Inverse of [`harness_token`]: a stored `sessions.agent` label back to a [`HarnessId`]. Used by
+/// the revive path to re-resolve which adapter to (re-)spawn. Tokens ARE registry ids now, so this
+/// is a validating parse. Unknown / legacy / NULL / invalid -> `claude` (the historical default
+/// for pre-label rows); unknown-but-valid ids flow through and hit the registry's lookup-miss
+/// policy (generic non-headed contract) downstream.
 #[doc(hidden)]
-pub fn harness_from_token(token: Option<&str>) -> Harness {
-    match token {
-        Some("codex") => Harness::Codex,
-        Some("opencode") => Harness::OpenCode,
-        Some("hermes") => Harness::Hermes,
-        Some("pi") => Harness::Pi,
-        Some("other") => Harness::Other,
-        _ => Harness::Claude,
-    }
+pub fn harness_from_token(token: Option<&str>) -> HarnessId {
+    token
+        .and_then(|tok| HarnessId::new(tok).ok())
+        .unwrap_or_else(|| HarnessId::new("claude").expect("claude is a valid harness id"))
 }
 
+/// Headed-runtime resolution keeps its OWN fallback, distinct from [`harness_from_token`]:
+/// revive falls back to `claude`, but a NULL / legacy / invalid `sessions.agent` label must keep
+/// attaching via the generic `Screen` runtime (pre-label rows were screen-attached; respawning
+/// them as ClaudeNative would change attach behavior for rows that never ran claude).
 #[doc(hidden)]
 pub fn headed_runtime_from_agent_token(token: Option<&str>) -> HeadedRuntimeKind {
-    match token {
-        Some("claude") => headed_runtime_kind(Harness::Claude),
-        Some("codex") => headed_runtime_kind(Harness::Codex),
-        Some("opencode") => headed_runtime_kind(Harness::OpenCode),
-        Some("hermes") => headed_runtime_kind(Harness::Hermes),
-        Some("pi") => headed_runtime_kind(Harness::Pi),
-        Some("other") => headed_runtime_kind(Harness::Other),
-        _ => HeadedRuntimeKind::Screen,
-    }
+    token
+        .and_then(|tok| HarnessId::new(tok).ok())
+        .map(|h| headed_runtime_kind(&h))
+        .unwrap_or(HeadedRuntimeKind::Screen)
 }
 
 pub(crate) fn default_agent_cwd(agent_key: &str) -> String {

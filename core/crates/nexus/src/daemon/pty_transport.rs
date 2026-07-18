@@ -293,7 +293,7 @@ mod tests {
     use nexus_contracts::batch::{BatchCounts, BatchMessage, NexusBatch};
     use nexus_contracts::ids::{MessageId, SessionId};
     use nexus_contracts::{
-        AgentUpdateKind, Harness, InjectError, Kind, ProviderLimitReason, Scope,
+        AgentUpdateKind, HarnessId, InjectError, Kind, ProviderLimitReason, Scope,
     };
     use nexus_pty::bracketed_paste;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -566,7 +566,7 @@ mod tests {
         let InjectError::ProviderLimit(limit) = err else {
             panic!("expected ProviderLimit, got {err:?}");
         };
-        assert_eq!(limit.harness, Harness::OpenCode);
+        assert_eq!(limit.harness, HarnessId::new("opencode").unwrap());
         assert_eq!(limit.session, session);
         assert_eq!(limit.reason, ProviderLimitReason::RateLimit);
         assert_eq!(limit.provider.as_deref(), Some("openrouter"));

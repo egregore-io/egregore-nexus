@@ -7,7 +7,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_client_protocol::Error;
-use nexus_contracts::{Harness, ProviderLimitReason, ResetHint};
+use nexus_contracts::{HarnessId, ProviderLimitReason, ResetHint};
 use serde_json::Value;
 
 use super::{
@@ -19,12 +19,12 @@ use super::{
 /// Only structured `error.data` (plus ACP's structured auth code) participates. The human-facing
 /// error message is intentionally ignored.
 pub fn classify_acp_prompt_error(
-    harness: Harness,
+    harness: HarnessId,
     error: &Error,
-    source: &'static str,
+    source: &str,
 ) -> Option<AdapterInjectError> {
     if let Some(data) = error.data.as_ref() {
-        if let Some(classified) = classify_structured_payload(harness, data, source) {
+        if let Some(classified) = classify_structured_payload(harness.clone(), data, source) {
             return Some(classified);
         }
         if let Some(reason) = retryable_provider_reason(data) {
@@ -102,9 +102,9 @@ fn retryable_provider_reason(value: &Value) -> Option<String> {
 /// This is used by headed bridge paths that already preserved a machine-readable provider error.
 /// Human-visible message text must stay outside the payload passed here.
 pub fn classify_structured_provider_payload(
-    harness: Harness,
+    harness: HarnessId,
     value: &Value,
-    source: &'static str,
+    source: &str,
 ) -> Option<AdapterInjectError> {
     classify_structured_payload(harness, value, source)
 }
@@ -124,16 +124,16 @@ pub fn classify_claude_stop_failure(
         data.insert("error_details".to_string(), parsed);
     }
     classify_structured_payload(
-        Harness::Claude,
+        HarnessId::new("claude").expect("builtin harness id is valid"),
         &Value::Object(data),
         "claude.native.stop_failure",
     )
 }
 
 fn classify_structured_payload(
-    harness: Harness,
+    harness: HarnessId,
     value: &Value,
-    source: &'static str,
+    source: &str,
 ) -> Option<AdapterInjectError> {
     let mut observed = Observed::default();
     collect_observed(None, value, &mut observed);

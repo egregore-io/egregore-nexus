@@ -7,8 +7,7 @@ mod common;
 use common::*;
 
 use nexus_contracts::{
-    Ack, Harness, MemberListResponse, Presence, RemoveRequest, ThreadListResponse,
-    ThreadMembersResponse,
+    Ack, MemberListResponse, Presence, RemoveRequest, ThreadListResponse, ThreadMembersResponse,
 };
 
 const PROJECT: &str = "proj";
@@ -105,7 +104,7 @@ async fn non_member_excluded_from_thread_fanout() {
         "poster",
         PROJECT,
         "launch",
-        spawn(Harness::Claude, "inside", PROJECT),
+        spawn(hid("claude"), "inside", PROJECT),
     )
     .await
     .ok();
@@ -113,7 +112,7 @@ async fn non_member_excluded_from_thread_fanout() {
         "poster",
         PROJECT,
         "launch",
-        spawn(Harness::Claude, "outside", PROJECT),
+        spawn(hid("claude"), "outside", PROJECT),
     )
     .await
     .ok();
@@ -174,7 +173,7 @@ async fn removed_agent_leaves_default_members_and_remains_offline_for_audit() {
         "owner",
         PROJECT,
         "launch",
-        spawn(Harness::Claude, "doomed-member", PROJECT),
+        spawn(hid("claude"), "doomed-member", PROJECT),
     )
     .await
     .ok();

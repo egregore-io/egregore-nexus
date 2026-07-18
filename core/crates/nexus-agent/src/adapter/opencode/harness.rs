@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 
 use nexus_common::NexusError;
-use nexus_contracts::{Harness, SteerCapability};
+use nexus_contracts::{HarnessId, SteerCapability};
 #[cfg(windows)]
 use nexus_harness_core::native_executable::resolve_opencode_executable;
 use nexus_harness_core::{native_harness_program, NativeProcessPlatform};
@@ -89,7 +89,9 @@ impl OpenCodeAdapter {
         }
         Self {
             command,
-            engine: AcpEngine::for_harness(Harness::OpenCode),
+            engine: AcpEngine::for_harness(
+                HarnessId::new("opencode").expect("builtin harness id is valid"),
+            ),
             ctx,
         }
     }
@@ -104,7 +106,9 @@ impl OpenCodeAdapter {
         };
         Self {
             command,
-            engine: AcpEngine::for_harness(Harness::OpenCode),
+            engine: AcpEngine::for_harness(
+                HarnessId::new("opencode").expect("builtin harness id is valid"),
+            ),
             ctx,
         }
     }
@@ -147,7 +151,7 @@ fn default_native_program() -> String {
         return program;
     }
 
-    native_harness_program(Harness::OpenCode, NativeProcessPlatform::current())
+    native_harness_program("opencode", NativeProcessPlatform::current())
         .expect("supported harness has a native executable")
         .into()
 }
@@ -271,7 +275,11 @@ pub fn classify_opencode_provider_error_payload(
     data: &Value,
     source: &'static str,
 ) -> Option<AdapterInjectError> {
-    classify_structured_provider_payload(Harness::OpenCode, data, source)
+    classify_structured_provider_payload(
+        HarnessId::new("opencode").expect("builtin harness id is valid"),
+        data,
+        source,
+    )
 }
 
 /// Resolve the launch-local OpenCode session DB used by headless ACP launches.

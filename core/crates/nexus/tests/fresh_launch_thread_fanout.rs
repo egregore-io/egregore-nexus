@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use nexus::daemon::AppState;
 use nexus_common::Config;
 use nexus_contracts::{
-    AgentTurnExecutionPort, CreateThreadRequest, Harness, Kind, NexusBatch, PortResult,
-    RegisterRequest, RemoveRequest, RemoveResponse, SendRequest, SendTarget, SessionId,
-    SpawnRequest, SpawnResponse, Tier,
+    AgentTurnExecutionPort, CreateThreadRequest, Kind, NexusBatch, PortResult, RegisterRequest,
+    RemoveRequest, RemoveResponse, SendRequest, SendTarget, SessionId, SpawnRequest, SpawnResponse,
+    Tier,
 };
 use nexus_store::Store;
 use tokio::sync::mpsc;
@@ -18,7 +18,7 @@ fn human(name: &str, client_key: &str) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(name.into()),
-        harness: Harness::Other,
+        harness: hid("other"),
         harness_session_id: format!("hs_{client_key}"),
         project: PROJECT.into(),
         client_key: client_key.into(),
@@ -86,7 +86,7 @@ async fn fresh_codex_launch_receives_thread_fanout_without_self_register_or_bus_
             "a_codex_fresh_thread_fanout",
             Some("codex-fresh-thread-fanout"),
             PROJECT,
-            Harness::Codex,
+            hid("codex"),
             None,
             "ck_codex_fresh_thread_fanout",
             Some("/tmp/nexus-codex-fresh-thread-fanout".into()),
@@ -106,7 +106,7 @@ async fn fresh_codex_launch_receives_thread_fanout_without_self_register_or_bus_
             "a_codex_fresh_thread_fanout",
             Some("codex-fresh-thread-fanout"),
             PROJECT,
-            Harness::Codex,
+            hid("codex"),
             None,
             "ck_codex_fresh_thread_fanout",
             Some("/tmp/nexus-codex-fresh-thread-fanout".into()),
@@ -156,4 +156,9 @@ async fn fresh_codex_launch_receives_thread_fanout_without_self_register_or_bus_
         batch.threads[0].body,
         "thread fanout should drain after fresh codex reregister"
     );
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

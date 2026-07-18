@@ -3,7 +3,7 @@ use std::sync::Arc;
 use nexus::daemon::{command_worker, AppState};
 use nexus_common::Config;
 use nexus_contracts::{
-    AdminGroupAssignRequest, CreateThreadRequest, Harness, Kind, RegisterRequest, RegisterResponse,
+    AdminGroupAssignRequest, CreateThreadRequest, Kind, RegisterRequest, RegisterResponse,
     SendRequest, SendTarget, Tier,
 };
 use nexus_store::command_kinds;
@@ -20,7 +20,7 @@ fn register_agent(name: &str, client_key: &str) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(name.into()),
-        harness: Harness::Other,
+        harness: hid("other"),
         harness_session_id: format!("hs_{client_key}"),
         project: "default".into(),
         client_key: client_key.into(),
@@ -635,4 +635,9 @@ async fn policy_rejects_non_member_thread_post_before_message_write() {
         .unwrap();
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 0);
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

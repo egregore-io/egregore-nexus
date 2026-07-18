@@ -4,7 +4,6 @@ use nexus::cli::commands::lifecycle::{
     validate_launch_harness_args, validate_launch_resume,
 };
 use nexus::cli::{Cli, Command};
-use nexus_contracts::Harness;
 
 const RESUME_KEY: &str = "codex-thread-test";
 const CLAUDE_SESSION_ID: &str = "claude-session-test";
@@ -22,7 +21,7 @@ fn test_cwd() -> String {
 fn build_spawn_request_carries_resume_key() {
     let mode = launch_mode(false, true, true, None);
     let req = build_spawn_request(
-        Harness::Codex,
+        hid("codex"),
         Some("resumed-codex".into()),
         "resumed-codex".into(),
         Some(test_cwd()),
@@ -43,7 +42,7 @@ fn build_spawn_request_carries_resume_key() {
 fn build_spawn_request_carries_harness_args() {
     let mode = launch_mode(false, true, true, None);
     let req = build_spawn_request(
-        Harness::Claude,
+        hid("claude"),
         Some("resumed-claude".into()),
         "resumed-claude".into(),
         Some(test_cwd()),
@@ -74,7 +73,7 @@ fn codex_tail_resume_parses_as_harness_args() {
         panic!("expected launch command");
     };
     assert_eq!(args.name.as_deref(), Some("chloe"));
-    assert_eq!(args.kind, Harness::Codex);
+    assert_eq!(args.kind, hid("codex"));
     assert_eq!(args.harness_args, ["resume", RESUME_KEY]);
 }
 
@@ -97,8 +96,7 @@ fn resume_command_parses_name_or_session_id_targets() {
 #[test]
 fn codex_tail_resume_normalizes_to_resume_key() {
     let args = vec!["resume".to_string(), RESUME_KEY.to_string()];
-    let resolved =
-        resolve_launch_resume(&Harness::Codex, &args).expect("tail resume should resolve");
+    let resolved = resolve_launch_resume(&hid("codex"), &args).expect("tail resume should resolve");
     assert_eq!(resolved.resume.as_deref(), Some(RESUME_KEY));
     assert!(resolved.harness_args.is_empty());
     assert!(resolved.requires_tui);
@@ -121,7 +119,7 @@ fn codex_non_resume_tail_passes_through_as_harness_args() {
         panic!("expected launch command");
     };
     assert_eq!(args.name.as_deref(), Some("chloe"));
-    assert_eq!(args.kind, Harness::Codex);
+    assert_eq!(args.kind, hid("codex"));
     assert_eq!(args.harness_args, ["--model", "gpt-5-codex"]);
 
     let resolved = resolve_launch_resume(&args.kind, &args.harness_args)
@@ -134,10 +132,10 @@ fn codex_non_resume_tail_passes_through_as_harness_args() {
 #[test]
 fn all_tui_harness_tails_parse_as_harness_native_args() {
     for (kind, harness) in [
-        (Harness::Claude, "claude"),
-        (Harness::Codex, "codex"),
-        (Harness::OpenCode, "opencode"),
-        (Harness::Hermes, "hermes"),
+        (hid("claude"), "claude"),
+        (hid("codex"), "codex"),
+        (hid("opencode"), "opencode"),
+        (hid("hermes"), "hermes"),
     ] {
         let cli = Cli::try_parse_from([
             "nexus",
@@ -160,12 +158,7 @@ fn all_tui_harness_tails_parse_as_harness_native_args() {
 
 #[test]
 fn all_tui_harness_non_resume_tails_forward_to_spawn_request() {
-    for kind in [
-        Harness::Claude,
-        Harness::Codex,
-        Harness::OpenCode,
-        Harness::Hermes,
-    ] {
+    for kind in [hid("claude"), hid("codex"), hid("opencode"), hid("hermes")] {
         let harness_args = vec![NATIVE_FLAG.to_string(), NATIVE_VALUE.to_string()];
         let resolved = resolve_launch_resume(&kind, &harness_args)
             .unwrap_or_else(|error| panic!("{kind:?} tail should resolve: {error}"));
@@ -174,7 +167,7 @@ fn all_tui_harness_non_resume_tails_forward_to_spawn_request() {
         assert!(resolved.requires_tui);
 
         let req = build_spawn_request(
-            kind,
+            kind.clone(),
             Some(format!("{kind:?}-probe")),
             format!("{kind:?}-probe"),
             Some(test_cwd()),
@@ -207,7 +200,7 @@ fn claude_tail_resume_flag_parses_as_harness_args() {
         panic!("expected launch command");
     };
     assert_eq!(args.name.as_deref(), Some("hugo"));
-    assert_eq!(args.kind, Harness::Claude);
+    assert_eq!(args.kind, hid("claude"));
     assert_eq!(args.harness_args, ["--resume", CLAUDE_SESSION_ID]);
 }
 
@@ -215,7 +208,7 @@ fn claude_tail_resume_flag_parses_as_harness_args() {
 fn claude_tail_resume_command_passes_through_as_native_harness_args() {
     let args = vec!["resume".to_string(), CLAUDE_SESSION_ID.to_string()];
     let resolved =
-        resolve_launch_resume(&Harness::Claude, &args).expect("claude native tail should resolve");
+        resolve_launch_resume(&hid("claude"), &args).expect("claude native tail should resolve");
 
     assert_eq!(resolved.resume, None);
     assert_eq!(resolved.harness_args, args);
@@ -226,7 +219,7 @@ fn claude_tail_resume_command_passes_through_as_native_harness_args() {
 fn claude_tail_continue_command_passes_through_as_native_harness_args() {
     let args = vec!["continue".to_string()];
     let resolved =
-        resolve_launch_resume(&Harness::Claude, &args).expect("claude native tail should resolve");
+        resolve_launch_resume(&hid("claude"), &args).expect("claude native tail should resolve");
 
     assert_eq!(resolved.resume, None);
     assert_eq!(resolved.harness_args, args);
@@ -262,7 +255,7 @@ fn resume_defaults_to_tui_mode_even_in_non_interactive_shell() {
 fn codex_tui_resume_is_valid() {
     let mode = launch_mode(false, true, false, None);
     assert_eq!(
-        validate_launch_resume(&Harness::Codex, Some(RESUME_KEY), mode),
+        validate_launch_resume(&hid("codex"), Some(RESUME_KEY), mode),
         Ok(())
     );
 }
@@ -270,14 +263,14 @@ fn codex_tui_resume_is_valid() {
 #[test]
 fn resume_rejects_non_codex_harness() {
     let mode = launch_mode(false, true, false, None);
-    assert!(validate_launch_resume(&Harness::Claude, Some(RESUME_KEY), mode).is_err());
+    assert!(validate_launch_resume(&hid("claude"), Some(RESUME_KEY), mode).is_err());
 }
 
 #[test]
 fn resume_rejects_headless_codex_launch() {
     let mode = launch_mode(true, false, false, None);
     assert_eq!(
-        validate_launch_resume(&Harness::Codex, Some(RESUME_KEY), mode),
+        validate_launch_resume(&hid("codex"), Some(RESUME_KEY), mode),
         Err("codex resume requires a headed launch; pass --tui when running non-interactively")
     );
 }
@@ -285,14 +278,19 @@ fn resume_rejects_headless_codex_launch() {
 #[test]
 fn claude_native_tail_rejects_headless_launch() {
     let args = vec!["--resume".to_string(), CLAUDE_SESSION_ID.to_string()];
-    let resolved = resolve_launch_resume(&Harness::Claude, &args)
+    let resolved = resolve_launch_resume(&hid("claude"), &args)
         .expect("claude native resume tail should resolve");
     let mode = launch_mode(true, false, false, None);
 
     assert_eq!(
-        validate_launch_harness_args(&Harness::Claude, &resolved, mode),
+        validate_launch_harness_args(&hid("claude"), &resolved, mode),
         Err(
             "harness launch arguments require a headed launch; pass --tui when running non-interactively"
         )
     );
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

@@ -3,27 +3,39 @@
 //! Harness crates own their native launch-tail behavior. The `nexus` composition crate owns the
 //! kind-to-contract registry because it is the only layer allowed to depend on every harness crate.
 
-use nexus_contracts::Harness as HarnessKind;
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+use nexus_contracts::HarnessId;
 use nexus_harness_core::{
     native_harness_program, GenericHarness, Harness as HarnessContract, HarnessIdentity,
-    HeadedCommand, HeadedRuntimeKind, NativeProcessPlatform, SlashCommand, SlashCommandAction,
+    HeadedCommand, HeadedRuntimeKind, NativeProcessPlatform, ResumeStyle, SlashCommand,
+    SlashCommandAction,
 };
 
 #[derive(Debug, Clone, Copy)]
 struct OpenCodeHarness;
 
 impl HarnessContract for OpenCodeHarness {
-    fn kind(&self) -> HarnessKind {
-        HarnessKind::OpenCode
-    }
-
     fn program(&self) -> &'static str {
-        native_harness_program(self.kind(), NativeProcessPlatform::current())
+        native_harness_program("opencode", NativeProcessPlatform::current())
             .expect("OpenCode has a native headed executable")
     }
 
     fn headed_runtime_kind(&self) -> HeadedRuntimeKind {
         HeadedRuntimeKind::OpenCodePlugin
+    }
+
+    fn display_name(&self) -> &'static str {
+        "OpenCode"
+    }
+
+    fn has_native_thread_binding(&self) -> bool {
+        true
+    }
+
+    fn resume_style(&self) -> ResumeStyle {
+        ResumeStyle::Flag(&["-s"])
     }
 }
 
@@ -31,17 +43,29 @@ impl HarnessContract for OpenCodeHarness {
 struct HermesHarness;
 
 impl HarnessContract for HermesHarness {
-    fn kind(&self) -> HarnessKind {
-        HarnessKind::Hermes
-    }
-
     fn program(&self) -> &'static str {
-        native_harness_program(self.kind(), NativeProcessPlatform::current())
+        native_harness_program("hermes", NativeProcessPlatform::current())
             .expect("Hermes has a native headed executable")
     }
 
     fn headed_runtime_kind(&self) -> HeadedRuntimeKind {
         HeadedRuntimeKind::HermesGateway
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Hermes"
+    }
+
+    fn attach_backend(&self) -> Option<&'static str> {
+        Some("tmux")
+    }
+
+    fn has_native_thread_binding(&self) -> bool {
+        true
+    }
+
+    fn resume_style(&self) -> ResumeStyle {
+        ResumeStyle::Flag(&["--session"])
     }
 
     fn headed_cli_command(
@@ -66,31 +90,60 @@ impl HarnessContract for HermesHarness {
             Ok(SlashCommandAction::NativeCompact)
         } else {
             Err(nexus_harness_core::HarnessError::UnsupportedSlashCommand {
-                harness: self.kind(),
+                harness: self.agent_token().to_string(),
                 command: command.display_name(),
             })
         }
     }
 }
 
-static CLAUDE: nexus_harness_claude::ClaudeHarness = nexus_harness_claude::ClaudeHarness;
-static CODEX: nexus_harness_codex::CodexHarness = nexus_harness_codex::CodexHarness;
-static OPENCODE: OpenCodeHarness = OpenCodeHarness;
-static HERMES: HermesHarness = HermesHarness;
-static PI: GenericHarness = GenericHarness::new(HarnessKind::Pi, "");
-static OTHER: GenericHarness = GenericHarness::new(HarnessKind::Other, "");
+static PI: GenericHarness = GenericHarness::new("pi", "");
+static OTHER: GenericHarness = GenericHarness::new("other", "");
 
-/// Return the harness contract for a contract harness kind.
-///
-/// Empty-program entries are non-headed harness kinds. They still provide default launch-tail
-/// conformance for CLI/request parsing while `harness_program` rejects headed launches.
-pub fn harness_registry(kind: HarnessKind) -> &'static dyn HarnessContract {
-    match kind {
-        HarnessKind::Claude => &CLAUDE,
-        HarnessKind::Codex => &CODEX,
-        HarnessKind::OpenCode => &OPENCODE,
-        HarnessKind::Hermes => &HERMES,
-        HarnessKind::Pi => &PI,
-        HarnessKind::Other => &OTHER,
+/// The built-in harness contracts. This list is the only enumeration of in-tree harnesses.
+fn builtin_contracts() -> [&'static dyn HarnessContract; 6] {
+    [
+        &nexus_harness_claude::ClaudeHarness,
+        &nexus_harness_codex::CodexHarness,
+        &OpenCodeHarness,
+        &HermesHarness,
+        &PI,
+        &OTHER,
+    ]
+}
+
+static REGISTRY: OnceLock<HashMap<String, &'static dyn HarnessContract>> = OnceLock::new();
+
+fn build_registry(
+    extra: &[(HarnessId, &'static dyn HarnessContract)],
+) -> HashMap<String, &'static dyn HarnessContract> {
+    let mut map: HashMap<String, &'static dyn HarnessContract> = HashMap::new();
+    for contract in builtin_contracts() {
+        map.insert(contract.agent_token().to_owned(), contract);
     }
+    for (id, contract) in extra {
+        map.insert(id.as_str().to_owned(), *contract);
+    }
+    map
+}
+
+/// Install the harness registry at the composition root, adding `extra` contracts on top of
+/// the built-ins. Returns `false` if the registry was already initialized (first install wins;
+/// lazy default installs the built-ins only).
+pub fn init_harness_registry(extra: &[(HarnessId, &'static dyn HarnessContract)]) -> bool {
+    REGISTRY.set(build_registry(extra)).is_ok()
+}
+
+fn registry() -> &'static HashMap<String, &'static dyn HarnessContract> {
+    REGISTRY.get_or_init(|| build_registry(&[]))
+}
+
+/// Return the harness contract for an open-set harness id.
+///
+/// Lookup-miss policy: unknown ids deterministically fall back to the generic non-headed
+/// contract. The fallback still
+/// provides default launch-tail conformance for CLI/request parsing, while its empty
+/// `program` means `harness_program` rejects headed launches.
+pub fn harness_registry_by_id(id: &HarnessId) -> &'static dyn HarnessContract {
+    registry().get(id.as_str()).copied().unwrap_or(&OTHER)
 }

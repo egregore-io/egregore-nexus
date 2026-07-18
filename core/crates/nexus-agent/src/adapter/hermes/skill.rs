@@ -1,7 +1,7 @@
 //! Hermes-specific `nexus-bus` skill + bootstrap-register script + `nexus-bus` MCP wiring.
 //!
 //! Unlike claude/codex (which got their skill from the shared `bootstrap.rs`), Hermes previously
-//! got NOTHING — `bootstrap::install` had a `_ => {}` arm for `Harness::Hermes`, so a launched
+//! got NOTHING — the legacy bootstrap installer skipped the `hermes` harness, so a launched
 //! Hermes had no bus skill and (together with the forced stdio MCP over ACP) never came online.
 //! This installs the full set:
 //!

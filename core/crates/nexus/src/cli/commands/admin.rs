@@ -11,7 +11,7 @@ use nexus_contracts::{
     AdminRenameRequest, AdminRenameResponse, AssignProjectRequest, AssignProjectResponse,
     AssignRoleRequest, AssignRoleResponse, ChannelOp, ChannelRequest, DlqListRequest,
     DlqListResponse, DlqMutationResponse, DlqPurgeRequest, DlqRequeueRequest, GrantTierRequest,
-    GrantTierResponse, Harness, MessageId, MonitorRequest, RemoveRequest, RemoveResponse,
+    GrantTierResponse, HarnessId, MessageId, MonitorRequest, RemoveRequest, RemoveResponse,
     RouteForwardRequest, SpawnRequest, SpawnResponse, Tier,
 };
 
@@ -32,7 +32,7 @@ pub enum AdminCmd {
     /// Admin-initiated agent spawn (the agent still self-registers).
     Spawn {
         #[arg(value_parser = parse::harness)]
-        kind: Harness,
+        kind: HarnessId,
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]

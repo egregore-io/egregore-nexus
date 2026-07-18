@@ -24,7 +24,7 @@
 use async_trait::async_trait;
 
 use nexus_common::NexusError;
-use nexus_contracts::{Harness, SteerCapability};
+use nexus_contracts::{HarnessId, SteerCapability};
 
 use nexus_agent::adapter::engine::{AcpEngine, HarnessCommand, LaunchCtx};
 use nexus_agent::{Adapter, AdapterInjectError, StreamEvent};
@@ -56,7 +56,9 @@ impl CodexAdapter {
         command.env = ctx.env.clone();
         Self {
             command,
-            engine: AcpEngine::for_harness(Harness::Codex),
+            engine: AcpEngine::for_harness(
+                HarnessId::new("codex").expect("builtin harness id is valid"),
+            ),
             ctx,
         }
     }
@@ -70,7 +72,9 @@ impl CodexAdapter {
         };
         Self {
             command,
-            engine: AcpEngine::for_harness(Harness::Codex),
+            engine: AcpEngine::for_harness(
+                HarnessId::new("codex").expect("builtin harness id is valid"),
+            ),
             ctx,
         }
     }

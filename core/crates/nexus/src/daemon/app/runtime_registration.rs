@@ -105,7 +105,7 @@ impl AppState {
         agent_id: &str,
         name: Option<&str>,
         project: &str,
-        kind: Harness,
+        kind: HarnessId,
         client_key: &str,
         cwd: Option<String>,
     ) -> (Option<String>, Vec<(String, String)>) {
@@ -136,7 +136,7 @@ impl AppState {
             ("NEXUS_AGENT_ID".to_string(), agent_id.to_string()),
             ("NEXUS_CLIENT_KEY".to_string(), client_key.to_string()),
             ("NEXUS_PROJECT".to_string(), project.to_string()),
-            ("NEXUS_AGENT".to_string(), harness_token(kind).to_string()),
+            ("NEXUS_AGENT".to_string(), harness_token(&kind).to_string()),
             ("NEXUS_HOME".to_string(), self.nexus_home.clone()),
             ("NEXUS_CLI".to_string(), nexus_bin),
             ("PATH".to_string(), path),
@@ -160,7 +160,7 @@ impl AppState {
         // The ACP engine scrubs inherited CODEX_* state. Pin an explicitly resolved Codex home in
         // the launch context so headless Codex uses the operator-selected OAuth/profile boundary
         // instead of silently falling back to $HOME/.codex.
-        if kind == Harness::Codex {
+        if kind.as_str() == "codex" {
             if let Some(home) = std::env::var_os("CODEX_HOME") {
                 env.push((
                     "CODEX_HOME".to_string(),
@@ -172,7 +172,7 @@ impl AppState {
         // child, so a daemon configured with an explicit Hermes home must pin that value in the
         // launch context. Otherwise headless Hermes silently falls back to `$HOME/.hermes` and can
         // lose the selected provider or credentials even though the daemon itself resolves them.
-        if kind == Harness::Hermes {
+        if kind.as_str() == "hermes" {
             if let Some(home) = std::env::var_os("HERMES_HOME") {
                 env.push((
                     "HERMES_HOME".to_string(),
@@ -219,7 +219,7 @@ impl AppState {
             &registered.agent_id,
             registered.name.as_deref(),
             &registered.project,
-            registered.kind,
+            registered.kind.clone(),
             registered.role.clone(),
             client_key,
             registered.cwd.clone(),
@@ -288,7 +288,7 @@ impl AppState {
                 runtime_id: registered.session.0.clone(),
                 agent_id: registered.agent_id.clone(),
                 project: registered.project.clone(),
-                harness: Self::harness_to_store(registered.kind),
+                harness: Self::harness_to_store(registered.kind.clone()),
                 mode: mode.to_string(),
                 backend: Some(backend.to_string()),
                 cwd: registered.cwd.clone(),
@@ -304,7 +304,7 @@ impl AppState {
         agent_id: &str,
         name: Option<&str>,
         project: &str,
-        kind: Harness,
+        kind: HarnessId,
         role: Option<String>,
         client_key: &str,
         cwd: Option<String>,
@@ -359,7 +359,7 @@ impl AppState {
             Ok(Some(r)) => r,
             _ => return,
         };
-        // `Harness::Other` with no daemon transport is an externally drained transport client
+        // The `other` harness with no daemon transport is an externally drained transport client
         // (`nexus listen`), not an injectable harness. Starting an EventLoop for it creates a
         // second consumer that can claim and terminalize its inbox before the subscriber sees it.
         let externally_drained = Self::is_externally_drained_session(&row);
@@ -523,7 +523,7 @@ impl AppState {
         agent_id: &str,
         name: Option<&str>,
         project: &str,
-        kind: Harness,
+        kind: HarnessId,
         role: Option<String>,
         client_key: &str,
         cwd: Option<String>,
@@ -534,7 +534,7 @@ impl AppState {
         let new = NewSession {
             session_id: SessionId(session.0.clone()),
             name: name.map(str::to_string),
-            agent: Some(harness_token(kind).to_string()),
+            agent: Some(harness_token(&kind).to_string()),
             kind: kind_token(Kind::Agent).to_string(),
             role: role.clone(),
             tier: tier_token(Tier::Agent).to_string(),
@@ -656,7 +656,7 @@ impl AppState {
         agent_id: &str,
         name: Option<&str>,
         project: &str,
-        kind: Harness,
+        kind: HarnessId,
         role: Option<String>,
         cwd: Option<String>,
         transport: &str,
@@ -688,7 +688,7 @@ impl AppState {
                     agent_id: agent_id.to_string(),
                     project: project.to_string(),
                     name: name.map(str::to_string),
-                    default_harness: Some(Self::harness_to_store(kind)),
+                    default_harness: Some(Self::harness_to_store(kind.clone())),
                     role,
                     tier: Some(tier_token(Tier::Agent).to_string()),
                     owner,

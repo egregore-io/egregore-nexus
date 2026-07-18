@@ -6,8 +6,8 @@ use nexus::cli::store_client::StoreClient;
 use nexus::daemon::AppState;
 use nexus_common::{now, Config};
 use nexus_contracts::{
-    codes, Ack, BatchCounts, ConsumeRequest, ContractError, Harness, Kind, MessageId, NexusBatch,
-    Presence, RegisterRequest, SendRequest, SendTarget, SpawnRequest, SpawnResponse, Tier,
+    codes, Ack, BatchCounts, ConsumeRequest, ContractError, Kind, MessageId, NexusBatch, Presence,
+    RegisterRequest, SendRequest, SendTarget, SpawnRequest, SpawnResponse, Tier,
 };
 use nexus_store::command_kinds;
 use nexus_store::repos::{CommandIntents, DaemonState, Inbox, NewSession, Sessions};
@@ -196,7 +196,7 @@ fn agent_register(name: &str, client_key: &str) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(name.into()),
-        harness: Harness::Other,
+        harness: hid("other"),
         harness_session_id: format!("hs_{client_key}"),
         project: "default".into(),
         client_key: client_key.into(),
@@ -1094,7 +1094,7 @@ async fn ambient_store_client_follows_registered_client_key_after_rename() {
         RegisterRequest {
             agent_id: None,
             name: Some("before-rename".into()),
-            harness: Harness::Claude,
+            harness: hid("claude"),
             harness_session_id: "hs_rename".into(),
             project: "default".into(),
             client_key: "ck_rename".into(),
@@ -1223,7 +1223,7 @@ async fn default_harness_launch_wait_outlives_the_generic_ten_second_budget() {
             .command::<_, SpawnResponse>(
                 command_kinds::harness::LAUNCH,
                 &SpawnRequest {
-                    kind: Harness::Claude,
+                    kind: hid("claude"),
                     name: Some("slow-cold-launch".into()),
                     identity_policy: None,
                     cwd: None,
@@ -1254,4 +1254,9 @@ async fn default_harness_launch_wait_outlives_the_generic_ten_second_budget() {
         .unwrap();
 
     assert_eq!(pending.await.unwrap().unwrap(), response);
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

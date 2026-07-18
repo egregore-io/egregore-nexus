@@ -1,4 +1,3 @@
-use nexus_contracts::Harness as HarnessKind;
 use nexus_harness_codex::CodexHarness;
 use nexus_harness_core::{
     harness_conformance, Harness as _, HarnessError, HarnessIdentity, SlashCommand,
@@ -52,7 +51,7 @@ fn codex_rejects_unmapped_slash_commands() {
     assert_eq!(
         err,
         HarnessError::UnsupportedSlashCommand {
-            harness: HarnessKind::Codex,
+            harness: "codex".to_string(),
             command: "/clear".to_string(),
         }
     );

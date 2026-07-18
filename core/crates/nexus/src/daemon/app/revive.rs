@@ -211,7 +211,7 @@ impl AppState {
     }
 
     /// REVIVE-ON-INTERACTION for headed Codex app-server sessions. Reuses the durable Nexus session
-    /// id, restarts `codex app-server`, resumes the stored Codex thread id, launches the human TUI
+    /// id, restarts `codex app-server`, resumes the stored thread id, launches the human TUI
     /// with `codex resume --remote`, rebinds the structured transport, and rings the drain loop.
     pub async fn ensure_codex_appserver_live(
         &self,
@@ -588,7 +588,7 @@ impl AppState {
         }
 
         let kind = harness_from_token(row.agent.as_deref());
-        let harness = harness_registry(kind);
+        let harness = harness_registry_by_id(&kind);
         let program = harness.program();
         if program.is_empty() {
             return Err(nexus_contracts::ContractError {
@@ -610,15 +610,15 @@ impl AppState {
         } else {
             None
         };
-        let viewer_backend = match kind {
-            Harness::Hermes => HermesRuntimeStateRepo::new(&self.store)
+        let viewer_backend = match kind.as_str() {
+            "hermes" => HermesRuntimeStateRepo::new(&self.store)
                 .find_by_runtime_id(&session)
                 .await
                 .map_err(|e| e.to_contract_error())?
                 .map(|state| state.viewer_backend)
                 .or_else(|| capsule.as_ref().and_then(|capsule| capsule.backend.clone()))
                 .unwrap_or_else(|| "tmux".to_string()),
-            Harness::Claude => {
+            "claude" => {
                 let state = nexus_harness_claude::storage::ClaudeRuntimeStateRepo::new(&self.store)
                     .find_by_runtime_id(&session)
                     .await
@@ -672,8 +672,30 @@ impl AppState {
             pixel_width: 0,
             pixel_height: 0,
         };
-        let revive_tail = self.headed_revive_tail_for_row(&row, kind).await?;
-        if kind == Harness::Claude {
+        let revive_tail = self.headed_revive_tail_for_row(&row, &kind).await?;
+        let viewer_backend = match kind.as_str() {
+            "hermes" => HermesRuntimeStateRepo::new(&self.store)
+                .find_by_runtime_id(&session)
+                .await
+                .map_err(|e| e.to_contract_error())?
+                .map(|state| state.viewer_backend)
+                .unwrap_or_else(|| "tmux".to_string()),
+            "claude" => {
+                let state = nexus_harness_claude::storage::ClaudeRuntimeStateRepo::new(&self.store)
+                    .find_by_runtime_id(&session)
+                    .await
+                    .map_err(|e| e.to_contract_error())?;
+                if state.as_ref().is_some_and(|state| {
+                    state.tmux_socket.is_some() || state.tmux_session.is_some()
+                }) {
+                    "tmux".to_string()
+                } else {
+                    "pty".to_string()
+                }
+            }
+            _ => "tmux".to_string(),
+        };
+        if kind.as_str() == "claude" {
             supervisor.arm_claude_startup_wait(&session);
         }
         supervisor.kill(&session);
@@ -683,7 +705,7 @@ impl AppState {
             supervisor
                 .launch_headed_raw_pty(
                     &session,
-                    kind,
+                    &kind,
                     row.agent_id.as_deref().unwrap_or(&name),
                     Some(&name),
                     &project,
@@ -700,7 +722,7 @@ impl AppState {
             supervisor
                 .launch_headed_pty(
                     &session,
-                    kind,
+                    &kind,
                     row.agent_id.as_deref().unwrap_or(&name),
                     Some(&name),
                     &project,
@@ -721,7 +743,7 @@ impl AppState {
                 message: format!("harness {viewer_backend} respawn failed: {error}"),
             });
         }
-        if kind == Harness::Claude {
+        if kind.as_str() == "claude" {
             supervisor
                 .wait_for_claude_startup(&session)
                 .map_err(|message| nexus_contracts::ContractError {
@@ -745,9 +767,13 @@ impl AppState {
     pub async fn headed_revive_tail_for_row(
         &self,
         row: &SessionRow,
-        kind: Harness,
+        kind: &HarnessId,
     ) -> Result<Vec<String>, nexus_contracts::ContractError> {
-        if headed_runtime_kind(kind) == HeadedRuntimeKind::ClaudeNative {
+        let harness = harness_registry_by_id(kind);
+        if let nexus_harness_core::ResumeStyle::Flag(prefix) = harness.resume_style() {
+            // The native session-id store for flag-resume harnesses is currently the
+            // ClaudeNative runtime repo; a future flag-style harness must route its own
+            // durable key through the registry (P3).
             let state = nexus_harness_claude::storage::ClaudeRuntimeStateRepo::new(&self.store)
                 .find_by_runtime_id(&row.session_id)
                 .await
@@ -760,7 +786,7 @@ impl AppState {
             } else {
                 None
             };
-            let Some(claude_session_id) = capsule
+            let Some(native_session_id) = capsule
                 .and_then(|capsule| capsule.native_resume_key)
                 .or_else(|| state.and_then(|state| state.claude_session_id))
                 .or_else(|| row.harness_session_id.clone())
@@ -769,15 +795,16 @@ impl AppState {
                 return Err(nexus_contracts::ContractError {
                     code: nexus_contracts::codes::INVALID_PARAMS,
                     message: format!(
-                        "cannot revive headed Claude {}:{} without a stored --resume session id; refusing unsafe --continue",
-                        row.display_name(), row.session_id.0
+                        "cannot revive headed {} {}:{} without a stored {} session id; refusing unsafe --continue",
+                        harness.program(), row.display_name(), row.session_id.0, prefix.join(" ")
                     ),
                 });
             };
-            return Ok(vec!["--resume".to_string(), claude_session_id]);
+            let mut tail: Vec<String> = prefix.iter().map(|s| s.to_string()).collect();
+            tail.push(native_session_id);
+            return Ok(tail);
         }
 
-        let harness = harness_registry(kind);
         harness
             .revive_tail()
             .map(|tail| tail.argv)

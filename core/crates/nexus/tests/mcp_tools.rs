@@ -7,8 +7,8 @@ use nexus::cli::store_client::StoreClient;
 use nexus::daemon::AppState;
 use nexus_common::{now, Config};
 use nexus_contracts::{
-    BatchCounts, CreateThreadRequest, Harness, Kind, MessageId, NexusBatch, RegisterRequest,
-    SendRequest, SendTarget, Tier,
+    BatchCounts, CreateThreadRequest, Kind, MessageId, NexusBatch, RegisterRequest, SendRequest,
+    SendTarget, Tier,
 };
 use nexus_store::repos::{CommandIntentRow, CommandIntents};
 use nexus_store::Store;
@@ -24,7 +24,7 @@ fn reg(name: &str, client_key: &str) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(name.into()),
-        harness: Harness::Claude,
+        harness: hid("claude"),
         harness_session_id: format!("hs_{client_key}"),
         project: "egregore".into(),
         client_key: client_key.into(),
@@ -297,4 +297,9 @@ async fn dispatch_inbox_end_to_end() {
         val.get("counts").is_some(),
         "expected counts in NexusBatch: {val}"
     );
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

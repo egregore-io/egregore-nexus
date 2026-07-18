@@ -97,7 +97,7 @@ impl Agent {
         session: SessionId,
         name: &str,
         project: &str,
-        kind: nexus_contracts::Harness,
+        kind: nexus_contracts::HarnessId,
         cwd: Option<String>,
         env: Vec<(String, String)>,
         resume_key: Option<&str>,
@@ -114,7 +114,7 @@ impl Agent {
             // Default `false`; the OpenCode adapter flips this on in its constructor.
             ..Default::default()
         };
-        let adapter = self.registry.get(kind, ctx).map_err(to_contract)?;
+        let adapter = self.registry.get(&kind, ctx).map_err(to_contract)?;
         // Resume the harness's existing ACP session (`session/load`) when a resume key is given —
         // the not-fresh path. If resume fails (bad key / harness lacks loadSession), fall back to a
         // fresh `session/new` so the caller is never blocked.
@@ -574,7 +574,7 @@ impl AgentTurnExecutionPort for Agent {
         let adapter = self
             .registry
             .get(
-                req.kind,
+                &req.kind,
                 LaunchCtx {
                     cwd: req.cwd.clone(),
                     ..Default::default()

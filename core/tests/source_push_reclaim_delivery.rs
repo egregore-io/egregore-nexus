@@ -13,7 +13,7 @@ use nexus::daemon::{command_worker, AppState};
 use nexus_agent::adapter::engine::HarnessCommand;
 use nexus_agent::{Adapter, AdapterRegistry};
 use nexus_common::Config;
-use nexus_contracts::{Harness, Kind, PushRequest, RegisterRequest, SpawnRequest, Tier};
+use nexus_contracts::{Kind, PushRequest, RegisterRequest, SpawnRequest, Tier};
 use nexus_harness_claude::ClaudeAdapter;
 use nexus_store::command_kinds;
 use nexus_store::repos::{CommandIntents, NewCommandIntent, Sources, Topics};
@@ -41,7 +41,7 @@ async fn state_against_fake_acp() -> AppState {
     store.migrate().await.unwrap();
     let mut registry = AdapterRegistry::new();
     registry.register(
-        Harness::Claude,
+        &hid("claude"),
         Arc::new(|_ctx| Arc::new(ClaudeAdapter::with_command(fake_command())) as Arc<dyn Adapter>),
     );
     AppState::wire_with_registry(store, &Config::default(), registry)
@@ -51,7 +51,7 @@ fn operator_request() -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some("operator".into()),
-        harness: Harness::Other,
+        harness: hid("other"),
         harness_session_id: "source-reclaim-operator-native".into(),
         project: PROJECT.into(),
         client_key: "source-reclaim-operator-client".into(),
@@ -65,7 +65,7 @@ fn operator_request() -> RegisterRequest {
 
 fn spawn_request() -> SpawnRequest {
     SpawnRequest {
-        kind: Harness::Claude,
+        kind: hid("claude"),
         name: Some("cold-source-target".into()),
         identity_policy: None,
         cwd: None,
@@ -245,4 +245,9 @@ async fn reclaimed_signed_source_push_reuses_commit_and_injects_once() {
     assert_eq!(row.get::<i64>(0).unwrap(), 1, "one delivery row");
     assert_eq!(row.get::<i64>(1).unwrap(), 1, "one automatic injection");
     assert_eq!(row.get::<String>(2).unwrap(), "delivered");
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

@@ -11,9 +11,7 @@ mod common;
 
 use common::*;
 
-use nexus_contracts::{
-    codes, Harness, MemberListResponse, RegisterResponse, RemoveResponse, SpawnResponse,
-};
+use nexus_contracts::{codes, MemberListResponse, RegisterResponse, RemoveResponse, SpawnResponse};
 use nexus_store::repos::{Agents, Sessions};
 
 const PROJECT: &str = "proj";
@@ -53,7 +51,7 @@ async fn local_operator_launch_does_not_require_registered_agent_caller() {
     let d = TestDaemon::start().await;
 
     let spawned = d
-        .local_operator_launch(PROJECT, spawn(Harness::Codex, "worker1", PROJECT))
+        .local_operator_launch(PROJECT, spawn(hid("codex"), "worker1", PROJECT))
         .await
         .expect("local operator launch should be trusted without agent registration");
     assert!(
@@ -95,7 +93,7 @@ async fn dispatch_launch_without_caller_is_unauthorized() {
     let d = TestDaemon::start().await;
 
     let launch = d
-        .rpc_anon("launch", spawn(Harness::Codex, "remote_worker", PROJECT))
+        .rpc_anon("launch", spawn(hid("codex"), "remote_worker", PROJECT))
         .await;
 
     assert_eq!(launch.error_code(), codes::UNAUTHORIZED);
@@ -106,7 +104,7 @@ async fn launch_without_name_stages_id_only_identity() {
     let d = TestDaemon::start().await;
 
     let spawned = d
-        .local_operator_launch(PROJECT, spawn_no_name(Harness::Codex, PROJECT))
+        .local_operator_launch(PROJECT, spawn_no_name(hid("codex"), PROJECT))
         .await
         .expect("local operator launch without name should succeed");
 
@@ -145,7 +143,7 @@ async fn launch_makes_agent_addressable_and_wakeable_then_remove() {
             "boss",
             PROJECT,
             "launch",
-            spawn(Harness::Claude, "worker1", PROJECT),
+            spawn(hid("claude"), "worker1", PROJECT),
         )
         .await
         .result();
@@ -303,7 +301,7 @@ async fn launch_inherits_caller_project_when_request_omits_it() {
             "boss",
             DEMO,
             "launch",
-            spawn_no_project(Harness::Codex, "worker1"),
+            spawn_no_project(hid("codex"), "worker1"),
         )
         .await
         .result();

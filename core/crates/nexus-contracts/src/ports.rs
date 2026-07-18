@@ -13,8 +13,9 @@ use crate::admin::{
     SpawnRequest, SpawnResponse,
 };
 use crate::batch::{ConsumeRequest, NexusBatch};
-use crate::enums::{Harness, Kind};
+use crate::enums::Kind;
 use crate::events::WsEvent;
+use crate::harness::HarnessId;
 use crate::ids::{AgentId, MessageId, SessionId};
 use crate::notify::{NotifyRequest, NotifyResponse, NotifySendRequest};
 use crate::prompt::SteerResponse;
@@ -55,7 +56,7 @@ pub type PortResult<T> = Result<T, ContractError>;
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderLimit {
-    pub harness: Harness,
+    pub harness: HarnessId,
     pub session: SessionId,
     pub reason: ProviderLimitReason,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,7 +74,7 @@ pub struct ProviderLimit {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderError {
-    pub harness: Harness,
+    pub harness: HarnessId,
     pub session: SessionId,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -107,7 +108,7 @@ pub struct ResetHint {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OperatorAction {
-    pub harness: Harness,
+    pub harness: HarnessId,
     pub session: SessionId,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -12,8 +12,8 @@ use nexus::daemon::{dispatch, AppState};
 use nexus_common::Config;
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::{
-    Caller, CreateThreadRequest, Harness, Kind, RegisterRequest, RegisterResponse, Request,
-    RequestId, SendRequest, SendTarget, ThreadMemberRequest, Tier,
+    Caller, CreateThreadRequest, Kind, RegisterRequest, RegisterResponse, Request, RequestId,
+    SendRequest, SendTarget, ThreadMemberRequest, Tier,
 };
 use nexus_pty::PtySession;
 use nexus_store::Store;
@@ -91,7 +91,7 @@ impl PtyTestDaemon {
                 RegisterRequest {
                     name: Some(name.into()),
                     agent_id: None,
-                    harness: Harness::Claude,
+                    harness: hid("claude"),
                     harness_session_id: format!("hs_{name}"),
                     project: PROJECT.into(),
                     client_key: format!("ck_{name}"),
@@ -301,4 +301,9 @@ async fn raw_pty_thread_delivery_is_terminally_rejected_before_write() {
         "an unsupported raw PTY must not receive a durable thread post"
     );
     wait_for_terminal_contract_error(&d, &ack.message_id, &ben.session).await;
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

@@ -7,7 +7,8 @@
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
-use crate::enums::{AgentAccessRole, Harness, Presence};
+use crate::enums::{AgentAccessRole, Presence};
+use crate::harness::HarnessId;
 use crate::ids::{AgentId, CredentialId, SessionId};
 
 /// `nexus agents create <name>` — create a durable agent identity.
@@ -19,7 +20,7 @@ pub struct AgentCreateRequest {
     pub name: String,
     /// Default harness used by launch/resume commands when one is not supplied.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_harness: Option<Harness>,
+    pub default_harness: Option<HarnessId>,
     /// Project scope the agent belongs to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
@@ -51,7 +52,7 @@ pub struct AgentSummary {
     pub name: Option<String>,
     pub project: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_harness: Option<Harness>,
+    pub default_harness: Option<HarnessId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -269,7 +270,7 @@ pub struct AgentRuntimeSummary {
     /// The disposable runtime id. In the first pass this is the Nexus `SessionId`.
     pub runtime_id: SessionId,
     pub agent_id: AgentId,
-    pub harness: Harness,
+    pub harness: HarnessId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

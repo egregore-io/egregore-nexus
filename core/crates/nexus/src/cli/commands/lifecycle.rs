@@ -6,8 +6,8 @@ use std::process::ExitCode;
 
 use clap::Args;
 use nexus_contracts::{
-    codes, AgentId, ContractError, Harness, Kind, RegisterRequest, RegisterResponse, RenameRequest,
-    RenameResponse, SpawnIdentityPolicy, SpawnRequest, SpawnResponse, Tier, Whoami,
+    codes, AgentId, ContractError, HarnessId, Kind, RegisterRequest, RegisterResponse,
+    RenameRequest, RenameResponse, SpawnIdentityPolicy, SpawnRequest, SpawnResponse, Tier, Whoami,
 };
 use nexus_harness_core::HarnessIdentity;
 
@@ -16,7 +16,7 @@ use crate::cli::commands::parse;
 use crate::cli::read_client::ReadClient;
 use crate::cli::render::finish_with;
 use crate::cli::store_client::StoreClient;
-use crate::harness_registry::harness_registry;
+use crate::harness_registry::harness_registry_by_id;
 
 /// Launch mode decision — factored out so it can be unit-tested without touching stdin or exec.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -62,14 +62,14 @@ pub fn launch_mode(headless: bool, tui: bool, is_tty: bool, prompt_answer: Optio
 /// Reject unsupported combinations so callers never think a resume key was honored when it was
 /// silently ignored by a different backend.
 pub fn validate_launch_resume(
-    kind: &Harness,
+    kind: &HarnessId,
     resume: Option<&str>,
     mode: Mode,
 ) -> Result<(), &'static str> {
     if resume.is_none() {
         return Ok(());
     }
-    if *kind != Harness::Codex {
+    if kind.as_str() != "codex" {
         return Err("resume is currently supported only for codex launches");
     }
     if mode == Mode::Headless {
@@ -110,7 +110,7 @@ impl ResolvedLaunchArgs {
 /// Codex keeps the one compatibility normalization, `codex resume <thread-id>`, because the
 /// app-server bridge stores that thread id separately.
 pub fn resolve_launch_resume(
-    kind: &Harness,
+    kind: &HarnessId,
     harness_args: &[String],
 ) -> Result<ResolvedLaunchArgs, String> {
     if harness_args.is_empty() {
@@ -127,7 +127,7 @@ pub fn resolve_launch_resume(
 
 /// Validate the resolved harness tail against the selected run mode.
 pub fn validate_launch_harness_args(
-    kind: &Harness,
+    kind: &HarnessId,
     resolved: &ResolvedLaunchArgs,
     mode: Mode,
 ) -> Result<(), &'static str> {
@@ -186,9 +186,9 @@ pub fn launch_mode_for_resume(
 /// `nexus launch <kind>` — submit a daemon-owned harness launch; the agent then self-registers.
 #[derive(Args, Debug)]
 pub struct LaunchArgs {
-    /// Harness kind (`claude`|`codex`|`opencode`|`hermes`|`pi`|`other`).
+    /// Harness id (`claude`|`codex`|`opencode`|`hermes`|`pi`|any registered id).
     #[arg(value_parser = parse::harness)]
-    pub kind: Harness,
+    pub kind: HarnessId,
     #[arg(long)]
     pub cwd: Option<String>,
     #[arg(long)]
@@ -236,7 +236,7 @@ pub struct RegisterArgs {
     pub name: String,
     /// The harness/runtime (`claude`|`codex`|…); defaults to claude.
     #[arg(long, value_parser = parse::harness)]
-    pub agent: Option<Harness>,
+    pub agent: Option<HarnessId>,
     /// `agent` | `app`.
     #[arg(long, value_parser = parse::kind)]
     pub kind: Option<Kind>,
@@ -274,7 +274,10 @@ pub fn register_request(a: &RegisterArgs) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(a.name.clone()),
-        harness: a.agent.unwrap_or(Harness::Claude),
+        harness: a
+            .agent
+            .clone()
+            .unwrap_or_else(|| HarnessId::new("claude").expect("builtin harness id is valid")),
         harness_session_id: stable_harness_session_id_from_env()
             .unwrap_or_else(|| format!("hs_{client_key}")),
         project: a.project.clone().unwrap_or_else(|| "default".into()),
@@ -302,10 +305,10 @@ pub fn resolve_launch_cwd(explicit: Option<String>) -> Option<String> {
 /// Resolve the launch working directory for a concrete harness.
 ///
 /// Explicit `--cwd` remains authoritative. Otherwise the CLI sends its shell cwd for every harness,
-/// including Claude, so launched agents work in the folder the operator chose. Claude revival uses
-/// an exact best-effort `--resume` hint, but Nexus does not own or validate Claude Code identity.
+/// including Claude, so launched agents work in the folder the operator chose. Revival uses
+/// an exact best-effort `--resume` hint, but Nexus does not own or validate harness identity.
 pub fn resolve_launch_cwd_for(
-    kind: &Harness,
+    kind: &HarnessId,
     explicit: Option<String>,
     harness_args: &[String],
 ) -> Option<String> {
@@ -320,23 +323,23 @@ pub fn resolve_launch_cwd_for(
 ///
 /// Returns `None` for unsupported kinds (pi/other).
 pub fn build_harness_command(
-    kind: &Harness,
+    kind: &HarnessId,
     name: &str,
     project: &str,
     nexus_exe: &str,
     _cwd: Option<&str>,
 ) -> Option<(String, Vec<String>)> {
-    let command = harness_registry(*kind)
+    let command = harness_registry_by_id(kind)
         .headed_cli_command(&HarnessIdentity::legacy(name, project), nexus_exe, &[])
         .ok()?;
     (!command.program.is_empty()).then_some((command.program, command.args))
 }
 
 fn resolve_tail_for(
-    kind: &Harness,
+    kind: &HarnessId,
     harness_args: &[String],
 ) -> Result<nexus_harness_core::ResolvedTail, nexus_harness_core::HarnessError> {
-    harness_registry(*kind).resolve_tail(harness_args)
+    harness_registry_by_id(kind).resolve_tail(harness_args)
 }
 
 /// `nexus launch <kind>` — ask the daemon command worker to spawn the harness runtime, then
@@ -507,7 +510,7 @@ pub fn parse_launch_meta(raw: Option<&str>) -> Result<Option<serde_json::Value>,
 }
 
 pub fn launch_identity_fields(
-    kind: &Harness,
+    kind: &HarnessId,
     explicit_name: Option<String>,
     resume: Option<&str>,
 ) -> (Option<String>, SpawnIdentityPolicy) {
@@ -594,7 +597,9 @@ fn build_register_request(
     Ok(RegisterRequest {
         agent_id: a.agent_id.clone().map(AgentId),
         name: Some(a.name.clone()),
-        harness: a.agent.unwrap_or(Harness::Claude),
+        harness: a
+            .agent
+            .unwrap_or_else(|| HarnessId::new("claude").expect("builtin harness id is valid")),
         harness_session_id,
         project: a.project.unwrap_or_else(|| "default".into()),
         client_key,
@@ -640,7 +645,7 @@ mod tests {
             || {
                 let req = register_request(&RegisterArgs {
                     name: "bianca".into(),
-                    agent: Some(Harness::Claude),
+                    agent: Some(HarnessId::new("claude").unwrap()),
                     kind: Some(Kind::Human),
                     project: Some("default".into()),
                     role: Some("operator".into()),
@@ -749,16 +754,15 @@ mod builder_tests {
 
     #[test]
     fn codex_command_and_mcp_args() {
-        let (prog, args) =
-            build_harness_command(&Harness::Codex, "ada", "lens", "/usr/bin/nexus", None).unwrap();
-        assert_eq!(
-            prog,
-            nexus_harness_core::native_harness_program(
-                Harness::Codex,
-                nexus_harness_core::NativeProcessPlatform::current(),
-            )
-            .unwrap()
-        );
+        let (prog, args) = build_harness_command(
+            &HarnessId::new("codex").unwrap(),
+            "ada",
+            "lens",
+            "/usr/bin/nexus",
+            None,
+        )
+        .unwrap();
+        assert_eq!(prog, "codex");
         assert!(args.contains(&"-c".to_string()));
         assert!(args
             .iter()
@@ -772,16 +776,15 @@ mod builder_tests {
 
     #[test]
     fn claude_command_and_mcp_config() {
-        let (prog, args) =
-            build_harness_command(&Harness::Claude, "ada", "lens", "/usr/bin/nexus", None).unwrap();
-        assert_eq!(
-            prog,
-            nexus_harness_core::native_harness_program(
-                Harness::Claude,
-                nexus_harness_core::NativeProcessPlatform::current(),
-            )
-            .unwrap()
-        );
+        let (prog, args) = build_harness_command(
+            &HarnessId::new("claude").unwrap(),
+            "ada",
+            "lens",
+            "/usr/bin/nexus",
+            None,
+        )
+        .unwrap();
+        assert_eq!(prog, "claude");
         let idx = args
             .iter()
             .position(|a| a == "--mcp-config")
@@ -807,7 +810,9 @@ mod builder_tests {
 
     #[test]
     fn pi_returns_none() {
-        assert!(build_harness_command(&Harness::Pi, "x", "p", "/e", None).is_none());
+        assert!(
+            build_harness_command(&HarnessId::new("pi").unwrap(), "x", "p", "/e", None).is_none()
+        );
     }
 
     #[test]
@@ -857,7 +862,7 @@ mod builder_tests {
 /// Build a `SpawnRequest` from launch args and a resolved mode, without any I/O. Used for unit
 /// testing `headless` wiring without submitting a command intent.
 pub fn build_spawn_request(
-    kind: nexus_contracts::Harness,
+    kind: nexus_contracts::HarnessId,
     explicit_name: Option<String>,
     generated_name: String,
     cwd: Option<String>,
@@ -890,7 +895,7 @@ pub fn build_spawn_request(
 #[cfg(test)]
 mod launch_mode_tests {
     use super::{build_spawn_request, launch_mode, resolve_launch_cwd, Mode};
-    use nexus_contracts::{Harness, SpawnIdentityPolicy};
+    use nexus_contracts::{HarnessId, SpawnIdentityPolicy};
 
     #[test]
     fn headless_flag_forces_headless() {
@@ -940,7 +945,7 @@ mod launch_mode_tests {
         let mode = launch_mode(true, false, true, None); // --headless
         assert_eq!(mode, Mode::Headless);
         let req = build_spawn_request(
-            Harness::Claude,
+            HarnessId::new("claude").unwrap(),
             Some("ada".into()),
             "ada".into(),
             None,
@@ -963,7 +968,7 @@ mod launch_mode_tests {
         let mode = launch_mode(false, true, true, None); // --tui
         assert_eq!(mode, Mode::Tui);
         let req = build_spawn_request(
-            Harness::Codex,
+            HarnessId::new("codex").unwrap(),
             Some("ben".into()),
             "ben".into(),
             None,
@@ -984,7 +989,7 @@ mod launch_mode_tests {
     fn codex_resume_without_user_name_preserves_implicit_identity_intent() {
         let mode = launch_mode(false, true, true, None);
         let req = build_spawn_request(
-            Harness::Codex,
+            HarnessId::new("codex").unwrap(),
             None,
             "generated-celia".into(),
             None,
@@ -1004,7 +1009,7 @@ mod launch_mode_tests {
     fn fresh_launch_without_user_name_sends_no_name() {
         let mode = launch_mode(false, true, true, None);
         let req = build_spawn_request(
-            Harness::Codex,
+            HarnessId::new("codex").unwrap(),
             None,
             "generated-celia".into(),
             None,
@@ -1024,7 +1029,7 @@ mod launch_mode_tests {
     fn explicit_agent_id_name_sets_explicit_agent_id_policy() {
         let mode = launch_mode(false, true, true, None);
         let req = build_spawn_request(
-            Harness::Codex,
+            HarnessId::new("codex").unwrap(),
             Some("a_s_otto".into()),
             "unused-generated".into(),
             None,
@@ -1130,7 +1135,9 @@ mod arg_tests {
         assert!(help.contains("opencode"), "{help}");
         assert!(help.contains("hermes"), "{help}");
         assert!(help.contains("pi"), "{help}");
-        assert!(help.contains("other"), "{help}");
+        // Open-set migration: `other` is no longer a kind literal; the help must
+        // instead advertise that any registered id is accepted.
+        assert!(help.contains("any registered id"), "{help}");
     }
 
     #[test]

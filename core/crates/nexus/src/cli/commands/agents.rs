@@ -11,7 +11,7 @@ use nexus_contracts::{
     AgentAccessRevokeResponse, AgentAccessRole, AgentCreateRequest, AgentCreateResponse,
     AgentCredentialCreateRequest, AgentCredentialCreateResponse, AgentCredentialRevokeRequest,
     AgentCredentialRevokeResponse, AgentOwnerTransferRequest, AgentOwnerTransferResponse,
-    AgentRuntimeListResponse, AgentShowResponse, Harness, MemberListRequest, MemberListResponse,
+    AgentRuntimeListResponse, AgentShowResponse, HarnessId, MemberListRequest, MemberListResponse,
 };
 
 use crate::cli::commands::parse;
@@ -28,7 +28,7 @@ pub enum AgentsCmd {
     Create {
         name: String,
         #[arg(long, value_parser = parse::harness)]
-        harness: Option<Harness>,
+        harness: Option<HarnessId>,
         #[arg(long)]
         project: Option<String>,
         #[arg(long)]
@@ -242,7 +242,7 @@ async fn list(client: &ReadClient, json: bool) -> ExitCode {
 async fn create(
     client: &StoreClient,
     name: String,
-    default_harness: Option<Harness>,
+    default_harness: Option<HarnessId>,
     project: Option<String>,
     role: Option<String>,
     json: bool,
@@ -271,7 +271,7 @@ async fn show(client: &ReadClient, name: String, json: bool) -> ExitCode {
                 out.push_str(&format!(
                     "\n{} {} {:?} {}",
                     runtime.runtime_id.0,
-                    format!("{:?}", runtime.harness).to_lowercase(),
+                    runtime.harness,
                     runtime.presence,
                     if runtime.active { "active" } else { "stopped" }
                 ));
@@ -350,7 +350,7 @@ async fn runtimes(
             out.push_str(&format!(
                 "\n{:<11} {:<9} {:<9} {}",
                 runtime.runtime_id.0,
-                format!("{:?}", runtime.harness).to_lowercase(),
+                runtime.harness,
                 format!("{:?}", runtime.presence).to_lowercase(),
                 if runtime.active { "active" } else { "stopped" }
             ));
@@ -361,10 +361,14 @@ async fn runtimes(
 
 fn format_agent_summary(agent: &nexus_contracts::AgentSummary) -> String {
     format!(
-        "{} {} {:?}",
+        "{} {} {}",
         agent.agent_id.0,
         agent.name.as_deref().unwrap_or("<unnamed>"),
-        agent.default_harness.unwrap_or(Harness::Other)
+        agent
+            .default_harness
+            .as_ref()
+            .map(HarnessId::as_str)
+            .unwrap_or("-")
     )
 }
 

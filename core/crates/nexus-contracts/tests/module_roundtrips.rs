@@ -42,8 +42,9 @@ mod ack {
 
 mod admin {
     use nexus_contracts::admin::*;
-    use nexus_contracts::enums::{Harness, Tier};
+    use nexus_contracts::enums::Tier;
     use nexus_contracts::ids::{AgentId, MessageId, SessionId};
+    use nexus_contracts::HarnessId;
 
     #[test]
     fn route_forward_roundtrips() {
@@ -61,7 +62,7 @@ mod admin {
     #[test]
     fn spawn_roundtrips() {
         let req = SpawnRequest {
-            kind: Harness::Codex,
+            kind: HarnessId::new("codex").unwrap(),
             name: Some("dylan".into()),
             identity_policy: None,
             cwd: None,
@@ -110,7 +111,7 @@ mod admin {
     #[test]
     fn spawn_request_headless_true_roundtrips() {
         let req = SpawnRequest {
-            kind: Harness::Claude,
+            kind: HarnessId::new("claude").unwrap(),
             name: Some("ada".into()),
             identity_policy: None,
             cwd: None,
@@ -131,7 +132,7 @@ mod admin {
     #[test]
     fn spawn_request_initial_prompt_roundtrips() {
         let req = SpawnRequest {
-            kind: Harness::Codex,
+            kind: HarnessId::new("codex").unwrap(),
             name: Some("otto".into()),
             identity_policy: None,
             cwd: Some("/tmp/project".into()),
@@ -375,14 +376,15 @@ mod admin {
 
 mod agents {
     use nexus_contracts::agents::*;
-    use nexus_contracts::enums::{AgentAccessRole, Harness, Presence};
+    use nexus_contracts::enums::{AgentAccessRole, Presence};
     use nexus_contracts::ids::{AgentId, CredentialId, SessionId};
+    use nexus_contracts::HarnessId;
 
     fn runtime() -> AgentRuntimeSummary {
         AgentRuntimeSummary {
             runtime_id: SessionId("s_1".into()),
             agent_id: AgentId("a_1".into()),
-            harness: Harness::Codex,
+            harness: HarnessId::new("codex").unwrap(),
             cwd: Some("/repo".into()),
             transport: Some("codex-appserver".into()),
             presence: Presence::Online,
@@ -397,7 +399,7 @@ mod agents {
     fn agent_create_roundtrips() {
         let req = AgentCreateRequest {
             name: "blake".into(),
-            default_harness: Some(Harness::Codex),
+            default_harness: Some(HarnessId::new("codex").unwrap()),
             project: Some("default".into()),
             role: Some("backend".into()),
         };
@@ -484,7 +486,7 @@ mod agents {
             agent_id: AgentId("a_1".into()),
             name: Some("blake".into()),
             project: "default".into(),
-            default_harness: Some(Harness::Codex),
+            default_harness: Some(HarnessId::new("codex").unwrap()),
             role: None,
             tier: Some("agent".into()),
             disabled: false,
@@ -585,6 +587,7 @@ mod batch {
 
 mod enums {
     use nexus_contracts::enums::*;
+    use nexus_contracts::HarnessId;
 
     #[test]
     fn enums_serialize_lowercase() {
@@ -621,11 +624,11 @@ mod enums {
         );
 
         assert_eq!(
-            serde_json::to_string(&Harness::Claude).unwrap(),
+            serde_json::to_string(&HarnessId::new("claude").unwrap()).unwrap(),
             r#""claude""#
         );
         assert_eq!(
-            serde_json::to_string(&Harness::Codex).unwrap(),
+            serde_json::to_string(&HarnessId::new("codex").unwrap()).unwrap(),
             r#""codex""#
         );
 
@@ -650,21 +653,21 @@ mod enums {
     #[test]
     fn harness_opencode_serializes_lowercase() {
         assert_eq!(
-            serde_json::to_string(&Harness::OpenCode).unwrap(),
+            serde_json::to_string(&HarnessId::new("opencode").unwrap()).unwrap(),
             r#""opencode""#
         );
-        let h: Harness = serde_json::from_str(r#""opencode""#).unwrap();
-        assert_eq!(h, Harness::OpenCode);
+        let h: HarnessId = serde_json::from_str(r#""opencode""#).unwrap();
+        assert_eq!(h, HarnessId::new("opencode").unwrap());
     }
 
     #[test]
     fn harness_hermes_serializes_lowercase() {
         assert_eq!(
-            serde_json::to_string(&Harness::Hermes).unwrap(),
+            serde_json::to_string(&HarnessId::new("hermes").unwrap()).unwrap(),
             r#""hermes""#
         );
-        let h: Harness = serde_json::from_str(r#""hermes""#).unwrap();
-        assert_eq!(h, Harness::Hermes);
+        let h: HarnessId = serde_json::from_str(r#""hermes""#).unwrap();
+        assert_eq!(h, HarnessId::new("hermes").unwrap());
     }
 }
 
@@ -1124,16 +1127,17 @@ mod project {
 }
 
 mod register {
-    use nexus_contracts::enums::{Harness, Presence, Tier};
+    use nexus_contracts::enums::{Presence, Tier};
     use nexus_contracts::ids::{AgentId, SessionId};
     use nexus_contracts::register::*;
+    use nexus_contracts::HarnessId;
 
     #[test]
     fn register_request_roundtrips_camelcase() {
         let req = RegisterRequest {
             name: Some("ben".into()),
             agent_id: Some(AgentId("a_ben".into())),
-            harness: Harness::Claude,
+            harness: HarnessId::new("claude").unwrap(),
             harness_session_id: "hs_abc".into(),
             project: "egregore".into(),
             client_key: "ck_stable".into(),

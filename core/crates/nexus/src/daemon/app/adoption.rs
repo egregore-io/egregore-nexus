@@ -449,10 +449,15 @@ impl AppState {
     }
 
     /// Reattach the generic PTY scraper for headed runtimes that do not have a structured bridge.
-    /// Claude uses its native hook forwarder and Codex uses the app-server bridge, so neither should
-    /// receive PTY screen-scraped stream rows during daemon boot adoption.
+    /// Harnesses whose contract reports a non-`Screen` runtime (`uses_structured_output`) deliver
+    /// rows through their own bridge/forwarder, so they must not also receive PTY screen-scraped
+    /// stream rows during daemon boot adoption. Unknown tokens resolve to `Screen` and keep the
+    /// scraper.
     pub(crate) fn spawn_generic_pty_reader_if_needed(&self, session: &SessionId, harness: &str) {
-        if matches!(harness, "claude" | "codex" | "opencode" | "hermes") {
+        if !matches!(
+            headed_runtime_from_agent_token(Some(harness)),
+            HeadedRuntimeKind::Screen
+        ) {
             return;
         }
         let (Some(supervisor), Some(w)) = (&self.pty, &self.loop_wiring) else {

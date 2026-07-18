@@ -343,7 +343,10 @@ mod tests {
         let InjectError::ProviderLimit(limit) = err else {
             panic!("expected provider limit, got {err:?}");
         };
-        assert_eq!(limit.harness, nexus_contracts::Harness::Claude);
+        assert_eq!(
+            limit.harness,
+            nexus_contracts::HarnessId::new("claude").unwrap()
+        );
         assert_eq!(limit.session, session);
         assert_eq!(
             limit.reason,

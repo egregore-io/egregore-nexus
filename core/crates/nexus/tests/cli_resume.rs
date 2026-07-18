@@ -8,7 +8,7 @@ use nexus::cli::store_client::StoreClient;
 use nexus::daemon::AppState;
 use nexus_common::Config;
 use nexus_contracts::{
-    codes, Harness, Kind, Presence, RegisterRequest, SessionId, SpawnRequest, SpawnResponse, Tier,
+    codes, Kind, Presence, RegisterRequest, SessionId, SpawnRequest, SpawnResponse, Tier,
 };
 use nexus_harness_codex::storage::{CodexRuntimeLaunch, CodexRuntimeStateRepo};
 use nexus_store::command_kinds;
@@ -22,7 +22,12 @@ async fn state() -> AppState {
     AppState::wire(store, &Config::default())
 }
 
-fn agent(name: &str, client_key: &str, harness: Harness, cwd: &str) -> RegisterRequest {
+fn agent(
+    name: &str,
+    client_key: &str,
+    harness: nexus_contracts::HarnessId,
+    cwd: &str,
+) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(name.into()),
@@ -112,7 +117,7 @@ async fn command_count(store: &Store, kind: Option<&str>) -> usize {
 async fn seed_codex_resume(state: &AppState, name: &str, thread_id: &str) -> SessionId {
     let registered = state
         .identity
-        .register(agent(name, "ck_codex", Harness::Codex, "/work/codex"))
+        .register(agent(name, "ck_codex", hid("codex"), "/work/codex"))
         .await
         .unwrap();
     let sessions = Sessions::new(&state.store);
@@ -167,7 +172,7 @@ async fn cli_resume_submits_detached_launch_without_attach_event() {
     assert_eq!(row.kind, command_kinds::harness::LAUNCH);
     let req: SpawnRequest = serde_json::from_str(&row.request_json).unwrap();
     assert_eq!(req.name.as_deref(), Some("rex"));
-    assert_eq!(req.kind, Harness::Codex);
+    assert_eq!(req.kind, hid("codex"));
     assert_eq!(req.resume.as_deref(), Some("codex-thread-rex"));
     assert!(req.harness_args.is_empty());
     assert!(!req.headless);
@@ -197,7 +202,7 @@ async fn cli_resume_rejects_missing_resume_id_before_enqueue() {
     let state = state().await;
     let registered = state
         .identity
-        .register(agent("hugo", "ck_hugo", Harness::Claude, "/work/claude"))
+        .register(agent("hugo", "ck_hugo", hid("claude"), "/work/claude"))
         .await
         .unwrap();
     let sessions = Sessions::new(&state.store);
@@ -227,4 +232,9 @@ async fn cli_resume_rejects_missing_resume_id_before_enqueue() {
     let err = read.attach_revive_plan("hugo").await.unwrap_err();
     assert_eq!(err.code, codes::INVALID_PARAMS);
     assert!(err.message.contains("--resume"));
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

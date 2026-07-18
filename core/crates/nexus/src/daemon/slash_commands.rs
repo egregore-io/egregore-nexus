@@ -4,12 +4,12 @@
 //! execute a slash command natively, dispatch must fail the command intent immediately instead of
 //! queueing text that can hang the serial HarnessPrompt lane.
 
-use nexus_contracts::{codes, ContractError, Harness};
+use nexus_contracts::{codes, ContractError};
 use nexus_harness_core::{SlashCommand, SlashCommandAction};
 use nexus_store::types::SessionRow;
 
 use crate::daemon::app::harness_from_token;
-use crate::harness_registry::harness_registry;
+use crate::harness_registry::harness_registry_by_id;
 
 /// Native prompt handling decision for a parsed slash command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +29,7 @@ pub(crate) fn prompt_slash_action(
         return Ok(None);
     };
     let kind = harness_from_token(row.agent.as_deref());
-    let harness = harness_registry(kind);
+    let harness = harness_registry_by_id(&kind);
     let translated = harness
         .translate_slash_command(&command)
         .map_err(|_| unsupported(row, &command, "not declared by harness adapter"))?;
@@ -47,8 +47,8 @@ pub(crate) fn prompt_slash_action(
             }
         }
         SlashCommandAction::NativeCompact => {
-            if (kind == Harness::Codex && row.transport.as_deref() == Some("codex-appserver"))
-                || (kind == Harness::Hermes && row.transport.as_deref() == Some("pty"))
+            if (kind.as_str() == "codex" && row.transport.as_deref() == Some("codex-appserver"))
+                || (kind.as_str() == "hermes" && row.transport.as_deref() == Some("pty"))
             {
                 Ok(Some(PromptSlashAction::NativeCompact))
             } else {
