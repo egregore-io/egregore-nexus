@@ -40,13 +40,16 @@ command. The same guidance applies when the CLI arrives through the Gateway or c
 nexus daemon install     # register for login, restart on failure, and start now
 nexus daemon status
 
+nexus gateway install     # register Gateway after ensuring the daemon service
 nexus gateway start       # starts the daemon first when needed
 nexus gateway status
 nexus gateway logs
 nexus gateway restart
 nexus gateway stop
+nexus gateway uninstall
 
-nexus-webui --gateway-url http://127.0.0.1:4100
+nexus webconsole launch
+nexus webconsole status
 ```
 
 Daemon installation is per-user: a systemd user unit on Linux and WSL, a LaunchAgent on macOS,
@@ -55,13 +58,39 @@ daemon and removes its native registration. Installation reports success only af
 is live and stable; otherwise it exits nonzero with log and native service-manager guidance.
 `nexus daemon start` remains available for a one-off detached run.
 
-`nexus gateway start` never installs software. If the Gateway executable is missing, it returns a
-precise error naming `@egregore/nexus-gateway`. Gateway restart affects the Gateway only; daemon
-lifecycle remains an explicit operator action.
+When the installed npm topology already contains the Gateway, `nexus daemon install` also installs
+the Gateway service after daemon health succeeds. It never downloads a missing facet.
+
+`nexus gateway install` ensures the daemon service and registers an independently supervised
+Gateway with dependency ordering and restart-on-failure. `nexus gateway start` never installs
+software. If the Gateway executable is missing, it returns a precise error naming
+`@egregore/nexus-gateway`. Gateway restart affects the Gateway only; daemon lifecycle remains an
+explicit operator action.
+
+Webconsole is on demand rather than a login service. `nexus webconsole launch` starts or reuses it,
+waits for daemon and Gateway health, and opens the browser. `--no-open` is available for remote and
+headless hosts. Non-loopback binding is explicit and emits a security warning.
 
 The Gateway writes discovery under the Nexus home after it binds. Clients should use
 `nexus gateway status` rather than assuming port 4100, because the default resolver may select an
 available port from 4100–4110. An explicit `NEXUS_GATEWAY_PORT` disables fallback.
+
+## Updates
+
+```bash
+nexus update --check
+nexus update
+```
+
+Automatic update is available only to a managed npm or Cargo installation. The npm launcher marks
+whether the active installation is CLI-only, Gateway, or complete; the updater changes only those
+facets. Cargo updates only the native CLI and daemon. Manual and development binaries print the
+package-manager recovery path instead of guessing ownership.
+
+Updates use an exclusive lock, exact versions, bounded command output, service-state snapshots,
+post-install command and health verification, and exact-version rollback. Daemon, Gateway, and
+Webconsole are restored in dependency order only when they were running before the update. An
+operator can inspect the structured receipt under the Nexus home after completion.
 
 ## Platform matrix
 

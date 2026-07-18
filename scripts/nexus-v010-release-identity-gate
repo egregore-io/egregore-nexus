@@ -155,6 +155,10 @@ if gateway_manifest.get("dependencies", {}).get("@egregore/nexus-cli") != "0.1.2
 if gateway_manifest.get("bin", {}).get("nexus") != "scripts/nexus.mjs":
     failures.append("@egregore/nexus-gateway must expose the nexus command")
 
+package_smoke = root / "packages/nexus-cli/tests/package-smoke.test.mjs"
+if not package_smoke.is_file():
+    failures.append("packed npm topology lifecycle smoke is missing")
+
 routing_path = root / "core/crates/nexus/src/daemon/routing.rs"
 dispatch_path = root / "core/crates/nexus/src/daemon/dispatch.rs"
 if not routing_path.is_file():

@@ -108,8 +108,14 @@ grep -Fq "$TMP/path-guidance-install/bin" "$TMP/path-guidance.log"
 
 test "$(find "$TMP/packs" -maxdepth 1 -name '*.tgz' -printf '.' | wc -c)" -eq 3
 "$STACK_BIN/nexus" daemon install --help >/dev/null
+"$STACK_BIN/nexus" update --help >/dev/null
+"$STACK_BIN/nexus" gateway install --help >/dev/null
+"$STACK_BIN/nexus" webconsole launch --help >/dev/null
 node "$ROOT/scripts/nexus-cli-command-surface-smoke.mjs" "$STACK_BIN/nexus"
 "$TMP/global-install/bin/nexus" daemon install --help >/dev/null
+"$TMP/global-install/bin/nexus" update --help >/dev/null
+"$TMP/global-install/bin/nexus" gateway install --help >/dev/null
+"$TMP/global-install/bin/nexus" webconsole launch --help >/dev/null
 "$TMP/path-guidance-install/bin/nexus" daemon install --help >/dev/null
 "$STACK_BIN/nexus-gateway" --help | grep -q 'nexus-gateway'
 NEXUS_HOME="$TMP/nexus-home" NEXUS_GATEWAY_DB="file:$TMP/nexus-home/gateway.db" \
