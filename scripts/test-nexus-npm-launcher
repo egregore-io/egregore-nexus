@@ -97,6 +97,23 @@ WINDOWS_SHA256=$(sha256sum "$TMP/nexus.exe" | cut -d' ' -f1)
   --expected-sha256 "$WINDOWS_SHA256" >/dev/null
 cmp "$TMP/nexus.exe" \
   "$TMP/windows-pack/native/win32-x64-msvc/nexus.exe"
+
+printf 'MZwindows-fixture /home/private-builder/.cargo/registry/src/example.rs\n' \
+  >"$TMP/leaked-build-path.exe"
+LEAKED_BUILD_PATH_SHA256=$(sha256sum "$TMP/leaked-build-path.exe" | cut -d' ' -f1)
+if "$ROOT/scripts/nexus-pack-native-npm" \
+  --target win32-x64-msvc \
+  --binary "$TMP/leaked-build-path.exe" \
+  --output "$TMP/leaked-build-path-pack" \
+  --version-output 'nexus 0.1.0 (revision windows-lab)' \
+  --expected-sha256 "$LEAKED_BUILD_PATH_SHA256" \
+  >"$TMP/leaked-build-path.out" 2>"$TMP/leaked-build-path.err"; then
+  echo "expected native packer to reject a private build-home path" >&2
+  exit 1
+fi
+grep -q 'native binary exposes a private build-home path' \
+  "$TMP/leaked-build-path.err"
+
 if "$ROOT/scripts/nexus-pack-native-npm" \
   --target win32-x64-msvc \
   --binary "$TMP/nexus.exe" \

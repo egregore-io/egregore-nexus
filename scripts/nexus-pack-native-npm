@@ -105,6 +105,13 @@ if [[ "$TARGET" == linux-* ]]; then
   fi
 fi
 
+if LC_ALL=C grep -aEq \
+  '(/home/[^/[:space:]]+|/Users/[^/[:space:]]+)/(\.cargo|\.rustup|Projects)/|[A-Za-z]:[\\/]+Users[\\/]+[^\\/[:space:]]+[\\/]+(\.cargo|\.rustup|Projects)[\\/]' \
+  "$TMP/$EXECUTABLE"; then
+  echo "native binary exposes a private build-home path" >&2
+  exit 1
+fi
+
 if [ -z "$EXPECTED_SHA256" ]; then
   if ! "$TMP/$EXECUTABLE" --version 2>&1 | grep -Fxq "$VERSION_OUTPUT"; then
     echo "stripped native npm binary no longer reports the expected version" >&2

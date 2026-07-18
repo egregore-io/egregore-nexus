@@ -145,6 +145,7 @@ grep -Eq '^libsql-sys = \{ workspace = true, features = \["rusqlite"\] \}$' "$ST
 
 grep -q 'workflow_dispatch:' "$WORKFLOW"
 grep -q 'upload-artifact' "$WORKFLOW"
+grep -Fq -- '--remap-path-prefix=' "$WORKFLOW"
 grep -q 'Smoke complete umbrella install' "$WORKFLOW"
 grep -Fq 'dist/npm-smoke/node_modules/.bin/nexus daemon install --help' "$WORKFLOW"
 grep -Fq 'npm install --global --prefix dist/npm-global-smoke' "$WORKFLOW"

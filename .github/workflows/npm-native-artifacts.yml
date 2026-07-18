@@ -89,9 +89,15 @@ jobs:
           pnpm --dir gateway exec vitest run src/server/agui/daemonPushRelay.test.ts --maxWorkers=2
       - name: Build native Nexus
         shell: bash
-        run: >-
-          cargo build --locked --release --manifest-path core/Cargo.toml
-          -p egregore-nexus --bin nexus --target "${{ matrix.rust_target }}"
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            WINDOWS_HOME=${USERPROFILE//\\//}
+            export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=${USERPROFILE}=/build-home"$'\x1f'"--remap-path-prefix=${WINDOWS_HOME}=/build-home"
+          else
+            export CARGO_ENCODED_RUSTFLAGS="--remap-path-prefix=${HOME}=/build-home"
+          fi
+          cargo build --locked --release --manifest-path core/Cargo.toml \
+            -p egregore-nexus --bin nexus --target "${{ matrix.rust_target }}"
       - name: Stage and execute packaged launcher
         shell: bash
         run: |
