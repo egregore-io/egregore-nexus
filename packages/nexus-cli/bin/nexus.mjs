@@ -6,9 +6,11 @@ import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { platformTarget } from "../lib/platform-target.mjs";
+import { npmInstallContext } from "../lib/install-context.mjs";
 
 const executableName = process.platform === "win32" ? "nexus.exe" : "nexus";
-const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+const launcherPath = fileURLToPath(import.meta.url);
+const packageRoot = dirname(dirname(launcherPath));
 const candidates = [
   process.env.NEXUS_NATIVE_BIN,
   packagedNativeBinary(),
@@ -29,7 +31,13 @@ if (!executable) {
 
 const child = spawnSync(executable, process.argv.slice(2), {
   stdio: "inherit",
-  env: process.env,
+  env: npmInstallContext({
+    defaultPackageName: "@egregore/nexus-cli",
+    defaultPackageRoot: packageRoot,
+    defaultLauncherPath: launcherPath,
+    nativeBinary: executable,
+    env: process.env,
+  }),
   windowsHide: false,
 });
 if (child.error) throw child.error;

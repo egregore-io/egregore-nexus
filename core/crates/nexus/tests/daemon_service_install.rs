@@ -242,6 +242,53 @@ fn daemon_uninstall_stops_disables_and_removes_the_systemd_user_service() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn daemon_uninstall_removes_gateway_service_first() {
+    let root = tempfile::tempdir().unwrap();
+    let fake_bin = root.path().join("bin");
+    let config = root.path().join("config");
+    let home = root.path().join("nexus-home");
+    let calls = root.path().join("systemctl.log");
+    let units = config.join("systemd/user");
+    fs::create_dir_all(&fake_bin).unwrap();
+    fs::create_dir_all(&units).unwrap();
+    fs::write(units.join("nexus-daemon.service"), "[Service]\n").unwrap();
+    fs::write(units.join("nexus-gateway.service"), "[Service]\n").unwrap();
+    let systemctl = fake_bin.join("systemctl");
+    fs::write(
+        &systemctl,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$NEXUS_TEST_SYSTEMCTL_LOG\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = nexus()
+        .args(["daemon", "uninstall"])
+        .env("PATH", &fake_bin)
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", &config)
+        .env("NEXUS_HOME", &home)
+        .env("NEXUS_TEST_SYSTEMCTL_LOG", &calls)
+        .env_remove("NEXUS_NAME")
+        .env_remove("NEXUS_CLIENT_KEY")
+        .env_remove("NEXUS_SESSION_ID")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fs::read_to_string(calls).unwrap();
+    let gateway = calls.find("--user stop nexus-gateway.service").unwrap();
+    let daemon = calls.find("--user stop nexus-daemon.service").unwrap();
+    assert!(gateway < daemon, "{calls}");
+    assert!(!units.join("nexus-gateway.service").exists());
+    assert!(!units.join("nexus-daemon.service").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn wsl_install_transfers_a_running_self_daemon_to_systemd() {
     let root = tempfile::tempdir().unwrap();
     let fake_bin = root.path().join("bin");

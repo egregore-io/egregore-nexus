@@ -16,9 +16,12 @@ pub mod cli;
 pub mod daemon;
 pub mod error;
 pub mod gateway_lifecycle;
+pub mod gateway_service;
 pub mod harness_registry;
 pub mod initial_prompt;
 pub(crate) mod local_operator;
 pub mod names;
+pub mod update;
+pub mod webconsole_lifecycle;
 
 pub use daemon::{dispatch, AppState, WsSink};

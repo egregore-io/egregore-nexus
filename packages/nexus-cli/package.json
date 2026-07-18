@@ -9,10 +9,12 @@
     "nexus": "bin/nexus.mjs"
   },
   "scripts": {
+    "test": "node --test tests/*.test.mjs",
     "postinstall": "node scripts/postinstall.mjs"
   },
   "files": [
     "bin/nexus.mjs",
+    "lib/install-context.mjs",
     "lib/path-guidance.mjs",
     "lib/platform-target.mjs",
     "scripts/postinstall.mjs",

@@ -1,16 +1,18 @@
 #!/usr/bin/env node
 
 import { createReadStream } from "node:fs";
-import { access, stat } from "node:fs/promises";
+import { access, realpath, stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { dirname, extname, join } from "node:path";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
+import { removeOwnedDiscovery, writeDiscovery } from "../lib/lifecycle.mjs";
+
 const args = process.argv.slice(2);
 if (args.includes("--help")) {
   process.stdout.write(
-    "Usage: nexus-webui [--host 127.0.0.1] [--port 4200] [--gateway-url http://127.0.0.1:4100]\n",
+    "Usage: nexus-webui [--host 127.0.0.1] [--port 4200] [--gateway-url http://127.0.0.1:4100] [--discovery <path>]\n",
   );
   process.exit(0);
 }
@@ -20,8 +22,10 @@ const port = parsePort(valueAfter("--port") ?? process.env.NEXUS_WEBUI_PORT ?? "
 const gateway = new URL(
   valueAfter("--gateway-url") ?? process.env.NEXUS_GATEWAY_URL ?? "http://127.0.0.1:4100",
 );
+const discoveryPath = valueAfter("--discovery") ?? process.env.NEXUS_WEBCONSOLE_DISCOVERY;
+const executable = await realpath(fileURLToPath(import.meta.url));
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
-const dist = join(packageRoot, "dist");
+const dist = process.env.NEXUS_WEBUI_DIST ?? join(packageRoot, "dist");
 await access(join(dist, "index.html"));
 
 const server = createServer((request, response) => {
@@ -30,11 +34,29 @@ const server = createServer((request, response) => {
     response.end(JSON.stringify({ error: { code: "gateway_unavailable", message: String(error) } }));
   });
 });
-server.listen(port, host, () => {
-  process.stdout.write(`Nexus WebUI listening on http://${host}:${port} (Gateway ${gateway.origin})\n`);
+server.listen(port, host, async () => {
+  const address = server.address();
+  const boundPort = typeof address === "object" && address ? address.port : port;
+  const displayHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  const url = `http://${displayHost}:${boundPort}`;
+  if (discoveryPath) {
+    await writeDiscovery(discoveryPath, {
+      pid: process.pid,
+      host,
+      port: boundPort,
+      url,
+      gatewayUrl: gateway.origin,
+      startedAtMs: Date.now(),
+      executable,
+    });
+  }
+  process.stdout.write(`Nexus WebUI listening on ${url} (Gateway ${gateway.origin})\n`);
 });
 for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.on(signal, () => server.close(() => process.exit(0)));
+  process.on(signal, () => server.close(async () => {
+    if (discoveryPath) await removeOwnedDiscovery(discoveryPath, process.pid);
+    process.exit(0);
+  }));
 }
 
 async function dispatch(request, response) {
