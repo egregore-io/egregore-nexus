@@ -98,6 +98,44 @@ WINDOWS_SHA256=$(sha256sum "$TMP/nexus.exe" | cut -d' ' -f1)
 cmp "$TMP/nexus.exe" \
   "$TMP/windows-pack/native/win32-x64-msvc/nexus.exe"
 
+mkdir -p "$TMP/cross-tools"
+cat >"$TMP/cross-tools/strip" <<'SH'
+#!/usr/bin/env sh
+exit 91
+SH
+cat >"$TMP/cross-tools/objcopy" <<'SH'
+#!/usr/bin/env sh
+exit 92
+SH
+cat >"$TMP/cross-tools/readelf" <<'SH'
+#!/usr/bin/env sh
+exit 93
+SH
+for tool in llvm-strip llvm-objcopy; do
+  cat >"$TMP/cross-tools/$tool" <<'SH'
+#!/usr/bin/env sh
+printf '%s\n' "$0" >>"$NEXUS_TEST_TOOL_LOG"
+SH
+done
+cat >"$TMP/cross-tools/llvm-readelf" <<'SH'
+#!/usr/bin/env sh
+printf '%s\n' "$0" >>"$NEXUS_TEST_TOOL_LOG"
+SH
+chmod +x "$TMP/cross-tools"/*
+printf 'ELFarm64-fixture\n' >"$TMP/nexus-arm64"
+ARM64_SHA256=$(sha256sum "$TMP/nexus-arm64" | cut -d' ' -f1)
+NEXUS_TEST_TOOL_LOG="$TMP/cross-tools.log" \
+  PATH="$TMP/cross-tools:$PATH" \
+  "$ROOT/scripts/nexus-pack-native-npm" \
+    --target linux-arm64-gnu \
+    --binary "$TMP/nexus-arm64" \
+    --output "$TMP/arm64-pack" \
+    --version-output 'nexus 0.1.0 (revision cross-host)' \
+    --expected-sha256 "$ARM64_SHA256" >/dev/null
+grep -q '/llvm-strip$' "$TMP/cross-tools.log"
+grep -q '/llvm-objcopy$' "$TMP/cross-tools.log"
+grep -q '/llvm-readelf$' "$TMP/cross-tools.log"
+
 printf 'MZwindows-fixture /home/private-builder/.cargo/registry/src/example.rs\n' \
   >"$TMP/leaked-build-path.exe"
 LEAKED_BUILD_PATH_SHA256=$(sha256sum "$TMP/leaked-build-path.exe" | cut -d' ' -f1)

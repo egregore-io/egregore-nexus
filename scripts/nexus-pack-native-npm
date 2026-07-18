@@ -88,17 +88,30 @@ cp "$BINARY" "$TMP/$EXECUTABLE"
 chmod 755 "$TMP/$EXECUTABLE"
 
 if [[ "$TARGET" == linux-* ]]; then
-  for tool in strip objcopy readelf; do
+  STRIP_TOOL=strip
+  OBJCOPY_TOOL=objcopy
+  READELF_TOOL=readelf
+  if [ "$TARGET" = linux-arm64-gnu ]; then
+    case "$(uname -m)" in
+      aarch64|arm64) ;;
+      *)
+        STRIP_TOOL=llvm-strip
+        OBJCOPY_TOOL=llvm-objcopy
+        READELF_TOOL=llvm-readelf
+        ;;
+    esac
+  fi
+  for tool in "$STRIP_TOOL" "$OBJCOPY_TOOL" "$READELF_TOOL"; do
     if ! command -v "$tool" >/dev/null 2>&1; then
-      echo "Linux native npm packaging requires GNU binutils tool: $tool" >&2
+      echo "Linux native npm packaging requires binary tool: $tool" >&2
       exit 1
     fi
   done
 
-  strip --strip-all "$TMP/$EXECUTABLE"
-  objcopy --remove-section=.comment "$TMP/$EXECUTABLE"
+  "$STRIP_TOOL" --strip-all "$TMP/$EXECUTABLE"
+  "$OBJCOPY_TOOL" --remove-section=.comment "$TMP/$EXECUTABLE"
 
-  SECTIONS=$(readelf -SW "$TMP/$EXECUTABLE")
+  SECTIONS=$("$READELF_TOOL" -SW "$TMP/$EXECUTABLE")
   if printf '%s\n' "$SECTIONS" | grep -Eq '\.(symtab|debug_[^ ]*|comment)([[:space:]]|$)'; then
     echo "native npm binary retains symbol, debug, or comment sections after stripping" >&2
     exit 1
