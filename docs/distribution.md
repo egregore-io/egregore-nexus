@@ -3,7 +3,7 @@
 [← Nexus docs](README.md)
 
 Nexus 0.1.0 has three runtime facets and three public npm entry packages. The npm wrappers are at
-0.1.2; the native Cargo release remains 0.1.0.
+0.1.3; the native Cargo release remains 0.1.0.
 
 ## Artifact map
 
@@ -119,7 +119,7 @@ native Windows runner.
 
 Every published package must:
 
-- report version `0.1.0` for Cargo or `0.1.2` for npm, and license `Apache-2.0`;
+- report version `0.1.0` for Cargo or `0.1.3` for npm, and license `Apache-2.0`;
 - contain no source-checkout or operator-local path dependency;
 - contain no credentials, OAuth state, runtime database, logs, screenshots, or captured model
   output;

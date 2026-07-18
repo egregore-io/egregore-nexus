@@ -127,9 +127,9 @@ public_npm = (
 internal_npm = ("gateway/webconsole/package.json",)
 for relative in public_npm + internal_npm:
     manifest = json.loads((root / relative).read_text(encoding="utf-8"))
-    if manifest.get("version") != "0.1.2":
+    if manifest.get("version") != "0.1.3":
         failures.append(
-            f"{relative} reports {manifest.get('version')!r} (expected '0.1.2')"
+            f"{relative} reports {manifest.get('version')!r} (expected '0.1.3')"
         )
     if manifest.get("license") != "Apache-2.0":
         failures.append(
@@ -150,7 +150,7 @@ for target in native_targets:
         failures.append(f"separate native npm package still exists: {target}")
 
 gateway_manifest = json.loads((root / "gateway/package.json").read_text(encoding="utf-8"))
-if gateway_manifest.get("dependencies", {}).get("@egregore/nexus-cli") != "0.1.2":
+if gateway_manifest.get("dependencies", {}).get("@egregore/nexus-cli") != "0.1.3":
     failures.append("@egregore/nexus-gateway must install @egregore/nexus-cli")
 if gateway_manifest.get("bin", {}).get("nexus") != "scripts/nexus.mjs":
     failures.append("@egregore/nexus-gateway must expose the nexus command")

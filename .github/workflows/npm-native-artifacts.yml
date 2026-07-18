@@ -153,31 +153,31 @@ jobs:
           npm pack ./gateway --pack-destination dist/npm --silent
           npm pack ./packages/nexus --pack-destination dist/npm --silent
           test "$(find dist/npm -maxdepth 1 -name '*.tgz' -printf '.' | wc -c)" -eq 3
-          tar -tf dist/npm/egregore-nexus-cli-0.1.2.tgz | grep -q 'native/win32-x64-msvc/nexus.exe'
+          tar -tf dist/npm/egregore-nexus-cli-0.1.3.tgz | grep -q 'native/win32-x64-msvc/nexus.exe'
       - name: Smoke complete umbrella install
         shell: bash
         run: |
           npm install --prefix dist/npm-smoke --ignore-scripts --no-audit --no-fund \
-            ./dist/npm/egregore-nexus-cli-0.1.2.tgz \
-            ./dist/npm/egregore-nexus-gateway-0.1.2.tgz \
-            ./dist/npm/egregore-nexus-0.1.2.tgz
+            ./dist/npm/egregore-nexus-cli-0.1.3.tgz \
+            ./dist/npm/egregore-nexus-gateway-0.1.3.tgz \
+            ./dist/npm/egregore-nexus-0.1.3.tgz
           dist/npm-smoke/node_modules/.bin/nexus daemon install --help
           npm install --global --prefix dist/npm-global-smoke --ignore-scripts --no-audit --no-fund \
-            ./dist/npm/egregore-nexus-cli-0.1.2.tgz \
-            ./dist/npm/egregore-nexus-gateway-0.1.2.tgz \
-            ./dist/npm/egregore-nexus-0.1.2.tgz
+            ./dist/npm/egregore-nexus-cli-0.1.3.tgz \
+            ./dist/npm/egregore-nexus-gateway-0.1.3.tgz \
+            ./dist/npm/egregore-nexus-0.1.3.tgz
           dist/npm-global-smoke/bin/nexus daemon install --help
           npm install --global --prefix dist/npm-path-smoke --foreground-scripts --no-audit --no-fund \
-            ./dist/npm/egregore-nexus-cli-0.1.2.tgz \
-            ./dist/npm/egregore-nexus-gateway-0.1.2.tgz \
-            ./dist/npm/egregore-nexus-0.1.2.tgz >dist/npm-path-smoke.log
+            ./dist/npm/egregore-nexus-cli-0.1.3.tgz \
+            ./dist/npm/egregore-nexus-gateway-0.1.3.tgz \
+            ./dist/npm/egregore-nexus-0.1.3.tgz >dist/npm-path-smoke.log
           grep -Fq 'Nexus installed successfully, but its command directory is not on PATH' \
             dist/npm-path-smoke.log
           grep -Fq "$PWD/dist/npm-path-smoke/bin" dist/npm-path-smoke.log
           dist/npm-path-smoke/bin/nexus daemon install --help
       - uses: actions/upload-artifact@v4
         with:
-          name: nexus-npm-0.1.2
+          name: nexus-npm-0.1.3
           path: dist/npm/*.tgz
           if-no-files-found: error
           retention-days: 1
