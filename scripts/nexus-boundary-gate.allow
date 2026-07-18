@@ -44,7 +44,6 @@ name core/crates/nexus/src/cli/commands/attach.rs|2
 name core/crates/nexus/src/cli/commands/lifecycle.rs|47
 name core/crates/nexus/src/cli/commands/mcp/mod.rs|23
 name core/crates/nexus/src/cli/commands/mod.rs|16
-name core/crates/nexus/src/cli/mod.rs|5
 name core/crates/nexus/src/cli/read_client.rs|45
 name core/crates/nexus/src/daemon/app/adoption.rs|51
 name core/crates/nexus/src/daemon/app/launch_orchestration.rs|39

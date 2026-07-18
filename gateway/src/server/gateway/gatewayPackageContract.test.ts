@@ -26,6 +26,7 @@ describe("public gateway package contract", () => {
       "scripts/nexus-gateway.mjs",
       "scripts/nexus.mjs",
       "webconsole/bin/nexus-webui.mjs",
+      "webconsole/lib/lifecycle.mjs",
       "webconsole/dist",
     ]);
     expect(manifest.scripts?.prepack).toContain("webconsole:build");
