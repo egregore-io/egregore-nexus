@@ -88,6 +88,7 @@ CONTENT_SCAN_EXEMPT = {
     "scripts/nexus-public-release-hygiene-gate",
     "scripts/test-nexus-public-release-hygiene-gate",
 }
+THIRD_PARTY_PREFIXES = ("core/vendor/",)
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,8 @@ def content_findings(root: Path, relative: str) -> list[Finding]:
     for line_number, line in enumerate(text.splitlines(), start=1):
         excerpt = line.strip()[:240]
         for code, pattern in CONTENT_RULES:
+            if code == "internal_persona" and relative.startswith(THIRD_PARTY_PREFIXES):
+                continue
             if pattern.search(line):
                 findings.append(Finding(code, relative, line_number, excerpt))
         if path.suffix.lower() in DOCUMENT_SUFFIXES and CANDIDATE_NARRATION.search(line):

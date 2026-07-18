@@ -14,6 +14,12 @@ case "${1:-}" in
 esac
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+# This fixture owns a disposable daemon and Gateway. Never let an ambient agent session inherit
+# operator authority or route the smoke test into the caller's live Nexus runtime.
+unset NEXUS_AGENT NEXUS_AGENT_ID NEXUS_CLI NEXUS_CLIENT_KEY NEXUS_HOME \
+  NEXUS_KIND NEXUS_NAME NEXUS_PROJECT NEXUS_SESSION_ID NEXUS_TIER
+
 TMP=$(mktemp -d)
 GATEWAY_PORT=$((43000 + ($$ % 1000)))
 WEBUI_PORT=$((44000 + ($$ % 1000)))

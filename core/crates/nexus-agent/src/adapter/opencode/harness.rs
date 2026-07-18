@@ -426,13 +426,13 @@ mod tests {
             .iter()
             .filter_map(|(key, value)| (key == "OPENCODE_DB").then_some(value.as_str()))
             .collect();
+        let expected_db = std::fs::canonicalize(&dir)
+            .unwrap()
+            .join(".nexus")
+            .join("opencode")
+            .join("opencode.db");
         assert_eq!(db_values.len(), 1);
-        assert_eq!(
-            db_values[0],
-            dir.join(".nexus/opencode/opencode.db")
-                .to_string_lossy()
-                .as_ref()
-        );
+        assert_eq!(Path::new(db_values[0]), expected_db);
         assert!(dir.join(".nexus/opencode").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -462,18 +462,20 @@ mod tests {
 
         let dean_db = only_env(dean.command(), "OPENCODE_DB");
         let oscar_db = only_env(oscar.command(), "OPENCODE_DB");
+        let expected_root = std::fs::canonicalize(&dir)
+            .unwrap()
+            .join(".nexus")
+            .join("opencode")
+            .join("acp")
+            .join("default");
         assert_ne!(dean_db, oscar_db);
         assert_eq!(
-            dean_db,
-            dir.join(".nexus/opencode/acp/default/dean/opencode.db")
-                .to_string_lossy()
-                .as_ref()
+            Path::new(dean_db),
+            expected_root.join("dean").join("opencode.db")
         );
         assert_eq!(
-            oscar_db,
-            dir.join(".nexus/opencode/acp/default/oscar/opencode.db")
-                .to_string_lossy()
-                .as_ref()
+            Path::new(oscar_db),
+            expected_root.join("oscar").join("opencode.db")
         );
 
         let _ = std::fs::remove_dir_all(&dir);

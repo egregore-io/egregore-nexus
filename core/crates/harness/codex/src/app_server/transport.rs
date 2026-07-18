@@ -58,11 +58,11 @@ pub struct CodexAppServerTransport {
 
 /// Whether an OS pid is currently running (unix: `/proc/<pid>` exists; elsewhere: assume yes).
 fn os_pid_alive(pid: u32) -> bool {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", windows))]
     {
-        std::path::Path::new(&format!("/proc/{pid}")).exists()
+        nexus_common::process_ids::runtime_process_ids_for_pid(pid).is_some()
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         true
     }

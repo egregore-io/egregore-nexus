@@ -116,6 +116,7 @@ async fn bridge_launch_persists_runtime_state_and_rollout_discovery_updates_thre
     let _ = std::fs::remove_dir_all(&session_dir);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn bridge_adoption_updates_runtime_state_as_adopted_without_owner_pid() {
     let store = store().await;

@@ -4,6 +4,10 @@ use super::*;
 use crate::daemon::harness_launch::harness_launch_spec;
 use crate::daemon::pty_supervisor::harness_agent_token;
 
+fn is_passive_test_program(program: &str) -> bool {
+    program == "cat" || cfg!(windows) && program.eq_ignore_ascii_case("cmd.exe")
+}
+
 impl AppState {
     pub async fn launch_agent(
         &self,
@@ -294,7 +298,8 @@ impl AppState {
     /// supervisor's [`PtyTransport`] is already the daemon's turn-exec (wired by [`wire_pty`]) and is
     /// bound to this session inside `launch`, so a later `send` to the agent lands in its PTY with no
     /// manual `bind`. Production callers reach this via [`launch_agent`] with `harness_program(kind)`;
-    /// tests call it directly with `"cat"` for a deterministic, offline harness stand-in.
+    /// tests call it directly with the platform's passive shell for a deterministic, offline
+    /// harness stand-in.
     pub async fn launch_agent_with_program(
         &self,
         req: SpawnRequest,
@@ -415,7 +420,8 @@ impl AppState {
             .pty
             .as_ref()
             .expect("launch_agent_with_program requires a PtySupervisor");
-        let headed_runtime = if program == "cat" {
+        let passive_test_program = is_passive_test_program(program);
+        let headed_runtime = if passive_test_program {
             HeadedRuntimeKind::Screen
         } else {
             headed_runtime_kind(req.kind)
@@ -698,12 +704,12 @@ impl AppState {
         // supervisor binds that exact runtime identity on the transport so injected turns reach
         // THIS harness. Real headed harnesses default to the daemon-owned raw PTY backend; tmux is
         // now only the explicit legacy backend (`--backend tmux` / `--tmux`). The deterministic,
-        // offline stand-in `cat` always uses the raw PTY path because it echoes its input, which the
-        // cat-based proofs assert on.
+        // offline stand-in always uses the raw PTY path because it echoes its input, which the
+        // fixture proofs assert on.
         //
         // We capture a broadcast::Receiver<Vec<u8>> of the harness's raw PTY output here, to hand
         // to `spawn_pty_reply_reader` below.  The two backends produce it differently:
-        //  - raw PtySession (`cat`): `PtySession::subscribe()` returns the receiver directly.
+        //  - raw PtySession (passive fixture): `PtySession::subscribe()` returns the receiver directly.
         //  - TmuxHarness (real harnesses): `TmuxHarness::pipe_output()` sets up `tmux pipe-pane`
         //    and returns a receiver of the pane's raw byte stream.
         let registered = if let Some(template) = req.initial_prompt.as_deref() {
@@ -735,7 +741,7 @@ impl AppState {
         let pty_output_result: Result<
             Option<broadcast::Receiver<Vec<u8>>>,
             nexus_contracts::ContractError,
-        > = if program == "cat" {
+        > = if passive_test_program {
             let launch_result = supervisor
                 .launch(
                     &session,
@@ -887,7 +893,7 @@ impl AppState {
             req.role.clone(),
             Some(cwd.clone()),
         );
-        let viewer_backend = if program == "cat" {
+        let viewer_backend = if passive_test_program {
             "pty"
         } else {
             req.resolved_backend(self.launch_backend_default())

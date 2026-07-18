@@ -93,6 +93,22 @@ class PublicReleaseHygieneGateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertIn("legacy_release_contract", result.stdout)
 
+    def test_ignores_generic_names_in_third_party_code_but_still_scans_secrets(self) -> None:
+        generic_name = self.run_gate(
+            {"core/vendor/example/src/lib.rs": 'let email = "bob@test.com";\n'}
+        )
+        self.assertEqual(generic_name.returncode, 0, generic_name.stdout)
+
+        private_key = self.run_gate(
+            {
+                "core/vendor/example/src/lib.rs": (
+                    "-----BEGIN PRIVATE KEY-----\nthird-party-secret\n"
+                )
+            }
+        )
+        self.assertEqual(private_key.returncode, 1, private_key.stdout)
+        self.assertIn("embedded_private_key", private_key.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

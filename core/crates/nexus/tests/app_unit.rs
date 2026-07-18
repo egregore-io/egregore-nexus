@@ -9,7 +9,7 @@ use nexus::daemon::app::{
 };
 use nexus_common::{now, Config};
 use nexus_contracts::{Caller, Harness, Kind, Message, SessionId, SpawnRequest, Tier};
-use nexus_harness_core::HeadedRuntimeKind;
+use nexus_harness_core::{native_harness_program, HeadedRuntimeKind, NativeProcessPlatform};
 use nexus_store::repos::{Inbox, Messages, NativeThreadBindings, NewSession, Sessions};
 use nexus_store::types::SessionRow;
 use nexus_store::Store;
@@ -19,6 +19,17 @@ use std::sync::Arc;
 const PENDING_RESPAWN_BASE_BACKOFF_MS: i64 = 30_000;
 const PENDING_RESPAWN_MAX_BACKOFF_MS: i64 = 5 * 60_000;
 const PENDING_RESPAWN_TOMBSTONE_FAILURES: u32 = 3;
+
+fn passive_pty_program() -> &'static str {
+    #[cfg(windows)]
+    {
+        "cmd.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "cat"
+    }
+}
 
 fn kind_token(kind: Kind) -> &'static str {
     match kind {
@@ -810,21 +821,25 @@ fn headed_runtime_from_stored_agent_token_preserves_legacy_attach_behavior() {
 // ── launch_route truth table ─────────────────────────────────────────────────────────────────
 // These are pure/hermetic — no spawning, no I/O, no async.
 
-/// Headed claude with PTY present → spawn with the "claude" binary.
+/// Headed Claude with a PTY uses the provider's OS-native executable.
 #[test]
 fn launch_route_headed_claude_pty_present() {
     assert_eq!(
         launch_route(false, true, Harness::Claude),
-        LaunchRoute::Headed("claude"),
+        LaunchRoute::Headed(
+            native_harness_program(Harness::Claude, NativeProcessPlatform::current()).unwrap(),
+        ),
     );
 }
 
-/// Headed codex with PTY present → spawn with the "codex" binary.
+/// Headed Codex with a PTY uses the provider's OS-native executable.
 #[test]
 fn launch_route_headed_codex_pty_present() {
     assert_eq!(
         launch_route(false, true, Harness::Codex),
-        LaunchRoute::Headed("codex"),
+        LaunchRoute::Headed(
+            native_harness_program(Harness::Codex, NativeProcessPlatform::current()).unwrap(),
+        ),
     );
 }
 
@@ -907,7 +922,7 @@ async fn admin_remove_kill_targets_the_resolved_pty_session_only() {
         supervisor
             .launch(
                 session,
-                "cat",
+                passive_pty_program(),
                 name,
                 Some(name),
                 "default",

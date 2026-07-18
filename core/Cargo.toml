@@ -38,6 +38,7 @@ wsl-target = "x86_64-unknown-linux-gnu"
 strip = "symbols"
 
 [patch.crates-io]
+libsql = { path = "vendor/libsql" }
 portable-pty = { path = "vendor/portable-pty" }
 
 [workspace.dependencies]

@@ -12,7 +12,7 @@ name core/crates/nexus-agent/src/adapter/hermes/mod.rs|5
 name core/crates/nexus-agent/src/adapter/hermes/native.rs|16
 name core/crates/nexus-agent/src/adapter/hermes/skill.rs|33
 name core/crates/nexus-agent/src/adapter/mod.rs|6
-name core/crates/nexus-agent/src/adapter/opencode/harness.rs|76
+name core/crates/nexus-agent/src/adapter/opencode/harness.rs|75
 name core/crates/nexus-agent/src/adapter/opencode/mod.rs|4
 name core/crates/nexus-agent/src/adapter/opencode/native.rs|16
 name core/crates/nexus-agent/src/adapter/opencode/skill.rs|14

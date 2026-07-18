@@ -153,8 +153,7 @@ async fn start_waits_until_initialize_round_trips() {
     let dir = tempdir("supervisor");
 
     let opts = SupervisorOpts {
-        // The fake binary accepts the same `app-server --listen unix://…`
-        // command shape as real codex (reads the last `unix://…` token).
+        // The fake binary accepts the same native app-server listen shape as real Codex.
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
         codex_home: None,
@@ -168,12 +167,28 @@ async fn start_waits_until_initialize_round_trips() {
         .await
         .expect("supervisor should start and complete initialize round-trip");
 
-    // The socket must exist and be reachable.
+    // Unix exposes a socket file; Windows exposes a loopback WebSocket descriptor.
+    #[cfg(unix)]
     assert!(
         srv.socket().exists(),
         "socket {:?} should exist after start()",
         srv.socket()
     );
+    #[cfg(windows)]
+    {
+        let endpoint = srv.socket().to_string_lossy();
+        assert!(
+            endpoint.starts_with("ws://127.0.0.1:"),
+            "Windows app-server endpoint must be loopback-only: {endpoint}"
+        );
+        let client = nexus_harness_codex::CodexAppServerClient::connect(
+            srv.socket(),
+            "windows-readiness-probe",
+        )
+        .await
+        .expect("Windows loopback endpoint should accept a fresh initialized client");
+        drop(client);
+    }
 
     // config.toml is copied into CODEX_HOME by the supervisor. Nexus runtime settings such as the
     // model are passed as argv overrides, not persisted into this file.
@@ -202,6 +217,7 @@ async fn start_waits_until_initialize_round_trips() {
     cleanup(&dir);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn start_adopts_existing_app_server_socket_without_owning_process() {
     let dir = tempdir("adopt-existing");

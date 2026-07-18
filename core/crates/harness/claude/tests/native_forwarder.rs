@@ -725,10 +725,15 @@ async fn forwarder_discovers_real_transcript_path_without_replaying_old_history(
     let old_len = std::fs::metadata(&real_transcript).unwrap().len() as i64;
     std::fs::write(
         &paths.hook_log_path,
-        format!(
-            r#"{{"event":"UserPromptSubmit","payload":{{"hook_event_name":"UserPromptSubmit","session_id":"claude-real","transcript_path":"{}"}}}}"#,
-            real_transcript.display()
-        ),
+        json!({
+            "event": "UserPromptSubmit",
+            "payload": {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "claude-real",
+                "transcript_path": real_transcript,
+            },
+        })
+        .to_string(),
     )
     .unwrap();
 
@@ -802,10 +807,15 @@ async fn forwarder_repairs_consumed_hook_binding_when_stored_transcript_is_missi
     let old_len = std::fs::metadata(&real_transcript).unwrap().len() as i64;
     std::fs::write(
         &paths.hook_log_path,
-        format!(
-            r#"{{"event":"SessionStart","payload":{{"hook_event_name":"SessionStart","session_id":"claude-hook-truth","transcript_path":"{}"}}}}"#,
-            real_transcript.display()
-        ),
+        json!({
+            "event": "SessionStart",
+            "payload": {
+                "hook_event_name": "SessionStart",
+                "session_id": "claude-hook-truth",
+                "transcript_path": real_transcript,
+            },
+        })
+        .to_string(),
     )
     .unwrap();
     let consumed_hook_cursor = std::fs::metadata(&paths.hook_log_path).unwrap().len() as i64;
@@ -873,10 +883,14 @@ async fn forwarder_does_not_rebind_full_hook_path_without_native_session_id() {
     let unowned_transcript = paths.bridge_dir.join("unowned-transcript.jsonl");
     std::fs::write(
         &paths.hook_log_path,
-        format!(
-            r#"{{"event":"SessionStart","payload":{{"hook_event_name":"SessionStart","transcript_path":"{}"}}}}"#,
-            unowned_transcript.display()
-        ),
+        json!({
+            "event": "SessionStart",
+            "payload": {
+                "hook_event_name": "SessionStart",
+                "transcript_path": unowned_transcript,
+            },
+        })
+        .to_string(),
     )
     .unwrap();
     let consumed_hook_cursor = std::fs::metadata(&paths.hook_log_path).unwrap().len() as i64;
@@ -924,10 +938,15 @@ async fn forwarder_ignores_legacy_global_binding_and_keeps_claude_hint_runtime_s
     let real_transcript = paths.bridge_dir.join("owned-by-other-agent.jsonl");
     std::fs::write(
         &paths.hook_log_path,
-        format!(
-            r#"{{"event":"SessionStart","payload":{{"hook_event_name":"SessionStart","session_id":"claude-owned-by-other-agent","transcript_path":"{}"}}}}"#,
-            real_transcript.display()
-        ),
+        json!({
+            "event": "SessionStart",
+            "payload": {
+                "hook_event_name": "SessionStart",
+                "session_id": "claude-owned-by-other-agent",
+                "transcript_path": real_transcript,
+            },
+        })
+        .to_string(),
     )
     .unwrap();
     let consumed_hook_cursor = std::fs::metadata(&paths.hook_log_path).unwrap().len() as i64;
@@ -989,10 +1008,16 @@ async fn forwarder_keeps_duplicate_claude_hint_scoped_to_attempting_runtime() {
     let attempted_transcript = paths.bridge_dir.join("attempted-real.jsonl");
     std::fs::write(
         &paths.hook_log_path,
-        format!(
-            r#"{{"event":"UserPromptSubmit","payload":{{"hook_event_name":"UserPromptSubmit","session_id":"claude-real","transcript_path":"{}","prompt":"wrong bridge"}}}}"#,
-            attempted_transcript.display()
-        ),
+        json!({
+            "event": "UserPromptSubmit",
+            "payload": {
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "claude-real",
+                "transcript_path": attempted_transcript,
+                "prompt": "wrong bridge",
+            },
+        })
+        .to_string(),
     )
     .unwrap();
 

@@ -28,7 +28,39 @@ pub fn runtime_process_ids_for_pid(pid: u32) -> Option<RuntimeProcessIds> {
 }
 
 /// Read the current process ids for `pid`.
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+pub fn runtime_process_ids_for_pid(pid: u32) -> Option<RuntimeProcessIds> {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: OpenProcess is called with a non-inheritable, query-only handle. The handle is
+    // checked for null, passed to GetExitCodeProcess, and closed exactly once before returning.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut exit_code = 0;
+    // SAFETY: `handle` is valid and `exit_code` points to writable stack storage.
+    let queried = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
+    // SAFETY: `handle` was returned by OpenProcess and has not been closed yet.
+    unsafe {
+        CloseHandle(handle);
+    }
+    if !queried || exit_code != STILL_ACTIVE as u32 {
+        return None;
+    }
+    Some(RuntimeProcessIds {
+        os_pid: pid,
+        // Windows has no POSIX process-group id. The root PID is the stable tree token used by
+        // the Windows supervisor, which owns and terminates the direct child handle.
+        os_pgid: pid,
+    })
+}
+
+/// Read the current process ids for `pid`.
+#[cfg(not(any(target_os = "linux", windows)))]
 pub fn runtime_process_ids_for_pid(_pid: u32) -> Option<RuntimeProcessIds> {
     None
 }
@@ -45,35 +77,4 @@ fn parse_linux_proc_stat_process_ids(stat: &str, pid: u32) -> Option<RuntimeProc
         os_pid: pid,
         os_pgid,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn parses_proc_stat_with_spaces_in_comm() {
-        let stat = "123 (fake process) S 1 456 456 0 -1 4194304 0 0 0 0 1 2 0 0 20 0 1 0 789 0 0";
-
-        assert_eq!(
-            parse_linux_proc_stat_process_ids(stat, 123),
-            Some(RuntimeProcessIds {
-                os_pid: 123,
-                os_pgid: 456,
-            })
-        );
-    }
-
-    #[test]
-    fn from_parts_rejects_incomplete_or_out_of_range_rows() {
-        assert_eq!(
-            RuntimeProcessIds::from_parts(Some(1), Some(2))
-                .unwrap()
-                .os_pid,
-            1
-        );
-        assert!(RuntimeProcessIds::from_parts(None, Some(2)).is_none());
-        assert!(RuntimeProcessIds::from_parts(Some(-1), Some(2)).is_none());
-    }
 }

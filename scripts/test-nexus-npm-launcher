@@ -87,6 +87,26 @@ if "$ROOT/scripts/nexus-pack-native-npm" \
   exit 1
 fi
 
+printf 'MZwindows-fixture\n' >"$TMP/nexus.exe"
+WINDOWS_SHA256=$(sha256sum "$TMP/nexus.exe" | cut -d' ' -f1)
+"$ROOT/scripts/nexus-pack-native-npm" \
+  --target win32-x64-msvc \
+  --binary "$TMP/nexus.exe" \
+  --output "$TMP/windows-pack" \
+  --version-output 'nexus 0.1.0 (revision windows-lab)' \
+  --expected-sha256 "$WINDOWS_SHA256" >/dev/null
+cmp "$TMP/nexus.exe" \
+  "$TMP/windows-pack/native/win32-x64-msvc/nexus.exe"
+if "$ROOT/scripts/nexus-pack-native-npm" \
+  --target win32-x64-msvc \
+  --binary "$TMP/nexus.exe" \
+  --output "$TMP/wrong-windows-pack" \
+  --version-output 'nexus 0.1.0 (revision windows-lab)' \
+  --expected-sha256 "$(printf '0%.0s' {1..64})" >/dev/null 2>&1; then
+  echo "expected native packer to reject mismatched cross-host evidence" >&2
+  exit 1
+fi
+
 set +e
 NEXUS_NATIVE_BIN="$TMP/nexus-native" NEXUS_LAUNCHER_ARGS="$TMP/args" \
   node "$ROOT/packages/nexus-cli/bin/nexus.mjs" daemon status

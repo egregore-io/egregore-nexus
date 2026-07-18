@@ -44,6 +44,17 @@ fn temp_dir(label: &str) -> PathBuf {
     dir
 }
 
+fn passive_pty_program() -> &'static str {
+    #[cfg(windows)]
+    {
+        "cmd.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "cat"
+    }
+}
+
 struct MockAgent;
 
 #[async_trait]
@@ -1072,7 +1083,7 @@ async fn claude_resume_does_not_treat_provider_session_as_nexus_identity() {
     let mut request = claude_resume_request("felix");
     request.cwd = Some(cwd.to_string_lossy().into_owned());
     let response = state
-        .launch_agent_with_program(request, PROJECT, "cat", None)
+        .launch_agent_with_program(request, PROJECT, passive_pty_program(), None)
         .await
         .unwrap();
 
@@ -1139,7 +1150,7 @@ async fn claude_resume_replaces_same_identity_acp_owner_with_headed_runtime() {
     let mut request = claude_resume_request("hugo");
     request.cwd = Some(cwd.to_string_lossy().into_owned());
     let response = state
-        .launch_agent_with_program(request, PROJECT, "cat", None)
+        .launch_agent_with_program(request, PROJECT, passive_pty_program(), None)
         .await
         .unwrap();
 
@@ -1178,7 +1189,7 @@ async fn daemon_launch_without_cwd_uses_stable_agent_id_fallback_workspace() {
     };
 
     let response = state
-        .launch_agent_with_program(request, PROJECT, "cat", None)
+        .launch_agent_with_program(request, PROJECT, passive_pty_program(), None)
         .await
         .unwrap();
     let row = Sessions::new(&store)
