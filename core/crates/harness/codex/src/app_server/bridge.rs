@@ -58,10 +58,9 @@ pub struct BridgeLaunchOptions {
     /// Force a fresh app-server process instead of adopting an existing socket at the deterministic
     /// session path.
     ///
-    /// Daemon restart revive uses this for headed Codex sessions: the old app-server socket may
-    /// still accept `turn/start`, but its completion stream can belong to the dead daemon's adopted
-    /// transport. Fresh launch/adoption keeps the default `false` so idempotent launch calls can
-    /// still reuse a process that this daemon already owns.
+    /// This is a destructive recovery escape hatch for a socket known to be unhealthy. Normal
+    /// daemon restart revive keeps the default `false`: it adopts a live socket, opens a fresh
+    /// client connection, and installs a new completion forwarder without duplicating the agent.
     pub force_fresh_app_server: bool,
     /// Create and bind a fresh app-server thread before returning when no resume thread was given.
     /// This removes the fresh-headed bootstrap gap where Nexus could not deliver the first message

@@ -14,9 +14,10 @@ use nexus_contracts::events::WsEvent;
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::EventSink;
 use nexus_contracts::{AgentUpdateKind, HarnessId, SpawnRequest};
+use nexus_harness_codex::storage::CodexRuntimeStateRepo;
 use nexus_harness_codex::{CodexAppServerClient, CodexBridge, SupervisorOpts};
 use nexus_store::repos::IdentitySessions;
-use nexus_store::DaemonStore;
+use nexus_store::{DaemonStore, Store};
 use portable_pty::PtySize;
 
 const FAKE_BIN: &str = env!("CARGO_BIN_EXE_nexus_fake_codex_app_server");
@@ -230,6 +231,141 @@ async fn codex_remote_viewer_runs_in_daemon_owned_raw_pty() {
     );
 
     supervisor.kill(&session);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn codex_restart_adopts_live_app_server_without_spawning_a_duplicate() {
+    let root = std::env::temp_dir().join(format!(
+        "nx-codex-restart-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+    ));
+    let fake_bin_dir = root.join("bin");
+    let cwd = root.join("work");
+    let state_dir = root.join("state");
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    let fake_codex = write_fake_codex_command(&fake_bin_dir);
+
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let owner = PtySupervisor::with_runtime_store(store.clone());
+    let restarted = PtySupervisor::with_runtime_store(store.clone());
+    let session = SessionId("s_codex_restart_adopts_live_server".into());
+    let sink = Arc::new(RecSink::default());
+    let size = PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+
+    owner
+        .launch_codex_appserver(
+            &session,
+            "a_codex_restart_adopts_live_server",
+            Some("restart-codex"),
+            "default",
+            "client-key",
+            "nexus",
+            cwd.to_str().unwrap(),
+            size,
+            sink.clone(),
+            fake_codex.to_str().unwrap(),
+            None,
+            state_dir.to_str().unwrap(),
+            None,
+            Vec::new(),
+            &[],
+            None,
+            "pty",
+        )
+        .await
+        .expect("initial headed Codex launch");
+
+    let repo = CodexRuntimeStateRepo::new(&store);
+    let owner_state = repo
+        .find_by_runtime_id(&session)
+        .await
+        .unwrap()
+        .expect("owner runtime state");
+    let owner_pid = owner_state
+        .app_server_pid
+        .expect("the original supervisor owns the app-server process");
+    let owner_home = owner_state.codex_home.clone().expect("owner Codex home");
+    let session_dir = state_dir.join("codex-sessions").join(&session.0);
+    write_rollout(&session_dir, "fake-thread");
+
+    restarted
+        .respawn_codex_appserver(
+            &session,
+            "a_codex_restart_adopts_live_server",
+            "restart-codex",
+            "default",
+            "client-key",
+            "nexus",
+            cwd.to_str().unwrap(),
+            size,
+            sink,
+            fake_codex.to_str().unwrap(),
+            None,
+            state_dir.to_str().unwrap(),
+            Some("fake-thread".into()),
+            vec![owner_home],
+            None,
+            "pty",
+        )
+        .await
+        .expect("restart should adopt the live app-server");
+
+    let restarted_state = repo
+        .find_by_runtime_id(&session)
+        .await
+        .unwrap()
+        .expect("restarted runtime state");
+    assert!(
+        restarted_state.app_server_adopted,
+        "daemon restart must adopt a live app-server instead of replacing it"
+    );
+    assert_eq!(
+        restarted_state.app_server_pid, None,
+        "an adopted app-server remains owned by the process that launched it"
+    );
+    assert!(
+        nexus_common::process_ids::runtime_process_ids_for_pid(
+            u32::try_from(owner_pid).expect("app-server pid fits u32"),
+        )
+        .is_some(),
+        "adoption must leave the original app-server process alive"
+    );
+
+    let transport = restarted.codex_transport();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while transport.bound_thread_id(&session).as_deref() != Some("fake-thread") {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("adopted bridge should bind the durable native thread");
+    transport
+        .prompt(&session, "after restart".into())
+        .await
+        .expect("adopted bridge should accept a turn");
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !transport.active_turn_sessions().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("adopted completion forwarder should observe turn completion");
+
+    restarted.kill(&session);
+    owner.kill(&session);
     let _ = std::fs::remove_dir_all(root);
 }
 

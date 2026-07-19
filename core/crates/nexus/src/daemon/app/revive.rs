@@ -211,8 +211,9 @@ impl AppState {
     }
 
     /// REVIVE-ON-INTERACTION for headed Codex app-server sessions. Reuses the durable Nexus session
-    /// id, restarts `codex app-server`, resumes the stored thread id, launches the human TUI
-    /// with `codex resume --remote`, rebinds the structured transport, and rings the drain loop.
+    /// id, adopts a live `codex app-server` or starts one when absent, resumes the stored thread id,
+    /// launches the human TUI with `codex resume --remote`, rebinds the structured transport, and
+    /// rings the drain loop.
     pub async fn ensure_codex_appserver_live(
         &self,
         name: &str,
@@ -546,8 +547,8 @@ impl AppState {
     /// Headed Codex is explicitly excluded from this generic tmux adoption path. A daemon restart
     /// can leave both the remote TUI pane and `codex.sock` alive, but adopting either as a plain PTY
     /// leaves the new daemon without a trustworthy Codex `turn/completed` stream. Codex rows must
-    /// revive through [`Self::ensure_codex_appserver_live`], which relaunches the structured
-    /// app-server bridge and binds a fresh completion forwarder.
+    /// revive through [`Self::ensure_codex_appserver_live`], which adopts or relaunches the
+    /// structured app-server bridge and binds a fresh completion forwarder.
     pub async fn ensure_harness_live(
         &self,
         name: &str,
