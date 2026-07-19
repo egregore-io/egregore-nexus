@@ -305,12 +305,17 @@ No one installs or restarts the host runtime during implementation or validation
 
 ## Exit Criteria
 
-v0.1.5 is ready only when:
+The canonical ship decision is defined by
+[`docs/v0.1.5-acceptance.md`](../../v0.1.5-acceptance.md). This lab is green only when it produces
+the evidence required by that document, including the complete packed `nexus webconsole` CLI
+lifecycle and durable human Webconsole attribution.
+
+In particular, v0.1.5 is ready only when:
 
 - focused and full Rust/Gateway/Lens suites are green;
 - packed artifact installation and route/module inventory are green;
 - every backend real-network gate is green;
-- O1–O16 are green with evidence;
+- O1–O18 and W1–W8 are green with evidence;
 - every inventoried Lens affordance has a passing CDP contract or an explicit release-blocking gap;
 - the 30-minute dual-lane restart soak is green;
 - Bob signs off on boundary and evidence review; and

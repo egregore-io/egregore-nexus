@@ -36,6 +36,8 @@ connects only to the Gateway.
 - [Debugging](debugging.md) — daemon, Gateway, store, identity, and harness diagnostics.
 - [Release regression](release-regression.md) — deterministic, resurrection, endurance, and
   rollback gates.
+- [v0.1.5 release acceptance](v0.1.5-acceptance.md) — the canonical, non-waivable ship criteria and
+  required evidence for the v0.1.5 candidate.
 - [Optional Windows validation](windows-validation.md) — run native Windows source gates from a
   disposable QEMU/KVM guest on a Linux host.
 

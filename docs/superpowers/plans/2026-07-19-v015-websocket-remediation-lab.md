@@ -840,6 +840,10 @@ git commit -m "test: add v0.1.5 websocket restart soak"
 
 ## Final evidence checklist
 
+This checklist is an implementation aid. The normative ship rule is
+[`docs/v0.1.5-acceptance.md`](../../v0.1.5-acceptance.md); any difference is resolved in favor of
+that document.
+
 - [ ] Host daemon/Gateway/Webconsole PID, boot ID, executable hash, listener owner, and socket inode unchanged.
 - [ ] Exactly one validator container, capped at six CPUs, 8 GiB, and 1,024 PIDs.
 - [ ] Full restored descriptors and exact roster reconciliation after two daemon restarts.
@@ -850,8 +854,12 @@ git commit -m "test: add v0.1.5 websocket restart soak"
 - [ ] Cookie-authenticated WS mutations pass centralized CSRF; forged frame auth is rejected.
 - [ ] Packed Gateway imports and serves both WS surfaces outside the source checkout.
 - [ ] Webconsole missing-discovery case cannot spawn an `EADDRINUSE` loop.
+- [ ] The packed `nexus webconsole` command passes help, start, status, url, launch, logs, restart,
+      and stop parameter/lifecycle checks, including idempotency and discovery adoption.
+- [ ] Webconsole thread, DM, queue, and control mutations remain attributed to the human browser
+      principal; the target agent never replaces the caller.
 - [ ] Every agent/WS-fed Lens surface is inventoried and exercised through human Electron interaction.
-- [ ] O1–O16 and every additional affordance test pass with artifacts.
+- [ ] O1–O18, W1–W8, and every additional affordance test pass with artifacts.
 - [ ] PACTBIN2 persistence and damage states are visible and recoverable.
 - [ ] 30-minute dual-lane restart soak passes without loss, duplicates, cross-route, or unbounded growth.
 - [ ] Full Rust/Gateway/Lens/package gates are green for the exact candidate.
