@@ -52,7 +52,7 @@ describe("Gateway hook bridge", () => {
         request: {
           evaluationId: "he_message",
           message: {
-            sender: { name: "paul" },
+            sender: { name: "fixture-sender" },
             target: { verb: "post", thread: "release" },
             body: "hello",
             mention: [],
@@ -66,7 +66,7 @@ describe("Gateway hook bridge", () => {
         evaluationId: "he_message",
         action: HookAction.Continue,
         message: {
-          sender: { name: "paul" },
+          sender: { name: "fixture-sender" },
           target: { verb: "post", thread: "release" },
           body: "hello",
           mention: [],
@@ -102,7 +102,7 @@ describe("Gateway hook bridge", () => {
         request: {
           invocationId: "hi_receipt",
           message: {
-            sender: { name: "paul" },
+            sender: { name: "fixture-sender" },
             target: { verb: "post", thread: "release" },
             body: "hello",
           },

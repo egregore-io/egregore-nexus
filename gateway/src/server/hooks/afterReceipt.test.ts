@@ -24,8 +24,8 @@ const accepted: CanonicalProjectionEvent = {
   payload: {
     messageId: "m_after",
     scope: "thread",
-    fromName: "paul",
-    fromAgentId: "a_paul",
+    fromName: "fixture-sender",
+    fromAgentId: "a_fixture_sender",
     threadId: "t_release",
     threadName: "release",
     body: "ship it",
@@ -88,7 +88,7 @@ describe("after_receipt processing", () => {
     expect(execute).toHaveBeenCalledTimes(1);
     expect(requests[0]).toMatchObject({
       message: {
-        sender: { agentId: "a_paul", name: "paul" },
+        sender: { agentId: "a_fixture_sender", name: "fixture-sender" },
         target: { verb: "post", thread: "release" },
         mention: ["fable"],
       },

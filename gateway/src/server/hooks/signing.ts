@@ -8,7 +8,7 @@ import {
   type KeyObject,
 } from "node:crypto";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
-import { basename } from "node:path";
+import { basename, join } from "node:path";
 
 import type { HookExecutedBy } from "@shared/types";
 
@@ -50,7 +50,7 @@ export class HookSigner {
   static async loadOrCreate(keysDirectory: string): Promise<HookSigner> {
     await mkdir(keysDirectory, { recursive: true, mode: 0o700 });
     await chmod(keysDirectory, 0o700);
-    const privatePath = `${keysDirectory}/${HOOK_PRIVATE_KEY_FILE}`;
+    const privatePath = join(keysDirectory, HOOK_PRIVATE_KEY_FILE);
     let pem: string;
     try {
       pem = await readFile(privatePath, "utf8");

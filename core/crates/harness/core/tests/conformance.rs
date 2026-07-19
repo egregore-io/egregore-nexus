@@ -7,6 +7,10 @@ impl Harness for FutureHarness {
     fn program(&self) -> &'static str {
         "future"
     }
+
+    fn agent_token(&self) -> &'static str {
+        "future"
+    }
 }
 
 harness_conformance!(FutureHarness);

@@ -542,7 +542,7 @@ export interface CommandQueueSnapshot {
 	/** Derived exclusively from the durable normalized session-turn projection. */
 	turnActive: boolean;
 	steerCapability: SteerCapability;
-	/** Monotonic project queue cursor used as the reconnect `afterSeq` boundary. */
+	/** Monotonic global queue cursor used as the reconnect `afterSeq` boundary. */
 	seq: number;
 	/** Queue revision. It advances with `seq`; named separately for compare-and-set UI state. */
 	revision: number;

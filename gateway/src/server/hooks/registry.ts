@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { watch as watchDirectory } from "node:fs";
 import { mkdir, readFile, readdir } from "node:fs/promises";
+import { join } from "node:path";
 
 import { loadHookManifest } from "./manifest";
 import type { HookManifest, HookRegistryReload, HookRegistrySnapshot } from "./types";
@@ -88,7 +89,7 @@ export class HookRegistry {
     const hooks: HookManifest[] = [];
 
     for (const entry of manifestEntries) {
-      const path = `${this.#directory}/${entry.name}`;
+      const path = join(this.#directory, entry.name);
       if (!entry.isFile()) {
         errors.push(`${path}: manifest must be a regular file`);
         continue;

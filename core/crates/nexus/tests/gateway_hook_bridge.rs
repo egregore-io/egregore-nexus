@@ -29,7 +29,7 @@ fn request(evaluation_id: &str) -> HookEvaluationRequest {
         message: HookMessage {
             sender: HookSender {
                 agent_id: None,
-                name: "paul".to_string(),
+                name: "fixture-sender".to_string(),
             },
             target: SendTarget::Post {
                 thread: "release".to_string(),

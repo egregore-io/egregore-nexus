@@ -9,7 +9,7 @@ use nexus::daemon::app::{
 };
 use nexus_common::{now, Config};
 use nexus_contracts::{Caller, Kind, Message, SessionId, SpawnRequest, Tier};
-use nexus_harness_core::HeadedRuntimeKind;
+use nexus_harness_core::{native_harness_program, HeadedRuntimeKind, NativeProcessPlatform};
 use nexus_store::repos::{Inbox, Messages, NativeThreadBindings, NewSession, Sessions};
 use nexus_store::types::SessionRow;
 use nexus_store::Store;
@@ -826,7 +826,10 @@ fn headed_runtime_from_stored_agent_token_preserves_legacy_attach_behavior() {
 fn launch_route_headed_claude_pty_present() {
     assert_eq!(
         launch_route(false, true, &hid("claude")),
-        LaunchRoute::Headed("claude"),
+        LaunchRoute::Headed(
+            native_harness_program("claude", NativeProcessPlatform::current())
+                .expect("Claude has a native headed executable")
+        ),
     );
 }
 
@@ -835,7 +838,10 @@ fn launch_route_headed_claude_pty_present() {
 fn launch_route_headed_codex_pty_present() {
     assert_eq!(
         launch_route(false, true, &hid("codex")),
-        LaunchRoute::Headed("codex"),
+        LaunchRoute::Headed(
+            native_harness_program("codex", NativeProcessPlatform::current())
+                .expect("Codex has a native headed executable")
+        ),
     );
 }
 

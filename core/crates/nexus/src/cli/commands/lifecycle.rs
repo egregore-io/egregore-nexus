@@ -692,6 +692,7 @@ pub async fn whoami(client: &ReadClient, json: bool) -> ExitCode {
 mod builder_tests {
     use super::*;
     use crate::cli::ambient::with_test_env_vars;
+    use nexus_harness_core::{native_harness_program, NativeProcessPlatform};
 
     #[test]
     fn launch_meta_accepts_objects_and_rejects_everything_else() {
@@ -762,7 +763,11 @@ mod builder_tests {
             None,
         )
         .unwrap();
-        assert_eq!(prog, "codex");
+        assert_eq!(
+            prog,
+            native_harness_program("codex", NativeProcessPlatform::current())
+                .expect("Codex has a native headed executable")
+        );
         assert!(args.contains(&"-c".to_string()));
         assert!(args
             .iter()
@@ -784,7 +789,11 @@ mod builder_tests {
             None,
         )
         .unwrap();
-        assert_eq!(prog, "claude");
+        assert_eq!(
+            prog,
+            native_harness_program("claude", NativeProcessPlatform::current())
+                .expect("Claude has a native headed executable")
+        );
         let idx = args
             .iter()
             .position(|a| a == "--mcp-config")

@@ -590,7 +590,7 @@ describe("daemon push relay", () => {
                   request: {
                     evaluationId,
                     message: {
-                      sender: { name: "paul" },
+                      sender: { name: "fixture-sender" },
                       target: { verb: "post", thread: "release" },
                       body: evaluationId,
                       mention: [],

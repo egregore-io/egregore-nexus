@@ -163,7 +163,7 @@ Every invocation uses `protocol: "nexus.hooks/v1"`. A representative `before_sen
   "evaluationId": "he_...",
   "messageId": "m_...",
   "message": {
-    "sender": { "agentId": "a_...", "name": "paul" },
+    "sender": { "agentId": "a_...", "name": "fixture-sender" },
     "target": { "verb": "post", "thread": "release" },
     "body": "ship it",
     "mention": [],

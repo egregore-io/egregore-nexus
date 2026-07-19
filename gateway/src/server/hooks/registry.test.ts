@@ -56,6 +56,7 @@ describe("Gateway hook registry", () => {
     expect(result.activated).toBe(true);
     expect(result.errors).toEqual([]);
     expect(registry.snapshot().hooks.map((hook) => hook.id)).toEqual(["alpha", "beta", "zeta"]);
+    expect(registry.snapshot().hooks[0]?.manifestPath).toBe(join(directory, "020-alpha.toml"));
     expect(registry.snapshot().generation).toMatch(/^sha256:/);
   });
 

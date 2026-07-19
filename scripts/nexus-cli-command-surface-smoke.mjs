@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { extname, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const launcher = process.argv[2];
 if (!launcher) {
@@ -12,7 +14,10 @@ if (!launcher) {
 
 const resolvedLauncher = resolve(launcher);
 const version = run(["--version"]);
-assert.match(version, /^nexus 0\.1\.[01] \(revision [^)]+\)/);
+const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const expectedVersion = readFileSync(resolve(repoRoot, "VERSION"), "utf8").trim();
+const escapedVersion = expectedVersion.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+assert.match(version, new RegExp(`^nexus ${escapedVersion} \\(revision [^)]+\\)`));
 
 const queue = [[]];
 const visited = new Set();

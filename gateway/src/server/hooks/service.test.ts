@@ -66,7 +66,7 @@ describe("Gateway hook service", () => {
         request: {
           evaluationId: "he_message",
           message: {
-            sender: { name: "paul" },
+            sender: { name: "fixture-sender" },
             target: { verb: "post", thread: "release" },
             body: "hello",
             mention: [],
@@ -91,8 +91,12 @@ describe("Gateway hook service", () => {
       expect(JSON.stringify(publicView)).not.toContain('"run"');
       expect(JSON.stringify(publicView)).not.toContain('"entrypoint"');
       const adminView = await service.list(true);
-      expect(JSON.stringify(adminView)).toContain(join(hooks, "redact.toml"));
-      expect(JSON.stringify(adminView)).toContain('"run"');
+      const adminHooks = adminView.hooks as Array<{
+        manifestPath: string;
+        handler: { run: string[] };
+      }>;
+      expect(adminHooks[0]?.manifestPath).toBe(join(hooks, "redact.toml"));
+      expect(adminHooks[0]?.handler.run).toEqual(["node", join(hooks, "redact.mjs")]);
 
       const audit = await service.audit(20) as { executions: Array<Record<string, unknown>> };
       expect(audit.executions).toHaveLength(1);
@@ -174,7 +178,7 @@ describe("Gateway hook service", () => {
         request: {
           evaluationId: "he_digest_failure",
           message: {
-            sender: { name: "paul" },
+            sender: { name: "fixture-sender" },
             target: { verb: "post", thread: "release" },
             body: "hello",
             mention: [],
@@ -249,7 +253,7 @@ describe("Gateway hook service", () => {
         request: {
           evaluationId: "he_resume",
           message: {
-            sender: { name: "paul" },
+            sender: { name: "fixture-sender" },
             target: { verb: "post", thread: "release" },
             body: "hello",
             mention: [],

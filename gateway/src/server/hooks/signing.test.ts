@@ -55,7 +55,9 @@ describe("hook execution signing", () => {
     expect(
       verifyHookExecution({ ...executedBy, outcome: "tampered" }, "before_send", signer.publicKey),
     ).toBe(false);
-    expect((await stat(join(directory, "keys", HOOK_PRIVATE_KEY_FILE))).mode & 0o777).toBe(0o600);
+    if (process.platform !== "win32") {
+      expect((await stat(join(directory, "keys", HOOK_PRIVATE_KEY_FILE))).mode & 0o777).toBe(0o600);
+    }
     expect(await readFile(join(directory, "keys", HOOK_PRIVATE_KEY_FILE), "utf8")).toContain(
       "PRIVATE KEY",
     );

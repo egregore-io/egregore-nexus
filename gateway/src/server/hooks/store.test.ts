@@ -10,7 +10,7 @@ describe("Gateway hook audit store", () => {
     await migrateGatewayStore(db);
     const store = new HookAuditStore(db);
     const original = {
-      sender: { agentId: "a_paul", name: "paul" },
+      sender: { agentId: "a_fixture_sender", name: "fixture-sender" },
       target: { verb: "post", thread: "release" } as const,
       body: "original",
       mention: [],
@@ -50,7 +50,7 @@ describe("Gateway hook audit store", () => {
       event: "before_send",
       registryGeneration: "sha256:generation",
       originalMessage: {
-        sender: { name: "paul" },
+        sender: { name: "fixture-sender" },
         target: { verb: "dm", name: "fable" },
         body: "hello",
         mention: [],
@@ -94,7 +94,7 @@ describe("Gateway hook audit store", () => {
       event: "before_send",
       registryGeneration: "sha256:generation",
       originalMessage: {
-        sender: { name: "paul" },
+        sender: { name: "fixture-sender" },
         target: { verb: "post", thread: "release" } as const,
         body: "original",
         mention: [],

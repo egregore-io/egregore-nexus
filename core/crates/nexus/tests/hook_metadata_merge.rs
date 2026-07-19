@@ -13,7 +13,7 @@ async fn state() -> AppState {
         .execute(
             "INSERT INTO messages
              (message_id, from_name, kind, body, provenance, project, created_at, metadata_json)
-             VALUES ('m_hook', 'paul', 'dm', 'hello', '{}', 'metadata-only', 1, '{}')",
+             VALUES ('m_hook', 'fixture-sender', 'dm', 'hello', '{}', 'metadata-only', 1, '{}')",
             (),
         )
         .await

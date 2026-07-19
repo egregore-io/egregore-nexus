@@ -87,8 +87,17 @@ def main() -> int:
         'schema = 1',
         'network = "internet"',
         'path = "../.."',
+        '"packages/nexus-cli/native/**"',
+        'name = "rust-cache-preflight"',
+        '$MinimumFreeBytes = 40GB',
         'name = "rust-tests"',
+        'cargo.exe test --workspace --no-fail-fast',
+        'name = "rust-native-teardown-stress"',
+        'for ($iteration = 1; $iteration -le 100; $iteration++)',
+        'NEXUS_BUILD_REVISION',
+        'original_revision',
         'name = "npm-cli-smoke"',
+        'Windows npm launcher reports the wrong source revision',
         "node.exe packages/nexus-cli/bin/nexus.mjs daemon install --help",
         "node.exe scripts/nexus-cli-command-surface-smoke.mjs",
         'name = "gateway-gates"',
@@ -102,8 +111,10 @@ def main() -> int:
     if missing_fragments:
         failures.append(f"recipe is missing required contract fragments: {missing_fragments}")
     optimization_fragments = (
-        'CARGO_BUILD_JOBS = "4"',
-        'RUST_TEST_THREADS = "4"',
+        'CARGO_BUILD_JOBS = "2"',
+        'RUST_TEST_THREADS = "2"',
+        'CARGO_INCREMENTAL = "0"',
+        'CARGO_PROFILE_TEST_DEBUG = "0"',
         'CARGO_TARGET_DIR = "C:\\\\w\\\\cache\\\\cargo-target"',
         '--store-dir C:\\w\\cache\\pnpm-store',
         '--prefer-offline',
@@ -121,6 +132,8 @@ def main() -> int:
         failures.append("recipe must compile and run the Rust workspace exactly once")
     if "pnpm.cmd --dir gateway build\n" in recipe:
         failures.append("recipe still performs the duplicate headless Gateway build")
+    if 'CARGO_BUILD_JOBS = "4"' in recipe or 'RUST_TEST_THREADS = "4"' in recipe:
+        failures.append("recipe exceeds the resource-capped Windows validation concurrency")
 
     if failures:
         print("FAIL optional Windows validation contract")

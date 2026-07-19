@@ -8,8 +8,8 @@ use serde_json::json;
 fn hook_message() -> HookMessage {
     HookMessage {
         sender: HookSender {
-            agent_id: Some("a_paul".into()),
-            name: "paul".into(),
+            agent_id: Some("a_fixture_sender".into()),
+            name: "fixture-sender".into(),
         },
         target: SendTarget::Post {
             thread: "release".into(),

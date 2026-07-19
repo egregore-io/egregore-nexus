@@ -13,6 +13,7 @@ import {
 import type { HookManifest } from "./types";
 
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), "test-fixtures");
+const PYTHON_COMMAND = process.platform === "win32" ? "python.exe" : "python3";
 const temporaryDirectories: string[] = [];
 
 afterEach(async () => {
@@ -31,7 +32,7 @@ function invocation(id = "hi_deterministic"): HookInvocation {
     },
     executedBy: [],
     message: {
-      sender: { agentId: "a_paul", name: "paul" },
+      sender: { agentId: "a_fixture_sender", name: "fixture-sender" },
       target: { verb: "post", thread: "release" },
       body: "exact input",
       mention: [],
@@ -108,7 +109,7 @@ describe("local hook command runner", () => {
 
   it.each([
     ["javascript", [process.execPath, join(FIXTURES, "echo-hook.mjs")]],
-    ["python", ["python3", join(FIXTURES, "echo-hook.py")]],
+    ["python", [PYTHON_COMMAND, join(FIXTURES, "echo-hook.py")]],
     ["shell", ["sh", join(FIXTURES, "echo-hook.sh")]],
   ])("executes %s hooks through the same JSON boundary", async (runtime, run) => {
     const result = await new LocalCommandRunner({

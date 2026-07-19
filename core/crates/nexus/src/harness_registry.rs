@@ -22,6 +22,10 @@ impl HarnessContract for OpenCodeHarness {
             .expect("OpenCode has a native headed executable")
     }
 
+    fn agent_token(&self) -> &'static str {
+        "opencode"
+    }
+
     fn headed_runtime_kind(&self) -> HeadedRuntimeKind {
         HeadedRuntimeKind::OpenCodePlugin
     }
@@ -46,6 +50,10 @@ impl HarnessContract for HermesHarness {
     fn program(&self) -> &'static str {
         native_harness_program("hermes", NativeProcessPlatform::current())
             .expect("Hermes has a native headed executable")
+    }
+
+    fn agent_token(&self) -> &'static str {
+        "hermes"
     }
 
     fn headed_runtime_kind(&self) -> HeadedRuntimeKind {

@@ -12,7 +12,7 @@ import type { HookManifest, HookRegistrySnapshot } from "./types";
 
 function message(): HookMessage {
   return {
-    sender: { agentId: "a_paul", name: "paul" },
+    sender: { agentId: "a_fixture_sender", name: "fixture-sender" },
     target: { verb: "post", thread: "release" },
     body: "original",
     mention: [],
