@@ -755,18 +755,13 @@ mod builder_tests {
 
     #[test]
     fn codex_command_and_mcp_args() {
-        let (prog, args) = build_harness_command(
-            &HarnessId::new("codex").unwrap(),
-            "ada",
-            "lens",
-            "/usr/bin/nexus",
-            None,
-        )
-        .unwrap();
+        let kind = HarnessId::new("codex").unwrap();
+        let (prog, args) =
+            build_harness_command(&kind, "ada", "lens", "/usr/bin/nexus", None).unwrap();
         assert_eq!(
             prog,
-            native_harness_program("codex", NativeProcessPlatform::current())
-                .expect("Codex has a native headed executable")
+            native_harness_program(kind.as_str(), NativeProcessPlatform::current())
+                .expect("built-in harness has a native headed executable")
         );
         assert!(args.contains(&"-c".to_string()));
         assert!(args
@@ -781,18 +776,13 @@ mod builder_tests {
 
     #[test]
     fn claude_command_and_mcp_config() {
-        let (prog, args) = build_harness_command(
-            &HarnessId::new("claude").unwrap(),
-            "ada",
-            "lens",
-            "/usr/bin/nexus",
-            None,
-        )
-        .unwrap();
+        let kind = HarnessId::new("claude").unwrap();
+        let (prog, args) =
+            build_harness_command(&kind, "ada", "lens", "/usr/bin/nexus", None).unwrap();
         assert_eq!(
             prog,
-            native_harness_program("claude", NativeProcessPlatform::current())
-                .expect("Claude has a native headed executable")
+            native_harness_program(kind.as_str(), NativeProcessPlatform::current())
+                .expect("built-in harness has a native headed executable")
         );
         let idx = args
             .iter()
