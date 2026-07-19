@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION = "0.1.0"
-NPM_VERSION = "0.1.3"
+NPM_VERSION = "0.1.4"
 NPM_MANIFESTS = (
     ROOT / "packages/nexus/package.json",
     ROOT / "packages/nexus-cli/package.json",
