@@ -221,16 +221,21 @@ impl Store {
     }
 
     pub(crate) async fn mark_schema_variant(&self, name: &str) -> Result<(), NexusError> {
-        self.conn
+        let tx = self.begin_write_txn("schema_variant_marker").await?;
+        if let Err(error) = tx.execute("DELETE FROM schema_migrations", ()).await {
+            return rollback_error(tx, error).await;
+        }
+        if let Err(error) = tx
             .execute(
                 "INSERT INTO schema_migrations(version, name, applied_at)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(version) DO UPDATE SET name = excluded.name",
-                libsql::params![CURRENT_SCHEMA_VERSION, name, now()],
+                 VALUES (?1, ?2, ?3)",
+                libsql::params![BASELINE_SCHEMA_VERSION, name, now()],
             )
             .await
-            .map_err(store_err)?;
-        Ok(())
+        {
+            return rollback_error(tx, error).await;
+        }
+        tx.commit().await
     }
 
     async fn install_baseline(&self) -> Result<(), NexusError> {
@@ -353,6 +358,15 @@ impl Store {
         let Some((first_version, _)) = markers.first() else {
             return Ok(Some("empty migration ledger".into()));
         };
+        if markers.iter().all(|(_, name)| name == IDENTITY_SCHEMA_NAME) {
+            return Ok(Some(IDENTITY_SCHEMA_NAME.into()));
+        }
+        if markers
+            .iter()
+            .all(|(_, name)| name == TRANSPORT_SCHEMA_NAME)
+        {
+            return Ok(Some(TRANSPORT_SCHEMA_NAME.into()));
+        }
         let marker = match markers.as_slice() {
             [(BASELINE_SCHEMA_VERSION, name)] => name.clone(),
             [(BASELINE_SCHEMA_VERSION, _), (MESSAGE_HOOKS_SCHEMA_VERSION, name)] => name.clone(),

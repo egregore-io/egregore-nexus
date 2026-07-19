@@ -67,6 +67,54 @@ async fn fresh_identity_baseline_carries_the_runtime_client_key() {
     let _ = std::fs::remove_file(path.with_extension("db-shm"));
 }
 
+#[tokio::test]
+async fn legacy_identity_marker_ladder_reopens_and_is_canonicalized() {
+    let path = unique_store_path("legacy-identity-marker");
+    {
+        let daemon = DaemonStore::open(path.to_string_lossy().as_ref())
+            .await
+            .expect("create split daemon store");
+        daemon
+            .identity()
+            .conn
+            .execute_batch(
+                "DELETE FROM schema_migrations;
+                 INSERT INTO schema_migrations(version, name, applied_at)
+                   VALUES (1, 'v0.1.0_identity', 1),
+                          (3, 'v0.1.0_identity', 3);",
+            )
+            .await
+            .expect("seed identity marker ladder from the pre-release upgrader");
+    }
+
+    let reopened = DaemonStore::open(path.to_string_lossy().as_ref())
+        .await
+        .expect("reopen legacy identity marker ladder");
+    let mut rows = reopened
+        .identity()
+        .conn
+        .query(
+            "SELECT version, name FROM schema_migrations ORDER BY version",
+            (),
+        )
+        .await
+        .expect("query canonical identity marker");
+    let mut markers = Vec::new();
+    while let Some(row) = rows.next().await.expect("identity marker row") {
+        markers.push((
+            row.get::<i64>(0).expect("identity marker version"),
+            row.get::<String>(1).expect("identity marker name"),
+        ));
+    }
+    assert_eq!(markers, vec![(1, "v0.1.0_identity".into())]);
+
+    drop(rows);
+    drop(reopened);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(path.with_extension("db-shm"));
+}
+
 #[test]
 fn every_daemon_table_has_exactly_one_authoritative_class() {
     let persistent = PERSISTENT_CONTINUITY_TABLES
