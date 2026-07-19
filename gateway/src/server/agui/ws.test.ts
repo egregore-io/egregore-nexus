@@ -483,9 +483,10 @@ describe("AG-UI WebSocket server transport", () => {
   it("replays developer events over a sys topic subscription", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
-    const since = vi.fn(async (topic: string, afterSeq: number) => {
-      if (topic !== "sys.agent.lifecycle" || afterSeq !== 7) return [];
-      return [{
+    const subscribe = vi.fn((topic: string, afterSeq: number, handlers: ToolCallEventHandlers) => {
+      expect(topic).toBe("sys.agent.lifecycle");
+      expect(afterSeq).toBe(7);
+      queueMicrotask(() => handlers.onEvent({
         kind: "agent_lifecycle",
         topic,
         seq: 8,
@@ -494,7 +495,8 @@ describe("AG-UI WebSocket server transport", () => {
         sessionId: "s_otto",
         lifecycle: "current_work",
         currentWork: "R1.5",
-      }];
+      }));
+      return { ready: Promise.resolve(), close: vi.fn() };
     });
 
     const control = handleWs(
@@ -502,8 +504,7 @@ describe("AG-UI WebSocket server transport", () => {
       new Request("http://localhost/api/agui/ws?session=otto"),
       {
         observe: async () => new Response(textStream([]), { status: 200 }),
-        developerEvents: { since },
-        developerEventPollMs: 10_000,
+        developerEvents: { subscribe },
       },
     );
 
@@ -538,6 +539,79 @@ describe("AG-UI WebSocket server transport", () => {
     await control.closed;
   });
 
+  it("uses an event-driven Gateway source for durable thread subscriptions", async () => {
+    const { handleWs } = await loadWs();
+    const socket = new FakeSocket();
+    const closeSubscription = vi.fn();
+    let handlers: ToolCallEventHandlers | undefined;
+    const subscribe = vi.fn((topic: string, afterSeq: number, next: ToolCallEventHandlers) => {
+      expect(topic).toBe("sys.message.thread.design");
+      expect(afterSeq).toBe(7);
+      handlers = next;
+      return { ready: Promise.resolve(), close: closeSubscription };
+    });
+    const control = handleWs(socket, new Request("http://localhost/api/agui/ws"), {
+      developerEvents: { subscribe },
+    });
+
+    socket.emit("message", JSON.stringify({
+      t: "subscribe",
+      topic: "sys.message.thread.design",
+      afterSeq: 7,
+    }));
+    handlers?.onEvent({
+      kind: "message",
+      topic: "sys.message.thread.design",
+      seq: 8,
+      ts: 1_780_000_000_008,
+      thread: "design",
+      from: "Ada",
+      messageId: "m_8",
+    });
+
+    await vi.waitFor(() => expect(developerEvents(socket)).toContainEqual(expect.objectContaining({
+      topic: "sys.message.thread.design",
+      seq: 8,
+      messageId: "m_8",
+    })));
+    expect(subscribe).toHaveBeenCalledTimes(1);
+
+    control.close();
+    await control.closed;
+    expect(closeSubscription).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes a durable event socket with its last cursor unadvanced under backpressure", async () => {
+    const { handleWs } = await loadWs();
+    const socket = new FakeSocket();
+    let handlers: ToolCallEventHandlers | undefined;
+    const control = handleWs(socket, new Request("http://localhost/api/agui/ws"), {
+      developerEvents: {
+        subscribe(_topic: string, _afterSeq: number, next: ToolCallEventHandlers) {
+          handlers = next;
+          return { ready: Promise.resolve(), close: vi.fn() };
+        },
+      },
+    });
+    socket.emit("message", JSON.stringify({
+      t: "subscribe",
+      topic: "sys.message.thread.design",
+      afterSeq: 7,
+    }));
+    socket.bufferedAmount = 1024 * 1024 + 1;
+
+    expect(handlers?.onEvent({
+      kind: "message",
+      topic: "sys.message.thread.design",
+      seq: 8,
+      ts: 1_780_000_000_008,
+      messageId: "m_8",
+    })).toBe(false);
+    await control.closed;
+    expect(socket.closed).toEqual({ code: 1013, reason: "developer event websocket backpressure" });
+    expect(developerEvents(socket)).toEqual([]);
+  });
+
   it("tails ephemeral tool-call developer events for the observed session", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
@@ -548,7 +622,6 @@ describe("AG-UI WebSocket server transport", () => {
       {
         observe: async () => new Response(source.stream, { status: 200 }),
         daemonToolCallEvents: null,
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -609,7 +682,6 @@ describe("AG-UI WebSocket server transport", () => {
             return unsubscribe;
           },
         },
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -656,8 +728,8 @@ describe("AG-UI WebSocket server transport", () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
     const source = controlledTextStream();
-    const durableSince = vi.fn(async () => {
-      throw new Error("fleet status must not poll durable developer_events");
+    const durableSubscribe = vi.fn(() => {
+      throw new Error("fleet status must not subscribe to durable message events");
     });
     let handlers: ToolCallEventHandlers | undefined;
     const unsubscribe = vi.fn();
@@ -667,7 +739,7 @@ describe("AG-UI WebSocket server transport", () => {
       new Request("http://localhost/api/agui/ws"),
       {
         observe: async () => new Response(source.stream, { status: 200 }),
-        developerEvents: { since: durableSince },
+        developerEvents: { subscribe: durableSubscribe },
         daemonFleetStatusEvents: {
           subscribe(topic: string, afterSeq: number, h: ToolCallEventHandlers) {
             expect(topic).toBe("sys.fleet.status");
@@ -676,7 +748,6 @@ describe("AG-UI WebSocket server transport", () => {
             return unsubscribe;
           },
         },
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -736,7 +807,7 @@ describe("AG-UI WebSocket server transport", () => {
         data: { presence: "online", paused: false },
       });
     });
-    expect(durableSince).not.toHaveBeenCalled();
+    expect(durableSubscribe).not.toHaveBeenCalled();
 
     source.close();
     control.close();
@@ -754,7 +825,6 @@ describe("AG-UI WebSocket server transport", () => {
       {
         observe: async () => new Response(source.stream, { status: 200 }),
         daemonFleetStatusEvents: null,
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -784,8 +854,8 @@ describe("AG-UI WebSocket server transport", () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
     const source = controlledTextStream();
-    const durableSince = vi.fn(async () => {
-      throw new Error("tool-call topics must not poll durable developer_events");
+    const durableSubscribe = vi.fn(() => {
+      throw new Error("tool-call topics must not subscribe to durable message events");
     });
     let handlers: ToolCallEventHandlers | undefined;
     const sessionInput = vi.fn(async () => new Response(
@@ -809,7 +879,7 @@ describe("AG-UI WebSocket server transport", () => {
       {
         observe: async () => new Response(source.stream, { status: 200 }),
         sessionInput,
-        developerEvents: { since: durableSince },
+        developerEvents: { subscribe: durableSubscribe },
         daemonToolCallEvents: {
           subscribe(topic: string, afterSeq: number, h: ToolCallEventHandlers) {
             expect(topic).toBe("sys.agent.smoke-agent.tool_call");
@@ -818,7 +888,6 @@ describe("AG-UI WebSocket server transport", () => {
             return () => {};
           },
         },
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -905,7 +974,7 @@ describe("AG-UI WebSocket server transport", () => {
       }),
       expect.any(Request),
     );
-    expect(durableSince).not.toHaveBeenCalled();
+    expect(durableSubscribe).not.toHaveBeenCalled();
 
     source.close();
     control.close();
@@ -928,7 +997,6 @@ describe("AG-UI WebSocket server transport", () => {
             return () => {};
           },
         },
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -966,7 +1034,6 @@ describe("AG-UI WebSocket server transport", () => {
       {
         observe: async () => new Response(source.stream, { status: 200 }),
         daemonToolCallEvents: null,
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -1011,7 +1078,6 @@ describe("AG-UI WebSocket server transport", () => {
       {
         observe: async () => new Response(source.stream, { status: 200 }),
         daemonToolCallEvents: null,
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -1047,7 +1113,6 @@ describe("AG-UI WebSocket server transport", () => {
       {
         observe: async () => new Response(source.stream, { status: 200 }),
         daemonToolCallEvents: null,
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -1082,12 +1147,12 @@ describe("AG-UI WebSocket server transport", () => {
   it("rejects tool-call subscriptions for a different observed session", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
-    const since = vi.fn(async () => []);
+    const subscribe = vi.fn();
 
     handleWs(socket, new Request("http://localhost/api/agui/ws?session=otto"), {
       observe: async () => new Response(textStream([]), { status: 200 }),
       daemonToolCallEvents: null,
-      developerEvents: { since },
+      developerEvents: { subscribe },
     });
 
     socket.emit("message", JSON.stringify({
@@ -1101,17 +1166,17 @@ describe("AG-UI WebSocket server transport", () => {
       topic: "sys.agent.iris.tool_call",
       error: "tool_call subscriptions require matching ?session=iris",
     }));
-    expect(since).not.toHaveBeenCalled();
+    expect(subscribe).not.toHaveBeenCalled();
   });
 
   it("rejects non-system developer event subscriptions", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
-    const since = vi.fn(async () => []);
+    const subscribe = vi.fn();
 
     handleWs(socket, new Request("http://localhost/api/agui/ws?session=otto"), {
       observe: async () => new Response(textStream([]), { status: 200 }),
-      developerEvents: { since },
+      developerEvents: { subscribe },
     });
 
     socket.emit("message", JSON.stringify({
@@ -1124,7 +1189,7 @@ describe("AG-UI WebSocket server transport", () => {
       t: "subscribe.err",
       error: "subscribe.topic must be a sys.* topic",
     }));
-    expect(since).not.toHaveBeenCalled();
+    expect(subscribe).not.toHaveBeenCalled();
   });
 
   it("shares one durable queue watcher across mounted lanes and filters by session", async () => {

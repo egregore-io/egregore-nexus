@@ -25,7 +25,19 @@ export interface AguiWsSteerInput {
 }
 
 export interface AguiWsDeveloperEventSource {
-  since(topic: string, afterSeq: number): Promise<unknown[]>;
+  subscribe(
+    topic: string,
+    afterSeq: number,
+    handlers: {
+      onEvent: (event: any) => boolean | void;
+      onError?: (error: unknown) => void;
+    },
+  ): {
+    ready: Promise<void>;
+    pause?(): void;
+    resume?(): void;
+    close(): void;
+  };
 }
 
 export interface AguiWsDaemonToolCallEventSource {
@@ -59,7 +71,6 @@ export interface AguiWsDeps {
    *  ordered `resync` reconciliation boundary on every subscribe/reconnect). Defaults to the
    *  daemon push socket under the pseudo session id `fleet`. */
   daemonFleetStatusEvents?: AguiWsDaemonToolCallEventSource | null;
-  developerEventPollMs?: number;
   /** One gateway-wide poll cadence for the daemon-owned transition projection. */
   commandQueueEventPollMs?: number;
   commandQueueHub?: CommandQueueHub;

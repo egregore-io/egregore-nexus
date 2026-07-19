@@ -271,6 +271,8 @@ async fn thread_fanout_is_daemon_resolved_but_projects_one_message_fact() {
     assert_eq!(effects.len(), 1);
     assert_eq!(effects[0].kind, GatewayProjectionKind::MessageAccepted);
     assert_eq!(effects[0].payload["messageId"], ack.message_id.0);
+    assert_eq!(effects[0].payload["toName"], "review");
+    assert_eq!(effects[0].payload["threadId"], "t_review");
     assert_eq!(effects[0].payload["project"], "thread-metadata");
     assert!(effects[0].payload.get("fanout").is_none());
 }

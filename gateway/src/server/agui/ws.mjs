@@ -7,28 +7,9 @@ import {
   validateCommandArgs,
 } from "./commandRegistry.mjs";
 
-// The durable developer-event source is drizzle-backed TypeScript, which the plain-Node
-// serve path (scripts/gateway-serve.mjs imports this module directly) cannot load. Import
-// it lazily and degrade: without it, durable sys.* subscriptions error per-subscribe
-// instead of the whole gateway crashing at boot. Ephemeral tool_call topics and the
-// daemon push lane never need it.
-let createDeveloperEventSource;
-try {
-  ({ createDeveloperEventSource } = await import("./developerEvents"));
-} catch {
-  // Plain-Node serve cannot load the drizzle-backed TS module; fall back to the
-  // .mjs twin so durable sys.* subscribes work on every gateway build.
-  try {
-    ({ createDeveloperEventSource } = await import("./developerEventsSource.mjs"));
-  } catch {
-    createDeveloperEventSource = undefined;
-  }
-}
-
 const AGUI_WS_PATH = "/api/agui/ws";
 const SESSION_EVENTS_PATH = /^\/api\/v1\/agent-sessions\/[^/]+\/events$/;
 const MAX_BUFFERED_AMOUNT = 1024 * 1024;
-const DEFAULT_DEVELOPER_EVENT_POLL_MS = 250;
 const TOOL_CALL_TOPIC_PREFIX = "sys.agent.";
 const TOOL_CALL_TOPIC_SUFFIX = ".tool_call";
 // Fleet-wide agent status (presence/spawned/removed) — ephemeral daemon push events
@@ -799,8 +780,7 @@ function commandCodeForStatus(status) {
 class DeveloperEventSubscriptions {
   #socket;
   #source;
-  #pollMs;
-  #timers = new Map();
+  #topics = new Map();
   #sessionName;
   #toolCallRows = new Map();
   #toolCallNames = new Map();
@@ -820,7 +800,6 @@ class DeveloperEventSubscriptions {
     this.#daemonFleetSource = Object.prototype.hasOwnProperty.call(deps, "daemonFleetStatusEvents")
       ? deps.daemonFleetStatusEvents
       : createDaemonPushDeveloperEventSource(FLEET_SESSION_KEY);
-    this.#pollMs = Math.max(25, Number(deps.developerEventPollMs ?? DEFAULT_DEVELOPER_EVENT_POLL_MS));
   }
 
   subscribe(frame) {
@@ -854,19 +833,51 @@ class DeveloperEventSubscriptions {
       return;
     }
 
-    if (!this.#source && !createDeveloperEventSource) {
+    if (!this.#source || typeof this.#source.subscribe !== "function") {
       sendJson(this.#socket, {
         t: "subscribe.err",
         topic,
-        error: "durable developer events unavailable on this gateway build",
+        error: "Gateway message event source is unavailable on this gateway build",
       });
       return;
     }
     this.#stopTopic(topic, false);
-    const state = { topic, cursor: afterSeq, active: true, timer: undefined, ephemeral: false };
-    this.#timers.set(topic, state);
+    const state = { topic, cursor: afterSeq, active: true, ephemeral: false };
+    this.#topics.set(topic, state);
     sendJson(this.#socket, { t: "subscribe.ack", topic, afterSeq });
-    void this.#poll(state);
+    try {
+      const subscription = this.#source.subscribe(topic, afterSeq, {
+        onEvent: (event) => {
+          if (!state.active || this.#closed) return false;
+          const seq = Number(event?.seq ?? 0);
+          if (!Number.isInteger(seq) || seq <= state.cursor) return true;
+          if ((this.#socket.bufferedAmount ?? 0) > MAX_BUFFERED_AMOUNT) {
+            this.#socket.close?.(1013, "developer event websocket backpressure");
+            return false;
+          }
+          sendJson(this.#socket, { type: "developer.event", event });
+          state.cursor = seq;
+          return true;
+        },
+        onError: (error) => {
+          if (!state.active || this.#closed) return;
+          sendJson(this.#socket, {
+            t: "subscribe.err",
+            topic,
+            error: messageForError(error),
+          });
+          this.#stopTopic(topic, false);
+        },
+      });
+      state.daemonUnsubscribe = () => subscription.close();
+    } catch (error) {
+      this.#stopTopic(topic, false);
+      sendJson(this.#socket, {
+        t: "subscribe.err",
+        topic,
+        error: messageForError(error),
+      });
+    }
   }
 
   unsubscribe(frame) {
@@ -876,24 +887,22 @@ class DeveloperEventSubscriptions {
   }
 
   #stopTopic(topic, acknowledge) {
-    const state = this.#timers.get(topic);
+    const state = this.#topics.get(topic);
     if (!state) return;
     state.active = false;
-    if (state.timer) clearTimeout(state.timer);
     state.daemonUnsubscribe?.();
-    this.#timers.delete(topic);
+    this.#topics.delete(topic);
     if (toolCallTopicAgent(topic)) this.#daemonToolCallActiveTopics.delete(topic);
     if (acknowledge) sendJson(this.#socket, { t: "unsubscribe.ack", topic });
   }
 
   close() {
     this.#closed = true;
-    for (const state of this.#timers.values()) {
+    for (const state of this.#topics.values()) {
       state.active = false;
-      if (state.timer) clearTimeout(state.timer);
       state.daemonUnsubscribe?.();
     }
-    this.#timers.clear();
+    this.#topics.clear();
     this.#daemonToolCallActiveTopics.clear();
   }
 
@@ -912,7 +921,7 @@ class DeveloperEventSubscriptions {
     const rows = this.#rowsForTopic(event.topic);
     rows.push(event);
     if (rows.length > TOOL_CALL_RING_LIMIT) rows.splice(0, rows.length - TOOL_CALL_RING_LIMIT);
-    const state = this.#timers.get(event.topic);
+    const state = this.#topics.get(event.topic);
     if (!state?.active || state.cursor >= event.seq) return;
     sendJson(this.#socket, { type: "developer.event", event });
     state.cursor = event.seq;
@@ -924,11 +933,10 @@ class DeveloperEventSubscriptions {
       topic,
       cursor: afterSeq,
       active: true,
-      timer: undefined,
       ephemeral: true,
       daemonUnsubscribe: undefined,
     };
-    this.#timers.set(topic, state);
+    this.#topics.set(topic, state);
     sendJson(this.#socket, { t: "subscribe.ack", topic, afterSeq });
     state.daemonUnsubscribe = this.#daemonToolCallSource?.subscribe(topic, afterSeq, {
       onEvent: (event) => {
@@ -980,11 +988,10 @@ class DeveloperEventSubscriptions {
       topic,
       cursor: afterSeq,
       active: true,
-      timer: undefined,
       ephemeral: true,
       daemonUnsubscribe: undefined,
     };
-    this.#timers.set(topic, state);
+    this.#topics.set(topic, state);
     sendJson(this.#socket, { t: "subscribe.ack", topic, afterSeq });
     state.daemonUnsubscribe = this.#daemonFleetSource.subscribe(topic, afterSeq, {
       onEvent: (event) => {
@@ -1014,34 +1021,6 @@ class DeveloperEventSubscriptions {
         // reconnect loop re-subscribes with its cursor, so nothing to do here.
       },
     });
-  }
-
-  async #poll(state) {
-    if (this.#closed || !state.active || state.ephemeral) return;
-    try {
-      const rows = await this.#getSource().since(state.topic, state.cursor);
-      for (const event of rows) {
-        if (!state.active || this.#closed) return;
-        sendJson(this.#socket, { type: "developer.event", event });
-        state.cursor = Math.max(state.cursor, Number(event.seq ?? state.cursor));
-      }
-    } catch (error) {
-      sendJson(this.#socket, {
-        t: "subscribe.err",
-        topic: state.topic,
-        error: messageForError(error),
-      });
-    }
-    if (!this.#closed && state.active) {
-      state.timer = setTimeout(() => {
-        void this.#poll(state);
-      }, this.#pollMs);
-    }
-  }
-
-  #getSource() {
-    if (!this.#source) this.#source = createDeveloperEventSource();
-    return this.#source;
   }
 
   #toolCallEventFromAgui(frame) {

@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { once } from "node:events";
 
 import { dispatchNetworkMcp } from "../../routes/api/mcp";
@@ -6,6 +6,10 @@ import { dispatchApiV1 } from "../../routes/api/v1/$";
 import { observeScoped } from "../../routes/api/agui.observe";
 import { attachAguiWsUpgrade } from "../agui/ws.mjs";
 import { closeSharedDaemonPushConnector } from "../agui/daemonPushRelay.mjs";
+import {
+  createGatewayDeveloperEventSource,
+  type GatewayDeveloperEventSource,
+} from "../agui/gatewayDeveloperEvents";
 import {
   startGatewayProjectionService,
   stopGatewayProjectionService,
@@ -56,6 +60,11 @@ export interface HeadlessGatewayLifecycle {
   stopProjection(): Promise<void>;
   stopHooks(): Promise<void>;
   stopConnection?(): Promise<void> | void;
+}
+
+export interface HeadlessGatewayWsOptions {
+  fetchHandler: (request: Request) => Promise<Response>;
+  developerEvents?: GatewayDeveloperEventSource;
 }
 
 const DEFAULT_LIFECYCLE: HeadlessGatewayLifecycle = {
@@ -134,7 +143,7 @@ export async function createHeadlessGatewayServer(
   const server = createServer((req, res) => {
     void handleNodeRequest(req, res, dispatchers);
   });
-  await attachAguiWsUpgrade(server, { fetchHandler });
+  await attachHeadlessGatewayWs(server, { fetchHandler });
   let cleanup: Promise<void> | undefined;
   const stopServices = () => cleanup ??= lifecycle.stopProjection()
     .then(() => lifecycle.stopHooks())
@@ -156,6 +165,23 @@ export async function createHeadlessGatewayServer(
       await stopServices();
     },
   });
+}
+
+/** Attach the bundled AG-UI upgrade lane with Gateway-owned durable message subscriptions. */
+export async function attachHeadlessGatewayWs(
+  server: Server,
+  options: HeadlessGatewayWsOptions,
+) {
+  const ownsDeveloperEvents = !options.developerEvents;
+  const developerEvents = options.developerEvents ?? createGatewayDeveloperEventSource();
+  const wss = await attachAguiWsUpgrade(server, {
+    fetchHandler: options.fetchHandler,
+    developerEvents,
+  });
+  if (ownsDeveloperEvents) {
+    server.once("close", () => developerEvents.close());
+  }
+  return wss;
 }
 
 async function main(): Promise<void> {
