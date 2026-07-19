@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TARGET="$SCRIPT_DIR/nexus-v015-lab-manifest"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+mkdir -p "$TMP/bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'case "$*" in' \
+  '*"{{.Image}}"*) printf "sha256:image-fixture\\n" ;;' \
+  '*"{{json .RepoDigests}}"*) echo "[\"fixture@sha256:digest\"]" ;;' \
+  '*"{{json .HostConfig}}"*) echo "{\"NanoCpus\":6000000000,\"Memory\":8589934592,\"PidsLimit\":1024}" ;;' \
+  '*"{{json .NetworkSettings.Ports}}"*) printf "{}\\n" ;;' \
+  '*"{{json .Config.Env}}"*) echo "[\"SAFE=value\",\"API_TOKEN=secret\"]" ;;' \
+  '*"nexus --version"*) printf "nexus 0.1.5\\n" ;;' \
+  '*"node --version"*) printf "v24.0.0\\n" ;;' \
+  '*"rustc --version"*) printf "rustc 1.90.0\\n" ;;' \
+  'cp*) exit 0 ;;' \
+  '*) printf "unexpected docker call: %s\\n" "$*" >&2; exit 98 ;;' \
+  'esac' >"$TMP/bin/docker"
+chmod +x "$TMP/bin/docker"
+
+PATH="$TMP/bin:/usr/bin:/bin" "$TARGET" --help >"$TMP/help"
+grep -Fq -- "--container" "$TMP/help"
+grep -Fq -- "--mode" "$TMP/help"
+grep -Fq -- "--output" "$TMP/help"
+
+PATH="$TMP/bin:/usr/bin:/bin" "$TARGET" \
+  --container fixture \
+  --mode source \
+  --output "$TMP/manifest.json" \
+  --no-copy
+
+jq -e '
+  .schemaVersion == 1 and
+  .mode == "source" and
+  .container.name == "fixture" and
+  .container.limits.cpus == 6 and
+  .container.limits.memoryBytes == 8589934592 and
+  .container.limits.pids == 1024 and
+  .image.id == "sha256:image-fixture" and
+  .environment.SAFE == "value" and
+  .environment.API_TOKEN == "<redacted>" and
+  .sources.nexus.sha != null and
+  .toolchains.nexus == "nexus 0.1.5"
+' "$TMP/manifest.json" >/dev/null
+
+bash -n "$TARGET"
+printf 'v0.1.5 lab manifest contract: ok\n'

@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO=$(cd "$SCRIPT_DIR/.." && pwd)
+CONTAINER="${NEXUS_DOCKER_TEST_NAME:-nexus-v010-load51}"
+MODE="${NEXUS_V015_LAB_MODE:-source}"
+RUN_ID="${NEXUS_V015_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+OUTPUT=""
+COPY_TO_CONTAINER=1
+LAB_ROOT="${NEXUS_V015_LAB_ROOT:-/tmp/nexus-lens-home}"
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/nexus-v015-lab-manifest [options]
+
+Capture a redacted, reproducible manifest for the isolated v0.1.5 validator.
+
+Options:
+  --container NAME  Validator container name.
+  --mode MODE       Candidate mode: source or packed.
+  --output PATH     Host output path for manifest.json.
+  --run-id ID       Evidence run identifier.
+  --no-copy         Do not copy the manifest into the validator evidence tree.
+  -h, --help        Show this help.
+
+The command reads Docker metadata and source checkouts only. It never reads the
+host Nexus home, databases, discovery files, or runtime sockets.
+USAGE
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --container)
+      [ "$#" -ge 2 ] || die "--container requires a value"
+      CONTAINER=$2
+      shift 2
+      ;;
+    --mode)
+      [ "$#" -ge 2 ] || die "--mode requires a value"
+      MODE=$2
+      shift 2
+      ;;
+    --output)
+      [ "$#" -ge 2 ] || die "--output requires a value"
+      OUTPUT=$2
+      shift 2
+      ;;
+    --run-id)
+      [ "$#" -ge 2 ] || die "--run-id requires a value"
+      RUN_ID=$2
+      shift 2
+      ;;
+    --no-copy)
+      COPY_TO_CONTAINER=0
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+done
+
+case "$MODE" in
+  source|packed) ;;
+  *) die "--mode must be source or packed" ;;
+esac
+
+for command in docker git jq sha256sum; do
+  command -v "$command" >/dev/null 2>&1 || die "required command is unavailable: $command"
+done
+
+if [ -z "$OUTPUT" ]; then
+  OUTPUT="$REPO/output/v0.1.5/evidence/$RUN_ID/manifest.json"
+fi
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+source_record() {
+  local path=$1
+  local dirty_json="$TMP/dirty-$(printf '%s' "$path" | sha256sum | cut -d' ' -f1).json"
+  local names="$TMP/names-$(printf '%s' "$path" | sha256sum | cut -d' ' -f1)"
+  local sha=""
+  local exists=false
+
+  printf '[]\n' >"$dirty_json"
+  if [ -d "$path/.git" ] || git -C "$path" rev-parse --git-dir >/dev/null 2>&1; then
+    exists=true
+    sha=$(git -C "$path" rev-parse HEAD)
+    {
+      git -C "$path" diff --name-only -z HEAD
+      git -C "$path" ls-files --others --exclude-standard -z
+    } | sort -zu >"$names"
+
+    while IFS= read -r -d '' relative; do
+      local absolute="$path/$relative"
+      local state=present
+      local digest=""
+      if [ -L "$absolute" ]; then
+        digest=$(readlink "$absolute" | sha256sum | cut -d' ' -f1)
+      elif [ -f "$absolute" ]; then
+        digest=$(sha256sum "$absolute" | cut -d' ' -f1)
+      else
+        state=deleted
+      fi
+      jq \
+        --arg path "$relative" \
+        --arg state "$state" \
+        --arg sha256 "$digest" \
+        '. + [{path: $path, state: $state, sha256: $sha256}]' \
+        "$dirty_json" >"$dirty_json.next"
+      mv "$dirty_json.next" "$dirty_json"
+    done <"$names"
+  fi
+
+  jq -n \
+    --arg path "$path" \
+    --arg sha "$sha" \
+    --argjson exists "$exists" \
+    --slurpfile dirty "$dirty_json" \
+    '{path: $path, exists: $exists, sha: (if $sha == "" then null else $sha end),
+      dirty: ($dirty[0] | length > 0), dirtyPaths: $dirty[0]}'
+}
+
+NEXUS_REPO="${NEXUS_V015_NEXUS_REPO:-$REPO}"
+LENS_REPO="${NEXUS_V015_LENS_REPO:-$HOME/Projects/egregore-lens}"
+EGREGORE_REPO="${NEXUS_V015_EGREGORE_REPO:-$HOME/Projects/egregore-v2}"
+PACTREE_REPO="${NEXUS_V015_PACTREE_REPO:-$HOME/.config/superpowers/worktrees/pactree/v01-one-spine}"
+PACTREE_PY_REPO="${NEXUS_V015_PACTREE_PY_REPO:-$HOME/.config/superpowers/worktrees/pactree-py/v01-read-handle-compat}"
+PACTREE_FS_REPO="${NEXUS_V015_PACTREE_FS_REPO:-$HOME/Projects/pactree-fs}"
+
+source_record "$NEXUS_REPO" >"$TMP/nexus.json"
+source_record "$LENS_REPO" >"$TMP/lens.json"
+source_record "$EGREGORE_REPO" >"$TMP/egregore.json"
+source_record "$PACTREE_REPO" >"$TMP/pactree.json"
+source_record "$PACTREE_PY_REPO" >"$TMP/pactree-py.json"
+source_record "$PACTREE_FS_REPO" >"$TMP/pactree-fs.json"
+
+IMAGE_ID=$(docker container inspect -f '{{.Image}}' "$CONTAINER")
+REPO_DIGESTS=$(docker image inspect -f '{{json .RepoDigests}}' "$IMAGE_ID")
+HOST_CONFIG=$(docker container inspect -f '{{json .HostConfig}}' "$CONTAINER")
+PORTS=$(docker container inspect -f '{{json .NetworkSettings.Ports}}' "$CONTAINER")
+ENVIRONMENT=$(docker container inspect -f '{{json .Config.Env}}' "$CONTAINER")
+
+for json_value in REPO_DIGESTS HOST_CONFIG PORTS ENVIRONMENT; do
+  jq -e . >/dev/null <<<"${!json_value}" \
+    || die "Docker returned invalid JSON for $json_value"
+done
+
+NEXUS_VERSION=$(docker exec "$CONTAINER" bash -lc 'nexus --version')
+NODE_VERSION=$(docker exec "$CONTAINER" bash -lc 'node --version')
+RUST_VERSION=$(docker exec "$CONTAINER" bash -lc 'rustc --version')
+
+jq -n \
+  --arg capturedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --arg runId "$RUN_ID" \
+  --arg mode "$MODE" \
+  --arg container "$CONTAINER" \
+  --arg imageId "$IMAGE_ID" \
+  --arg nexusVersion "$NEXUS_VERSION" \
+  --arg nodeVersion "$NODE_VERSION" \
+  --arg rustVersion "$RUST_VERSION" \
+  --argjson repoDigests "$REPO_DIGESTS" \
+  --argjson hostConfig "$HOST_CONFIG" \
+  --argjson ports "$PORTS" \
+  --argjson rawEnvironment "$ENVIRONMENT" \
+  --slurpfile nexus "$TMP/nexus.json" \
+  --slurpfile lens "$TMP/lens.json" \
+  --slurpfile egregore "$TMP/egregore.json" \
+  --slurpfile pactree "$TMP/pactree.json" \
+  --slurpfile pactreePy "$TMP/pactree-py.json" \
+  --slurpfile pactreeFs "$TMP/pactree-fs.json" '
+    def redacted_environment:
+      $rawEnvironment
+      | map(capture("^(?<key>[^=]+)=(?<value>.*)$"))
+      | map({
+          key: .key,
+          value: (if (.key | test("TOKEN|KEY|SECRET|PASSWORD|COOKIE|AUTH"; "i"))
+                  then "<redacted>" else .value end)
+        })
+      | from_entries;
+    {
+      schemaVersion: 1,
+      capturedAt: $capturedAt,
+      runId: $runId,
+      mode: $mode,
+      container: {
+        name: $container,
+        limits: {
+          cpus: (($hostConfig.NanoCpus // 0) / 1000000000),
+          memoryBytes: ($hostConfig.Memory // 0),
+          pids: ($hostConfig.PidsLimit // 0)
+        },
+        ports: $ports
+      },
+      image: {id: $imageId, repoDigests: $repoDigests},
+      environment: redacted_environment,
+      sources: {
+        nexus: $nexus[0],
+        lens: $lens[0],
+        egregore: $egregore[0],
+        pactree: $pactree[0],
+        pactreePython: $pactreePy[0],
+        pactreeFs: $pactreeFs[0]
+      },
+      toolchains: {
+        nexus: $nexusVersion,
+        node: $nodeVersion,
+        rustc: $rustVersion
+      }
+    }
+  ' >"$TMP/manifest.json"
+
+mkdir -p "$(dirname "$OUTPUT")"
+cp "$TMP/manifest.json" "$OUTPUT.tmp"
+mv "$OUTPUT.tmp" "$OUTPUT"
+
+if [ "$COPY_TO_CONTAINER" -eq 1 ]; then
+  CONTAINER_DIR="$LAB_ROOT/evidence/$RUN_ID"
+  docker exec "$CONTAINER" mkdir -p "$CONTAINER_DIR"
+  docker cp "$OUTPUT" "$CONTAINER:$CONTAINER_DIR/manifest.json"
+fi
+
+printf '%s\n' "$OUTPUT"
