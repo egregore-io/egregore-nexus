@@ -3,12 +3,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use libsql::params;
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
 use nexus_contracts::{EventSink, GatewayProjectionEffect, Notification, WsEvent, JSONRPC_VERSION};
-use nexus_store::repos::Sessions;
+use nexus_store::repos::{AgentRuntimes, Agents, IdentitySessions, Sessions};
 use nexus_store::Store;
 
 use crate::daemon::transcript_archive::archive_codex_once;
@@ -164,36 +163,37 @@ impl WsSink {
             } => {
                 let mut effects = Vec::new();
                 if let Some(agent_id) = agent_id.as_deref() {
-                    let payload = match store
-                        .conn
-                        .query(
-                            "SELECT agent_id, name, project, default_harness, role, tier, owner, \
-                             created_at, updated_at FROM agents WHERE agent_id = ?1 LIMIT 1",
-                            params![agent_id],
-                        )
-                        .await
-                    {
-                        Ok(mut rows) => match rows.next().await {
-                            Ok(Some(row)) => serde_json::json!({
-                                "agentId": row.get::<String>(0).ok(),
-                                "name": row.get::<Option<String>>(1).ok().flatten(),
-                                "project": row.get::<String>(2).ok(),
-                                "defaultHarness": row.get::<Option<String>>(3).ok().flatten(),
-                                "role": row.get::<Option<String>>(4).ok().flatten(),
-                                "tier": row.get::<Option<String>>(5).ok().flatten(),
-                                "owner": row.get::<Option<String>>(6).ok().flatten(),
-                                "createdAt": row.get::<i64>(7).ok(),
-                                "updatedAt": row.get::<i64>(8).ok(),
-                            }),
-                            _ => serde_json::json!({
-                                "agentId": agent_id,
-                                "name": name,
-                            }),
-                        },
-                        Err(_) => serde_json::json!({
+                    let payload = match Agents::new(store).find_by_id(agent_id).await {
+                        Ok(Some(row)) => serde_json::json!({
+                            "agentId": row.agent_id,
+                            "name": row.name,
+                            "project": row.project,
+                            "defaultHarness": row.default_harness,
+                            "role": row.role,
+                            "tier": row.tier,
+                            "owner": row.owner_name,
+                            "ownerProject": row.owner_project,
+                            "ownerSessionId": row.owner_session_id,
+                            "ownerAgentId": row.owner_agent_id,
+                            "disabledAt": row.disabled_at,
+                            "createdAt": row.created_at,
+                        }),
+                        Ok(None) => serde_json::json!({
                             "agentId": agent_id,
                             "name": name,
                         }),
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "nexus::gateway_projection",
+                                agent_id,
+                                %error,
+                                "failed to load identity projection payload"
+                            );
+                            serde_json::json!({
+                                "agentId": agent_id,
+                                "name": name,
+                            })
+                        }
                     };
                     effects.push(lifecycle_effect(
                         "identity",
@@ -201,41 +201,51 @@ impl WsSink {
                         payload,
                     ));
                 }
-                let runtime_payload = match store
-                    .conn
-                    .query(
-                        "SELECT runtime_id, agent_id, harness, cwd, transport, presence, active, \
-                         started_at, stopped_at, native_thread_id FROM agent_runtimes \
-                         WHERE runtime_id = ?1 LIMIT 1",
-                        params![session_id.0.clone()],
-                    )
+                let capsule = IdentitySessions::new(store)
+                    .find(&session_id.0)
+                    .await
+                    .ok()
+                    .flatten();
+                let runtime_payload = match AgentRuntimes::new(store)
+                    .find_by_runtime_id(&session_id.0)
                     .await
                 {
-                    Ok(mut rows) => match rows.next().await {
-                        Ok(Some(row)) => serde_json::json!({
-                            "runtimeId": row.get::<String>(0).ok(),
-                            "agentId": row.get::<String>(1).ok(),
-                            "harness": row.get::<String>(2).ok(),
-                            "cwd": row.get::<Option<String>>(3).ok().flatten(),
-                            "transport": row.get::<Option<String>>(4).ok().flatten(),
-                            "presence": row.get::<Option<String>>(5).ok().flatten(),
-                            "active": row.get::<i64>(6).ok().map(|v| v != 0),
-                            "startedAt": row.get::<i64>(7).ok(),
-                            "stoppedAt": row.get::<Option<i64>>(8).ok().flatten(),
-                            "nativeResumeKey": row.get::<Option<String>>(9).ok().flatten(),
-                            "name": name,
-                        }),
-                        _ => serde_json::json!({
-                            "runtimeId": session_id.0,
-                            "agentId": agent_id,
-                            "name": name,
-                        }),
-                    },
-                    Err(_) => serde_json::json!({
+                    Ok(Some(row)) => serde_json::json!({
+                        "runtimeId": row.runtime_id,
+                        "sessionId": session_id.0,
+                        "agentId": row.agent_id,
+                        "harness": row.harness,
+                        "mode": capsule.as_ref().map(|row| row.mode.as_str()),
+                        "backend": capsule.as_ref().and_then(|row| row.backend.as_deref()),
+                        "cwd": row.cwd,
+                        "transport": row.transport,
+                        "presence": row.presence,
+                        "active": row.active,
+                        "startedAt": row.started_at,
+                        "stoppedAt": row.stopped_at,
+                        "nativeResumeKey": capsule
+                            .as_ref()
+                            .and_then(|row| row.native_resume_key.as_deref()),
+                        "name": name,
+                    }),
+                    Ok(None) => serde_json::json!({
                         "runtimeId": session_id.0,
                         "agentId": agent_id,
                         "name": name,
                     }),
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "nexus::gateway_projection",
+                            runtime_id = %session_id,
+                            %error,
+                            "failed to load runtime projection payload"
+                        );
+                        serde_json::json!({
+                            "runtimeId": session_id.0,
+                            "agentId": agent_id,
+                            "name": name,
+                        })
+                    }
                 };
                 effects.push(lifecycle_effect(
                     "runtime",

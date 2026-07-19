@@ -22,15 +22,30 @@ export interface GatewayProjectionGap {
   recordedAt: number;
 }
 
+export interface ProjectionApplyContext {
+  /** This is the first settled event observed from a different daemon boot. */
+  epochChanged: boolean;
+  /** This stable event was already recorded under an earlier daemon boot. */
+  replayedFromPriorEpoch: boolean;
+}
+
 /** Apply an immutable source event, its projection, and cursor in one transaction. */
 export async function applyProjectionEvent(
   db: Client,
   source: string,
   event: GatewayProjectionRecord,
-  project?: (tx: Transaction) => Promise<void>,
+  project?: (tx: Transaction, context: ProjectionApplyContext) => Promise<void>,
 ): Promise<"applied" | "duplicate"> {
   const tx = await db.transaction("write");
   try {
+    const cursor = await tx.execute({
+      sql: "SELECT daemon_epoch FROM projection_cursors WHERE source = ? LIMIT 1",
+      args: [source],
+    });
+    const previousEpoch = cursor.rows[0]?.daemon_epoch;
+    const epochChanged = previousEpoch !== undefined
+      && previousEpoch !== null
+      && String(previousEpoch) !== event.daemonEpoch;
     const duplicate = await tx.execute({
       sql: `SELECT event_id, daemon_epoch, seq FROM projection_events
             WHERE event_id = ? OR (daemon_epoch = ? AND seq = ?)
@@ -43,6 +58,10 @@ export async function applyProjectionEvent(
         throw new Error(
           `projection sequence collision at ${event.daemonEpoch}:${event.seq}`,
         );
+      }
+      const replayedFromPriorEpoch = String(row.daemon_epoch) !== event.daemonEpoch;
+      if (epochChanged || replayedFromPriorEpoch) {
+        await project?.(tx, { epochChanged, replayedFromPriorEpoch });
       }
       await advanceProjectionCursor(tx, source, event);
       await tx.commit();
@@ -62,7 +81,7 @@ export async function applyProjectionEvent(
         JSON.stringify(event.payload),
       ],
     });
-    await project?.(tx);
+    await project?.(tx, { epochChanged, replayedFromPriorEpoch: false });
     await advanceProjectionCursor(tx, source, event);
     await tx.commit();
     return "applied";

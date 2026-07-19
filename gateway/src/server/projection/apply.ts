@@ -30,7 +30,15 @@ export async function applyCanonicalProjection(
   if (event.version !== 1) {
     throw new Error(`unsupported projection version ${event.version}`);
   }
-  return applyProjectionEvent(db, "daemon", event, async (tx) => {
+  return applyProjectionEvent(db, "daemon", event, async (tx, context) => {
+    if (context.epochChanged) {
+      await tx.execute({
+        sql: `UPDATE runtime_descriptors
+              SET status = 'stopped', updated_at = ?
+              WHERE lower(status) NOT IN ('stopped', 'offline')`,
+        args: [event.occurredAt],
+      });
+    }
     await materialize(tx, event);
   });
 }

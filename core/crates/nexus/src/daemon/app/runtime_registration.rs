@@ -105,6 +105,17 @@ impl AppState {
             sessions
                 .set_agent_id(&session, &descriptor.agent_id)
                 .await?;
+            // A restored runtime is newly visible in this daemon boot just like a freshly bound
+            // runtime. Replay the existing lifecycle fact through the buffered Gateway projection
+            // lane so a Gateway that reconnects after daemon startup can rebuild its roster from
+            // the current boot without polling Core or retaining stale pre-boot state.
+            self.ws
+                .emit(WsEvent::AgentSpawned {
+                    session_id: session,
+                    name: agent.name,
+                    agent_id: Some(descriptor.agent_id),
+                })
+                .await;
             restored += 1;
         }
         Ok(restored)

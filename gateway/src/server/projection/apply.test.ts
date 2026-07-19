@@ -122,4 +122,66 @@ describe("canonical Gateway projection application", () => {
       .toMatchObject([{ daemon_epoch: "boot-2", through_seq: 1 }]);
     expect((await db.execute("SELECT * FROM bus_messages")).rows).toHaveLength(1);
   });
+
+  it("retires stale runtimes and rematerializes current runtimes on a daemon epoch change", async () => {
+    const identity = (agentId: string, name: string, seq: number) => ({
+      eventId: `identity:${agentId}`,
+      daemonEpoch: "boot-1",
+      seq,
+      occurredAt: seq,
+      kind: "identity.upserted" as const,
+      version: 1,
+      payload: { agentId, name, project: "default", defaultHarness: "codex" },
+    });
+    const runtime = (runtimeId: string, agentId: string, seq: number) => ({
+      eventId: `runtime:${runtimeId}`,
+      daemonEpoch: "boot-1",
+      seq,
+      occurredAt: seq,
+      kind: "runtime.upserted" as const,
+      version: 1,
+      payload: {
+        runtimeId,
+        agentId,
+        harness: "codex",
+        transport: "acp",
+        presence: "online",
+        active: true,
+      },
+    });
+
+    const earlIdentity = identity("a_earl", "earl", 1);
+    const earlRuntime = runtime("s_earl", "a_earl", 2);
+    const bobIdentity = identity("a_bob", "Bob", 3);
+    const bobRuntime = runtime("s_bob", "a_bob", 4);
+    for (const event of [earlIdentity, earlRuntime, bobIdentity, bobRuntime]) {
+      await applyCanonicalProjection(db, event);
+    }
+
+    await applyCanonicalProjection(db, {
+      ...bobIdentity,
+      daemonEpoch: "boot-2",
+      seq: 1,
+      occurredAt: 10,
+    });
+    await applyCanonicalProjection(db, {
+      ...bobRuntime,
+      daemonEpoch: "boot-2",
+      seq: 2,
+      occurredAt: 11,
+    });
+
+    expect((await db.execute(
+      "SELECT runtime_id, status FROM runtime_descriptors ORDER BY runtime_id",
+    )).rows).toMatchObject([
+      { runtime_id: "s_bob", status: "online" },
+      { runtime_id: "s_earl", status: "stopped" },
+    ]);
+    expect((await db.execute(
+      "SELECT agent_id FROM identities ORDER BY agent_id",
+    )).rows).toMatchObject([
+      { agent_id: "a_bob" },
+      { agent_id: "a_earl" },
+    ]);
+  });
 });
