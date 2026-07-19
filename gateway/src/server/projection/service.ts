@@ -19,6 +19,10 @@ export interface GatewayProjectionConnection {
   close(): void;
 }
 
+export interface GatewayProjectionServiceOptions {
+  afterReceipt?: (event: CanonicalProjectionEvent) => Promise<unknown>;
+}
+
 /** One projection subscription for the Gateway process, independent of browsers and requests. */
 export class GatewayProjectionService {
   private started?: Promise<void>;
@@ -29,12 +33,14 @@ export class GatewayProjectionService {
     db: Client,
     private readonly connection: GatewayProjectionConnection,
     changeBus: GatewayChangeBus = gatewayChangeBus,
+    options: GatewayProjectionServiceOptions = {},
   ) {
     this.consumer = new GatewayProjectionConsumer(db, {
       ack: (ack) => Promise.resolve(connection.ackProjection(ack)),
     }, {
       afterCommit: async (event, result) => {
         if (result !== "applied") return;
+        if (event.kind === "message.accepted") await options.afterReceipt?.(event);
         for (const key of projectionChangeKeys(event)) changeBus.publish(key);
       },
     });
@@ -69,7 +75,6 @@ export class GatewayProjectionService {
     this.unsubscribe?.();
     this.unsubscribe = undefined;
     await this.chain;
-    this.connection.close();
   }
 }
 
@@ -98,8 +103,10 @@ function addKey(keys: string[], prefix: string, value: unknown): void {
 let processService: Promise<GatewayProjectionService | undefined> | undefined;
 
 /** Start the process singleton when the local daemon stream endpoint is installed. */
-export function startGatewayProjectionService(): Promise<GatewayProjectionService | undefined> {
-  processService ??= startProcessService();
+export function startGatewayProjectionService(
+  options: GatewayProjectionServiceOptions = {},
+): Promise<GatewayProjectionService | undefined> {
+  processService ??= startProcessService(options);
   return processService;
 }
 
@@ -109,16 +116,23 @@ export async function stopGatewayProjectionService(): Promise<void> {
   await service?.close();
 }
 
-async function startProcessService(): Promise<GatewayProjectionService | undefined> {
+async function startProcessService(
+  options: GatewayProjectionServiceOptions,
+): Promise<GatewayProjectionService | undefined> {
   const connection = sharedDaemonPushConnector() as DaemonPushConnection | undefined;
   if (!connection?.subscribeProjections || !connection.ackProjection) return undefined;
   const projectionConnection: GatewayProjectionConnection = {
     ready: connection.ready,
     subscribeProjections: (handlers) => connection.subscribeProjections!(handlers),
     ackProjection: (ack) => connection.ackProjection!(ack),
-    close: () => connection.close(),
+    close: () => undefined,
   };
-  const service = new GatewayProjectionService(await getGatewayStore(), projectionConnection);
+  const service = new GatewayProjectionService(
+    await getGatewayStore(),
+    projectionConnection,
+    gatewayChangeBus,
+    options,
+  );
   await service.start();
   return service;
 }

@@ -547,11 +547,20 @@ impl AppState {
         let realtime: Arc<dyn DispatchPort> = realtime_svc.clone();
 
         // bus
-        let bus_svc = Arc::new(Bus::new(
+        let message_hooks = Arc::new(
+            crate::daemon::services::loop_wiring::GatewayMessageHookPort::new(
+                ws.gateway_stream_publisher()
+                    .map(|publisher| publisher.hook_bridge()),
+                config.hook_gateway_mode,
+                std::time::Duration::from_secs(31),
+            ),
+        );
+        let bus_svc = Arc::new(Bus::new_with_message_hooks(
             store.clone(),
             realtime.clone(),
             identity.clone(),
             events.clone(),
+            message_hooks,
         ));
         let bus: Arc<dyn BusPort> = bus_svc.clone();
 

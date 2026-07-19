@@ -196,8 +196,21 @@ impl AgentTurnExecutionPort for RoutingTurnExec {
 
     fn active_turn_sessions(&self) -> Vec<SessionId> {
         let mut sessions = self.codex.active_turn_sessions();
+        sessions.extend(self.pty.active_turn_sessions());
         sessions.extend(self.acp.active_turn_sessions());
+        sessions.sort_by(|left, right| left.0.cmp(&right.0));
+        sessions.dedup();
         sessions
+    }
+
+    async fn wait_for_turn_completion(&self, recipient: &SessionId) -> PortResult<()> {
+        if self.codex.is_bound(recipient) {
+            self.codex.wait_for_turn_completion(recipient).await
+        } else if self.pty.is_bound(recipient) {
+            self.pty.wait_for_turn_completion(recipient).await
+        } else {
+            self.acp.wait_for_turn_completion(recipient).await
+        }
     }
 
     /// Not routed via this type — app.rs dispatches launch directly to the PTY supervisor or the

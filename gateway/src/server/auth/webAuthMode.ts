@@ -130,7 +130,7 @@ export function isLocalOperatorCaller(
     caller.runtimeId === LOCAL_OPERATOR_MARKER &&
     caller.kind === "human" &&
     caller.tier === "admin" &&
-    caller.credentialFacet === "local" &&
+    (caller.credentialFacet === "local" || caller.credentialFacet === "machine") &&
     !caller.clientKey
   );
 }

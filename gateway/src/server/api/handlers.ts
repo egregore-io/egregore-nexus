@@ -121,6 +121,11 @@ function requireCommands(deps: Parameters<Handler>[0]["deps"]) {
   return deps.commands;
 }
 
+function requireHooks(deps: ApiDeps) {
+  if (!deps.hooks) throw new GatewayError(503, "message hook service is unavailable");
+  return deps.hooks;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // READS (GET → read-view over the lazily-resolved read handle). The read DB is
 // obtained on demand via `await deps.db()` — so a read route is the ONLY thing
@@ -159,6 +164,18 @@ export const getThreadHistory: Handler = async ({ deps, params, req }) => {
     }),
   );
 };
+
+export const getHooks: Handler = async ({ deps, req }) =>
+  ok(await requireHooks(deps).list(req.caller?.tier === Tier.Admin));
+
+export const getHookPublicKey: Handler = async ({ deps }) =>
+  ok(await requireHooks(deps).publicKey());
+
+export const getHookAudit: Handler = async ({ deps, req }) =>
+  ok(await requireHooks(deps).audit(
+    intParam(req.query.limit) ?? 100,
+    req.caller?.tier === Tier.Admin,
+  ));
 
 export const getDmHistory: Handler = async ({ deps, params, req }) => {
   if (deps.canonicalDb) {

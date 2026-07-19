@@ -239,6 +239,18 @@ nexus gateway delivery-mode set best-effort
 Buffered mode retains a bounded boot-epoch projection backlog until Gateway acknowledgement.
 Best-effort mode does not retain disconnected Gateway projections.
 
+Read-only hook inspection:
+
+```bash
+nexus gateway hooks list
+nexus gateway hooks list --json
+```
+
+The command reports the active Gateway hook generation, registered `before_send` and
+`after_receipt` handlers, and manifest errors. Hook configuration is file-owned under
+`$NEXUS_HOME/gateway/hooks.d`; the CLI does not add, edit, enable, or remove hook programs. See
+[Message hooks](hooks.md).
+
 ## Webconsole lifecycle
 
 ```bash

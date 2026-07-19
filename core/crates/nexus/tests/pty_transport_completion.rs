@@ -33,6 +33,37 @@ struct ContextAcceptedHarness {
     calls: AtomicUsize,
 }
 
+struct BlockingContextAcceptedHarness {
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+impl Default for BlockingContextAcceptedHarness {
+    fn default() -> Self {
+        Self {
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl HarnessInput for BlockingContextAcceptedHarness {
+    async fn send_turn(&self, _text: &str) -> Result<(), String> {
+        self.started.add_permits(1);
+        self.release
+            .acquire()
+            .await
+            .map_err(|error| error.to_string())?
+            .forget();
+        Ok(())
+    }
+
+    fn turn_completion_evidence(&self) -> TurnCompletionEvidence {
+        TurnCompletionEvidence::ContextAccepted
+    }
+}
+
 #[async_trait]
 impl HarnessInput for ContextAcceptedHarness {
     async fn send_turn(&self, _text: &str) -> Result<(), String> {
@@ -127,4 +158,39 @@ async fn observed_inject_rejects_input_acceptance_without_context_evidence() {
         0,
         "unsupported acceptance-only paths must fail before bytes reach the harness"
     );
+}
+
+#[tokio::test]
+async fn pty_turn_activity_is_observable_until_authoritative_completion() {
+    let session = SessionId("s_active_pty".into());
+    let transport = PtyTransport::default();
+    let harness = Arc::new(BlockingContextAcceptedHarness::default());
+    transport.bind(session.clone(), harness.clone() as Arc<dyn HarnessInput>);
+
+    let turn_transport = transport.clone();
+    let turn_session = session.clone();
+    let turn = tokio::spawn(async move {
+        turn_transport
+            .prompt(&turn_session, "hold this PTY turn".into())
+            .await
+    });
+    harness
+        .started
+        .acquire()
+        .await
+        .expect("blocking harness start semaphore remains open")
+        .forget();
+
+    assert_eq!(transport.active_turn_sessions(), vec![session.clone()]);
+    let wait_transport = transport.clone();
+    let wait_session = session.clone();
+    let completion =
+        tokio::spawn(async move { wait_transport.wait_for_turn_completion(&wait_session).await });
+    tokio::task::yield_now().await;
+    assert!(!completion.is_finished());
+
+    harness.release.add_permits(1);
+    turn.await.unwrap().unwrap();
+    completion.await.unwrap().unwrap();
+    assert!(transport.active_turn_sessions().is_empty());
 }

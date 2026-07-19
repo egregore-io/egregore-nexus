@@ -3,8 +3,10 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use nexus_agent::{
-    Adapter, AdapterProviderLimit, AdapterRegistry, Agent, MockAdapter, StreamEvent,
+    Adapter, AdapterInjectError, AdapterProviderLimit, AdapterRegistry, Agent, MockAdapter,
+    StreamEvent,
 };
+use nexus_common::NexusError;
 use nexus_contracts::{
     codes, AgentTurnExecutionPort, AgentUpdateKind, AssignProjectResponse, BatchCounts,
     BatchMessage, Caller, ContractError, EventSink, HarnessId, HeartbeatResponse, IdentityPort,
@@ -125,6 +127,94 @@ fn agent_with_bound_mock() -> (Agent, MockAdapter, RecordingSink, SessionId) {
         false,
     );
     (agent, mock, sink, session)
+}
+
+struct BlockingAdapter {
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+impl Default for BlockingAdapter {
+    fn default() -> Self {
+        Self {
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl Adapter for BlockingAdapter {
+    async fn open_session(&self) -> Result<(), NexusError> {
+        Ok(())
+    }
+
+    async fn resume(&self, _resume_key: &str) -> Result<(), NexusError> {
+        Ok(())
+    }
+
+    async fn inject(&self, _prompt: String) -> Result<(), AdapterInjectError> {
+        self.started.add_permits(1);
+        self.release
+            .acquire()
+            .await
+            .expect("blocking adapter release semaphore remains open")
+            .forget();
+        Ok(())
+    }
+
+    async fn stream_updates(&self) -> Result<Vec<StreamEvent>, NexusError> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn acp_turn_activity_is_observable_until_authoritative_completion() {
+    let registry = AdapterRegistry::with_builtins();
+    let agent = Agent::new(
+        registry,
+        Arc::new(StubIdentity),
+        Arc::new(RecordingSink::default()),
+    );
+    let adapter = Arc::new(BlockingAdapter::default());
+    let session = SessionId("s_active_acp".into());
+    agent.bind_session(
+        session.clone(),
+        "active-acp",
+        "demo",
+        adapter.clone(),
+        false,
+    );
+
+    let turn_agent = agent.clone();
+    let turn_session = session.clone();
+    let turn = tokio::spawn(async move {
+        turn_agent
+            .inject_turn(
+                &turn_session,
+                &batch(vec![dm("ana", Kind::Agent, "hold")], vec![]),
+            )
+            .await
+    });
+    adapter
+        .started
+        .acquire()
+        .await
+        .expect("blocking adapter start semaphore remains open")
+        .forget();
+
+    assert_eq!(agent.active_turn_sessions(), vec![session.clone()]);
+    let wait_agent = agent.clone();
+    let wait_session = session.clone();
+    let completion =
+        tokio::spawn(async move { wait_agent.wait_for_turn_completion(&wait_session).await });
+    tokio::task::yield_now().await;
+    assert!(!completion.is_finished());
+
+    adapter.release.add_permits(1);
+    turn.await.unwrap().unwrap();
+    completion.await.unwrap().unwrap();
+    assert!(agent.active_turn_sessions().is_empty());
 }
 
 #[tokio::test]

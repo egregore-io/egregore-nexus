@@ -252,6 +252,66 @@ describe("/api/mcp network MCP", () => {
     expect(caller.name).not.toBe("lens-bridge");
   });
 
+  it("carries first-boot operator authority through command ingress", async () => {
+    let idSeq = 0;
+    const apiDispatch = makeApiDispatch({
+      db: async () => db,
+      authMode: "local",
+      now: () => 2_000_000,
+      genId: () => `operator_authority_${++idSeq}`,
+      randomSecret: (prefix) => `${prefix}_secret_${++idSeq}`,
+    });
+    const issue = await apiDispatch(new Request("http://localhost/api/v1/auth/operator-token", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: "Alex Morgan",
+        scopes: ["message:send"],
+        ttlMs: 60_000,
+      }),
+    }));
+    const issued = await issue.json() as { accessToken: string };
+    const daemonCommand = vi.fn(async () => ({ messageId: "m_operator_authority" }));
+    const mcpDispatch = makeMcpDispatch({
+      db: async () => db,
+      now: () => 2_000_001,
+      commandIngress: { daemonCommand },
+    });
+
+    const response = await mcpDispatch(new Request("http://localhost/api/mcp", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${issued.accessToken}`,
+      },
+      body: rpc("tools/call", {
+        name: "post",
+        arguments: { thread: "backend", message: "operator authority survives" },
+      }),
+    }));
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      result: { isError: false },
+    });
+    expect(daemonCommand).toHaveBeenCalledWith(
+      "message.post.send",
+      {
+        to: { verb: "post", thread: "backend" },
+        body: "operator authority survives",
+      },
+      expect.objectContaining({
+        name: "Alex Morgan",
+        project: "default",
+        sessionId: "local-operator",
+        runtimeId: "local-operator",
+        kind: Kind.Human,
+        tier: Tier.Admin,
+      }),
+      expect.any(Object),
+    );
+  });
+
   it("keeps operator bearer bootstrap local-only and named", async () => {
     const remoteDispatch = makeApiDispatch({
       db: async () => db,

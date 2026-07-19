@@ -11,14 +11,14 @@ describe("public gateway package contract", () => {
     const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 
     expect(manifest.name).toBe("@egregore/nexus-gateway");
-    expect(manifest.version).toBe("0.1.4");
+    expect(manifest.version).toBe("0.1.5");
     expect(manifest.private).toBe(false);
     expect(manifest.license).toBe("Apache-2.0");
     expect(manifest.engines?.node).toBe(">=20");
     expect(manifest.bin?.nexus).toBe("scripts/nexus.mjs");
     expect(manifest.bin?.["nexus-gateway"]).toBe("scripts/nexus-gateway.mjs");
     expect(manifest.bin?.["nexus-webui"]).toBe("webconsole/bin/nexus-webui.mjs");
-    expect(manifest.dependencies?.["@egregore/nexus-cli"]).toBe("0.1.4");
+    expect(manifest.dependencies?.["@egregore/nexus-cli"]).toBe("0.1.5");
     expect(manifest.files).toEqual([
       "dist-gateway/headless.mjs",
       "scripts/gateway-serve-impl.mjs",

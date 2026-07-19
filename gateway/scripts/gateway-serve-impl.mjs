@@ -130,10 +130,22 @@ async function startPackagedGateway(port) {
     );
   }
   const {
+    closeSharedDaemonPushConnector,
+    startGatewayHookService,
     startGatewayProjectionService,
+    stopGatewayHookService,
     stopGatewayProjectionService,
   } = await import(pathToFileURL(projectionBundle).href);
-  await startGatewayProjectionService();
+  const hooks = await startGatewayHookService();
+  try {
+    await startGatewayProjectionService({
+      afterReceipt: (event) => hooks.afterReceipt(event),
+    });
+  } catch (error) {
+    await stopGatewayHookService();
+    closeSharedDaemonPushConnector();
+    throw error;
+  }
   const distDir = await snapshotDistForRun();
   servingClientDir = join(distDir, "client");
   const handler = await loadPackagedServerHandler(join(distDir, "server/server.js"));
@@ -158,6 +170,8 @@ async function startPackagedGateway(port) {
     async stop() {
       await closeHttpServerWithDeadline(server, sockets, GATEWAY_CLOSE_TIMEOUT_MS);
       await stopGatewayProjectionService();
+      await stopGatewayHookService();
+      closeSharedDaemonPushConnector();
     },
   };
 }

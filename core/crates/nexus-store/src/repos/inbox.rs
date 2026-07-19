@@ -18,7 +18,7 @@ use libsql::params;
 use nexus_common::{new_message_id, now, NexusError};
 use nexus_contracts::ids::{MessageId, SessionId};
 use nexus_contracts::message::Message;
-use nexus_contracts::{GatewayProjectionEffect, GatewayProjectionKind};
+use nexus_contracts::{DeliveryTiming, GatewayProjectionEffect, GatewayProjectionKind};
 
 use crate::error::{store_err, store_msg};
 use crate::repos::messages::Messages;
@@ -96,6 +96,14 @@ pub struct DeadLetterMutation {
 pub struct MessageDeliveryTarget {
     pub recipient_session: Option<SessionId>,
     pub recipient_agent_id: Option<String>,
+}
+
+/// One unsettled recipient row paired with its canonical message and explicit scheduling policy.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimedMessage {
+    pub in_flight_id: String,
+    pub message: Message,
+    pub timing: DeliveryTiming,
 }
 
 /// Persistence for the `in_flight` delivery queue.
@@ -178,18 +186,32 @@ impl<'a> Inbox<'a> {
         message: &MessageId,
         recipient: &SessionId,
     ) -> Result<(), NexusError> {
+        self.enqueue_with_timing(message, recipient, DeliveryTiming::default())
+            .await
+    }
+
+    /// Write one pending recipient edge with an explicit delivery timing. An idempotent re-enqueue
+    /// never rewrites the original policy.
+    pub async fn enqueue_with_timing(
+        &self,
+        message: &MessageId,
+        recipient: &SessionId,
+        timing: DeliveryTiming,
+    ) -> Result<(), NexusError> {
         let in_flight_id = new_message_id().0; // a fresh opaque id (prefixed)
         let recipient_agent_id = self.agent_id_for_runtime(recipient).await?;
         self.store
             .conn
             .execute(
                 "INSERT OR IGNORE INTO in_flight (in_flight_id, message_id, recipient_session, \
-                 recipient_agent_id, state) VALUES (?1, ?2, ?3, ?4, 'pending')",
+                 recipient_agent_id, state, delivery_timing) \
+                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
                 params![
                     in_flight_id,
                     message.0.clone(),
                     recipient.0.clone(),
-                    recipient_agent_id
+                    recipient_agent_id,
+                    timing.as_str()
                 ],
             )
             .await
@@ -205,6 +227,16 @@ impl<'a> Inbox<'a> {
         message: &MessageId,
         recipient_agent_id: &str,
     ) -> Result<(), NexusError> {
+        self.enqueue_for_agent_with_timing(message, recipient_agent_id, DeliveryTiming::default())
+            .await
+    }
+
+    pub async fn enqueue_for_agent_with_timing(
+        &self,
+        message: &MessageId,
+        recipient_agent_id: &str,
+        timing: DeliveryTiming,
+    ) -> Result<(), NexusError> {
         let in_flight_id = new_message_id().0;
         let recipient_session = AgentRuntimes::new(self.store)
             .active_for_agent(recipient_agent_id)
@@ -214,12 +246,14 @@ impl<'a> Inbox<'a> {
             .conn
             .execute(
                 "INSERT OR IGNORE INTO in_flight (in_flight_id, message_id, recipient_session, \
-                 recipient_agent_id, state) VALUES (?1, ?2, ?3, ?4, 'pending')",
+                 recipient_agent_id, state, delivery_timing) \
+                 VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
                 params![
                     in_flight_id,
                     message.0.clone(),
                     recipient_session,
-                    recipient_agent_id
+                    recipient_agent_id,
+                    timing.as_str()
                 ],
             )
             .await
@@ -236,7 +270,21 @@ impl<'a> Inbox<'a> {
         _project: &str,
         limit: u32,
     ) -> Result<Vec<(String, Message)>, NexusError> {
-        self.queued_for(recipient, limit, true).await
+        Ok(self
+            .pending_timed_for(recipient, _project, limit)
+            .await?
+            .into_iter()
+            .map(|row| (row.in_flight_id, row.message))
+            .collect())
+    }
+
+    pub async fn pending_timed_for(
+        &self,
+        recipient: &SessionId,
+        _project: &str,
+        limit: u32,
+    ) -> Result<Vec<TimedMessage>, NexusError> {
+        self.queued_timed_for(recipient, limit, true).await
     }
 
     /// The exact rows already included in a recipient's latest notification boundary.
@@ -250,15 +298,29 @@ impl<'a> Inbox<'a> {
         _project: &str,
         limit: u32,
     ) -> Result<Vec<(String, Message)>, NexusError> {
-        self.queued_for(recipient, limit, false).await
+        Ok(self
+            .notified_timed_for(recipient, _project, limit)
+            .await?
+            .into_iter()
+            .map(|row| (row.in_flight_id, row.message))
+            .collect())
     }
 
-    async fn queued_for(
+    pub async fn notified_timed_for(
+        &self,
+        recipient: &SessionId,
+        _project: &str,
+        limit: u32,
+    ) -> Result<Vec<TimedMessage>, NexusError> {
+        self.queued_timed_for(recipient, limit, false).await
+    }
+
+    async fn queued_timed_for(
         &self,
         recipient: &SessionId,
         limit: u32,
         include_pending: bool,
-    ) -> Result<Vec<(String, Message)>, NexusError> {
+    ) -> Result<Vec<TimedMessage>, NexusError> {
         let agent_id = self.agent_id_for_runtime(recipient).await?;
         if self
             .runtime_is_superseded(recipient, agent_id.as_deref())
@@ -277,7 +339,7 @@ impl<'a> Inbox<'a> {
             .query(
                 &format!(
                     "SELECT f.in_flight_id, m.message_id, m.from_name, m.kind, m.thread_id, m.topic, \
-                 m.summary, m.body, m.provenance, m.project, m.created_at \
+                 m.summary, m.body, m.provenance, m.project, m.created_at, f.delivery_timing \
                  FROM in_flight f JOIN messages m ON m.message_id = f.message_id \
                  WHERE ((f.recipient_session = ?1 AND EXISTS ( \
                    SELECT 1 FROM sessions s WHERE s.session_id = ?1 \
@@ -295,7 +357,17 @@ impl<'a> Inbox<'a> {
         while let Some(row) = rows.next().await.map_err(store_err)? {
             let in_flight_id = crate::repos::sessions::get_text(&row, 0)?;
             let msg = Messages::row_to_message_joined(&row)?;
-            out.push((in_flight_id, msg));
+            let timing_wire = crate::repos::sessions::get_text(&row, 11)?;
+            let timing = DeliveryTiming::from_str(&timing_wire).ok_or_else(|| {
+                NexusError::Store(format!(
+                    "invalid in_flight delivery_timing value {timing_wire:?}"
+                ))
+            })?;
+            out.push(TimedMessage {
+                in_flight_id,
+                message: msg,
+                timing,
+            });
         }
         Ok(out)
     }

@@ -7,13 +7,19 @@
 use nexus_common::Config;
 use nexus_contracts::ids::{MessageId, SessionId};
 use nexus_contracts::message::Message;
-use nexus_contracts::{BatchCounts, BatchMessage, NexusBatch, Scope};
-use nexus_store::repos::inbox::Inbox;
+use nexus_contracts::{BatchCounts, BatchMessage, DeliveryTiming, NexusBatch, Scope};
+use nexus_store::repos::inbox::{Inbox, TimedMessage};
 
 use crate::error::DispatchResult;
 
 /// Builds drain-once [`NexusBatch`]es from a recipient's pending in-flight queue.
 pub struct InboxDrainer;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimedNexusBatch {
+    pub timing: DeliveryTiming,
+    pub batch: NexusBatch,
+}
 
 impl InboxDrainer {
     /// Drain a recipient's pending queue **once** into a single [`NexusBatch`].
@@ -56,6 +62,51 @@ impl InboxDrainer {
         Ok(Self::batch_from_rows(&notified, limit, preview_chars))
     }
 
+    /// Drain one same-policy prefix from the notified queue. A timing boundary is a batch boundary:
+    /// policies are never collapsed into one harness operation.
+    pub async fn drain_notified_timed_once(
+        inbox: &Inbox<'_>,
+        session: &SessionId,
+        project: &str,
+        limit: u32,
+        preview_chars: u32,
+    ) -> DispatchResult<Option<TimedNexusBatch>> {
+        let rows = inbox
+            .notified_timed_for(session, project, limit.saturating_add(1))
+            .await?;
+        let Some(timing) = rows.first().map(|row| row.timing) else {
+            return Ok(None);
+        };
+        let selected = rows
+            .iter()
+            .take_while(|row| row.timing == timing)
+            .take(limit as usize)
+            .cloned()
+            .collect::<Vec<_>>();
+        let has_more = rows.len() > selected.len();
+        Ok(Some(TimedNexusBatch {
+            timing,
+            batch: Self::batch_from_timed_rows(
+                &selected,
+                has_more.then(|| rows[selected.len()].clone()),
+                preview_chars,
+            ),
+        }))
+    }
+
+    fn batch_from_timed_rows(
+        rows: &[TimedMessage],
+        lookahead: Option<TimedMessage>,
+        preview_chars: u32,
+    ) -> NexusBatch {
+        let tuples = rows
+            .iter()
+            .map(|row| (row.in_flight_id.clone(), row.message.clone()))
+            .collect::<Vec<_>>();
+        let lookahead = lookahead.map(|row| (row.in_flight_id, row.message));
+        Self::batch_from_selected(&tuples, lookahead.as_ref(), preview_chars)
+    }
+
     fn batch_from_rows(
         pending: &[(String, Message)],
         limit: u32,
@@ -69,7 +120,14 @@ impl InboxDrainer {
         };
         let kept = &pending[..kept_n];
         let lookahead = pending.get(kept_n);
+        Self::batch_from_selected(kept, lookahead, preview_chars)
+    }
 
+    fn batch_from_selected(
+        kept: &[(String, Message)],
+        lookahead: Option<&(String, Message)>,
+        preview_chars: u32,
+    ) -> NexusBatch {
         let mut dms = Vec::new();
         let mut threads = Vec::new();
         let mut dm_message_ids = Vec::new();

@@ -33,16 +33,16 @@ use nexus_contracts::{
     InboxSubscribeResponse, InboxSubscriptionAckRequest, InboxSubscriptionBatch,
     InboxSubscriptionNextRequest, InboxSubscriptionNextResponse, InboxSubscriptionStatusResponse,
     InboxUnsubscribeRequest, JoinThreadRequest, LeaveThreadRequest, MemberListRequest,
-    MetadataSetRequest, MonitorRequest, NexusBatch, NotifyRequest, NotifySendRequest, NotifyTarget,
-    PushRequest, ReadRequest, RegisterRequest, RemoveRequest, RemoveResponse, RenameThreadRequest,
-    Request, Response, RouteForwardRequest, RpcError, SearchRequest, SendRequest, SourceRef,
-    SourceRegisterRequest, SpawnRequest, StatusRequest, SteerRequest, SubscribeRequest,
-    ThreadMembersRequest, Tier, UnsubscribeRequest, WsEvent,
+    MessageMetadataMergeRequest, MetadataSetRequest, MonitorRequest, NexusBatch, NotifyRequest,
+    NotifySendRequest, NotifyTarget, PushRequest, ReadRequest, RegisterRequest, RemoveRequest,
+    RemoveResponse, RenameThreadRequest, Request, Response, RouteForwardRequest, RpcError,
+    SearchRequest, SendRequest, SourceRef, SourceRegisterRequest, SpawnRequest, StatusRequest,
+    SteerRequest, SubscribeRequest, ThreadMembersRequest, Tier, UnsubscribeRequest, WsEvent,
 };
 use nexus_store::repos::{
     caller_subscription_id, subscription_now, Agents, DeadLetterFilter, DeadLetterMutation,
     DeadLetterSelector, DeveloperEvents, Inbox, InboxSubscriptionBatchRow, InboxSubscriptions,
-    NewInboxSubscription, Sessions,
+    Metadata, NewInboxSubscription, Sessions,
 };
 use nexus_store::types::SessionRow;
 
@@ -690,6 +690,23 @@ async fn route_request_inner(
                 .await
                 .map_err(|e| contract_to_rpc(&e))?;
             Ok(serde_json::to_value(out).unwrap())
+        }
+        "hook.metadata.merge" => {
+            let _caller = require_admin(caller)?;
+            let r: MessageMetadataMergeRequest = parse(p)?;
+            let metadata = Metadata::new(&state.store)
+                .merge_message_hook_metadata(
+                    &r.message_id.0,
+                    &r.invocation_id,
+                    &serde_json::Value::Object(r.metadata),
+                )
+                .await
+                .map_err(|e| contract_to_rpc(&e.to_contract_error()))?;
+            Ok(json!({
+                "messageId": r.message_id,
+                "invocationId": r.invocation_id,
+                "metadata": metadata,
+            }))
         }
 
         // ---- Durable agent identity/runtime lifecycle ----

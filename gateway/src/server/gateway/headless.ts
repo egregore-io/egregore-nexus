@@ -5,17 +5,30 @@ import { dispatchNetworkMcp } from "../../routes/api/mcp";
 import { dispatchApiV1 } from "../../routes/api/v1/$";
 import { observeScoped } from "../../routes/api/agui.observe";
 import { attachAguiWsUpgrade } from "../agui/ws.mjs";
+import { closeSharedDaemonPushConnector } from "../agui/daemonPushRelay.mjs";
 import {
   startGatewayProjectionService,
   stopGatewayProjectionService,
+  type GatewayProjectionServiceOptions,
 } from "../projection/service";
+import {
+  startGatewayHookService,
+  stopGatewayHookService,
+  type GatewayHookService,
+} from "../hooks/service";
 import { handleSessionEvents } from "../stream/sessionEvents";
 import { dispatchWebuiApi, isWebuiApiPath } from "./webuiApi";
 import { createGatewayStore, getGatewayStore } from "../store/client";
 import { gatewayStoreConfig } from "../store/config";
 import { CURRENT_GATEWAY_SCHEMA_VERSION } from "../store/migrations";
 
-export { startGatewayProjectionService, stopGatewayProjectionService };
+export {
+  closeSharedDaemonPushConnector,
+  startGatewayHookService,
+  startGatewayProjectionService,
+  stopGatewayHookService,
+  stopGatewayProjectionService,
+};
 
 /** Apply the local canonical-store schema without starting REST, WS, MCP, or WebUI listeners. */
 export async function migrateHeadlessGatewayStore(
@@ -36,6 +49,22 @@ export interface HeadlessGatewayDispatchers {
   webuiApi: (request: Request) => Promise<Response>;
   sessionEvents?: (request: Request, sessionId: string) => Promise<Response> | Response;
 }
+
+export interface HeadlessGatewayLifecycle {
+  startHooks(): Promise<Pick<GatewayHookService, "afterReceipt"> | undefined>;
+  startProjection(options: GatewayProjectionServiceOptions): Promise<unknown>;
+  stopProjection(): Promise<void>;
+  stopHooks(): Promise<void>;
+  stopConnection?(): Promise<void> | void;
+}
+
+const DEFAULT_LIFECYCLE: HeadlessGatewayLifecycle = {
+  startHooks: startGatewayHookService,
+  startProjection: startGatewayProjectionService,
+  stopProjection: stopGatewayProjectionService,
+  stopHooks: stopGatewayHookService,
+  stopConnection: async () => closeSharedDaemonPushConnector(),
+};
 
 const DEFAULT_DISPATCHERS: HeadlessGatewayDispatchers = {
   aguiObserve: (request) => observeScoped(request, { canonicalDb: getGatewayStore }),
@@ -88,18 +117,45 @@ export async function handleHeadlessGatewayRequest(
  */
 export async function createHeadlessGatewayServer(
   dispatchers: HeadlessGatewayDispatchers = DEFAULT_DISPATCHERS,
+  lifecycle: HeadlessGatewayLifecycle = DEFAULT_LIFECYCLE,
 ) {
-  await startGatewayProjectionService();
+  const hooks = await lifecycle.startHooks();
+  try {
+    await lifecycle.startProjection({
+      ...(hooks ? { afterReceipt: (event) => hooks.afterReceipt(event) } : {}),
+    });
+  } catch (error) {
+    await lifecycle.stopHooks();
+    await lifecycle.stopConnection?.();
+    throw error;
+  }
   const fetchHandler = (request: Request) =>
     handleHeadlessGatewayRequest(request, dispatchers);
   const server = createServer((req, res) => {
     void handleNodeRequest(req, res, dispatchers);
   });
   await attachAguiWsUpgrade(server, { fetchHandler });
+  let cleanup: Promise<void> | undefined;
+  const stopServices = () => cleanup ??= lifecycle.stopProjection()
+    .then(() => lifecycle.stopHooks())
+    .then(() => lifecycle.stopConnection?.())
+    .then(() => undefined);
   server.once("close", () => {
-    void stopGatewayProjectionService();
+    void stopServices()
+      .catch((error) => {
+        process.stderr.write(`Nexus Gateway shutdown failed: ${String(error)}\n`);
+      });
   });
-  return server;
+  return Object.assign(server, {
+    async shutdown(): Promise<void> {
+      if (server.listening) {
+        await new Promise<void>((resolve, reject) => {
+          server.close((error) => error ? reject(error) : resolve());
+        });
+      }
+      await stopServices();
+    },
+  });
 }
 
 async function main(): Promise<void> {
@@ -109,6 +165,16 @@ async function main(): Promise<void> {
   server.listen(port, host, () => {
     process.stdout.write(`Nexus headless gateway listening on http://${host}:${port}\n`);
   });
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.once(signal, () => {
+      void server.shutdown()
+        .then(() => process.exit(0))
+        .catch((error) => {
+          process.stderr.write(`Nexus Gateway shutdown failed: ${String(error)}\n`);
+          process.exit(1);
+        });
+    });
+  }
 }
 
 async function handleNodeRequest(

@@ -23,8 +23,8 @@ use std::sync::Arc;
 use nexus_common::render_injected_turn_for;
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::{
-    AgentTurnExecutionPort, AgentUpdateKind, EventSink, InjectError, NexusBatch, SteerCapability,
-    WsEvent,
+    AgentTurnExecutionPort, AgentUpdateKind, ContractError, DeliveryTiming, EventSink, InjectError,
+    NexusBatch, WsEvent,
 };
 use nexus_store::repos::inbox::{
     Inbox, COMPLETION_TIMEOUT_ERROR_CODE, CONTRACT_ERROR_CODE, OPERATOR_ACTION_ERROR_CODE,
@@ -34,6 +34,7 @@ use nexus_store::Store;
 use tokio::task::JoinHandle;
 
 use crate::bell::Bell;
+use crate::delivery_timing::{delivery_action, DeliveryAction, DeliveryTimingError};
 use crate::drain::InboxDrainer;
 use crate::wake_policy::{AgentState, WakeDecision, WakePolicy};
 
@@ -144,7 +145,7 @@ async fn run(session: SessionId, deps: LoopDeps) {
                 tracing::error!(%error, %session, "mark_notified failed; refusing to inject");
                 break;
             }
-            let batch = match InboxDrainer::drain_notified_once(
+            let timed_batch = match InboxDrainer::drain_notified_timed_once(
                 &inbox,
                 &session,
                 &deps.project,
@@ -153,7 +154,8 @@ async fn run(session: SessionId, deps: LoopDeps) {
             )
             .await
             {
-                Ok(b) => b,
+                Ok(Some(batch)) => batch,
+                Ok(None) => break,
                 Err(e) => {
                     tracing::error!(error = %e, session = %session, "drain failed");
                     break;
@@ -166,9 +168,11 @@ async fn run(session: SessionId, deps: LoopDeps) {
                 target: "nexus_dispatch::loop",
                 session = %session,
                 project = %deps.project,
-                count = batch.counts.total,
+                count = timed_batch.batch.counts.total,
                 "drain_once result"
             );
+            let timing = timed_batch.timing;
+            let batch = timed_batch.batch;
             if batch.counts.total == 0 {
                 break;
             }
@@ -181,22 +185,60 @@ async fn run(session: SessionId, deps: LoopDeps) {
                 "injecting turn"
             );
 
+            let turn_active = has_active_turn(&session, &deps);
+            match delivery_action(
+                timing,
+                turn_active,
+                deps.turn_exec.steer_capability(&session),
+            ) {
+                Ok(DeliveryAction::WaitForTurnBoundary)
+                | Ok(DeliveryAction::WaitForFinalTurnCompletion) => {
+                    if let Err(error) = deps.turn_exec.wait_for_turn_completion(&session).await {
+                        if !claim_batch(&session, &deps, &inbox, &batch).await {
+                            break;
+                        }
+                        handle_inject_error(
+                            &session,
+                            &deps,
+                            &inbox,
+                            &batch,
+                            InjectError::Contract(error),
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+                Ok(DeliveryAction::NativeSteer) | Ok(DeliveryAction::InterruptAndSend) => {
+                    if !claim_batch(&session, &deps, &inbox, &batch).await {
+                        break;
+                    }
+                    match steer_claimed_batch(&session, &deps, &inbox, &batch).await {
+                        SteerAttempt::Delivered | SteerAttempt::TurnEnded => continue,
+                        SteerAttempt::Failed => break,
+                    }
+                }
+                Err(error) => {
+                    if !claim_batch(&session, &deps, &inbox, &batch).await {
+                        break;
+                    }
+                    handle_inject_error(
+                        &session,
+                        &deps,
+                        &inbox,
+                        &batch,
+                        InjectError::Contract(delivery_timing_contract_error(timing, error)),
+                    )
+                    .await;
+                    continue;
+                }
+                Ok(DeliveryAction::StartTurn) => {}
+            }
+
             // Persist the one permitted attempt before crossing the harness boundary. If the
             // daemon exits after this point, boot recovery turns `injecting` into the terminal
             // `delivery_outcome_unknown`; it never guesses that retrying is safe.
             if !claim_batch(&session, &deps, &inbox, &batch).await {
                 break;
-            }
-
-            // A Codex app-server turn may already be active because an operator or a previous
-            // delivery started it. Native steer is non-destructive context admission, so use it
-            // before attempting a second turn/start. Interrupt-and-send is intentionally excluded:
-            // automatic bus mail must never cancel ongoing developer work.
-            if has_active_native_turn(&session, &deps) {
-                match steer_claimed_batch(&session, &deps, &inbox, &batch).await {
-                    SteerAttempt::Delivered | SteerAttempt::TurnEnded => continue,
-                    SteerAttempt::Failed => break,
-                }
             }
 
             // Inject the whole batch as a single turn. The await is BOUNDED: adapters that wait
@@ -254,11 +296,11 @@ async fn run(session: SessionId, deps: LoopDeps) {
                         mark_batch_timeout(&session, &deps, &inbox, &batch).await;
                         break true;
                     }
-                    _ = deps.bell.wait(&session), if native_steer_capable(&session, &deps) => {
+                    _ = deps.bell.wait(&session) => {
                         // The current completion future stays alive while the new durable batch is
                         // admitted into the active turn. Dropping it here can block delivery for
                         // the full completion timeout.
-                        steer_next_pending_batch(&session, &deps, &inbox).await;
+                        handle_pending_during_active_turn(&session, &deps, &inbox).await;
                     }
                 }
             };
@@ -282,17 +324,11 @@ enum SteerAttempt {
     Failed,
 }
 
-fn native_steer_capable(session: &SessionId, deps: &LoopDeps) -> bool {
-    deps.turn_exec.steer_capability(session) == SteerCapability::NativeSteer
-}
-
-fn has_active_native_turn(session: &SessionId, deps: &LoopDeps) -> bool {
-    native_steer_capable(session, deps)
-        && deps
-            .turn_exec
-            .active_turn_sessions()
-            .iter()
-            .any(|active| active == session)
+fn has_active_turn(session: &SessionId, deps: &LoopDeps) -> bool {
+    deps.turn_exec
+        .active_turn_sessions()
+        .iter()
+        .any(|active| active == session)
 }
 
 async fn claim_batch(
@@ -384,12 +420,16 @@ async fn mark_batch_timeout(
     }
 }
 
-async fn steer_next_pending_batch(session: &SessionId, deps: &LoopDeps, inbox: &Inbox<'_>) {
+async fn handle_pending_during_active_turn(
+    session: &SessionId,
+    deps: &LoopDeps,
+    inbox: &Inbox<'_>,
+) {
     if let Err(error) = inbox.mark_notified(session).await {
         tracing::error!(%error, %session, "mid-turn mark_notified failed");
         return;
     }
-    let batch = match InboxDrainer::drain_notified_once(
+    let timed_batch = match InboxDrainer::drain_notified_timed_once(
         inbox,
         session,
         &deps.project,
@@ -398,17 +438,56 @@ async fn steer_next_pending_batch(session: &SessionId, deps: &LoopDeps, inbox: &
     )
     .await
     {
-        Ok(batch) if batch.counts.total > 0 => batch,
+        Ok(Some(batch)) if batch.batch.counts.total > 0 => batch,
         Ok(_) => return,
         Err(error) => {
             tracing::error!(%error, %session, "mid-turn drain failed");
             return;
         }
     };
-    if !claim_batch(session, deps, inbox, &batch).await {
-        return;
+    let timing = timed_batch.timing;
+    let batch = timed_batch.batch;
+    match delivery_action(timing, true, deps.turn_exec.steer_capability(session)) {
+        Ok(DeliveryAction::NativeSteer) | Ok(DeliveryAction::InterruptAndSend) => {
+            if claim_batch(session, deps, inbox, &batch).await {
+                let _ = steer_claimed_batch(session, deps, inbox, &batch).await;
+            }
+        }
+        Ok(DeliveryAction::WaitForTurnBoundary)
+        | Ok(DeliveryAction::WaitForFinalTurnCompletion) => {
+            // The current turn future is still being polled by the caller. Leave these rows
+            // notified; its terminal branch immediately re-drains them.
+        }
+        Err(error) => {
+            if claim_batch(session, deps, inbox, &batch).await {
+                handle_inject_error(
+                    session,
+                    deps,
+                    inbox,
+                    &batch,
+                    InjectError::Contract(delivery_timing_contract_error(timing, error)),
+                )
+                .await;
+            }
+        }
+        Ok(DeliveryAction::StartTurn) => unreachable!("the caller owns an active turn"),
     }
-    let _ = steer_claimed_batch(session, deps, inbox, &batch).await;
+}
+
+fn delivery_timing_contract_error(
+    timing: DeliveryTiming,
+    error: DeliveryTimingError,
+) -> ContractError {
+    let message = match error {
+        DeliveryTimingError::InterruptUnsupported => format!(
+            "delivery timing {} is unsupported by this harness while a turn is active",
+            timing.as_str()
+        ),
+    };
+    ContractError {
+        code: nexus_contracts::codes::DELIVERY_TIMING_UNSUPPORTED,
+        message,
+    }
 }
 
 async fn steer_claimed_batch(
@@ -429,7 +508,7 @@ async fn steer_claimed_batch(
                 target: "nexus_dispatch::loop",
                 session = %session,
                 count = batch.counts.total,
-                "native steer accepted; marking delivered"
+                "active-turn delivery accepted; marking delivered"
             );
             mark_batch_delivered(session, deps, inbox, batch).await;
             SteerAttempt::Delivered

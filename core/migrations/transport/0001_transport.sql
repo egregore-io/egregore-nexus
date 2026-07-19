@@ -62,7 +62,8 @@ SELECT
   NULL AS thread_id, NULL AS topic, NULL AS summary, NULL AS body,
   NULL AS provenance, NULL AS project, NULL AS created_at,
   NULL AS from_agent_id, NULL AS to_agent_id, NULL AS sender_session_id,
-  NULL AS idempotency_key, NULL AS recipients_json, NULL AS events_json
+  NULL AS idempotency_key, NULL AS metadata_json, NULL AS mention_json,
+  NULL AS delivery_timing, NULL AS recipients_json, NULL AS events_json
 WHERE 0;
 
 CREATE TRIGGER IF NOT EXISTS nexus_broadcast_ingress_insert
@@ -70,22 +71,25 @@ INSTEAD OF INSERT ON nexus_broadcast_ingress
 BEGIN
   INSERT INTO messages (
     message_id, from_name, kind, to_name, thread_id, topic, summary, body, provenance,
-    project, created_at, from_agent_id, to_agent_id, sender_session_id, idempotency_key
+    project, created_at, from_agent_id, to_agent_id, sender_session_id, idempotency_key,
+    metadata_json, mention_json
   ) VALUES (
     NEW.message_id, NEW.from_name, NEW.kind, NEW.to_name, NEW.thread_id, NEW.topic,
     NEW.summary, NEW.body, NEW.provenance, NEW.project, NEW.created_at, NEW.from_agent_id,
-    NEW.to_agent_id, NEW.sender_session_id, NEW.idempotency_key
+    NEW.to_agent_id, NEW.sender_session_id, NEW.idempotency_key, NEW.metadata_json,
+    NEW.mention_json
   );
 
   INSERT OR IGNORE INTO in_flight (
-    in_flight_id, message_id, recipient_session, recipient_agent_id, state
+    in_flight_id, message_id, recipient_session, recipient_agent_id, state, delivery_timing
   )
   SELECT
     json_extract(recipient.value, '$.inFlightId'),
     NEW.message_id,
     json_extract(recipient.value, '$.session'),
     json_extract(recipient.value, '$.agentId'),
-    'pending'
+    'pending',
+    COALESCE(NEW.delivery_timing, 'interrupt')
   FROM json_each(NEW.recipients_json) AS recipient;
 
   INSERT INTO developer_event_topics (topic, latest_seq, updated_at)

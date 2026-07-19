@@ -29,9 +29,9 @@ while read -r crate; do
   printf 'crate:%s\n' "$crate" >"$TMP/artifacts/$crate"
 done <"$TMP/crates"
 for package in \
-  egregore-nexus-0.1.4.tgz \
-  egregore-nexus-cli-0.1.4.tgz \
-  egregore-nexus-gateway-0.1.4.tgz; do
+  egregore-nexus-0.1.5.tgz \
+  egregore-nexus-cli-0.1.5.tgz \
+  egregore-nexus-gateway-0.1.5.tgz; do
   printf 'npm:%s\n' "$package" >"$TMP/artifacts/$package"
 done
 

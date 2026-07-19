@@ -1,8 +1,7 @@
-//! Fresh v0.1.0 schema bootstrap.
+//! Public Nexus schema bootstrap and forward-only upgrades.
 //!
-//! Nexus did not publish a database format before v0.1.0. The release therefore has one named
-//! baseline and deliberately rejects every pre-release migration ladder. Operators archive the
-//! pre-release home and start with fresh daemon and Gateway stores.
+//! v0.1.0 established the first supported database format. Every later public schema change is
+//! additive and recorded here; unknown pre-release ladders still fail closed without mutation.
 
 use std::path::{Path, PathBuf};
 
@@ -11,12 +10,18 @@ use nexus_common::{now, NexusError};
 use crate::error::store_err;
 use crate::state::Store;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
-pub const CURRENT_SCHEMA_NAME: &str = "v0.1.0_baseline";
+pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_NAME: &str = "v0.1.5_delivery_timing";
+const BASELINE_SCHEMA_VERSION: i64 = 1;
+const BASELINE_SCHEMA_NAME: &str = "v0.1.0_baseline";
+const MESSAGE_HOOKS_SCHEMA_VERSION: i64 = 2;
+const MESSAGE_HOOKS_SCHEMA_NAME: &str = "v0.1.5_message_hooks";
 pub(crate) const IDENTITY_SCHEMA_NAME: &str = "v0.1.0_identity";
 pub(crate) const TRANSPORT_SCHEMA_NAME: &str = "v0.1.0_transport";
 
 const BASELINE_SCHEMA: &str = include_str!("../../../migrations/0001_init.sql");
+const MESSAGE_HOOKS_SCHEMA: &str = include_str!("../../../migrations/0002_message_hooks.sql");
+const DELIVERY_TIMING_SCHEMA: &str = include_str!("../../../migrations/0003_delivery_timing.sql");
 const EPHEMERAL_STREAM_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS mem.stream_events (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -167,14 +172,29 @@ impl Store {
         self.migrate().await
     }
 
-    /// Bootstrap or validate the single v0.1.0 schema baseline.
+    /// Bootstrap, upgrade, or validate a supported public schema.
     ///
-    /// Pre-release databases are intentionally unsupported. This method never adds columns,
-    /// renames existing tables, backfills rows, or records an upgrade version.
+    /// Pre-release and unknown databases are intentionally unsupported. Known public upgrades run
+    /// in one write transaction and never discard existing rows.
     pub async fn migrate(&self) -> Result<(), NexusError> {
         match self.schema_marker().await? {
             Some(marker) if marker == CURRENT_SCHEMA_NAME => {
                 self.validate_objects(CORE_REQUIRED_OBJECTS).await?;
+                self.validate_message_hook_schema().await?;
+                self.validate_delivery_timing_schema().await?;
+            }
+            Some(marker) if marker == MESSAGE_HOOKS_SCHEMA_NAME => {
+                self.upgrade_message_hooks_to_delivery_timing().await?;
+                self.validate_objects(CORE_REQUIRED_OBJECTS).await?;
+                self.validate_message_hook_schema().await?;
+                self.validate_delivery_timing_schema().await?;
+            }
+            Some(marker) if marker == BASELINE_SCHEMA_NAME => {
+                self.upgrade_v010_to_message_hooks().await?;
+                self.upgrade_message_hooks_to_delivery_timing().await?;
+                self.validate_objects(CORE_REQUIRED_OBJECTS).await?;
+                self.validate_message_hook_schema().await?;
+                self.validate_delivery_timing_schema().await?;
             }
             Some(marker) if marker == IDENTITY_SCHEMA_NAME => {
                 self.validate_identity_schema().await?;
@@ -187,6 +207,8 @@ impl Store {
             None if self.user_schema_is_empty().await? => {
                 self.install_baseline().await?;
                 self.validate_objects(CORE_REQUIRED_OBJECTS).await?;
+                self.validate_message_hook_schema().await?;
+                self.validate_delivery_timing_schema().await?;
             }
             None => {
                 return Err(NexusError::Store(
@@ -201,8 +223,10 @@ impl Store {
     pub(crate) async fn mark_schema_variant(&self, name: &str) -> Result<(), NexusError> {
         self.conn
             .execute(
-                "UPDATE schema_migrations SET name = ?1 WHERE version = ?2",
-                libsql::params![name, CURRENT_SCHEMA_VERSION],
+                "INSERT INTO schema_migrations(version, name, applied_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(version) DO UPDATE SET name = excluded.name",
+                libsql::params![CURRENT_SCHEMA_VERSION, name, now()],
             )
             .await
             .map_err(store_err)?;
@@ -224,6 +248,72 @@ impl Store {
             return rollback_error(tx, error).await;
         }
         if let Err(error) = tx.execute_batch(BASELINE_SCHEMA).await {
+            return rollback_error(tx, error).await;
+        }
+        if let Err(error) = tx.execute_batch(MESSAGE_HOOKS_SCHEMA).await {
+            return rollback_error(tx, error).await;
+        }
+        if let Err(error) = tx.execute_batch(DELIVERY_TIMING_SCHEMA).await {
+            return rollback_error(tx, error).await;
+        }
+        if let Err(error) = tx
+            .execute(
+                "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?1, ?2, ?3)",
+                libsql::params![BASELINE_SCHEMA_VERSION, BASELINE_SCHEMA_NAME, now()],
+            )
+            .await
+        {
+            return rollback_error(tx, error).await;
+        }
+        if let Err(error) = tx
+            .execute(
+                "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?1, ?2, ?3)",
+                libsql::params![
+                    MESSAGE_HOOKS_SCHEMA_VERSION,
+                    MESSAGE_HOOKS_SCHEMA_NAME,
+                    now()
+                ],
+            )
+            .await
+        {
+            return rollback_error(tx, error).await;
+        }
+        if let Err(error) = tx
+            .execute(
+                "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?1, ?2, ?3)",
+                libsql::params![CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_NAME, now()],
+            )
+            .await
+        {
+            return rollback_error(tx, error).await;
+        }
+        tx.commit().await
+    }
+
+    async fn upgrade_v010_to_message_hooks(&self) -> Result<(), NexusError> {
+        let tx = self.begin_write_txn("v015_message_hooks_schema").await?;
+        if let Err(error) = tx.execute_batch(MESSAGE_HOOKS_SCHEMA).await {
+            return rollback_error(tx, error).await;
+        }
+        if let Err(error) = tx
+            .execute(
+                "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?1, ?2, ?3)",
+                libsql::params![
+                    MESSAGE_HOOKS_SCHEMA_VERSION,
+                    MESSAGE_HOOKS_SCHEMA_NAME,
+                    now()
+                ],
+            )
+            .await
+        {
+            return rollback_error(tx, error).await;
+        }
+        tx.commit().await
+    }
+
+    async fn upgrade_message_hooks_to_delivery_timing(&self) -> Result<(), NexusError> {
+        let tx = self.begin_write_txn("v015_delivery_timing_schema").await?;
+        if let Err(error) = tx.execute_batch(DELIVERY_TIMING_SCHEMA).await {
             return rollback_error(tx, error).await;
         }
         if let Err(error) = tx
@@ -253,17 +343,29 @@ impl Store {
             )
             .await
             .map_err(store_err)?;
-        let Some(row) = rows.next().await.map_err(store_err)? else {
+        let mut markers = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            markers.push((
+                row.get::<i64>(0).map_err(store_err)?,
+                row.get::<String>(1).map_err(store_err)?,
+            ));
+        }
+        let Some((first_version, _)) = markers.first() else {
             return Ok(Some("empty migration ledger".into()));
         };
-        let version: i64 = row.get(0).map_err(store_err)?;
-        let name: String = row.get(1).map_err(store_err)?;
-        if rows.next().await.map_err(store_err)?.is_some() || version != CURRENT_SCHEMA_VERSION {
-            return Ok(Some(format!(
-                "pre-release migration ladder ending at {version}"
-            )));
-        }
-        Ok(Some(name))
+        let marker = match markers.as_slice() {
+            [(BASELINE_SCHEMA_VERSION, name)] => name.clone(),
+            [(BASELINE_SCHEMA_VERSION, _), (MESSAGE_HOOKS_SCHEMA_VERSION, name)] => name.clone(),
+            [(BASELINE_SCHEMA_VERSION, _), (MESSAGE_HOOKS_SCHEMA_VERSION, _), (CURRENT_SCHEMA_VERSION, name)] => {
+                name.clone()
+            }
+            _ => {
+                return Ok(Some(format!(
+                    "pre-release migration ladder ending at {first_version}"
+                )));
+            }
+        };
+        Ok(Some(marker))
     }
 
     async fn has_schema_migrations_table(&self) -> Result<bool, NexusError> {
@@ -328,6 +430,50 @@ impl Store {
         Ok(())
     }
 
+    async fn validate_message_hook_schema(&self) -> Result<(), NexusError> {
+        for (object, column) in [
+            ("messages", "mention_json"),
+            ("nexus_broadcast_ingress", "metadata_json"),
+            ("nexus_broadcast_ingress", "mention_json"),
+        ] {
+            if !self.column_exists(object, column).await? {
+                return Err(NexusError::Store(format!(
+                    "incomplete {CURRENT_SCHEMA_NAME} Nexus schema: missing {object}.{column}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn validate_delivery_timing_schema(&self) -> Result<(), NexusError> {
+        for (object, column) in [
+            ("in_flight", "delivery_timing"),
+            ("nexus_broadcast_ingress", "delivery_timing"),
+        ] {
+            if !self.column_exists(object, column).await? {
+                return Err(NexusError::Store(format!(
+                    "incomplete {CURRENT_SCHEMA_NAME} Nexus schema: missing {object}.{column}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    async fn column_exists(&self, object: &str, column: &str) -> Result<bool, NexusError> {
+        let escaped = object.replace('"', "\"\"");
+        let mut rows = self
+            .conn
+            .query(&format!("PRAGMA table_info(\"{escaped}\")"), ())
+            .await
+            .map_err(store_err)?;
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            if row.get::<String>(1).map_err(store_err)? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn object_exists(&self, kind: &str, name: &str) -> Result<bool, NexusError> {
         let mut rows = self
             .conn
@@ -374,7 +520,7 @@ async fn rollback_error(tx: crate::state::WriteTxn, error: NexusError) -> Result
 
 fn unsupported_schema(marker: &str) -> NexusError {
     NexusError::Store(format!(
-        "unsupported pre-release Nexus database schema ({marker}); v0.1.0 does not perform silent upgrades. Back it up and start with a fresh v0.1.0 store"
+        "unsupported Nexus database schema ({marker}); only published forward migrations are applied automatically. Back up the store before replacing it"
     ))
 }
 

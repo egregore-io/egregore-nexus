@@ -16,7 +16,9 @@ describe("public canonical Gateway reads", () => {
       "INSERT INTO thread_members VALUES ('t_design','a_ada',1,NULL)",
       "INSERT INTO topics VALUES ('builds',1,1)",
       "INSERT INTO topic_subscriptions VALUES ('builds','a_ada',NULL,'0',1,1)",
-      `INSERT INTO bus_messages VALUES
+      `INSERT INTO bus_messages
+        (message_id, kind, from_name, from_agent_id, to_name, to_agent_id,
+         thread_id, topic, summary, body, provenance_json, created_at) VALUES
         ('m_thread','thread','ada','a_ada','design',NULL,'t_design',NULL,NULL,'thread row','{}',10),
         ('m_dm','dm','ada','a_ada','operator','a_operator',NULL,NULL,NULL,'dm row','{}',11)`,
       "INSERT INTO notifications VALUES ('n_1','m_dm','build','{\"topic\":\"builds\"}',NULL,'done',12)",
@@ -68,7 +70,9 @@ describe("public canonical Gateway reads", () => {
   it("serves a projected thread message even when the Gateway missed the earlier thread registry event", async () => {
     const db = createClient({ url: ":memory:" });
     await migrateGatewayStore(db);
-    await db.execute(`INSERT INTO bus_messages VALUES
+    await db.execute(`INSERT INTO bus_messages
+      (message_id, kind, from_name, from_agent_id, to_name, to_agent_id,
+       thread_id, topic, summary, body, provenance_json, created_at) VALUES
       ('m_late','thread','ada','a_ada','late-thread',NULL,'t_late',NULL,NULL,
        'arrived after Gateway boot','{}',10)`);
 
@@ -91,7 +95,9 @@ describe("public canonical Gateway reads", () => {
     const db = createClient({ url: ":memory:" });
     await migrateGatewayStore(db);
     await db.batch([
-      `INSERT INTO bus_messages VALUES
+      `INSERT INTO bus_messages
+        (message_id, kind, from_name, from_agent_id, to_name, to_agent_id,
+         thread_id, topic, summary, body, provenance_json, created_at) VALUES
         ('m_public','thread','ada','a_ada','design',NULL,'t_design',NULL,NULL,
          'shared architecture note','{"project":"default","from":"ada","kind":"agent","thread":"design"}',10),
         ('m_private','dm','ada','a_ada','operator','a_operator',NULL,NULL,NULL,
@@ -147,7 +153,9 @@ describe("public canonical Gateway reads", () => {
   it("accepts the local CLI me projection when no authenticated HTTP caller is attached", async () => {
     const db = createClient({ url: ":memory:" });
     await migrateGatewayStore(db);
-    await db.execute(`INSERT INTO bus_messages VALUES
+    await db.execute(`INSERT INTO bus_messages
+      (message_id, kind, from_name, from_agent_id, to_name, to_agent_id,
+       thread_id, topic, summary, body, provenance_json, created_at) VALUES
       ('m_cli','dm','ada','a_ada','cli-agent','a_cli',NULL,NULL,NULL,
        'CLI-visible message','{"project":"default","from":"ada","kind":"agent"}',11)`);
     const deps = { db: vi.fn(), canonicalDb: () => db };

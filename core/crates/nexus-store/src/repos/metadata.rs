@@ -140,6 +140,67 @@ impl<'a> Metadata<'a> {
         self.get(project, entity, id).await
     }
 
+    /// Recursively merge one Gateway-owned hook result into a canonical message metadata bag.
+    ///
+    /// Message ids are globally unique transport identities, so this internal Gateway path does
+    /// not use `project` as an authorization partition. Replaying the same invocation is safe:
+    /// object/scalar patches are naturally idempotent and signed `executedBy` entries are keyed by
+    /// their stable invocation id.
+    pub async fn merge_message_hook_metadata(
+        &self,
+        id: &str,
+        invocation_id: &str,
+        patch: &serde_json::Value,
+    ) -> Result<serde_json::Value, NexusError> {
+        if invocation_id.trim().is_empty() {
+            return Err(NexusError::Invalid(
+                "hook metadata merge requires invocationId".into(),
+            ));
+        }
+        if !patch.is_object() {
+            return Err(NexusError::Invalid(
+                "hook metadata merge requires an object metadata patch".into(),
+            ));
+        }
+
+        let txn = self.store.begin_write_txn("hook.metadata.merge").await?;
+        let result = async {
+            let mut rows = txn
+                .query(
+                    "SELECT metadata_json FROM messages WHERE message_id = ?1 LIMIT 1",
+                    params![id],
+                )
+                .await?;
+            let Some(row) = rows.next().await.map_err(store_err)? else {
+                return Err(NexusError::NotFound(format!("message:{id}")));
+            };
+            let mut metadata = get_opt_text(&row, 0)?
+                .map(|raw| serde_json::from_str::<serde_json::Value>(&raw))
+                .transpose()
+                .map_err(store_msg)?
+                .unwrap_or_else(|| serde_json::json!({}));
+            merge_hook_value(&mut metadata, patch, &mut Vec::new());
+            let raw = serde_json::to_string(&metadata).map_err(store_msg)?;
+            txn.execute(
+                "UPDATE messages SET metadata_json = ?2 WHERE message_id = ?1",
+                params![id, raw],
+            )
+            .await?;
+            Ok(metadata)
+        }
+        .await;
+        match result {
+            Ok(metadata) => {
+                txn.commit().await?;
+                Ok(metadata)
+            }
+            Err(error) => {
+                txn.rollback(&error).await?;
+                Err(error)
+            }
+        }
+    }
+
     async fn select_metadata(
         &self,
         project: &str,
@@ -175,4 +236,46 @@ impl<'a> Metadata<'a> {
         let _ = get_text(&row, 0)?;
         Ok(Some(get_opt_text(&row, 1)?))
     }
+}
+
+fn merge_hook_value(
+    base: &mut serde_json::Value,
+    patch: &serde_json::Value,
+    path: &mut Vec<String>,
+) {
+    if path == &["_nexus", "hooks", "executedBy"] {
+        if let (Some(current), Some(incoming)) = (base.as_array_mut(), patch.as_array()) {
+            for entry in incoming {
+                let invocation_id = entry
+                    .get("invocationId")
+                    .and_then(serde_json::Value::as_str);
+                let duplicate = invocation_id.is_some_and(|id| {
+                    current.iter().any(|existing| {
+                        existing
+                            .get("invocationId")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(id)
+                    })
+                });
+                if !duplicate {
+                    current.push(entry.clone());
+                }
+            }
+            return;
+        }
+    }
+    if let (Some(base), Some(patch)) = (base.as_object_mut(), patch.as_object()) {
+        for (key, value) in patch {
+            path.push(key.clone());
+            match base.get_mut(key) {
+                Some(current) => merge_hook_value(current, value, path),
+                None => {
+                    base.insert(key.clone(), value.clone());
+                }
+            }
+            path.pop();
+        }
+        return;
+    }
+    *base = patch.clone();
 }

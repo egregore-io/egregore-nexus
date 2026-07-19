@@ -17,7 +17,17 @@ fn gateway_lifecycle_verbs_parse() {
     parse(&["gateway", "delivery-mode", "show"]);
     parse(&["gateway", "delivery-mode", "set", "buffered"]);
     parse(&["gateway", "delivery-mode", "set", "best-effort"]);
+    parse(&["gateway", "hooks", "list"]);
+    parse(&["--json", "gateway", "hooks", "list"]);
+    parse(&["gateway", "hooks", "list", "--json"]);
     parse(&["gateway", "uninstall"]);
+}
+
+#[test]
+fn gateway_read_client_forwards_the_standard_rest_bearer() {
+    let source = include_str!("../src/cli/gateway_read_client.rs");
+    assert!(source.contains("NEXUS_REST_TOKEN"));
+    assert!(source.contains("AUTHORIZATION"));
 }
 
 #[test]

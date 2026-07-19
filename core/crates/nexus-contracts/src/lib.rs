@@ -70,6 +70,7 @@ pub mod enums;
 pub mod events;
 pub mod gateway_projection;
 pub mod harness;
+pub mod hook_ports;
 pub mod hooks;
 pub mod ids;
 pub mod message;
@@ -124,9 +125,12 @@ pub use gateway_projection::{
     GATEWAY_PROJECTION_VERSION,
 };
 pub use harness::{HarnessId, HarnessIdError, HARNESS_ID_MAX_LEN};
+pub use hook_ports::MessageHookPort;
 pub use hooks::{
-    DeliveryTiming, HookAction, HookAfterReceiptRequest, HookAfterReceiptResult,
-    HookBeforeSendRequest, HookBeforeSendResult, HookExecutedBy, HookMessage, HookSender,
+    DeliveryTiming, GatewayHookCapabilities, GatewayHookEvaluation, HookAction,
+    HookAfterReceiptRequest, HookAfterReceiptResult, HookBeforeSendRequest, HookBeforeSendResult,
+    HookEvaluationFailure, HookEvaluationRequest, HookEvaluationResponse, HookExecutedBy,
+    HookMessage, HookSender,
 };
 pub use ids::{AgentId, CredentialId, MessageId, ProjectId, SessionId, ThreadId, TopicId};
 pub use message::{Message, Provenance, ProvenanceStamp, ReadRequest};

@@ -560,4 +560,179 @@ describe("daemon push relay", () => {
     db.close();
     await removeTempPath(dir, { recursive: true });
   });
+
+  it("advertises hook capabilities and returns concurrent results by correlation ID", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "nexus-hook-stream-"));
+    const socketPath = fixtureSocketPath(dir, "hooks");
+    const manifest = join(dir, "gateway-stream-endpoint.json");
+    const previousHome = process.env.NEXUS_HOME;
+    const hellos: Array<Record<string, unknown>> = [];
+    const results: Array<Record<string, unknown>> = [];
+    let fixture: Awaited<ReturnType<typeof startPushFixture>> | undefined;
+    let unregister = () => {};
+
+    try {
+      process.env.NEXUS_HOME = dir;
+      fixture = await startPushFixture(socketPath, (frame, socket) => {
+        if (frame.t === "hello") {
+          hellos.push(frame);
+          writeFramedJson(socket, { t: "ready", version: 1, daemonBootId: "boot-hooks", resume: "store" });
+          for (const [correlationId, evaluationId] of [
+            ["hc_first", "he_first"],
+            ["hc_second", "he_second"],
+          ]) {
+            writeFramedJson(socket, {
+              t: "hook.evaluate",
+              evaluation: {
+                correlationId,
+                request: {
+                  event: "before_send",
+                  request: {
+                    evaluationId,
+                    message: {
+                      sender: { name: "paul" },
+                      target: { verb: "post", thread: "release" },
+                      body: evaluationId,
+                      mention: [],
+                      metadata: {},
+                    },
+                  },
+                },
+              },
+            });
+          }
+        } else if (frame.t === "hook.result") {
+          results.push(frame);
+        }
+      });
+      await writeFile(
+        manifest,
+        JSON.stringify({ path: socketPath, token: "token", daemonBootId: "boot-hooks" }),
+      );
+      resetSharedDaemonPushConnectorForTests();
+      const connection = sharedDaemonPushConnector();
+      expect(connection?.registerHooks).toBeTypeOf("function");
+      unregister = connection!.registerHooks!(
+        {
+          protocolVersion: 1,
+          generation: "sha256:generation",
+          events: ["before_send"],
+        },
+        async (request) => {
+          if (request.event !== "before_send") throw new Error("unsupported event");
+          if (request.request.evaluationId === "he_first") {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          return {
+            event: "before_send",
+            result: {
+              evaluationId: request.request.evaluationId,
+              message: request.request.message,
+              executedBy: [],
+            },
+          };
+        },
+      );
+      await connection!.ready;
+      await waitFor(() => results.length === 2, 1_000);
+
+      expect(hellos[0]).toMatchObject({
+        hooks: {
+          protocolVersion: 1,
+          generation: "sha256:generation",
+          events: ["before_send"],
+        },
+      });
+      expect(results.map((frame) => frame.correlationId)).toEqual(["hc_second", "hc_first"]);
+      expect(results.every((frame) => frame.result && !frame.error)).toBe(true);
+    } finally {
+      unregister();
+      resetSharedDaemonPushConnectorForTests();
+      await fixture?.close();
+      if (previousHome === undefined) delete process.env.NEXUS_HOME;
+      else process.env.NEXUS_HOME = previousHome;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("replaces readiness when hooks require a capability-bearing reconnect", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "nexus-hook-readiness-"));
+    const socketPath = fixtureSocketPath(dir, "hook-readiness");
+    const manifest = join(dir, "gateway-stream-endpoint.json");
+    const previousHome = process.env.NEXUS_HOME;
+    const hellos: Array<Record<string, unknown>> = [];
+    let secondSocket: Socket | undefined;
+    let fixture: Awaited<ReturnType<typeof startPushFixture>> | undefined;
+    let unregister = () => {};
+
+    try {
+      process.env.NEXUS_HOME = dir;
+      fixture = await startPushFixture(socketPath, (frame, socket) => {
+        if (frame.t !== "hello") return;
+        hellos.push(frame);
+        if (hellos.length === 1) {
+          writeFramedJson(socket, {
+            t: "ready",
+            version: 1,
+            daemonBootId: "boot-before-hooks",
+            resume: "store",
+          });
+        } else {
+          secondSocket = socket;
+        }
+      });
+      await writeFile(
+        manifest,
+        JSON.stringify({ path: socketPath, token: "token", daemonBootId: "boot-hooks" }),
+      );
+      resetSharedDaemonPushConnectorForTests();
+      const connection = sharedDaemonPushConnector();
+      await connection!.ready;
+      expect(hellos[0]).not.toHaveProperty("hooks");
+
+      unregister = connection!.registerHooks!(
+        {
+          protocolVersion: 1,
+          generation: "sha256:after-start",
+          events: ["before_send"],
+        },
+        async (request) => {
+          if (request.event !== "before_send") throw new Error("unsupported event");
+          return {
+            event: "before_send",
+            result: {
+              evaluationId: request.request.evaluationId,
+              message: request.request.message,
+              executedBy: [],
+            },
+          };
+        },
+      );
+      const hooksReady = connection!.ready;
+      let settled = false;
+      void hooksReady.then(() => { settled = true; });
+      await waitFor(() => hellos.length === 2, 1_000);
+      await Promise.resolve();
+      expect(settled).toBe(false);
+      expect(hellos[1]).toMatchObject({
+        hooks: { generation: "sha256:after-start", events: ["before_send"] },
+      });
+
+      writeFramedJson(secondSocket!, {
+        t: "ready",
+        version: 1,
+        daemonBootId: "boot-with-hooks",
+        resume: "store",
+      });
+      await hooksReady;
+      expect(settled).toBe(true);
+    } finally {
+      unregister();
+      resetSharedDaemonPushConnectorForTests();
+      await fixture?.close();
+      if (previousHome === undefined) delete process.env.NEXUS_HOME;
+      else process.env.NEXUS_HOME = previousHome;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

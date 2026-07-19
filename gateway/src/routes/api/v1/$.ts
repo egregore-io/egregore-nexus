@@ -15,6 +15,7 @@ import { handle } from "@server/api/router";
 import type { ApiRequest, ReadDbGetter } from "@server/api/router";
 import type {
   CommandIntentSender,
+  HookDiagnosticsReader,
   MessagePostSender,
   PrincipalScope,
   SourceRegistryReader,
@@ -61,6 +62,7 @@ import type { Client } from "@libsql/client";
 import { parseCookies } from "@server/http/cookies";
 import { handleSessionEvents } from "@server/stream/sessionEvents";
 import { createDaemonSourceRegistry } from "@server/source/daemonRegistry";
+import { gatewayHookDiagnostics } from "@server/hooks/diagnostics";
 
 /** Methods that may carry a JSON body. */
 const BODY_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
@@ -149,6 +151,8 @@ export interface DispatchDeps {
   commands?: CommandIntentSender;
   /** Typed daemon-owned notification-source identity view. */
   sourceRegistry?: SourceRegistryReader;
+  /** Process-local read-only hook diagnostics; resolved per request after service startup. */
+  hookDiagnostics?: () => HookDiagnosticsReader | undefined;
   /** Public notification signing secret; production falls back to `NEXUS_HMAC_SECRET`. */
   notifyHmacSecret?: string;
   /** Optional human read-receipt marker; production defaults to the daemon DB. */
@@ -179,6 +183,7 @@ const realDispatchDeps: DispatchDeps = {
   db: () => getWriteDbLazy(),
   canonicalDb: () => getGatewayStore(),
   sourceRegistry: createDaemonSourceRegistry(),
+  hookDiagnostics: gatewayHookDiagnostics,
 };
 
 // ── dispatch factory ──────────────────────────────────────────────────────────
@@ -278,6 +283,7 @@ export function makeDispatch(deps: DispatchDeps) {
       messagePost,
       commands,
       sourceRegistry: deps.sourceRegistry,
+      hooks: deps.hookDiagnostics?.(),
       humanReads,
       notifyHmacSecret: deps.notifyHmacSecret ?? process.env.NEXUS_HMAC_SECRET,
       now: deps.now ?? Date.now,

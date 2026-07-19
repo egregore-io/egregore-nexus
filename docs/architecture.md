@@ -107,6 +107,30 @@ are idempotent, so reconnect after an uncertain acknowledgement does not duplica
 When the daemon is unavailable, Gateway history remains readable and writes return an explicit
 transport-unavailable error. The Gateway never opens the daemon database directly.
 
+### Message-hook boundary
+
+Gateway owns local message-hook discovery, execution, audit persistence, and signing. Every new
+logical send converges at the daemon's canonical bus boundary; before acceptance, the daemon uses a
+correlated capability-negotiated stream request to ask Gateway for one `before_send` pipeline
+result. The daemon validates immutable sender/target fields and atomically commits the resulting
+body, metadata, provenance, and delivery timing. Idempotency retries reuse the completed evaluation
+instead of executing developer code again.
+
+After the accepted-message projection commits, Gateway invokes `after_receipt` once per canonical
+message identity. Receipt processing is not on recipient delivery's critical path and may merge
+metadata back through an idempotent daemon command. External side effects remain at-least-once.
+
+```text
+message source -> daemon canonical send -> Gateway before_send -> atomic acceptance
+                                                        |
+accepted projection -> Gateway persistence -> after_receipt + signed audit
+```
+
+Hooks never run in the daemon and never observe the agent-session/token-stream lane. If a
+hook-capable Gateway is unavailable, `NEXUS_HOOK_GATEWAY_MODE=optional` (the default) preserves
+transport with an explicit bypass, while `required` rejects new canonical sends. See
+[Message hooks](hooks.md) for the executable protocol and timing semantics.
+
 ### Projection delivery policy
 
 Buffered mode is the default:
@@ -159,7 +183,7 @@ own identity, routing, or authorization.
 Nexus keeps three presentation lanes distinct:
 
 1. **Message facts** — DMs, thread posts, topic publications, and notifications. Gateway REST owns
-   durable paginated history.
+   durable paginated history. Gateway message hooks apply only at this canonical boundary.
 2. **Agent-session activity** — normalized model text and structured activity, available as raw
    model-text events or converted AG-UI events.
 3. **Terminal attach** — raw PTY/tmux bytes for an interactive headed runtime. This is ephemeral,

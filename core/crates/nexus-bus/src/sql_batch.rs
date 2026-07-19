@@ -2,9 +2,9 @@
 pub(crate) const BROADCAST_INGRESS_SQL: &str = "INSERT INTO nexus_broadcast_ingress ( \
        message_id, from_name, kind, to_name, thread_id, topic, summary, body, provenance, \
        project, created_at, from_agent_id, to_agent_id, sender_session_id, idempotency_key, \
-       recipients_json, events_json \
+       metadata_json, mention_json, delivery_timing, recipients_json, events_json \
      ) VALUES ( \
-       ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17 \
+       ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20 \
      )";
 
 pub(crate) fn push_stmt(batch: &mut String, stmt: String) {

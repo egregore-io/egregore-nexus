@@ -774,6 +774,24 @@ export interface DlqRequeueRequest {
 	since?: string;
 }
 
+/** Hook capability advertised by the local Gateway during stream negotiation. */
+export interface GatewayHookCapabilities {
+	protocolVersion: number;
+	generation: string;
+	events: string[];
+}
+
+/** Event-specific payload carried by one correlated daemon-to-Gateway evaluation. */
+export type HookEvaluationRequest =
+	| { event: "before_send", request: HookBeforeSendRequest }
+	| { event: "after_receipt", request: HookAfterReceiptRequest };
+
+/** One daemon request on the private correlated hook lane. */
+export interface GatewayHookEvaluation {
+	correlationId: string;
+	request: HookEvaluationRequest;
+}
+
 /** Gateway's durable projection watermark for one daemon boot epoch. */
 export interface GatewayProjectionAck {
 	daemonEpoch: string;
@@ -931,6 +949,13 @@ export interface HookBeforeSendResult {
 	message: HookMessage;
 	timing?: DeliveryTiming;
 	executedBy?: HookExecutedBy[];
+}
+
+/** Structured Gateway-side failure for one correlation ID. */
+export interface HookEvaluationFailure {
+	code: string;
+	message: string;
+	retryable?: boolean;
 }
 
 /** Register a daemon-tracked durable inbox subscription for the caller. */
@@ -1842,6 +1867,11 @@ export enum DeliveryState {
 	Delivered = "delivered",
 	Acked = "acked",
 }
+
+/** Event-specific terminal result returned by Gateway. */
+export type HookEvaluationResponse =
+	| { event: "before_send", result: HookBeforeSendResult }
+	| { event: "after_receipt", result: HookAfterReceiptResult };
 
 
 // --- Hand-authored wire unions (appended by gen-ts.sh / the ts_gen test) ---

@@ -1,0 +1,934 @@
+#!/usr/bin/env python3
+"""Cross-source practical gate for Gateway-owned canonical message hooks."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import socket
+import sqlite3
+import struct
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONTAINER = "nexus-v010-load51"
+DEFAULT_OUTPUT = ROOT / "output" / "hooks-practical" / "gate.json"
+CONTAINER_ROOT = Path("/work/egregore-nexus")
+INSIDE_HOME = Path("/tmp/nexus-hooks-gate")
+INSIDE_HOME_ASSIGNMENT = "NEXUS_HOME=/tmp/nexus-hooks-gate"
+INSIDE_GATEWAY_PORT = 4195
+NEXUS_BIN = Path("/tmp/nexus-target/debug/nexus")
+
+SCENARIOS = (
+    "direct-daemon-rpc",
+    "cli-command-intent",
+    "gateway-rest",
+    "network-mcp",
+    "notification",
+    "agent-origin",
+    "timing-interrupt",
+    "timing-yield-turn",
+    "timing-after-tool-loop",
+    "idempotent-retry",
+    "gateway-optional-outage",
+    "gateway-required-outage",
+    "gateway-restart-recovery",
+    "after-receipt-signature",
+    "token-stream-isolation",
+)
+
+
+def usage() -> str:
+    return """Usage: scripts/nexus-hooks-practical-gate [--container NAME] [--output PATH]
+
+Runs the canonical message sources through live before_send and after_receipt hooks in the
+single existing clamped Docker validator. It covers direct daemon RPC, CLI command intent,
+Gateway REST, network MCP, notifications, and agent-origin sends, plus Gateway outage modes,
+restart recovery, signed audit provenance, idempotency, delivery timing, and token stream
+isolation. The validator uses a disposable Nexus home and never touches the operator runtime.
+
+Options:
+  --list            List scenario ids without running the gate.
+  --container NAME  Sole validation container (default: nexus-v010-load51).
+  --output PATH     JSON evidence path under this repository.
+  -h, --help        Show this help without inspecting Docker or changing files.
+"""
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--container", default=DEFAULT_CONTAINER)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("-h", "--help", action="store_true")
+    args, unknown = parser.parse_known_args(argv)
+    if unknown:
+        raise SystemExit(f"error: unknown argument(s): {' '.join(unknown)}\n{usage()}")
+    return args
+
+
+def command(
+    args: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    input_text: str | None = None,
+    capture: bool = True,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        env=env,
+        input=input_text,
+        text=True,
+        capture_output=capture,
+        check=check,
+    )
+
+
+def host_main(args: argparse.Namespace) -> int:
+    validators = command(
+        [
+            "docker",
+            "ps",
+            "--filter",
+            "label=egregore-nexus-test=true",
+            "--format",
+            "{{.Names}}",
+        ]
+    ).stdout.splitlines()
+    if validators != [args.container]:
+        raise GateFailure(
+            "expected exactly one Nexus validation container; "
+            f"found {len(validators)}: {', '.join(validators) if validators else 'none'}"
+        )
+
+    inspect = json.loads(command(["docker", "inspect", args.container]).stdout)[0]
+    host_config = inspect["HostConfig"]
+    nano_cpus = int(host_config.get("NanoCpus") or 0)
+    memory = int(host_config.get("Memory") or 0)
+    pids_limit = int(host_config.get("PidsLimit") or 0)
+    if not (0 < nano_cpus <= 2000000000):
+        raise GateFailure(f"validator CPU limit exceeds 2 CPUs: {nano_cpus}")
+    if not (0 < memory <= 10737418240):
+        raise GateFailure(f"validator memory limit exceeds 10 GiB: {memory}")
+    if not (0 < pids_limit <= 1024):
+        raise GateFailure(f"validator PID limit exceeds 1024: {pids_limit}")
+
+    mounted = next(
+        (
+            item.get("Source")
+            for item in inspect.get("Mounts", [])
+            if item.get("Destination") == str(CONTAINER_ROOT)
+        ),
+        None,
+    )
+    if Path(mounted or "").resolve() != ROOT:
+        raise GateFailure(f"validator mounts {mounted!r}, not {ROOT}")
+
+    output = args.output.resolve()
+    try:
+        relative_output = output.relative_to(ROOT)
+    except ValueError as error:
+        raise GateFailure("--output must be inside the repository") from error
+    output.parent.mkdir(parents=True, exist_ok=True)
+    inside_output = CONTAINER_ROOT / relative_output
+    uid_gid = f"{os.getuid()}:{os.getgid()}"
+
+    build = command(
+        [
+            "docker",
+            "exec",
+            "--user",
+            uid_gid,
+            "-e",
+            "CARGO_BUILD_JOBS=2",
+            args.container,
+            "bash",
+            "-lc",
+            "set -euo pipefail; "
+            "export PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin; "
+            "cd /work/egregore-nexus/core; "
+            "CARGO_BUILD_JOBS=2 cargo build -p egregore-nexus; "
+            "cd /work/egregore-nexus/gateway; "
+            "pnpm build:gateway-package",
+        ],
+        capture=False,
+        check=False,
+    )
+    if build.returncode != 0:
+        raise GateFailure("validator build failed")
+
+    inside = command(
+        [
+            "docker",
+            "exec",
+            "--user",
+            uid_gid,
+            args.container,
+            "python3",
+            str(CONTAINER_ROOT / "scripts" / "nexus-hooks-practical-gate"),
+            "--inside",
+            "--output",
+            str(inside_output),
+        ],
+        capture=False,
+        check=False,
+    )
+    if inside.returncode != 0:
+        raise GateFailure("live hook gate failed")
+    if not output.is_file():
+        raise GateFailure(f"live hook gate did not write {output}")
+    print(f"PASS Gateway message hooks practical gate: {output}")
+    return 0
+
+
+class GateFailure(RuntimeError):
+    pass
+
+
+class LiveGate:
+    def __init__(self, output: Path):
+        self.output = output
+        self.home = INSIDE_HOME
+        self.gateway_url = f"http://127.0.0.1:{INSIDE_GATEWAY_PORT}"
+        self.daemon: subprocess.Popen[str] | None = None
+        self.gateway: subprocess.Popen[str] | None = None
+        self.daemon_log: Any = None
+        self.gateway_log: Any = None
+        self.message_ids: dict[str, str] = {}
+        self.scenario_status = {scenario: "pending" for scenario in SCENARIOS}
+        self.started_at = time.time()
+
+    def run(self) -> dict[str, Any]:
+        self.prepare()
+        try:
+            self.start_daemon("optional")
+            self.start_gateway()
+            self.seed_identities_and_thread()
+            self.exercise_sources()
+            self.verify_canonical_results()
+            self.verify_idempotent_retry()
+            self.verify_gateway_restart()
+            self.verify_outage_modes()
+            self.verify_token_stream_isolation()
+            report = self.report()
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            self.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+            print(json.dumps(report, indent=2))
+            return report
+        finally:
+            self.cleanup_processes()
+
+    def prepare(self) -> None:
+        self.cleanup_stale_home()
+        self.home.mkdir(parents=True, mode=0o700)
+        hooks = self.home / "gateway" / "hooks.d"
+        hooks.mkdir(parents=True)
+        before = CONTAINER_ROOT / "core" / "tests" / "fixtures" / "hooks" / "before-send.py"
+        after = CONTAINER_ROOT / "core" / "tests" / "fixtures" / "hooks" / "after-receipt.mjs"
+        shutil.copy2(before, hooks / "before-send.py")
+        shutil.copy2(after, hooks / "after-receipt.mjs")
+        (hooks / "10-before-send.toml").write_text(
+            """version = 1
+id = "practical-before-send"
+event = "before_send"
+order = 10
+timeout_ms = 5000
+on_failure = "reject"
+
+[handler]
+kind = "local"
+entry = "before-send.py"
+entrypoint = "main"
+run = ["python3", "{entry}"]
+""",
+            encoding="utf-8",
+        )
+        (hooks / "20-after-receipt.toml").write_text(
+            """version = 1
+id = "practical-after-receipt"
+event = "after_receipt"
+order = 20
+timeout_ms = 5000
+on_failure = "continue"
+
+[handler]
+kind = "local"
+entry = "after-receipt.mjs"
+entrypoint = "main"
+run = ["node", "{entry}"]
+""",
+            encoding="utf-8",
+        )
+
+    def base_env(self, mode: str | None = None) -> dict[str, str]:
+        env = os.environ.copy()
+        env.update(
+            {
+                "NEXUS_HOME": str(self.home),
+                "NEXUS_DB_PATH": str(self.home / "nexus.db"),
+                "NEXUS_GATEWAY_DB": f"file:{self.home / 'gateway.db'}",
+                "NEXUS_STREAM_DB_PATH": "/dev/shm/nexus-hooks-gate-stream.db",
+                "NEXUS_GATEWAY_BIND": "127.0.0.1",
+                "NEXUS_GATEWAY_PORT": str(INSIDE_GATEWAY_PORT),
+                "NEXUS_GATEWAY_BIN": str(CONTAINER_ROOT / "gateway" / "scripts" / "nexus-gateway.mjs"),
+                "NEXUS_WEB_AUTH_MODE": "local",
+                "RUST_MIN_STACK": "33554432",
+            }
+        )
+        if mode is not None:
+            env["NEXUS_HOOK_GATEWAY_MODE"] = mode
+        for key in ("NEXUS_NAME", "NEXUS_AGENT", "NEXUS_PROJECT", "NEXUS_CLIENT_KEY"):
+            env.pop(key, None)
+        return env
+
+    def start_daemon(self, mode: str) -> None:
+        if self.daemon and self.daemon.poll() is None:
+            raise GateFailure("isolated daemon is already running")
+        self.daemon_log = open(self.home / "daemon.log", "a", encoding="utf-8")
+        self.daemon = subprocess.Popen(
+            [str(NEXUS_BIN), "daemon"],
+            env=self.base_env(mode),
+            stdin=subprocess.DEVNULL,
+            stdout=self.daemon_log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        self.wait_until(
+            lambda: (self.home / "daemon-ipc-endpoint.json").is_file(),
+            30,
+            "daemon IPC endpoint",
+        )
+
+    def stop_daemon(self) -> None:
+        self.stop_process(self.daemon)
+        self.daemon = None
+        if self.daemon_log:
+            self.daemon_log.close()
+            self.daemon_log = None
+        for name in ("daemon-ipc-endpoint.json", "gateway-stream-endpoint.json"):
+            (self.home / name).unlink(missing_ok=True)
+
+    def start_gateway(self) -> None:
+        if self.gateway and self.gateway.poll() is None:
+            raise GateFailure("isolated Gateway is already running")
+        self.gateway_log = open(self.home / "gateway.log", "a", encoding="utf-8")
+        self.gateway = subprocess.Popen(
+            [
+                "node",
+                str(CONTAINER_ROOT / "gateway" / "scripts" / "nexus-gateway.mjs"),
+                "--api-only",
+                "--discovery=write",
+            ],
+            env=self.base_env(),
+            stdin=subprocess.DEVNULL,
+            stdout=self.gateway_log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        self.wait_until(self.gateway_healthy, 30, "Gateway health")
+        hooks = self.http_json("GET", "/api/v1/hooks")
+        ids = {hook["id"] for hook in hooks.get("hooks", [])}
+        if ids != {"practical-before-send", "practical-after-receipt"}:
+            raise GateFailure(f"unexpected active hooks: {sorted(ids)}")
+
+    def stop_gateway(self) -> None:
+        self.stop_process(self.gateway)
+        self.gateway = None
+        if self.gateway_log:
+            self.gateway_log.close()
+            self.gateway_log = None
+        (self.home / "gateway.json").unlink(missing_ok=True)
+        time.sleep(0.5)
+
+    def seed_identities_and_thread(self) -> None:
+        self.register_agent("hook-recipient", "ck_hooks_recipient")
+        self.register_agent("hook-agent", "ck_hooks_agent")
+        self.cli(
+            [
+                "thread",
+                "new",
+                "hooks-practical",
+                "--member",
+                "hook-recipient",
+                "--member",
+                "hook-agent",
+            ]
+        )
+
+    def register_agent(self, name: str, key: str) -> None:
+        env = self.agent_env(name, key)
+        self.cli(
+            [
+                "register",
+                "--name",
+                name,
+                "--agent",
+                "other",
+                "--project",
+                "default",
+                "--client-key",
+                key,
+            ],
+            env=env,
+        )
+
+    def agent_env(self, name: str, key: str) -> dict[str, str]:
+        env = self.base_env()
+        env.update(
+            {
+                "NEXUS_NAME": name,
+                "NEXUS_AGENT": "other",
+                "NEXUS_PROJECT": "default",
+                "NEXUS_CLIENT_KEY": key,
+            }
+        )
+        return env
+
+    def exercise_sources(self) -> None:
+        self.message_ids["direct-daemon-rpc"] = self.direct_send(
+            "direct-daemon-rpc", "interrupt", "direct boundary", "hooks-direct-1"
+        )
+        self.scenario_status["direct-daemon-rpc"] = "pass"
+
+        cli_result = self.cli_json(
+            [
+                "post",
+                "hooks-practical",
+                "-m",
+                self.marker("cli-command-intent", "yield_turn", "CLI boundary"),
+            ]
+        )
+        self.message_ids["cli-command-intent"] = required_message_id(cli_result)
+        self.scenario_status["cli-command-intent"] = "pass"
+
+        rest_result = self.http_json(
+            "POST",
+            "/api/v1/messages",
+            {
+                "to": {"verb": "post", "thread": "hooks-practical"},
+                "body": self.marker("gateway-rest", "after_tool_loop", "REST boundary"),
+                "idempotencyKey": "hooks-rest-1",
+            },
+        )
+        self.message_ids["gateway-rest"] = required_message_id(rest_result)
+        self.scenario_status["gateway-rest"] = "pass"
+
+        token = self.http_json(
+            "POST",
+            "/api/v1/auth/operator-token",
+            {"name": "hooks-mcp", "scopes": ["message:send"], "ttlMs": 300_000},
+        )["accessToken"]
+        mcp = self.http_json(
+            "POST",
+            "/api/mcp",
+            {
+                "jsonrpc": "2.0",
+                "id": "hooks-mcp-1",
+                "method": "tools/call",
+                "params": {
+                    "name": "post",
+                    "arguments": {
+                        "thread": "hooks-practical",
+                        "message": self.marker("network-mcp", "interrupt", "MCP boundary"),
+                    },
+                },
+            },
+            {"authorization": f"Bearer {token}"},
+        )
+        tool_result = mcp.get("result", {})
+        if tool_result.get("isError"):
+            raise GateFailure(f"network MCP failed: {tool_result}")
+        content = tool_result.get("content", [])
+        self.message_ids["network-mcp"] = required_message_id(json.loads(content[0]["text"]))
+        self.scenario_status["network-mcp"] = "pass"
+
+        notification = self.cli_json(
+            [
+                "notify",
+                "--target",
+                "thread:hooks-practical",
+                "--source",
+                "hooks-practical",
+                "--idempotency-key",
+                "hooks-notification-1",
+                self.marker("notification", "yield_turn", "notification boundary"),
+            ]
+        )
+        self.message_ids["notification"] = required_message_id(notification)
+        self.scenario_status["notification"] = "pass"
+
+        agent_result = self.cli_json(
+            [
+                "post",
+                "hooks-practical",
+                "-m",
+                self.marker("agent-origin", "after_tool_loop", "agent boundary"),
+            ],
+            env=self.agent_env("hook-agent", "ck_hooks_agent"),
+        )
+        self.message_ids["agent-origin"] = required_message_id(agent_result)
+        self.scenario_status["agent-origin"] = "pass"
+
+    def verify_canonical_results(self) -> None:
+        expected_timing = {
+            "direct-daemon-rpc": "interrupt",
+            "cli-command-intent": "yield_turn",
+            "gateway-rest": "after_tool_loop",
+            "network-mcp": "interrupt",
+            "notification": "yield_turn",
+            "agent-origin": "after_tool_loop",
+        }
+
+        def ready() -> bool:
+            with self.gateway_db() as db:
+                placeholders = ",".join("?" for _ in self.message_ids)
+                rows = db.execute(
+                    f"SELECT message_id FROM hook_receipt_completion "
+                    f"WHERE state = 'completed' AND message_id IN ({placeholders})",
+                    list(self.message_ids.values()),
+                ).fetchall()
+                return len(rows) == len(self.message_ids)
+
+        self.wait_until(ready, 30, "after_receipt completion")
+        delivery_outcomes = self.daemon_export("delivery_outcomes")
+        with self.gateway_db() as db:
+            for source, message_id in self.message_ids.items():
+                row = db.execute(
+                    "SELECT body, metadata_json FROM bus_messages WHERE message_id = ?",
+                    (message_id,),
+                ).fetchone()
+                if not row:
+                    raise GateFailure(f"Gateway canonical message missing: {message_id}")
+                body, raw_metadata = row
+                if body != f"[hook:{source}] {self.payload_for(source)}":
+                    raise GateFailure(f"unexpected transformed body for {source}: {body!r}")
+                metadata = json.loads(raw_metadata)
+                gate = metadata.get("hookGate", {})
+                if gate.get("beforeSend") is not True or gate.get("source") != source:
+                    raise GateFailure(f"before_send metadata missing for {source}: {metadata}")
+                if gate.get("afterReceipt") is not True or gate.get("receiptMessageId") != message_id:
+                    raise GateFailure(f"after_receipt metadata missing for {source}: {metadata}")
+                executions = metadata.get("_nexus", {}).get("hooks", {}).get("executedBy", [])
+                if {item.get("hookId") for item in executions} != {
+                    "practical-before-send",
+                    "practical-after-receipt",
+                }:
+                    raise GateFailure(f"signed provenance missing for {source}: {executions}")
+                timings = {
+                    row.get("delivery_timing")
+                    for row in delivery_outcomes
+                    if row.get("message_id") == message_id
+                }
+                if timings != {expected_timing[source]}:
+                    raise GateFailure(f"wrong timing for {source}: {sorted(timings)}")
+
+        self.scenario_status["timing-interrupt"] = "pass"
+        self.scenario_status["timing-yield-turn"] = "pass"
+        self.scenario_status["timing-after-tool-loop"] = "pass"
+        audit = self.http_json("GET", "/api/v1/hooks/audit?limit=100")
+        if not audit.get("executions") or not all(
+            item.get("verified") is True for item in audit["executions"]
+        ):
+            raise GateFailure("hook audit contains an unverifiable execution")
+        public_key = self.http_json("GET", "/api/v1/hooks/public-key")
+        if public_key.get("algorithm") != "ed25519" or "BEGIN PUBLIC KEY" not in public_key.get(
+            "publicKey", ""
+        ):
+            raise GateFailure("hook public key is unavailable")
+        self.scenario_status["after-receipt-signature"] = "pass"
+
+    def verify_idempotent_retry(self) -> None:
+        request = {
+            "to": {"verb": "post", "thread": "hooks-practical"},
+            "body": self.marker("gateway-rest", "after_tool_loop", "REST boundary"),
+            "idempotencyKey": "hooks-rest-1",
+        }
+        duplicate = self.http_json("POST", "/api/v1/messages", request)
+        message_id = self.message_ids["gateway-rest"]
+        if required_message_id(duplicate) != message_id:
+            raise GateFailure("REST idempotent retry returned a different message")
+        with self.gateway_db() as db:
+            evaluations = db.execute(
+                "SELECT COUNT(*) FROM hook_pipeline_evaluations WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()[0]
+            executions = db.execute(
+                "SELECT COUNT(*) FROM hook_handler_executions WHERE evaluation_id IN "
+                "(SELECT evaluation_id FROM hook_pipeline_evaluations WHERE message_id = ?)",
+                (message_id,),
+            ).fetchone()[0]
+        if (evaluations, executions) != (1, 1):
+            raise GateFailure(
+                f"idempotent retry duplicated hook work: evaluations={evaluations}, executions={executions}"
+            )
+        self.scenario_status["idempotent-retry"] = "pass"
+
+    def verify_gateway_restart(self) -> None:
+        self.stop_gateway()
+        self.start_gateway()
+        duplicate = self.http_json(
+            "POST",
+            "/api/v1/messages",
+            {
+                "to": {"verb": "post", "thread": "hooks-practical"},
+                "body": self.marker("gateway-rest", "after_tool_loop", "REST boundary"),
+                "idempotencyKey": "hooks-rest-1",
+            },
+        )
+        if required_message_id(duplicate) != self.message_ids["gateway-rest"]:
+            raise GateFailure("Gateway restart lost idempotent message identity")
+        self.scenario_status["gateway-restart-recovery"] = "pass"
+
+    def verify_outage_modes(self) -> None:
+        self.stop_gateway()
+        optional_id = self.direct_send(
+            "gateway-optional-outage", "interrupt", "optional bypass", "hooks-optional-outage-1"
+        )
+        message = next(
+            (row for row in self.daemon_export("messages") if row.get("message_id") == optional_id),
+            None,
+        )
+        body = message.get("body") if message else None
+        if not str(body).startswith("GATE[gateway-optional-outage|interrupt]"):
+            raise GateFailure("optional Gateway outage did not bypass the absent hook provider")
+        self.scenario_status["gateway-optional-outage"] = "pass"
+
+        self.stop_daemon()
+        self.start_daemon("required")
+        before_count = self.daemon_message_count()
+        response = self.direct_rpc_response(
+            "message.post.send",
+            self.send_request(
+                "gateway-required-outage", "interrupt", "required rejection", "hooks-required-1"
+            ),
+            "cmd_hooks_required_outage",
+            "hooks-required-1",
+        )
+        error = response.get("error")
+        if not error or "Gateway" not in str(error.get("message", "")):
+            raise GateFailure(f"required outage did not return a typed Gateway error: {response}")
+        if self.daemon_message_count() != before_count:
+            raise GateFailure("required Gateway outage committed a message")
+        self.scenario_status["gateway-required-outage"] = "pass"
+
+        self.start_gateway()
+        recovery_id = self.direct_send(
+            "gateway-restart-recovery", "interrupt", "required recovery", "hooks-required-recovery-1"
+        )
+        self.message_ids["gateway-restart-recovery"] = recovery_id
+        self.wait_until(
+            lambda: self.receipt_completed(recovery_id), 30, "required-mode receipt recovery"
+        )
+        with self.gateway_db() as db:
+            row = db.execute(
+                "SELECT body FROM bus_messages WHERE message_id = ?", (recovery_id,)
+            ).fetchone()
+        if not row or row[0] != "[hook:gateway-restart-recovery] required recovery":
+            raise GateFailure("required-mode Gateway recovery did not restore hooks")
+
+    def verify_token_stream_isolation(self) -> None:
+        with self.gateway_db() as db:
+            events = {
+                row[0]
+                for row in db.execute("SELECT DISTINCT event FROM hook_pipeline_evaluations")
+            }
+        if not events or not events.issubset({"before_send", "after_receipt"}):
+            raise GateFailure(f"non-message event entered hook pipeline: {sorted(events)}")
+        service_source = (
+            CONTAINER_ROOT / "gateway" / "src" / "server" / "hooks" / "service.ts"
+        ).read_text(encoding="utf-8")
+        if 'new Set(["before_send", "after_receipt"])' not in service_source:
+            raise GateFailure("hook service event allowlist no longer excludes token streams")
+        self.scenario_status["token-stream-isolation"] = "pass"
+
+    def report(self) -> dict[str, Any]:
+        pending = [name for name, status in self.scenario_status.items() if status != "pass"]
+        if pending:
+            raise GateFailure(f"unsettled scenarios: {', '.join(pending)}")
+        with self.gateway_db() as db:
+            execution_count = db.execute(
+                "SELECT COUNT(*) FROM hook_handler_executions WHERE outcome = 'completed'"
+            ).fetchone()[0]
+            receipt_count = db.execute(
+                "SELECT COUNT(*) FROM hook_receipt_completion WHERE state = 'completed'"
+            ).fetchone()[0]
+        return {
+            "schemaVersion": 1,
+            "status": "pass",
+            "durationSeconds": round(time.time() - self.started_at, 3),
+            "nexusHome": str(self.home),
+            "resourceLimits": {"cpus": 2, "memoryGiBMax": 10, "pidsMax": 1024},
+            "messages": self.message_ids,
+            "completedHookExecutions": execution_count,
+            "completedReceipts": receipt_count,
+            "scenarios": [
+                {"id": name, "status": self.scenario_status[name]} for name in SCENARIOS
+            ],
+        }
+
+    def cli(
+        self, args: list[str], *, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        result = command([str(NEXUS_BIN), *args], env=env or self.base_env(), check=False)
+        if result.returncode != 0:
+            raise GateFailure(
+                f"nexus {' '.join(args)} failed rc={result.returncode}: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        return result
+
+    def cli_json(self, args: list[str], *, env: dict[str, str] | None = None) -> dict[str, Any]:
+        result = self.cli(["--json", *args], env=env)
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as error:
+            raise GateFailure(f"invalid CLI JSON for {' '.join(args)}: {result.stdout!r}") from error
+
+    def direct_send(
+        self, source: str, timing: str, payload: str, idempotency_key: str
+    ) -> str:
+        response = self.direct_rpc_response(
+            "message.post.send",
+            self.send_request(source, timing, payload, idempotency_key),
+            f"cmd_{source.replace('-', '_')}_{int(time.time() * 1000)}",
+            idempotency_key,
+        )
+        if response.get("error"):
+            raise GateFailure(f"direct daemon RPC failed: {response['error']}")
+        return required_message_id(response.get("result", {}))
+
+    def send_request(
+        self, source: str, timing: str, payload: str, idempotency_key: str
+    ) -> dict[str, Any]:
+        return {
+            "to": {"verb": "post", "thread": "hooks-practical"},
+            "body": self.marker(source, timing, payload),
+            "mention": [],
+            "idempotencyKey": idempotency_key,
+        }
+
+    def direct_rpc_response(
+        self,
+        kind: str,
+        params: dict[str, Any],
+        command_id: str,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        request_id = f"rpc_{command_id}"
+        return self.direct_ipc_response(
+            request_id,
+            {
+                "mode": "command",
+                "commandId": command_id,
+                "kind": kind,
+                "params": params,
+                "idempotencyKey": idempotency_key,
+            },
+        )
+
+    def direct_query_response(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        request_id = f"rpc_query_{time.time_ns()}"
+        return self.direct_ipc_response(
+            request_id,
+            {"mode": "query", "method": method, "params": params},
+        )
+
+    def direct_ipc_response(
+        self, request_id: str, call: dict[str, Any]
+    ) -> dict[str, Any]:
+        endpoint = json.loads(
+            (self.home / "daemon-ipc-endpoint.json").read_text(encoding="utf-8")
+        )
+        request = {
+            "version": 1,
+            "token": endpoint["token"],
+            "requestId": request_id,
+            "caller": {
+                "name": "hooks-operator",
+                "project": "default",
+                "sessionId": "local-operator",
+                "runtimeId": "local-operator",
+                "kind": "human",
+                "tier": "admin",
+            },
+            "call": call,
+        }
+        payload = json.dumps(request, separators=(",", ":")).encode()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(15)
+            client.connect(endpoint["path"])
+            client.sendall(struct.pack(">I", len(payload)) + payload)
+            size = struct.unpack(">I", recv_exact(client, 4))[0]
+            response = json.loads(recv_exact(client, size))
+        if response.get("requestId") != request_id:
+            raise GateFailure(f"daemon RPC response correlation mismatch: {response}")
+        return response
+
+    def daemon_export(self, kind: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            response = self.direct_query_response(
+                "local.store.export",
+                {"kind": kind, "cursor": cursor, "limit": 500},
+            )
+            if response.get("error"):
+                raise GateFailure(f"daemon {kind} export failed: {response['error']}")
+            result = response.get("result", {})
+            page = result.get("rows")
+            if not isinstance(page, list):
+                raise GateFailure(f"daemon {kind} export returned invalid rows: {result}")
+            rows.extend(row for row in page if isinstance(row, dict))
+            cursor = result.get("nextCursor")
+            if not cursor:
+                return rows
+
+    def http_json(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        data = json.dumps(body).encode() if body is not None else None
+        request_headers = {"content-type": "application/json", **(headers or {})}
+        request = urllib.request.Request(
+            f"{self.gateway_url}{path}",
+            data=data,
+            headers=request_headers,
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            raw = error.read().decode("utf-8", "replace")
+            raise GateFailure(f"{method} {path} failed HTTP {error.code}: {raw}") from error
+
+    def gateway_healthy(self) -> bool:
+        try:
+            result = self.http_json("GET", "/api/v1/health")
+            return bool(result)
+        except Exception:
+            return False
+
+    def receipt_completed(self, message_id: str) -> bool:
+        try:
+            with self.gateway_db() as db:
+                row = db.execute(
+                    "SELECT state FROM hook_receipt_completion WHERE message_id = ?",
+                    (message_id,),
+                ).fetchone()
+            return bool(row and row[0] == "completed")
+        except sqlite3.Error:
+            return False
+
+    def gateway_db(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.home / "gateway.db", timeout=5)
+
+    def daemon_message_count(self) -> int:
+        return len(self.daemon_export("messages"))
+
+    def marker(self, source: str, timing: str, payload: str) -> str:
+        return f"GATE[{source}|{timing}] {payload}"
+
+    def payload_for(self, source: str) -> str:
+        return {
+            "direct-daemon-rpc": "direct boundary",
+            "cli-command-intent": "CLI boundary",
+            "gateway-rest": "REST boundary",
+            "network-mcp": "MCP boundary",
+            "notification": "notification boundary",
+            "agent-origin": "agent boundary",
+        }[source]
+
+    def wait_until(self, predicate: Any, timeout: float, label: str) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.1)
+        raise GateFailure(f"timed out waiting for {label}")
+
+    def stop_process(self, process: subprocess.Popen[str] | None) -> None:
+        if not process or process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=3)
+
+    def cleanup_processes(self) -> None:
+        self.stop_gateway()
+        self.stop_daemon()
+
+    def cleanup_stale_home(self) -> None:
+        if self.home.exists():
+            for pid_file in (self.home / "gate-daemon.pid", self.home / "gate-gateway.pid"):
+                try:
+                    pid = int(pid_file.read_text(encoding="utf-8").strip())
+                    os.kill(pid, signal.SIGTERM)
+                except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+                    pass
+            shutil.rmtree(self.home)
+        Path("/dev/shm/nexus-hooks-gate-stream.db").unlink(missing_ok=True)
+
+
+def required_message_id(value: dict[str, Any]) -> str:
+    message_id = value.get("messageId")
+    if not isinstance(message_id, str) or not message_id:
+        raise GateFailure(f"message acknowledgement lacks messageId: {value}")
+    return message_id
+
+
+def recv_exact(client: socket.socket, length: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = length
+    while remaining:
+        chunk = client.recv(remaining)
+        if not chunk:
+            raise GateFailure("daemon RPC socket ended before a complete frame")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    if args.help:
+        print(usage(), end="")
+        return 0
+    if args.list:
+        print("\n".join(SCENARIOS))
+        return 0
+    if args.inside:
+        LiveGate(args.output).run()
+        return 0
+    return host_main(args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except GateFailure as error:
+        print(f"error: {error}", file=sys.stderr)
+        raise SystemExit(1)

@@ -15,9 +15,14 @@ use libsql::params;
 use nexus_common::{new_thread_id, now, NexusError};
 use nexus_contracts::enums::{Kind, Scope, Tier};
 use nexus_contracts::events::WsEvent;
+use nexus_contracts::hooks::{
+    DeliveryTiming, HookAction, HookBeforeSendRequest, HookMessage, HookSender,
+};
 use nexus_contracts::ids::{MessageId, SessionId};
-use nexus_contracts::notify::NotifySendRequest;
-use nexus_contracts::ports::{BusPort, Caller, DispatchPort, EventSink, IdentityPort, PortResult};
+use nexus_contracts::notify::{NotifySendRequest, NotifyTarget};
+use nexus_contracts::ports::{
+    BusPort, Caller, DispatchPort, EventSink, IdentityPort, MessageHookPort, PortResult,
+};
 use nexus_contracts::send::{
     validate_send_body, validate_send_request, Ack, SendRequest, SendTarget,
 };
@@ -42,6 +47,11 @@ use crate::{dm, thread, topic};
 
 const LEGACY_DUPLICATE_WINDOW_MS: i64 = 2_000;
 
+struct EvaluatedSend {
+    request: SendRequest,
+    timing: DeliveryTiming,
+}
+
 /// The bus service. Owns the shared store (sole writer), the realtime port (enqueue + bell), the
 /// identity port (name resolution), and an event sink (web console WS broadcast).
 pub struct Bus {
@@ -49,6 +59,7 @@ pub struct Bus {
     realtime: Arc<dyn DispatchPort>,
     events: Arc<dyn EventSink>,
     router: Router,
+    message_hooks: Option<Arc<dyn MessageHookPort>>,
     now: Arc<dyn Fn() -> i64 + Send + Sync>,
     /// Session kind is immutable for one runtime id. A rebind mints a new SessionId, naturally
     /// invalidating this cache without coupling Bus to identity registration callbacks.
@@ -63,13 +74,43 @@ impl Bus {
         identity: Arc<dyn IdentityPort>,
         events: Arc<dyn EventSink>,
     ) -> Self {
+        Self::build(store, realtime, identity, events, None, Arc::new(now))
+    }
+
+    /// Build a bus whose single canonical send boundary delegates to a Gateway-owned hook port.
+    pub fn new_with_message_hooks(
+        store: Arc<Store>,
+        realtime: Arc<dyn DispatchPort>,
+        identity: Arc<dyn IdentityPort>,
+        events: Arc<dyn EventSink>,
+        message_hooks: Arc<dyn MessageHookPort>,
+    ) -> Self {
+        Self::build(
+            store,
+            realtime,
+            identity,
+            events,
+            Some(message_hooks),
+            Arc::new(now),
+        )
+    }
+
+    fn build(
+        store: Arc<Store>,
+        realtime: Arc<dyn DispatchPort>,
+        identity: Arc<dyn IdentityPort>,
+        events: Arc<dyn EventSink>,
+        message_hooks: Option<Arc<dyn MessageHookPort>>,
+        now: Arc<dyn Fn() -> i64 + Send + Sync>,
+    ) -> Self {
         let router = Router::new(store.clone(), identity);
         Bus {
             store,
             realtime,
             events,
             router,
-            now: Arc::new(now),
+            message_hooks,
+            now,
             sender_kinds: Mutex::new(HashMap::new()),
         }
     }
@@ -83,15 +124,7 @@ impl Bus {
         events: Arc<dyn EventSink>,
         now_fn: Arc<dyn Fn() -> i64 + Send + Sync>,
     ) -> Self {
-        let router = Router::new(store.clone(), identity);
-        Bus {
-            store,
-            realtime,
-            events,
-            router,
-            now: now_fn,
-            sender_kinds: Mutex::new(HashMap::new()),
-        }
+        Self::build(store, realtime, identity, events, None, now_fn)
     }
 
     /// The whole send path: resolve `to` → write + fan-out atomically → emit the event → ack.
@@ -137,11 +170,12 @@ impl Bus {
         // Local IPC and the authenticated gateway are the trust boundaries. The notification
         // transport does not add a second policy system after the target was accepted there.
         source_caller.tier = Tier::Admin;
+        let hook_target = notify_hook_target(&req.target, &resolved);
         self.send_resolved(
             &source_caller,
             SendRequest {
-                // Resolution already happened through NotifyTarget; this placeholder is never read.
-                to: SendTarget::Reply,
+                // Routing is already resolved, but hooks receive the equivalent immutable target.
+                to: hook_target,
                 summary: Some(source),
                 body: req.body,
                 mention: Vec::new(),
@@ -157,12 +191,13 @@ impl Bus {
     async fn send_resolved(
         &self,
         caller: &Caller,
-        req: SendRequest,
+        mut req: SendRequest,
         sender_kind: Option<Kind>,
         resolved: Resolved,
     ) -> Result<Ack, NexusError> {
-        let idempotency_key = normalized_idempotency_key(req.idempotency_key.as_deref());
-        if let Some(key) = idempotency_key {
+        let idempotency_key =
+            normalized_idempotency_key(req.idempotency_key.as_deref()).map(str::to_string);
+        if let Some(key) = idempotency_key.as_deref() {
             if let Some(ack) = self.ack_for_idempotency_key(caller, key).await? {
                 return Ok(ack);
             }
@@ -172,6 +207,9 @@ impl Bus {
         MessagePolicy::new(&self.store)
             .check(caller, &resolved)
             .await?;
+        let evaluated = self.evaluate_before_send(caller, req).await?;
+        req = evaluated.request;
+        let timing = evaluated.timing;
         let created_at = (self.now)();
 
         let (message_id, fanout, event): (MessageId, Option<u32>, WsEvent) = match resolved {
@@ -201,8 +239,11 @@ impl Bus {
                         dm::spec(&recipients),
                         req.summary.clone(),
                         req.body.clone(),
+                        req.metadata.clone(),
+                        req.mention.clone(),
+                        timing,
                         created_at,
-                        idempotency_key,
+                        idempotency_key.as_deref(),
                         sender_kind,
                     )
                     .await?;
@@ -234,8 +275,11 @@ impl Bus {
                         dm::local_operator_spec(operator_name, &recipients),
                         req.summary.clone(),
                         req.body.clone(),
+                        req.metadata.clone(),
+                        req.mention.clone(),
+                        timing,
                         created_at,
-                        idempotency_key,
+                        idempotency_key.as_deref(),
                         sender_kind,
                     )
                     .await?;
@@ -269,8 +313,11 @@ impl Bus {
                         thread::spec(&thread_id, thread_name, thread_project, &members),
                         req.summary.clone(),
                         req.body.clone(),
+                        req.metadata.clone(),
+                        req.mention.clone(),
+                        timing,
                         created_at,
-                        idempotency_key,
+                        idempotency_key.as_deref(),
                         sender_kind,
                     )
                     .await?;
@@ -301,8 +348,11 @@ impl Bus {
                         topic::spec(&topic_id, &subscribers),
                         req.summary.clone(),
                         req.body.clone(),
+                        req.metadata.clone(),
+                        req.mention.clone(),
+                        timing,
                         created_at,
-                        idempotency_key,
+                        idempotency_key.as_deref(),
                         sender_kind,
                     )
                     .await?;
@@ -330,8 +380,11 @@ impl Bus {
                         dm::group_spec(group, &members),
                         req.summary.clone(),
                         req.body.clone(),
+                        req.metadata.clone(),
+                        req.mention.clone(),
+                        timing,
                         created_at,
-                        idempotency_key,
+                        idempotency_key.as_deref(),
                         sender_kind,
                     )
                     .await?;
@@ -380,6 +433,9 @@ impl Bus {
         spec: WriteSpec<'_>,
         summary: Option<String>,
         body: String,
+        metadata: Option<serde_json::Map<String, serde_json::Value>>,
+        mention: Vec<String>,
+        timing: DeliveryTiming,
         created_at: i64,
         idempotency_key: Option<&str>,
         sender_kind: Option<Kind>,
@@ -395,6 +451,9 @@ impl Bus {
             spec,
             summary,
             body,
+            metadata,
+            mention,
+            timing,
             created_at,
             idempotency_key,
             sender_kind,
@@ -411,6 +470,93 @@ impl Bus {
             }
             (Err(err), _) => Err(err),
         }
+    }
+
+    async fn evaluate_before_send(
+        &self,
+        caller: &Caller,
+        req: SendRequest,
+    ) -> Result<EvaluatedSend, NexusError> {
+        if req
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.contains_key("_nexus"))
+        {
+            return Err(NexusError::Invalid(
+                "metadata._nexus is reserved for Nexus provenance".into(),
+            ));
+        }
+        let Some(hooks) = &self.message_hooks else {
+            return Ok(EvaluatedSend {
+                request: req,
+                timing: DeliveryTiming::default(),
+            });
+        };
+
+        let evaluation_id = hook_evaluation_id(caller, req.idempotency_key.as_deref());
+        let original_sender = HookSender {
+            agent_id: caller.agent_id.clone(),
+            name: caller.name.clone(),
+        };
+        let original_target = req.to.clone();
+        let result = hooks
+            .before_send(HookBeforeSendRequest {
+                evaluation_id: evaluation_id.clone(),
+                message: HookMessage {
+                    sender: original_sender.clone(),
+                    target: original_target.clone(),
+                    body: req.body,
+                    summary: req.summary,
+                    mention: req.mention,
+                    metadata: req.metadata.unwrap_or_default(),
+                },
+            })
+            .await
+            .map_err(NexusError::from)?;
+
+        if result.evaluation_id != evaluation_id {
+            return Err(NexusError::Invalid(
+                "hook result evaluationId does not match the request".into(),
+            ));
+        }
+        if result.message.sender != original_sender || result.message.target != original_target {
+            return Err(NexusError::Invalid(
+                "before_send hooks cannot change sender or target".into(),
+            ));
+        }
+        if result.message.metadata.contains_key("_nexus") {
+            return Err(NexusError::Invalid(
+                "hook result cannot write reserved metadata._nexus".into(),
+            ));
+        }
+        if result.action == HookAction::Reject {
+            return Err(NexusError::HookRejected);
+        }
+        validate_send_body(&result.message.body)
+            .map_err(|error| NexusError::Invalid(error.message))?;
+
+        let mut metadata = result.message.metadata;
+        if !result.executed_by.is_empty() {
+            metadata.insert(
+                "_nexus".into(),
+                serde_json::json!({
+                    "hooks": {
+                        "executedBy": result.executed_by,
+                    }
+                }),
+            );
+        }
+        Ok(EvaluatedSend {
+            request: SendRequest {
+                to: original_target,
+                summary: result.message.summary,
+                body: result.message.body,
+                mention: result.message.mention,
+                metadata: (!metadata.is_empty()).then_some(metadata),
+                idempotency_key: req.idempotency_key,
+            },
+            timing: result.timing.unwrap_or_default(),
+        })
     }
 
     async fn sender_kind(&self, caller: &Caller) -> Result<Kind, NexusError> {
@@ -843,6 +989,45 @@ fn projection_effect(
 
 fn normalized_idempotency_key(key: Option<&str>) -> Option<&str> {
     key.map(str::trim).filter(|key| !key.is_empty())
+}
+
+fn hook_evaluation_id(caller: &Caller, idempotency_key: Option<&str>) -> String {
+    match normalized_idempotency_key(idempotency_key) {
+        Some(key) => {
+            let mut digest = Sha256::new();
+            digest.update(b"nexus.hooks.before_send.v1\0");
+            digest.update(
+                caller
+                    .agent_id
+                    .as_ref()
+                    .map(|agent_id| agent_id.0.as_str())
+                    .unwrap_or(&caller.session.0)
+                    .as_bytes(),
+            );
+            digest.update(b"\0");
+            digest.update(key.as_bytes());
+            format!("he_{:x}", digest.finalize())
+        }
+        None => nexus_common::new_message_id().0.replacen("m_", "he_", 1),
+    }
+}
+
+fn notify_hook_target(target: &NotifyTarget, resolved: &Resolved) -> SendTarget {
+    match target {
+        NotifyTarget::Agent { agent_id } => SendTarget::dm_agent(agent_id.clone(), None),
+        NotifyTarget::Name { name } | NotifyTarget::Group { group: name } => {
+            SendTarget::dm_name(name)
+        }
+        NotifyTarget::Thread { thread } => SendTarget::Post {
+            thread: thread.clone(),
+        },
+        NotifyTarget::Auto { value } => match resolved {
+            Resolved::Thread(_, _) => SendTarget::Post {
+                thread: value.clone(),
+            },
+            _ => SendTarget::dm_name(value),
+        },
+    }
 }
 
 fn scope_token(scope: Scope) -> &'static str {

@@ -3184,6 +3184,35 @@ mod messages {
         assert_eq!(got.scope, Scope::Thread);
         assert_eq!(got.thread, Some(ThreadId("t_backend".into())));
     }
+
+    #[tokio::test]
+    async fn accepted_message_projection_carries_canonical_hook_fields() {
+        let store = migrated().await;
+        let repo = Messages::new(&store);
+        let message = sample_dm();
+        repo.insert(&message).await.unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE messages
+                 SET metadata_json = ?2, mention_json = ?3
+                 WHERE message_id = ?1",
+                libsql::params![
+                    message.id.0.clone(),
+                    r#"{"reviewed":true,"nested":{"source":"hook"}}"#,
+                    r#"["fable"]"#
+                ],
+            )
+            .await
+            .unwrap();
+
+        let effects = repo.gateway_projection_effects(&message.id).await.unwrap();
+        assert_eq!(
+            effects[0].payload["metadata"],
+            serde_json::json!({"reviewed": true, "nested": {"source": "hook"}})
+        );
+        assert_eq!(effects[0].payload["mention"], serde_json::json!(["fable"]));
+    }
 }
 
 mod stream_raw {

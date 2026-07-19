@@ -16,6 +16,7 @@ use crate::batch::{ConsumeRequest, NexusBatch};
 use crate::enums::Kind;
 use crate::events::WsEvent;
 use crate::harness::HarnessId;
+pub use crate::hook_ports::MessageHookPort;
 use crate::ids::{AgentId, MessageId, SessionId};
 use crate::notify::{NotifyRequest, NotifyResponse, NotifySendRequest};
 use crate::prompt::SteerResponse;
@@ -516,6 +517,15 @@ pub trait AgentTurnExecutionPort: Send + Sync {
     /// weakens this queue contract.
     fn active_turn_sessions(&self) -> Vec<SessionId> {
         Vec::new()
+    }
+
+    /// Await the adapter's authoritative final-turn boundary for an already active session.
+    /// Implementations must use protocol completion, never rendered text or inferred tool counts.
+    async fn wait_for_turn_completion(&self, _recipient: &SessionId) -> PortResult<()> {
+        Err(ContractError {
+            code: crate::codes::METHOD_NOT_FOUND,
+            message: "this transport cannot observe an active turn completion boundary".into(),
+        })
     }
 }
 

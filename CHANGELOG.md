@@ -3,6 +3,37 @@
 All notable public changes to Egregore Nexus are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and uses semantic versioning.
 
+## [0.1.5] - Unreleased
+
+### Added
+
+- Gateway-owned, language-neutral local message hooks using one JSON stdin/stdout protocol for
+  shell, JavaScript, Python, and native executables.
+- `before_send` transformation/rejection and `after_receipt` metadata/automation events at the
+  canonical message boundary, covering CLI, REST, network MCP, notifications, and agent sends.
+- Explicit `interrupt`, `yield_turn`, and `after_tool_loop` delivery timing selected by hooks and
+  enforced through harness-neutral capabilities.
+- Gateway-persisted hook audit records, Ed25519 execution attestations, read-only REST diagnostics,
+  and `nexus gateway hooks list`.
+
+### Changed
+
+- Canonical send acceptance now uses one correlated daemon-to-Gateway hook evaluation when a
+  hook-capable Gateway is available. Optional mode preserves transport during Gateway outage;
+  required mode makes Gateway hook availability a policy boundary.
+
+### Security
+
+- Local hook processes receive a minimal environment, declared argv with no implicit shell,
+  bounded execution time/output/concurrency, and process-tree cleanup. Hooks remain trusted local
+  code running as the Gateway account, not sandboxed programs.
+
+### Known limitations
+
+- v0.1.5 does not provide token-stream hooks, language SDKs, HTTP callback delivery, remote hook
+  execution, or programmable custom timing policies.
+- External `after_receipt` side effects are at-least-once and must deduplicate on `invocationId`.
+
 ## [0.1.4] - 2026-07-19
 
 ### Changed

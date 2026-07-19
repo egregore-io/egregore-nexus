@@ -24,7 +24,9 @@ describe("canonical Gateway REST reads", () => {
       "INSERT INTO thread_members VALUES ('t_design','a_ada',1,NULL)",
       "INSERT INTO topics VALUES ('builds',1,1)",
       "INSERT INTO topic_subscriptions VALUES ('builds','a_ada',NULL,'0',1,1)",
-      `INSERT INTO bus_messages VALUES
+      `INSERT INTO bus_messages
+        (message_id, kind, from_name, from_agent_id, to_name, to_agent_id,
+         thread_id, topic, summary, body, provenance_json, created_at) VALUES
         ('m_t1','thread','ada','a_ada','design',NULL,'t_design',NULL,NULL,'first','{}',10),
         ('m_t2','thread','blake','a_blake','design',NULL,'t_design',NULL,NULL,'second','{}',11),
         ('m_d1','dm','ada','a_ada','blake','a_blake',NULL,NULL,NULL,'dm','{}',12)`,

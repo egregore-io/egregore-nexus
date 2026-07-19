@@ -67,6 +67,56 @@ async fn metadata_is_project_scoped() {
     );
 }
 
+#[tokio::test]
+async fn hook_metadata_merge_is_recursive_global_and_provenance_idempotent() {
+    let store = migrated().await;
+    seed_entities(&store, "nexus").await;
+    let repo = Metadata::new(&store);
+    repo.set(
+        "nexus",
+        MetadataEntity::Message,
+        "m_1",
+        &serde_json::json!({
+            "nested": {"before": true},
+            "_nexus": {"hooks": {"executedBy": [
+                {"invocationId": "hi_before", "hookId": "before"}
+            ]}}
+        }),
+    )
+    .await
+    .unwrap();
+
+    let patch = serde_json::json!({
+        "nested": {"after": true},
+        "indexed": true,
+        "_nexus": {"hooks": {"executedBy": [
+            {"invocationId": "hi_after", "hookId": "after"}
+        ]}}
+    });
+    let first = repo
+        .merge_message_hook_metadata("m_1", "hr_m_1", &patch)
+        .await
+        .unwrap();
+    let replay = repo
+        .merge_message_hook_metadata("m_1", "hr_m_1", &patch)
+        .await
+        .unwrap();
+
+    assert_eq!(first, replay);
+    assert_eq!(
+        replay["nested"],
+        serde_json::json!({"before": true, "after": true})
+    );
+    assert_eq!(replay["indexed"], true);
+    assert_eq!(
+        replay["_nexus"]["hooks"]["executedBy"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
 async fn seed_entities(store: &Store, project: &str) {
     store
         .conn

@@ -22,6 +22,8 @@ connects only to the Gateway.
 - [ACP activity pass-through](acp-passthrough.md) — normalized activity from structured harness
   events.
 - [Tool-call contract](tool-call-contract.md) — the canonical C-TOOL event shape.
+- [Message hooks](hooks.md) — Gateway-owned `before_send` and `after_receipt` local programs,
+  delivery timing, and signed audit provenance.
 - [Extending Nexus](extending-nexus.md) — public extension seams and delivery-shaping patterns.
 - [Coding standards](coding-standards.md) — architecture, test, documentation, and commit rules.
 

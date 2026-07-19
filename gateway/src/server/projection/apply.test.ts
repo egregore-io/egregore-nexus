@@ -48,11 +48,40 @@ describe("canonical Gateway projection application", () => {
         },
       }),
     ).resolves.toBe("applied");
-    expect((await db.execute("SELECT message_id, body FROM bus_messages")).rows).toMatchObject([
-      { message_id: "m1", body: "hello" },
+    expect((await db.execute(
+      "SELECT message_id, body, metadata_json, mention_json FROM bus_messages",
+    )).rows).toMatchObject([
+      { message_id: "m1", body: "hello", metadata_json: "{}", mention_json: "[]" },
     ]);
     expect((await db.execute("SELECT daemon_epoch, through_seq FROM projection_cursors")).rows)
       .toMatchObject([{ daemon_epoch: "boot-1", through_seq: 1 }]);
+  });
+
+  it("materializes canonical message metadata and mentions for receipt hooks", async () => {
+    await applyCanonicalProjection(db, {
+      eventId: "message:m_hook",
+      daemonEpoch: "boot-1",
+      seq: 1,
+      occurredAt: 10,
+      kind: "message.accepted",
+      version: 1,
+      payload: {
+        messageId: "m_hook",
+        scope: "thread",
+        threadId: "t_release",
+        body: "review",
+        metadata: { nested: { source: "before_send" } },
+        mention: ["fable"],
+      },
+    });
+
+    const row = (await db.execute(
+      "SELECT metadata_json, mention_json FROM bus_messages WHERE message_id = 'm_hook'",
+    )).rows[0];
+    expect(JSON.parse(String(row?.metadata_json))).toEqual({
+      nested: { source: "before_send" },
+    });
+    expect(JSON.parse(String(row?.mention_json))).toEqual(["fable"]);
   });
 
   it("rolls back the source event and cursor when materialization rejects", async () => {

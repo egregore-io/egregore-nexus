@@ -192,6 +192,9 @@ endpoints enqueue daemon command intents unless explicitly marked as not impleme
 | GET | `/agents/:id/metadata` | Read an agent's opaque metadata JSON bag. `:id` may be the stable `agentId` or current name. |
 | GET | `/agents/:id/runtimes` | List runtimes for one durable agent. Query: `includeStopped`. |
 | GET | `/runtimes` | Top-level runtime list for one durable agent. Query: `agent` or `name` or `agentId`, plus `includeStopped`. |
+| GET | `/hooks` | Read the active message-hook generation, handlers, and manifest errors. Local paths are redacted unless the caller is Admin-tier. |
+| GET | `/hooks/public-key` | Read the Gateway Ed25519 public key used to verify hook execution provenance. |
+| GET | `/hooks/audit` | Read recent hook executions and pending receipts. Query: `limit` (default 100). Results and local details are redacted unless the caller is Admin-tier. |
 | GET | `/capabilities` | Machine-readable REST capability list generated from the registered route table, including read routes, command-backed routes, unauthenticated producer routes, and explicit `501` gaps. |
 | GET | `/openapi` | OpenAPI 3.x discovery document generated from the same route registry as `/capabilities`. |
 | GET | `/sources` | List notification sources without tokens. |
@@ -307,6 +310,26 @@ a second bus write. The daemon also stores the key on the canonical Message
 Post row under the sender session and returns the original `messageId` if a duplicate reaches the
 bus writer directly. Keyless requests are protected by a short same-sender/same-target/body
 duplicate window.
+
+If Gateway message hooks are configured, every genuinely new logical send uses the same
+`before_send` pipeline before daemon acceptance, including sends originating outside REST. Hook
+metadata and signed provenance are committed with the message. An idempotent retry returns the
+original message rather than running the hook again. See [Message hooks](hooks.md).
+
+### Hook diagnostics
+
+The hook endpoints are read-only; manifests remain local files. All three require normal Gateway
+authentication except where local operator mode supplies it automatically.
+
+```bash
+curl -s http://localhost:4100/api/v1/hooks
+curl -s http://localhost:4100/api/v1/hooks/public-key
+curl -s 'http://localhost:4100/api/v1/hooks/audit?limit=20'
+```
+
+`GET /hooks/audit` verifies stored execution signatures against the Gateway key and includes a
+`verified` boolean. Non-admin callers receive redacted entries without local command results or
+paths. A missing hook service returns `503` rather than an empty registry.
 
 ### Entity metadata
 

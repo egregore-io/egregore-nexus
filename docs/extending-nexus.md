@@ -1,7 +1,8 @@
 # Extending Nexus
 
 Nexus is a neutral realtime bus: it routes and wakes, nothing more. There is no orchestrator
-to plug into — **extensions live OUTSIDE the daemon and ride its stable surfaces**. This guide
+to plug into — **extensions live outside the daemon and ride its stable surfaces**. Gateway-owned
+message hooks are local extension programs, never daemon plug-ins. This guide
 inventories those surfaces and shows working recipes, including delivery-shaping (e.g.
 "only deliver to this agent when it is mentioned") built with zero changes to nexus core or
 any frontend (Lens included — frontends render what the bus decides).
@@ -25,6 +26,7 @@ The invariants your extension must respect:
 | **Observe / AG-UI** (WS) | read/write | Per-session streams (`?session=<name>&afterId=<cursor>`) and input frames (`{"t":"input",...}` acked by `input.ack` / rejected by `input.err`, correlated on `clientMessageId`). |
 | **REST projection** | read/write | Everything the daemon exposes, discoverable at `GET /api/v1/capabilities`. |
 | **Sources** (inbound webhooks) | write | Named ingress with HMAC over the raw body: `POST /api/v1/sources/{name}/push`. Verified payloads land on the Pub monitor feed; they reach an agent only via a standing route rule (`admin route`) or a one-shot forward. |
+| **Message hooks** | read/write | Local shell, JavaScript, Python, or native programs at `before_send` and `after_receipt`. They can transform message fields, add metadata, select named delivery timing, reject before acceptance, and run receipt side effects. See [Message hooks](hooks.md). |
 | **CLI as automation** | read/write | Register your controller as an agent; `nexus listen --json` is the same drain loop real agents use. |
 | **Terminal socket** | read/write | Per-session UDS with a binary frame protocol (`terminal_socket.rs`); manifests under `~/.nexus/terminal-endpoints/`. Host headed terminals in any emulator. |
 
@@ -76,6 +78,14 @@ dropped; landing in Pub never by itself pushes to an agent.
 Subscribe the events lane with `afterSeq` cursors per topic. Reconnects replay the gap from
 the server-side ring — your consumer never misses events and never polls.
 
+### Recipe 5 — canonical message policy
+
+Put a `before_send` manifest in `$NEXUS_HOME/gateway/hooks.d` when a rule must cover every
+canonical source: CLI, REST, network MCP, notification, or agent-originated traffic. The program
+can rewrite body/summary/mentions, merge developer metadata, choose `interrupt`, `yield_turn`, or
+`after_tool_loop`, or reject before the daemon commits the message. Use `after_receipt` for
+message-ID-aware local automation. Hooks do not see token streams or agent-session events.
+
 ## Seams deliberately left open (not yet features)
 
 - **Native per-source wake gating**: `WakePolicy::should_wake(state, source)` carries the
@@ -83,8 +93,9 @@ the server-side ring — your consumer never misses events and never polls.
   mention-only delivery keyed off agent metadata) can land **without a contract change**.
   Today the decision ignores `source`; `--mention` is a soft highlight, never routing.
 - **Outbound webhooks**: `sessions.callback_url` is a dormant schema column; there is no
-  push-to-URL dispatcher. The events lane is the outbound story. If your extension needs
-  HTTP push, run a small events-lane consumer that forwards.
+  push-to-URL hook runner. The events lane is the outbound story. If your extension needs HTTP
+  push, run a small events-lane consumer that forwards. A future callback runner can reuse the
+  message-hook invocation protocol, but it is not shipped in v0.1.5.
 - **Routing rules over REST**: `POST /api/v1/routing-rules` is a deliberate `501`; rules are
   created via `admin route`. The read side (`GET /api/v1/routing-rules`) works.
 
@@ -98,3 +109,5 @@ the server-side ring — your consumer never misses events and never polls.
    surfaces that permit it (DMs, admin tier where granted, or credentials you legitimately
    hold as their operator).
 5. **Policy state goes in metadata**, not in side files the fleet can't see.
+6. **Make receipt side effects idempotent.** `after_receipt` is at-least-once; use its stable
+   `invocationId` as the external dedupe key.

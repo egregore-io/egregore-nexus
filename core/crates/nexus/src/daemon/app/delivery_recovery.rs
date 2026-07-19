@@ -5,6 +5,25 @@
 
 use super::*;
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeliveryObligationPayload {
+    message: Message,
+    #[serde(default)]
+    delivery_timing: nexus_contracts::DeliveryTiming,
+}
+
+fn decode_delivery_obligation(
+    payload: &str,
+) -> Result<DeliveryObligationPayload, serde_json::Error> {
+    serde_json::from_str(payload).or_else(|_| {
+        serde_json::from_str::<Message>(payload).map(|message| DeliveryObligationPayload {
+            message,
+            delivery_timing: nexus_contracts::DeliveryTiming::default(),
+        })
+    })
+}
+
 impl AppState {
     /// Settle one accepted delivery immediately when its durable agent identity is explicitly
     /// dead. This check must run before pull-consumer and harness ownership routing: DEAD is a
@@ -90,8 +109,8 @@ impl AppState {
                 );
                 continue;
             }
-            let message: Message = match serde_json::from_str(&obligation.payload_json) {
-                Ok(message) => message,
+            let payload = match decode_delivery_obligation(&obligation.payload_json) {
+                Ok(payload) => payload,
                 Err(error) => {
                     tracing::error!(
                         target: "nexus::delivery",
@@ -103,6 +122,7 @@ impl AppState {
                     continue;
                 }
             };
+            let message = payload.message;
             if messages
                 .get(&message.project.0, &message.id)
                 .await?
@@ -112,7 +132,9 @@ impl AppState {
                     .insert_with_agents(&message, None, Some(&obligation.recipient_agent_id))
                     .await?;
             }
-            inbox.enqueue(&message.id, &runtime).await?;
+            inbox
+                .enqueue_with_timing(&message.id, &runtime, payload.delivery_timing)
+                .await?;
             restored += 1;
         }
         Ok(restored)

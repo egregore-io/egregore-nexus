@@ -70,8 +70,11 @@ describe("gateway/webconsole package split", () => {
     expect(source).toContain("snapshotDistForRun()");
     expect(source).toContain("createHttpServer");
     expect(source).toContain("attachAguiWsUpgrade(server");
-    expect(source).toContain("startGatewayProjectionService()");
+    expect(source).toContain("startGatewayProjectionService({");
     expect(source).toContain("stopGatewayProjectionService()");
+    expect(source).toContain("startGatewayHookService()");
+    expect(source).toContain("stopGatewayHookService()");
+    expect(source).toContain("closeSharedDaemonPushConnector()");
     expect(source).toContain("pathToFileURL(serverEntry).href");
     expect(source).not.toContain("spawn(process.execPath, [join(FRONTEND_DIR, \"dist/server/server.js\")]");
   });

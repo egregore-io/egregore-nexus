@@ -8,6 +8,7 @@ import { createClient } from "@libsql/client";
 import { describe, expect, it, vi } from "vitest";
 
 import { removeTempPath } from "../../test/removeTempPath";
+import { CURRENT_GATEWAY_SCHEMA_VERSION } from "../store/migrations";
 
 vi.mock("../../routes/api/agui.observe", () => ({
   observeScoped: vi.fn(async () => json({ ok: true, route: "agent-session" })),
@@ -45,6 +46,37 @@ function dispatchers(): HeadlessGatewayDispatchers {
 }
 
 describe("headless gateway", () => {
+  it("starts hooks before projection and closes both services", async () => {
+    const calls: string[] = [];
+    const afterReceipt = vi.fn(async () => undefined);
+    const server = await createHeadlessGatewayServer(dispatchers(), {
+      async startHooks() {
+        calls.push("hooks:start");
+        return { afterReceipt };
+      },
+      async startProjection(options) {
+        calls.push("projection:start");
+        expect(options.afterReceipt).toEqual(expect.any(Function));
+        await options.afterReceipt?.({} as never);
+        expect(afterReceipt).toHaveBeenCalledOnce();
+      },
+      async stopProjection() { calls.push("projection:stop"); },
+      async stopHooks() { calls.push("hooks:stop"); },
+      async stopConnection() { calls.push("connection:stop"); },
+    });
+
+    expect(calls).toEqual(["hooks:start", "projection:start"]);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    await server.shutdown();
+    expect(calls).toEqual([
+      "hooks:start",
+      "projection:start",
+      "projection:stop",
+      "hooks:stop",
+      "connection:stop",
+    ]);
+  });
+
   it("supports a v0.1.0 baseline-only activation step without starting the server", async () => {
     const dir = await mkdtemp(join(tmpdir(), "nexus-gateway-migrate-"));
     const path = join(dir, "gateway.db");
@@ -53,7 +85,7 @@ describe("headless gateway", () => {
         ...process.env,
         NEXUS_GATEWAY_DB: `file:${path}`,
       });
-      expect(result).toEqual({ schemaVersion: 1 });
+      expect(result).toEqual({ schemaVersion: CURRENT_GATEWAY_SCHEMA_VERSION });
       const db = createClient({ url: `file:${path}` });
       const rows = await db.execute(
         "SELECT version FROM gateway_schema_migrations ORDER BY version DESC LIMIT 1",

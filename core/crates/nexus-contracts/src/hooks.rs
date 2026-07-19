@@ -19,6 +19,31 @@ pub enum DeliveryTiming {
     AfterToolLoop,
 }
 
+impl Default for DeliveryTiming {
+    fn default() -> Self {
+        Self::Interrupt
+    }
+}
+
+impl DeliveryTiming {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Interrupt => "interrupt",
+            Self::YieldTurn => "yield_turn",
+            Self::AfterToolLoop => "after_tool_loop",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "interrupt" => Some(Self::Interrupt),
+            "yield_turn" => Some(Self::YieldTurn),
+            "after_tool_loop" => Some(Self::AfterToolLoop),
+            _ => None,
+        }
+    }
+}
+
 /// Terminal pipeline decision. Omitted hook output defaults to continuing the send.
 #[typeshare]
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -117,4 +142,61 @@ pub struct HookAfterReceiptResult {
     pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     pub executed_by: Vec<HookExecutedBy>,
+}
+
+/// Hook capability advertised by the local Gateway during stream negotiation.
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayHookCapabilities {
+    pub protocol_version: u32,
+    pub generation: String,
+    pub events: Vec<String>,
+}
+
+/// Event-specific payload carried by one correlated daemon-to-Gateway evaluation.
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "event", content = "request", rename_all = "snake_case")]
+pub enum HookEvaluationRequest {
+    BeforeSend(HookBeforeSendRequest),
+    AfterReceipt(HookAfterReceiptRequest),
+}
+
+impl HookEvaluationRequest {
+    pub fn event_name(&self) -> &'static str {
+        match self {
+            Self::BeforeSend(_) => "before_send",
+            Self::AfterReceipt(_) => "after_receipt",
+        }
+    }
+}
+
+/// Event-specific terminal result returned by Gateway.
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "event", content = "result", rename_all = "snake_case")]
+pub enum HookEvaluationResponse {
+    BeforeSend(HookBeforeSendResult),
+    AfterReceipt(HookAfterReceiptResult),
+}
+
+/// One daemon request on the private correlated hook lane.
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayHookEvaluation {
+    pub correlation_id: String,
+    pub request: HookEvaluationRequest,
+}
+
+/// Structured Gateway-side failure for one correlation ID.
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HookEvaluationFailure {
+    pub code: String,
+    pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
 }

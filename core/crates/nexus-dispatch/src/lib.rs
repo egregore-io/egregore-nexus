@@ -15,6 +15,7 @@
 //! re-rung on [`EventLoop::spawn`] for crash-safety).
 
 pub mod bell;
+pub mod delivery_timing;
 pub mod drain;
 pub mod error;
 pub mod event_loop;
@@ -23,7 +24,8 @@ pub mod state;
 pub mod wake_policy;
 
 pub use bell::Bell;
-pub use drain::InboxDrainer;
+pub use delivery_timing::{delivery_action, DeliveryAction, DeliveryTimingError};
+pub use drain::{InboxDrainer, TimedNexusBatch};
 pub use error::{DispatchResult, DispatchResult as RealtimeResult};
 pub use event_loop::{
     EventLoop, LoopDeps, DEFAULT_INJECT_COMPLETION_TIMEOUT, DEFAULT_PROVIDER_LIMIT_COOLDOWN,

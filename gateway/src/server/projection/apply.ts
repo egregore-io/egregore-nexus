@@ -190,8 +190,9 @@ async function materialize(tx: Transaction, event: CanonicalProjectionEvent): Pr
       await tx.execute({
         sql: `INSERT OR IGNORE INTO bus_messages
               (message_id, kind, from_name, from_agent_id, to_name, to_agent_id,
-               thread_id, topic, summary, body, provenance_json, created_at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               thread_id, topic, summary, body, provenance_json, metadata_json,
+               mention_json, created_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           requiredString(payload, "messageId"),
           requiredString(payload, "scope"),
@@ -204,6 +205,8 @@ async function materialize(tx: Transaction, event: CanonicalProjectionEvent): Pr
           optionalString(payload.summary),
           requiredString(payload, "body"),
           JSON.stringify(provenance),
+          JSON.stringify(objectOrEmpty(payload.metadata)),
+          JSON.stringify(stringArray(payload.mention)),
           optionalNumber(payload.createdAt) ?? event.occurredAt,
         ],
       });
@@ -268,6 +271,16 @@ async function materialize(tx: Transaction, event: CanonicalProjectionEvent): Pr
     default:
       throw new Error(`unsupported projection kind ${String(event.kind)}`);
   }
+}
+
+function objectOrEmpty(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
 }
 
 function objectPayload(value: unknown): Record<string, unknown> {

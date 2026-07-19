@@ -23,6 +23,7 @@ import {
   GatewayError,
   type CommandIntentSender,
   type GatewayCallerIdentity,
+  type HookDiagnosticsReader,
   type MessagePostSender,
 } from "./http";
 import { seedDb } from "@drizzle/__mocks__/seedDb";
@@ -570,6 +571,47 @@ describe("public API — writes/ops dispatch through the right transport", () =>
       },
     ]);
     expect(res.body).toEqual({ entity: "message", id: "m_seed_1", metadata });
+  });
+
+  it("GET /api/v1/hooks exposes redacted registry, public-key, and verified audit reads", async () => {
+    const hooks: HookDiagnosticsReader = {
+      list: vi.fn(async (includePrivate) => ({
+        generation: "sha256:generation",
+        includePrivate,
+        hooks: [{ id: "redact", event: "before_send" }],
+        errors: [],
+      })),
+      publicKey: vi.fn(async () => ({
+        algorithm: "ed25519",
+        keyId: "sha256:key",
+        publicKey: "PUBLIC KEY",
+      })),
+      audit: vi.fn(async (limit, includePrivate) => ({
+        limit,
+        includePrivate,
+        executions: [{ verified: true }],
+      })),
+    };
+    const adminDeps = { ...deps(), hooks };
+
+    const list = await handle(req({ path: "/api/v1/hooks" }), adminDeps);
+    expect(list).toMatchObject({ status: 200, body: { includePrivate: true } });
+    expect(hooks.list).toHaveBeenCalledWith(true);
+
+    const agent = await handle(
+      req({
+        path: "/api/v1/hooks",
+        caller: { ...API_CALLER, tier: Tier.Agent, scopes: ["message:read"] },
+      }),
+      adminDeps,
+    );
+    expect(agent).toMatchObject({ status: 200, body: { includePrivate: false } });
+    expect(hooks.list).toHaveBeenLastCalledWith(false);
+
+    await expect(handle(req({ path: "/api/v1/hooks/public-key" }), adminDeps))
+      .resolves.toMatchObject({ status: 200, body: { algorithm: "ed25519" } });
+    await expect(handle(req({ path: "/api/v1/hooks/audit", query: { limit: "7" } }), adminDeps))
+      .resolves.toMatchObject({ status: 200, body: { limit: 7, includePrivate: true } });
   });
 });
 

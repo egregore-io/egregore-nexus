@@ -529,6 +529,24 @@ impl AgentTurnExecutionPort for CodexAppServerTransport {
     fn active_turn_sessions(&self) -> Vec<SessionId> {
         CodexAppServerTransport::active_turn_sessions(self)
     }
+
+    async fn wait_for_turn_completion(&self, recipient: &SessionId) -> PortResult<()> {
+        let (_, thread_id) = self.client_for(recipient)?;
+        let Some(turn_id) = self.turn_tracker.active_turn_id(&thread_id) else {
+            return Ok(());
+        };
+        match self
+            .turn_tracker
+            .wait_for_completion(&thread_id, &turn_id, TURN_COMPLETION_TIMEOUT)
+            .await
+        {
+            Ok(()) | Err(super::turn_completion::CodexTurnWaitError::Failed(_)) => Ok(()),
+            Err(error) => Err(ContractError {
+                code: -32004,
+                message: format!("failed waiting for active Codex turn boundary: {error}"),
+            }),
+        }
+    }
 }
 
 struct SteerDecision {

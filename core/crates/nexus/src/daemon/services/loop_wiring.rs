@@ -3,18 +3,104 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
+use nexus_common::HookGatewayMode;
 use nexus_contracts::ids::SessionId;
-use nexus_contracts::{AgentTurnExecutionPort, EventSink};
+use nexus_contracts::{
+    codes, AgentTurnExecutionPort, ContractError, EventSink, HookAction, HookBeforeSendRequest,
+    HookBeforeSendResult, HookEvaluationRequest, HookEvaluationResponse, MessageHookPort,
+    PortResult,
+};
 use nexus_dispatch::{AgentRegistry, Bell, EventLoop, LoopDeps};
 use nexus_store::types::NativeThreadBindingRow;
 use nexus_store::Store;
 
 use crate::daemon::services::presence::{PresenceWriter, TransportHandle};
 use crate::daemon::stream_raw_writer::spawn_stream_raw_writer;
+
+use crate::daemon::gateway_hook_bridge::{GatewayHookBridge, GatewayHookBridgeError};
+
+/// Concrete daemon adapter for the Gateway-owned `before_send` hook boundary.
+pub struct GatewayMessageHookPort {
+    bridge: Option<GatewayHookBridge>,
+    mode: HookGatewayMode,
+    timeout: Duration,
+}
+
+impl GatewayMessageHookPort {
+    pub fn new(
+        bridge: Option<GatewayHookBridge>,
+        mode: HookGatewayMode,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            bridge,
+            mode,
+            timeout,
+        }
+    }
+
+    fn unavailable_or_bypass(
+        &self,
+        request: HookBeforeSendRequest,
+    ) -> PortResult<HookBeforeSendResult> {
+        match self.mode {
+            HookGatewayMode::Optional => Ok(passthrough_hook_result(request)),
+            HookGatewayMode::Required => Err(ContractError {
+                code: codes::HOOK_GATEWAY_UNAVAILABLE,
+                message: "hook-capable Gateway is unavailable".into(),
+            }),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl MessageHookPort for GatewayMessageHookPort {
+    async fn before_send(
+        &self,
+        request: HookBeforeSendRequest,
+    ) -> PortResult<HookBeforeSendResult> {
+        let Some(bridge) = &self.bridge else {
+            return self.unavailable_or_bypass(request);
+        };
+        let retained = request.clone();
+        match bridge
+            .evaluate(HookEvaluationRequest::BeforeSend(request), self.timeout)
+            .await
+        {
+            Ok(HookEvaluationResponse::BeforeSend(result)) => Ok(result),
+            Ok(HookEvaluationResponse::AfterReceipt(_)) => Err(ContractError {
+                code: codes::INTERNAL_ERROR,
+                message: "Gateway returned the wrong hook event result".into(),
+            }),
+            Err(
+                GatewayHookBridgeError::Unavailable
+                | GatewayHookBridgeError::UnsupportedEvent(_)
+                | GatewayHookBridgeError::Backpressure
+                | GatewayHookBridgeError::Disconnected
+                | GatewayHookBridgeError::TimedOut,
+            ) => self.unavailable_or_bypass(retained),
+            Err(GatewayHookBridgeError::Remote(error)) => Err(ContractError {
+                code: codes::INTERNAL_ERROR,
+                message: format!("Gateway hook evaluation failed: {}", error.message),
+            }),
+        }
+    }
+}
+
+fn passthrough_hook_result(request: HookBeforeSendRequest) -> HookBeforeSendResult {
+    HookBeforeSendResult {
+        evaluation_id: request.evaluation_id,
+        action: HookAction::Continue,
+        message: request.message,
+        timing: None,
+        executed_by: Vec::new(),
+    }
+}
 
 /// The concrete handles needed to make a launched/registered agent **wakeable**: the shared
 /// [`Bell`] + [`AgentRegistry`] (so a `dm`'s ring reaches the same per-session bell the loop parks

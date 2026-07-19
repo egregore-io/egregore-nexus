@@ -2,6 +2,7 @@ use std::path::Path;
 
 use http_body_util::{BodyExt, Empty};
 use hyper::body::Bytes;
+use hyper::header::{ACCEPT, AUTHORIZATION};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
@@ -50,6 +51,7 @@ struct GatewayErrorBody {
 #[derive(Clone)]
 pub(crate) struct GatewayReadClient {
     base_url: String,
+    bearer_token: Option<String>,
     client: Client<HttpConnector, Empty<Bytes>>,
 }
 
@@ -65,6 +67,10 @@ impl GatewayReadClient {
         }
         Ok(Self {
             base_url: discovery.url.trim_end_matches('/').to_string(),
+            bearer_token: std::env::var("NEXUS_REST_TOKEN")
+                .ok()
+                .map(|token| token.trim().to_string())
+                .filter(|token| !token.is_empty()),
             client: Client::builder(TokioExecutor::new()).build_http(),
         })
     }
@@ -155,6 +161,10 @@ impl GatewayReadClient {
         .await
     }
 
+    pub(crate) async fn get_json(&self, path: &str) -> Result<serde_json::Value, ContractError> {
+        self.get(path, &[]).await
+    }
+
     async fn get<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -177,10 +187,14 @@ impl GatewayReadClient {
             )
         };
         let uri = format!("{}{}{}", self.base_url, path, suffix);
-        let request = Request::builder()
+        let mut builder = Request::builder()
             .method(Method::GET)
             .uri(&uri)
-            .header("accept", "application/json")
+            .header(ACCEPT, "application/json");
+        if let Some(token) = &self.bearer_token {
+            builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let request = builder
             .body(Empty::<Bytes>::new())
             .map_err(|error| unavailable(&format!("invalid request: {error}")))?;
         let response = self

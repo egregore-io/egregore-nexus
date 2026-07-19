@@ -25,8 +25,8 @@ use nexus_contracts::ports::{
     InjectResult,
 };
 use nexus_contracts::{
-    AgentUpdateKind, HarnessId, OperatorAction, ProviderError, ProviderLimit, ProviderLimitReason,
-    ResetHint, SteerCapability, SteerDelivery, SteerResponse,
+    AgentUpdateKind, DeliveryTiming, HarnessId, OperatorAction, ProviderError, ProviderLimit,
+    ProviderLimitReason, ResetHint, SteerCapability, SteerDelivery, SteerResponse,
 };
 use nexus_store::repos::{Inbox, Messages};
 use nexus_store::Store;
@@ -90,6 +90,63 @@ struct NativeSteerRaceTurnExec {
     first_gate: Notify,
     steer_rejected: Notify,
     steer_error: ContractError,
+}
+
+/// Models a turn that is already active outside the bus loop. Tool-stream activity is deliberately
+/// separate from the final completion signal so timing cannot be inferred from visible updates.
+struct BoundaryWaitTurnExec {
+    session: SessionId,
+    active: AtomicBool,
+    injected: Mutex<Vec<NexusBatch>>,
+    wait_started: Notify,
+    final_completion: Notify,
+}
+
+impl BoundaryWaitTurnExec {
+    fn new(session: SessionId) -> Self {
+        Self {
+            session,
+            active: AtomicBool::new(true),
+            injected: Mutex::new(Vec::new()),
+            wait_started: Notify::new(),
+            final_completion: Notify::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentTurnExecutionPort for BoundaryWaitTurnExec {
+    async fn inject_turn(
+        &self,
+        _recipient: &SessionId,
+        batch: &NexusBatch,
+    ) -> Result<(), ContractError> {
+        self.injected.lock().unwrap().push(batch.clone());
+        Ok(())
+    }
+
+    fn active_turn_sessions(&self) -> Vec<SessionId> {
+        self.active
+            .load(Ordering::SeqCst)
+            .then(|| self.session.clone())
+            .into_iter()
+            .collect()
+    }
+
+    async fn wait_for_turn_completion(&self, _recipient: &SessionId) -> Result<(), ContractError> {
+        self.wait_started.notify_one();
+        self.final_completion.notified().await;
+        self.active.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn launch(&self, _req: SpawnRequest) -> Result<SpawnResponse, ContractError> {
+        unreachable!()
+    }
+
+    async fn remove(&self, _req: RemoveRequest) -> Result<RemoveResponse, ContractError> {
+        unreachable!()
+    }
 }
 
 impl NativeSteerRaceTurnExec {
@@ -748,6 +805,124 @@ async fn idle_agent_drains_one_turn_then_coalesces_a_followup() {
     assert_eq!(
         injected[1].counts.total, 2,
         "the follow-up turn carries both coalesced messages"
+    );
+}
+
+#[tokio::test]
+async fn after_tool_loop_waits_for_authoritative_final_completion_before_injecting() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let cfg = Config::default();
+    let bell = Bell::new();
+    let registry = AgentRegistry::new();
+    let session = SessionId("s_after_tool_loop".into());
+    let turn_exec = Arc::new(BoundaryWaitTurnExec::new(session.clone()));
+
+    insert(
+        &store,
+        &dm(
+            "m_after_tool_loop",
+            "casey",
+            "deliver only after the final model boundary",
+        ),
+    )
+    .await;
+    Inbox::new(&store)
+        .enqueue_with_timing(
+            &MessageId("m_after_tool_loop".into()),
+            &session,
+            DeliveryTiming::AfterToolLoop,
+        )
+        .await
+        .unwrap();
+
+    let _loop = EventLoop::spawn(
+        session.clone(),
+        LoopDeps {
+            store: store.clone(),
+            bell,
+            registry,
+            turn_exec: turn_exec.clone(),
+            events: Arc::new(NullSink),
+            project: PROJECT.into(),
+            drain_limit: cfg.drain_limit,
+            preview_chars: cfg.msg_preview_chars,
+            completion_timeout: Duration::from_secs(45),
+            provider_limit_default_cooldown: Duration::from_millis(50),
+        },
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), turn_exec.wait_started.notified())
+        .await
+        .expect("the timing policy should wait on the adapter boundary");
+    tokio::task::yield_now().await;
+    assert!(
+        turn_exec.injected.lock().unwrap().is_empty(),
+        "visible activity before final completion must not release after_tool_loop"
+    );
+
+    turn_exec.final_completion.notify_one();
+    wait_for_delivery_state(&store, "m_after_tool_loop", "delivered").await;
+    assert_eq!(turn_exec.injected.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn active_turn_interrupt_without_adapter_support_is_a_typed_terminal_error() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let cfg = Config::default();
+    let session = SessionId("s_interrupt_unsupported".into());
+    let turn_exec = Arc::new(BoundaryWaitTurnExec::new(session.clone()));
+
+    insert(
+        &store,
+        &dm(
+            "m_interrupt_unsupported",
+            "casey",
+            "do not silently downgrade interrupt",
+        ),
+    )
+    .await;
+    Inbox::new(&store)
+        .enqueue_with_timing(
+            &MessageId("m_interrupt_unsupported".into()),
+            &session,
+            DeliveryTiming::Interrupt,
+        )
+        .await
+        .unwrap();
+
+    let _loop = EventLoop::spawn(
+        session.clone(),
+        LoopDeps {
+            store: store.clone(),
+            bell: Bell::new(),
+            registry: AgentRegistry::new(),
+            turn_exec: turn_exec.clone(),
+            events: Arc::new(NullSink),
+            project: PROJECT.into(),
+            drain_limit: cfg.drain_limit,
+            preview_chars: cfg.msg_preview_chars,
+            completion_timeout: Duration::from_secs(45),
+            provider_limit_default_cooldown: Duration::from_millis(50),
+        },
+    );
+
+    wait_for_delivery_state(&store, "m_interrupt_unsupported", "error").await;
+    assert!(turn_exec.injected.lock().unwrap().is_empty());
+    let mut rows = store
+        .conn
+        .query(
+            "SELECT error_details_json FROM in_flight WHERE message_id = ?1",
+            ["m_interrupt_unsupported"],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    let details: serde_json::Value = serde_json::from_str(&row.get::<String>(0).unwrap()).unwrap();
+    assert_eq!(
+        details["rpcCode"],
+        nexus_contracts::codes::DELIVERY_TIMING_UNSUPPORTED
     );
 }
 
