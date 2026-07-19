@@ -196,7 +196,7 @@ describe("local hook command runner", () => {
     });
     if (process.platform !== "win32") {
       const pid = Number.parseInt(await readFile(pidPath, "utf8"), 10);
-      expect(() => process.kill(pid, 0)).toThrow();
+      await expect(waitForProcessExit(pid, 1_000)).resolves.toBe(true);
     }
   });
 
@@ -229,4 +229,22 @@ async function temporaryDirectory(): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), "nexus-hook-runner-"));
   temporaryDirectories.push(directory);
   return directory;
+}
+
+async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!processExists(pid)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return !processExists(pid);
+}
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
