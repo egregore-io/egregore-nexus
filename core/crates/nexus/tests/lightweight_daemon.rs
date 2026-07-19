@@ -594,6 +594,113 @@ async fn daemon_boot_rehydrates_the_nexus_runtime_identity_from_its_capsule() {
 }
 
 #[tokio::test]
+async fn daemon_boot_projects_only_the_newest_runtime_capsule_per_agent() {
+    let path = unique_store_path("boot-latest-runtime-per-agent");
+    {
+        let daemon = DaemonStore::open(path.to_string_lossy().as_ref())
+            .await
+            .expect("first boot");
+        let store = daemon.compatibility_store();
+        for (agent_id, name) in [
+            ("a_relaunched", "relaunched-agent"),
+            ("a_following", "following-agent"),
+        ] {
+            Agents::new(&store)
+                .create(NewAgent {
+                    agent_id: agent_id.into(),
+                    project: "default".into(),
+                    name: Some(name.into()),
+                    default_harness: Some("codex".into()),
+                    role: None,
+                    tier: Some("agent".into()),
+                    owner: None,
+                })
+                .await
+                .expect("agent identity");
+        }
+        for (runtime_id, agent_id, client_key) in [
+            ("s_following", "a_following", "following-key"),
+            ("s_relaunched_old", "a_relaunched", "old-key"),
+            ("s_relaunched_new", "a_relaunched", "new-key"),
+        ] {
+            IdentitySessions::new(&store)
+                .upsert(NewIdentitySession {
+                    runtime_id: runtime_id.into(),
+                    agent_id: agent_id.into(),
+                    project: "default".into(),
+                    harness: "codex".into(),
+                    mode: "headless".into(),
+                    backend: Some("acp".into()),
+                    cwd: Some(format!("/work/{runtime_id}")),
+                    native_resume_key: Some(format!("native-{runtime_id}")),
+                    client_key: Some(client_key.into()),
+                })
+                .await
+                .expect("resurrection capsule");
+        }
+        for (runtime_id, updated_at) in [
+            ("s_following", 10_i64),
+            ("s_relaunched_old", 20_i64),
+            ("s_relaunched_new", 30_i64),
+        ] {
+            store
+                .identity_conn()
+                .execute(
+                    "UPDATE identity_sessions SET updated_at = ?2 WHERE runtime_id = ?1",
+                    libsql::params![runtime_id, updated_at],
+                )
+                .await
+                .expect("ordered resurrection capsule");
+        }
+    }
+
+    let daemon = DaemonStore::open(path.to_string_lossy().as_ref())
+        .await
+        .expect("second boot");
+    let store = Arc::new(daemon.compatibility_store());
+    let state =
+        AppState::wire_with_registry(store.clone(), &Config::default(), AdapterRegistry::new());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        state.wait_for_runtime_identity_ready(),
+    )
+    .await
+    .expect("boot identity readiness");
+
+    let sessions = Sessions::new(&store);
+    let latest = sessions
+        .find_by_session_id(&SessionId("s_relaunched_new".into()))
+        .await
+        .expect("latest runtime lookup")
+        .expect("latest runtime must be projected");
+    assert_eq!(latest.agent_id.as_deref(), Some("a_relaunched"));
+    assert_eq!(latest.client_key.as_deref(), Some("new-key"));
+    assert!(
+        sessions
+            .find_by_session_id(&SessionId("s_relaunched_old".into()))
+            .await
+            .expect("old runtime lookup")
+            .is_none(),
+        "an older capsule for the same stable agent must remain history, not a live projection"
+    );
+    assert!(
+        sessions
+            .find_by_session_id(&SessionId("s_following".into()))
+            .await
+            .expect("following runtime lookup")
+            .is_some(),
+        "one stale capsule must not abort restoration for later agents"
+    );
+
+    drop(state);
+    drop(store);
+    drop(daemon);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(path.with_extension("db-shm"));
+}
+
+#[tokio::test]
 async fn concurrent_acp_revives_open_one_adapter_for_the_runtime() {
     let path = unique_store_path("concurrent-acp-revive");
     {

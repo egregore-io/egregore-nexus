@@ -24,9 +24,25 @@ impl AppState {
         let descriptors = IdentitySessions::new(&self.store).list().await?;
         let sessions = Sessions::new(&self.store);
         let agents = Agents::new(&self.store);
+        // `identity_sessions` is continuity history keyed by runtime, while the boot-scoped
+        // address directory projects one current runtime per durable agent. The repository lists
+        // capsules newest first, so retain the first capsule for each immutable agent id and leave
+        // older launches as history. Selecting by mutable display name would reintroduce rename
+        // races and trying to materialize every historical runtime can violate the live name
+        // uniqueness constraint, aborting restoration for unrelated agents.
+        let mut projected_agent_ids = HashSet::new();
         let mut restored = 0;
 
         for descriptor in descriptors {
+            if !projected_agent_ids.insert(descriptor.agent_id.clone()) {
+                tracing::debug!(
+                    target: "nexus::revive",
+                    runtime_id = %descriptor.runtime_id,
+                    agent_id = %descriptor.agent_id,
+                    "skipping superseded resurrection capsule"
+                );
+                continue;
+            }
             let session = SessionId(descriptor.runtime_id.clone());
             if sessions.find_by_session_id(&session).await?.is_some() {
                 continue;
