@@ -12,6 +12,7 @@ from unittest import mock
 
 
 PATH = Path(__file__).resolve().parent / "nexus-v01-release-validation"
+VERSION = (PATH.parent.parent / "VERSION").read_text(encoding="utf-8").strip()
 LOADER = importlib.machinery.SourceFileLoader("nexus_v01_release_validation", str(PATH))
 SPEC = importlib.util.spec_from_loader("nexus_v01_release_validation", LOADER)
 rv = importlib.util.module_from_spec(SPEC)
@@ -124,7 +125,7 @@ class LedgerTests(unittest.TestCase):
         with mock.patch.object(
             runner,
             "command",
-            return_value=(result, "nexus 0.1.0 (revision stale-sha)\n", ""),
+            return_value=(result, f"nexus {VERSION} (revision stale-sha)\n", ""),
         ):
             self.assertFalse(runner.require_exact_binary())
 

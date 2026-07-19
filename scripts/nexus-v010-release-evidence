@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate checksums, an SBOM, and source-bound provenance for Nexus 0.1.0 artifacts."""
+"""Generate checksums, an SBOM, and source-bound provenance for Nexus artifacts."""
 
 from __future__ import annotations
 
@@ -15,8 +15,7 @@ from urllib.parse import quote
 
 
 ROOT = Path(__file__).resolve().parent.parent
-VERSION = "0.1.0"
-NPM_VERSION = "0.1.5"
+VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 NPM_MANIFESTS = (
     ROOT / "packages/nexus/package.json",
     ROOT / "packages/nexus-cli/package.json",
@@ -148,7 +147,7 @@ def npm_components() -> list[dict[str, object]]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate Nexus 0.1.0 checksums, CycloneDX SBOM, and SLSA provenance."
+        description=f"Generate Nexus {VERSION} checksums, CycloneDX SBOM, and SLSA provenance."
     )
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -192,9 +191,9 @@ def main() -> int:
     artifact_names = {path.name for path in artifact_paths}
     cargo, expected_crates = cargo_components()
     expected_npm = {
-        f"egregore-nexus-{NPM_VERSION}.tgz",
-        f"egregore-nexus-cli-{NPM_VERSION}.tgz",
-        f"egregore-nexus-gateway-{NPM_VERSION}.tgz",
+        f"egregore-nexus-{VERSION}.tgz",
+        f"egregore-nexus-cli-{VERSION}.tgz",
+        f"egregore-nexus-gateway-{VERSION}.tgz",
     }
     missing = sorted((expected_crates | expected_npm) - artifact_names)
     if missing:
@@ -225,7 +224,7 @@ def main() -> int:
         },
         "components": components,
     }
-    (args.output / "nexus-0.1.0.cdx.json").write_text(
+    (args.output / f"nexus-{VERSION}.cdx.json").write_text(
         json.dumps(sbom, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     provenance = {
@@ -234,7 +233,7 @@ def main() -> int:
         "predicateType": "https://slsa.dev/provenance/v1",
         "predicate": {
             "buildDefinition": {
-                "buildType": "https://github.com/egregore-io/egregore-nexus/v0.1.0",
+                "buildType": f"https://github.com/egregore-io/egregore-nexus/v{VERSION}",
                 "externalParameters": {"version": VERSION, "sourceDirty": dirty},
                 "resolvedDependencies": [
                     {
@@ -254,7 +253,7 @@ def main() -> int:
             },
         },
     }
-    (args.output / "nexus-0.1.0.intoto.jsonl").write_text(
+    (args.output / f"nexus-{VERSION}.intoto.jsonl").write_text(
         json.dumps(provenance, sort_keys=True) + "\n", encoding="utf-8"
     )
     print(

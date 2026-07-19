@@ -15,7 +15,7 @@ documents the stable v0.1 command groups and behavior.
 |---|---|
 | `--json` | Emit machine-readable JSON. It may appear before or after the subcommand. |
 | `-q`, `--quiet` | Suppress non-essential human output. |
-| `--version` | Print `nexus 0.1.0` and exit. |
+| `--version` | Print `nexus 0.1.5` and exit. |
 
 A command error is written to stderr and exits nonzero. Authorization is enforced by the daemon or
 Gateway, never inferred by the CLI.

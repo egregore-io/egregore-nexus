@@ -2,8 +2,8 @@
 
 [← Nexus docs](README.md)
 
-Nexus 0.1.0 has three runtime facets and three public npm entry packages. The npm wrappers are at
-0.1.5; the native Cargo release remains 0.1.0.
+Nexus 0.1.5 has three runtime facets and three public npm entry packages. Cargo crates, npm
+packages, native binaries, and release evidence all use that one canonical version.
 
 ## Artifact map
 
@@ -119,7 +119,7 @@ native Windows runner.
 
 Every published package must:
 
-- report version `0.1.0` for Cargo or `0.1.5` for npm, and license `Apache-2.0`;
+- report version `0.1.5` and license `Apache-2.0`;
 - contain no source-checkout or operator-local path dependency;
 - contain no credentials, OAuth state, runtime database, logs, screenshots, or captured model
   output;
@@ -127,7 +127,7 @@ Every published package must:
 - expose successful, side-effect-free `--help` and `--version` behavior where applicable;
 - ship with checksums, an SBOM, provenance metadata, and a documented rollback or yank action.
 
-Cargo crates are packaged in dependency order with exact `=0.1.0` internal runtime dependencies.
+Cargo crates are packaged in dependency order with exact `=0.1.5` internal runtime dependencies.
 Test-only crates remain unpublished. npm packages are packed and installed from their tarballs in
 isolated directories before publication.
 
@@ -147,18 +147,16 @@ source revision.
 
 ## Pre-release reset and post-publication recovery
 
-0.1.0 has no database upgrade path because no earlier public database contract exists. Before
-installing over a development build:
+Before installing 0.1.5 over a development build with an unsupported pre-release schema:
 
 1. stop the old Gateway and daemon;
 2. archive the old Nexus home, including database WAL/SHM files when present;
-3. start 0.1.0 with a fresh Nexus home;
+3. start 0.1.5 with a fresh Nexus home;
 4. retain the archive until the new installation passes smoke checks.
 
 After publication, recovery uses package-manager-native controls: yank affected Cargo crates,
 deprecate affected npm versions, and publish a corrective version. Only a prior public version may
 be restored to an npm dist-tag. The annotated release tag is never moved.
 
-Because 0.1.0 is the first public version, it has no prior public dist-tag or database contract to
-restore. Use the exact commands and artifact-evidence procedure in
+Use the exact withdrawal commands and versioned artifact-evidence procedure in
 [Release recovery](release-recovery.md).

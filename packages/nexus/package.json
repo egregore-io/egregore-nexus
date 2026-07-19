@@ -9,10 +9,14 @@
     "nexus-gateway": "bin/nexus-gateway.mjs",
     "nexus-webui": "bin/nexus-webui.mjs"
   },
+  "scripts": {
+    "prepack": "node scripts/check-version.mjs"
+  },
   "files": [
     "bin/nexus.mjs",
     "bin/nexus-gateway.mjs",
     "bin/nexus-webui.mjs",
+    "scripts/check-version.mjs",
     "README.md"
   ],
   "engines": {

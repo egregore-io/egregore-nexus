@@ -49,7 +49,7 @@ Validate what users install, not only the checkout:
 - Cargo-pack and install the CLI/daemon graph from a clean directory;
 - pack `@egregore/nexus` and the single multi-platform `@egregore/nexus-cli` tarball;
 - pack and start `@egregore/nexus-gateway` plus its bundled WebUI without the source checkout;
-- verify `nexus --version` reports `0.1.0` and the revision when available;
+- verify `nexus --version` reports `0.1.5` and the revision when available;
 - exercise `gateway start|status|logs|restart|stop`;
 - confirm a missing Gateway installation returns `GATEWAY_NOT_INSTALLED` and an install command.
 

@@ -29,7 +29,7 @@ describe("gateway/webconsole package split", () => {
     expect(publishedGateway.scripts.build).toBe("npm run build:gateway-package");
     expect(publishedGateway.scripts["webconsole:dev"]).toBe("pnpm --dir webconsole dev");
     expect(publishedGateway.scripts["webconsole:build"]).toBe(
-      "node webconsole/build-webconsole.mjs",
+      "node ../scripts/nexus-version check && node webconsole/build-webconsole.mjs",
     );
   });
 
@@ -48,7 +48,9 @@ describe("gateway/webconsole package split", () => {
     const webconsole = readJson<PackageJson>("webconsole/package.json");
     expect(webconsole.name).toBe("@egregore/nexus-webui-workspace");
     expect(webconsole.scripts.dev).toBe("vite --config vite.config.ts");
-    expect(webconsole.scripts.build).toBe("node build-webconsole.mjs");
+    expect(webconsole.scripts.build).toBe(
+      "node ../../scripts/nexus-version check && node build-webconsole.mjs",
+    );
     expect(webconsole.scripts.dev).not.toContain("gateway-serve");
     expect(webconsole.scripts.build).not.toContain("gateway-serve");
   });

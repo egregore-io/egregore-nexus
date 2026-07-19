@@ -2,17 +2,19 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+VERSION=$(tr -d '\n' < "$ROOT/VERSION")
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/artifacts" "$TMP/evidence"
 
-python3 - "$ROOT/core" >"$TMP/crates" <<'PY'
+python3 - "$ROOT/core" "$VERSION" >"$TMP/crates" <<'PY'
 import json
 import pathlib
 import subprocess
 import sys
 
 core = pathlib.Path(sys.argv[1])
+version = sys.argv[2]
 metadata = json.loads(
     subprocess.check_output(
         ["cargo", "metadata", "--format-version", "1", "--no-deps"],
@@ -23,15 +25,15 @@ metadata = json.loads(
 workspace = set(metadata["workspace_members"])
 for package in sorted(metadata["packages"], key=lambda item: item["name"]):
     if package["id"] in workspace and package.get("publish") == ["crates-io"]:
-        print(f"{package['name']}-0.1.0.crate")
+        print(f"{package['name']}-{version}.crate")
 PY
 while read -r crate; do
   printf 'crate:%s\n' "$crate" >"$TMP/artifacts/$crate"
 done <"$TMP/crates"
 for package in \
-  egregore-nexus-0.1.5.tgz \
-  egregore-nexus-cli-0.1.5.tgz \
-  egregore-nexus-gateway-0.1.5.tgz; do
+  "egregore-nexus-${VERSION}.tgz" \
+  "egregore-nexus-cli-${VERSION}.tgz" \
+  "egregore-nexus-gateway-${VERSION}.tgz"; do
   printf 'npm:%s\n' "$package" >"$TMP/artifacts/$package"
 done
 
@@ -40,7 +42,7 @@ REVISION=$(git -C "$ROOT" rev-parse HEAD)
   --artifacts "$TMP/artifacts" --output "$TMP/evidence" \
   --revision "$REVISION" --allow-dirty >/dev/null
 
-python3 - "$TMP/artifacts" "$TMP/evidence" "$REVISION" <<'PY'
+python3 - "$TMP/artifacts" "$TMP/evidence" "$REVISION" "$VERSION" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -49,19 +51,20 @@ import sys
 artifacts = pathlib.Path(sys.argv[1])
 evidence = pathlib.Path(sys.argv[2])
 revision = sys.argv[3]
+version = sys.argv[4]
 checksums = {}
 for line in (evidence / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
     digest, name = line.split("  ", 1)
     checksums[name] = digest
 for path in artifacts.iterdir():
     assert checksums[path.name] == hashlib.sha256(path.read_bytes()).hexdigest()
-sbom = json.loads((evidence / "nexus-0.1.0.cdx.json").read_text(encoding="utf-8"))
+sbom = json.loads((evidence / f"nexus-{version}.cdx.json").read_text(encoding="utf-8"))
 assert sbom["bomFormat"] == "CycloneDX" and sbom["specVersion"] == "1.5"
 names = {component["name"] for component in sbom["components"]}
 assert {"@egregore/nexus", "@egregore/nexus-cli", "@egregore/nexus-gateway"} <= names
-provenance = json.loads((evidence / "nexus-0.1.0.intoto.jsonl").read_text(encoding="utf-8"))
+provenance = json.loads((evidence / f"nexus-{version}.intoto.jsonl").read_text(encoding="utf-8"))
 assert provenance["predicate"]["buildDefinition"]["resolvedDependencies"][0]["digest"]["gitCommit"] == revision
 assert {subject["name"] for subject in provenance["subject"]} == set(checksums)
 PY
 
-echo "nexus v0.1.0 release evidence fixtures: PASS"
+echo "nexus v${VERSION} release evidence fixtures: PASS"

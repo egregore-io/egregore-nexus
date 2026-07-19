@@ -1,0 +1,267 @@
+#!/usr/bin/env node
+
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const SCRIPT = join(ROOT, "scripts", "nexus-version");
+const workspaceMatch = readFileSync(join(ROOT, "core/Cargo.toml"), "utf8").match(
+  /^members = (\[[^\n]+\])$/m,
+);
+assert.ok(workspaceMatch, "core/Cargo.toml must expose a one-line workspace member list");
+const WORKSPACE_MANIFESTS = JSON.parse(workspaceMatch[1]).map(
+  (member) => `core/${member}/Cargo.toml`,
+);
+const WORKSPACE_NAMES = new Set(
+  WORKSPACE_MANIFESTS.map((relative) => {
+    const match = readFileSync(join(ROOT, relative), "utf8").match(/^name = "([^"]+)"$/m);
+    assert.ok(match, `${relative} must declare a package name`);
+    return match[1];
+  }),
+);
+const VERSION_FILES = [
+  "core/Cargo.toml",
+  "core/Cargo.lock",
+  "gateway/package.json",
+  "gateway/gateway/package.json",
+  "gateway/webconsole/package.json",
+  "gateway/pnpm-lock.yaml",
+  "packages/nexus-cli/package.json",
+  "packages/nexus/package.json",
+  ...WORKSPACE_MANIFESTS,
+];
+
+function usage() {
+  return "Usage: scripts/test-nexus-version\n";
+}
+
+if (process.argv.includes("--help") || process.argv.includes("-h")) {
+  process.stdout.write(usage());
+  process.exit(0);
+}
+if (process.argv.length !== 2) {
+  process.stderr.write(usage());
+  process.exit(2);
+}
+
+function fixture() {
+  const root = mkdtempSync(join(tmpdir(), "nexus-version-test-"));
+  for (const relative of VERSION_FILES) {
+    const target = join(root, relative);
+    mkdirSync(dirname(target), { recursive: true });
+    cpSync(join(ROOT, relative), target);
+  }
+  writeFileSync(join(root, "VERSION"), "0.1.5\n");
+
+  const cargoPath = join(root, "core/Cargo.toml");
+  writeFileSync(
+    cargoPath,
+    readFileSync(cargoPath, "utf8")
+      .replace(
+        /(\[workspace\.package\]\nversion = ")[^"]+/,
+        (_match, prefix) => `${prefix}0.1.4`,
+      )
+      .replace(/(path = "[^"]+", version = ")=[^"]+/g, "$1=0.1.4"),
+  );
+
+  const lockPath = join(root, "core/Cargo.lock");
+  writeFileSync(
+    lockPath,
+    readFileSync(lockPath, "utf8").replace(
+      /\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"/g,
+      (match, name) =>
+        WORKSPACE_NAMES.has(name)
+          ? `[[package]]\nname = "${name}"\nversion = "0.1.4"`
+          : match,
+    ),
+  );
+
+  for (const relative of [
+    "gateway/package.json",
+    "gateway/gateway/package.json",
+    "gateway/webconsole/package.json",
+    "packages/nexus-cli/package.json",
+    "packages/nexus/package.json",
+  ]) {
+    const path = join(root, relative);
+    const manifest = JSON.parse(readFileSync(path, "utf8"));
+    manifest.version = "0.1.4";
+    for (const dependency of ["@egregore/nexus-cli", "@egregore/nexus-gateway"]) {
+      if (manifest.dependencies?.[dependency]) manifest.dependencies[dependency] = "0.1.4";
+    }
+    writeFileSync(path, `${JSON.stringify(manifest, null, 2)}\n`);
+  }
+  const pnpmLockPath = join(root, "gateway/pnpm-lock.yaml");
+  writeFileSync(
+    pnpmLockPath,
+    readFileSync(pnpmLockPath, "utf8").replace(
+      /('@egregore\/nexus-cli':\n\s+specifier: )[^\n]+/,
+      (_match, prefix) => `${prefix}0.1.4`,
+    ),
+  );
+  return root;
+}
+
+function run(root, command) {
+  return spawnSync(process.execPath, [SCRIPT, command], {
+    cwd: root,
+    encoding: "utf8",
+    env: { ...process.env, NEXUS_VERSION_ROOT: root },
+  });
+}
+
+function digest(root) {
+  const hash = createHash("sha256");
+  for (const relative of ["VERSION", ...VERSION_FILES]) {
+    hash.update(relative);
+    hash.update(readFileSync(join(root, relative)));
+  }
+  return hash.digest("hex");
+}
+
+function json(root, relative) {
+  return JSON.parse(readFileSync(join(root, relative), "utf8"));
+}
+
+function assertSynchronized(root) {
+  const cargo = readFileSync(join(root, "core/Cargo.toml"), "utf8");
+  assert.match(cargo, /\[workspace\.package\]\nversion = "0\.1\.5"/);
+  assert.doesNotMatch(cargo, /path = "[^"]+", version = "=0\.1\.0"/);
+  assert.match(cargo, /path = "crates\/nexus-contracts", version = "=0\.1\.5"/);
+
+  const lock = readFileSync(join(root, "core/Cargo.lock"), "utf8");
+  assert.match(lock, /name = "egregore-nexus"\nversion = "0\.1\.5"/);
+  assert.match(lock, /name = "nexus-acceptance"\nversion = "0\.1\.5"/);
+
+  for (const relative of [
+    "gateway/package.json",
+    "gateway/gateway/package.json",
+    "gateway/webconsole/package.json",
+    "packages/nexus-cli/package.json",
+    "packages/nexus/package.json",
+  ]) {
+    assert.equal(json(root, relative).version, "0.1.5", relative);
+  }
+  assert.equal(json(root, "gateway/package.json").dependencies["@egregore/nexus-cli"], "0.1.5");
+  const umbrella = json(root, "packages/nexus/package.json");
+  assert.equal(umbrella.dependencies["@egregore/nexus-cli"], "0.1.5");
+  assert.equal(umbrella.dependencies["@egregore/nexus-gateway"], "0.1.5");
+  assert.match(
+    readFileSync(join(root, "gateway/pnpm-lock.yaml"), "utf8"),
+    /'@egregore\/nexus-cli':\n\s+specifier: 0\.1\.5/,
+  );
+}
+
+function assertBuildBoundaries() {
+  const buildScript = readFileSync(join(ROOT, "core/crates/nexus/build.rs"), "utf8");
+  assert.match(buildScript, /VERSION/, "native build.rs does not enforce the root version");
+  assert.match(buildScript, /CARGO_PKG_VERSION/, "native build.rs does not compare Cargo metadata");
+
+  const gateway = json(ROOT, "gateway/package.json");
+  assert.match(gateway.scripts["build:gateway-package"], /nexus-version check/);
+  assert.match(gateway.scripts["webconsole:build"], /nexus-version check/);
+  const webconsole = json(ROOT, "gateway/webconsole/package.json");
+  assert.match(webconsole.scripts.build, /nexus-version check/);
+  for (const relative of ["packages/nexus-cli", "packages/nexus"]) {
+    const manifest = json(ROOT, `${relative}/package.json`);
+    assert.equal(manifest.scripts.prepack, "node scripts/check-version.mjs");
+    assert.ok(manifest.files.includes("scripts/check-version.mjs"));
+    const packageCheck = readFileSync(join(ROOT, relative, "scripts/check-version.mjs"), "utf8");
+    assert.match(packageCheck, /NEXUS_VERSION_ROOT/);
+    assert.match(packageCheck, /nexus-version/);
+  }
+  assert.match(
+    readFileSync(join(ROOT, ".github/workflows/npm-native-artifacts.yml"), "utf8"),
+    /node scripts\/nexus-version check/,
+  );
+}
+
+function assertReleaseConsumers() {
+  const identityGate = readFileSync(
+    join(ROOT, "scripts/nexus-v010-release-identity-gate"),
+    "utf8",
+  );
+  assert.match(identityGate, /nexus-version" check/);
+  assert.match(identityGate, /NEXUS_RELEASE_VERSION/);
+
+  const evidence = readFileSync(join(ROOT, "scripts/nexus-v010-release-evidence"), "utf8");
+  assert.match(evidence, /ROOT \/ "VERSION"/);
+  assert.doesNotMatch(evidence, /^NPM_VERSION\s*=/m);
+
+  const nativePacker = readFileSync(join(ROOT, "scripts/nexus-pack-native-npm"), "utf8");
+  assert.match(nativePacker, /ROOT\/VERSION/);
+  assert.doesNotMatch(nativePacker, /Nexus 0\.1\.0 with a source revision/);
+
+  const packageSmoke = readFileSync(
+    join(ROOT, "scripts/nexus-three-facet-package-smoke"),
+    "utf8",
+  );
+  assert.match(packageSmoke, /ROOT\/VERSION/);
+  assert.doesNotMatch(packageSmoke, /grep -q '0\.1\.0'/);
+
+  const workflow = readFileSync(
+    join(ROOT, ".github/workflows/npm-native-artifacts.yml"),
+    "utf8",
+  );
+  assert.match(workflow, /VERSION=\$\(tr -d/);
+  assert.doesNotMatch(workflow, /egregore-nexus(?:-cli|-gateway)?-0\.1\.4\.tgz/);
+  assert.doesNotMatch(workflow, /tar -tf[^\n]+\| grep/);
+
+  const distribution = readFileSync(join(ROOT, "docs/distribution.md"), "utf8");
+  assert.doesNotMatch(distribution, /npm wrappers are at\s+0\.1\.5; the native Cargo release remains 0\.1\.0/);
+}
+
+const roots = [];
+try {
+  const root = fixture();
+  roots.push(root);
+  const before = digest(root);
+  const drift = run(root, "check");
+  assert.equal(drift.status, 1, drift.stderr || drift.stdout);
+  assert.match(drift.stderr, /version drift/);
+  assert.equal(digest(root), before, "check changed fixture files");
+
+  const sync = run(root, "sync");
+  assert.equal(sync.status, 0, sync.stderr || sync.stdout);
+  assertSynchronized(root);
+
+  const afterFirstSync = digest(root);
+  const secondSync = run(root, "sync");
+  assert.equal(secondSync.status, 0, secondSync.stderr || secondSync.stdout);
+  assert.equal(digest(root), afterFirstSync, "second sync was not idempotent");
+
+  const clean = run(root, "check");
+  assert.equal(clean.status, 0, clean.stderr || clean.stdout);
+
+  assertBuildBoundaries();
+  assertReleaseConsumers();
+
+  const malformed = fixture();
+  roots.push(malformed);
+  writeFileSync(join(malformed, "VERSION"), "1.2\n");
+  const malformedBefore = digest(malformed);
+  const malformedResult = run(malformed, "sync");
+  assert.equal(malformedResult.status, 2, malformedResult.stderr || malformedResult.stdout);
+  assert.equal(digest(malformed), malformedBefore, "malformed sync changed fixture files");
+
+  const incomplete = fixture();
+  roots.push(incomplete);
+  unlinkSync(join(incomplete, "gateway/webconsole/package.json"));
+  const survivingBefore = readFileSync(join(incomplete, "core/Cargo.toml"), "utf8");
+  const incompleteResult = run(incomplete, "sync");
+  assert.equal(incompleteResult.status, 2, incompleteResult.stderr || incompleteResult.stdout);
+  assert.equal(
+    readFileSync(join(incomplete, "core/Cargo.toml"), "utf8"),
+    survivingBefore,
+    "incomplete sync partially changed the fixture",
+  );
+
+  console.log("nexus version synchronizer: PASS");
+} finally {
+  for (const root of roots) rmSync(root, { recursive: true, force: true });
+}

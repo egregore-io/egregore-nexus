@@ -19,6 +19,9 @@ BINARY=
 OUTPUT=
 VERSION_OUTPUT=
 EXPECTED_SHA256=
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+"$ROOT/scripts/nexus-version" check >/dev/null
+VERSION=$(tr -d '\n' < "$ROOT/VERSION")
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -73,10 +76,11 @@ else
     exit 1
   }
 fi
+VERSION_PATTERN=${VERSION//./\\.}
 if ! printf '%s\n' "$VERSION_OUTPUT" \
-  | grep -Eq '^nexus 0\.1\.0 \(revision [A-Za-z0-9._+-]+\)$' \
+  | grep -Eq "^nexus ${VERSION_PATTERN} \\(revision [A-Za-z0-9._+-]+\\)$" \
   || printf '%s\n' "$VERSION_OUTPUT" | grep -q 'revision unknown'; then
-  echo "native binary does not report Nexus 0.1.0 with a source revision: $VERSION_OUTPUT" >&2
+  echo "native binary does not report Nexus $VERSION with a source revision: $VERSION_OUTPUT" >&2
   exit 1
 fi
 
