@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
+use crate::ids::MessageId;
+
 /// Core entity families that support an opaque metadata JSON bag.
 #[typeshare]
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,4 +49,15 @@ pub struct MetadataResponse {
     pub entity: MetadataEntityKind,
     pub id: String,
     pub metadata: serde_json::Value,
+}
+
+/// Idempotent recursive metadata merge produced by one completed hook invocation.
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageMetadataMergeRequest {
+    pub message_id: MessageId,
+    pub invocation_id: String,
+    #[typeshare(serialized_as = "Record<string, unknown>")]
+    pub metadata: serde_json::Map<String, serde_json::Value>,
 }

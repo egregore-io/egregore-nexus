@@ -141,6 +141,7 @@ impl PtyTestDaemon {
                 summary: None,
                 body: body.into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )

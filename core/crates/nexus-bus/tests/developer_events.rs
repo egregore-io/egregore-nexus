@@ -182,6 +182,7 @@ async fn thread_post_writes_metadata_events_without_extra_turn_wakes() {
                 summary: None,
                 body: "status".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -232,6 +233,7 @@ async fn dm_writes_private_per_party_sequences() {
                 summary: None,
                 body: "private".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )

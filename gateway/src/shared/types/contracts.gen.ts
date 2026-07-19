@@ -863,6 +863,76 @@ export interface HistoryResponse {
 	entries: HistoryEntry[];
 }
 
+/** Authenticated sender identity visible to a hook but immutable in hook output. */
+export interface HookSender {
+	agentId?: AgentId;
+	name: string;
+}
+
+/** Canonical message document passed through the hook pipeline. */
+export interface HookMessage {
+	sender: HookSender;
+	target: SendTarget;
+	body: string;
+	summary?: string;
+	mention?: string[];
+	metadata?: Record<string, unknown>;
+}
+
+/** Compact, signed execution provenance attached by Gateway after validating hook output. */
+export interface HookExecutedBy {
+	hookId: string;
+	entrypoint: string;
+	runtime: string;
+	artifactDigest: string;
+	invocationId: string;
+	outcome: string;
+	attestation: any;
+}
+
+/** Gateway-local invocation after the canonical send receipt exists. */
+export interface HookAfterReceiptRequest {
+	invocationId: string;
+	message: HookMessage;
+	receipt: Ack;
+	executedBy?: HookExecutedBy[];
+}
+
+/** Allowed `after_receipt` output. Message content and timing are immutable at this boundary. */
+export interface HookAfterReceiptResult {
+	invocationId: string;
+	metadata?: Record<string, unknown>;
+	executedBy?: HookExecutedBy[];
+}
+
+/** Correlated request from the daemon for a new logical send. */
+export interface HookBeforeSendRequest {
+	evaluationId: string;
+	message: HookMessage;
+}
+
+/** Terminal pipeline decision. Omitted hook output defaults to continuing the send. */
+export enum HookAction {
+	Continue = "continue",
+	Reject = "reject",
+}
+
+/** Public delivery timing selected by a `before_send` hook pipeline. */
+export enum DeliveryTiming {
+	Interrupt = "interrupt",
+	YieldTurn = "yield_turn",
+	AfterToolLoop = "after_tool_loop",
+}
+
+/** Final Gateway result for one `before_send` evaluation. */
+export interface HookBeforeSendResult {
+	evaluationId: string;
+	action?: HookAction;
+	message: HookMessage;
+	timing?: DeliveryTiming;
+	executedBy?: HookExecutedBy[];
+}
+
 /** Register a daemon-tracked durable inbox subscription for the caller. */
 export interface InboxSubscribeRequest {
 	/** Held-receive window for follow-up `next` calls when no durable batch is ready. */
@@ -1021,6 +1091,13 @@ export interface Message {
 	provenance: Provenance;
 	/** Unix epoch millis. */
 	createdAt: number;
+}
+
+/** Idempotent recursive metadata merge produced by one completed hook invocation. */
+export interface MessageMetadataMergeRequest {
+	messageId: MessageId;
+	invocationId: string;
+	metadata: Record<string, unknown>;
 }
 
 /** Core entity families that support an opaque metadata JSON bag. */
@@ -1400,6 +1477,8 @@ export interface SendRequest {
 	summary?: string;
 	body: string;
 	mention?: string[];
+	/** Developer-owned metadata that is committed atomically with the message body. */
+	metadata?: Record<string, unknown>;
 	idempotencyKey?: string;
 }
 

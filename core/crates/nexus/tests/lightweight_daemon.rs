@@ -996,6 +996,7 @@ async fn daemon_boot_restores_minimal_thread_routing_and_wakes_the_same_agent_id
                     summary: None,
                     body: "THREAD-RESTART-WAKE".into(),
                     mention: Vec::new(),
+                    metadata: None,
                     idempotency_key: Some("thread-restart-wake".into()),
                 })
                 .expect("send request json"),
@@ -1158,6 +1159,7 @@ async fn gateway_absent_delivery_uses_memory_transport_and_only_unsettled_contin
                 summary: None,
                 body: "transport without Gateway".into(),
                 mention: Vec::new(),
+                metadata: None,
                 idempotency_key: Some("lightweight-send-1".into()),
             },
         )

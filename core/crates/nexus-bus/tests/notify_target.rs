@@ -74,6 +74,7 @@ async fn positional_dm_target_accepts_a_stable_agent_id_without_a_name() {
                 summary: None,
                 body: "id-only delivery".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: Some("id-only-delivery".into()),
             },
         )
@@ -135,6 +136,7 @@ async fn named_agent_dm_resolves_the_alias_then_routes_by_stable_agent_id() {
             summary: None,
             body: "alias routes through identity".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: Some("alias-to-id".into()),
         },
     )

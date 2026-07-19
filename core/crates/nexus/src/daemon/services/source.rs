@@ -181,6 +181,7 @@ impl SourceService {
                     summary: req.summary.clone(),
                     body: bus_body,
                     mention: vec![],
+                    metadata: None,
                     idempotency_key: command_idempotency_key,
                 },
                 Kind::Notification,

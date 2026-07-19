@@ -136,6 +136,7 @@ impl Notify {
             summary: Some(summary.clone()),
             body: payload_json.clone(),
             mention: Vec::new(),
+            metadata: None,
             idempotency_key: notification_effect_key(idempotency_root, "pub", pub_topic()),
         };
         // A Pub publish with no subscribers is a no-op fan-out, not an error.
@@ -163,6 +164,7 @@ impl Notify {
                     summary: Some(summary.clone()),
                     body: payload_json.clone(),
                     mention: Vec::new(),
+                    metadata: None,
                     idempotency_key: notification_effect_key(idempotency_root, "topic", topic),
                 };
                 match self
@@ -310,6 +312,7 @@ impl Notify {
             summary: Some(summary),
             body,
             mention: Vec::new(),
+            metadata: None,
             idempotency_key: None,
         };
         self.bus
@@ -392,6 +395,7 @@ async fn send_notification_dm(
         summary: Some(summary.to_string()),
         body: body.to_string(),
         mention: Vec::new(),
+        metadata: None,
         idempotency_key,
     };
     match bus.send_with_kind(caller, dm, Kind::Notification).await {

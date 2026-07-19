@@ -127,6 +127,7 @@ async fn active_inbox_subscription_owns_delivery_instead_of_harness_event_loop()
                 summary: None,
                 body: "pull-owned-message".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: Some("pull-owned-message".into()),
             },
         )
@@ -267,6 +268,7 @@ async fn inbox_unsubscribe_restores_daemon_owned_harness_delivery() {
                 summary: None,
                 body: "daemon-owned-again".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: Some("daemon-owned-again".into()),
             },
         )
@@ -345,6 +347,7 @@ async fn external_other_thread_member_is_pull_delivered_and_never_revived() {
                     summary: None,
                     body: format!("wait for external pull {index}"),
                     mention: vec![],
+                    metadata: None,
                     idempotency_key: Some(format!("external-controller-thread-message-{index}")),
                 },
             )

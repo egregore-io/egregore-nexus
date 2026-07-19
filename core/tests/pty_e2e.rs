@@ -179,6 +179,7 @@ async fn live_claude_receives_a_dm_and_its_reply_reaches_the_store() {
             summary: None,
             body,
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         },
     )

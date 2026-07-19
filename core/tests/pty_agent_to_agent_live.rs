@@ -192,6 +192,7 @@ async fn two_live_claude_agents_dm_and_thread_over_the_pty_bus() {
             summary: None,
             body: dm_body,
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         },
     )
@@ -234,6 +235,7 @@ async fn two_live_claude_agents_dm_and_thread_over_the_pty_bus() {
             summary: None,
             body: post_body,
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         },
     )

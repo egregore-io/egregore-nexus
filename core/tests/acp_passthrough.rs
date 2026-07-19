@@ -182,6 +182,7 @@ async fn full_acp_stream_relays_as_ordered_tagged_agent_updates() {
             summary: None,
             body: "go".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         },
     )

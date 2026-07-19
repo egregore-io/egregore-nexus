@@ -260,6 +260,7 @@ async fn thread_fanout_is_daemon_resolved_but_projects_one_message_fact() {
                 summary: None,
                 body: "one durable post".into(),
                 mention: Vec::new(),
+                metadata: None,
                 idempotency_key: Some("thread:one".into()),
             },
         )
@@ -299,6 +300,7 @@ async fn terminal_delivery_projection_is_stable_and_failed_mutation_emits_nothin
                 summary: None,
                 body: "   ".into(),
                 mention: Vec::new(),
+                metadata: None,
                 idempotency_key: Some("invalid".into()),
             },
         )
@@ -314,6 +316,7 @@ async fn terminal_delivery_projection_is_stable_and_failed_mutation_emits_nothin
                 summary: None,
                 body: "settle me".into(),
                 mention: Vec::new(),
+                metadata: None,
                 idempotency_key: Some("settle".into()),
             },
         )

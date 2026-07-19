@@ -234,6 +234,7 @@ fn dm_request() -> SendRequest {
         summary: Some("hello".into()),
         body: "hi".into(),
         mention: vec![],
+        metadata: None,
         idempotency_key: None,
     }
 }
@@ -290,6 +291,7 @@ async fn listen_ack_activity_keeps_consumer_heartbeat_fresh() {
                 summary: Some("listen heartbeat proof".to_string()),
                 body: "hello from listen-sender".to_string(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -392,6 +394,7 @@ async fn durable_listen_subscription_replays_pending_batch_until_subscription_ac
                 summary: Some("durable subscription replay".to_string()),
                 body: "hello durable listen".to_string(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -531,6 +534,7 @@ async fn durable_subscription_ack_does_not_resurrect_a_terminal_delivery() {
                 summary: None,
                 body: "terminal pull delivery".to_string(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -848,6 +852,7 @@ async fn inbox_consume_reissues_after_daemon_boot_epoch_changes() {
                 summary: None,
                 body: "restart-safe delivery".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )

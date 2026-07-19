@@ -182,6 +182,7 @@ async fn policy_rejects_cross_group_agent_dm_before_message_write() {
             summary: None,
             body: "this should not cross groups".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         },
     )
@@ -275,6 +276,7 @@ async fn policy_allows_cross_group_dm_for_current_active_thread_comembers() {
             summary: None,
             body: "shared thread permits a direct follow-up".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         },
     )
@@ -359,6 +361,7 @@ async fn policy_revokes_thread_comember_dm_after_member_removal() {
             summary: None,
             body: "removed co-member cannot dm".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         },
     )
@@ -441,6 +444,7 @@ async fn policy_ignores_archived_threads_for_comember_dm_allowance() {
             summary: None,
             body: "archived co-member cannot dm".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         },
     )
@@ -521,6 +525,7 @@ async fn policy_keeps_authorized_thread_fanout_working() {
             summary: None,
             body: "thread membership is the authorization surface".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         },
     )
@@ -601,6 +606,7 @@ async fn policy_rejects_non_member_thread_post_before_message_write() {
             summary: None,
             body: "non-members cannot post into the lane".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         },
     )

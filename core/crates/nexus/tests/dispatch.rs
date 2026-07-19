@@ -403,6 +403,7 @@ fn send_params() -> serde_json::Value {
         summary: None,
         body: "hi".into(),
         mention: vec![],
+        metadata: None,
         idempotency_key: None,
     })
     .unwrap()
@@ -487,6 +488,7 @@ async fn send_commits_before_a_cold_target_finishes_reviving() {
                         summary: None,
                         body: "durable before revive".into(),
                         mention: vec![],
+                        metadata: None,
                         idempotency_key: None,
                     })
                     .unwrap(),
@@ -581,6 +583,7 @@ async fn registration_does_not_start_a_drain_loop_before_the_harness_is_live() {
                 summary: None,
                 body: "hold until the adapter binds".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )

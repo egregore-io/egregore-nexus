@@ -1265,6 +1265,7 @@ mod rpc {
             summary: None,
             body: "rebase first".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         };
         let req = Request {
@@ -1435,6 +1436,7 @@ mod send {
             summary: None,
             body: "rebase before you start".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         };
         let json = serde_json::to_value(&req).unwrap();
@@ -1482,6 +1484,7 @@ mod send {
             summary: None,
             body: "has a body but no recipient".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         };
 
@@ -1499,6 +1502,7 @@ mod send {
             summary: Some("plan".into()),
             body: "step 1 ...".into(),
             mention: vec!["dylan".into()],
+            metadata: None,
             idempotency_key: None,
         };
         let json = serde_json::to_value(&req).unwrap();
@@ -1516,6 +1520,7 @@ mod send {
             summary: None,
             body: "build green".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         };
         assert_eq!(
@@ -1528,6 +1533,7 @@ mod send {
             summary: None,
             body: "on it".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         };
         let json = serde_json::to_value(&reply).unwrap();

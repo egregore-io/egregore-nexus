@@ -225,6 +225,7 @@ async fn fresh_launch_initial_prompt_blocks_thread_drain_until_accepted() {
                 summary: None,
                 body: "must wait behind boot prompt".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )

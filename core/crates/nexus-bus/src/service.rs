@@ -145,6 +145,7 @@ impl Bus {
                 summary: Some(source),
                 body: req.body,
                 mention: Vec::new(),
+                metadata: None,
                 idempotency_key: req.idempotency_key,
             },
             Some(Kind::Notification),

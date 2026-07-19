@@ -70,6 +70,10 @@ pub struct SendRequest {
     pub body: String,
     #[serde(default)]
     pub mention: Vec<String>,
+    /// Developer-owned metadata that is committed atomically with the message body.
+    #[typeshare(serialized_as = "Option<Record<string, unknown>>")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,

@@ -264,6 +264,7 @@ async fn held_inbox_consume_does_not_starve_message_post_send() {
                 summary: None,
                 body: "send should not wait for long consume".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             })
             .unwrap(),
@@ -343,6 +344,7 @@ async fn held_inbox_subscription_next_does_not_starve_message_post_send() {
                 summary: None,
                 body: "send should not wait for subscription next".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             })
             .unwrap(),
@@ -509,6 +511,7 @@ async fn expired_claimed_control_command_does_not_block_later_message_post_send(
             summary: None,
             body: "send should not wait behind an expired control claim".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         })
         .unwrap(),
@@ -597,6 +600,7 @@ async fn held_harness_prompt_does_not_starve_message_post_send() {
                 summary: None,
                 body: "send should not wait for a long prompt turn".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             })
             .unwrap(),

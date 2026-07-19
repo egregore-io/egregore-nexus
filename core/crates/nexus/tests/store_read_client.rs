@@ -110,6 +110,7 @@ async fn read_client_renders_identity_roster_threads_topics_and_recall_from_stor
                 summary: None,
                 body: "store backed recall works".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -202,6 +203,7 @@ async fn read_client_fetches_full_message_body_by_id() {
                 summary: Some("long".into()),
                 body: "this is the full message body that the drain view may truncate".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )

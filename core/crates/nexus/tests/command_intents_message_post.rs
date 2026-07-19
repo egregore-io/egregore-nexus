@@ -117,6 +117,7 @@ async fn message_post_command_intent_writes_canonical_bus_rows() {
         summary: Some("smoke".into()),
         body: "hello over command ingress".into(),
         mention: vec![],
+        metadata: None,
         idempotency_key: None,
     };
     CommandIntents::new(&state.store)
@@ -204,6 +205,7 @@ async fn message_post_command_intent_keeps_dm_fanout_internal() {
         summary: None,
         body: "fanout should count a live DM recipient".into(),
         mention: vec![],
+        metadata: None,
         idempotency_key: None,
     };
     CommandIntents::new(&state.store)
@@ -454,6 +456,7 @@ async fn duplicate_message_post_command_intents_return_original_ack() {
         summary: Some("retry-safe".into()),
         body: "same write submitted twice".into(),
         mention: vec![],
+        metadata: None,
         idempotency_key: Some("web:thread-retry:client-1".into()),
     };
     let intents = CommandIntents::new(&state.store);
@@ -556,6 +559,7 @@ async fn reclaimed_message_post_promotes_command_idempotency_key_into_bus_write(
         summary: None,
         body: "commit survived before command receipt".into(),
         mention: vec![],
+        metadata: None,
         // Store-backed callers may put the retry key on the durable command envelope only. The
         // worker must promote that key into the canonical Message Post write before dispatch.
         idempotency_key: None,
@@ -659,6 +663,7 @@ async fn message_post_dm_to_local_operator_writes_operator_view_row() {
         summary: None,
         body: "reply visible to the local operator".into(),
         mention: vec![],
+        metadata: None,
         idempotency_key: None,
     };
     CommandIntents::new(&state.store)
@@ -759,6 +764,7 @@ async fn message_post_reply_to_local_operator_writes_operator_view_row() {
                 summary: None,
                 body: "human prompt from web".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             })
             .unwrap(),
@@ -787,6 +793,7 @@ async fn message_post_reply_to_local_operator_writes_operator_view_row() {
                 summary: None,
                 body: "reply visible in the web operator DM".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             })
             .unwrap(),

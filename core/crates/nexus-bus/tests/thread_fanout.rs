@@ -305,6 +305,7 @@ async fn split_authority_thread_post_composes_identity_and_transport_edges() {
                 summary: None,
                 body: "split stores must still fan out".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: Some("split-thread-1".into()),
             },
         )
@@ -385,6 +386,7 @@ async fn split_authority_topic_publish_composes_identity_and_transport_edges() {
                 summary: None,
                 body: "split topic fanout".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: Some("split-topic-1".into()),
             },
         )
@@ -421,6 +423,7 @@ async fn split_authority_reply_reads_transport_with_identity_resolved_separately
             summary: None,
             body: "first half".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: Some("split-reply-inbound".into()),
         },
     )
@@ -435,6 +438,7 @@ async fn split_authority_reply_reads_transport_with_identity_resolved_separately
                 summary: None,
                 body: "second half".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: Some("split-reply-outbound".into()),
             },
         )
@@ -521,6 +525,7 @@ async fn thread_post_fans_out_to_member_whose_runtime_is_stopped() {
                 summary: None,
                 body: "durable membership beats runtime flap".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -599,6 +604,7 @@ async fn thread_post_batch_resolves_many_fossil_sessions_without_per_member_iden
                 summary: None,
                 body: "one resolution query regardless of member count".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: Some("batch-resolution-1".into()),
             },
         )
@@ -653,6 +659,7 @@ async fn thread_post_stamps_the_threads_project_not_the_callers() {
         summary: None,
         body: "project follows the conversation".into(),
         mention: vec![],
+        metadata: None,
         idempotency_key: Some("cross-project-thread-1".into()),
     };
     let first = bus.send(&caller, request.clone()).await.unwrap();
@@ -666,6 +673,7 @@ async fn thread_post_stamps_the_threads_project_not_the_callers() {
         summary: None,
         body: "keyless duplicate ignores project metadata".into(),
         mention: vec![],
+        metadata: None,
         idempotency_key: None,
     };
     let keyless_first = bus.send(&caller, keyless.clone()).await.unwrap();
@@ -760,6 +768,7 @@ async fn direct_dm_resolves_global_agent_when_projects_differ() {
                 summary: None,
                 body: "project is metadata".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: Some("cross-project-dm-1".into()),
             },
         )
@@ -834,6 +843,7 @@ async fn direct_dm_agent_id_reaches_an_unnamed_agent() {
                 summary: None,
                 body: "identity is enough".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: Some("unnamed-agent-dm-1".into()),
             },
         )
@@ -880,6 +890,7 @@ async fn direct_dm_agent_id_ignores_mismatched_display_name_for_routing() {
                 summary: None,
                 body: "stable identity wins".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: Some("agent-id-wins-1".into()),
             },
         )
@@ -929,6 +940,7 @@ async fn direct_dm_name_with_agent_id_prefix_still_routes_by_name() {
                 summary: None,
                 body: "the name field is a name".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: Some("prefixed-name-dm-1".into()),
             },
         )
@@ -969,6 +981,7 @@ async fn direct_dm_without_name_or_agent_id_fails_before_any_write() {
                 summary: None,
                 body: "must not persist".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )

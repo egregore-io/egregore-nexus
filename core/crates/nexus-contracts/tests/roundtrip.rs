@@ -44,6 +44,7 @@ fn full_flow_uses_consistent_top_level_names() {
         summary: None,
         body: "hi".into(),
         mention: vec![],
+        metadata: None,
         idempotency_key: None,
     };
     let _: SendRequest = serde_json::from_str(&serde_json::to_string(&send).unwrap()).unwrap();

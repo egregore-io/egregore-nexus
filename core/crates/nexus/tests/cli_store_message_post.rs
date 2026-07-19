@@ -757,6 +757,7 @@ async fn cli_send_commands_reject_empty_or_whitespace_bodies_before_enqueue() {
                 summary: None,
                 body: " \n\t ".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             })
             .await

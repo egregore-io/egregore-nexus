@@ -70,6 +70,7 @@ pub mod enums;
 pub mod events;
 pub mod gateway_projection;
 pub mod harness;
+pub mod hooks;
 pub mod ids;
 pub mod message;
 pub mod metadata;
@@ -123,9 +124,16 @@ pub use gateway_projection::{
     GATEWAY_PROJECTION_VERSION,
 };
 pub use harness::{HarnessId, HarnessIdError, HARNESS_ID_MAX_LEN};
+pub use hooks::{
+    DeliveryTiming, HookAction, HookAfterReceiptRequest, HookAfterReceiptResult,
+    HookBeforeSendRequest, HookBeforeSendResult, HookExecutedBy, HookMessage, HookSender,
+};
 pub use ids::{AgentId, CredentialId, MessageId, ProjectId, SessionId, ThreadId, TopicId};
 pub use message::{Message, Provenance, ProvenanceStamp, ReadRequest};
-pub use metadata::{MetadataEntityKind, MetadataGetRequest, MetadataResponse, MetadataSetRequest};
+pub use metadata::{
+    MessageMetadataMergeRequest, MetadataEntityKind, MetadataGetRequest, MetadataResponse,
+    MetadataSetRequest,
+};
 pub use notify::{
     NotifyCommandRequest, NotifyRequest, NotifyResponse, NotifySendRequest, NotifyTarget,
     RouteRule, NOTIFY_SIGNATURE_HEADER, NOTIFY_TIMESTAMP_HEADER,
