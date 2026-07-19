@@ -260,6 +260,7 @@ async fn run(session: SessionId, deps: LoopDeps) {
             tokio::pin!(turn);
             let completion_timeout = tokio::time::sleep(deps.completion_timeout);
             tokio::pin!(completion_timeout);
+            let mut redrive_after_interrupt = false;
             let stop_after_turn = loop {
                 tokio::select! {
                     // Prefer a terminal completion when it races the bell. The post-completion
@@ -280,6 +281,9 @@ async fn run(session: SessionId, deps: LoopDeps) {
                             }
                             Err(error) => {
                                 handle_inject_error(&session, &deps, &inbox, &batch, error).await;
+                                if redrive_after_interrupt {
+                                    deps.bell.ring(&session);
+                                }
                                 break true;
                             }
                         }
@@ -294,13 +298,25 @@ async fn run(session: SessionId, deps: LoopDeps) {
                              FAILED, not delivered (completion signal lost?)"
                         );
                         mark_batch_timeout(&session, &deps, &inbox, &batch).await;
+                        if redrive_after_interrupt {
+                            deps.bell.ring(&session);
+                        }
                         break true;
                     }
                     _ = deps.bell.wait(&session) => {
                         // The current completion future stays alive while the new durable batch is
                         // admitted into the active turn. Dropping it here can block delivery for
                         // the full completion timeout.
-                        handle_pending_during_active_turn(&session, &deps, &inbox).await;
+                        if redrive_after_interrupt {
+                            // Cancellation has already been accepted. Coalesce later arrivals at
+                            // the same durable notified boundary without sending another cancel.
+                            if let Err(error) = inbox.mark_notified(&session).await {
+                                tracing::error!(%error, session = %session, "mid-turn coalesce after interrupt failed");
+                            }
+                        } else {
+                            redrive_after_interrupt =
+                                handle_pending_during_active_turn(&session, &deps, &inbox).await;
+                        }
                     }
                 }
             };
@@ -424,10 +440,10 @@ async fn handle_pending_during_active_turn(
     session: &SessionId,
     deps: &LoopDeps,
     inbox: &Inbox<'_>,
-) {
+) -> bool {
     if let Err(error) = inbox.mark_notified(session).await {
         tracing::error!(%error, %session, "mid-turn mark_notified failed");
-        return;
+        return false;
     }
     let timed_batch = match InboxDrainer::drain_notified_timed_once(
         inbox,
@@ -439,24 +455,29 @@ async fn handle_pending_during_active_turn(
     .await
     {
         Ok(Some(batch)) if batch.batch.counts.total > 0 => batch,
-        Ok(_) => return,
+        Ok(_) => return false,
         Err(error) => {
             tracing::error!(%error, %session, "mid-turn drain failed");
-            return;
+            return false;
         }
     };
     let timing = timed_batch.timing;
     let batch = timed_batch.batch;
     match delivery_action(timing, true, deps.turn_exec.steer_capability(session)) {
-        Ok(DeliveryAction::NativeSteer) | Ok(DeliveryAction::InterruptAndSend) => {
+        Ok(DeliveryAction::NativeSteer) => {
             if claim_batch(session, deps, inbox, &batch).await {
                 let _ = steer_claimed_batch(session, deps, inbox, &batch).await;
             }
+            false
+        }
+        Ok(DeliveryAction::InterruptAndSend) => {
+            interrupt_and_redrive_notified_batch(session, deps, inbox, &batch).await
         }
         Ok(DeliveryAction::WaitForTurnBoundary)
         | Ok(DeliveryAction::WaitForFinalTurnCompletion) => {
             // The current turn future is still being polled by the caller. Leave these rows
             // notified; its terminal branch immediately re-drains them.
+            false
         }
         Err(error) => {
             if claim_batch(session, deps, inbox, &batch).await {
@@ -469,9 +490,30 @@ async fn handle_pending_during_active_turn(
                 )
                 .await;
             }
+            false
         }
         Ok(DeliveryAction::StartTurn) => unreachable!("the caller owns an active turn"),
     }
+}
+
+/// Cancel the active prompt while leaving the replacement batch at the durable `notified`
+/// boundary. The caller still owns and polls the active turn future; once cancellation makes that
+/// future terminal, the normal drain path atomically claims and starts the replacement prompt.
+///
+/// Do not call `steer_observed` inline here for interrupt-and-send adapters. Their replacement
+/// prompt is serialized behind the active prompt. Awaiting it from this bell branch pauses polling
+/// of the active future, so the cancelled prompt can never release the serialization boundary.
+async fn interrupt_and_redrive_notified_batch(
+    session: &SessionId,
+    deps: &LoopDeps,
+    inbox: &Inbox<'_>,
+    batch: &NexusBatch,
+) -> bool {
+    if let Err(error) = deps.turn_exec.interrupt_active_turn(session).await {
+        handle_inject_error(session, deps, inbox, batch, InjectError::Contract(error)).await;
+        return false;
+    }
+    true
 }
 
 fn delivery_timing_contract_error(

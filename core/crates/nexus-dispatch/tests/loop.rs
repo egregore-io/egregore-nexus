@@ -79,6 +79,170 @@ struct NativeSteerTurnExec {
     steer_accepted: Notify,
 }
 
+/// Models an interrupt-and-send ACP adapter whose replacement prompt is serialized behind the
+/// current prompt. The current prompt can observe cancellation only while its future is polled.
+/// Awaiting the replacement inline from the event-loop bell branch therefore deadlocks: that
+/// branch stops polling the very future that must release the serialization boundary.
+struct SerializedInterruptAndSendTurnExec {
+    session: SessionId,
+    injected: Mutex<Vec<NexusBatch>>,
+    active: AtomicBool,
+    interrupts: AtomicUsize,
+    steer_calls: AtomicUsize,
+    first_error: Option<ContractError>,
+    interrupt_error: Option<ContractError>,
+    first_started: Notify,
+    interrupt_requested: Notify,
+    terminal_release: Notify,
+    first_completed: Notify,
+}
+
+struct ActivePromptGuard<'a> {
+    active: &'a AtomicBool,
+    completed: &'a Notify,
+}
+
+impl Drop for ActivePromptGuard<'_> {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::SeqCst);
+        self.completed.notify_one();
+    }
+}
+
+impl SerializedInterruptAndSendTurnExec {
+    fn new(session: SessionId) -> Self {
+        Self {
+            session,
+            injected: Mutex::new(Vec::new()),
+            active: AtomicBool::new(false),
+            interrupts: AtomicUsize::new(0),
+            steer_calls: AtomicUsize::new(0),
+            first_error: None,
+            interrupt_error: None,
+            first_started: Notify::new(),
+            interrupt_requested: Notify::new(),
+            terminal_release: Notify::new(),
+            first_completed: Notify::new(),
+        }
+    }
+
+    fn with_first_error(session: SessionId, error: ContractError) -> Self {
+        Self {
+            first_error: Some(error),
+            ..Self::new(session)
+        }
+    }
+
+    fn with_interrupt_error(session: SessionId, error: ContractError) -> Self {
+        Self {
+            interrupt_error: Some(error),
+            ..Self::new(session)
+        }
+    }
+
+    fn begin_injection(&self, batch: &NexusBatch) -> bool {
+        let first = {
+            let mut injected = self.injected.lock().unwrap();
+            injected.push(batch.clone());
+            injected.len() == 1
+        };
+        if first {
+            self.active.store(true, Ordering::SeqCst);
+            self.first_started.notify_one();
+        }
+        first
+    }
+
+    async fn finish_injection(&self, first: bool) -> Result<(), ContractError> {
+        if !first {
+            return Ok(());
+        }
+        let _active_prompt = ActivePromptGuard {
+            active: &self.active,
+            completed: &self.first_completed,
+        };
+        self.interrupt_requested.notified().await;
+        self.terminal_release.notified().await;
+        match &self.first_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentTurnExecutionPort for SerializedInterruptAndSendTurnExec {
+    async fn inject_turn(
+        &self,
+        _recipient: &SessionId,
+        batch: &NexusBatch,
+    ) -> Result<(), ContractError> {
+        let first = self.begin_injection(batch);
+        self.finish_injection(first).await
+    }
+
+    async fn inject_turn_observed(
+        &self,
+        _recipient: &SessionId,
+        batch: &NexusBatch,
+        events: Arc<dyn EventSink>,
+        accepted_event: WsEvent,
+    ) -> InjectResult<()> {
+        let first = self.begin_injection(batch);
+        events.emit(accepted_event).await;
+        self.finish_injection(first)
+            .await
+            .map_err(InjectError::Contract)
+    }
+
+    async fn steer_observed(
+        &self,
+        _recipient: &SessionId,
+        _text: String,
+        events: Arc<dyn EventSink>,
+        accepted_event: WsEvent,
+    ) -> Result<SteerResponse, ContractError> {
+        self.steer_calls.fetch_add(1, Ordering::SeqCst);
+        self.interrupt_active_turn(_recipient).await?;
+        self.first_completed.notified().await;
+        events.emit(accepted_event).await;
+        Ok(SteerResponse {
+            accepted: true,
+            delivery: SteerDelivery::InterruptedAndStarted,
+            turn_id: None,
+        })
+    }
+
+    fn steer_capability(&self, _recipient: &SessionId) -> SteerCapability {
+        SteerCapability::InterruptAndSend
+    }
+
+    fn active_turn_sessions(&self) -> Vec<SessionId> {
+        self.active
+            .load(Ordering::SeqCst)
+            .then(|| self.session.clone())
+            .into_iter()
+            .collect()
+    }
+
+    async fn interrupt_active_turn(&self, _recipient: &SessionId) -> Result<(), ContractError> {
+        self.interrupts.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = &self.interrupt_error {
+            return Err(error.clone());
+        }
+        self.interrupt_requested.notify_one();
+        Ok(())
+    }
+
+    async fn launch(&self, _req: SpawnRequest) -> Result<SpawnResponse, ContractError> {
+        unreachable!()
+    }
+
+    async fn remove(&self, _req: RemoveRequest) -> Result<RemoveResponse, ContractError> {
+        unreachable!()
+    }
+}
+
 /// Models the narrow race where the tracked active turn ends between the daemon's capability
 /// check and the native steer RPC. The rejected payload was not admitted and must become the next
 /// normal turn after the first completion is observed.
@@ -1013,6 +1177,633 @@ async fn active_native_turn_receives_new_bus_batch_before_current_turn_completes
 
     turn_exec.first_gate.notify_one();
     wait_for_delivery_state(&store, "m_active_first", "delivered").await;
+}
+
+#[tokio::test]
+async fn interrupt_and_send_redrives_after_cancel_without_deadlocking_the_active_turn() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let cfg = Config::default();
+    let bell = Bell::new();
+    let registry = AgentRegistry::new();
+    let session = SessionId("s_serialized_interrupt".into());
+    let turn_exec = Arc::new(SerializedInterruptAndSendTurnExec::new(session.clone()));
+    let events = RecordingSink::default();
+    let service = DispatchService::new(ServiceDeps {
+        store: store.clone(),
+        bell: bell.clone(),
+        registry: registry.clone(),
+        project: PROJECT.into(),
+        drain_limit: cfg.drain_limit,
+        preview_chars: cfg.msg_preview_chars,
+    });
+    let _loop = EventLoop::spawn(
+        session.clone(),
+        LoopDeps {
+            store: store.clone(),
+            bell,
+            registry,
+            turn_exec: turn_exec.clone(),
+            events: Arc::new(events.clone()),
+            project: PROJECT.into(),
+            drain_limit: cfg.drain_limit,
+            preview_chars: cfg.msg_preview_chars,
+            completion_timeout: Duration::from_secs(45),
+            provider_limit_default_cooldown: Duration::from_millis(50),
+        },
+    );
+
+    insert(
+        &store,
+        &dm("m_serialized_first", "Alex", "current model turn"),
+    )
+    .await;
+    service
+        .enqueue(&session, &MessageId("m_serialized_first".into()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), turn_exec.first_started.notified())
+        .await
+        .expect("first prompt should be active");
+
+    insert(
+        &store,
+        &dm(
+            "m_serialized_followup",
+            "casey",
+            "interrupt, then deliver this as the next prompt",
+        ),
+    )
+    .await;
+    service
+        .enqueue(&session, &MessageId("m_serialized_followup".into()))
+        .await
+        .unwrap();
+
+    for _ in 0..200 {
+        if turn_exec.interrupts.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        turn_exec.interrupts.load(Ordering::SeqCst),
+        1,
+        "one accepted cancellation must not self-ring into a cancellation storm"
+    );
+    let mut rows = store
+        .conn
+        .query(
+            "SELECT state, attempt_count FROM in_flight WHERE message_id = ?1",
+            ["m_serialized_followup"],
+        )
+        .await
+        .unwrap();
+    let row = rows
+        .next()
+        .await
+        .unwrap()
+        .expect("replacement delivery row");
+    assert_eq!(row.get::<String>(0).unwrap(), "notified");
+    assert_eq!(
+        row.get::<i64>(1).unwrap(),
+        0,
+        "cancelling the old turn must not claim an unsent replacement prompt"
+    );
+
+    turn_exec.terminal_release.notify_one();
+
+    wait_for_delivery_state(&store, "m_serialized_followup", "delivered").await;
+    wait_for_delivery_state(&store, "m_serialized_first", "delivered").await;
+
+    let injected = turn_exec.injected.lock().unwrap();
+    assert_eq!(
+        injected.len(),
+        2,
+        "the replacement must run as the next turn"
+    );
+    assert_eq!(
+        injected[1].message_ids,
+        vec![MessageId("m_serialized_followup".into())]
+    );
+    assert_eq!(turn_exec.interrupts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        turn_exec.steer_calls.load(Ordering::SeqCst),
+        0,
+        "the event loop must not await a serialized replacement while its active future is paused"
+    );
+    let accepted_client_ids = events
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            WsEvent::AgentUpdate {
+                kind: AgentUpdateKind::UserInput,
+                data,
+                ..
+            } => data
+                .get("clientMessageId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        accepted_client_ids,
+        vec![
+            "bus:m_serialized_first".to_string(),
+            "bus:m_serialized_followup".to_string(),
+        ],
+        "the original and replacement accepted boundaries must each be projected exactly once"
+    );
+}
+
+#[tokio::test]
+async fn accepted_interrupt_redrives_once_after_the_active_turn_times_out() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let cfg = Config::default();
+    let bell = Bell::new();
+    let registry = AgentRegistry::new();
+    let session = SessionId("s_interrupt_timeout".into());
+    let turn_exec = Arc::new(SerializedInterruptAndSendTurnExec::new(session.clone()));
+    let events = RecordingSink::default();
+    let service = DispatchService::new(ServiceDeps {
+        store: store.clone(),
+        bell: bell.clone(),
+        registry: registry.clone(),
+        project: PROJECT.into(),
+        drain_limit: cfg.drain_limit,
+        preview_chars: cfg.msg_preview_chars,
+    });
+    let _loop = EventLoop::spawn(
+        session.clone(),
+        LoopDeps {
+            store: store.clone(),
+            bell,
+            registry,
+            turn_exec: turn_exec.clone(),
+            events: Arc::new(events.clone()),
+            project: PROJECT.into(),
+            drain_limit: cfg.drain_limit,
+            preview_chars: cfg.msg_preview_chars,
+            completion_timeout: Duration::from_millis(250),
+            provider_limit_default_cooldown: Duration::from_millis(50),
+        },
+    );
+
+    insert(&store, &dm("m_timeout_active", "Alex", "never completes")).await;
+    service
+        .enqueue(&session, &MessageId("m_timeout_active".into()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), turn_exec.first_started.notified())
+        .await
+        .expect("first prompt should be active");
+
+    insert(
+        &store,
+        &dm("m_timeout_replacement", "casey", "deliver after timeout"),
+    )
+    .await;
+    service
+        .enqueue(&session, &MessageId("m_timeout_replacement".into()))
+        .await
+        .unwrap();
+    for _ in 0..200 {
+        if turn_exec.interrupts.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let mut rows = store
+        .conn
+        .query(
+            "SELECT state, attempt_count FROM in_flight WHERE message_id = ?1",
+            ["m_timeout_replacement"],
+        )
+        .await
+        .unwrap();
+    let row = rows
+        .next()
+        .await
+        .unwrap()
+        .expect("replacement delivery row");
+    assert_eq!(row.get::<String>(0).unwrap(), "notified");
+    assert_eq!(row.get::<i64>(1).unwrap(), 0);
+    assert_eq!(
+        events
+            .events()
+            .into_iter()
+            .filter(|event| matches!(
+                event,
+                WsEvent::AgentUpdate {
+                    kind: AgentUpdateKind::UserInput,
+                    ..
+                }
+            ))
+            .count(),
+        1,
+        "the replacement is not accepted before the active turn closes"
+    );
+
+    wait_for_delivery_state(&store, "m_timeout_active", "error").await;
+    wait_for_delivery_state(&store, "m_timeout_replacement", "delivered").await;
+    assert_eq!(turn_exec.interrupts.load(Ordering::SeqCst), 1);
+    let injected = turn_exec.injected.lock().unwrap();
+    assert_eq!(injected.len(), 2);
+    assert_eq!(
+        injected[1].message_ids,
+        vec![MessageId("m_timeout_replacement".into())]
+    );
+    let accepted_client_ids = events
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            WsEvent::AgentUpdate {
+                kind: AgentUpdateKind::UserInput,
+                data,
+                ..
+            } => data
+                .get("clientMessageId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        accepted_client_ids,
+        vec![
+            "bus:m_timeout_active".to_string(),
+            "bus:m_timeout_replacement".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn later_arrivals_coalesce_without_reinterrupting_the_canceled_turn() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let cfg = Config::default();
+    let bell = Bell::new();
+    let registry = AgentRegistry::new();
+    let session = SessionId("s_interrupt_coalesce".into());
+    let turn_exec = Arc::new(SerializedInterruptAndSendTurnExec::new(session.clone()));
+    let events = RecordingSink::default();
+    let service = DispatchService::new(ServiceDeps {
+        store: store.clone(),
+        bell: bell.clone(),
+        registry: registry.clone(),
+        project: PROJECT.into(),
+        drain_limit: cfg.drain_limit,
+        preview_chars: cfg.msg_preview_chars,
+    });
+    let _loop = EventLoop::spawn(
+        session.clone(),
+        LoopDeps {
+            store: store.clone(),
+            bell,
+            registry,
+            turn_exec: turn_exec.clone(),
+            events: Arc::new(events.clone()),
+            project: PROJECT.into(),
+            drain_limit: cfg.drain_limit,
+            preview_chars: cfg.msg_preview_chars,
+            completion_timeout: Duration::from_secs(45),
+            provider_limit_default_cooldown: Duration::from_millis(50),
+        },
+    );
+
+    insert(&store, &dm("m_coalesce_active", "Alex", "current turn")).await;
+    service
+        .enqueue(&session, &MessageId("m_coalesce_active".into()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), turn_exec.first_started.notified())
+        .await
+        .expect("first prompt should be active");
+
+    insert(&store, &dm("m_coalesce_one", "casey", "first replacement")).await;
+    service
+        .enqueue(&session, &MessageId("m_coalesce_one".into()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while turn_exec.interrupts.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the first replacement must trigger cancellation before later arrivals");
+    let mut rows = store
+        .conn
+        .query(
+            "SELECT state, attempt_count FROM in_flight WHERE message_id = ?1",
+            ["m_coalesce_one"],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("first replacement row");
+    assert_eq!(row.get::<String>(0).unwrap(), "notified");
+    assert_eq!(row.get::<i64>(1).unwrap(), 0);
+
+    for message_id in ["m_coalesce_two", "m_coalesce_three"] {
+        insert(&store, &dm(message_id, "casey", message_id)).await;
+        service
+            .enqueue(&session, &MessageId(message_id.into()))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert_eq!(
+        turn_exec.interrupts.load(Ordering::SeqCst),
+        1,
+        "later bells must coalesce without sending another interrupt"
+    );
+    for message_id in ["m_coalesce_one", "m_coalesce_two", "m_coalesce_three"] {
+        let mut rows = store
+            .conn
+            .query(
+                "SELECT state, attempt_count FROM in_flight WHERE message_id = ?1",
+                [message_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("coalesced delivery row");
+        assert_eq!(row.get::<String>(0).unwrap(), "notified");
+        assert_eq!(row.get::<i64>(1).unwrap(), 0);
+    }
+
+    turn_exec.terminal_release.notify_one();
+    wait_for_delivery_state(&store, "m_coalesce_active", "delivered").await;
+    for message_id in ["m_coalesce_one", "m_coalesce_two", "m_coalesce_three"] {
+        wait_for_delivery_state(&store, message_id, "delivered").await;
+        let mut rows = store
+            .conn
+            .query(
+                "SELECT attempt_count FROM in_flight WHERE message_id = ?1",
+                [message_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next()
+                .await
+                .unwrap()
+                .expect("delivered replacement row")
+                .get::<i64>(0)
+                .unwrap(),
+            1,
+            "each coalesced row crosses the harness boundary exactly once"
+        );
+    }
+    assert_eq!(turn_exec.interrupts.load(Ordering::SeqCst), 1);
+    let injected = turn_exec.injected.lock().unwrap();
+    assert_eq!(injected.len(), 2);
+    assert_eq!(
+        injected[1].message_ids,
+        vec![
+            MessageId("m_coalesce_one".into()),
+            MessageId("m_coalesce_two".into()),
+            MessageId("m_coalesce_three".into()),
+        ]
+    );
+    let accepted_client_ids = events
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            WsEvent::AgentUpdate {
+                kind: AgentUpdateKind::UserInput,
+                data,
+                ..
+            } => data
+                .get("clientMessageId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        accepted_client_ids,
+        vec![
+            "bus:m_coalesce_active".to_string(),
+            "bus:m_coalesce_one,m_coalesce_two,m_coalesce_three".to_string(),
+        ],
+        "the combined replacement batch is accepted exactly once"
+    );
+}
+
+#[tokio::test]
+async fn interrupted_turn_error_still_redrives_the_unclaimed_replacement_once() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let cfg = Config::default();
+    let bell = Bell::new();
+    let registry = AgentRegistry::new();
+    let session = SessionId("s_interrupted_error".into());
+    let turn_exec = Arc::new(SerializedInterruptAndSendTurnExec::with_first_error(
+        session.clone(),
+        ContractError {
+            code: -32000,
+            message: "active prompt was canceled".into(),
+        },
+    ));
+    let events = RecordingSink::default();
+    let service = DispatchService::new(ServiceDeps {
+        store: store.clone(),
+        bell: bell.clone(),
+        registry: registry.clone(),
+        project: PROJECT.into(),
+        drain_limit: cfg.drain_limit,
+        preview_chars: cfg.msg_preview_chars,
+    });
+    let _loop = EventLoop::spawn(
+        session.clone(),
+        LoopDeps {
+            store: store.clone(),
+            bell,
+            registry,
+            turn_exec: turn_exec.clone(),
+            events: Arc::new(events.clone()),
+            project: PROJECT.into(),
+            drain_limit: cfg.drain_limit,
+            preview_chars: cfg.msg_preview_chars,
+            completion_timeout: Duration::from_secs(45),
+            provider_limit_default_cooldown: Duration::from_millis(50),
+        },
+    );
+
+    insert(&store, &dm("m_canceled_error", "Alex", "cancel this turn")).await;
+    service
+        .enqueue(&session, &MessageId("m_canceled_error".into()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), turn_exec.first_started.notified())
+        .await
+        .expect("first prompt should be active");
+
+    insert(
+        &store,
+        &dm("m_after_canceled_error", "casey", "deliver after cancel"),
+    )
+    .await;
+    service
+        .enqueue(&session, &MessageId("m_after_canceled_error".into()))
+        .await
+        .unwrap();
+    for _ in 0..200 {
+        if turn_exec.interrupts.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    turn_exec.terminal_release.notify_one();
+
+    wait_for_delivery_state(&store, "m_canceled_error", "error").await;
+    wait_for_delivery_state(&store, "m_after_canceled_error", "delivered").await;
+    assert_eq!(turn_exec.interrupts.load(Ordering::SeqCst), 1);
+    assert_eq!(turn_exec.injected.lock().unwrap().len(), 2);
+    let accepted_client_ids = events
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            WsEvent::AgentUpdate {
+                kind: AgentUpdateKind::UserInput,
+                data,
+                ..
+            } => data
+                .get("clientMessageId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        accepted_client_ids,
+        vec![
+            "bus:m_canceled_error".to_string(),
+            "bus:m_after_canceled_error".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn interrupt_failure_settles_replacement_without_injection_or_accepted_event() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let cfg = Config::default();
+    let bell = Bell::new();
+    let registry = AgentRegistry::new();
+    let session = SessionId("s_interrupt_failure".into());
+    let turn_exec = Arc::new(SerializedInterruptAndSendTurnExec::with_interrupt_error(
+        session.clone(),
+        ContractError {
+            code: -32001,
+            message: "session/cancel failed".into(),
+        },
+    ));
+    let events = RecordingSink::default();
+    let service = DispatchService::new(ServiceDeps {
+        store: store.clone(),
+        bell: bell.clone(),
+        registry: registry.clone(),
+        project: PROJECT.into(),
+        drain_limit: cfg.drain_limit,
+        preview_chars: cfg.msg_preview_chars,
+    });
+    let _loop = EventLoop::spawn(
+        session.clone(),
+        LoopDeps {
+            store: store.clone(),
+            bell,
+            registry,
+            turn_exec: turn_exec.clone(),
+            events: Arc::new(events.clone()),
+            project: PROJECT.into(),
+            drain_limit: cfg.drain_limit,
+            preview_chars: cfg.msg_preview_chars,
+            completion_timeout: Duration::from_secs(45),
+            provider_limit_default_cooldown: Duration::from_millis(50),
+        },
+    );
+
+    insert(
+        &store,
+        &dm("m_interrupt_failure_first", "Alex", "active turn"),
+    )
+    .await;
+    service
+        .enqueue(&session, &MessageId("m_interrupt_failure_first".into()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), turn_exec.first_started.notified())
+        .await
+        .expect("first prompt should be active");
+
+    insert(
+        &store,
+        &dm(
+            "m_interrupt_failure_replacement",
+            "casey",
+            "must fail before prompt injection",
+        ),
+    )
+    .await;
+    service
+        .enqueue(
+            &session,
+            &MessageId("m_interrupt_failure_replacement".into()),
+        )
+        .await
+        .unwrap();
+
+    wait_for_delivery_state(&store, "m_interrupt_failure_replacement", "error").await;
+    assert_eq!(turn_exec.interrupts.load(Ordering::SeqCst), 1);
+    assert_eq!(turn_exec.injected.lock().unwrap().len(), 1);
+    let mut rows = store
+        .conn
+        .query(
+            "SELECT attempt_count FROM in_flight WHERE message_id = ?1",
+            ["m_interrupt_failure_replacement"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next()
+            .await
+            .unwrap()
+            .expect("replacement row")
+            .get::<i64>(0)
+            .unwrap(),
+        0,
+        "a failed cancel must not invent a replacement prompt attempt"
+    );
+    let accepted_client_ids = events
+        .events()
+        .into_iter()
+        .filter_map(|event| match event {
+            WsEvent::AgentUpdate {
+                kind: AgentUpdateKind::UserInput,
+                data,
+                ..
+            } => data
+                .get("clientMessageId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        accepted_client_ids,
+        vec!["bus:m_interrupt_failure_first".to_string()]
+    );
+
+    // Let the original test turn finish so the spawned loop does not outlive this fixture.
+    turn_exec.interrupt_requested.notify_one();
+    turn_exec.terminal_release.notify_one();
+    wait_for_delivery_state(&store, "m_interrupt_failure_first", "delivered").await;
 }
 
 #[tokio::test]
