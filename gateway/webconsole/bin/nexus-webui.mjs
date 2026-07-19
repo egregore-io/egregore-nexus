@@ -23,7 +23,7 @@ const gateway = new URL(
   valueAfter("--gateway-url") ?? process.env.NEXUS_GATEWAY_URL ?? "http://127.0.0.1:4100",
 );
 const discoveryPath = valueAfter("--discovery") ?? process.env.NEXUS_WEBCONSOLE_DISCOVERY;
-const executable = await realpath(fileURLToPath(import.meta.url));
+const executable = await realpath(process.argv[1] ?? fileURLToPath(import.meta.url));
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const dist = process.env.NEXUS_WEBUI_DIST ?? join(packageRoot, "dist");
 await access(join(dist, "index.html"));

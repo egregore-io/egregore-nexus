@@ -573,6 +573,11 @@ pub fn resolve_webconsole_installation(
 }
 
 fn webconsole_installation(executable: PathBuf, windows: bool) -> WebconsoleInstallation {
+    let executable = if windows {
+        executable
+    } else {
+        fs::canonicalize(&executable).unwrap_or(executable)
+    };
     let invocation = if windows
         && executable
             .extension()

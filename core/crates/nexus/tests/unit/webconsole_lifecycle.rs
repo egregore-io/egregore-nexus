@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use nexus::webconsole_lifecycle::{
-    launch_webconsole_with, start_webconsole_with, stop_webconsole_with, WebconsoleBackend,
-    WebconsoleInstallation, WebconsoleInvocation, WebconsoleRuntimeStatus, WebconsoleStartOptions,
+    launch_webconsole_with, resolve_webconsole_installation, start_webconsole_with,
+    stop_webconsole_with, WebconsoleBackend, WebconsoleInstallation, WebconsoleInvocation,
+    WebconsoleRuntimeStatus, WebconsoleStartOptions,
 };
 
 struct FakeBackend {
@@ -183,6 +184,25 @@ fn stop_never_touches_gateway() {
     };
     stop_webconsole_with(&mut backend, false).unwrap();
     assert_eq!(backend.calls, ["status", "stop", "clear-stale"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_webconsole_symlink_resolves_to_the_spawned_executable() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("nexus-webui.mjs");
+    let launcher = directory.path().join("nexus-webui");
+    std::fs::write(&executable, "#!/usr/bin/env node\n").unwrap();
+    symlink(&executable, &launcher).unwrap();
+
+    let installation =
+        resolve_webconsole_installation(Some(launcher.as_os_str().to_os_string()), None, false)
+            .unwrap();
+
+    assert_eq!(installation.executable, executable.canonicalize().unwrap());
+    assert_eq!(installation.invocation, WebconsoleInvocation::Direct);
 }
 
 fn options() -> WebconsoleStartOptions {
