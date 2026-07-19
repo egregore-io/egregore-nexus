@@ -216,6 +216,67 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
     });
   });
 
+  it("rebinds a persisted human before the first post after daemon replacement", async () => {
+    const { commands: seedCommands } = makeCommandCapture();
+    let idSeq = 0;
+    const { cookieToken } = await registerHuman({ name: "earl", password: "pw" }, {
+      db,
+      commands: seedCommands,
+      genId: () => `rebind_id_${++idSeq}`,
+      now: () => 1_000_000,
+    });
+    const calls: Array<{ kind: string; request: unknown; caller: unknown }> = [];
+
+    const dispatch = makeDispatch({
+      db: async () => db,
+      authMode: "remote",
+      commandIngress: {
+        daemonBootId: async () => "boot_after_restart",
+        daemonCommand: async (kind, request, caller) => {
+          calls.push({ kind, request, caller });
+          if (kind === "identity.register") {
+            return { sessionId: "s_rebound_earl", agentId: "a_earl" };
+          }
+          return { messageId: "m_after_rebind", fanout: 1 };
+        },
+      },
+    });
+
+    const res = await dispatch(new Request("http://localhost/api/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        cookie: `nexus_human=${cookieToken}; nexus_csrf=csrf-rebind`,
+        "x-nexus-csrf": "csrf-rebind",
+      },
+      body: JSON.stringify({
+        to: { verb: "post", thread: "lens-live-blockers" },
+        body: "first post after restart",
+      }),
+    }));
+
+    expect(res.status).toBe(201);
+    expect(calls).toEqual([
+      expect.objectContaining({
+        kind: "identity.register",
+        request: expect.objectContaining({
+          name: "earl",
+          clientKey: "rebind_id_1",
+          kind: "human",
+        }),
+      }),
+      expect.objectContaining({
+        kind: "message.post.send",
+        caller: expect.objectContaining({
+          sessionId: "s_rebound_earl",
+          runtimeId: "s_rebound_earl",
+          agentId: "a_earl",
+          clientKey: "rebind_id_1",
+        }),
+      }),
+    ]);
+  });
+
   it("rejects message sends when there is no cookie", async () => {
     const dispatch = makeDispatch({
       db: async () => db,

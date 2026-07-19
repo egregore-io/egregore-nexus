@@ -12,7 +12,9 @@ import {
   callDaemonCommand,
   callDaemonEnqueue,
   DaemonIpcError,
+  readDaemonBootId,
   type DaemonIpcCaller,
+  type DaemonIpcCallOptions,
   type DaemonIpcCommandOptions,
 } from "@server/daemon/ipc";
 import type {
@@ -106,6 +108,8 @@ export interface CommandIngressOptions {
     caller: DaemonIpcCaller,
     options: DaemonIpcCommandOptions,
   ) => Promise<unknown>;
+  /** Test seam for the daemon boot epoch used by human-principal rebinding. */
+  daemonBootId?: (options?: DaemonIpcCallOptions) => Promise<string>;
 }
 
 interface CommandPollRow {
@@ -139,6 +143,15 @@ interface CommandCallerRow {
 const DEFAULT_TIMEOUT_MS = 10_000;
 const DEFAULT_POLL_INTERVAL_MS = 100;
 
+interface HumanDaemonBinding {
+  bootId: string;
+  sessionId: string;
+  agentId?: string;
+}
+
+const humanDaemonBindings = new Map<string, HumanDaemonBinding>();
+const pendingHumanRebinds = new Map<string, Promise<HumanDaemonBinding>>();
+
 /** Build a generic command sender backed by `command_intents`. */
 export function createCommandIngressSubmitter(
   opts: CommandIngressOptions = {},
@@ -162,7 +175,8 @@ export async function submitCommandIntent<T = unknown>(
   opts: CommandIngressOptions = {},
   idempotencyKey?: string,
 ): Promise<T> {
-  const commandCaller = callerRow(caller);
+  const currentCaller = await ensureHumanCallerForDaemonBoot(kind, caller, opts);
+  const commandCaller = callerRow(currentCaller);
   if (!opts.db) {
     const invoke = opts.daemonCommand ?? callDaemonCommand;
     const commandId = opts.genCommandId?.() ?? `cmd_${randomUUID()}`;
@@ -214,7 +228,8 @@ export async function enqueueCommandIntent(
   const now = opts.now ?? Date.now;
   const createdAt = now();
   const commandId = opts.genCommandId?.() ?? `cmd_${randomUUID()}`;
-  const commandCaller = callerRow(caller);
+  const currentCaller = await ensureHumanCallerForDaemonBoot(kind, caller, opts);
+  const commandCaller = callerRow(currentCaller);
   if (!opts.db) {
     const invoke = opts.daemonEnqueue ?? callDaemonEnqueue;
     if (opts.ingressDb && idempotencyKey) {
@@ -250,10 +265,110 @@ export async function enqueueCommandIntent(
     commandId,
     kind,
     req,
-    commandCaller: callerRow(caller),
+    commandCaller,
     createdAt,
     idempotencyKey: cleanEnv(idempotencyKey),
   });
+}
+
+async function ensureHumanCallerForDaemonBoot(
+  commandKind: string,
+  caller: GatewayCallerIdentity | undefined,
+  opts: CommandIngressOptions,
+): Promise<GatewayCallerIdentity | undefined> {
+  if (
+    opts.db ||
+    commandKind === COMMAND_KINDS.identityRegister ||
+    caller?.credentialFacet !== "human"
+  ) {
+    return caller;
+  }
+  if (!caller.clientKey) {
+    throw new GatewayError(401, "human command caller is missing its stable client key");
+  }
+
+  let bootId: string;
+  try {
+    bootId = await (opts.daemonBootId ?? readDaemonBootId)(
+      opts.nexusHome ? { nexusHome: opts.nexusHome } : {},
+    );
+  } catch (error) {
+    throw gatewayIpcError(error);
+  }
+  const bindingKey = `${opts.nexusHome ?? "<default>"}:${caller.clientKey}`;
+  const cached = humanDaemonBindings.get(bindingKey);
+  const binding = cached?.bootId === bootId
+    ? cached
+    : await rebindHumanCaller(bindingKey, bootId, caller, opts);
+
+  return {
+    ...caller,
+    sessionId: binding.sessionId,
+    runtimeId: binding.sessionId,
+    ...(binding.agentId ? { agentId: binding.agentId } : {}),
+  };
+}
+
+async function rebindHumanCaller(
+  bindingKey: string,
+  bootId: string,
+  caller: GatewayCallerIdentity,
+  opts: CommandIngressOptions,
+): Promise<HumanDaemonBinding> {
+  const pendingKey = `${bindingKey}:${bootId}`;
+  const existing = pendingHumanRebinds.get(pendingKey);
+  if (existing) return existing;
+
+  const pending = registerHumanCaller(bootId, caller, opts);
+  pendingHumanRebinds.set(pendingKey, pending);
+  try {
+    const binding = await pending;
+    humanDaemonBindings.set(bindingKey, binding);
+    return binding;
+  } finally {
+    pendingHumanRebinds.delete(pendingKey);
+  }
+}
+
+async function registerHumanCaller(
+  bootId: string,
+  caller: GatewayCallerIdentity,
+  opts: CommandIngressOptions,
+): Promise<HumanDaemonBinding> {
+  const invoke = opts.daemonCommand ?? callDaemonCommand;
+  const clientKey = caller.clientKey as string;
+  try {
+    const response = await invoke(
+      COMMAND_KINDS.identityRegister,
+      {
+        name: caller.name,
+        harness: "other",
+        harnessSessionId: `hs_${clientKey}`,
+        project: caller.project,
+        clientKey,
+        tier: caller.tier ?? Tier.Admin,
+        kind: Kind.Human,
+      },
+      daemonCaller(callerRow(caller)),
+      {
+        commandId: `cmd_${randomUUID()}`,
+        ...(opts.nexusHome ? { nexusHome: opts.nexusHome } : {}),
+        timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      },
+    ) as { sessionId?: unknown; agentId?: unknown };
+    if (typeof response?.sessionId !== "string" || !response.sessionId) {
+      throw new GatewayError(502, "daemon human rebind returned no sessionId");
+    }
+    return {
+      bootId,
+      sessionId: response.sessionId,
+      ...(typeof response.agentId === "string" && response.agentId
+        ? { agentId: response.agentId }
+        : {}),
+    };
+  } catch (error) {
+    throw gatewayIpcError(error);
+  }
 }
 
 interface GatewayIngressSubmission<T> {

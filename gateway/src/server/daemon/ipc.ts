@@ -84,6 +84,16 @@ export interface DaemonIpcCommandOptions extends DaemonIpcCallOptions {
   idempotencyKey?: string;
 }
 
+/** Return the boot epoch advertised by the daemon's current local IPC endpoint. */
+export async function readDaemonBootId(options: DaemonIpcCallOptions = {}): Promise<string> {
+  const nexusHome = options.nexusHome ?? resolveNexusHome();
+  const endpoint = await readEndpoint(nexusHome);
+  if (typeof endpoint.daemonBootId !== "string" || !endpoint.daemonBootId) {
+    throw new DaemonIpcError("daemon IPC endpoint manifest is missing daemonBootId");
+  }
+  return endpoint.daemonBootId;
+}
+
 export class DaemonIpcError extends Error {
   readonly code?: number;
   readonly data?: unknown;
