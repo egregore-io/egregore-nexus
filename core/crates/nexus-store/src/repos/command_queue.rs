@@ -5,7 +5,8 @@ use std::collections::{HashMap, HashSet};
 use libsql::params;
 use nexus_common::NexusError;
 use nexus_contracts::{
-    CommandQueueAction, CommandQueueMutationRequest, CommandQueueState, SessionId, SteerCapability,
+    AgentId, CommandQueueAction, CommandQueueEntry, CommandQueueMutationRequest,
+    CommandQueueSnapshot, CommandQueueState, CommandQueueTransition, SessionId, SteerCapability,
 };
 use serde_json::{json, Map, Value};
 
@@ -24,14 +25,49 @@ pub struct CommandQueueMutationOutcome {
     pub body: Value,
 }
 
+/// Bounded monotonic queue transitions returned to the Gateway reconnect poller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandQueueEventsPage {
+    pub events: Vec<CommandQueueTransition>,
+    pub next_seq: i64,
+    pub latest_seq: i64,
+    pub gap: bool,
+}
+
 /// Atomic pending-queue mutation service. The daemon is its only production caller.
 pub struct CommandQueue<'a> {
     store: &'a Store,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct QueueTarget<'a> {
+    name: Option<&'a str>,
+    agent_id: Option<&'a str>,
+}
+
+impl<'a> QueueTarget<'a> {
+    fn from_request(request: &'a CommandQueueMutationRequest) -> Self {
+        Self {
+            name: Some(request.name.trim()),
+            agent_id: request.agent_id.as_ref().map(|id| id.0.as_str()),
+        }
+    }
+
+    fn display_name(&self, runtime: &TargetRuntime) -> String {
+        runtime
+            .name
+            .as_deref()
+            .or(self.name)
+            .or(self.agent_id)
+            .unwrap_or_default()
+            .to_string()
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TargetRuntime {
     session_id: Option<String>,
+    name: Option<String>,
     harness: Option<String>,
     transport: Option<String>,
     turn_active: bool,
@@ -59,6 +95,37 @@ enum QueueEffect {
 impl<'a> CommandQueue<'a> {
     pub fn new(store: &'a Store) -> Self {
         Self { store }
+    }
+
+    /// Hydrate one daemon-owned session queue without exposing the raw store over IPC.
+    pub async fn snapshot_with_active_sessions(
+        &self,
+        name: Option<&str>,
+        agent_id: Option<&AgentId>,
+        active_sessions: &[SessionId],
+    ) -> Result<CommandQueueSnapshot, NexusError> {
+        let target = QueueTarget {
+            name: name.map(str::trim).filter(|name| !name.is_empty()),
+            agent_id: agent_id.map(|id| id.0.as_str()),
+        };
+        let runtime = target_runtime(self.store, target, active_sessions).await?;
+        let seq = latest_queue_seq_store(self.store).await?;
+        let commands = queue_entries(self.store, target, runtime.session_id.as_deref()).await?;
+        let steer_capability = runtime.steer_capability();
+        Ok(CommandQueueSnapshot {
+            target: target.display_name(&runtime),
+            session_id: runtime.session_id,
+            turn_active: runtime.turn_active,
+            steer_capability,
+            seq,
+            revision: seq,
+            commands,
+        })
+    }
+
+    /// Read one bounded global transition page after a reconnect cursor.
+    pub async fn events_after(&self, after_seq: i64) -> Result<CommandQueueEventsPage, NexusError> {
+        queue_events_after(self.store, after_seq).await
     }
 
     /// Apply one idempotent compare-and-set mutation under the store's single write transaction.
@@ -89,7 +156,8 @@ impl<'a> CommandQueue<'a> {
 
         let canonical = canonical_request(request)?;
         let canonical_json = serde_json::to_string(&canonical).map_err(store_msg)?;
-        let runtime = target_runtime(self.store, project, request, active_sessions).await?;
+        let target = QueueTarget::from_request(request);
+        let runtime = target_runtime(self.store, target, active_sessions).await?;
         let tx = self
             .store
             .begin_identity_write_txn("command_queue_mutation")
@@ -108,7 +176,8 @@ impl<'a> CommandQueue<'a> {
         )
         .await?;
 
-        let (outcome, effect) = apply_mutation(&tx, project, request, now, &runtime).await?;
+        let (outcome, effect) =
+            apply_mutation(&tx, project, request, target, now, &runtime).await?;
         let response_json = serde_json::to_string(&outcome.body).map_err(store_msg)?;
         tx.execute(
             "UPDATE command_queue_mutations SET response_status = ?1, response_json = ?2 \
@@ -176,19 +245,21 @@ async fn replay(
 
 async fn target_runtime(
     store: &Store,
-    project: &str,
-    request: &CommandQueueMutationRequest,
+    target: QueueTarget<'_>,
     active_sessions: &[SessionId],
 ) -> Result<TargetRuntime, NexusError> {
-    let agent_id = request.agent_id.as_ref().map(|id| id.0.as_str());
     let sessions = Sessions::new(store);
-    let session = match agent_id {
+    let session = match target.agent_id {
         Some(agent_id) => sessions.find_by_agent_id(agent_id).await?,
-        None => sessions.find_by_name(project, request.name.trim()).await?,
+        None => match target.name {
+            Some(name) => sessions.find_by_name_any_project(name).await?,
+            None => None,
+        },
     };
     let Some(session) = session else {
         return Ok(TargetRuntime {
             session_id: None,
+            name: None,
             harness: None,
             transport: None,
             turn_active: false,
@@ -211,16 +282,190 @@ async fn target_runtime(
     }
     Ok(TargetRuntime {
         session_id: Some(session.session_id.0),
+        name: session.name,
         harness: session.agent,
         transport: session.transport,
         turn_active,
     })
 }
 
+async fn queue_entries(
+    store: &Store,
+    target: QueueTarget<'_>,
+    session_id: Option<&str>,
+) -> Result<Vec<CommandQueueEntry>, NexusError> {
+    let has_agent_id = i64::from(target.agent_id.is_some());
+    let has_session_id = i64::from(session_id.is_some());
+    let identity = store.identity_conn();
+    let mut rows = identity
+        .query(
+            "SELECT command_id, kind, status, request_json, error_json, revision, created_at, \
+             claimed_at, started_at, completed_at, COALESCE((SELECT MAX(seq) \
+             FROM command_intent_events e WHERE e.command_id = command_intents.command_id), 0) \
+             FROM command_intents WHERE kind IN (?1, ?2) AND ( \
+               (?3 = 1 AND json_extract(request_json, '$.agentId') = ?4) OR \
+               (?3 = 0 AND json_extract(request_json, '$.agentId') IS NULL \
+                  AND json_extract(request_json, '$.name') = ?5) OR \
+               (?6 = 1 AND command_id IN (SELECT command_id FROM command_intent_events \
+                  WHERE session_id = ?7)) \
+             ) ORDER BY CASE WHEN status IN ('pending', 'claimed') THEN 0 ELSE 1 END, \
+             created_at ASC LIMIT 100",
+            params![
+                PROMPT,
+                STEER,
+                has_agent_id,
+                target.agent_id.unwrap_or(""),
+                target.name.unwrap_or(""),
+                has_session_id,
+                session_id.unwrap_or("")
+            ],
+        )
+        .await
+        .map_err(store_err)?;
+    let mut entries = Vec::new();
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        let request_json = get_text(&row, 3)?;
+        let request = serde_json::from_str::<Value>(&request_json).unwrap_or(Value::Null);
+        let status = get_text(&row, 2)?;
+        let started_at = get_opt_int(&row, 8)?;
+        entries.push(CommandQueueEntry {
+            command_id: get_text(&row, 0)?,
+            client_message_id: request
+                .get("clientMessageId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            session_id: session_id.map(str::to_string),
+            text: request
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            state: command_queue_state(&status, started_at),
+            mode: if get_text(&row, 1)? == STEER {
+                "redirect".into()
+            } else {
+                "queue".into()
+            },
+            revision: get_opt_int(&row, 5)?.unwrap_or(1),
+            seq: get_opt_int(&row, 10)?.unwrap_or_default(),
+            created_at: get_opt_int(&row, 6)?.unwrap_or_default(),
+            claimed_at: get_opt_int(&row, 7)?,
+            started_at,
+            completed_at: get_opt_int(&row, 9)?,
+            error: get_opt_text(&row, 4)?
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .and_then(|value| {
+                    value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                }),
+        });
+    }
+    Ok(entries)
+}
+
+async fn latest_queue_seq_store(store: &Store) -> Result<i64, NexusError> {
+    let identity = store.identity_conn();
+    let mut rows = identity
+        .query(
+            "SELECT COALESCE(MAX(seq), 0) FROM command_intent_events",
+            (),
+        )
+        .await
+        .map_err(store_err)?;
+    match rows.next().await.map_err(store_err)? {
+        Some(row) => Ok(get_opt_int(&row, 0)?.unwrap_or_default()),
+        None => Ok(0),
+    }
+}
+
+async fn queue_events_after(
+    store: &Store,
+    after_seq: i64,
+) -> Result<CommandQueueEventsPage, NexusError> {
+    let identity = store.identity_conn();
+    let mut bounds = identity
+        .query(
+            "SELECT COALESCE(MIN(CASE WHEN seq > ?1 THEN seq END), 0), \
+             COALESCE(MAX(seq), 0) FROM command_intent_events",
+            params![after_seq],
+        )
+        .await
+        .map_err(store_err)?;
+    let (next_seq, latest_seq) = match bounds.next().await.map_err(store_err)? {
+        Some(row) => (
+            get_opt_int(&row, 0)?.unwrap_or_default(),
+            get_opt_int(&row, 1)?.unwrap_or_default(),
+        ),
+        None => (0, 0),
+    };
+    let gap = after_seq > 0 && next_seq > after_seq.saturating_add(1);
+    if gap {
+        return Ok(CommandQueueEventsPage {
+            events: Vec::new(),
+            next_seq,
+            latest_seq,
+            gap,
+        });
+    }
+    let mut rows = identity
+        .query(
+            "SELECT seq, session_id, command_id, client_message_id, state, mode, revision \
+             FROM command_intent_events WHERE seq > ?1 ORDER BY seq LIMIT 500",
+            params![after_seq],
+        )
+        .await
+        .map_err(store_err)?;
+    let mut events = Vec::new();
+    while let Some(row) = rows.next().await.map_err(store_err)? {
+        events.push(CommandQueueTransition {
+            seq: get_opt_int(&row, 0)?.unwrap_or_default(),
+            session_id: get_opt_text(&row, 1)?,
+            command_id: get_text(&row, 2)?,
+            client_message_id: get_opt_text(&row, 3)?,
+            state: command_queue_event_state(&get_text(&row, 4)?),
+            mode: get_text(&row, 5)?,
+            revision: get_opt_int(&row, 6)?.unwrap_or_default(),
+        });
+    }
+    Ok(CommandQueueEventsPage {
+        events,
+        next_seq,
+        latest_seq,
+        gap,
+    })
+}
+
+fn command_queue_state(status: &str, started_at: Option<i64>) -> CommandQueueState {
+    match status {
+        "pending" => CommandQueueState::Queued,
+        "claimed" if started_at.is_some() => CommandQueueState::Started,
+        "claimed" => CommandQueueState::Claimed,
+        "done" => CommandQueueState::Completed,
+        "error" => CommandQueueState::Failed,
+        "cancelled" => CommandQueueState::Cancelled,
+        _ => CommandQueueState::Failed,
+    }
+}
+
+fn command_queue_event_state(state: &str) -> CommandQueueState {
+    match state {
+        "queued" => CommandQueueState::Queued,
+        "claimed" => CommandQueueState::Claimed,
+        "started" => CommandQueueState::Started,
+        "completed" => CommandQueueState::Completed,
+        "failed" => CommandQueueState::Failed,
+        "cancelled" => CommandQueueState::Cancelled,
+        _ => CommandQueueState::Failed,
+    }
+}
+
 async fn apply_mutation(
     tx: &WriteTxn,
     project: &str,
     request: &CommandQueueMutationRequest,
+    target: QueueTarget<'_>,
     now: i64,
     runtime: &TargetRuntime,
 ) -> Result<(CommandQueueMutationOutcome, QueueEffect), NexusError> {
@@ -248,7 +493,7 @@ async fn apply_mutation(
                     QueueEffect::None,
                 ));
             }
-            if !command_matches_target(tx, project, command_id, request, runtime).await? {
+            if !command_matches_target(tx, project, command_id, target, runtime).await? {
                 return Ok((cas_conflict(request), QueueEffect::None));
             }
             let changed = tx
@@ -276,7 +521,7 @@ async fn apply_mutation(
                     QueueEffect::None,
                 ));
             };
-            if !command_matches_target(tx, project, command_id, request, runtime).await? {
+            if !command_matches_target(tx, project, command_id, target, runtime).await? {
                 return Ok((cas_conflict(request), QueueEffect::None));
             }
             let changed = tx
@@ -329,7 +574,7 @@ async fn apply_mutation(
                     QueueEffect::None,
                 ));
             };
-            if !command_matches_target(tx, project, command_id, request, runtime).await? {
+            if !command_matches_target(tx, project, command_id, target, runtime).await? {
                 return Ok((cas_conflict(request), QueueEffect::None));
             }
             let changed = tx
@@ -350,7 +595,7 @@ async fn apply_mutation(
                 QueueEffect::None,
             ))
         }
-        CommandQueueAction::Reorder => reorder(tx, project, request, runtime).await,
+        CommandQueueAction::Reorder => reorder(tx, project, request, target, runtime).await,
     }
 }
 
@@ -358,6 +603,7 @@ async fn reorder(
     tx: &WriteTxn,
     project: &str,
     request: &CommandQueueMutationRequest,
+    target: QueueTarget<'_>,
     runtime: &TargetRuntime,
 ) -> Result<(CommandQueueMutationOutcome, QueueEffect), NexusError> {
     let unique = request.command_ids.iter().collect::<HashSet<_>>();
@@ -386,7 +632,7 @@ async fn reorder(
 
     let mut created_at = Vec::with_capacity(request.command_ids.len());
     for command_id in &request.command_ids {
-        if !command_matches_target(tx, project, command_id, request, runtime).await? {
+        if !command_matches_target(tx, project, command_id, target, runtime).await? {
             return Ok((reorder_conflict(request), QueueEffect::None));
         }
         let mut rows = tx
@@ -440,7 +686,7 @@ async fn command_matches_target(
     tx: &WriteTxn,
     project: &str,
     command_id: &str,
-    request: &CommandQueueMutationRequest,
+    target: QueueTarget<'_>,
     runtime: &TargetRuntime,
 ) -> Result<bool, NexusError> {
     let mut rows = tx
@@ -453,13 +699,11 @@ async fn command_matches_target(
         return Ok(false);
     };
     let command_request = serde_json::from_str::<Value>(&get_text(&row, 0)?).map_err(store_msg)?;
-    let direct = match request.agent_id.as_ref() {
-        Some(agent_id) => {
-            command_request.get("agentId").and_then(Value::as_str) == Some(agent_id.0.as_str())
-        }
+    let direct = match target.agent_id {
+        Some(agent_id) => command_request.get("agentId").and_then(Value::as_str) == Some(agent_id),
         None => {
             command_request.get("agentId").is_none_or(Value::is_null)
-                && command_request.get("name").and_then(Value::as_str) == Some(request.name.trim())
+                && command_request.get("name").and_then(Value::as_str) == target.name
         }
     };
     if direct {

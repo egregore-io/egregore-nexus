@@ -1,8 +1,9 @@
 //! Durable session-command queue transitions and atomic redirect promotion.
 
+use nexus_contracts::{AgentId, CommandQueueState, SessionId};
 use nexus_store::command_kinds;
-use nexus_store::repos::{CommandIntents, NewCommandIntent};
-use nexus_store::Store;
+use nexus_store::repos::{CommandIntents, CommandQueue, NewCommandIntent, NewSession, Sessions};
+use nexus_store::{DaemonStore, Store};
 
 async fn store() -> Store {
     let store = Store::open(":memory:").await.unwrap();
@@ -198,6 +199,177 @@ async fn queue_event_cursor_is_visible_to_insert_returning() {
     assert_eq!(row.get::<i64>(0).unwrap(), 1);
     assert_eq!(row.get::<String>(1).unwrap(), "s_otto");
     assert_eq!(row.get::<i64>(2).unwrap(), 1);
+}
+
+#[tokio::test]
+async fn typed_snapshot_projects_daemon_queue_truth_for_name_or_agent_id() {
+    let store = store().await;
+    let intents = CommandIntents::new(&store);
+    intents
+        .insert_pending(prompt("cmd_snapshot", 10))
+        .await
+        .unwrap();
+    let queue = CommandQueue::new(&store);
+    let active = vec![SessionId("s_otto".into())];
+
+    let by_name = queue
+        .snapshot_with_active_sessions(Some("otto"), None, &active)
+        .await
+        .unwrap();
+    assert_eq!(by_name.target, "otto");
+    assert_eq!(by_name.session_id.as_deref(), Some("s_otto"));
+    assert!(by_name.turn_active);
+    assert_eq!(
+        by_name.steer_capability,
+        nexus_contracts::SteerCapability::InterruptAndSend
+    );
+    assert_eq!(by_name.seq, 1);
+    assert_eq!(by_name.revision, 1);
+    assert_eq!(by_name.commands.len(), 1);
+    assert_eq!(by_name.commands[0].command_id, "cmd_snapshot");
+    assert_eq!(
+        by_name.commands[0].client_message_id.as_deref(),
+        Some("cm_cmd_snapshot")
+    );
+    assert_eq!(by_name.commands[0].state, CommandQueueState::Queued);
+    assert_eq!(by_name.commands[0].text, "continue");
+
+    let by_id = queue
+        .snapshot_with_active_sessions(
+            Some("stale-display-name"),
+            Some(&AgentId("a_otto".into())),
+            &active,
+        )
+        .await
+        .unwrap();
+    assert_eq!(by_id.target, "otto");
+    assert_eq!(by_id.commands[0].command_id, "cmd_snapshot");
+
+    let id_only = queue
+        .snapshot_with_active_sessions(None, Some(&AgentId("a_otto".into())), &active)
+        .await
+        .unwrap();
+    assert_eq!(id_only.target, "otto");
+    assert_eq!(id_only.session_id.as_deref(), Some("s_otto"));
+    assert_eq!(id_only.commands[0].command_id, "cmd_snapshot");
+}
+
+#[tokio::test]
+async fn split_store_snapshot_reads_runtime_from_transport_and_queue_from_identity() {
+    let daemon = DaemonStore::open(":memory:").await.unwrap();
+    let store = daemon.compatibility_store();
+    let session_id = SessionId("s_split".into());
+    Sessions::new(&store)
+        .create(NewSession {
+            session_id: session_id.clone(),
+            name: Some("split-agent".into()),
+            agent: Some("codex".into()),
+            kind: "agent".into(),
+            role: None,
+            tier: "agent".into(),
+            harness_session_id: None,
+            client_key: Some("split-client".into()),
+            cwd: None,
+            project: "other-metadata".into(),
+            transport: Some("codex-appserver".into()),
+        })
+        .await
+        .unwrap();
+    Sessions::new(&store)
+        .set_agent_id(&session_id, "a_split")
+        .await
+        .unwrap();
+    CommandIntents::new(&store)
+        .insert_pending(NewCommandIntent {
+            command_id: "cmd_split".into(),
+            kind: command_kinds::harness::PROMPT.into(),
+            project: "default".into(),
+            caller_name: "Alex".into(),
+            caller_session_id: Some("local-operator".into()),
+            caller_agent_id: None,
+            caller_runtime_id: Some("local-operator".into()),
+            caller_client_key: None,
+            caller_kind: Some("human".into()),
+            caller_tier: Some("admin".into()),
+            idempotency_key: Some("cm_split".into()),
+            request_json: serde_json::json!({
+                "name": "split-agent",
+                "agentId": "a_split",
+                "text": "split truth",
+                "clientMessageId": "cm_split"
+            })
+            .to_string(),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+
+    let snapshot = CommandQueue::new(&store)
+        .snapshot_with_active_sessions(None, Some(&AgentId("a_split".into())), &[session_id])
+        .await
+        .unwrap();
+    assert!(snapshot.turn_active);
+    assert_eq!(snapshot.session_id.as_deref(), Some("s_split"));
+    assert_eq!(snapshot.commands.len(), 1);
+    assert_eq!(snapshot.commands[0].command_id, "cmd_split");
+    assert_eq!(snapshot.commands[0].text, "split truth");
+    assert_eq!(snapshot.commands[0].state, CommandQueueState::Queued);
+}
+
+#[tokio::test]
+async fn typed_transition_read_is_bounded_and_reports_cursor_gaps() {
+    let store = store().await;
+    let intents = CommandIntents::new(&store);
+    intents
+        .insert_pending(prompt("cmd_events", 1))
+        .await
+        .unwrap();
+    let mut interleaved = prompt("cmd_other_metadata", 2);
+    interleaved.project = "other-metadata".into();
+    intents.insert_pending(interleaved).await.unwrap();
+    let claimed = intents
+        .claim_next_kind(10, 1_000, command_kinds::harness::PROMPT)
+        .await
+        .unwrap()
+        .unwrap();
+    let claimed_at = claimed.claimed_at.unwrap();
+    assert!(intents
+        .mark_started_for_claim("cmd_events", claimed_at, 11)
+        .await
+        .unwrap());
+    assert!(intents
+        .mark_done_for_claim("cmd_events", claimed_at, r#"{"accepted":true}"#, 12)
+        .await
+        .unwrap());
+    let queue = CommandQueue::new(&store);
+
+    let page = queue.events_after(1).await.unwrap();
+    assert_eq!(page.next_seq, 2);
+    assert_eq!(page.latest_seq, 5);
+    assert!(!page.gap);
+    assert_eq!(
+        page.events
+            .iter()
+            .map(|event| event.state)
+            .collect::<Vec<_>>(),
+        vec![
+            CommandQueueState::Queued,
+            CommandQueueState::Claimed,
+            CommandQueueState::Started,
+            CommandQueueState::Completed,
+        ]
+    );
+
+    store
+        .conn
+        .execute("DELETE FROM command_intent_events WHERE seq = 2", ())
+        .await
+        .unwrap();
+    let gap = queue.events_after(1).await.unwrap();
+    assert!(gap.gap);
+    assert!(gap.events.is_empty());
+    assert_eq!(gap.next_seq, 3);
+    assert_eq!(gap.latest_seq, 5);
 }
 
 #[tokio::test]

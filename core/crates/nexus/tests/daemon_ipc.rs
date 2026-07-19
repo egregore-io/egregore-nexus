@@ -620,6 +620,157 @@ async fn local_queue_mutation_executes_atomically_inside_the_daemon_owner() {
 }
 
 #[tokio::test]
+async fn local_queue_read_returns_typed_snapshot_and_transitions_without_raw_store_access() {
+    let state = state().await;
+    state
+        .store
+        .conn
+        .execute(
+            "INSERT INTO sessions (session_id, agent_id, name, agent, transport, project, created_at) \
+             VALUES ('s_queue_read', 'a_queue_read', 'queue-reader', 'codex', \
+             'codex-appserver', 'default', 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    CommandIntents::new(&state.store)
+        .insert_pending(nexus_store::repos::NewCommandIntent {
+            command_id: "cmd_queue_read".into(),
+            kind: nexus_store::command_kinds::harness::PROMPT.into(),
+            project: "default".into(),
+            caller_name: "Alex".into(),
+            caller_session_id: Some("local-operator".into()),
+            caller_agent_id: None,
+            caller_runtime_id: Some("local-operator".into()),
+            caller_client_key: None,
+            caller_kind: Some("human".into()),
+            caller_tier: Some("admin".into()),
+            idempotency_key: Some("cm_queue_read".into()),
+            request_json: serde_json::json!({
+                "name": "queue-reader",
+                "agentId": "a_queue_read",
+                "text": "read me",
+                "clientMessageId": "cm_queue_read"
+            })
+            .to_string(),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+    let caller = DaemonIpcCaller {
+        name: Some("Nexus Gateway".into()),
+        project: "default".into(),
+        session_id: Some("local-operator".into()),
+        agent_id: None,
+        runtime_id: Some("local-operator".into()),
+        client_key: None,
+        kind: Kind::Human,
+        tier: Tier::Admin,
+    };
+    let read = |request_id: &str, params: serde_json::Value| DaemonIpcRequest {
+        version: DAEMON_IPC_PROTOCOL_VERSION,
+        token: "boot-token".into(),
+        request_id: request_id.into(),
+        caller: Some(caller.clone()),
+        call: DaemonIpcCall::Query {
+            method: "local.sessionQueue.read".into(),
+            params,
+        },
+    };
+
+    let snapshot = daemon_ipc::handle_request(
+        &state,
+        "boot-token",
+        read(
+            "rpc-queue-snapshot",
+            serde_json::json!({
+                "project": "other-metadata",
+                "agentId": "a_queue_read"
+            }),
+        ),
+    )
+    .await;
+    assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+    let snapshot = snapshot.result.unwrap();
+    assert_eq!(snapshot["target"], "queue-reader");
+    assert_eq!(snapshot["sessionId"], "s_queue_read");
+    assert_eq!(snapshot["commands"][0]["commandId"], "cmd_queue_read");
+    assert_eq!(snapshot["commands"][0]["state"], "queued");
+
+    let stale_name = daemon_ipc::handle_request(
+        &state,
+        "boot-token",
+        read(
+            "rpc-queue-stale-name",
+            serde_json::json!({
+                "project": "stale-project-metadata",
+                "name": "stale-display-name",
+                "agentId": "a_queue_read"
+            }),
+        ),
+    )
+    .await;
+    assert!(stale_name.error.is_none(), "{:?}", stale_name.error);
+    let stale_name = stale_name.result.unwrap();
+    assert_eq!(stale_name["target"], "queue-reader");
+    assert_eq!(stale_name["sessionId"], "s_queue_read");
+    assert_eq!(stale_name["commands"][0]["commandId"], "cmd_queue_read");
+
+    let events = daemon_ipc::handle_request(
+        &state,
+        "boot-token",
+        read(
+            "rpc-queue-events",
+            serde_json::json!({ "project": "other-metadata", "eventsAfter": 0 }),
+        ),
+    )
+    .await;
+    assert!(events.error.is_none(), "{:?}", events.error);
+    assert_eq!(
+        events.result.unwrap()["events"][0]["commandId"],
+        "cmd_queue_read"
+    );
+
+    let name_fallback = daemon_ipc::handle_request(
+        &state,
+        "boot-token",
+        read(
+            "rpc-queue-name-fallback",
+            serde_json::json!({
+                "project": "other-metadata",
+                "name": "queue-reader"
+            }),
+        ),
+    )
+    .await;
+    assert!(name_fallback.error.is_none(), "{:?}", name_fallback.error);
+    assert_eq!(name_fallback.result.unwrap()["sessionId"], "s_queue_read");
+
+    let unauthorized = daemon_ipc::handle_request(
+        &state,
+        "boot-token",
+        DaemonIpcRequest {
+            version: DAEMON_IPC_PROTOCOL_VERSION,
+            token: "boot-token".into(),
+            request_id: "rpc-queue-unauthorized".into(),
+            caller: None,
+            call: DaemonIpcCall::Query {
+                method: "local.sessionQueue.read".into(),
+                params: serde_json::json!({
+                    "project": "default",
+                    "name": "queue-reader"
+                }),
+            },
+        },
+    )
+    .await;
+    assert_eq!(
+        unauthorized.error.unwrap().code,
+        nexus_contracts::codes::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
 async fn local_human_read_settlement_updates_only_the_authenticated_session_rows() {
     let state = state().await;
     state

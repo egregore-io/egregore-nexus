@@ -532,6 +532,9 @@ async fn handle_query(
         }
         return handle_local_store_read_query(state, request_id, caller, params).await;
     }
+    if method == "local.sessionQueue.read" {
+        return handle_local_session_queue_read(state, request_id, caller, params).await;
+    }
     if method == "local.sessionQueue.mutate" {
         return handle_local_session_queue_mutation(state, request_id, caller, params).await;
     }
@@ -849,6 +852,88 @@ struct LocalSessionQueueMutationRequest {
     project: String,
     now: i64,
     request: CommandQueueMutationRequest,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalSessionQueueReadRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    agent_id: Option<AgentId>,
+    #[serde(default)]
+    events_after: Option<i64>,
+}
+
+async fn handle_local_session_queue_read(
+    state: &AppState,
+    request_id: String,
+    caller: Option<DaemonIpcCaller>,
+    params: Value,
+) -> DaemonIpcResponse {
+    if !caller.as_ref().is_some_and(is_local_operator) {
+        return failure(
+            request_id,
+            codes::UNAUTHORIZED,
+            "session queue reads require local operator authority",
+        );
+    };
+    let request: LocalSessionQueueReadRequest = match serde_json::from_value(params) {
+        Ok(request) => request,
+        Err(error) => {
+            return failure(
+                request_id,
+                codes::INVALID_PARAMS,
+                format!("invalid session queue read: {error}"),
+            )
+        }
+    };
+    let queue = CommandQueue::new(&state.store);
+    let result: Result<Value, ContractError> = match request.events_after {
+        Some(after_seq) if after_seq >= 0 => queue
+            .events_after(after_seq)
+            .await
+            .map_err(|error| error.to_contract_error())
+            .map(|page| {
+                json!({
+                    "events": page.events,
+                    "nextSeq": page.next_seq,
+                    "latestSeq": page.latest_seq,
+                    "gap": page.gap,
+                })
+            }),
+        Some(_) => {
+            return failure(
+                request_id,
+                codes::INVALID_PARAMS,
+                "eventsAfter must be a non-negative integer",
+            )
+        }
+        None => {
+            let name = request
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+            if name.is_none() && request.agent_id.is_none() {
+                return failure(
+                    request_id,
+                    codes::INVALID_PARAMS,
+                    "name or agentId is required",
+                );
+            }
+            let active_sessions = state.agent.active_turn_sessions();
+            queue
+                .snapshot_with_active_sessions(name, request.agent_id.as_ref(), &active_sessions)
+                .await
+                .map_err(|error| error.to_contract_error())
+                .and_then(|snapshot| serde_json::to_value(snapshot).map_err(json_contract_error))
+        }
+    };
+    match result {
+        Ok(value) => DaemonIpcResponse::success(request_id, value),
+        Err(error) => store_failure(request_id, error),
+    }
 }
 
 async fn handle_local_session_queue_mutation(

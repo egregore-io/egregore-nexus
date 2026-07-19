@@ -5,6 +5,7 @@ import {
   handleConversationQueueGet,
   handleConversationQueuePost,
 } from "./sessionQueue";
+import { CommandQueueState, SteerCapability } from "@shared/types";
 
 const DDL = `
 CREATE TABLE sessions (
@@ -247,6 +248,122 @@ describe("durable session command queue", () => {
     });
   });
 
+  it("hydrates production snapshots through the typed daemon queue read", async () => {
+    const daemonQueueRead = vi.fn(async () => ({
+      target: "otto",
+      sessionId: "s_otto",
+      turnActive: false,
+      steerCapability: SteerCapability.NativeSteer,
+      seq: 12,
+      revision: 12,
+      commands: [],
+    }));
+
+    const response = await handleConversationQueueGet(
+      new Request("http://localhost/api/conversation/prompt?agentId=a_otto"),
+      {
+        env: { NEXUS_WEB_AUTH_MODE: "local" },
+        daemonQueueRead,
+      },
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      target: "otto",
+      sessionId: "s_otto",
+      seq: 12,
+      commands: [],
+    });
+    expect(daemonQueueRead).toHaveBeenCalledWith({
+      project: "default",
+      agentId: "a_otto",
+    });
+  });
+
+  it("reads production reconnect transitions through the typed daemon queue read", async () => {
+    const daemonQueueRead = vi.fn(async () => ({
+      events: [
+        {
+          seq: 13,
+          sessionId: "s_otto",
+          commandId: "cmd_done",
+          clientMessageId: "cm_done",
+          state: CommandQueueState.Completed,
+          mode: "queue",
+          revision: 4,
+        },
+      ],
+      nextSeq: 13,
+      latestSeq: 13,
+      gap: false,
+    }));
+
+    const response = await handleConversationQueueGet(
+      new Request("http://localhost/api/conversation/prompt?eventsAfter=12"),
+      {
+        env: { NEXUS_WEB_AUTH_MODE: "local" },
+        daemonQueueRead,
+      },
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      events: [{ commandId: "cmd_done", state: "completed" }],
+      latestSeq: 13,
+    });
+    expect(daemonQueueRead).toHaveBeenCalledWith({
+      project: "default",
+      eventsAfter: 12,
+    });
+  });
+
+  it("maps daemon queue read failures to a bad-gateway response", async () => {
+    const response = await handleConversationQueueGet(
+      new Request("http://localhost/api/conversation/prompt?name=otto"),
+      {
+        env: { NEXUS_WEB_AUTH_MODE: "local" },
+        daemonQueueRead: vi.fn(async () => {
+          throw new Error("daemon queue unavailable");
+        }),
+      },
+    );
+
+    expect(response.status).toBe(502);
+    await expect(response.json()).resolves.toEqual({
+      error: "daemon queue unavailable",
+    });
+  });
+
+  it("keeps the reconnect cursor global when project metadata interleaves", async () => {
+    const db = await dbFor();
+    await insertCommand(db, "cmd_default", "pending", 10);
+    await db.execute({
+      sql:
+        "INSERT INTO command_intent_events " +
+        "(project, session_id, command_id, client_message_id, state, mode, revision, created_at) " +
+        "VALUES (?, ?, ?, ?, 'queued', 'queue', 1, 11)",
+      args: [
+        "other-metadata",
+        "s_other",
+        "cmd_other",
+        "cm_other",
+      ],
+    });
+
+    const response = await handleConversationQueueGet(
+      new Request("http://localhost/api/conversation/prompt?eventsAfter=1"),
+      deps(db),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      events: [{ seq: 2, commandId: "cmd_other" }],
+      nextSeq: 2,
+      latestSeq: 2,
+      gap: false,
+    });
+  });
+
   it("hydrates a snapshot in three reads with turn activity folded into runtime lookup", async () => {
     const raw = await dbFor();
     await insertActiveTurn(raw);
@@ -374,6 +491,45 @@ describe("durable session command queue", () => {
           seq: 2,
         },
       ],
+    });
+  });
+
+  it("does not fall back to a mutable name when a stable agentId is supplied", async () => {
+    const db = await dbFor();
+    await insertCommand(db, "cmd_wrong_identity", "pending", 10);
+
+    const response = await handleConversationQueueGet(
+      new Request(
+        "http://localhost/api/conversation/prompt?name=otto&agentId=a_different",
+      ),
+      deps(db),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      target: "otto",
+      turnActive: false,
+      steerCapability: "none",
+      commands: [],
+    });
+  });
+
+  it("uses a valid stable agentId when the supplied display name is stale", async () => {
+    const db = await dbFor();
+    await insertCommand(db, "cmd_stable_identity", "pending", 10);
+
+    const response = await handleConversationQueueGet(
+      new Request(
+        "http://localhost/api/conversation/prompt?name=stale-name&agentId=a_otto",
+      ),
+      deps(db),
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      target: "otto",
+      sessionId: "s_otto",
+      commands: [{ commandId: "cmd_stable_identity" }],
     });
   });
 

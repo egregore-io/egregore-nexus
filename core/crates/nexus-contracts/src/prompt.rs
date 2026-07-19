@@ -96,7 +96,7 @@ pub struct CommandQueueSnapshot {
     /// Derived exclusively from the durable normalized session-turn projection.
     pub turn_active: bool,
     pub steer_capability: SteerCapability,
-    /// Monotonic project queue cursor used as the reconnect `afterSeq` boundary.
+    /// Monotonic global queue cursor used as the reconnect `afterSeq` boundary.
     #[typeshare(serialized_as = "number")]
     pub seq: i64,
     /// Queue revision. It advances with `seq`; named separately for compare-and-set UI state.
