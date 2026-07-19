@@ -9,6 +9,7 @@ use nexus::webconsole_lifecycle::{
 struct FakeBackend {
     calls: Vec<&'static str>,
     status: WebconsoleRuntimeStatus,
+    recovery: Result<Option<WebconsoleRuntimeStatus>, String>,
 }
 
 impl FakeBackend {
@@ -16,6 +17,7 @@ impl FakeBackend {
         Self {
             calls: Vec::new(),
             status: WebconsoleRuntimeStatus::Down,
+            recovery: Ok(None),
         }
     }
 }
@@ -43,6 +45,16 @@ impl WebconsoleBackend for FakeBackend {
     fn clear_stale(&mut self) -> Result<(), String> {
         self.calls.push("clear-stale");
         Ok(())
+    }
+
+    fn recover(
+        &mut self,
+        _installation: &WebconsoleInstallation,
+        _gateway_url: &str,
+        _options: &WebconsoleStartOptions,
+    ) -> Result<Option<WebconsoleRuntimeStatus>, String> {
+        self.calls.push("recover");
+        self.recovery.clone()
     }
 
     fn spawn(
@@ -81,7 +93,14 @@ async fn start_ensures_gateway_before_spawning() {
     assert_eq!(runtime, live());
     assert_eq!(
         backend.calls,
-        ["resolve", "ensure-gateway", "status", "spawn", "health"]
+        [
+            "resolve",
+            "ensure-gateway",
+            "status",
+            "recover",
+            "spawn",
+            "health"
+        ]
     );
 }
 
@@ -90,12 +109,53 @@ async fn healthy_process_is_reused_without_duplicate_spawn() {
     let mut backend = FakeBackend {
         calls: Vec::new(),
         status: live(),
+        recovery: Ok(None),
     };
     let runtime = start_webconsole_with(&mut backend, &options())
         .await
         .unwrap();
 
     assert_eq!(runtime, live());
+    assert!(!backend.calls.contains(&"spawn"));
+}
+
+#[tokio::test]
+async fn missing_discovery_adopts_a_verified_live_webconsole_without_spawning() {
+    let mut backend = FakeBackend {
+        calls: Vec::new(),
+        status: WebconsoleRuntimeStatus::Down,
+        recovery: Ok(Some(live())),
+    };
+
+    let runtime = start_webconsole_with(&mut backend, &options())
+        .await
+        .unwrap();
+
+    assert_eq!(runtime, live());
+    assert_eq!(
+        backend.calls,
+        ["resolve", "ensure-gateway", "status", "recover"]
+    );
+    assert!(!backend.calls.contains(&"spawn"));
+}
+
+#[tokio::test]
+async fn occupied_port_diagnosis_is_immediate_and_never_spawns() {
+    let mut backend = FakeBackend {
+        calls: Vec::new(),
+        status: WebconsoleRuntimeStatus::Down,
+        recovery: Err("Webconsole port 4200 is occupied by an untracked process".into()),
+    };
+
+    let error = start_webconsole_with(&mut backend, &options())
+        .await
+        .unwrap_err();
+
+    assert!(error.contains("occupied"));
+    assert_eq!(
+        backend.calls,
+        ["resolve", "ensure-gateway", "status", "recover"]
+    );
     assert!(!backend.calls.contains(&"spawn"));
 }
 
@@ -119,6 +179,7 @@ fn stop_never_touches_gateway() {
     let mut backend = FakeBackend {
         calls: Vec::new(),
         status: live(),
+        recovery: Ok(None),
     };
     stop_webconsole_with(&mut backend, false).unwrap();
     assert_eq!(backend.calls, ["status", "stop", "clear-stale"]);

@@ -64,7 +64,18 @@ test("server publishes its bound endpoint and removes only its own record", asyn
     const record = await waitForDiscovery(discovery);
     assert.equal(record.pid, child.pid);
     assert.equal(record.url, `http://127.0.0.1:${port}`);
-    assert.equal((await fetch(`${record.url}/health`)).status, 200);
+    const healthResponse = await fetch(`${record.url}/health`);
+    assert.equal(healthResponse.status, 200);
+    assert.deepEqual(await healthResponse.json(), {
+      ok: true,
+      service: "nexus-webui",
+      pid: child.pid,
+      host: "127.0.0.1",
+      port,
+      url: record.url,
+      gateway: "http://127.0.0.1:4100",
+      executable: record.executable,
+    });
     assert.equal((await fetch(record.url)).status, 200);
   } finally {
     child.kill("SIGTERM");
