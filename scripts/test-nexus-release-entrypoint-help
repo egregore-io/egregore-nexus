@@ -33,6 +33,9 @@ ENTRYPOINTS = (
     "scripts/nexus-v010-resurrection-gate",
     "scripts/nexus-v010-resurrection-run",
     "scripts/nexus-v010-ws-cutoff-gate",
+    "scripts/nexus-v015-host-isolation-snapshot",
+    "scripts/nexus-v015-lab-manifest",
+    "scripts/nexus-v015-webconsole-acceptance",
     "scripts/nexus-webui-screenshot.mjs",
     "scripts/nexus-windows-validation",
 )

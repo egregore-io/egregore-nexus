@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""Capture and compare read-only Nexus host-runtime identity evidence."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+
+EMPTY_DAEMON = {"pid": 0, "bootId": "", "executable": "", "sha256": ""}
+EMPTY_SERVICE = {"pid": 0, "listener": "", "executable": "", "sha256": ""}
+EMPTY_IPC = {"path": "", "inode": 0}
+SOCKET_LINK = re.compile(r"socket:\[(\d+)]\Z")
+
+
+class SnapshotError(RuntimeError):
+    """A host snapshot could not be captured or validated safely."""
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Capture read-only Nexus host-runtime identity or compare two captures. "
+            "Snapshot mode reads discovery files and procfs metadata only."
+        ),
+        epilog=(
+            "Environment seams: NEXUS_HOME and NEXUS_HOST_ISOLATION_PROC_ROOT. "
+            "Database, WAL, and log contents are never read or hashed."
+        ),
+    )
+    parser.add_argument(
+        "--home",
+        type=Path,
+        help="Nexus discovery directory (default: NEXUS_HOME or ~/.nexus)",
+    )
+    parser.add_argument(
+        "--proc-root",
+        type=Path,
+        help=(
+            "procfs root (default: NEXUS_HOST_ISOLATION_PROC_ROOT or /proc; "
+            "intended as a fixture seam)"
+        ),
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        default="snapshot",
+        metavar="{snapshot,compare}",
+        help="snapshot (default), or compare BEFORE AFTER",
+    )
+    parser.add_argument("paths", nargs="*", metavar="PATH")
+    args = parser.parse_args()
+    if args.command not in {"snapshot", "compare"}:
+        parser.error(f"unknown command: {args.command}")
+    expected_paths = 2 if args.command == "compare" else 0
+    if len(args.paths) != expected_paths:
+        if args.command == "compare":
+            parser.error("compare requires BEFORE and AFTER snapshot paths")
+        parser.error("snapshot does not accept positional paths")
+    return args
+
+
+def read_json(path: Path, label: str) -> dict[str, Any] | None:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SnapshotError(f"cannot read {label} discovery {path}: {error}") from error
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise SnapshotError(f"invalid {label} discovery {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise SnapshotError(f"invalid {label} discovery {path}: expected a JSON object")
+    return value
+
+
+def positive_int(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise SnapshotError(f"invalid {label}: expected a positive integer")
+    return value
+
+
+def nonempty_string(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise SnapshotError(f"invalid {label}: expected a non-empty string")
+    return value
+
+
+def sha256(path: Path, label: str) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        raise SnapshotError(f"cannot hash {label} through {path}: {error}") from error
+    return digest.hexdigest()
+
+
+def process_identity(pid: int, proc_root: Path, label: str) -> tuple[str, str]:
+    proc_executable = proc_root / str(pid) / "exe"
+    try:
+        executable = os.readlink(proc_executable)
+    except OSError as error:
+        if error.errno == 22 and proc_executable.is_file():
+            executable = str(proc_executable.resolve())
+        else:
+            raise SnapshotError(
+                f"cannot read {label} executable for pid {pid} from {proc_executable}: {error}"
+            ) from error
+    return executable, sha256(proc_executable, f"{label} executable for pid {pid}")
+
+
+def listener_port(discovery: dict[str, Any], label: str) -> int:
+    port = discovery.get("port")
+    if port is not None:
+        value = positive_int(port, f"{label}.port")
+        if value > 65535:
+            raise SnapshotError(f"invalid {label}.port: expected a TCP port")
+        return value
+    url = nonempty_string(discovery.get("url"), f"{label}.url")
+    try:
+        parsed_port = urlsplit(url).port
+    except ValueError as error:
+        raise SnapshotError(f"invalid {label}.url: {error}") from error
+    if parsed_port is None:
+        raise SnapshotError(f"invalid {label}.url: URL has no explicit port")
+    return parsed_port
+
+
+def decode_proc_address(raw: str, protocol: str) -> str:
+    try:
+        encoded = bytes.fromhex(raw)
+        if protocol == "tcp":
+            if len(encoded) != 4:
+                raise ValueError("IPv4 address is not four bytes")
+            return str(ipaddress.IPv4Address(encoded[::-1]))
+        if len(encoded) != 16:
+            raise ValueError("IPv6 address is not sixteen bytes")
+        ordered = b"".join(encoded[index : index + 4][::-1] for index in range(0, 16, 4))
+        return str(ipaddress.IPv6Address(ordered))
+    except ValueError as error:
+        raise SnapshotError(f"invalid {protocol} listener address {raw!r}: {error}") from error
+
+
+def proc_listeners(proc_root: Path, port: int) -> list[tuple[str, str, int]]:
+    listeners: list[tuple[str, str, int]] = []
+    for protocol in ("tcp", "tcp6"):
+        table = proc_root / "net" / protocol
+        try:
+            lines = table.read_text(encoding="utf-8").splitlines()[1:]
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise SnapshotError(f"cannot read listener metadata {table}: {error}") from error
+        for line in lines:
+            fields = line.split()
+            if len(fields) < 10 or fields[3] != "0A":
+                continue
+            try:
+                raw_address, raw_port = fields[1].rsplit(":", 1)
+                local_port = int(raw_port, 16)
+                inode = int(fields[9])
+            except (ValueError, IndexError) as error:
+                raise SnapshotError(f"invalid listener row in {table}: {line!r}") from error
+            if local_port == port:
+                listeners.append((protocol, decode_proc_address(raw_address, protocol), inode))
+    return listeners
+
+
+def socket_owners(proc_root: Path, inodes: set[int]) -> dict[int, set[int]]:
+    owners = {inode: set() for inode in inodes}
+    if not inodes:
+        return owners
+    try:
+        process_roots = list(proc_root.iterdir())
+    except OSError as error:
+        raise SnapshotError(f"cannot scan process metadata {proc_root}: {error}") from error
+    for process_root in process_roots:
+        if not process_root.name.isdecimal():
+            continue
+        fd_root = process_root / "fd"
+        try:
+            descriptors = list(fd_root.iterdir())
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            continue
+        except OSError as error:
+            raise SnapshotError(f"cannot scan process descriptors {fd_root}: {error}") from error
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(descriptor)
+            except (FileNotFoundError, PermissionError):
+                continue
+            except OSError:
+                continue
+            match = SOCKET_LINK.fullmatch(target)
+            if match is None:
+                continue
+            inode = int(match.group(1))
+            if inode in owners:
+                owners[inode].add(int(process_root.name))
+    return owners
+
+
+def listener_identity(
+    discovery: dict[str, Any], proc_root: Path, label: str, discovery_pid: int
+) -> str:
+    port = listener_port(discovery, label)
+    listeners = proc_listeners(proc_root, port)
+    if not listeners:
+        raise SnapshotError(
+            f"{label} listener for port {port} was not found in {proc_root}/net "
+            f"(discovery pid {discovery_pid})"
+        )
+    owners = socket_owners(proc_root, {listener[2] for listener in listeners})
+    owned = [listener for listener in listeners if discovery_pid in owners[listener[2]]]
+    if not owned:
+        raise SnapshotError(
+            f"{label} listener for port {port} is not owned by discovery pid "
+            f"{discovery_pid} in {proc_root}"
+        )
+
+    identities = []
+    for protocol, address, inode in sorted(owned):
+        display_address = f"[{address}]" if ":" in address else address
+        identities.append(
+            f"{protocol}://{display_address}:{port} inode={inode} owner={discovery_pid}"
+        )
+    return "; ".join(identities)
+
+
+def daemon_snapshot(home: Path, proc_root: Path) -> tuple[dict[str, object], dict[str, object]]:
+    pid_path = home / "daemon.pid"
+    manifest_path = home / "daemon-ipc-endpoint.json"
+    try:
+        raw_pid = pid_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raw_pid = None
+    except OSError as error:
+        raise SnapshotError(f"cannot read daemon discovery {pid_path}: {error}") from error
+    manifest = read_json(manifest_path, "daemon IPC")
+    if raw_pid is None and manifest is None:
+        return dict(EMPTY_DAEMON), dict(EMPTY_IPC)
+    if raw_pid is None or manifest is None:
+        missing = pid_path if raw_pid is None else manifest_path
+        raise SnapshotError(f"incomplete daemon discovery: missing {missing}")
+    try:
+        pid = positive_int(int(raw_pid.strip()), "daemon.pid")
+    except ValueError as error:
+        raise SnapshotError("invalid daemon.pid: expected a positive integer") from error
+    boot_id = manifest.get("daemonBootId", manifest.get("daemon_boot_id"))
+    boot_id = nonempty_string(boot_id, "daemon.daemonBootId")
+    executable, digest = process_identity(pid, proc_root, "daemon")
+    raw_ipc_path = nonempty_string(manifest.get("path"), "daemon IPC path")
+    ipc_path = Path(raw_ipc_path)
+    if not ipc_path.is_absolute():
+        ipc_path = home / ipc_path
+    try:
+        inode = ipc_path.stat().st_ino
+    except OSError as error:
+        raise SnapshotError(f"cannot stat daemon IPC path {ipc_path}: {error}") from error
+    return (
+        {"pid": pid, "bootId": boot_id, "executable": executable, "sha256": digest},
+        {"path": str(ipc_path), "inode": inode},
+    )
+
+
+def service_snapshot(home: Path, proc_root: Path, name: str) -> dict[str, object]:
+    discovery = read_json(home / f"{name}.json", name)
+    if discovery is None:
+        return dict(EMPTY_SERVICE)
+    pid = positive_int(discovery.get("pid"), f"{name}.pid")
+    executable, digest = process_identity(pid, proc_root, name)
+    listener = listener_identity(discovery, proc_root, name, pid)
+    return {"pid": pid, "listener": listener, "executable": executable, "sha256": digest}
+
+
+def capture(home: Path, proc_root: Path) -> dict[str, object]:
+    daemon, ipc = daemon_snapshot(home, proc_root)
+    return {
+        "daemon": daemon,
+        "gateway": service_snapshot(home, proc_root, "gateway"),
+        "webconsole": service_snapshot(home, proc_root, "webconsole"),
+        "ipc": ipc,
+        "capturedAt": time.time_ns() // 1_000_000,
+    }
+
+
+def load_snapshot(path: Path, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise SnapshotError(f"cannot read {label} snapshot {path}: {error}") from error
+    except json.JSONDecodeError as error:
+        raise SnapshotError(f"invalid {label} snapshot {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise SnapshotError(f"invalid {label} snapshot {path}: expected a JSON object")
+    validate_snapshot(value, f"{label} snapshot {path}")
+    return value
+
+
+def validate_snapshot(value: dict[str, object], label: str) -> None:
+    expected_fields = {
+        "daemon": {"pid": int, "bootId": str, "executable": str, "sha256": str},
+        "gateway": {"pid": int, "listener": str, "executable": str, "sha256": str},
+        "webconsole": {"pid": int, "listener": str, "executable": str, "sha256": str},
+        "ipc": {"path": str, "inode": int},
+    }
+    if set(value) != {*expected_fields, "capturedAt"}:
+        raise SnapshotError(f"invalid {label}: unexpected top-level fields")
+    captured_at = value.get("capturedAt")
+    if isinstance(captured_at, bool) or not isinstance(captured_at, int):
+        raise SnapshotError(f"invalid {label}: capturedAt must be an integer")
+    for section, fields in expected_fields.items():
+        actual = value.get(section)
+        if not isinstance(actual, dict) or set(actual) != set(fields):
+            raise SnapshotError(f"invalid {label}: {section} fields do not match the contract")
+        for field, expected_type in fields.items():
+            field_value = actual[field]
+            if isinstance(field_value, bool) or not isinstance(field_value, expected_type):
+                raise SnapshotError(
+                    f"invalid {label}: {section}.{field} must be {expected_type.__name__}"
+                )
+
+
+def differences(before: object, after: object, path: str = "") -> list[tuple[str, object, object]]:
+    if isinstance(before, dict) and isinstance(after, dict):
+        found: list[tuple[str, object, object]] = []
+        for key in sorted(set(before) | set(after)):
+            child = f"{path}.{key}" if path else key
+            if key not in before:
+                found.append((child, "<missing>", after[key]))
+            elif key not in after:
+                found.append((child, before[key], "<missing>"))
+            else:
+                found.extend(differences(before[key], after[key], child))
+        return found
+    return [] if before == after else [(path, before, after)]
+
+
+def compare(before_path: Path, after_path: Path) -> int:
+    before = load_snapshot(before_path, "before")
+    after = load_snapshot(after_path, "after")
+    before.pop("capturedAt")
+    after.pop("capturedAt")
+    drift = differences(before, after)
+    if not drift:
+        print(f"host isolation unchanged: {before_path} -> {after_path}")
+        return 0
+    print("host isolation drift detected:", file=sys.stderr)
+    for path, old, new in drift:
+        print(
+            f"- {path}: before={json.dumps(old, sort_keys=True)} "
+            f"after={json.dumps(new, sort_keys=True)}",
+            file=sys.stderr,
+        )
+    return 1
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        if args.command == "compare":
+            return compare(Path(args.paths[0]), Path(args.paths[1]))
+        home = args.home
+        if home is None:
+            home = Path(os.environ.get("NEXUS_HOME", Path.home() / ".nexus"))
+        proc_root = args.proc_root
+        if proc_root is None:
+            proc_root = Path(os.environ.get("NEXUS_HOST_ISOLATION_PROC_ROOT", "/proc"))
+        print(json.dumps(capture(home, proc_root), indent=2))
+        return 0
+    except SnapshotError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

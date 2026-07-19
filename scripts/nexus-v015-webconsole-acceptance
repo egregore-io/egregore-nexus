@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+NEXUS_BIN="${NEXUS_V015_NEXUS_BIN:-nexus}"
+HOST=127.0.0.1
+PORT=4200
+RUN_ID="${NEXUS_V015_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+EVIDENCE_DIR="${NEXUS_V015_EVIDENCE_DIR:-/tmp/nexus-lens-home/evidence}"
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/nexus-v015-webconsole-acceptance [options]
+
+Exercise the complete packed `nexus webconsole` lifecycle inside the isolated
+v0.1.5 validator and leave the Webconsole healthy for browser acceptance.
+
+Options:
+  --nexus-bin PATH      Nexus CLI under test.
+  --host HOST           Webconsole bind host (default: 127.0.0.1).
+  --port PORT           Webconsole port (default: 4200).
+  --run-id ID           Evidence run identifier.
+  --evidence-dir PATH   Root evidence directory.
+  -h, --help            Show this help without side effects.
+USAGE
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --nexus-bin)
+      [ "$#" -ge 2 ] || die "--nexus-bin requires a value"
+      NEXUS_BIN=$2
+      shift 2
+      ;;
+    --host)
+      [ "$#" -ge 2 ] || die "--host requires a value"
+      HOST=$2
+      shift 2
+      ;;
+    --port)
+      [ "$#" -ge 2 ] || die "--port requires a value"
+      PORT=$2
+      shift 2
+      ;;
+    --run-id)
+      [ "$#" -ge 2 ] || die "--run-id requires a value"
+      RUN_ID=$2
+      shift 2
+      ;;
+    --evidence-dir)
+      [ "$#" -ge 2 ] || die "--evidence-dir requires a value"
+      EVIDENCE_DIR=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+
+[ "${OCULAR_LAB:-}" = 1 ] || die "refusing to run outside the isolated ocular lab"
+[ -n "${NEXUS_HOME:-}" ] || die "NEXUS_HOME is required"
+if [ "${NEXUS_V015_ALLOW_FIXTURE_HOME:-}" != 1 ]; then
+  case "$NEXUS_HOME" in
+    /tmp/nexus-lens-home/*) ;;
+    *) die "refusing non-lab NEXUS_HOME: $NEXUS_HOME" ;;
+  esac
+fi
+
+case "$PORT" in
+  ''|*[!0-9]*) die "--port must be an integer" ;;
+esac
+[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "--port must be a TCP port"
+
+for command in curl jq timeout; do
+  command -v "$command" >/dev/null 2>&1 || die "required command is unavailable: $command"
+done
+if [[ "$NEXUS_BIN" == */* ]]; then
+  [ -x "$NEXUS_BIN" ] || die "Nexus CLI is not executable: $NEXUS_BIN"
+else
+  command -v "$NEXUS_BIN" >/dev/null 2>&1 || die "Nexus CLI is unavailable: $NEXUS_BIN"
+fi
+
+OUT="$EVIDENCE_DIR/$RUN_ID/webconsole"
+mkdir -p "$OUT"
+
+run_capture() {
+  local label=$1
+  shift
+  "$@" >"$OUT/$label.stdout" 2>"$OUT/$label.stderr"
+}
+
+assert_live_status() {
+  local path=$1
+  jq -e \
+    --arg host "$HOST" \
+    --argjson port "$PORT" '
+      .installed == true and
+      .gatewayHealthy == true and
+      .runtime.state == "live" and
+      .runtime.host == $host and
+      .runtime.port == $port and
+      (.runtime.pid | type == "number")
+    ' "$path" >/dev/null
+}
+
+run_capture help-webconsole "$NEXUS_BIN" webconsole --help
+for action in launch start stop restart status logs url; do
+  run_capture "help-$action" "$NEXUS_BIN" webconsole "$action" --help
+done
+
+run_capture start-first "$NEXUS_BIN" webconsole start --host "$HOST" --port "$PORT"
+run_capture status-first "$NEXUS_BIN" --json webconsole status
+assert_live_status "$OUT/status-first.stdout"
+INITIAL_PID=$(jq -r '.runtime.pid' "$OUT/status-first.stdout")
+
+run_capture start-second "$NEXUS_BIN" webconsole start --host "$HOST" --port "$PORT"
+run_capture status-second "$NEXUS_BIN" --json webconsole status
+assert_live_status "$OUT/status-second.stdout"
+[ "$(jq -r '.runtime.pid' "$OUT/status-second.stdout")" = "$INITIAL_PID" ] \
+  || die "repeat start replaced the live Webconsole"
+
+run_capture url "$NEXUS_BIN" webconsole url
+[ "$(tr -d '\r\n' <"$OUT/url.stdout")" = "http://$HOST:$PORT" ] \
+  || die "webconsole url did not report the configured endpoint"
+run_capture launch-no-open "$NEXUS_BIN" webconsole launch --no-open --host "$HOST" --port "$PORT"
+run_capture logs-lines "$NEXUS_BIN" webconsole logs --lines 5
+
+set +e
+timeout 1s "$NEXUS_BIN" webconsole logs --follow --lines 1 \
+  >"$OUT/logs-follow.stdout" 2>"$OUT/logs-follow.stderr"
+FOLLOW_STATUS=$?
+set -e
+[ "$FOLLOW_STATUS" -eq 124 ] || die "webconsole logs --follow was not cancellable (status $FOLLOW_STATUS)"
+
+DISCOVERY="$NEXUS_HOME/webconsole.json"
+[ -f "$DISCOVERY" ] || die "Webconsole discovery is missing before adoption test"
+mv "$DISCOVERY" "$OUT/discovery-before-adoption.json"
+run_capture start-adopt "$NEXUS_BIN" webconsole start --host "$HOST" --port "$PORT"
+[ -f "$DISCOVERY" ] || die "Webconsole start did not restore missing discovery"
+ADOPTED_PID=$(jq -r '.pid' "$DISCOVERY")
+[ "$ADOPTED_PID" = "$INITIAL_PID" ] || die "missing-discovery recovery adopted the wrong process"
+
+run_capture restart "$NEXUS_BIN" --json webconsole restart --host "$HOST" --port "$PORT"
+assert_live_status "$OUT/restart.stdout"
+RESTARTED_PID=$(jq -r '.runtime.pid' "$OUT/restart.stdout")
+[ "$RESTARTED_PID" != "$ADOPTED_PID" ] || die "webconsole restart did not replace the process"
+curl -fsS --max-time 2 "http://$HOST:$PORT/health" >"$OUT/health-after-restart.json"
+
+run_capture stop "$NEXUS_BIN" webconsole stop
+set +e
+"$NEXUS_BIN" --json webconsole status >"$OUT/status-down.stdout" 2>"$OUT/status-down.stderr"
+DOWN_STATUS=$?
+set -e
+[ "$DOWN_STATUS" -eq 2 ] || die "stopped Webconsole status returned $DOWN_STATUS instead of 2"
+jq -e '.runtime.state == "down"' "$OUT/status-down.stdout" >/dev/null
+if curl -fsS --max-time 1 "http://$HOST:$PORT/health" >"$OUT/health-after-stop.stdout" 2>"$OUT/health-after-stop.stderr"; then
+  die "Webconsole port remained healthy after stop"
+fi
+run_capture stop-force "$NEXUS_BIN" webconsole stop --force
+
+run_capture start-final "$NEXUS_BIN" webconsole start --host "$HOST" --port "$PORT"
+run_capture launch-final "$NEXUS_BIN" webconsole launch --no-open --host "$HOST" --port "$PORT"
+run_capture status-final "$NEXUS_BIN" --json webconsole status
+assert_live_status "$OUT/status-final.stdout"
+curl -fsS --max-time 2 "http://$HOST:$PORT/health" >"$OUT/health-final.json"
+
+jq -n \
+  --arg runId "$RUN_ID" \
+  --arg status passed \
+  --argjson initialPid "$INITIAL_PID" \
+  --argjson adoptedPid "$ADOPTED_PID" \
+  --argjson restartedPid "$RESTARTED_PID" \
+  --arg finalState "$(jq -r '.runtime.state' "$OUT/status-final.stdout")" \
+  --argjson followExit "$FOLLOW_STATUS" \
+  '{
+    schemaVersion: 1,
+    runId: $runId,
+    status: $status,
+    initialPid: $initialPid,
+    adoptedPid: $adoptedPid,
+    restartedPid: $restartedPid,
+    finalState: $finalState,
+    boundedFollowExit: $followExit
+  }' >"$OUT/result.json"
+
+printf 'v0.1.5 Webconsole acceptance passed: %s\n' "$OUT"

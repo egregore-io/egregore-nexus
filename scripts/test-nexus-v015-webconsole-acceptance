@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TARGET="$SCRIPT_DIR/nexus-v015-webconsole-acceptance"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$TMP/bin" "$TMP/home" "$TMP/evidence"
+
+cat >"$TMP/bin/nexus-fixture" <<'FIXTURE'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "$*" >>"$FIXTURE_COMMANDS"
+json=0
+if [ "${1:-}" = "--json" ]; then json=1; shift; fi
+if [ "${1:-}" = "webconsole" ] && [ "${2:-}" = "--help" ]; then echo webconsole-help; exit 0; fi
+if [ "${1:-}" = "webconsole" ] && [ "${3:-}" = "--help" ]; then echo "$2-help"; exit 0; fi
+test "${1:-}" = webconsole
+action=${2:-}
+state="$FIXTURE_STATE"
+next_pid() {
+  current=$(cat "$FIXTURE_PID" 2>/dev/null || echo 4000)
+  current=$((current + 1))
+  echo "$current" >"$FIXTURE_PID"
+  printf '%s' "$current"
+}
+write_discovery() {
+  pid=$1
+  printf '{"pid":%s,"host":"127.0.0.1","port":4200,"url":"http://127.0.0.1:4200","gatewayUrl":"http://127.0.0.1:4100","executable":"/fixture/nexus-webui"}\n' "$pid" >"$NEXUS_HOME/webconsole.json"
+}
+report() {
+  if [ -f "$state" ]; then
+    pid=$(cat "$FIXTURE_PID")
+    printf '{"installed":true,"gatewayHealthy":true,"runtime":{"state":"live","pid":%s,"url":"http://127.0.0.1:4200","host":"127.0.0.1","port":4200,"gatewayUrl":"http://127.0.0.1:4100"},"logPath":"%s/webconsole.log"}\n' "$pid" "$NEXUS_HOME"
+  else
+    printf '{"installed":true,"gatewayHealthy":true,"runtime":{"state":"down"},"logPath":"%s/webconsole.log"}\n' "$NEXUS_HOME"
+  fi
+}
+case "$action" in
+  start|launch)
+    if [ ! -f "$state" ]; then next_pid >/dev/null; touch "$state"; fi
+    write_discovery "$(cat "$FIXTURE_PID")"
+    report
+    ;;
+  restart)
+    next_pid >/dev/null; touch "$state"; write_discovery "$(cat "$FIXTURE_PID")"; report
+    ;;
+  stop)
+    rm -f "$state" "$NEXUS_HOME/webconsole.json"; report
+    ;;
+  status)
+    report
+    [ -f "$state" ] || exit 2
+    ;;
+  url)
+    echo http://127.0.0.1:4200
+    ;;
+  logs)
+    if [[ " $* " == *" --follow "* ]]; then sleep 30; else echo fixture-log; fi
+    ;;
+  *) exit 64 ;;
+esac
+FIXTURE
+chmod +x "$TMP/bin/nexus-fixture"
+
+cat >"$TMP/bin/curl" <<'FIXTURE'
+#!/usr/bin/env bash
+if [ -f "$FIXTURE_STATE" ]; then
+  printf '{"service":"nexus-webconsole"}\n'
+  exit 0
+fi
+exit 7
+FIXTURE
+chmod +x "$TMP/bin/curl"
+
+set +e
+"$TARGET" --help >"$TMP/help" 2>"$TMP/help.err"
+help_status=$?
+set -e
+test "$help_status" -eq 0
+grep -Fq -- "--nexus-bin" "$TMP/help"
+grep -Fq -- "--evidence-dir" "$TMP/help"
+
+PATH="$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_HOME="$TMP/home" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_STATE="$TMP/state" \
+  FIXTURE_PID="$TMP/pid" \
+  "$TARGET" \
+    --nexus-bin "$TMP/bin/nexus-fixture" \
+    --host 127.0.0.1 \
+    --port 4200 \
+    --run-id fixture \
+    --evidence-dir "$TMP/evidence"
+
+test -f "$TMP/evidence/fixture/webconsole/result.json"
+jq -e '
+  .schemaVersion == 1 and
+  .status == "passed" and
+  .initialPid == .adoptedPid and
+  .restartedPid != .adoptedPid and
+  .finalState == "live"
+' "$TMP/evidence/fixture/webconsole/result.json" >/dev/null
+
+grep -Fq -- "webconsole start --host 127.0.0.1 --port 4200" "$TMP/commands"
+test "$(grep -Fc -- "webconsole start --host 127.0.0.1 --port 4200" "$TMP/commands")" -ge 4
+grep -Fq -- "--json webconsole status" "$TMP/commands"
+grep -Fq -- "webconsole launch --no-open --host 127.0.0.1 --port 4200" "$TMP/commands"
+grep -Fq -- "webconsole logs --lines 5" "$TMP/commands"
+grep -Fq -- "webconsole logs --follow --lines 1" "$TMP/commands"
+grep -Fq -- "webconsole restart --host 127.0.0.1 --port 4200" "$TMP/commands"
+grep -Fq -- "webconsole stop" "$TMP/commands"
+grep -Fq -- "webconsole stop --force" "$TMP/commands"
+
+bash -n "$TARGET"
+printf 'v0.1.5 Webconsole acceptance contract: ok\n'

@@ -30,6 +30,38 @@ pnpm --dir gateway build
 The public hygiene gate rejects private plans, operator paths, internal personas, secret-like state,
 assistant workflow artifacts, and attribution trailers from the public tree.
 
+## v0.1.5 host-isolation evidence
+
+Freeze the live host runtime before an isolated validation run, then compare it afterward:
+
+```bash
+scripts/nexus-v015-host-isolation-snapshot snapshot > host-before.json
+# Run the disposable validator without mounting the host Nexus home.
+scripts/nexus-v015-host-isolation-snapshot snapshot > host-after.json
+scripts/nexus-v015-host-isolation-snapshot compare host-before.json host-after.json
+```
+
+The snapshots contain only daemon boot/PID/executable identity, Gateway and Webconsole listener
+ownership, and daemon IPC path/inode metadata. Comparison ignores `capturedAt` and fails on any
+other drift. The script never reads or hashes Nexus or Gateway databases, WALs, or logs; tests use
+`--home` and `--proc-root` fixture seams instead of the live host runtime.
+
+## v0.1.5 Webconsole lifecycle gate
+
+Run the packed CLI lifecycle before the WebUI ocular cases inside the validator:
+
+```bash
+scripts/nexus-v015-webconsole-acceptance \
+  --run-id "$NEXUS_V015_RUN_ID" \
+  --evidence-dir "$NEXUS_LAB_ROOT/evidence"
+```
+
+The gate exercises every `nexus webconsole` subcommand and its release parameters, repeat-start
+idempotency, bounded log following, missing-discovery adoption, restart, graceful and forced stop,
+and final healthy recovery. It refuses to run outside the isolated lab. The normative Webconsole,
+human-attribution, browser, and WebSocket requirements are in
+[v0.1.5 release acceptance](v0.1.5-acceptance.md).
+
 ## Fresh-schema gates
 
 v0.1.0 supports fresh stores only. The release gate must prove:
