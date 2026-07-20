@@ -609,6 +609,36 @@ def require_queue_snapshot(frame: dict[str, Any], session_id: str) -> None:
         raise AcceptanceFailure("queue.snapshot has no valid global reconnect seq")
 
 
+async def receive_queue_snapshot(
+    socket: Any,
+    session_id: str,
+    *,
+    timeout: float,
+    label: str,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AcceptanceFailure(f"{label}: timed out")
+        try:
+            raw = await asyncio.wait_for(socket.recv(), remaining)
+        except asyncio.TimeoutError as error:
+            raise AcceptanceFailure(f"{label}: timed out") from error
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        try:
+            frame = json.loads(str(raw))
+        except (TypeError, ValueError) as error:
+            raise AcceptanceFailure(f"{label}: emitted invalid JSON") from error
+        if not isinstance(frame, dict):
+            raise AcceptanceFailure(f"{label}: emitted a non-object frame")
+        if frame.get("t") != "queue.snapshot":
+            continue
+        require_queue_snapshot(frame, session_id)
+        return frame
+
+
 class ExactRosterPending(AcceptanceFailure):
     """The exact stable roster exists but has not returned fully online yet."""
 
@@ -4291,8 +4321,12 @@ class BackendAcceptance:
                 raise AcceptanceFailure("session backpressure run has no runId")
 
             slow = await open_raw(path, 1)
-            first = json.loads(str(await asyncio.wait_for(slow.recv(), 30)))
-            require_queue_snapshot(first, self.live_agents[1].session_id)
+            await receive_queue_snapshot(
+                slow,
+                self.live_agents[1].session_id,
+                timeout=30,
+                label="isolated slow-reader queue snapshot",
+            )
 
             accepted: list[dict[str, Any]] = []
             rejected: list[dict[str, Any]] = []

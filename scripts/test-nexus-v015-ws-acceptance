@@ -2320,6 +2320,32 @@ class WsAcceptanceContracts(unittest.TestCase):
                 "s_expected",
             )
 
+    def test_raw_session_open_accepts_content_before_queue_snapshot(self) -> None:
+        module = runpy.run_path(str(TARGET))
+
+        class Socket:
+            def __init__(self) -> None:
+                self.frames = iter([
+                    {"type": "RUN_STARTED", "cursor": "cur-1"},
+                    {"t": "queue.snapshot", "sessionId": "s_expected", "seq": 7},
+                ])
+
+            async def recv(self) -> str:
+                return json.dumps(next(self.frames))
+
+        snapshot = asyncio.run(
+            module["receive_queue_snapshot"](
+                Socket(),
+                "s_expected",
+                timeout=1,
+                label="raw initial queue snapshot",
+            )
+        )
+        self.assertEqual(
+            snapshot,
+            {"t": "queue.snapshot", "sessionId": "s_expected", "seq": 7},
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
