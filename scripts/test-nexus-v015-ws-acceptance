@@ -1770,6 +1770,54 @@ class WsAcceptanceContracts(unittest.TestCase):
             restart_body.index("human = await self.human_write"),
         )
 
+    def test_daemon_restart_accepts_only_gap_or_ordered_fleet_resync_as_boot_reset(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        backend = module["BackendAcceptance"].__new__(module["BackendAcceptance"])
+        backend.fleet_cursor = 999
+        backend.fleet_frames = []
+
+        class FleetSocket:
+            def __init__(self, frames: list[dict[str, object]]) -> None:
+                self.frames = iter(frames)
+
+            async def recv(self) -> str:
+                return json.dumps(next(self.frames))
+
+        ordinary = {
+            "type": "developer.event",
+            "event": {
+                "topic": "sys.fleet.status",
+                "seq": 1000,
+                "lifecycle": "status",
+            },
+        }
+        resync = {
+            "type": "developer.event",
+            "event": {
+                "topic": "sys.fleet.status",
+                "seq": 1,
+                "lifecycle": "resync",
+                "data": {"reason": "subscribe", "source": "members"},
+            },
+        }
+        backend.fleet_socket = FleetSocket([ordinary, resync])
+        reset = asyncio.run(backend.wait_fleet_boot_reset("daemon restart", timeout=1))
+        self.assertEqual(reset, {"mode": "resync", "frame": resync})
+        self.assertEqual(backend.fleet_cursor, 1)
+        self.assertEqual(backend.fleet_frames, [ordinary, resync])
+
+        gap = {
+            "t": "subscribe.gap",
+            "topic": "sys.fleet.status",
+            "afterSeq": 999,
+            "retry": "ephemeral",
+        }
+        backend.fleet_socket = FleetSocket([gap])
+        backend.fleet_cursor = 999
+        reset = asyncio.run(backend.wait_fleet_boot_reset("daemon restart", timeout=1))
+        self.assertEqual(reset, {"mode": "gap", "frame": gap})
+        self.assertEqual(backend.fleet_cursor, 999)
+
     def test_backend_run_drives_every_release_boundary_before_observation(self) -> None:
         module = runpy.run_path(str(TARGET))
         source = TARGET.read_text(encoding="utf-8")

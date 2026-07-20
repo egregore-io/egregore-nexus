@@ -3233,7 +3233,12 @@ class BackendAcceptance:
                     return frame
         raise AcceptanceFailure(f"{label} did not produce a fleet event")
 
-    async def wait_fleet_gap(self, label: str, *, timeout: float = 60) -> dict[str, Any]:
+    async def wait_fleet_boot_reset(
+        self,
+        label: str,
+        *,
+        timeout: float = 60,
+    ) -> dict[str, Any]:
         if self.fleet_socket is None:
             raise AcceptanceFailure("fleet socket is not mounted")
         deadline = time.monotonic() + timeout
@@ -3245,10 +3250,24 @@ class BackendAcceptance:
                 continue
             self.fleet_frames.append(frame)
             if frame.get("t") == "subscribe.gap":
-                return frame
+                return {"mode": "gap", "frame": frame}
             if frame.get("t") == "subscribe.err":
-                raise AcceptanceFailure(f"{label} emitted subscribe.err instead of gap: {frame!r}")
-        raise AcceptanceFailure(f"{label} did not signal a boot-aware gap")
+                raise AcceptanceFailure(
+                    f"{label} emitted subscribe.err instead of a boot reset: {frame!r}"
+                )
+            event = frame.get("event")
+            if (
+                frame.get("type") == "developer.event"
+                and isinstance(event, dict)
+                and event.get("topic") == "sys.fleet.status"
+                and event.get("lifecycle") == "resync"
+            ):
+                seq = event.get("seq")
+                if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+                    raise AcceptanceFailure(f"{label} emitted an invalid fleet resync: {frame!r}")
+                self.fleet_cursor = seq
+                return {"mode": "resync", "frame": frame}
+        raise AcceptanceFailure(f"{label} did not signal a boot-aware gap or resync")
 
     async def concurrent_thread_subscribers(self) -> dict[str, Any]:
         socket = await self.soak.developer._open(
@@ -3712,16 +3731,20 @@ class BackendAcceptance:
                 "ack": ack,
             }
         else:
-            gap = await self.wait_fleet_gap(f"fleet after {target} restart")
-            self.fleet_cursor = 0
-            ack = await self.open_fleet(0)
-            event = await self.wait_fleet_event(f"fleet resync after {target} restart")
+            gaps: list[dict[str, Any]] = []
+            reset = await self.wait_fleet_boot_reset(f"fleet after {target} restart")
+            while reset["mode"] == "gap":
+                gaps.append(reset["frame"])
+                if len(gaps) > 2:
+                    raise AcceptanceFailure("fleet emitted repeated gaps without a resync boundary")
+                reset = await self.wait_fleet_boot_reset(
+                    f"fleet resync after {target} restart"
+                )
             fleet_recovery = {
-                "mode": "boot-gap-resync",
+                "mode": "boot-aware-resync",
                 "previousCursor": fleet_cursor_before,
-                "gap": gap,
-                "ack": ack,
-                "event": event,
+                "gaps": gaps,
+                "resync": reset["frame"],
             }
         if before_post_restart_human_write is not None:
             await before_post_restart_human_write()
