@@ -69,7 +69,7 @@ describe("gateway/webconsole package split", () => {
 
   it("binds the packaged webconsole server instead of executing the generated handler", () => {
     const source = readFileSync(join(root, "scripts/gateway-serve-impl.mjs"), "utf8");
-    expect(source).toContain("startPackagedGateway(port)");
+    expect(source).toContain("startPackagedGateway(port, host)");
     // The handler loads from the run-scoped dist SNAPSHOT (deploy hygiene: an in-place
     // rebuild of dist/ must not yank modules from under the running server).
     expect(source).toContain('loadPackagedServerHandler(join(distDir, "server/server.js"))');

@@ -226,6 +226,7 @@ async function exerciseLocalFacet(
   try {
     await waitForHealth(child, port);
     expect(await waitForJson(discovery)).toMatchObject({
+      url: `http://127.0.0.1:${port}`,
       port,
       authMode: "local",
     });
@@ -395,6 +396,7 @@ async function exerciseRemotePackedLanes(
     }
     await push.waitForFrame((frame) => frame.t === "hello");
     expect(await waitForJson(discovery)).toMatchObject({
+      url: `http://127.0.0.1:${port}`,
       port,
       authMode: "remote",
     });

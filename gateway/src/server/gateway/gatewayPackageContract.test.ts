@@ -57,7 +57,7 @@ describe("public gateway package contract", () => {
     expect(serveSource).toContain('value === "local-operator"');
     expect(serveSource).toContain('value === "remote-human"');
     expect(serveSource).toContain('value === "remote-agent"');
-    expect(serveSource).toContain("writeGatewayDiscovery(port, process.pid)");
+    expect(serveSource).toContain("writeGatewayDiscovery(port, process.pid, host)");
     expect(serveSource).not.toContain("writeGatewayDiscovery(port, runner.pid)");
   });
 });
