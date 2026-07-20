@@ -158,6 +158,7 @@ class DaemonPushConnection {
   #connected = false;
   #closed = false;
   #manifest;
+  #daemonBootId;
   #manifestPath;
   #subscriptions = new Map();
   #projectionHandlers = new Set();
@@ -174,6 +175,10 @@ class DaemonPushConnection {
       this.#scheduleReconnect();
       throw error;
     });
+  }
+
+  get daemonBootId() {
+    return this.#daemonBootId ?? this.#manifest?.daemonBootId;
   }
 
   subscribe(subscription, handlers) {
@@ -271,6 +276,9 @@ class DaemonPushConnection {
         }
       }
       this.#manifest = nextManifest;
+      this.#daemonBootId = typeof nextManifest.daemonBootId === "string"
+        ? nextManifest.daemonBootId
+        : undefined;
       this.#buffer = Buffer.alloc(0);
       await this.#openSocket();
       this.#reconnectAttempt = 0;
@@ -303,6 +311,14 @@ class DaemonPushConnection {
       });
       socket.on("data", (chunk) => this.#onData(chunk, (frame) => {
         if (frame?.t === "ready") {
+          if (typeof frame.daemonBootId !== "string" || !frame.daemonBootId) {
+            const error = new Error("daemon push ready frame is missing daemonBootId");
+            this.#broadcastError(error);
+            reject(error);
+            socket.destroy();
+            return true;
+          }
+          this.#daemonBootId = frame.daemonBootId;
           protocolReady = true;
           const hookReadiness = this.#hookReadiness;
           if (hookReadiness && hookReadiness.registration === helloHookProvider) {

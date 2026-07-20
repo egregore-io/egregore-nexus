@@ -96,7 +96,7 @@ describe("submitCommandIntent", () => {
         registrations += 1;
         return {
           sessionId: `s_rebound_${registrations}`,
-          agentId: "a_human_earl",
+          agentId: "a_human_fixture",
         };
       },
       daemonEnqueue: async (kind: string, request: unknown, caller: unknown) => {
@@ -113,7 +113,7 @@ describe("submitCommandIntent", () => {
     } as unknown as CommandIngressOptions;
     const persistedHuman = {
       id: "human:default:nexus_ck_human",
-      name: "earl",
+      name: "test-user",
       project: "default",
       kind: Kind.Human,
       tier: Tier.Admin,
@@ -125,7 +125,7 @@ describe("submitCommandIntent", () => {
 
     await enqueueCommandIntent(
       COMMAND_KINDS.harnessPrompt,
-      { name: "fable", text: "first" },
+      { name: "fable", agentId: "a_fable", text: "first" },
       persistedHuman,
       options,
     );
@@ -134,7 +134,7 @@ describe("submitCommandIntent", () => {
         mode: "command",
         kind: COMMAND_KINDS.identityRegister,
         request: expect.objectContaining({
-          name: "earl",
+          name: "test-user",
           project: "default",
           clientKey: "nexus_ck_human",
           kind: "human",
@@ -143,14 +143,19 @@ describe("submitCommandIntent", () => {
       expect.objectContaining({
         mode: "enqueue",
         kind: COMMAND_KINDS.harnessPrompt,
+        request: expect.objectContaining({
+          name: "fable",
+          agentId: "a_fable",
+        }),
         caller: expect.objectContaining({
           sessionId: "s_rebound_1",
           runtimeId: "s_rebound_1",
-          agentId: "a_human_earl",
           clientKey: "nexus_ck_human",
+          kind: "human",
         }),
       }),
     ]);
+    expect(calls[1]!.caller).not.toHaveProperty("agentId");
 
     calls.length = 0;
     await enqueueCommandIntent(
@@ -252,9 +257,10 @@ describe("submitCommandIntent", () => {
       expect(call[2]).toEqual(expect.objectContaining({
         sessionId: "s_concurrent_human",
         runtimeId: "s_concurrent_human",
-        agentId: "a_concurrent_human",
         clientKey: "nexus_ck_concurrent_human",
+        kind: "human",
       }));
+      expect(call[2]).not.toHaveProperty("agentId");
     }
   });
 

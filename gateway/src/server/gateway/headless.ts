@@ -20,8 +20,12 @@ import {
   stopGatewayHookService,
   type GatewayHookService,
 } from "../hooks/service";
-import { handleSessionEvents } from "../stream/sessionEvents";
 import { dispatchWebuiApi, isWebuiApiPath } from "./webuiApi";
+import { browserMutationCsrfFailure } from "../auth/browserMutationAuth.mjs";
+import {
+  isLocalOperatorWebAuthMode,
+  webAuthModeFromEnv,
+} from "../auth/webAuthMode";
 import { createGatewayStore, getGatewayStore } from "../store/client";
 import { gatewayStoreConfig } from "../store/config";
 import { CURRENT_GATEWAY_SCHEMA_VERSION } from "../store/migrations";
@@ -51,7 +55,6 @@ export interface HeadlessGatewayDispatchers {
   apiV1: (request: Request) => Promise<Response>;
   networkMcp: (request: Request) => Promise<Response>;
   webuiApi: (request: Request) => Promise<Response>;
-  sessionEvents?: (request: Request, sessionId: string) => Promise<Response> | Response;
 }
 
 export interface HeadlessGatewayLifecycle {
@@ -89,14 +92,13 @@ const DEFAULT_DISPATCHERS: HeadlessGatewayDispatchers = {
 export async function handleHeadlessGatewayRequest(
   request: Request,
   dispatchers: HeadlessGatewayDispatchers = DEFAULT_DISPATCHERS,
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<Response> {
+  const csrfFailure = browserMutationCsrfFailure(request, {
+    enforce: !isLocalOperatorWebAuthMode(webAuthModeFromEnv(env)),
+  });
+  if (csrfFailure) return csrfFailure;
   const url = new URL(request.url);
-  const sessionEvents = /^\/api\/v1\/agent-sessions\/([^/]+)\/events$/.exec(url.pathname);
-  if (request.method === "GET" && sessionEvents) {
-    return dispatchers.sessionEvents
-      ? dispatchers.sessionEvents(request, decodeURIComponent(sessionEvents[1]!))
-      : handleSessionEvents(request, decodeURIComponent(sessionEvents[1]!));
-  }
   if (url.pathname === "/api/mcp") {
     return dispatchers.networkMcp(request);
   }
@@ -118,6 +120,18 @@ export async function handleHeadlessGatewayRequest(
     },
     404,
   );
+}
+
+/** Guard a packaged TanStack handler with the same browser mutation contract as headless mode. */
+export function guardGatewayBrowserRequest(
+  request: Request,
+  next: (request: Request) => Promise<Response>,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<Response> {
+  const failure = browserMutationCsrfFailure(request, {
+    enforce: !isLocalOperatorWebAuthMode(webAuthModeFromEnv(env)),
+  });
+  return failure ? Promise.resolve(failure) : next(request);
 }
 
 /**

@@ -54,7 +54,6 @@ import {
   listNotifications,
   listRoutingRules,
   listProjects,
-  whoamiRow,
   threadHeader,
   threadMembersFor,
   listSources,
@@ -88,7 +87,6 @@ import {
   canonicalThreadMembers,
   canonicalThreads,
   canonicalTopics,
-  canonicalWhoami,
 } from "@server/read/canonical";
 import { longPollCanonicalPage } from "@server/messagePost/longPoll";
 import { gatewayChangeBus } from "@server/store/changeBus";
@@ -283,13 +281,18 @@ export const getProjects: Handler = async ({ deps }) =>
     ? await canonicalProjects(await deps.canonicalDb())
     : await listProjects(await deps.db()));
 
-export const getWhoami: Handler = async ({ deps, req }) => {
-  const name = req.query.name ?? req.caller?.name;
-  if (!name) return fail(401, "not logged in", "unauthorized");
-  const row = deps.canonicalDb
-    ? await canonicalWhoami(await deps.canonicalDb(), name)
-    : await whoamiRow(await deps.db(), name);
-  return row ? ok(row) : { status: 404, body: { error: { code: "not_found", message: `no session named "${name}"` } } };
+export const getWhoami: Handler = async ({ req }) => {
+  const caller = req.caller;
+  if (!caller) return fail(401, "not logged in", "unauthorized");
+  return ok({
+    name: caller.name,
+    ...(caller.agentId ? { agentId: caller.agentId } : {}),
+    sessionId: caller.sessionId ?? "",
+    kind: caller.kind ?? Kind.Human,
+    tier: caller.tier ?? Tier.Agent,
+    project: caller.project,
+    presence: "online",
+  });
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -526,10 +529,8 @@ export const patchAgentMetadata: Handler = async (ctx) =>
 
 export const getAgent: Handler = async ({ deps, params, req }) => {
   const row = deps.canonicalDb ? await canonicalAgentShow(await deps.canonicalDb(), params.id!, {
-    project: req.query.project ?? req.caller?.project,
     includeStopped: boolParam(req.query.includeStopped) ?? true,
   }) : await agentShow(await deps.db(), params.id!, {
-    project: req.query.project ?? req.caller?.project,
     includeStopped: boolParam(req.query.includeStopped) ?? true,
   });
   return row ? ok(row) : fail(404, `agent not found: ${params.id!}`);
@@ -537,35 +538,31 @@ export const getAgent: Handler = async ({ deps, params, req }) => {
 
 export const getAgentRuntimes: Handler = async ({ deps, params, req }) => {
   const row = deps.canonicalDb ? await canonicalAgentRuntimesFor(await deps.canonicalDb(), params.id!, {
-    project: req.query.project ?? req.caller?.project,
     includeStopped: boolParam(req.query.includeStopped) ?? false,
   }) : await agentRuntimesFor(await deps.db(), {
     id: params.id!,
-    project: req.query.project ?? req.caller?.project,
     includeStopped: boolParam(req.query.includeStopped) ?? false,
   });
   return row ? ok(row) : fail(404, `agent not found: ${params.id!}`);
 };
 
 export const getRuntimes: Handler = async ({ deps, req }) => {
-  const id = req.query.agent ?? req.query.name ?? req.query.agentId;
+  const id = req.query.agentId ?? req.query.agent ?? req.query.name;
   // No target query = the fleet view: every runtime across all agents.
   if (!id) {
     const runtimes = deps.canonicalDb ? await canonicalRuntimes(await deps.canonicalDb(), {
-      project: req.query.project ?? req.caller?.project,
+      project: req.query.project,
       includeStopped: boolParam(req.query.includeStopped) ?? false,
     }) : await listRuntimes(await deps.db(), {
-      project: req.query.project ?? req.caller?.project,
+      project: req.query.project,
       includeStopped: boolParam(req.query.includeStopped) ?? false,
     });
     return ok({ runtimes });
   }
   const row = deps.canonicalDb ? await canonicalAgentRuntimesFor(await deps.canonicalDb(), id, {
-    project: req.query.project ?? req.caller?.project,
     includeStopped: boolParam(req.query.includeStopped) ?? false,
   }) : await agentRuntimesFor(await deps.db(), {
     id,
-    project: req.query.project ?? req.caller?.project,
     includeStopped: boolParam(req.query.includeStopped) ?? false,
   });
   return row ? ok(row) : fail(404, `agent not found: ${id}`);

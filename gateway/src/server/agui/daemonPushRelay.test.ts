@@ -17,6 +17,7 @@ import {
 } from "@server/agui/streamStoreRelay";
 import { createClient } from "@libsql/client";
 import { removeTempPath } from "../../test/removeTempPath";
+import { SessionFanoutHub, type SessionFanoutFrame } from "@server/stream/sessionFanout";
 
 async function waitFor(predicate: () => boolean, timeoutMs = 300): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -108,6 +109,66 @@ async function initStreamStore(path: string) {
 }
 
 describe("daemon push relay", () => {
+  it("stamps fanout cursors with the daemon boot id from the ready handshake", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "nexus-fanout-boot-"));
+    const socketPath = fixtureSocketPath(dir, "boot-cursor");
+    const manifest = join(dir, "gateway-stream-endpoint.json");
+    const previousHome = process.env.NEXUS_HOME;
+    let fixture: Awaited<ReturnType<typeof startPushFixture>> | undefined;
+    const frames: SessionFanoutFrame[] = [];
+    const hub = new SessionFanoutHub();
+
+    try {
+      process.env.NEXUS_HOME = dir;
+      fixture = await startPushFixture(socketPath, (frame, socket) => {
+        if (frame.t !== "hello") return;
+        writeFramedJson(socket, {
+          t: "ready",
+          version: 1,
+          daemonBootId: "boot-exact",
+          resume: "store",
+        });
+        writeFramedJson(socket, {
+          t: "agent.update",
+          sessionId: "s_ada",
+          streamEventId: 7,
+          kind: "text",
+          data: { text: "hello" },
+        });
+      });
+      await writeFile(
+        manifest,
+        JSON.stringify({
+          path: socketPath,
+          token: "token",
+          daemonBootId: "boot-manifest-stale",
+        }),
+      );
+      resetSharedDaemonPushConnectorForTests();
+
+      const subscription = hub.subscribe("s_ada", {
+        view: "nexus",
+        onFrame(frame) {
+          frames.push(frame);
+        },
+      });
+      await subscription.ready;
+      await waitFor(() => frames.length === 1, 1_000);
+
+      const payload = JSON.parse(Buffer.from(frames[0]!.cursor, "base64url").toString("utf8"));
+      expect(frames[0]).toMatchObject({ epoch: "boot-exact", id: 7 });
+      expect(payload).toEqual({ v: 1, daemonBootId: "boot-exact", id: 7 });
+      subscription.close();
+    } finally {
+      hub.close();
+      resetSharedDaemonPushConnectorForTests();
+      await fixture?.close();
+      if (previousHome === undefined) delete process.env.NEXUS_HOME;
+      else process.env.NEXUS_HOME = previousHome;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("emits daemon-pushed agent updates as normal WsEvents", async () => {
     let onFrame: ((frame: unknown) => void) | undefined;
     const connector: DaemonPushConnector = () => {

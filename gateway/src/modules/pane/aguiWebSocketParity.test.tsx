@@ -76,9 +76,14 @@ class FakeWebSocket extends EventTarget {
     this.sent.push(data);
   }
 
-  close(): void {
+  close(code = 1000, reason = ""): void {
     this.readyState = FakeWebSocket.CLOSED;
-    this.dispatchEvent(new Event("close"));
+    const event = new Event("close");
+    Object.defineProperties(event, {
+      code: { value: code },
+      reason: { value: reason },
+    });
+    this.dispatchEvent(event);
   }
 
   open(): void {
@@ -111,6 +116,7 @@ function CaptureHarness({
 }) {
   const { messages } = useAgentSession({
     name: "iris",
+    sessionId: "s_iris",
     openSource: () => source,
   });
   useEffect(() => onMessages(messages), [messages, onMessages]);
@@ -215,7 +221,7 @@ describe("AG-UI WebSocket verification source parity", () => {
 
   it("renders identical pane rows from SSE EventSource and the real WS client source", async () => {
     const Socket = installFakeWebSocket();
-    const sseSource = new FakeEventAguiSource("/api/v1/agent-sessions/iris/events?view=agui");
+    const sseSource = new FakeEventAguiSource("/api/v1/agent-sessions/s_iris/events?view=agui");
     let sseRows: PaneMessage[] = [];
     let wsRows: PaneMessage[] = [];
 
@@ -226,7 +232,7 @@ describe("AG-UI WebSocket verification source parity", () => {
       </>,
     );
     const wsSocket = Socket.instances[0]!;
-    expect(wsSocket.url).toBe("ws://localhost:3000/api/v1/agent-sessions/iris/events?view=agui");
+    expect(wsSocket.url).toBe("ws://localhost:3000/api/v1/agent-sessions/s_iris/events?view=agui");
 
     act(() => {
       for (const event of sessionTurn(214, "same pane row")) {
@@ -248,6 +254,7 @@ describe("AG-UI WebSocket verification source parity", () => {
     function Harness() {
       useAgentSession({
         name: "iris",
+        sessionId: "s_iris",
         reconnectDelayMs: 10,
         openSource: (url) => {
           opened.push(url);
@@ -258,8 +265,8 @@ describe("AG-UI WebSocket verification source parity", () => {
     }
 
     render(<Harness />);
-    expect(opened[0]).toBe("/api/v1/agent-sessions/iris/events?view=agui");
-    expect(Socket.instances[0]!.url).toBe("ws://localhost:3000/api/v1/agent-sessions/iris/events?view=agui");
+    expect(opened[0]).toBe("/api/v1/agent-sessions/s_iris/events?view=agui");
+    expect(Socket.instances[0]!.url).toBe("ws://localhost:3000/api/v1/agent-sessions/s_iris/events?view=agui");
 
     act(() => {
       for (const event of sessionTurn(214, "before drop")) {
@@ -269,8 +276,498 @@ describe("AG-UI WebSocket verification source parity", () => {
       vi.advanceTimersByTime(10);
     });
 
-    expect(opened[1]).toBe("/api/v1/agent-sessions/iris/events?view=agui&after=epoch%3A214");
-    expect(Socket.instances[1]!.url).toBe("ws://localhost:3000/api/v1/agent-sessions/iris/events?view=agui&after=epoch%3A214");
+    expect(opened[1]).toBe("/api/v1/agent-sessions/s_iris/events?view=agui&after=epoch%3A214");
+    expect(Socket.instances[1]!.url).toBe("ws://localhost:3000/api/v1/agent-sessions/s_iris/events?view=agui&after=epoch%3A214");
+  });
+
+  it("rolls back an incomplete same-cursor group before a 1013 replay", async () => {
+    vi.useFakeTimers();
+    const Socket = installFakeWebSocket();
+    const opened: string[] = [];
+    let rows: PaneMessage[] = [];
+
+    function Harness() {
+      const { messages } = useAgentSession({
+        name: "iris",
+        sessionId: "s_iris",
+        reconnectDelayMs: 10,
+        openSource: (url) => {
+          opened.push(url);
+          return openWsSource(url);
+        },
+      });
+      useEffect(() => {
+        rows = messages;
+      }, [messages]);
+      return null;
+    }
+
+    render(<Harness />);
+    const first = Socket.instances[0]!;
+    const runStarted = {
+      type: EventType.RUN_STARTED,
+      threadId: "iris",
+      runId: "r1",
+      cursor: "epoch:40",
+    } as BaseEvent;
+    const textStarted = {
+      type: EventType.TEXT_MESSAGE_START,
+      messageId: "m1",
+      role: "assistant",
+      cursor: "epoch:40",
+    } as BaseEvent;
+    const siblingA = {
+      type: EventType.TEXT_MESSAGE_CONTENT,
+      messageId: "m1",
+      delta: "A",
+      cursor: "epoch:41",
+    } as BaseEvent;
+    const siblingB = {
+      type: EventType.TEXT_MESSAGE_CONTENT,
+      messageId: "m1",
+      delta: "B",
+      cursor: "epoch:41",
+    } as BaseEvent;
+
+    act(() => {
+      first.message(runStarted);
+      first.message(textStarted);
+      first.message(siblingA);
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(16);
+    });
+    expect(rowText(rows)).toBe("A");
+
+    act(() => {
+      first.close(1013, "session.bp:epoch:40");
+      vi.advanceTimersByTime(10);
+    });
+
+    expect(opened[1]).toBe(
+      "/api/v1/agent-sessions/s_iris/events?view=agui&after=epoch%3A40",
+    );
+    const resumed = Socket.instances[1]!;
+    act(() => {
+      resumed.message(siblingA);
+      resumed.message(siblingB);
+      resumed.message({
+        type: EventType.TEXT_MESSAGE_END,
+        messageId: "m1",
+        cursor: "epoch:41",
+      } as BaseEvent);
+      resumed.message({
+        type: EventType.RUN_FINISHED,
+        threadId: "iris",
+        runId: "r1",
+        cursor: "epoch:41",
+      } as BaseEvent);
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(16);
+    });
+
+    expect(rowText(rows)).toBe("AB");
+    expect(rowText(rows).match(/A/g)).toHaveLength(1);
+    expect(rowText(rows).match(/B/g)).toHaveLength(1);
+  });
+
+  it("preserves an acknowledged optimistic input while rolling back a partial cursor group", async () => {
+    vi.useFakeTimers();
+    const Socket = installFakeWebSocket();
+    const opened: string[] = [];
+    let rows: PaneMessage[] = [];
+    let send: ((text: string) => Promise<void>) | undefined;
+
+    function Harness() {
+      const conversation = useAgentSession({
+        name: "iris",
+        sessionId: "s_iris",
+        you: { who: "test-user", glyph: "T" },
+        reconnectDelayMs: 10,
+        openSource: (url) => {
+          opened.push(url);
+          return openWsSource(url);
+        },
+      });
+      send = conversation.send;
+      useEffect(() => {
+        rows = conversation.messages;
+      }, [conversation.messages]);
+      return null;
+    }
+
+    render(<Harness />);
+    const first = Socket.instances[0]!;
+    first.open();
+    const runStarted = {
+      type: EventType.RUN_STARTED,
+      threadId: "iris",
+      runId: "r1",
+      cursor: "epoch:40",
+    } as BaseEvent;
+    const textStarted = {
+      type: EventType.TEXT_MESSAGE_START,
+      messageId: "m1",
+      role: "assistant",
+      cursor: "epoch:40",
+    } as BaseEvent;
+    const siblingA = {
+      type: EventType.TEXT_MESSAGE_CONTENT,
+      messageId: "m1",
+      delta: "A",
+      cursor: "epoch:41",
+    } as BaseEvent;
+    const siblingB = {
+      type: EventType.TEXT_MESSAGE_CONTENT,
+      messageId: "m1",
+      delta: "B",
+      cursor: "epoch:41",
+    } as BaseEvent;
+
+    act(() => {
+      first.message(runStarted);
+      first.message(textStarted);
+      first.message(siblingA);
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(16);
+    });
+    expect(rowText(rows)).toBe("A");
+
+    let sendPromise!: Promise<void>;
+    act(() => {
+      sendPromise = send!("MINE");
+    });
+    const input = JSON.parse(first.sent.at(-1)!) as {
+      t: string;
+      text: string;
+      clientMessageId: string;
+    };
+    expect(input).toMatchObject({ t: "input", text: "MINE" });
+    act(() => {
+      first.message({
+        t: "input.ack",
+        clientMessageId: input.clientMessageId,
+        delivered: true,
+      });
+    });
+    await act(async () => {
+      await sendPromise;
+    });
+    expect(rowText(rows)).toContain("MINE");
+
+    act(() => {
+      first.close(1013, "session.bp:epoch:40");
+      vi.advanceTimersByTime(10);
+    });
+
+    expect(opened[1]).toBe(
+      "/api/v1/agent-sessions/s_iris/events?view=agui&after=epoch%3A40",
+    );
+    expect(rowText(rows)).toContain("MINE");
+
+    const resumed = Socket.instances[1]!;
+    act(() => {
+      resumed.message(siblingA);
+      resumed.message(siblingB);
+      resumed.message({
+        type: EventType.TEXT_MESSAGE_END,
+        messageId: "m1",
+        cursor: "epoch:41",
+      } as BaseEvent);
+      resumed.message({
+        type: EventType.RUN_FINISHED,
+        threadId: "iris",
+        runId: "r1",
+        cursor: "epoch:41",
+      } as BaseEvent);
+      resumed.message({
+        type: EventType.TEXT_MESSAGE_START,
+        messageId: input.clientMessageId,
+        role: "user",
+        name: "test-user",
+        kind: "human",
+        cursor: "epoch:42",
+      } as BaseEvent);
+      resumed.message({
+        type: EventType.TEXT_MESSAGE_CONTENT,
+        messageId: input.clientMessageId,
+        delta: "MINE",
+        cursor: "epoch:42",
+      } as BaseEvent);
+      resumed.message({
+        type: EventType.TEXT_MESSAGE_END,
+        messageId: input.clientMessageId,
+        cursor: "epoch:42",
+      } as BaseEvent);
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(16);
+    });
+
+    expect(rowText(rows).match(/A/g)).toHaveLength(1);
+    expect(rowText(rows).match(/B/g)).toHaveLength(1);
+    expect(rowText(rows).match(/MINE/g)).toHaveLength(1);
+  });
+
+  it("preserves two optimistic inputs through out-of-order acknowledgements and replay echoes", async () => {
+    vi.useFakeTimers();
+    const Socket = installFakeWebSocket();
+    let rows: PaneMessage[] = [];
+    let send: ((text: string) => Promise<void>) | undefined;
+
+    function Harness() {
+      const conversation = useAgentSession({
+        name: "iris",
+        sessionId: "s_iris",
+        you: { who: "test-user", glyph: "T" },
+        reconnectDelayMs: 10,
+        openSource: openWsSource,
+      });
+      send = conversation.send;
+      useEffect(() => {
+        rows = conversation.messages;
+      }, [conversation.messages]);
+      return null;
+    }
+
+    render(<Harness />);
+    const first = Socket.instances[0]!;
+    first.open();
+    const siblingA = {
+      type: EventType.TEXT_MESSAGE_CONTENT,
+      messageId: "m1",
+      delta: "A",
+      cursor: "epoch:41",
+    } as BaseEvent;
+    const siblingB = {
+      type: EventType.TEXT_MESSAGE_CONTENT,
+      messageId: "m1",
+      delta: "B",
+      cursor: "epoch:41",
+    } as BaseEvent;
+    act(() => {
+      first.message({
+        type: EventType.RUN_STARTED,
+        threadId: "iris",
+        runId: "r1",
+        cursor: "epoch:40",
+      } as BaseEvent);
+      first.message({
+        type: EventType.TEXT_MESSAGE_START,
+        messageId: "m1",
+        role: "assistant",
+        cursor: "epoch:40",
+      } as BaseEvent);
+      first.message(siblingA);
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(16);
+    });
+
+    let firstSend!: Promise<void>;
+    let secondSend!: Promise<void>;
+    act(() => {
+      firstSend = send!("FIRST");
+      secondSend = send!("SECOND");
+    });
+    const inputs = first.sent.slice(-2).map((payload) => JSON.parse(payload) as {
+      t: string;
+      text: string;
+      clientMessageId: string;
+    });
+    expect(inputs.map((input) => input.text)).toEqual(["FIRST", "SECOND"]);
+    act(() => {
+      first.message({
+        t: "input.ack",
+        clientMessageId: inputs[1]!.clientMessageId,
+        delivered: true,
+      });
+      first.message({
+        t: "input.ack",
+        clientMessageId: inputs[0]!.clientMessageId,
+        delivered: true,
+      });
+    });
+    await act(async () => {
+      await Promise.all([secondSend, firstSend]);
+    });
+
+    const expectedInputs = inputs.map((input) => [input.clientMessageId, input.text]);
+    expect(
+      rows.filter((row) => row.isYou).map((row) => [row.id, rowText([row])]),
+    ).toEqual(expectedInputs);
+
+    act(() => {
+      first.close(1013, "session.bp:epoch:40");
+      vi.advanceTimersByTime(10);
+    });
+    expect(
+      rows.filter((row) => row.isYou).map((row) => [row.id, rowText([row])]),
+    ).toEqual(expectedInputs);
+
+    const resumed = Socket.instances[1]!;
+    const echo = (input: (typeof inputs)[number], cursor: string): void => {
+      resumed.message({
+        type: EventType.TEXT_MESSAGE_START,
+        messageId: input.clientMessageId,
+        role: "user",
+        name: "test-user",
+        kind: "human",
+        cursor,
+      } as BaseEvent);
+      resumed.message({
+        type: EventType.TEXT_MESSAGE_CONTENT,
+        messageId: input.clientMessageId,
+        delta: input.text,
+        cursor,
+      } as BaseEvent);
+      resumed.message({
+        type: EventType.TEXT_MESSAGE_END,
+        messageId: input.clientMessageId,
+        cursor,
+      } as BaseEvent);
+    };
+    act(() => {
+      resumed.message(siblingA);
+      resumed.message(siblingB);
+      resumed.message({
+        type: EventType.TEXT_MESSAGE_END,
+        messageId: "m1",
+        cursor: "epoch:41",
+      } as BaseEvent);
+      resumed.message({
+        type: EventType.RUN_FINISHED,
+        threadId: "iris",
+        runId: "r1",
+        cursor: "epoch:41",
+      } as BaseEvent);
+      echo(inputs[1]!, "epoch:42");
+      echo(inputs[0]!, "epoch:43");
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(16);
+    });
+
+    expect(
+      rows.filter((row) => row.isYou).map((row) => [row.id, rowText([row])]),
+    ).toEqual(expectedInputs);
+    expect(rows.filter((row) => rowText([row]) === "FIRST")).toHaveLength(1);
+    expect(rows.filter((row) => rowText([row]) === "SECOND")).toHaveLength(1);
+    expect(rowText(rows).match(/A/g)).toHaveLength(1);
+    expect(rowText(rows).match(/B/g)).toHaveLength(1);
+  });
+
+  it("preserves completed transcript state while rolling back only the partial cursor group", async () => {
+    vi.useFakeTimers();
+    const Socket = installFakeWebSocket();
+    let rows: PaneMessage[] = [];
+
+    function Harness() {
+      const { messages } = useAgentSession({
+        name: "iris",
+        sessionId: "s_iris",
+        reconnectDelayMs: 10,
+        openSource: openWsSource,
+      });
+      useEffect(() => {
+        rows = messages;
+      }, [messages]);
+      return null;
+    }
+
+    render(<Harness />);
+    const first = Socket.instances[0]!;
+    const siblingA = {
+      type: EventType.TEXT_MESSAGE_CONTENT,
+      messageId: "m1",
+      delta: "A",
+      cursor: "epoch:41",
+    } as BaseEvent;
+    const siblingB = {
+      type: EventType.TEXT_MESSAGE_CONTENT,
+      messageId: "m1",
+      delta: "B",
+      cursor: "epoch:41",
+    } as BaseEvent;
+    act(() => {
+      first.message({
+        type: EventType.RUN_STARTED,
+        threadId: "iris",
+        runId: "prior-run",
+        cursor: "epoch:38",
+      } as BaseEvent);
+      first.message({
+        type: EventType.TEXT_MESSAGE_START,
+        messageId: "prior-message",
+        role: "assistant",
+        cursor: "epoch:38",
+      } as BaseEvent);
+      first.message({
+        type: EventType.TEXT_MESSAGE_CONTENT,
+        messageId: "prior-message",
+        delta: "SEED",
+        cursor: "epoch:39",
+      } as BaseEvent);
+      first.message({
+        type: EventType.TEXT_MESSAGE_END,
+        messageId: "prior-message",
+        cursor: "epoch:39",
+      } as BaseEvent);
+      first.message({
+        type: EventType.RUN_FINISHED,
+        threadId: "iris",
+        runId: "prior-run",
+        cursor: "epoch:39",
+      } as BaseEvent);
+      first.message({
+        type: EventType.RUN_STARTED,
+        threadId: "iris",
+        runId: "r1",
+        cursor: "epoch:40",
+      } as BaseEvent);
+      first.message({
+        type: EventType.TEXT_MESSAGE_START,
+        messageId: "m1",
+        role: "assistant",
+        cursor: "epoch:40",
+      } as BaseEvent);
+      first.message(siblingA);
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(16);
+    });
+    expect(rowText(rows)).toBe("SEEDA");
+
+    act(() => {
+      first.close(1013, "session.bp:epoch:40");
+      vi.advanceTimersByTime(10);
+    });
+    expect(rowText(rows)).toBe("SEED");
+
+    const resumed = Socket.instances[1]!;
+    act(() => {
+      resumed.message(siblingA);
+      resumed.message(siblingB);
+      resumed.message({
+        type: EventType.TEXT_MESSAGE_END,
+        messageId: "m1",
+        cursor: "epoch:41",
+      } as BaseEvent);
+      resumed.message({
+        type: EventType.RUN_FINISHED,
+        threadId: "iris",
+        runId: "r1",
+        cursor: "epoch:41",
+      } as BaseEvent);
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(16);
+    });
+
+    expect(rowText(rows)).toBe("SEEDAB");
+    expect(rows.filter((row) => rowText([row]) === "SEED")).toHaveLength(1);
   });
 
   it("drops stale stream-store afterId on boot-epoch changes with the real WS client source", () => {
@@ -280,6 +777,7 @@ describe("AG-UI WebSocket verification source parity", () => {
     function Harness({ epoch }: { epoch: string }) {
       useAgentSession({
         name: "iris",
+        sessionId: "s_iris",
         observeEpoch: epoch,
         openSource: (url) => {
           opened.push(url);
@@ -299,8 +797,8 @@ describe("AG-UI WebSocket verification source parity", () => {
 
     rerender(<Harness epoch="boot-b" />);
 
-    expect(opened[1]).toBe("/api/v1/agent-sessions/iris/events?view=agui");
-    expect(Socket.instances[1]!.url).toBe("ws://localhost:3000/api/v1/agent-sessions/iris/events?view=agui");
+    expect(opened[1]).toBe("/api/v1/agent-sessions/s_iris/events?view=agui");
+    expect(Socket.instances[1]!.url).toBe("ws://localhost:3000/api/v1/agent-sessions/s_iris/events?view=agui");
   });
 
   it("repairs a dropped open run without duplicate or missing rows after WS reconnect replay", async () => {
@@ -312,6 +810,7 @@ describe("AG-UI WebSocket verification source parity", () => {
     function Harness() {
       const { messages } = useAgentSession({
         name: "iris",
+        sessionId: "s_iris",
         reconnectDelayMs: 10,
         openSource: (url) => {
           opened.push(url);
@@ -340,7 +839,7 @@ describe("AG-UI WebSocket verification source parity", () => {
       Socket.instances[0]!.close();
       vi.advanceTimersByTime(10);
     });
-    expect(opened[1]).toBe("/api/v1/agent-sessions/iris/events?view=agui&after=epoch%3A214");
+    expect(opened[1]).toBe("/api/v1/agent-sessions/s_iris/events?view=agui&after=epoch%3A214");
 
     act(() => {
       for (const event of sessionTurn(216, "replayed full")) {
@@ -361,6 +860,7 @@ describe("AG-UI WebSocket verification source parity", () => {
     function Harness() {
       ({ send } = useAgentSession({
         name: "iris",
+        sessionId: "s_iris",
         openSource: openWsSource,
         postPrompt: async (name, text) => { promptCalls.push({ name, text }); },
       }));
@@ -380,8 +880,6 @@ describe("AG-UI WebSocket verification source parity", () => {
     const frame = JSON.parse(socket.sent[0]!) as AguiInputFrame;
     expect(frame).toEqual({
       t: "input",
-      mode: "session",
-      target: "iris",
       text: "socket prompt",
       clientMessageId: expect.stringMatching(/^you:/),
     });
@@ -430,6 +928,7 @@ function WsCaptureHarness({
 }) {
   const { messages } = useAgentSession({
     name: "iris",
+    sessionId: "s_iris",
     openSource: openWsSource,
   });
   useEffect(() => onMessages(messages), [messages, onMessages]);

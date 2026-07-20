@@ -291,8 +291,11 @@ async function queueEvents(
 ): Promise<CommandQueueTransition[]> {
   const result = await db.execute({
     sql:
-      "SELECT seq, session_id, command_id, client_message_id, state, mode, revision " +
-      "FROM command_intent_events WHERE seq > ? ORDER BY seq LIMIT 500",
+      "SELECT e.seq, e.session_id, e.command_id, e.client_message_id, " +
+      "c.kind, c.caller_name, c.caller_session_id, c.caller_agent_id, c.caller_kind, " +
+      "e.state, e.mode, e.revision FROM command_intent_events e " +
+      "JOIN command_intents c ON c.command_id = e.command_id " +
+      "WHERE e.seq > ? ORDER BY e.seq LIMIT 500",
     args: [afterSeq],
   });
   return result.rows.map((row) => ({
@@ -303,6 +306,13 @@ async function queueEvents(
       typeof row.client_message_id === "string"
         ? row.client_message_id
         : undefined,
+    commandKind: String(row.kind),
+    callerName: String(row.caller_name),
+    callerSessionId:
+      typeof row.caller_session_id === "string" ? row.caller_session_id : undefined,
+    callerAgentId:
+      typeof row.caller_agent_id === "string" ? row.caller_agent_id : undefined,
+    callerKind: typeof row.caller_kind === "string" ? row.caller_kind : undefined,
     state: String(row.state) as CommandQueueState,
     mode: String(row.mode),
     revision: Number(row.revision),
@@ -489,12 +499,14 @@ export async function handleConversationQueuePost(
   } catch {
     return json({ error: "body must be JSON" }, 400);
   }
-  if (!body.name?.trim()) return mutationError(body, "name is required", 400);
+  if (!body.name?.trim() && !body.agentId) {
+    return mutationError(body, "name or agentId is required", 400);
+  }
   if (!body.clientMutationId?.trim()) {
     return mutationError(body, "clientMutationId is required", 400);
   }
   const target: QueueTarget = {
-    name: body.name.trim(),
+    ...(body.name?.trim() ? { name: body.name.trim() } : {}),
     ...(body.agentId ? { agentId: String(body.agentId) } : {}),
   };
   const auth = await authorizedProject(request, deps);

@@ -84,7 +84,7 @@ describe("Gateway-owned developer message events", () => {
       scope: "thread",
       threadId: "design",
       toName: "design",
-      fromName: "Bob",
+      fromName: "peer-agent",
       body: "new message",
       createdAt: 1_780_000_000_002,
     }));
@@ -93,7 +93,7 @@ describe("Gateway-owned developer message events", () => {
     expect(events[1]).toMatchObject({
       topic: "sys.message.thread.design",
       seq: 2,
-      from: "Bob",
+      from: "peer-agent",
       messageId: "m_after_subscribe",
     });
 
@@ -211,7 +211,7 @@ describe("Gateway-owned developer message events", () => {
       scope: "thread",
       threadId: "design",
       toName: "design",
-      fromName: "Bob",
+      fromName: "peer-agent",
       body: "unseen",
     }));
     const source = createGatewayDeveloperEventSource({
@@ -259,7 +259,7 @@ describe("Gateway-owned developer message events", () => {
       scope: "thread",
       threadId: "design",
       toName: "design",
-      fromName: "Bob",
+      fromName: "peer-agent",
       body: "after",
     }));
     changeBus.publish("thread-name:design");
@@ -283,7 +283,7 @@ describe("Gateway-owned developer message events", () => {
       messageId: "m_dm",
       scope: "dm",
       fromName: "Ada",
-      toName: "earl",
+      toName: "test-user",
       body: "private body",
       createdAt: 1_780_000_000_001,
     }));
@@ -291,19 +291,21 @@ describe("Gateway-owned developer message events", () => {
       db: async () => db,
       changeBus: new GatewayChangeBus(),
     });
-    const earl: DeveloperEventEnvelope[] = [];
+    const testUser: DeveloperEventEnvelope[] = [];
     const ada: DeveloperEventEnvelope[] = [];
     const unknown: DeveloperEventEnvelope[] = [];
     const subscriptions = [
-      source.subscribe("sys.dm.earl", 0, { onEvent: (event) => (earl.push(event), true) }),
+      source.subscribe("sys.dm.test-user", 0, {
+        onEvent: (event) => (testUser.push(event), true),
+      }),
       source.subscribe("sys.dm.Ada", 0, { onEvent: (event) => (ada.push(event), true) }),
       source.subscribe("sys.dm.unknown", 0, { onEvent: (event) => (unknown.push(event), true) }),
     ];
     await Promise.all(subscriptions.map((subscription) => subscription.ready));
 
-    expect(earl).toEqual([expect.objectContaining({
-      topic: "sys.dm.earl",
-      dm: "earl",
+    expect(testUser).toEqual([expect.objectContaining({
+      topic: "sys.dm.test-user",
+      dm: "test-user",
       from: "Ada",
       messageId: "m_dm",
     })]);

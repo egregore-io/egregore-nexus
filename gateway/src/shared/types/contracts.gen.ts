@@ -493,7 +493,7 @@ export enum CommandQueueAction {
 
 /** Request for one server-owned queue mutation. Fields not used by the selected action are absent. */
 export interface CommandQueueMutationRequest {
-	name: string;
+	name?: string;
 	agentId?: AgentId;
 	action: CommandQueueAction;
 	clientMutationId: string;
@@ -555,6 +555,11 @@ export interface CommandQueueTransition {
 	sessionId?: string;
 	commandId: string;
 	clientMessageId?: string;
+	commandKind: string;
+	callerName: string;
+	callerSessionId?: string;
+	callerAgentId?: AgentId;
+	callerKind?: string;
 	state: CommandQueueState;
 	mode: string;
 	revision: number;
@@ -570,6 +575,8 @@ export interface CompactRequest {
 	agentId?: AgentId;
 	/** The target agent's registered name fallback (resolved to its live session). */
 	name: string;
+	/** Client-generated id used to correlate the terminal command receipt. */
+	clientMessageId?: string;
 }
 
 /** Response: whether compaction was started (completion streams via observe). */
@@ -1022,6 +1029,21 @@ export interface InboxUnsubscribeRequest {
 	subscriptionId: string;
 }
 
+/** Interrupt the active turn on one agent session without injecting replacement text. */
+export interface InterruptRequest {
+	/** The stable target agent id. When present, it is authoritative over `name`. */
+	agentId?: AgentId;
+	/** The target agent's registered name fallback. */
+	name: string;
+	/** Client-generated id used to correlate the terminal command receipt. */
+	clientMessageId?: string;
+}
+
+/** Response emitted only after the adapter accepted the interrupt. */
+export interface InterruptResponse {
+	interrupted: boolean;
+}
+
 /** `nexus thread join <name>` (caller joins). */
 export interface JoinThreadRequest {
 	name: string;
@@ -1034,6 +1056,11 @@ export interface LeaveThreadRequest {
 
 /** `nexus members` request. */
 export interface MemberListRequest {
+	/**
+	 * Optional directory metadata filter. `None` returns the global directory; projects never
+	 * act as a routing or authorization boundary.
+	 */
+	project?: string;
 	/** Include offline members (default false). */
 	includeOffline?: boolean;
 	/** Include dead-marked members (default false; audit/admin views only). */

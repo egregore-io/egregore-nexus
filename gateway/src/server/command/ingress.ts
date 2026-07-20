@@ -48,6 +48,7 @@ export const COMMAND_KINDS = {
   threadRemoveMember: "thread.remove_member",
   harnessPrompt: "harness.prompt",
   harnessSteer: "harness.steer",
+  harnessInterrupt: "harness.interrupt",
   harnessCompact: "harness.compact",
   harnessWarm: "harness.warm",
   adminSpawn: "admin.spawn",
@@ -146,7 +147,6 @@ const DEFAULT_POLL_INTERVAL_MS = 100;
 interface HumanDaemonBinding {
   bootId: string;
   sessionId: string;
-  agentId?: string;
 }
 
 const humanDaemonBindings = new Map<string, HumanDaemonBinding>();
@@ -301,12 +301,13 @@ async function ensureHumanCallerForDaemonBoot(
     ? cached
     : await rebindHumanCaller(bindingKey, bootId, caller, opts);
 
-  return {
+  const reboundCaller = {
     ...caller,
     sessionId: binding.sessionId,
     runtimeId: binding.sessionId,
-    ...(binding.agentId ? { agentId: binding.agentId } : {}),
   };
+  delete reboundCaller.agentId;
+  return reboundCaller;
 }
 
 async function rebindHumanCaller(
@@ -355,16 +356,13 @@ async function registerHumanCaller(
         ...(opts.nexusHome ? { nexusHome: opts.nexusHome } : {}),
         timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       },
-    ) as { sessionId?: unknown; agentId?: unknown };
+    ) as { sessionId?: unknown };
     if (typeof response?.sessionId !== "string" || !response.sessionId) {
       throw new GatewayError(502, "daemon human rebind returned no sessionId");
     }
     return {
       bootId,
       sessionId: response.sessionId,
-      ...(typeof response.agentId === "string" && response.agentId
-        ? { agentId: response.agentId }
-        : {}),
     };
   } catch (error) {
     throw gatewayIpcError(error);

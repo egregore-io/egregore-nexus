@@ -34,6 +34,7 @@ const textStart = (
   messageId: string,
   name: string,
   createdAt: number,
+  kind?: string,
   cursor?: { createdAt: number; rowid: number },
 ): BaseEvent =>
   ({
@@ -42,11 +43,13 @@ const textStart = (
     role: "assistant",
     name,
     createdAt,
+    ...(kind ? { kind } : {}),
     ...(cursor ? { cursor } : {}),
   }) as BaseEvent;
 const userStart = (
   messageId: string,
   createdAt: number,
+  kind?: string,
   cursor?: { createdAt: number; rowid: number },
 ): BaseEvent =>
   ({
@@ -54,6 +57,7 @@ const userStart = (
     messageId,
     role: "user",
     createdAt,
+    ...(kind ? { kind } : {}),
     ...(cursor ? { cursor } : {}),
   }) as BaseEvent;
 const textContent = (messageId: string, delta: string): BaseEvent =>
@@ -72,8 +76,14 @@ export function messageToAguiEvents(msg: Message, selfName?: string): BaseEvent[
   if (!msg.body.trim()) return [];
   const isSelf = selfName != null && msg.from === selfName;
   const cursor = messageCursor(msg);
+  const provenance = msg.provenance as unknown;
+  const kind =
+    provenance != null && typeof provenance === "object"
+      ? (provenance as Record<string, unknown>).kind
+      : undefined;
+  const authorKind = typeof kind === "string" ? kind : undefined;
   const start = isSelf
-    ? userStart(msg.id, msg.createdAt, cursor)
-    : textStart(msg.id, msg.from, msg.createdAt, cursor);
+    ? userStart(msg.id, msg.createdAt, authorKind, cursor)
+    : textStart(msg.id, msg.from, msg.createdAt, authorKind, cursor);
   return [start, textContent(msg.id, msg.body), textEnd(msg.id)];
 }

@@ -42,6 +42,7 @@ interface MaterializedBlock {
   item_id?: unknown;
   source?: unknown;
   name?: unknown;
+  kind?: unknown;
   title?: unknown;
   harness?: unknown;
   runtimeId?: unknown;
@@ -135,6 +136,8 @@ function eventsForBlock(row: MaterializedRow, block: MaterializedBlock): AgentUp
     if (source) data.source = source;
     const name = asString(block.name);
     if (name) data.name = name;
+    const actorKind = asString(block.kind);
+    if (actorKind) data.kind = actorKind;
     const harness = asString(block.harness);
     if (harness) data.harness = harness;
     const runtimeId = asString(block.runtimeId) || asString(block.runtime_id);

@@ -6,10 +6,13 @@ import {
   renderHarnessInvocation,
   validateCommandArgs,
 } from "./commandRegistry.mjs";
+import { bindWebSocketCsrf } from "../auth/browserMutationAuth.mjs";
 
 const AGUI_WS_PATH = "/api/agui/ws";
 const SESSION_EVENTS_PATH = /^\/api\/v1\/agent-sessions\/[^/]+\/events$/;
 const MAX_BUFFERED_AMOUNT = 1024 * 1024;
+const SESSION_BACKPRESSURE_REASON = "session.bp:";
+const DEVELOPER_BACKPRESSURE_REASON = "developer.backpressure:";
 const TOOL_CALL_TOPIC_PREFIX = "sys.agent.";
 const TOOL_CALL_TOPIC_SUFFIX = ".tool_call";
 // Fleet-wide agent status (presence/spawned/removed) — ephemeral daemon push events
@@ -28,8 +31,10 @@ export function handleWs(socket, request, deps = {}) {
   const sessionInput = deps.sessionInput ?? defaultSessionInput(deps);
   const busInput = deps.busInput ?? defaultBusInput(deps);
   const steerInput = deps.steerInput ?? defaultSteerInput(deps);
-  const commands = new CommandFrames(socket, request, deps, sessionInput);
-  const commandQueue = new SessionCommandQueue(socket, request, deps);
+  const interruptInput = deps.interruptInput ?? defaultInterruptInput(deps);
+  const sessionLane = new SessionLaneBinding(request);
+  const commands = new CommandFrames(socket, request, deps, sessionInput, sessionLane);
+  const commandQueue = new SessionCommandQueue(socket, request, deps, sessionLane);
   const subscriptions = new DeveloperEventSubscriptions(socket, request, deps);
   const abort = new AbortController();
   let finished = false;
@@ -41,6 +46,7 @@ export function handleWs(socket, request, deps = {}) {
   const finish = () => {
     if (finished) return;
     finished = true;
+    sessionLane.fail("agent-session socket closed before lane binding completed");
     abort.abort();
     subscriptions.close();
     commandQueue.close();
@@ -66,12 +72,13 @@ export function handleWs(socket, request, deps = {}) {
       sessionInput,
       busInput,
       steerInput,
+      interruptInput,
       subscriptions,
       commands,
       commandQueue,
+      sessionLane,
     });
   });
-  commandQueue.start();
 
   void (async () => {
     // Dedicated events lane: a socket with no
@@ -81,12 +88,21 @@ export function handleWs(socket, request, deps = {}) {
     try {
       const response = await observe(toObserveRequest(request));
       if (!response.ok) {
+        sessionLane.fail(await errorReason(response));
         close(closeCodeForStatus(response.status), await errorReason(response));
         return;
       }
-      await pumpSseResponseToSocket(response, socket, abort.signal, subscriptions);
+      const boundTarget = sessionLane.bindResponse(response);
+      if (boundTarget) {
+        commandQueue.start(boundTarget);
+        subscriptions.bindSession(boundTarget.name);
+      }
+      await pumpSseResponseToSocket(response, socket, abort.signal, subscriptions, {
+        session: Boolean(sessionLaneTargetFromRequest(request) || sessionIdFromPath(request)),
+      });
       close(1000, "observe ended");
     } catch (error) {
+      sessionLane.fail(messageForError(error));
       if (!abort.signal.aborted) close(1011, messageForError(error));
     }
   })();
@@ -98,7 +114,7 @@ function hasObserveTarget(request) {
   const url = new URL(request.url);
   if (SESSION_EVENTS_PATH.test(url.pathname)) return true;
   const params = url.searchParams;
-  return ["session", "thread", "dm", "topic"].some((key) => params.get(key));
+  return ["session", "agentId", "thread", "dm", "topic"].some((key) => params.get(key));
 }
 
 export async function attachAguiWsUpgrade(server, options = {}) {
@@ -112,7 +128,7 @@ export async function attachAguiWsUpgrade(server, options = {}) {
   );
   const socketOptions = { ...options, commandQueueHub };
   server.on("upgrade", (req, socket, head) => {
-    const request = nodeUpgradeRequestToFetch(req);
+    const request = bindWebSocketCsrf(nodeUpgradeRequestToFetch(req));
     const url = new URL(request.url);
     if (url.pathname !== AGUI_WS_PATH && !SESSION_EVENTS_PATH.test(url.pathname)) {
       // This is the server's only upgrade handler: fail wrong-path upgrades
@@ -138,10 +154,18 @@ export function toObserveRequest(request) {
   });
 }
 
-export async function pumpSseResponseToSocket(response, socket, signal, observer) {
+export async function pumpSseResponseToSocket(response, socket, signal, observer, options = {}) {
   if (!response.body) return;
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
+  const outbound = {
+    socket,
+    observer,
+    session: options.session === true,
+    stopped: false,
+    lastAcceptedCursor: undefined,
+    pendingAcceptedCursor: undefined,
+  };
   let pending = "";
   for (;;) {
     if (signal?.aborted) {
@@ -152,42 +176,138 @@ export async function pumpSseResponseToSocket(response, socket, signal, observer
     if (done) break;
     if (!value) continue;
     pending += decoder.decode(value, { stream: true });
-    pending = flushSseBlocks(pending, socket, observer);
+    pending = flushSseBlocks(pending, outbound);
+    if (
+      !outbound.stopped
+      && outbound.session
+      && pending.length > 0
+      && (outbound.socket.bufferedAmount ?? 0) + Buffer.byteLength(pending, "utf8")
+        > MAX_BUFFERED_AMOUNT
+    ) {
+      closeOutboundBackpressure(outbound);
+    }
+    if (outbound.stopped) {
+      await reader.cancel().catch(() => {});
+      return;
+    }
   }
   pending += decoder.decode();
-  flushSseBlocks(`${pending}\n\n`, socket, observer);
+  flushSseBlocks(`${pending}\n\n`, outbound);
 }
 
-function flushSseBlocks(text, socket, observer) {
+function flushSseBlocks(text, outbound) {
   let start = 0;
+  const payloads = [];
   for (;;) {
     const next = text.indexOf("\n\n", start);
     if (next === -1) break;
-    emitSseBlock(text.slice(start, next), socket, observer);
+    const payload = ssePayload(text.slice(start, next));
+    if (payload !== undefined) payloads.push(payload);
     start = next + 2;
   }
+  if (!emitSsePayloads(payloads, outbound)) return "";
   return text.slice(start);
 }
 
-function emitSseBlock(block, socket, observer) {
+function ssePayload(block) {
   const data = [];
   for (const line of block.split(/\r?\n/)) {
     if (!line.startsWith("data:")) continue;
     data.push(line.slice(5).trimStart());
   }
-  if (data.length === 0) return;
-  if ((socket.bufferedAmount ?? 0) > MAX_BUFFERED_AMOUNT) {
-    socket.close?.(1013, "ag-ui websocket backpressure");
-    return;
+  return data.length > 0 ? data.join("\n") : undefined;
+}
+
+function emitSsePayloads(payloads, outbound) {
+  if (payloads.length === 0) return true;
+  if (outbound.session) {
+    let start = 0;
+    while (start < payloads.length) {
+      const cursor = opaqueCursorFromPayload(payloads[start]);
+      let end = start + 1;
+      while (end < payloads.length && opaqueCursorFromPayload(payloads[end]) === cursor) end += 1;
+
+      // A semantic cursor can produce multiple projection siblings, and transport readers may
+      // split those siblings across chunks. Only a later distinct cursor proves the prior cursor
+      // complete. Keeping one cursor pending makes a 1013 reconnect replay the whole unfinished
+      // sibling group instead of skipping a frame that never reached the socket.
+      if (
+        cursor
+        && outbound.pendingAcceptedCursor
+        && cursor !== outbound.pendingAcceptedCursor
+      ) {
+        outbound.lastAcceptedCursor = outbound.pendingAcceptedCursor;
+      }
+
+      const group = payloads.slice(start, end);
+      const groupBytes = group.reduce(
+        (total, payload) => total + Buffer.byteLength(payload, "utf8"),
+        0,
+      );
+      if ((outbound.socket.bufferedAmount ?? 0) + groupBytes > MAX_BUFFERED_AMOUNT) {
+        closeOutboundBackpressure(outbound);
+        return false;
+      }
+      for (const payload of group) {
+        outbound.socket.send(payload);
+        outbound.observer?.observeAguiFrame?.(payload);
+      }
+      if (cursor) outbound.pendingAcceptedCursor = cursor;
+      start = end;
+    }
+    return true;
   }
-  const payload = data.join("\n");
-  socket.send(payload);
-  observer?.observeAguiFrame?.(payload);
+  for (const payload of payloads) {
+    if (!emitLegacySsePayload(payload, outbound)) return false;
+  }
+  return true;
+}
+
+function emitLegacySsePayload(payload, outbound) {
+  const bufferedAmount = outbound.socket.bufferedAmount ?? 0;
+  if (bufferedAmount > MAX_BUFFERED_AMOUNT) {
+    closeOutboundBackpressure(outbound);
+    return false;
+  }
+  outbound.socket.send(payload);
+  outbound.observer?.observeAguiFrame?.(payload);
+  return true;
+}
+
+function closeOutboundBackpressure(outbound) {
+  if (outbound.stopped) return;
+  outbound.stopped = true;
+  outbound.socket.close?.(
+    1013,
+    outbound.session
+      ? `${SESSION_BACKPRESSURE_REASON}${outbound.lastAcceptedCursor ?? "none"}`
+      : "ag-ui websocket backpressure",
+  );
+}
+
+function opaqueCursorFromPayload(payload) {
+  try {
+    const cursor = JSON.parse(payload)?.cursor;
+    return typeof cursor === "string" && cursor.length > 0 ? cursor : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function handleClientFrame(
   raw,
-  { socket, request, sessionInput, busInput, steerInput, subscriptions, commands, commandQueue },
+  {
+    socket,
+    request,
+    sessionInput,
+    busInput,
+    steerInput,
+    interruptInput,
+    subscriptions,
+    commands,
+    commandQueue,
+    sessionLane,
+  },
 ) {
   let frame;
   try {
@@ -223,7 +343,10 @@ async function handleClientFrame(
   if (frame?.t === "steer") {
     const clientMessageId = stringField(frame.clientMessageId);
     try {
-      const steer = normalizeSteerFrame(withSocketScopedSteerDefaults(frame, request));
+      const scoped = sessionLane.isSessionLane
+        ? { ...frame, target: sessionTargetWireValue(await sessionLane.targetForFrame(frame)) }
+        : withSocketScopedSteerDefaults(frame, request);
+      const steer = normalizeSteerFrame(scoped);
       const response = await steerInput(steer, request);
       if (!response.ok) {
         sendJson(socket, {
@@ -248,6 +371,39 @@ async function handleClientFrame(
     }
     return;
   }
+  if (frame?.t === "interrupt") {
+    const clientMessageId = stringField(frame.clientMessageId);
+    try {
+      if (!clientMessageId) throw new Error("interrupt.clientMessageId is required");
+      const target = sessionLane.isSessionLane
+        ? await sessionLane.targetForFrame(frame)
+        : normalizeSessionLookup(frame.target, frame.agentId)
+          ?? sessionTargetFromRequest(request);
+      if (!target) throw new Error("interrupt requires a target session");
+      const response = await interruptInput({ target: sessionTargetWireValue(target), clientMessageId }, request);
+      if (!response.ok) {
+        sendJson(socket, {
+          t: "interrupt.err",
+          clientMessageId,
+          status: response.status,
+          error: await errorReason(response),
+        });
+        return;
+      }
+      const body = await response.json();
+      if (!body?.result || typeof body.result !== "object" || Array.isArray(body.result)) {
+        throw new Error("interrupt response is missing its result");
+      }
+      sendJson(socket, { t: "interrupt.ack", clientMessageId, ...body.result });
+    } catch (error) {
+      sendJson(socket, {
+        t: "interrupt.err",
+        clientMessageId,
+        error: messageForError(error),
+      });
+    }
+    return;
+  }
   if (frame?.t !== "input") {
     sendJson(socket, { t: "input.err", error: `unsupported frame: ${String(frame?.t)}` });
     return;
@@ -255,7 +411,17 @@ async function handleClientFrame(
 
   const clientMessageId = stringField(frame.clientMessageId);
   try {
-    const input = normalizeInputFrame(withSocketScopedInputDefaults(frame, request));
+    if (sessionLane.isSessionLane && frame.mode === "bus") {
+      throw new Error("bus input cannot be sent on an agent-session lane");
+    }
+    const scoped = sessionLane.isSessionLane
+      ? {
+          ...frame,
+          mode: "session",
+          target: sessionTargetWireValue(await sessionLane.targetForFrame(frame)),
+        }
+      : withSocketScopedInputDefaults(frame, request);
+    const input = normalizeInputFrame(scoped);
     const response = input.mode === "session"
       ? await sessionInput(input, request)
       : await busInput(input, request);
@@ -307,6 +473,40 @@ function normalizeQueueReceipt(value, fallbackClientMessageId) {
   };
 }
 
+function completedCommandReceipt(transition) {
+  if (transition?.state !== "completed") return undefined;
+  const commandKind = stringField(transition.commandKind);
+  const commandId = stringField(transition.commandId);
+  const clientId = stringField(transition.clientMessageId);
+  const sessionId = stringField(transition.sessionId);
+  const callerName = stringField(transition.callerName);
+  const callerSessionId = stringField(transition.callerSessionId);
+  const callerAgentId = stringField(transition.callerAgentId);
+  const callerKind = stringField(transition.callerKind);
+  const revision = nonNegativeInteger(transition.revision);
+  const seq = nonNegativeInteger(transition.seq);
+  const callerId = callerAgentId ?? callerSessionId;
+  if (!commandKind || !commandId || !clientId || !sessionId || !callerName
+      || !callerSessionId || !callerKind || !callerId
+      || revision === undefined || seq === undefined) {
+    return undefined;
+  }
+  return {
+    commandKind,
+    commandId,
+    clientId,
+    sessionId,
+    state: "completed",
+    revision,
+    seq,
+    callerId,
+    callerKind,
+    callerName,
+    callerSessionId,
+    ...(callerAgentId ? { callerAgentId } : {}),
+  };
+}
+
 // One lane's subscription/mutation facade. All event reads live in CommandQueueHub below.
 class SessionCommandQueue {
   #socket;
@@ -314,15 +514,18 @@ class SessionCommandQueue {
   #deps;
   #target;
   #unsubscribe;
+  #sessionLane;
 
-  constructor(socket, request, deps) {
+  constructor(socket, request, deps, sessionLane) {
     this.#socket = socket;
     this.#request = request;
     this.#deps = deps;
-    this.#target = sessionNameFromRequest(request);
+    this.#target = sessionTargetFromRequest(request);
+    this.#sessionLane = sessionLane;
   }
 
-  start() {
+  start(boundTarget) {
+    if (boundTarget) this.#target = boundTarget;
     if (!this.#target || !this.#deps.commandQueueHub) return;
     this.#unsubscribe = this.#deps.commandQueueHub.subscribe(
       this.#request,
@@ -331,8 +534,16 @@ class SessionCommandQueue {
         onSnapshot: (snapshot) => sendJson(this.#socket, { t: "queue.snapshot", ...snapshot }),
         onTransition: (transition) => {
           sendJson(this.#socket, { t: "command.transition", ...transition });
+          const receipt = completedCommandReceipt(transition);
+          if (receipt) sendJson(this.#socket, { t: "command.receipt", ...receipt });
         },
-        onError: (error) => sendJson(this.#socket, { t: "queue.err", error }),
+        onError: (error, details = {}) => sendJson(this.#socket, {
+          t: "queue.err",
+          error,
+          phase: details.phase ?? "events",
+          fatal: details.fatal === true,
+        }),
+        onRestored: (seq) => sendJson(this.#socket, { t: "queue.restored", seq }),
       },
     );
   }
@@ -345,10 +556,6 @@ class SessionCommandQueue {
   observeReceipt(_receipt) {}
 
   async mutate(frame) {
-    if (!this.#target) {
-      sendJson(this.#socket, { t: "queue.mutation.err", error: "queue operations require a session socket" });
-      return;
-    }
     const action = {
       "queue.redirect": "redirect_now",
       "queue.cancel": "cancel",
@@ -364,11 +571,16 @@ class SessionCommandQueue {
       return;
     }
     try {
+      const target = this.#sessionLane.isSessionLane
+        ? await this.#sessionLane.targetForFrame(frame)
+        : this.#target;
+      if (!target) {
+        throw new Error("queue operations require a session socket");
+      }
       const response = await routeThroughFetchHandler(
         this.#deps,
         requestWithJson(this.#request, "/api/conversation/prompt", {
-          name: this.#target,
-          ...(stringField(frame.agentId) ? { agentId: stringField(frame.agentId) } : {}),
+          ...sessionTargetRequestBody(target),
           action,
           clientMutationId,
           ...(stringField(frame.commandId) ? { commandId: stringField(frame.commandId) } : {}),
@@ -411,9 +623,6 @@ export class CommandQueueHub {
   #deps;
   #subscribers = new Set();
   #groups = new Map();
-  #pendingRefreshes = new Map();
-  #timer;
-  #polling = false;
   #pollMs;
 
   constructor(deps) {
@@ -423,43 +632,106 @@ export class CommandQueueHub {
   }
 
   subscribe(request, target, handlers) {
-    const authKey = request.headers.get("cookie") ?? "local";
+    const normalizedTarget = normalizeSessionLookup(target);
+    if (!normalizedTarget) {
+      handlers.onError(
+        "queue subscription requires a session name or agentId",
+        { phase: "subscribe", fatal: true },
+      );
+      return () => {};
+    }
+    const authKey = commandQueueAuthKey(request);
     let group = this.#groups.get(authKey);
     if (!group) {
-      group = { request, cursor: 0, ready: false };
+      group = {
+        request,
+        cursor: 0,
+        ready: false,
+        generation: 0,
+        timer: undefined,
+        polling: false,
+        wakeAfterPoll: false,
+        pendingRefreshes: new Map(),
+      };
       this.#groups.set(authKey, group);
+    }
+    // A subscriber may hydrate to an older global cursor than already-mounted
+    // siblings. Pause this auth group until every active snapshot settles, then
+    // resume from their minimum; per-subscriber cursors suppress safe replay.
+    group.generation += 1;
+    group.ready = false;
+    if (group.timer) {
+      clearTimeout(group.timer);
+      group.timer = undefined;
     }
     const subscriber = {
       request,
-      target,
+      target: normalizedTarget,
       handlers,
       authKey,
       sessionId: undefined,
       cursor: 0,
       ready: false,
+      degradedPhases: new Set(),
       buffered: [],
+      failed: false,
       closed: false,
+      hydrationGeneration: 1,
     };
     this.#subscribers.add(subscriber);
-    void this.#hydrate(subscriber, group);
+    void this.#hydrate(subscriber, group, "subscribe", subscriber.hydrationGeneration);
     return () => {
       subscriber.closed = true;
       this.#subscribers.delete(subscriber);
-      if (![...this.#subscribers].some((entry) => entry.authKey === authKey)) {
+      const remaining = [...this.#subscribers].filter((entry) => (
+        entry.authKey === authKey && !entry.closed
+      ));
+      if (remaining.length === 0) {
+        if (group.timer) clearTimeout(group.timer);
+        group.pendingRefreshes.clear();
         this.#groups.delete(authKey);
+      } else {
+        group.generation += 1;
+        group.request = remaining[0].request;
+        this.#reconcileGroup(authKey, group);
       }
-      if (this.#subscribers.size === 0 && this.#timer) {
-        clearTimeout(this.#timer);
-        this.#timer = undefined;
-      }
-      if (this.#subscribers.size === 0) this.#pendingRefreshes.clear();
     };
   }
 
-  async #hydrate(subscriber, group) {
+  #queueError(subscriber, error, phase, fatal) {
+    if (fatal) subscriber.failed = true;
+    if (!fatal) subscriber.degradedPhases.add(phase);
+    subscriber.handlers.onError(messageForError(error), { phase, fatal });
+  }
+
+  #queueRestored(subscriber, phase, seq) {
+    if (subscriber.failed) return;
+    if (!subscriber.degradedPhases.delete(phase)) return;
+    if (subscriber.degradedPhases.size === 0) subscriber.handlers.onRestored?.(seq);
+  }
+
+  #reconcileGroup(authKey, group, delay = 0) {
+    if (this.#groups.get(authKey) !== group) return;
+    const active = [...this.#subscribers].filter((subscriber) => (
+      subscriber.authKey === authKey && !subscriber.closed && !subscriber.failed
+    ));
+    if (active.length === 0 || active.some((subscriber) => !subscriber.ready)) {
+      group.ready = false;
+      return;
+    }
+    group.cursor = Math.min(...active.map((subscriber) => subscriber.cursor));
+    group.ready = true;
+    this.#scheduleGroup(authKey, group, delay);
+  }
+
+  async #hydrate(subscriber, group, phase, generation) {
     try {
       const snapshot = await this.#loadSnapshot(subscriber.request, subscriber.target);
-      if (subscriber.closed) return;
+      if (
+        subscriber.closed
+        || this.#groups.get(subscriber.authKey) !== group
+        || subscriber.hydrationGeneration !== generation
+      ) return;
       subscriber.sessionId = stringField(snapshot?.sessionId);
       subscriber.handlers.onSnapshot(snapshot);
       const snapshotSeq = nonNegativeInteger(snapshot?.seq) ?? 0;
@@ -472,13 +744,26 @@ export class CommandQueueHub {
         subscriber.handlers.onTransition(event);
       }
       subscriber.buffered = [];
-      if (!group.ready) {
-        group.cursor = snapshotSeq;
-        group.ready = true;
+      subscriber.failed = false;
+      if (phase === "hydrate" && subscriber.degradedPhases.size > 0) {
+        subscriber.degradedPhases.clear();
+        subscriber.handlers.onRestored?.(subscriber.cursor);
       }
-      this.#schedule(0);
+      this.#reconcileGroup(
+        subscriber.authKey,
+        group,
+        phase === "hydrate" ? this.#pollMs : 0,
+      );
     } catch (error) {
-      if (!subscriber.closed) subscriber.handlers.onError(messageForError(error));
+      if (
+        !subscriber.closed
+        && this.#groups.get(subscriber.authKey) === group
+        && subscriber.hydrationGeneration === generation
+      ) {
+        subscriber.ready = false;
+        this.#queueError(subscriber, error, phase, true);
+        this.#reconcileGroup(subscriber.authKey, group);
+      }
     }
   }
 
@@ -486,7 +771,8 @@ export class CommandQueueHub {
     const url = new URL(request.url);
     url.pathname = "/api/conversation/prompt";
     url.search = "";
-    url.searchParams.set("name", target);
+    if (target.name) url.searchParams.set("name", target.name);
+    if (target.agentId) url.searchParams.set("agentId", target.agentId);
     const response = await routeThroughFetchHandler(
       this.#deps,
       new Request(url, { method: "GET", headers: request.headers }),
@@ -495,110 +781,178 @@ export class CommandQueueHub {
     return response.json();
   }
 
-  async #refreshSubscribers(subscribers) {
-    const active = [...subscribers].filter((subscriber) => !subscriber.closed);
-    if (active.length === 0) return true;
+  async #refreshGroupSubscribers(group, generation, subscribers) {
+    const active = [...subscribers].filter((subscriber) => (
+      !subscriber.closed && !subscriber.failed && subscriber.ready
+    ));
+    if (active.length === 0) return "done";
     try {
       // All entries share auth + target. Fetch once, then fan the authoritative projection out to
       // every mounted client. This is event-driven reconciliation, not another polling lane.
       const snapshot = await this.#loadSnapshot(active[0].request, active[0].target);
+      if (
+        this.#groups.get(active[0].authKey) !== group
+        || group.generation !== generation
+        || !group.ready
+      ) return "stale";
       const sessionId = stringField(snapshot?.sessionId);
       for (const subscriber of active) {
         if (subscriber.closed) continue;
         subscriber.sessionId = sessionId;
         subscriber.handlers.onSnapshot(snapshot);
+        this.#queueRestored(
+          subscriber,
+          "refresh",
+          nonNegativeInteger(snapshot?.seq) ?? subscriber.cursor,
+        );
       }
-      return true;
+      return "done";
     } catch (error) {
+      if (
+        this.#groups.get(active[0].authKey) !== group
+        || group.generation !== generation
+        || !group.ready
+      ) return "stale";
       for (const subscriber of active) {
-        if (!subscriber.closed) subscriber.handlers.onError(messageForError(error));
+        if (!subscriber.closed) this.#queueError(subscriber, error, "refresh", false);
       }
-      return false;
+      return "retry";
     }
   }
 
-  #schedule(delay) {
-    if (this.#timer || this.#polling || this.#subscribers.size === 0) return;
-    this.#timer = setTimeout(() => {
-      this.#timer = undefined;
-      void this.#poll();
+  #scheduleGroup(authKey, group, delay) {
+    if (this.#groups.get(authKey) !== group || !group.ready) return;
+    if (group.polling) {
+      if (delay === 0) group.wakeAfterPoll = true;
+      return;
+    }
+    if (group.timer) {
+      if (delay !== 0) return;
+      clearTimeout(group.timer);
+    }
+    group.timer = setTimeout(() => {
+      group.timer = undefined;
+      void this.#pollGroup(authKey, group);
     }, delay);
   }
 
-  async #poll() {
-    if (this.#polling) return;
-    this.#polling = true;
+  async #pollGroup(authKey, group) {
+    if (
+      group.polling
+      || !group.ready
+      || this.#groups.get(authKey) !== group
+    ) return;
+    group.polling = true;
+    const generation = group.generation;
+    const requestCursor = group.cursor;
     let caughtUp = true;
     try {
-      for (const [authKey, group] of this.#groups) {
-        if (!group.ready) continue;
-        const url = new URL(group.request.url);
-        url.pathname = "/api/conversation/prompt";
-        url.search = "";
-        url.searchParams.set("eventsAfter", String(group.cursor));
-        const response = await routeThroughFetchHandler(
-          this.#deps,
-          new Request(url, { method: "GET", headers: group.request.headers }),
-        );
-        if (!response.ok) throw new Error(await errorReason(response));
-        const body = await response.json();
-        if (body?.gap === true) {
-          group.ready = false;
-          const affected = [...this.#subscribers].filter((entry) => entry.authKey === authKey);
-          for (const subscriber of affected) {
-            subscriber.ready = false;
-            subscriber.buffered = [];
-            void this.#hydrate(subscriber, group);
-          }
-          continue;
+      const url = new URL(group.request.url);
+      url.pathname = "/api/conversation/prompt";
+      url.search = "";
+      url.searchParams.set("eventsAfter", String(requestCursor));
+      const response = await routeThroughFetchHandler(
+        this.#deps,
+        new Request(url, { method: "GET", headers: group.request.headers }),
+      );
+      if (!response.ok) throw new Error(await errorReason(response));
+      const body = await response.json();
+      if (
+        this.#groups.get(authKey) !== group
+        || group.generation !== generation
+        || !group.ready
+        || group.cursor !== requestCursor
+      ) return;
+      if (body?.gap === true) {
+        group.generation += 1;
+        group.ready = false;
+        group.pendingRefreshes.clear();
+        const affected = [...this.#subscribers].filter((entry) => (
+          entry.authKey === authKey && !entry.closed && !entry.failed
+        ));
+        for (const subscriber of affected) {
+          subscriber.ready = false;
+          subscriber.buffered = [];
+          subscriber.hydrationGeneration += 1;
+          void this.#hydrate(
+            subscriber,
+            group,
+            "hydrate",
+            subscriber.hydrationGeneration,
+          );
         }
-        const events = Array.isArray(body?.events) ? body.events : [];
-        for (const event of events) {
-          const seq = nonNegativeInteger(event?.seq);
-          if (seq === undefined || seq <= group.cursor) continue;
-          group.cursor = seq;
-          for (const subscriber of this.#subscribers) {
-            if (subscriber.authKey !== authKey || subscriber.closed) continue;
-            if (stringField(event?.sessionId) !== subscriber.sessionId) continue;
-            if (seq <= subscriber.cursor) continue;
-            if (subscriber.ready) {
-              subscriber.cursor = seq;
-              subscriber.handlers.onTransition(event);
-              // A queued transition can mean new, edited, reordered, or redirected content. The
-              // transition remains the lifecycle fact; one coalesced snapshot supplies text/order
-              // that intentionally do not bloat every event row.
-              if (commandQueueState(event?.state) === "queued") {
-                const key = `${subscriber.authKey}\u0000${subscriber.target}`;
-                let entries = this.#pendingRefreshes.get(key);
-                if (!entries) {
-                  entries = new Set();
-                  this.#pendingRefreshes.set(key, entries);
-                }
-                entries.add(subscriber);
-              }
-            } else {
-              subscriber.buffered.push(event);
-            }
-          }
-        }
-        const latest = nonNegativeInteger(body?.latestSeq) ?? group.cursor;
-        if (events.length === 0) group.cursor = Math.max(group.cursor, latest);
-        if (group.cursor < latest) caughtUp = false;
+        return;
       }
-      for (const [key, subscribers] of this.#pendingRefreshes) {
-        if (await this.#refreshSubscribers(subscribers)) {
-          this.#pendingRefreshes.delete(key);
+      const events = Array.isArray(body?.events) ? body.events : [];
+      for (const event of events) {
+        const seq = nonNegativeInteger(event?.seq);
+        if (seq === undefined || seq <= group.cursor) continue;
+        group.cursor = seq;
+        for (const subscriber of this.#subscribers) {
+          if (subscriber.authKey !== authKey || subscriber.closed || subscriber.failed) continue;
+          if (stringField(event?.sessionId) !== subscriber.sessionId) continue;
+          if (seq <= subscriber.cursor) continue;
+          if (subscriber.ready) {
+            subscriber.cursor = seq;
+            subscriber.handlers.onTransition(event);
+            // A queued transition can mean new, edited, reordered, or redirected content. The
+            // transition remains the lifecycle fact; one coalesced snapshot supplies text/order
+            // that intentionally do not bloat every event row.
+            if (commandQueueState(event?.state) === "queued") {
+              const key = sessionTargetKey(subscriber.target);
+              let entries = group.pendingRefreshes.get(key);
+              if (!entries) {
+                entries = new Set();
+                group.pendingRefreshes.set(key, entries);
+              }
+              entries.add(subscriber);
+            }
+          } else {
+            subscriber.buffered.push(event);
+          }
         }
+      }
+      const latest = nonNegativeInteger(body?.latestSeq) ?? group.cursor;
+      if (events.length === 0) group.cursor = Math.max(group.cursor, latest);
+      if (group.cursor < latest) caughtUp = false;
+
+      for (const [key, subscribers] of group.pendingRefreshes) {
+        const result = await this.#refreshGroupSubscribers(group, generation, subscribers);
+        if (result === "stale") return;
+        if (result === "done") group.pendingRefreshes.delete(key);
+      }
+      for (const subscriber of this.#subscribers) {
+        if (subscriber.authKey !== authKey || subscriber.closed || subscriber.failed) continue;
+        this.#queueRestored(subscriber, "events", group.cursor);
       }
     } catch (error) {
-      for (const subscriber of this.#subscribers) {
-        if (!subscriber.closed) subscriber.handlers.onError(messageForError(error));
+      if (
+        this.#groups.get(authKey) === group
+        && group.generation === generation
+        && group.ready
+      ) {
+        for (const subscriber of this.#subscribers) {
+          if (subscriber.authKey !== authKey || subscriber.closed || subscriber.failed) continue;
+          this.#queueError(subscriber, error, "events", false);
+        }
       }
     } finally {
-      this.#polling = false;
-      this.#schedule(caughtUp ? this.#pollMs : 0);
+      group.polling = false;
+      if (this.#groups.get(authKey) === group && group.ready) {
+        const delay = group.wakeAfterPoll ? 0 : (caughtUp ? this.#pollMs : 0);
+        group.wakeAfterPoll = false;
+        this.#scheduleGroup(authKey, group, delay);
+      }
     }
   }
+}
+
+function commandQueueAuthKey(request) {
+  const cookie = request.headers.get("cookie");
+  if (cookie) return `cookie\u0000${cookie}`;
+  const authorization = request.headers.get("authorization");
+  if (authorization) return `authorization\u0000${authorization}`;
+  return "local";
 }
 
 function commandQueueState(value) {
@@ -626,17 +980,35 @@ class CommandFrames {
   #request;
   #deps;
   #sessionInput;
+  #sessionLane;
   #replay = new Map();
 
-  constructor(socket, request, deps, sessionInput) {
+  constructor(socket, request, deps, sessionInput, sessionLane) {
     this.#socket = socket;
     this.#request = request;
     this.#deps = deps;
     this.#sessionInput = sessionInput;
+    this.#sessionLane = sessionLane;
   }
 
   async list(frame) {
-    const target = stringField(frame.target) ?? sessionNameFromRequest(this.#request);
+    let target;
+    try {
+      target = this.#sessionLane.isSessionLane
+        ? await this.#sessionLane.targetForFrame(frame)
+        : normalizeSessionLookup(frame.target, frame.agentId)
+          ?? sessionTargetFromRequest(this.#request);
+    } catch (error) {
+      sendJson(this.#socket, {
+        t: "commands.err",
+        ...(stringField(frame.clientCommandId)
+          ? { clientCommandId: stringField(frame.clientCommandId) }
+          : {}),
+        error: messageForError(error),
+        code: "invalid_args",
+      });
+      return;
+    }
     if (!target) {
       sendJson(this.#socket, {
         t: "commands.err",
@@ -649,7 +1021,12 @@ class CommandFrames {
       return;
     }
     const harness = await this.#harnessFor(target);
-    sendJson(this.#socket, { t: "commands.catalog", target, ...catalogForHarness(harness) });
+    sendJson(this.#socket, {
+      t: "commands.catalog",
+      target: sessionTargetLabel(target),
+      ...(target.agentId ? { agentId: target.agentId } : {}),
+      ...catalogForHarness(harness),
+    });
   }
 
   async invoke(frame) {
@@ -676,7 +1053,15 @@ class CommandFrames {
     const err = (error, code) =>
       this.#finish(clientCommandId, [{ t: "command.err", clientCommandId, error, code }]);
 
-    const target = stringField(frame.target) ?? sessionNameFromRequest(this.#request);
+    let target;
+    try {
+      target = this.#sessionLane.isSessionLane
+        ? await this.#sessionLane.targetForFrame(frame)
+        : normalizeSessionLookup(frame.target, frame.agentId)
+          ?? sessionTargetFromRequest(this.#request);
+    } catch (error) {
+      return err(messageForError(error), "invalid_args");
+    }
     if (!target) return err("command requires a target session", "invalid_args");
     const name = stringField(frame.name);
     if (!name) return err("command.name is required", "invalid_args");
@@ -697,12 +1082,19 @@ class CommandFrames {
       const response = descriptor.class === "gateway"
         ? await routeThroughFetchHandler(
             this.#deps,
-            requestWithJson(this.#request, gatewayVerbPath(name), { name: target }),
+            requestWithJson(
+              this.#request,
+              gatewayVerbPath(name),
+              {
+                ...sessionTargetRequestBody(target),
+                clientMessageId: clientCommandId,
+              },
+            ),
           )
         : await this.#sessionInput(
             {
               mode: "session",
-              target,
+              target: sessionTargetWireValue(target),
               text: renderHarnessInvocation(descriptor, frame.args),
               clientMessageId: clientCommandId,
             },
@@ -733,7 +1125,7 @@ class CommandFrames {
   async #harnessFor(target) {
     const resolve = this.#deps.resolveHarness ?? defaultResolveHarness(this.#deps);
     try {
-      return await resolve(target, this.#request);
+      return await resolve(sessionTargetWireValue(target), this.#request);
     } catch {
       return undefined;
     }
@@ -758,6 +1150,8 @@ const PENDING_COMMAND = Symbol("pending command");
 
 function defaultResolveHarness(deps) {
   return async (target, request) => {
+    const lookup = normalizeSessionLookup(target);
+    if (!lookup) return undefined;
     const url = new URL(request.url);
     url.pathname = "/api/v1/members";
     url.search = "?includeOffline=true";
@@ -768,7 +1162,9 @@ function defaultResolveHarness(deps) {
     if (!response.ok) return undefined;
     const members = await response.json();
     if (!Array.isArray(members)) return undefined;
-    const member = members.find((row) => row?.name === target);
+    const member = lookup.agentId
+      ? members.find((row) => row?.agentId === lookup.agentId)
+      : members.find((row) => row?.name === lookup.name);
     return typeof member?.agent === "string" ? member.agent : undefined;
   };
 }
@@ -789,10 +1185,12 @@ class DeveloperEventSubscriptions {
   #daemonToolCallActiveTopics = new Set();
   #daemonFleetSource;
   #closed = false;
+  #deps;
 
   constructor(socket, request, deps) {
     this.#socket = socket;
     this.#sessionName = sessionNameFromRequest(request);
+    this.#deps = deps;
     this.#source = deps.developerEvents;
     this.#daemonToolCallSource = Object.prototype.hasOwnProperty.call(deps, "daemonToolCallEvents")
       ? deps.daemonToolCallEvents
@@ -800,6 +1198,15 @@ class DeveloperEventSubscriptions {
     this.#daemonFleetSource = Object.prototype.hasOwnProperty.call(deps, "daemonFleetStatusEvents")
       ? deps.daemonFleetStatusEvents
       : createDaemonPushDeveloperEventSource(FLEET_SESSION_KEY);
+  }
+
+  bindSession(name) {
+    const canonicalName = stringField(name);
+    if (!canonicalName) return;
+    this.#sessionName = canonicalName;
+    if (!Object.prototype.hasOwnProperty.call(this.#deps, "daemonToolCallEvents")) {
+      this.#daemonToolCallSource = createDaemonPushDeveloperEventSource(canonicalName);
+    }
   }
 
   subscribe(frame) {
@@ -851,13 +1258,7 @@ class DeveloperEventSubscriptions {
           if (!state.active || this.#closed) return false;
           const seq = Number(event?.seq ?? 0);
           if (!Number.isInteger(seq) || seq <= state.cursor) return true;
-          if ((this.#socket.bufferedAmount ?? 0) > MAX_BUFFERED_AMOUNT) {
-            this.#socket.close?.(1013, "developer event websocket backpressure");
-            return false;
-          }
-          sendJson(this.#socket, { type: "developer.event", event });
-          state.cursor = seq;
-          return true;
+          return this.#sendEvent(state, event);
         },
         onError: (error) => {
           if (!state.active || this.#closed) return;
@@ -923,8 +1324,7 @@ class DeveloperEventSubscriptions {
     if (rows.length > TOOL_CALL_RING_LIMIT) rows.splice(0, rows.length - TOOL_CALL_RING_LIMIT);
     const state = this.#topics.get(event.topic);
     if (!state?.active || state.cursor >= event.seq) return;
-    sendJson(this.#socket, { type: "developer.event", event });
-    state.cursor = event.seq;
+    this.#sendEvent(state, event);
   }
 
   #subscribeToolCalls(topic, afterSeq) {
@@ -944,8 +1344,7 @@ class DeveloperEventSubscriptions {
         this.#daemonToolCallActiveTopics.add(topic);
         const seq = Number(event.seq ?? 0);
         if (seq <= state.cursor) return;
-        sendJson(this.#socket, { type: "developer.event", event });
-        state.cursor = seq;
+        this.#sendEvent(state, event);
       },
       onGap: (frame) => {
         if (!state.active || this.#closed) return;
@@ -965,8 +1364,7 @@ class DeveloperEventSubscriptions {
     for (const event of this.#rowsForTopic(topic)) {
       if (!state.active || this.#closed) return;
       if (Number(event.seq ?? 0) <= state.cursor) continue;
-      sendJson(this.#socket, { type: "developer.event", event });
-      state.cursor = event.seq;
+      if (!this.#sendEvent(state, event)) return;
     }
   }
 
@@ -1002,8 +1400,7 @@ class DeveloperEventSubscriptions {
         // to move an ahead-of-boot cursor backwards; otherwise every event in the new boot would
         // be suppressed forever by a cursor retained from the old one.
         if (!isResync && seq <= state.cursor) return;
-        sendJson(this.#socket, { type: "developer.event", event });
-        state.cursor = seq;
+        this.#sendEvent(state, event);
       },
       onGap: (frame) => {
         if (!state.active || this.#closed) return;
@@ -1021,6 +1418,21 @@ class DeveloperEventSubscriptions {
         // reconnect loop re-subscribes with its cursor, so nothing to do here.
       },
     });
+  }
+
+  #sendEvent(state, event) {
+    const payload = JSON.stringify({ type: "developer.event", event });
+    const bufferedAmount = this.#socket.bufferedAmount ?? 0;
+    if (bufferedAmount + Buffer.byteLength(payload, "utf8") > MAX_BUFFERED_AMOUNT) {
+      this.#socket.close?.(
+        1013,
+        `${DEVELOPER_BACKPRESSURE_REASON}${state.cursor}`,
+      );
+      return false;
+    }
+    this.#socket.send(payload);
+    state.cursor = Number(event.seq);
+    return true;
   }
 
   #toolCallEventFromAgui(frame) {
@@ -1098,6 +1510,141 @@ function sessionNameFromRequest(request) {
   return stringField(session);
 }
 
+function sessionTargetFromRequest(request) {
+  const params = new URL(request.url).searchParams;
+  return normalizeSessionLookup(
+    params.get("session"),
+    params.get("agentId"),
+  );
+}
+
+class SessionLaneBinding {
+  #request;
+  #pathSessionId;
+  #fallbackTarget;
+  #resolve;
+  #settled = false;
+  #ready;
+
+  constructor(request) {
+    this.#request = request;
+    this.#pathSessionId = sessionIdFromPath(request);
+    this.#fallbackTarget = sessionLaneTargetFromRequest(request);
+    this.isSessionLane = Boolean(this.#pathSessionId || this.#fallbackTarget);
+    this.#ready = this.isSessionLane
+      ? new Promise((resolve) => { this.#resolve = resolve; })
+      : Promise.resolve({ target: undefined });
+  }
+
+  bindResponse(response) {
+    if (!this.isSessionLane || this.#settled) return undefined;
+    const responseSessionId = stringField(response.headers.get("x-nexus-session-id"));
+    const responseTarget = normalizeSessionLookup(
+      response.headers.get("x-nexus-agent-name"),
+      response.headers.get("x-nexus-agent-id"),
+    );
+    if (this.#pathSessionId) {
+      if (!responseSessionId || responseSessionId !== this.#pathSessionId || !responseTarget?.agentId) {
+        const error = "agent-session response is missing its canonical lane binding";
+        this.fail(error);
+        throw new Error(error);
+      }
+    }
+    const target = responseTarget ?? this.#fallbackTarget;
+    if (!target) {
+      const error = "agent-session lane target is not materialized";
+      this.fail(error);
+      throw new Error(error);
+    }
+    this.#settled = true;
+    this.#resolve?.({
+      target,
+      sessionId: responseSessionId ?? this.#pathSessionId,
+      canonical: Boolean(responseTarget),
+    });
+    return target;
+  }
+
+  fail(error) {
+    if (!this.isSessionLane || this.#settled) return;
+    this.#settled = true;
+    this.#resolve?.({ error });
+  }
+
+  async targetForFrame(frame) {
+    const state = await this.#ready;
+    if (state.error) throw new Error(state.error);
+    const canonical = state.target;
+    if (!canonical) throw new Error("agent-session lane target is not materialized");
+    const explicit = normalizeSessionLookup(frame?.target, frame?.agentId);
+    if (!explicit) return canonical;
+    if (canonical.agentId && explicit.agentId) {
+      if (canonical.agentId !== explicit.agentId) {
+        throw new Error("frame target does not match the bound agent-session lane");
+      }
+      return canonical;
+    }
+    if (explicit.agentId && !canonical.agentId) {
+      if (!state.canonical && explicit.name === canonical.name) return explicit;
+      throw new Error("frame stable agent id cannot be verified on this session lane");
+    }
+    if (explicit.name && explicit.name !== canonical.name) {
+      throw new Error("frame target does not match the bound agent-session lane");
+    }
+    return canonical;
+  }
+}
+
+function sessionLaneTargetFromRequest(request) {
+  const params = new URL(request.url).searchParams;
+  const session = stringField(params.get("session"));
+  const agentId = stringField(params.get("agentId"));
+  if (session) return normalizeSessionLookup(session, agentId);
+  if (!agentId || params.get("thread") || params.get("dm") || params.get("topic")) return undefined;
+  return { agentId };
+}
+
+function sessionIdFromPath(request) {
+  const match = /^\/api\/v1\/agent-sessions\/([^/]+)\/events$/.exec(new URL(request.url).pathname);
+  if (!match) return undefined;
+  try {
+    return stringField(decodeURIComponent(match[1]));
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeSessionLookup(value, explicitAgentId) {
+  const name = typeof value === "string"
+    ? stringField(value)
+    : stringField(value?.name);
+  const agentId = stringField(explicitAgentId) ?? stringField(value?.agentId);
+  if (!name && !agentId) return undefined;
+  return {
+    ...(name ? { name } : {}),
+    ...(agentId ? { agentId } : {}),
+  };
+}
+
+function sessionTargetLabel(target) {
+  return target.name ?? target.agentId;
+}
+
+function sessionTargetWireValue(target) {
+  return target.agentId ? target : target.name;
+}
+
+function sessionTargetRequestBody(target) {
+  return {
+    ...(target.name ? { name: target.name } : {}),
+    ...(target.agentId ? { agentId: target.agentId } : {}),
+  };
+}
+
+function sessionTargetKey(target) {
+  return target.agentId ? `agent:${target.agentId}` : `name:${target.name}`;
+}
+
 function toolCallTopic(agent) {
   return `${TOOL_CALL_TOPIC_PREFIX}${agent}${TOOL_CALL_TOPIC_SUFFIX}`;
 }
@@ -1133,29 +1680,32 @@ function withSocketScopedInputDefaults(frame, request) {
   if (frame.mode) return frame;
   const params = new URL(request.url).searchParams;
   const session = params.get("session");
-  if (session) {
+  const queryAgentId = stringField(params.get("agentId"));
+  const thread = params.get("thread");
+  const dm = params.get("dm");
+  const topic = params.get("topic");
+  const idOnlySession = queryAgentId && !session && !thread && !dm && !topic;
+  if (session || idOnlySession) {
     if (frame.target) return { ...frame, mode: "session" };
-    const agentId = stringField(frame.agentId);
+    const agentId = stringField(frame.agentId) ?? queryAgentId;
     return {
       ...frame,
       mode: "session",
-      target: agentId ? { name: session, agentId } : session,
+      target: agentId
+        ? { ...(session ? { name: session } : {}), agentId }
+        : session,
     };
   }
   if (frame.target) return { ...frame, mode: "bus" };
-  const thread = params.get("thread");
   if (thread) return { ...frame, mode: "bus", target: { verb: "post", thread } };
-  const dm = params.get("dm");
-  const targetAgentId = params.get("agentId");
-  if (targetAgentId) {
+  if (queryAgentId) {
     return {
       ...frame,
       mode: "bus",
-      target: { verb: "dm", agentId: targetAgentId, ...(dm ? { name: dm } : {}) },
+      target: { verb: "dm", agentId: queryAgentId, ...(dm ? { name: dm } : {}) },
     };
   }
   if (dm) return { ...frame, mode: "bus", target: { verb: "dm", name: dm } };
-  const topic = params.get("topic");
   if (topic) return { ...frame, mode: "bus", target: { verb: "publish", topic } };
   return frame;
 }
@@ -1165,12 +1715,15 @@ function withSocketScopedInputDefaults(frame, request) {
 // its existing prompt/bus routing paths.
 function withSocketScopedSteerDefaults(frame, request) {
   if (frame.target) return frame;
-  const session = new URL(request.url).searchParams.get("session");
-  if (!session) return frame;
-  const agentId = stringField(frame.agentId);
+  const params = new URL(request.url).searchParams;
+  const session = params.get("session");
+  const agentId = stringField(frame.agentId) ?? stringField(params.get("agentId"));
+  if (!session && !agentId) return frame;
   return {
     ...frame,
-    target: agentId ? { name: session, agentId } : session,
+    target: agentId
+      ? { ...(session ? { name: session } : {}), agentId }
+      : session,
   };
 }
 
@@ -1211,7 +1764,12 @@ function normalizeSessionTarget(target) {
   if (target && typeof target === "object") {
     const name = stringField(target.name);
     const agentId = stringField(target.agentId);
-    if (name || agentId) return { name, agentId };
+    if (name || agentId) {
+      return {
+        ...(name ? { name } : {}),
+        ...(agentId ? { agentId } : {}),
+      };
+    }
   }
   throw new Error("session input target must be a name or {name,agentId}");
 }
@@ -1295,6 +1853,20 @@ function defaultSteerInput(deps) {
         ...(target.agentId ? { agentId: target.agentId } : {}),
         text: input.text,
         ...(input.clientMessageId ? { clientMessageId: input.clientMessageId } : {}),
+      }),
+    );
+  };
+}
+
+function defaultInterruptInput(deps) {
+  return async (input, request) => {
+    const target = typeof input.target === "string" ? { name: input.target } : input.target;
+    return routeThroughFetchHandler(
+      deps,
+      requestWithJson(request, "/api/conversation/interrupt", {
+        name: target.name ?? target.agentId,
+        ...(target.agentId ? { agentId: target.agentId } : {}),
+        clientMessageId: input.clientMessageId,
       }),
     );
   };

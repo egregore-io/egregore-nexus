@@ -150,22 +150,22 @@ describe("canonical Gateway projection application", () => {
       },
     });
 
-    const earlIdentity = identity("a_earl", "earl", 1);
-    const earlRuntime = runtime("s_earl", "a_earl", 2);
-    const bobIdentity = identity("a_bob", "Bob", 3);
-    const bobRuntime = runtime("s_bob", "a_bob", 4);
-    for (const event of [earlIdentity, earlRuntime, bobIdentity, bobRuntime]) {
+    const staleIdentity = identity("a_stale", "stale-agent", 1);
+    const staleRuntime = runtime("s_stale", "a_stale", 2);
+    const currentIdentity = identity("a_current", "current-agent", 3);
+    const currentRuntime = runtime("s_current", "a_current", 4);
+    for (const event of [staleIdentity, staleRuntime, currentIdentity, currentRuntime]) {
       await applyCanonicalProjection(db, event);
     }
 
     await applyCanonicalProjection(db, {
-      ...bobIdentity,
+      ...currentIdentity,
       daemonEpoch: "boot-2",
       seq: 1,
       occurredAt: 10,
     });
     await applyCanonicalProjection(db, {
-      ...bobRuntime,
+      ...currentRuntime,
       daemonEpoch: "boot-2",
       seq: 2,
       occurredAt: 11,
@@ -174,14 +174,14 @@ describe("canonical Gateway projection application", () => {
     expect((await db.execute(
       "SELECT runtime_id, status FROM runtime_descriptors ORDER BY runtime_id",
     )).rows).toMatchObject([
-      { runtime_id: "s_bob", status: "online" },
-      { runtime_id: "s_earl", status: "stopped" },
+      { runtime_id: "s_current", status: "online" },
+      { runtime_id: "s_stale", status: "stopped" },
     ]);
     expect((await db.execute(
       "SELECT agent_id FROM identities ORDER BY agent_id",
     )).rows).toMatchObject([
-      { agent_id: "a_bob" },
-      { agent_id: "a_earl" },
+      { agent_id: "a_current" },
+      { agent_id: "a_stale" },
     ]);
   });
 });

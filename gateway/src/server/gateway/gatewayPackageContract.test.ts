@@ -39,11 +39,24 @@ describe("public gateway package contract", () => {
     expect(source).toContain('"--discovery=write"');
 
     const serveSource = await readFile(join(root, "scripts/gateway-serve-impl.mjs"), "utf8");
-    expect(serveSource).not.toContain('import { attachAguiWsUpgrade } from "../src/server/agui/ws.mjs"');
-    expect(serveSource).toContain('await import("../src/server/agui/ws.mjs")');
-    expect(serveSource).toContain('import.meta.resolve("tsx/cli")');
-    expect(serveSource).toContain('"--tsconfig", join(FRONTEND_DIR, "tsconfig.json")');
+    expect(serveSource).not.toContain("../src/server/");
+    expect(serveSource).toContain("attachHeadlessGatewayWs");
+    expect(serveSource).toContain("guardGatewayBrowserRequest");
+    expect(serveSource).toContain(
+      "const guardedHandler = (request) => guardGatewayBrowserRequest(request, handler)",
+    );
+    expect(serveSource).toContain("handlePackagedRequest(guardedHandler, req, res)");
+    expect(serveSource).toContain(
+      "await attachHeadlessGatewayWs(server, { fetchHandler: guardedHandler })",
+    );
+    expect(serveSource).not.toContain("tsx/cli");
+    expect(serveSource).not.toContain("src/server");
+    expect(serveSource).not.toContain("spawn(process.execPath");
+    expect(serveSource).toContain("await createHeadlessGatewayServer()");
     expect(serveSource).toContain('join(FRONTEND_DIR, "dist-gateway/headless.mjs")');
+    expect(serveSource).toContain('value === "local-operator"');
+    expect(serveSource).toContain('value === "remote-human"');
+    expect(serveSource).toContain('value === "remote-agent"');
     expect(serveSource).toContain("writeGatewayDiscovery(port, process.pid)");
     expect(serveSource).not.toContain("writeGatewayDiscovery(port, runner.pid)");
   });

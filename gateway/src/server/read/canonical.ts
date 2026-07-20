@@ -7,6 +7,7 @@ import {
 } from "../store/repos/messages";
 import { Kind, Scope, type Message, type Provenance } from "@shared/types";
 import type {
+  AgentAccessGrantRow,
   AgentOwnerRow,
   AgentRuntimeRow,
   AgentShowRow,
@@ -30,6 +31,7 @@ export interface CanonicalSearchRow {
 export interface CanonicalHistoryRow {
   messageId: string;
   from: string;
+  fromKind?: string;
   when: number;
   summary?: string;
   body: string;
@@ -46,6 +48,12 @@ export interface CanonicalHistoryPage {
 export interface CanonicalAgentSessionTarget {
   sessionId?: string;
   owner: AgentOwnerRow;
+}
+
+export interface CanonicalAgentSessionLookup {
+  agentId?: string;
+  sessionId?: string;
+  name?: string;
 }
 
 interface CanonicalRuntimeRow extends AgentRuntimeRow {
@@ -131,10 +139,9 @@ export async function canonicalAgentRuntimesFor(
   options: { includeStopped?: boolean; project?: string } = {},
 ): Promise<{ agentId: string; runtimes: CanonicalRuntimeRow[] } | undefined> {
   const identity = await canonicalIdentity(db, id);
-  if (!identity || (options.project && identity.project !== options.project)) return undefined;
+  if (!identity) return undefined;
   const runtimes = await canonicalRuntimes(db, {
     includeStopped: options.includeStopped,
-    project: options.project,
   });
   return { agentId: identity.agentId, runtimes: runtimes.filter((row) => row.agentId === identity.agentId) };
 }
@@ -145,7 +152,7 @@ export async function canonicalAgentShow(
   options: { includeStopped?: boolean; project?: string } = {},
 ): Promise<AgentShowRow | undefined> {
   const identity = await canonicalIdentity(db, id);
-  if (!identity || (options.project && identity.project !== options.project)) return undefined;
+  if (!identity) return undefined;
   const runtimeRows = await canonicalAgentRuntimesFor(db, id, options);
   const runtimes = runtimeRows?.runtimes ?? [];
   return {
@@ -201,6 +208,7 @@ export async function canonicalWhoami(db: Client, name: string): Promise<WhoamiR
   const member = (await canonicalMembers(db, { includeOffline: true }))
     .find((row) => row.agentId === identity.agentId);
   return {
+    agentId: identity.agentId,
     name: identity.name,
     sessionId: member?.sessionId ?? "",
     role: identity.role,
@@ -215,7 +223,14 @@ export async function canonicalThreadMembers(
   name: string,
 ): Promise<ThreadRow | undefined> {
   const result = await db.execute({
-    sql: `SELECT t.name, i.name AS member_name
+    sql: `SELECT t.name,
+                 COALESCE(
+                   i.name,
+                   CASE
+                     WHEN tm.agent_id LIKE 'legacy-name:%'
+                     THEN substr(tm.agent_id, 13)
+                   END
+                 ) AS member_name
           FROM threads t
           LEFT JOIN thread_members tm ON tm.thread_id = t.thread_id AND tm.left_at IS NULL
           LEFT JOIN identities i ON i.agent_id = tm.agent_id
@@ -269,6 +284,10 @@ export async function canonicalMetadata(
   entity: MetadataEntityKind,
   id: string,
 ): Promise<MetadataReadResult | undefined> {
+  if (entity === "agent") {
+    const identity = await canonicalIdentity(db, id);
+    return identity ? { entity, id, metadata: identity.metadata } : undefined;
+  }
   let result;
   switch (entity) {
     case "message":
@@ -290,13 +309,6 @@ export async function canonicalMetadata(
         args: [id, id],
       });
       break;
-    case "agent":
-      result = await db.execute({
-        sql: `SELECT metadata_json FROM identities
-              WHERE name = ? OR agent_id = ? LIMIT 1`,
-        args: [id, id],
-      });
-      break;
   }
   const row = result.rows[0];
   if (!row) return undefined;
@@ -311,45 +323,112 @@ export async function canonicalMetadata(
 /** Resolve a display name to the newest live runtime using Gateway-owned projection state. */
 export async function canonicalAgentSessionTarget(
   db: Client,
-  nameOrAgentId: string,
+  lookup: string | CanonicalAgentSessionLookup,
 ): Promise<CanonicalAgentSessionTarget | undefined> {
-  const result = await db.execute({
-    sql: `SELECT i.agent_id, i.name, i.owner, i.role, i.tier, i.metadata_json,
-                 r.session_id, r.runtime_id
-          FROM identities i
-          LEFT JOIN runtime_descriptors r ON r.agent_id = i.agent_id
-          WHERE i.name = ? OR i.agent_id = ?
-          ORDER BY CASE
-            WHEN lower(COALESCE(r.status, '')) IN ('stopped', 'offline') THEN 1
-            ELSE 0
-          END ASC,
-          r.updated_at DESC
-          LIMIT 1`,
-    args: [nameOrAgentId, nameOrAgentId],
-  });
-  const row = result.rows[0];
-  if (!row) return undefined;
-  const metadata = parseObject(row.metadata_json);
-  const agentId = String(row.agent_id);
-  const name = optionalString(row.name) ?? nameOrAgentId;
-  const sessionId = optionalString(row.session_id) ?? optionalString(row.runtime_id);
+  const exactAgentId = typeof lookup === "string" ? undefined : optionalString(lookup.agentId);
+  const exactSessionId = typeof lookup === "string" ? undefined : optionalString(lookup.sessionId);
+  const displayLookup = typeof lookup === "string"
+    ? lookup
+    : optionalString(lookup.name);
+  const target = exactAgentId ?? exactSessionId ?? displayLookup;
+  if (!target) return undefined;
+  let identity: CanonicalIdentity | undefined;
+  let sessionId: string | undefined;
+  if (exactSessionId) {
+    const runtimeColumns = `SELECT i.agent_id, i.name, i.owner, i.role, i.tier, i.metadata_json,
+                   r.session_id, r.runtime_id
+            FROM runtime_descriptors r
+            JOIN identities i ON i.agent_id = r.agent_id`;
+    const runtimeOrder = `ORDER BY CASE
+              WHEN lower(COALESCE(r.status, '')) IN ('stopped', 'offline') THEN 1
+              ELSE 0
+            END ASC,
+            r.updated_at DESC
+            LIMIT 1`;
+    let result = await db.execute({
+      sql: `SELECT i.agent_id, i.name, i.owner, i.role, i.tier, i.metadata_json,
+                   r.session_id, r.runtime_id
+            FROM runtime_descriptors r
+            JOIN identities i ON i.agent_id = r.agent_id
+            WHERE r.session_id = ?
+            ${runtimeOrder}`,
+      args: [exactSessionId],
+    });
+    if (!result.rows[0]) {
+      result = await db.execute({
+        sql: `${runtimeColumns} WHERE r.runtime_id = ? ${runtimeOrder}`,
+        args: [exactSessionId],
+      });
+    }
+    const row = result.rows[0];
+    if (!row) return undefined;
+    identity = canonicalIdentityFromRow(row);
+    sessionId = optionalString(row.session_id) ?? optionalString(row.runtime_id);
+  } else {
+    identity = exactAgentId
+      ? await canonicalIdentityByAgentId(db, exactAgentId)
+      : await canonicalIdentity(db, displayLookup!);
+    if (!identity) return undefined;
+    const runtime = await db.execute({
+      sql: `SELECT session_id, runtime_id
+            FROM runtime_descriptors
+            WHERE agent_id = ?
+            ORDER BY CASE
+              WHEN lower(COALESCE(status, '')) IN ('stopped', 'offline') THEN 1
+              ELSE 0
+            END ASC,
+            updated_at DESC
+            LIMIT 1`,
+      args: [identity.agentId],
+    });
+    sessionId = optionalString(runtime.rows[0]?.session_id)
+      ?? optionalString(runtime.rows[0]?.runtime_id);
+  }
   return {
     ...(sessionId ? { sessionId } : {}),
     owner: {
-      agentId,
-      name,
-      project: optionalString(metadata.project) ?? "default",
-      role: optionalString(row.role),
-      tier: optionalString(row.tier),
-      ownerName: optionalString(row.owner),
-      ownerProject: optionalString(metadata.ownerProject),
-      ownerSessionId: optionalString(metadata.ownerSessionId),
-      ownerAgentId: optionalString(metadata.ownerAgentId),
-      sessionKind: optionalString(metadata.kind),
-      sessionRole: optionalString(metadata.sessionRole),
-      sessionTier: optionalString(metadata.sessionTier),
+      agentId: identity.agentId,
+      name: identity.name,
+      project: identity.project,
+      role: identity.role,
+      tier: identity.tier,
+      ownerName: identity.owner,
+      ownerProject: optionalString(identity.metadata.ownerProject),
+      ownerSessionId: optionalString(identity.metadata.ownerSessionId),
+      ownerAgentId: optionalString(identity.metadata.ownerAgentId),
+      sessionKind: optionalString(identity.metadata.kind),
+      sessionRole: optionalString(identity.metadata.sessionRole),
+      sessionTier: optionalString(identity.metadata.sessionTier),
     },
   };
+}
+
+/** Read the delegated ACL snapshot carried by the canonical identity projection. */
+export async function canonicalAgentAccessGrantsByAgentId(
+  db: Client,
+  agentId: string,
+): Promise<AgentAccessGrantRow[]> {
+  const identity = await canonicalIdentityByAgentId(db, agentId);
+  const raw = identity?.metadata.accessGrants;
+  if (!Array.isArray(raw)) return [];
+  const grants: AgentAccessGrantRow[] = [];
+  for (const value of raw) {
+    const grant = parseObject(value);
+    const role = optionalString(grant.role);
+    const principalSessionId = optionalString(grant.principalSessionId);
+    const principalAgentId = optionalString(grant.principalAgentId);
+    const principalName = optionalString(grant.principalName) ?? principalAgentId;
+    if (!role || !principalName) continue;
+    grants.push({
+      agentId,
+      principalProject: optionalString(grant.principalProject) ?? "default",
+      principalName,
+      ...(principalSessionId ? { principalSessionId } : {}),
+      ...(principalAgentId ? { principalAgentId } : {}),
+      role,
+    });
+  }
+  return grants;
 }
 
 export async function canonicalThreads(db: Client): Promise<Array<{
@@ -359,7 +438,14 @@ export async function canonicalThreads(db: Client): Promise<Array<{
   latestSeq: number;
 }>> {
   const result = await db.execute(`
-    SELECT t.thread_id, t.name, i.name AS member_name,
+    SELECT t.thread_id, t.name,
+           COALESCE(
+             i.name,
+             CASE
+               WHEN tm.agent_id LIKE 'legacy-name:%'
+               THEN substr(tm.agent_id, 13)
+             END
+           ) AS member_name,
            (SELECT MAX(created_at) FROM bus_messages m WHERE m.thread_id = t.thread_id) AS last_at
     FROM threads t
     LEFT JOIN thread_members tm ON tm.thread_id = t.thread_id AND tm.left_at IS NULL
@@ -404,14 +490,10 @@ export async function canonicalDmHistory(
   nameOrAgentId: string,
   options: MessagePageOptions,
 ): Promise<CanonicalHistoryPage> {
-  const identity = await db.execute({
-    sql: "SELECT agent_id FROM identities WHERE agent_id = ? OR name = ? LIMIT 1",
-    args: [nameOrAgentId, nameOrAgentId],
-  });
-  const agentId = identity.rows[0]?.agent_id;
-  const target = agentId === undefined || agentId === null
+  const identity = await canonicalIdentity(db, nameOrAgentId);
+  const target = !identity
     ? { dmName: nameOrAgentId }
-    : { dmAgentId: String(agentId) };
+    : { dmAgentId: identity.agentId };
   return mapHistory(await pageCanonicalMessages(db, target, options));
 }
 
@@ -612,6 +694,7 @@ function mapHistory(page: {
     rows: page.messages.map((message) => ({
       messageId: message.messageId,
       from: message.fromName ?? message.fromAgentId ?? "unknown",
+      fromKind: optionalString(message.provenance.kind),
       when: message.createdAt,
       summary: message.summary,
       body: message.body,
@@ -673,6 +756,9 @@ function optionalNumber(value: unknown): number | undefined {
 }
 
 function parseObject(value: unknown): Record<string, unknown> {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
   try {
     const parsed = JSON.parse(String(value)) as unknown;
     return parsed && typeof parsed === "object" && !Array.isArray(parsed)
@@ -692,21 +778,17 @@ function canonicalPresence(status: unknown): string {
   return !value || value === "stopped" || value === "offline" ? "offline" : value;
 }
 
-async function canonicalIdentity(db: Client, id: string): Promise<{
+interface CanonicalIdentity {
   agentId: string;
   name: string;
   project: string;
   role?: string;
   tier?: string;
+  owner?: string;
   metadata: Record<string, unknown>;
-} | undefined> {
-  const result = await db.execute({
-    sql: `SELECT agent_id, name, role, tier, metadata_json
-          FROM identities WHERE agent_id = ? OR name = ? LIMIT 1`,
-    args: [id, id],
-  });
-  const row = result.rows[0];
-  if (!row) return undefined;
+}
+
+function canonicalIdentityFromRow(row: Row): CanonicalIdentity {
   const metadata = parseObject(row.metadata_json);
   return {
     agentId: String(row.agent_id),
@@ -714,8 +796,37 @@ async function canonicalIdentity(db: Client, id: string): Promise<{
     project: identityProject(metadata),
     role: optionalString(row.role),
     tier: optionalString(row.tier),
+    owner: optionalString(row.owner),
     metadata,
   };
+}
+
+async function canonicalIdentityByAgentId(
+  db: Client,
+  agentId: string,
+): Promise<CanonicalIdentity | undefined> {
+  const result = await db.execute({
+    sql: `SELECT agent_id, name, owner, role, tier, metadata_json
+          FROM identities WHERE agent_id = ? LIMIT 1`,
+    args: [agentId],
+  });
+  const row = result.rows[0];
+  return row ? canonicalIdentityFromRow(row) : undefined;
+}
+
+async function canonicalIdentity(db: Client, id: string): Promise<CanonicalIdentity | undefined> {
+  const exact = await canonicalIdentityByAgentId(db, id);
+  if (exact) return exact;
+  const result = await db.execute({
+    sql: `SELECT agent_id, name, owner, role, tier, metadata_json
+          FROM identities WHERE name = ? ORDER BY agent_id LIMIT 2`,
+    args: [id],
+  });
+  if (result.rows.length > 1) {
+    throw new Error(`ambiguous agent name ${JSON.stringify(id)}; address it by stable agent id`);
+  }
+  const row = result.rows[0];
+  return row ? canonicalIdentityFromRow(row) : undefined;
 }
 
 function parseKind(value: unknown): Kind {

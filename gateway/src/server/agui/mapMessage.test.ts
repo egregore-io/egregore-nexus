@@ -35,6 +35,21 @@ describe("messageToAguiEvents (committed message → Lane A text message)", () =
     expect(ev[0]).toMatchObject({ role: "assistant", name: "hermes" });
   });
 
+  it("carries a non-self human sender kind with the live message", () => {
+    const ev = messageToAguiEvents(
+      msg({
+        from: "other-browser-user",
+        provenance: { from: "other-browser-user", kind: "human" },
+      } as Partial<Message>),
+      "ada",
+    );
+    expect(ev[0]).toMatchObject({
+      role: "assistant",
+      name: "other-browser-user",
+      kind: "human",
+    });
+  });
+
   it("uses role 'user' (and no foreign name) when the author is the watcher", () => {
     const ev = messageToAguiEvents(msg({ from: "ada" }), "ada");
     expect(ev[0]).toMatchObject({ role: "user" });

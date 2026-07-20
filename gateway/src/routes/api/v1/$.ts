@@ -63,12 +63,19 @@ import { parseCookies } from "@server/http/cookies";
 import { handleSessionEvents } from "@server/stream/sessionEvents";
 import { createDaemonSourceRegistry } from "@server/source/daemonRegistry";
 import { gatewayHookDiagnostics } from "@server/hooks/diagnostics";
+import { browserMutationCsrfFailure } from "@server/auth/browserMutationAuth.mjs";
+import {
+  canonicalAgentAccessGrantsByAgentId,
+  canonicalAgentSessionTarget,
+} from "@server/read/canonical";
+import type { AgentAccessGrantRow } from "@server/read/queries";
+import {
+  canObserveAgentSession,
+  withAgentSessionBinding,
+} from "../agui.observe";
 
 /** Methods that may carry a JSON body. */
 const BODY_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
-const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
-const CSRF_COOKIE = "nexus_csrf";
-const CSRF_HEADER = "x-nexus-csrf";
 
 /** Adapt the framework `Request` → the router's plain `ApiRequest`. */
 async function toApiRequest(request: Request): Promise<ApiRequest> {
@@ -212,8 +219,12 @@ export function makeDispatch(deps: DispatchDeps) {
     });
 
   return async function dispatch(request: Request): Promise<Response> {
-    const apiReq = await toApiRequest(request);
     const mode = deps.authMode ?? webAuthModeFromEnv(process.env);
+    const csrfFailure = browserMutationCsrfFailure(request, {
+      enforce: !isLocalOperatorWebAuthMode(mode),
+    });
+    if (csrfFailure) return csrfFailure;
+    const apiReq = await toApiRequest(request);
 
     // ── cookie → _caller resolution ───────────────────────────────────────────
     // DI: command ingress for writes plus a LAZY read-only handle getter that
@@ -244,17 +255,6 @@ export function makeDispatch(deps: DispatchDeps) {
       return json({ error: { code: "unauthorized", message: "not logged in" } }, 401);
     }
 
-    if (requiresRemoteCookieCsrf(apiReq, mode)) {
-      const csrfCookie = cookies.get(CSRF_COOKIE);
-      const csrfHeader = request.headers.get(CSRF_HEADER);
-      if (!csrfCookie || !csrfHeader || csrfCookie !== csrfHeader) {
-        return json(
-          { error: { code: "forbidden", message: "missing or invalid CSRF token" } },
-          403,
-        );
-      }
-    }
-
     const tokenRoute = await handleBearerTokenRoute(apiReq, deps);
     if (tokenRoute) return tokenRoute;
 
@@ -274,7 +274,37 @@ export function makeDispatch(deps: DispatchDeps) {
 
     const sessionEvents = /^\/api\/v1\/agent-sessions\/([^/]+)\/events$/.exec(apiReq.path);
     if (apiReq.method === "GET" && sessionEvents) {
-      return handleSessionEvents(request, decodeURIComponent(sessionEvents[1]!));
+      if (!apiReq.caller) {
+        return json({ error: { code: "unauthorized", message: "not logged in" } }, 401);
+      }
+      if (!deps.canonicalDb) {
+        return json({
+          error: {
+            code: "unavailable",
+            message: "canonical agent session projection is unavailable",
+          },
+        }, 503);
+      }
+      const sessionId = decodeURIComponent(sessionEvents[1]!);
+      const canonicalDb = await deps.canonicalDb();
+      const target = await canonicalAgentSessionTarget(canonicalDb, { sessionId })
+        .catch(() => undefined);
+      if (!target?.sessionId) {
+        return json({
+          error: { code: "not_found", message: "agent session stream is not materialized" },
+        }, 404);
+      }
+      let grants: AgentAccessGrantRow[] = [];
+      if (!canObserveAgentSession(target.owner, apiReq.caller)) {
+        grants = await canonicalAgentAccessGrantsByAgentId(canonicalDb, target.owner.agentId)
+          .catch(() => []);
+      }
+      if (!canObserveAgentSession(target.owner, apiReq.caller, grants)) {
+        return json({
+          error: { code: "forbidden", message: "agent session owner required" },
+        }, 403);
+      }
+      return withAgentSessionBinding(handleSessionEvents(request, target.sessionId), target);
     }
 
     const res = await handle(apiReq, {
@@ -425,15 +455,6 @@ async function handleBearerTokenRoute(
   }
 
   return null;
-}
-
-function requiresRemoteCookieCsrf(apiReq: ApiRequest, mode: WebAuthMode): boolean {
-  return (
-    !isLocalOperatorWebAuthMode(mode) &&
-    apiReq.caller?.credentialFacet === "human" &&
-    MUTATING_METHODS.has(apiReq.method.toUpperCase()) &&
-    requiresHumanLogin(apiReq.method, apiReq.path)
-  );
 }
 
 function isBearerRefreshRoute(apiReq: ApiRequest): boolean {

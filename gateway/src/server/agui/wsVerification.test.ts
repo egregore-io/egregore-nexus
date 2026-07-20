@@ -135,8 +135,7 @@ describe("AG-UI WebSocket verification gates", () => {
       }),
     );
 
-    await Promise.resolve();
-    expect(sessionInput).toHaveBeenCalledWith(
+    await vi.waitFor(() => expect(sessionInput).toHaveBeenCalledWith(
       expect.objectContaining({
         mode: "session",
         target: { name: "iris", agentId: "a_iris" },
@@ -144,7 +143,7 @@ describe("AG-UI WebSocket verification gates", () => {
         clientMessageId: "cm_socket",
       }),
       expect.any(Request),
-    );
+    ));
     expect(socket.sent).not.toContain(JSON.stringify({
       t: "input.ack",
       commandId: "cmd_socket",

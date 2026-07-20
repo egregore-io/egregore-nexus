@@ -42,6 +42,8 @@ export interface DaemonPushProjectionGapFrame {
 
 export interface DaemonPushConnection {
   ready: Promise<void>;
+  /** Authenticated daemon boot currently backing this connection. */
+  readonly daemonBootId?: string;
   subscribe(
     subscription: DaemonPushSubscription,
     handlers: {

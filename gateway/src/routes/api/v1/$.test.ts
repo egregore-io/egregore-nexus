@@ -14,6 +14,7 @@ import { issueBearerToken } from "@server/identity/bearer";
 import type { CommandIntentSender, MessagePostSender } from "@server/api/http";
 import { AGENT_ATTACH_SCOPE } from "@server/auth/principal";
 import { localOperatorCaller } from "@server/auth/webAuthMode";
+import { migrateGatewayStore } from "@server/store/migrations";
 import { Kind, Tier } from "@shared/types";
 // The chokepoint must expose a `makeDispatch` factory for DI; we test that.
 import { makeDispatch } from "./$";
@@ -76,6 +77,12 @@ CREATE TABLE IF NOT EXISTS command_intent_events (
 async function makeCommandDb(): Promise<Client> {
   const db = createClient({ url: ":memory:" });
   await db.executeMultiple(COMMAND_DDL);
+  return db;
+}
+
+async function makeCanonicalDb(): Promise<Client> {
+  const db = createClient({ url: ":memory:" });
+  await migrateGatewayStore(db);
   return db;
 }
 
@@ -219,7 +226,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
   it("rebinds a persisted human before the first post after daemon replacement", async () => {
     const { commands: seedCommands } = makeCommandCapture();
     let idSeq = 0;
-    const { cookieToken } = await registerHuman({ name: "earl", password: "pw" }, {
+    const { cookieToken } = await registerHuman({ name: "test-user", password: "pw" }, {
       db,
       commands: seedCommands,
       genId: () => `rebind_id_${++idSeq}`,
@@ -235,7 +242,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
         daemonCommand: async (kind, request, caller) => {
           calls.push({ kind, request, caller });
           if (kind === "identity.register") {
-            return { sessionId: "s_rebound_earl", agentId: "a_earl" };
+            return { sessionId: "s_rebound_human", agentId: "a_human_fixture" };
           }
           return { messageId: "m_after_rebind", fanout: 1 };
         },
@@ -260,7 +267,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
       expect.objectContaining({
         kind: "identity.register",
         request: expect.objectContaining({
-          name: "earl",
+          name: "test-user",
           clientKey: "rebind_id_1",
           kind: "human",
         }),
@@ -268,13 +275,14 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
       expect.objectContaining({
         kind: "message.post.send",
         caller: expect.objectContaining({
-          sessionId: "s_rebound_earl",
-          runtimeId: "s_rebound_earl",
-          agentId: "a_earl",
+          sessionId: "s_rebound_human",
+          runtimeId: "s_rebound_human",
           clientKey: "rebind_id_1",
+          kind: "human",
         }),
       }),
     ]);
+    expect(calls[1]!.caller).not.toHaveProperty("agentId");
   });
 
   it("rejects message sends when there is no cookie", async () => {
@@ -294,6 +302,221 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
 
     expect(res.status).toBe(401);
     expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("authorizes a stable agent-session path by owner agent id and returns its canonical binding", async () => {
+    const canonicalDb = await makeCanonicalDb();
+    await canonicalDb.batch([
+      `INSERT INTO identities VALUES
+        ('a_target','current-target','old-owner-name','agent','agent',
+         '{"ownerAgentId":"a_owner"}',1)`,
+      `INSERT INTO runtime_descriptors VALUES
+        ('r_target','a_target','s_target','codex','headless',NULL,NULL,NULL,'online',2)`,
+    ], "write");
+    let idSeq = 0;
+    const issued = await issueBearerToken(
+      {
+        actor: {
+          name: "renamed-owner",
+          agentId: "a_owner",
+          project: "other-project",
+          kind: Kind.Agent,
+          tier: Tier.Agent,
+          credentialFacet: "machine",
+          scopes: ["message:read"],
+        },
+        scopes: ["message:read"],
+      },
+      {
+        db,
+        now: () => 2_000_000,
+        genId: () => `session_owner_${++idSeq}`,
+        randomSecret: (prefix) => `${prefix}_secret_${++idSeq}`,
+      },
+    );
+    const dispatch = makeDispatch({
+      db: async () => db,
+      canonicalDb: () => canonicalDb,
+      authMode: "remote",
+      now: () => 2_000_000,
+    });
+
+    const response = await dispatch(new Request(
+      "http://localhost/api/v1/agent-sessions/s_target/events?view=agui",
+      { headers: { authorization: `Bearer ${issued.accessToken}` } },
+    ));
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-nexus-session-id")).toBe("s_target");
+    expect(response.headers.get("x-nexus-agent-id")).toBe("a_target");
+    expect(response.headers.get("x-nexus-agent-name")).toBe("current-target");
+    await response.body?.cancel();
+    canonicalDb.close();
+  });
+
+  it("does not let a mutable owner-name match override a different stable owner id", async () => {
+    const canonicalDb = await makeCanonicalDb();
+    await canonicalDb.batch([
+      `INSERT INTO identities VALUES
+        ('a_target','current-target','old-owner-name','agent','agent',
+         '{"ownerAgentId":"a_owner"}',1)`,
+      `INSERT INTO runtime_descriptors VALUES
+        ('r_target','a_target','s_target','codex','headless',NULL,NULL,NULL,'online',2)`,
+    ], "write");
+    let idSeq = 0;
+    const issued = await issueBearerToken(
+      {
+        actor: {
+          name: "old-owner-name",
+          agentId: "a_intruder",
+          project: "default",
+          kind: Kind.Agent,
+          tier: Tier.Agent,
+          credentialFacet: "machine",
+          scopes: ["message:read"],
+        },
+        scopes: ["message:read"],
+      },
+      {
+        db,
+        now: () => 2_000_000,
+        genId: () => `session_intruder_${++idSeq}`,
+        randomSecret: (prefix) => `${prefix}_secret_${++idSeq}`,
+      },
+    );
+    const dispatch = makeDispatch({
+      db: async () => db,
+      canonicalDb: () => canonicalDb,
+      authMode: "remote",
+      now: () => 2_000_000,
+    });
+
+    const response = await dispatch(new Request(
+      "http://localhost/api/v1/agent-sessions/s_target/events?view=agui",
+      { headers: { authorization: `Bearer ${issued.accessToken}` } },
+    ));
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({
+      error: { code: "forbidden", message: "agent session owner required" },
+    });
+    canonicalDb.close();
+  });
+
+  it("authorizes stable delegated access from the canonical Gateway grant snapshot", async () => {
+    const canonicalDb = await makeCanonicalDb();
+    await canonicalDb.batch([
+      {
+        sql: `INSERT INTO identities VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          "a_target",
+          "current-target",
+          "owner",
+          "agent",
+          "agent",
+          JSON.stringify({
+            ownerAgentId: "a_owner",
+            accessGrants: [{
+              principalName: "old-delegate-name",
+              principalAgentId: "a_delegate",
+              principalProject: "stale-project",
+              role: "viewer",
+            }],
+          }),
+          1,
+        ],
+      },
+      `INSERT INTO runtime_descriptors VALUES
+        ('r_target','a_target','s_target','codex','headless',NULL,NULL,NULL,'online',2)`,
+    ], "write");
+    let idSeq = 0;
+    const issued = await issueBearerToken(
+      {
+        actor: {
+          name: "renamed-delegate",
+          agentId: "a_delegate",
+          project: "other-project",
+          kind: Kind.Agent,
+          tier: Tier.Agent,
+          credentialFacet: "machine",
+          scopes: ["message:read"],
+        },
+        scopes: ["message:read"],
+      },
+      {
+        db,
+        now: () => 2_000_000,
+        genId: () => `session_delegate_${++idSeq}`,
+        randomSecret: (prefix) => `${prefix}_secret_${++idSeq}`,
+      },
+    );
+    const dispatch = makeDispatch({
+      db: async () => db,
+      canonicalDb: () => canonicalDb,
+      authMode: "remote",
+      now: () => 2_000_000,
+    });
+
+    const response = await dispatch(new Request(
+      "http://localhost/api/v1/agent-sessions/s_target/events?view=agui",
+      { headers: { authorization: `Bearer ${issued.accessToken}` } },
+    ));
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-nexus-agent-id")).toBe("a_target");
+    await response.body?.cancel();
+    canonicalDb.close();
+  });
+
+  it("authorizes the exact session id before a newer colliding runtime alias", async () => {
+    const canonicalDb = await makeCanonicalDb();
+    await canonicalDb.batch([
+      `INSERT INTO identities VALUES
+        ('a_exact_target','exact-target','old-owner','agent','agent',
+         '{"ownerAgentId":"a_owner"}',1),
+        ('a_runtime_alias','runtime-alias','alias-owner','agent','agent',
+         '{"ownerAgentId":"a_intruder"}',1)`,
+      `INSERT INTO runtime_descriptors VALUES
+        ('r_exact','a_exact_target','s_collision','codex','headless',NULL,NULL,NULL,'online',2),
+        ('s_collision','a_runtime_alias','s_alias','claude','headless',NULL,NULL,NULL,'online',99)`,
+    ], "write");
+    let idSeq = 0;
+    const issued = await issueBearerToken(
+      {
+        actor: {
+          name: "renamed-owner",
+          agentId: "a_owner",
+          project: "other-project",
+          kind: Kind.Agent,
+          tier: Tier.Agent,
+          credentialFacet: "machine",
+          scopes: ["message:read"],
+        },
+        scopes: ["message:read"],
+      },
+      {
+        db,
+        now: () => 2_000_000,
+        genId: () => `session_collision_${++idSeq}`,
+        randomSecret: (prefix) => `${prefix}_secret_${++idSeq}`,
+      },
+    );
+    const dispatch = makeDispatch({
+      db: async () => db,
+      canonicalDb: () => canonicalDb,
+      authMode: "remote",
+      now: () => 2_000_000,
+    });
+
+    const response = await dispatch(new Request(
+      "http://localhost/api/v1/agent-sessions/s_collision/events?view=agui",
+      { headers: { authorization: `Bearer ${issued.accessToken}` } },
+    ));
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-nexus-agent-id")).toBe("a_exact_target");
+    await response.body?.cancel();
+    canonicalDb.close();
   });
 
   it("accepts valid signed notifications in remote mode without a human caller", async () => {
@@ -483,7 +706,8 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        cookie: "nexus_human=not_a_real_token",
+        cookie: "nexus_human=not_a_real_token; nexus_csrf=csrf-expired",
+        "x-nexus-csrf": "csrf-expired",
       },
       body: JSON.stringify({ to: { verb: "post", thread: "backend" }, body: "hello" }),
     });
@@ -491,6 +715,26 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
     const res = await dispatch(req);
 
     expect(res.status).toBe(401);
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
+  it("rejects a presented remote human cookie before auth when CSRF proof is absent", async () => {
+    const dispatch = makeDispatch({
+      db: async () => db,
+      commandIngressDb: () => commandDb,
+      authMode: "remote",
+    });
+
+    const res = await dispatch(new Request("http://localhost/api/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        cookie: "nexus_human=not_a_real_token",
+      },
+      body: JSON.stringify({ to: { verb: "post", thread: "backend" }, body: "hello" }),
+    }));
+
+    expect(res.status).toBe(403);
     expect(spawn).not.toHaveBeenCalled();
   });
 
@@ -504,7 +748,10 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
 
     const req = new Request("http://localhost/api/v1/messages", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        cookie: "nexus_human=stale-local-cookie",
+      },
       body: JSON.stringify({ to: { verb: "post", thread: "backend" }, body: "local hello" }),
     });
 
@@ -633,6 +880,18 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
       }),
       undefined,
     );
+
+    const cookieConfused = await dispatch(new Request("http://localhost/api/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${issued.accessToken}`,
+        cookie: "nexus_human=stale-cookie; nexus_csrf=stale-csrf",
+      },
+      body: JSON.stringify({ to: { verb: "post", thread: "backend" }, body: "blocked" }),
+    }));
+    expect(cookieConfused.status).toBe(403);
+    expect(messagePost.send).toHaveBeenCalledTimes(1);
   });
 
   it("denies REST bearer calls that lack the route scope before writing", async () => {

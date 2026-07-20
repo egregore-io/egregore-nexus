@@ -33,6 +33,9 @@ CREATE TABLE command_intents (
   status TEXT NOT NULL,
   project TEXT NOT NULL,
   caller_name TEXT NOT NULL,
+  caller_session_id TEXT,
+  caller_agent_id TEXT,
+  caller_kind TEXT,
   request_json TEXT NOT NULL,
   error_json TEXT,
   revision INTEGER NOT NULL DEFAULT 1,
@@ -248,6 +251,49 @@ describe("durable session command queue", () => {
     });
   });
 
+  it("accepts a stable agentId as the complete production mutation target", async () => {
+    const daemonQueueMutation = vi.fn(async () => ({
+      status: 200,
+      body: {
+        clientMutationId: "mut_agent_id",
+        commandId: "cmd_agent_id",
+        state: "cancelled",
+        steerCapability: "native_steer",
+        seq: 10,
+      },
+    }));
+
+    const response = await handleConversationQueuePost(
+      new Request("http://localhost/api/conversation/prompt", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          agentId: "a_otto",
+          action: "cancel",
+          clientMutationId: "mut_agent_id",
+          commandId: "cmd_agent_id",
+          expectedRevision: 1,
+        }),
+      }),
+      {
+        env: { NEXUS_WEB_AUTH_MODE: "local" },
+        daemonQueueMutation,
+        now: () => 9_000,
+      },
+    );
+
+    expect(response.status).toBe(200);
+    expect(daemonQueueMutation).toHaveBeenCalledWith({
+      project: "default",
+      now: 9_000,
+      request: expect.objectContaining({
+        agentId: "a_otto",
+        action: "cancel",
+        clientMutationId: "mut_agent_id",
+      }),
+    });
+  });
+
   it("hydrates production snapshots through the typed daemon queue read", async () => {
     const daemonQueueRead = vi.fn(async () => ({
       target: "otto",
@@ -288,6 +334,10 @@ describe("durable session command queue", () => {
           sessionId: "s_otto",
           commandId: "cmd_done",
           clientMessageId: "cm_done",
+          commandKind: "harness.prompt",
+          callerName: "Operator",
+          callerSessionId: "s_human",
+          callerKind: "human",
           state: CommandQueueState.Completed,
           mode: "queue",
           revision: 4,
@@ -337,6 +387,13 @@ describe("durable session command queue", () => {
   it("keeps the reconnect cursor global when project metadata interleaves", async () => {
     const db = await dbFor();
     await insertCommand(db, "cmd_default", "pending", 10);
+    await db.execute({
+      sql:
+        "INSERT INTO command_intents " +
+        "(command_id, kind, status, project, caller_name, caller_session_id, caller_kind, " +
+        "request_json, revision, created_at) VALUES (?, 'metadata.set', 'done', ?, ?, ?, ?, '{}', 1, 11)",
+      args: ["cmd_other", "other-metadata", "Other Operator", "s_other_human", "human"],
+    });
     await db.execute({
       sql:
         "INSERT INTO command_intent_events " +

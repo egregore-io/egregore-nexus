@@ -55,12 +55,16 @@ describe("gateway/webconsole package split", () => {
     expect(webconsole.scripts.build).not.toContain("gateway-serve");
   });
 
-  it("runs gateway-serve relative to its script path, not the caller cwd", () => {
+  it("loads the bundled client and server entries relative to the packaged script", () => {
     const source = readFileSync(join(root, "scripts/gateway-serve-impl.mjs"), "utf8");
-    expect(source).toContain("fileURLToPath(import.meta.url)");
-    expect(source).toContain("cwd: FRONTEND_DIR");
-    expect(source).toContain('import.meta.resolve("tsx/cli")');
-    expect(source).toContain("join(FRONTEND_DIR, \"dist/server/server.js\")");
+    expect(source).toContain(
+      "const FRONTEND_DIR = dirname(dirname(fileURLToPath(import.meta.url)))",
+    );
+    expect(source).toContain('const DIST_CLIENT_DIR = join(FRONTEND_DIR, "dist/client")');
+    expect(source).toContain(
+      'const DIST_SERVER_ENTRY = join(FRONTEND_DIR, "dist/server/server.js")',
+    );
+    expect(source).toContain('await cp(join(FRONTEND_DIR, "dist"), dir, { recursive: true })');
   });
 
   it("binds the packaged webconsole server instead of executing the generated handler", () => {
@@ -71,7 +75,10 @@ describe("gateway/webconsole package split", () => {
     expect(source).toContain('loadPackagedServerHandler(join(distDir, "server/server.js"))');
     expect(source).toContain("snapshotDistForRun()");
     expect(source).toContain("createHttpServer");
-    expect(source).toContain("attachAguiWsUpgrade(server");
+    expect(source).toContain("attachHeadlessGatewayWs,");
+    expect(source).toContain(
+      "await attachHeadlessGatewayWs(server, { fetchHandler: guardedHandler })",
+    );
     expect(source).toContain("startGatewayProjectionService({");
     expect(source).toContain("stopGatewayProjectionService()");
     expect(source).toContain("startGatewayHookService()");
@@ -88,7 +95,9 @@ describe("gateway/webconsole package split", () => {
     expect(source).toContain("server.on(\"connection\", (socket) => trackSocket(sockets, socket))");
     expect(source).toContain("server.on(\"upgrade\", (_req, socket) => trackSocket(sockets, socket))");
     expect(source).toContain("destroyTrackedSockets(sockets)");
-    expect(source).toContain("stopChildWithDeadline(child");
+    expect(source).toContain(
+      "await closeHttpServerWithDeadline(server, sockets, GATEWAY_CLOSE_TIMEOUT_MS)",
+    );
   });
 
   it("preserves duplicate Set-Cookie headers from registration responses", () => {

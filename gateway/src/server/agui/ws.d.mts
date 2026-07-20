@@ -24,6 +24,11 @@ export interface AguiWsSteerInput {
   clientMessageId?: string;
 }
 
+export interface AguiWsInterruptInput {
+  target: unknown;
+  clientMessageId: string;
+}
+
 export interface AguiWsDeveloperEventSource {
   subscribe(
     topic: string,
@@ -56,15 +61,24 @@ export interface AguiWsObserveFrameObserver {
   observeAguiFrame(payload: string): void;
 }
 
+export interface AguiWsPumpOptions {
+  /** Apply the bounded, resumable agent-session WebSocket outbound contract. */
+  session?: boolean;
+}
+
 export interface AguiWsDeps {
   fetchHandler?: (request: Request) => Promise<Response>;
   observe?: (request: Request) => Promise<Response>;
   sessionInput?: (input: AguiWsInput, request: Request) => Promise<Response>;
   busInput?: (input: AguiWsInput, request: Request) => Promise<Response>;
   steerInput?: (input: AguiWsSteerInput, request: Request) => Promise<Response>;
+  interruptInput?: (input: AguiWsInterruptInput, request: Request) => Promise<Response>;
   /** Session name → harness kind (`claude`|`codex`|…) for the command catalog.
    *  Defaults to a `/api/v1/members` lookup through `fetchHandler`. */
-  resolveHarness?: (target: string, request: Request) => Promise<string | undefined>;
+  resolveHarness?: (
+    target: string | { name?: string; agentId?: string },
+    request: Request,
+  ) => Promise<string | undefined>;
   developerEvents?: AguiWsDeveloperEventSource;
   daemonToolCallEvents?: AguiWsDaemonToolCallEventSource | null;
   /** Ephemeral `sys.fleet.status` push source (agent presence/activity/spawned/removed plus the
@@ -79,14 +93,21 @@ export interface AguiWsDeps {
 export interface CommandQueueHubHandlers {
   onSnapshot(snapshot: unknown): void;
   onTransition(transition: unknown): void;
-  onError(error: string): void;
+  onError(
+    error: string,
+    details: {
+      phase: "subscribe" | "hydrate" | "refresh" | "events";
+      fatal: boolean;
+    },
+  ): void;
+  onRestored?(seq: number): void;
 }
 
 export class CommandQueueHub {
   constructor(deps: AguiWsDeps);
   subscribe(
     request: Request,
-    target: string,
+    target: string | { name?: string; agentId?: string },
     handlers: CommandQueueHubHandlers,
   ): () => void;
 }
@@ -109,4 +130,5 @@ export function pumpSseResponseToSocket(
   socket: AguiWsSocket,
   signal?: AbortSignal,
   observer?: AguiWsObserveFrameObserver,
+  options?: AguiWsPumpOptions,
 ): Promise<void>;

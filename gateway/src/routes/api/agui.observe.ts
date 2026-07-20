@@ -6,7 +6,7 @@
 // framework adapter (the dot in `agui.observe.ts` maps to `/api/agui/observe`).
 //
 // Scoping:
-//   ?session=<name>  — Lane B (agent.update), dedicated to /agent route (T8/T10).
+//   ?session=<name>&agentId=<id> — Lane B (agent.update), dedicated to /agent route (T8/T10).
 //                      Hydrates materialized history, then tails raw stream rows.
 //   ?dm=<name>       — Lane A (message.created), used by /dm route (T9b).
 //                      Falls through to handleObserve like ?thread= and ?topic=.
@@ -39,7 +39,11 @@ import type { GatewayCallerIdentity } from "@server/api/http";
 import { getConversationStore } from "@server/conversation/store";
 import { COMMAND_KINDS, submitCommandIntent } from "@server/command/ingress";
 import { Kind, Tier } from "@shared/types";
-import { canonicalAgentSessionTarget } from "@server/read/canonical";
+import {
+  canonicalAgentAccessGrantsByAgentId,
+  canonicalAgentSessionTarget,
+  type CanonicalAgentSessionTarget,
+} from "@server/read/canonical";
 import { getGatewayStore } from "@server/store/client";
 import { handleSessionEvents } from "@server/stream/sessionEvents";
 import {
@@ -76,6 +80,21 @@ function sseResponse(stream: ReadableStream<Uint8Array>): Response {
   return new Response(stream, { status: 200, headers: SSE_HEADERS });
 }
 
+function agentDirectoryErrorResponse(error: unknown): Response {
+  const message = error instanceof Error ? error.message : String(error);
+  const ambiguous = ["ambiguous agent name", "ambiguous session name"]
+    .some((marker) => message.includes(marker));
+  return new Response(JSON.stringify({
+    error: {
+      code: ambiguous ? "ambiguous_agent" : "agent_directory_unavailable",
+      message,
+    },
+  }), {
+    status: ambiguous ? 409 : 503,
+    headers: { "content-type": "application/json" },
+  });
+}
+
 /** Read the `nexus_human` cookie value off a request, or undefined. */
 function humanCookie(request: Request): string | undefined {
   const header = request.headers.get("cookie");
@@ -107,8 +126,8 @@ async function identityFromRequest(request: Request): Promise<GatewayCallerIdent
   }
 }
 
-function agentCommandTarget(id: string): { name: string; agentId?: string } {
-  return { name: id };
+function agentCommandTarget(name: string, agentId?: string): { name: string; agentId?: string } {
+  return { name, ...(agentId ? { agentId } : {}) };
 }
 
 /**
@@ -123,12 +142,13 @@ function agentCommandTarget(id: string): { name: string; agentId?: string } {
  */
 function warmSession(
   name: string,
+  agentId: string | undefined,
   identity: GatewayCallerIdentity | null,
   submitCommand: WarmCommand = submitCommandIntent,
 ): void {
   void submitCommand(
     COMMAND_KINDS.harnessWarm,
-    agentCommandTarget(name),
+    agentCommandTarget(name, agentId),
     identity ?? undefined,
   ).catch(() => {});
 }
@@ -162,20 +182,41 @@ export function canObserveAgentSession(
   identity: GatewayCallerIdentity,
   grants: AgentAccessGrantRow[] = [],
 ): boolean {
-  if (!agent?.ownerName) return true;
-  if (
-    agent.ownerName === identity.name &&
-    (!agent.ownerProject || agent.ownerProject === identity.project)
-  ) {
+  if (!agent || (!agent.ownerAgentId && !agent.ownerName)) return true;
+  if (agent.ownerAgentId) {
+    if (agent.ownerAgentId === identity.agentId) return true;
+  } else if (agent.ownerSessionId) {
+    if (agent.ownerSessionId === identity.sessionId) return true;
+  } else if (agent.ownerName === identity.name) {
     return true;
   }
   if (hasObserveAdminOverride(agent, identity)) return true;
   return grants.some(
-    (grant) =>
-      grant.principalName === identity.name &&
-      grant.principalProject === identity.project &&
-      (grant.role === "viewer" || grant.role === "co_owner"),
+    (grant) => {
+      const principalMatches = grant.principalAgentId
+        ? grant.principalAgentId === identity.agentId
+        : grant.principalSessionId
+          ? grant.principalSessionId === identity.sessionId
+          : grant.principalName === identity.name;
+      return principalMatches && (grant.role === "viewer" || grant.role === "co_owner");
+    },
   );
+}
+
+/** Attach the immutable lane identity that WebSocket mutation handling binds once per socket. */
+export function withAgentSessionBinding(
+  response: Response,
+  target: CanonicalAgentSessionTarget,
+): Response {
+  const headers = new Headers(response.headers);
+  if (target.sessionId) headers.set("x-nexus-session-id", target.sessionId);
+  headers.set("x-nexus-agent-id", target.owner.agentId);
+  headers.set("x-nexus-agent-name", target.owner.name);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
 }
 
 export async function observeScoped(
@@ -194,25 +235,71 @@ export async function observeScoped(
   // --- ?session=<name>: dedicated agent-session endpoint (Lane B only, added T8). ---
   // Read BEFORE ?dm= so the new dedicated path takes priority over the shared one.
   const session = url.searchParams.get("session");
-  if (session) {
+  const requestedAgentId = url.searchParams.get("agentId") ?? undefined;
+  if (session || requestedAgentId) {
     let owner: AgentOwnerRow | undefined;
     let sessionId: string | undefined;
+    let canonicalTarget: CanonicalAgentSessionTarget | undefined;
+    let canonicalName = session ?? requestedAgentId!;
+    let canonicalAgentId = requestedAgentId;
+    let canonicalReadDb: Client | undefined;
     let legacyReadDb: ReturnType<typeof getReadDb> | undefined;
     if (deps.canonicalDb) {
-      const target = await canonicalAgentSessionTarget(await deps.canonicalDb(), session)
-        .catch(() => undefined);
+      let target: CanonicalAgentSessionTarget | undefined;
+      try {
+        canonicalReadDb = await deps.canonicalDb();
+        target = await canonicalAgentSessionTarget(canonicalReadDb, {
+          ...(requestedAgentId ? { agentId: requestedAgentId } : {}),
+          ...(session ? { name: session } : {}),
+        });
+      } catch (error) {
+        return agentDirectoryErrorResponse(error);
+      }
       owner = target?.owner;
       sessionId = target?.sessionId;
+      canonicalTarget = target;
+      canonicalName = target?.owner.name ?? canonicalName;
+      canonicalAgentId = target?.owner.agentId ?? canonicalAgentId;
+      if (!target) {
+        return new Response(JSON.stringify({ error: "agent session stream is not materialized" }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        });
+      }
     } else {
+      if (!session) {
+        return new Response(JSON.stringify({ error: "agent session stream is not materialized" }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        });
+      }
       legacyReadDb = getReadDb();
-      const ownerPromise = agentOwnerByName(legacyReadDb, session).catch(() => undefined);
-      const sessionPromise = whoamiRow(legacyReadDb, session).catch(() => undefined);
-      const [legacyOwner, sessionRow] = await Promise.all([ownerPromise, sessionPromise]);
-      owner = legacyOwner;
-      sessionId = sessionRow?.sessionId;
+      try {
+        const [legacyOwner, sessionRow] = await Promise.all([
+          agentOwnerByName(legacyReadDb, session),
+          whoamiRow(legacyReadDb, session),
+        ]);
+        owner = legacyOwner;
+        sessionId = sessionRow?.sessionId;
+      } catch (error) {
+        return agentDirectoryErrorResponse(error);
+      }
+      if (!sessionId) {
+        return new Response(JSON.stringify({ error: "agent session stream is not materialized" }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        });
+      }
     }
     let grants: AgentAccessGrantRow[] = [];
-    if (legacyReadDb && owner && !canObserveAgentSession(owner, identity)) {
+    if (canonicalReadDb && owner && !canObserveAgentSession(owner, identity)) {
+      try {
+        grants = await canonicalAgentAccessGrantsByAgentId(canonicalReadDb, owner.agentId);
+      } catch {
+        // Missing or malformed canonical ACL state fails closed to owner-only access.
+        grants = [];
+      }
+    } else if (legacyReadDb && owner && !canObserveAgentSession(owner, identity)) {
       try {
         grants = await agentAccessGrantsByAgentId(legacyReadDb, owner.agentId);
       } catch {
@@ -228,7 +315,7 @@ export async function observeScoped(
     }
 
     // Eager spawn: bring the agent's ACP session live as the pane opens. Fire-and-forget.
-    warmSession(session, identity, deps.submitCommand);
+    warmSession(canonicalName, canonicalAgentId, identity, deps.submitCommand);
 
     // Resolve the agent's session id so we can project its durable Turso stream.
     if (!sessionId) {
@@ -249,13 +336,13 @@ export async function observeScoped(
       );
       eventsUrl.searchParams.delete("session");
       eventsUrl.searchParams.delete("lane");
-      eventsUrl.searchParams.delete("afterId");
       eventsUrl.searchParams.delete("historyTurns");
-      return handleSessionEvents(new Request(eventsUrl, {
+      const response = handleSessionEvents(new Request(eventsUrl, {
         method: request.method,
         headers: request.headers,
         signal: request.signal,
       }), sessionId);
+      return canonicalTarget ? withAgentSessionBinding(response, canonicalTarget) : response;
     }
     if (url.searchParams.get("lane") === "raw") {
       const rawAfterId = Number(url.searchParams.get("afterId") ?? "");
@@ -281,7 +368,7 @@ export async function observeScoped(
         ? Math.floor(historyTurnsRaw)
         : undefined;
     const streamStoreReadyPromise = streamStoreFileExists();
-    const snapshot = await loadAgentSessionSnapshot(sessionId, session, {
+    const snapshot = await loadAgentSessionSnapshot(sessionId, canonicalName, {
       historyTurns: requestedAfterId > 0 ? 0 : requestedHistoryTurns,
     });
     const fallbackAfterCursor = requestedAfterId > 0
@@ -298,7 +385,7 @@ export async function observeScoped(
         });
 
     return handleAgentSession(request, {
-      sessionName: session,
+      sessionName: canonicalName,
       initialEvents: snapshot.events,
       createRelay,
     });

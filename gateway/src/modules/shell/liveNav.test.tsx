@@ -8,7 +8,7 @@
 // live read-view via `useShellNav` (TanStack Query). The wire under it (REST →
 // router → queries over libSQL) is proven against a real daemon in the Part D run.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import {
   RouterProvider,
   createMemoryHistory,
@@ -18,6 +18,7 @@ import {
 } from "@tanstack/react-router";
 
 import { AppProviders } from "@app/providers";
+import { useIdentityName, useIdentityStore } from "@app/identity";
 
 import { AppShell } from "./AppShell";
 
@@ -38,6 +39,7 @@ const PROJECTS = [
 const WHOAMI = {
   name: "etan",
   sessionId: "s_etan",
+  kind: "human",
   role: "operator",
   tier: "admin",
   project: "egregore-nexus",
@@ -65,16 +67,27 @@ function fakeFetch(input: RequestInfo | URL): Promise<Response> {
 }
 
 beforeEach(() => {
+  window.localStorage.clear();
+  useIdentityStore.setState({ name: null });
+  vi.spyOn(window, "scrollTo").mockImplementation(() => {});
   vi.stubGlobal("fetch", vi.fn(fakeFetch));
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  window.localStorage.clear();
+  useIdentityStore.setState({ name: null });
 });
+
+function IdentityProbe() {
+  return <output data-testid="identity-name">{useIdentityName() ?? "none"}</output>;
+}
 
 function renderShell(initialPath = "/") {
   const rootRoute = createRootRoute({
     component: () => (
       <AppProviders>
+        <IdentityProbe />
         <AppShell />
       </AppProviders>
     ),
@@ -122,6 +135,28 @@ describe("shell — rendered from LIVE read-view data (no seed)", () => {
     // The footer identity from whoami: "etan" (also a DM row) + "operator" role.
     expect((await within(rail).findAllByText("etan")).length).toBeGreaterThan(0);
     expect(within(rail).getAllByText("operator").length).toBeGreaterThan(0);
+  });
+
+  it("shares whoami as the shell and pane identity authority while ignoring stale browser identity", async () => {
+    window.localStorage.setItem("nexus.identity", JSON.stringify({
+      state: { name: "ben" },
+      version: 0,
+    }));
+    useIdentityStore.setState({ name: "ben" });
+    const fetchSpy = vi.fn(fakeFetch);
+    vi.stubGlobal("fetch", fetchSpy);
+
+    renderShell();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("identity-name")).toHaveTextContent("etan");
+    });
+    const rail = await screen.findByRole("navigation", { name: "Primary" });
+    expect((await within(rail).findAllByText("etan")).length).toBeGreaterThan(0);
+    const whoamiCalls = fetchSpy.mock.calls.filter(([input]) =>
+      String(input).includes("/api/v1/whoami"),
+    );
+    expect(whoamiCalls).toHaveLength(1);
   });
 
   it("treats logged-out whoami as an absent identity, not a shell query error", async () => {

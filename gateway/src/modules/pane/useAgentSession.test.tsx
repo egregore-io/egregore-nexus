@@ -84,6 +84,7 @@ describe("useAgentSession — Gateway session URL", () => {
     function AgentSessionUrlHarness() {
       const { live } = useAgentSession({
         name,
+        sessionId: "s_ben",
         openSource: (url) => {
           captured.push(url);
           return source;
@@ -95,17 +96,19 @@ describe("useAgentSession — Gateway session URL", () => {
     render(<AgentSessionUrlHarness />);
 
     expect(captured).toHaveLength(1);
-    expect(captured[0]).toBe(`/api/v1/agent-sessions/${name}/events?view=agui`);
+    expect(captured[0]).toBe("/api/v1/agent-sessions/s_ben/events?view=agui");
   });
 
-  it("encodes the name in the URL", () => {
+  it("encodes the stable session id in the URL", () => {
     const captured: string[] = [];
-    const name = "ben/zara";
+    const name = "ben";
+    const sessionId = "s_ben/zara";
     const source = new FakeEventSource("");
 
     function AgentSessionEncodedHarness() {
       const { live } = useAgentSession({
         name,
+        sessionId,
         openSource: (url) => {
           captured.push(url);
           return source;
@@ -115,7 +118,26 @@ describe("useAgentSession — Gateway session URL", () => {
     }
 
     render(<AgentSessionEncodedHarness />);
-    expect(captured[0]).toBe(`/api/v1/agent-sessions/${encodeURIComponent(name)}/events?view=agui`);
+    expect(captured[0]).toBe(`/api/v1/agent-sessions/${encodeURIComponent(sessionId)}/events?view=agui`);
+  });
+
+  it("uses the explicit legacy name route only when no stable session id is available", () => {
+    const captured: string[] = [];
+    const source = new FakeEventSource("");
+
+    function LegacyAgentSessionHarness() {
+      useAgentSession({
+        name: "ben/zara",
+        openSource: (url) => {
+          captured.push(url);
+          return source;
+        },
+      });
+      return null;
+    }
+
+    render(<LegacyAgentSessionHarness />);
+    expect(captured).toEqual(["/api/agui/observe?session=ben%2Fzara"]);
   });
 
   it("reopens an agent-session stream with the last opaque Gateway cursor", () => {
@@ -127,6 +149,7 @@ describe("useAgentSession — Gateway session URL", () => {
     function ReconnectHarness() {
       const { live } = useAgentSession({
         name,
+        sessionId: "s_ben",
         reconnectDelayMs: 10,
         openSource: (url) => {
           captured.push(url);
@@ -139,7 +162,7 @@ describe("useAgentSession — Gateway session URL", () => {
     }
 
     render(<ReconnectHarness />);
-    expect(captured[0]).toBe("/api/v1/agent-sessions/ben/events?view=agui");
+    expect(captured[0]).toBe("/api/v1/agent-sessions/s_ben/events?view=agui");
     const first = sources[0]!;
 
     act(() => {
@@ -154,7 +177,7 @@ describe("useAgentSession — Gateway session URL", () => {
     });
 
     expect(first.closed).toBe(true);
-    expect(captured[1]).toBe("/api/v1/agent-sessions/ben/events?view=agui&after=epoch%3A42");
+    expect(captured[1]).toBe("/api/v1/agent-sessions/s_ben/events?view=agui&after=epoch%3A42");
   });
 
   it("re-subscribes on boot-epoch changes without carrying a stale stream-store afterId", () => {
@@ -165,6 +188,7 @@ describe("useAgentSession — Gateway session URL", () => {
     function EpochHarness({ epoch }: { epoch: string }) {
       const { messages } = useAgentSession({
         name,
+        sessionId: "s_ben",
         agent: { who: name, glyph: "B", presence: "online" },
         observeEpoch: epoch,
         openSource: (url) => {
@@ -178,7 +202,7 @@ describe("useAgentSession — Gateway session URL", () => {
     }
 
     const { rerender } = render(<EpochHarness epoch="boot-1" />);
-    expect(captured[0]).toBe("/api/v1/agent-sessions/ben/events?view=agui");
+    expect(captured[0]).toBe("/api/v1/agent-sessions/s_ben/events?view=agui");
     const first = sources[0]!;
 
     act(() => {
@@ -206,7 +230,7 @@ describe("useAgentSession — Gateway session URL", () => {
     rerender(<EpochHarness epoch="boot-2" />);
 
     expect(first.closed).toBe(true);
-    expect(captured[1]).toBe("/api/v1/agent-sessions/ben/events?view=agui");
+    expect(captured[1]).toBe("/api/v1/agent-sessions/s_ben/events?view=agui");
     expect(screen.getByText("survives agent restart")).toBeInTheDocument();
 
     const replay = sources[1]!;

@@ -29,6 +29,7 @@ import type { AguiConversationState } from "./aguiConversation";
 import type { Block, PaneMessage } from "./types";
 
 afterEach(() => {
+  document.cookie = "nexus_csrf=; Max-Age=0; Path=/";
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
@@ -59,8 +60,11 @@ const ev = {
     ({ type: EventType.TEXT_MESSAGE_START, messageId }) as BaseEvent,
   // A `role:"user"` message — the operator's own input echoed by the session stream (what map.ts's
   // `user_input` case emits). This is the half that mirrors TUI ↔ web.
-  userStart: (messageId: string): BaseEvent =>
-    ({ type: EventType.TEXT_MESSAGE_START, messageId, role: "user" }) as BaseEvent,
+  userStart: (
+    messageId: string,
+    provenance: { name?: string; kind?: string } = {},
+  ): BaseEvent =>
+    ({ type: EventType.TEXT_MESSAGE_START, messageId, role: "user", ...provenance }) as BaseEvent,
   textContent: (messageId: string, delta: string): BaseEvent =>
     ({ type: EventType.TEXT_MESSAGE_CONTENT, messageId, delta }) as BaseEvent,
   textEnd: (messageId: string): BaseEvent =>
@@ -127,6 +131,24 @@ describe("reduceAguiEvents — AG-UI BaseEvent[] → PaneMessage[]/Block[]", () 
     // The row shows the real sender, not the generic default agent identity.
     expect(rows[0]!.who).toBe("hermes");
     expect(rows[0]!.glyph).toBe("H");
+  });
+
+  it("keeps a named live human author distinct from an agent", () => {
+    const rows = reduceAll([
+      ev.runStarted("r1"),
+      ({
+        type: EventType.TEXT_MESSAGE_START,
+        messageId: "m1",
+        role: "assistant",
+        name: "other-browser-user",
+        kind: "human",
+      }) as BaseEvent,
+      ev.textContent("m1", "from another human"),
+      ev.textEnd("m1"),
+      ev.runFinished("r1"),
+    ]);
+
+    expect(rows[0]).toMatchObject({ who: "other-browser-user", chip: "human" });
   });
 
   it("merges repeated tool-call updates by id (START once, then ARGS/RESULT)", () => {
@@ -299,10 +321,12 @@ describe("AguiWebSocketSource", () => {
     readyState = FakeWebSocket.CONNECTING;
     sent: string[] = [];
     readonly url: string;
+    readonly protocols: string | string[] | undefined;
 
-    constructor(url: string) {
+    constructor(url: string, protocols?: string | string[]) {
       super();
       this.url = url;
+      this.protocols = protocols;
       FakeWebSocket.instances.push(this);
     }
 
@@ -332,6 +356,7 @@ describe("AguiWebSocketSource", () => {
   }
 
   it("forwards raw AG-UI JSON frames while handling control frames internally", () => {
+    document.cookie = "nexus_csrf=csrf-source; Path=/";
     const Socket = installFakeWebSocket();
     const source = new AguiWebSocketSource("/api/agui/observe?session=otto");
     const socket = Socket.instances[0]!;
@@ -343,6 +368,7 @@ describe("AguiWebSocketSource", () => {
     socket.message(JSON.stringify({ type: EventType.RUN_STARTED, threadId: "otto", runId: "r1" }));
 
     expect(socket.url).toBe("ws://localhost:3000/api/agui/ws?session=otto");
+    expect(socket.protocols).toEqual(["nexus-v1", "nexus-csrf.csrf-source"]);
     expect(messages).toEqual([
       JSON.stringify({ type: EventType.RUN_STARTED, threadId: "otto", runId: "r1" }),
     ]);
@@ -429,6 +455,19 @@ describe("thread backlog hydration", () => {
     expect(rows[0]).toMatchObject({ id: "m1", who: "bianca", chip: "you", isYou: true });
     expect(rows[1]).toMatchObject({ id: "m2", who: "blake", chip: "agent", glyph: "B" });
     expect(rows[0]!.blocks).toEqual([{ b: "p", runs: [{ t: "text", v: "from me" }] }]);
+  });
+
+  it("keeps a non-self human backlog author distinct from an agent", () => {
+    expect(historyRowsToPaneMessages([
+      {
+        messageId: "m-human",
+        from: "other-browser-user",
+        fromKind: "human",
+        body: "from another human",
+      },
+    ], { who: "bianca", glyph: "B" })).toMatchObject([
+      { id: "m-human", who: "other-browser-user", chip: "human" },
+    ]);
   });
 
   it("keeps live rows that arrived while backlog was loading without duplicating ids", () => {
@@ -524,6 +563,48 @@ describe("operator input mirroring — no double echo, TUI-origin renders as you
     expect(JSON.stringify(first!.blocks)).toContain("typed in the TUI");
     expect(second!.chip).toBe("agent");
     expect(JSON.stringify(second!.blocks)).toContain("got it");
+  });
+
+  it("renders authenticated self as you while the target reply remains the target agent", () => {
+    let state = newConversationState(
+      { who: "ben", glyph: "B", chip: "agent" },
+      { who: "alice", glyph: "A" },
+    );
+    state = fold(state, [
+      ev.runStarted("r1"),
+      ev.userStart("u-self", { name: "alice", kind: "human" }),
+      ev.textContent("u-self", "from alice"),
+      ev.textEnd("u-self"),
+      ev.textStart("a1"),
+      ev.textContent("a1", "from ben"),
+      ev.textEnd("a1"),
+      ev.runFinished("r1"),
+    ]);
+
+    expect(state.messages).toMatchObject([
+      { who: "alice", chip: "you", isYou: true },
+      { who: "ben", chip: "agent" },
+    ]);
+  });
+
+  it("renders another authenticated human as human instead of you or the target", () => {
+    let state = newConversationState(
+      { who: "ben", glyph: "B", chip: "agent" },
+      { who: "alice", glyph: "A" },
+    );
+    state = fold(state, [
+      ev.runStarted("r1"),
+      ev.userStart("u-other", { name: "peer-user", kind: "human" }),
+      ev.textContent("u-other", "from peer-user"),
+      ev.textEnd("u-other"),
+      ev.runFinished("r1"),
+    ]);
+
+    expect(state.messages).toMatchObject([
+      { who: "peer-user", chip: "human" },
+    ]);
+    expect(state.messages[0]).not.toHaveProperty("isYou");
+    expect(state.messages[0]?.who).not.toBe("ben");
   });
 
   it("drops an agent run that carried only the operator's input (no empty bubble)", () => {

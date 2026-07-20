@@ -747,7 +747,14 @@ describe("public API — reads go to the read-view (NOT the daemon)", () => {
       req({
         method: "GET",
         path: "/api/v1/whoami",
-        caller: { name: "etan", project: "nexus" },
+        caller: {
+          name: "etan",
+          project: "nexus",
+          kind: Kind.Human,
+          tier: Tier.Admin,
+          sessionId: "s_etan_browser",
+          agentId: "a_etan_browser",
+        },
       }),
       deps(),
     );
@@ -755,10 +762,65 @@ describe("public API — reads go to the read-view (NOT the daemon)", () => {
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({
       name: "etan",
+      agentId: "a_etan_browser",
+      kind: "human",
       tier: "admin",
       project: "nexus",
       presence: "online",
     });
+  });
+
+  it("GET /api/v1/whoami ignores a name query that targets another identity", async () => {
+    const res = await handle(
+      req({
+        method: "GET",
+        path: "/api/v1/whoami",
+        query: { name: "ben" },
+        caller: {
+          name: "etan",
+          project: "nexus",
+          kind: Kind.Human,
+          tier: Tier.Admin,
+          sessionId: "s_etan_browser",
+        },
+      }),
+      deps(),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      name: "etan",
+      kind: "human",
+      project: "nexus",
+    });
+  });
+
+  it("GET /api/v1/whoami works without a projected identity row", async () => {
+    const readDb = vi.fn(() => db);
+    const res = await handle(
+      req({
+        method: "GET",
+        path: "/api/v1/whoami",
+        caller: {
+          name: "browser-operator",
+          project: "default",
+          kind: Kind.Human,
+          tier: Tier.Admin,
+          sessionId: "s_browser_operator",
+        },
+      }),
+      { db: readDb },
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      name: "browser-operator",
+      sessionId: "s_browser_operator",
+      kind: "human",
+      tier: "admin",
+      project: "default",
+    });
+    expect(readDb).not.toHaveBeenCalled();
   });
 
   it("GET /api/v1/whoami without caller or name returns 401 instead of querying an empty name", async () => {
@@ -1406,6 +1468,23 @@ describe("public API — reads go to the read-view (NOT the daemon)", () => {
         expect.objectContaining({ runtimeId: "s_ben" }),
         expect.objectContaining({ runtimeId: "s_ben_old" }),
       ],
+    });
+  });
+
+  it("GET /api/v1/runtimes prefers a stable agentId over stale name metadata", async () => {
+    const res = await handle(
+      req({
+        method: "GET",
+        path: "/api/v1/runtimes",
+        query: { name: "blake", agentId: "a_ben", includeStopped: "true" },
+      }),
+      deps(),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      agentId: "a_ben",
+      runtimes: expect.arrayContaining([expect.objectContaining({ runtimeId: "s_ben" })]),
     });
   });
 

@@ -162,6 +162,7 @@ export interface ProjectRow {
 
 /** The caller's resolved identity (web console header / public `whoami`). */
 export interface WhoamiRow {
+  agentId?: string;
   name: string;
   sessionId: string;
   role?: string;
@@ -213,6 +214,8 @@ export interface AgentAccessGrantRow {
   agentId: string;
   principalProject: string;
   principalName: string;
+  principalSessionId?: string;
+  principalAgentId?: string;
   role: string;
 }
 
@@ -283,9 +286,9 @@ export async function listMembers(
       );
   const rows = await db
     .select({
+      agentId: sessions.agentId,
       name: sessions.name,
       sessionId: sessions.sessionId,
-      agentId: sessions.agentId,
       agent: sessions.agent,
       kind: sessions.kind,
       role: sessions.role,
@@ -402,25 +405,30 @@ export async function listRuntimes(
 async function agentByIdOrName(
   db: ReadDb,
   id: string,
-  project?: string,
+  _project?: string,
 ): Promise<AgentSummaryRow | undefined> {
-  const identity = or(eq(agents.agentId, id), eq(agents.name, id));
-  const where = project
-    ? and(identity, eq(agents.project, project))
-    : identity;
-  const rows = await db
-    .select({
-      agentId: agents.agentId,
-      name: agents.name,
-      project: agents.project,
-      defaultHarness: agents.defaultHarness,
-      role: agents.role,
-      tier: agents.tier,
-      disabledAt: agents.disabledAt,
-    })
+  const columns = {
+    agentId: agents.agentId,
+    name: agents.name,
+    project: agents.project,
+    defaultHarness: agents.defaultHarness,
+    role: agents.role,
+    tier: agents.tier,
+    disabledAt: agents.disabledAt,
+  };
+  const exact = await db
+    .select(columns)
     .from(agents)
-    .where(where)
+    .where(eq(agents.agentId, id))
     .limit(1);
+  const rows = exact.length > 0 ? exact : await db
+    .select(columns)
+    .from(agents)
+    .where(eq(agents.name, id))
+    .limit(2);
+  if (exact.length === 0 && rows.length > 1) {
+    throw new Error(`ambiguous agent name ${JSON.stringify(id)}; address it by stable agent id`);
+  }
 
   const row = rows[0];
   if (!row) return undefined;
@@ -435,36 +443,66 @@ async function agentByIdOrName(
   };
 }
 
-/** Resolve the managed-owner fields for one agent display name. */
+/** Resolve managed-owner fields by exact stable id, then one globally unique display alias. */
 export async function agentOwnerByName(
   db: ReadDb,
-  name: string,
+  nameOrAgentId: string,
 ): Promise<AgentOwnerRow | undefined> {
-  const rows = await db
-    .select({
-      agentId: agents.agentId,
-      name: agents.name,
-      project: agents.project,
-      role: agents.role,
-      tier: agents.tier,
-      ownerName: agents.ownerName,
-      ownerProject: agents.ownerProject,
-      ownerSessionId: agents.ownerSessionId,
-      ownerAgentId: agents.ownerAgentId,
-      sessionKind: sessions.kind,
-      sessionRole: sessions.role,
-      sessionTier: sessions.tier,
-    })
+  const columns = {
+    agentId: agents.agentId,
+    name: agents.name,
+    project: agents.project,
+    role: agents.role,
+    tier: agents.tier,
+    ownerName: agents.ownerName,
+    ownerProject: agents.ownerProject,
+    ownerSessionId: agents.ownerSessionId,
+    ownerAgentId: agents.ownerAgentId,
+  };
+  const exact = await db
+    .select(columns)
     .from(agents)
-    .leftJoin(
-      sessions,
-      and(eq(sessions.name, agents.name), eq(sessions.project, agents.project)),
-    )
-    .where(eq(agents.name, name))
+    .where(eq(agents.agentId, nameOrAgentId))
     .limit(1);
+  const rows = exact.length > 0 ? exact : await db
+    .select(columns)
+    .from(agents)
+    .where(eq(agents.name, nameOrAgentId))
+    .limit(2);
+
+  if (exact.length === 0 && rows.length > 1) {
+    throw new Error(
+      `ambiguous agent name ${JSON.stringify(nameOrAgentId)}; address it by stable agent id`,
+    );
+  }
 
   const row = rows[0];
   if (!row) return undefined;
+  const sessionColumns = {
+    sessionKind: sessions.kind,
+    sessionRole: sessions.role,
+    sessionTier: sessions.tier,
+  };
+  let sessionRows = await db
+    .select(sessionColumns)
+    .from(sessions)
+    .where(eq(sessions.agentId, row.agentId))
+    .orderBy(desc(sessions.createdAt))
+    .limit(1);
+  if (sessionRows.length === 0 && row.name) {
+    sessionRows = await db
+      .select(sessionColumns)
+      .from(sessions)
+      .where(eq(sessions.name, row.name))
+      .orderBy(desc(sessions.createdAt))
+      .limit(2);
+    if (sessionRows.length > 1) {
+      throw new Error(
+        `ambiguous session name ${JSON.stringify(row.name)}; address it by stable agent id`,
+      );
+    }
+  }
+  const session = sessionRows[0];
   return {
     agentId: row.agentId,
     name: row.name ?? "",
@@ -475,9 +513,9 @@ export async function agentOwnerByName(
     ownerProject: opt(row.ownerProject),
     ownerSessionId: opt(row.ownerSessionId),
     ownerAgentId: opt(row.ownerAgentId),
-    sessionKind: opt(row.sessionKind),
-    sessionRole: opt(row.sessionRole),
-    sessionTier: opt(row.sessionTier),
+    sessionKind: opt(session?.sessionKind),
+    sessionRole: opt(session?.sessionRole),
+    sessionTier: opt(session?.sessionTier),
   };
 }
 
@@ -491,6 +529,8 @@ export async function agentAccessGrantsByAgentId(
       agentId: agentAclGrants.agentId,
       principalProject: agentAclGrants.principalProject,
       principalName: agentAclGrants.principalName,
+      principalSessionId: agentAclGrants.principalSessionId,
+      principalAgentId: agentAclGrants.principalAgentId,
       role: agentAclGrants.role,
     })
     .from(agentAclGrants)
@@ -499,6 +539,8 @@ export async function agentAccessGrantsByAgentId(
     agentId: row.agentId ?? agentId,
     principalProject: row.principalProject ?? "",
     principalName: row.principalName ?? "",
+    principalSessionId: opt(row.principalSessionId),
+    principalAgentId: opt(row.principalAgentId),
     role: row.role ?? "",
   }));
 }
@@ -1243,6 +1285,7 @@ export async function whoamiRow(
 ): Promise<WhoamiRow | undefined> {
   const rows = await db
     .select({
+      agentId: sessions.agentId,
       name: sessions.name,
       sessionId: sessions.sessionId,
       role: sessions.role,
@@ -1253,11 +1296,18 @@ export async function whoamiRow(
     })
     .from(sessions)
     .where(eq(sessions.name, name))
-    .limit(1);
+    .limit(2);
+
+  if (rows.length > 1) {
+    throw new Error(
+      `ambiguous session name ${JSON.stringify(name)}; address it by stable agent id`,
+    );
+  }
 
   const r = rows[0];
   if (!r) return undefined;
   return {
+    agentId: opt(r.agentId),
     name: r.name ?? "",
     sessionId: r.sessionId,
     role: opt(r.role),

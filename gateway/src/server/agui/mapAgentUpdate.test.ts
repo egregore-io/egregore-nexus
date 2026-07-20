@@ -215,6 +215,25 @@ describe("acpToAguiEvents (agent.update → AG-UI BaseEvent[])", () => {
     });
   });
 
+  it("preserves authenticated human provenance on live user_input events", () => {
+    const { events } = run([
+      upd("user_input", {
+        text: "hello target",
+        clientMessageId: "you:123:2",
+        name: "alice",
+        kind: "human",
+      }),
+    ]);
+
+    for (const event of events) {
+      expect(event).toMatchObject({
+        name: "alice",
+        kind: "human",
+      });
+      expect(event).not.toMatchObject({ name: "ben" });
+    }
+  });
+
   it("preserves initial_prompt metadata on user_input AG-UI events", () => {
     const { events } = run([
       upd("user_input", {

@@ -118,6 +118,8 @@ function userInputMetadata(data: Record<string, unknown>): Record<string, unknow
   if (source) metadata.source = source;
   const name = str(data.name);
   if (name) metadata.name = name;
+  const kind = str(data.kind);
+  if (kind) metadata.kind = kind;
   const harness = str(data.harness);
   if (harness) metadata.harness = harness;
   const runtimeId = str(data.runtimeId) ?? str(data.runtime_id);

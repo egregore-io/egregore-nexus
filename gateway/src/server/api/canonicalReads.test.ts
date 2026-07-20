@@ -91,6 +91,54 @@ describe("public canonical Gateway reads", () => {
     db.close();
   });
 
+  it("resolves stable agent targets globally while keeping project as an explicit fleet filter", async () => {
+    const db = createClient({ url: ":memory:" });
+    await migrateGatewayStore(db);
+    await db.batch([
+      "INSERT INTO identities VALUES ('a_cross','cross',NULL,'agent','agent','{\"project\":\"ops\"}',1)",
+      "INSERT INTO runtime_descriptors VALUES ('r_cross','a_cross','s_cross','codex','headless','acp','/work',NULL,'online',2)",
+    ], "write");
+    const deps = { db: vi.fn(), canonicalDb: () => db };
+    const caller = { name: "operator", project: "default", sessionId: "s_operator" };
+
+    for (const pathName of [
+      "/api/v1/agents/a_cross",
+      "/api/v1/agents/a_cross/runtimes",
+      "/api/v1/runtimes?agentId=a_cross",
+    ]) {
+      const url = new URL(pathName, "http://gateway.test");
+      const response = await handle({
+        method: "GET",
+        path: url.pathname,
+        query: Object.fromEntries(url.searchParams.entries()),
+        headers: {},
+        caller,
+      }, deps);
+      expect(response.status, pathName).toBe(200);
+    }
+
+    const globalFleet = await handle({
+      method: "GET",
+      path: "/api/v1/runtimes",
+      query: {},
+      headers: {},
+      caller,
+    }, deps);
+    expect(globalFleet.body).toMatchObject({
+      runtimes: [expect.objectContaining({ runtimeId: "r_cross", agentId: "a_cross" })],
+    });
+
+    const filteredFleet = await handle({
+      method: "GET",
+      path: "/api/v1/runtimes",
+      query: { project: "default" },
+      headers: {},
+      caller,
+    }, deps);
+    expect(filteredFleet.body).toEqual({ runtimes: [] });
+    db.close();
+  });
+
   it("keeps canonical search and message reads caller-scoped without the daemon read view", async () => {
     const db = createClient({ url: ":memory:" });
     await migrateGatewayStore(db);

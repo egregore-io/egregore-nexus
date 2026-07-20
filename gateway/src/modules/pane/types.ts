@@ -25,7 +25,7 @@ export type Block =
       output?: string;
     };
 
-export type ChipLabel = "you" | "agent" | "notification" | "app";
+export type ChipLabel = "you" | "human" | "agent" | "notification" | "app";
 
 /** A single message row in a thread. */
 export interface PaneMessage {
@@ -33,7 +33,7 @@ export interface PaneMessage {
   who: string;
   /** Avatar glyph (single char). */
   glyph: string;
-  /** The author's chip ("you" | "agent" | "notification"). */
+  /** The author's chip ("you" | "human" | "agent" | "notification"). */
   chip: ChipLabel;
   /** Avatar presence dot (omitted for the operator's own messages). */
   presence?: PresenceValue;

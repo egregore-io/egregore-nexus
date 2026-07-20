@@ -181,7 +181,7 @@ describe("useRenameThread", () => {
     queryClient.setQueryData<ThreadRow[]>(qk.threads(), [
       { name: "ops", members: ["roman"], lastAt: 1 },
     ]);
-    const fetchSpy = vi.fn(async () =>
+    const fetchSpy = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
       new Response(JSON.stringify({ previous: "ops", name: "launch" }), { status: 200 }),
     );
     const invalidate = vi.spyOn(queryClient, "invalidateQueries");
@@ -200,11 +200,17 @@ describe("useRenameThread", () => {
       await hook.result.current.rename.mutateAsync({ thread: "ops", name: "launch" });
     });
 
-    expect(fetchSpy).toHaveBeenCalledWith("/api/v1/threads/ops", {
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    const call = fetchSpy.mock.calls.at(0);
+    expect(call).toBeDefined();
+    const [requestUrl, requestInit] = call!;
+    expect(requestUrl).toBe("/api/v1/threads/ops");
+    expect(requestInit).toMatchObject({
       method: "PATCH",
-      headers: { "content-type": "application/json" },
+      credentials: "include",
       body: JSON.stringify({ name: "launch" }),
     });
+    expect(new Headers(requestInit?.headers).get("content-type")).toBe("application/json");
     expect(hook.result.current.client.getQueryData<ThreadRow[]>(qk.threads())?.[0]?.name)
       .toBe("launch");
     expect(invalidate).not.toHaveBeenCalled();
