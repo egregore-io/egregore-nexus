@@ -18,6 +18,7 @@ printf '%s\n' '{"name":"@openai/codex"}' >"$CODEX_SOURCE/package.json"
 printf '%s\n' 'platform payload' \
   >"$CODEX_SOURCE/node_modules/@openai/codex-linux-x64/vendor/payload"
 printf '%s\n' '#!/usr/bin/env bash' 'echo "claude 4.5.6"' >"$CLAUDE_SOURCE"
+ln "$CLAUDE_SOURCE" "$(dirname "$CLAUDE_SOURCE")/claude-hardlink"
 chmod 0775 "$CODEX_SOURCE" "$CODEX_SOURCE/bin" "$CODEX_SOURCE/bin/codex.js" \
   "$CODEX_SOURCE/node_modules" "$CODEX_SOURCE/node_modules/@openai" \
   "$CODEX_SOURCE/node_modules/@openai/codex-linux-x64" \

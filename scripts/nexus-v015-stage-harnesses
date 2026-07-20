@@ -28,7 +28,6 @@ CLAUDE_SOURCE="$HOST_NODE_ROOT/lib/node_modules/@anthropic-ai/claude-code/bin/cl
 [ -d "$CODEX_SOURCE" ] && [ ! -L "$CODEX_SOURCE" ] \
   || die 'Codex package source is missing or unsafe'
 [ -f "$CLAUDE_SOURCE" ] && [ ! -L "$CLAUDE_SOURCE" ] \
-  && [ "$(stat -c %h "$CLAUDE_SOURCE")" = 1 ] \
   || die 'Claude executable source is missing or unsafe'
 [ -z "$(find "$CODEX_SOURCE" -type l -print -quit)" ] \
   || die 'Codex package source contains a symbolic link'
