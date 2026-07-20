@@ -103,6 +103,15 @@ fn turn_timeout() -> Duration {
 /// on the full [`TURN_TIMEOUT`], not this.
 const QUIESCENCE_WINDOW: Duration = Duration::from_secs(8);
 
+/// Largest text delta Nexus relays from one ACP assistant update.
+///
+/// Some real ACP bridges coalesce a complete response into one `AgentMessageChunk`. Keeping that
+/// provider framing would turn a multi-paragraph answer into one large WebSocket frame and prevent
+/// clients from painting progressive content. Nexus therefore normalizes only oversized text
+/// updates into bounded UTF-8 slices. Concatenating the slices is byte-for-byte identical to the
+/// provider text; all non-text updates retain their original one-notification/one-event framing.
+const MAX_LIVE_TEXT_DELTA_BYTES: usize = 512;
+
 /// Grace period for harness process-tree shutdown. ACP stdio adapters commonly launch a shell /
 /// node wrapper that spawns provider-specific children; stopping only the wrapper leaks the
 /// descendants. The engine therefore starts each harness in its own process group and terminates
@@ -809,11 +818,13 @@ struct TurnActivity {
     /// Pulsed alongside `activity` so a waiting `inject` wakes promptly on new stream traffic
     /// instead of sleeping out the whole window every time.
     notify: tokio::sync::Notify,
-    /// Optional LIVE sink: when a turn is being relayed in realtime, each renderable
+    /// Optional LIVE sink: when a turn is being relayed in realtime, each normalized renderable
     /// [`StreamEvent`] is sent here AS IT ARRIVES (in addition to buffering), so the caller can
-    /// emit `agent.update` per chunk instead of waiting for turn-end. This is the realtime
-    /// streaming path (AionUi `responseStream` model); the buffer remains for quiescence detection
-    /// and a non-live fallback. Set per turn via `install_live`, dropped via `clear_live`.
+    /// emit bounded `agent.update` deltas instead of waiting for turn-end. A provider text update
+    /// may normalize into multiple deltas; other renderable updates remain one event. This is the
+    /// realtime streaming path (AionUi `responseStream` model); the buffer remains for quiescence
+    /// detection and a non-live fallback. Set per turn via `install_live`, dropped via
+    /// `clear_live`.
     live: Mutex<Option<tokio::sync::mpsc::UnboundedSender<StreamEvent>>>,
 }
 
@@ -830,8 +841,8 @@ impl TurnActivity {
     }
 
     /// Begin live relay for a turn: install a fresh channel and return its receiver. Each subsequent
-    /// `ingest` sends the renderable event here AS IT ARRIVES (realtime). Call `clear_live` at
-    /// turn-end to close the receiver.
+    /// `ingest` sends normalized renderable events here AS THEY ARRIVE (realtime). Call
+    /// `clear_live` at turn-end to close the receiver.
     fn install_live(&self) -> tokio::sync::mpsc::UnboundedReceiver<StreamEvent> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         *self.live.lock().unwrap() = Some(tx);
@@ -865,16 +876,17 @@ impl TurnActivity {
             return;
         }
 
-        match translate(update) {
-            Some(event) => {
-                // Hermes 0.17 emits this adapter-authored status line when it has only placed the
-                // prompt in a process-private queue. It is not model output and must not satisfy
-                // observed-delivery quiescence. The event remains buffered/relayed so clients can
-                // display the truthful harness status.
-                if !is_hermes_busy_queue_ack(&event) {
-                    self.model_events
-                        .fetch_add(1, std::sync::atomic::Ordering::Release);
-                }
+        let events = translate_for_relay(update);
+        if let Some(first) = events.first() {
+            // Hermes 0.17 emits this adapter-authored status line when it has only placed the
+            // prompt in a process-private queue. It is not model output and must not satisfy
+            // observed-delivery quiescence. The event remains buffered/relayed so clients can
+            // display the truthful harness status.
+            if events.len() != 1 || !is_hermes_busy_queue_ack(first) {
+                self.model_events
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+            for event in events {
                 let idx = self.push_event(event);
                 debug!(
                     target: "nexus_agent::acp",
@@ -882,14 +894,13 @@ impl TurnActivity {
                     "captured renderable session/update (relayed as agent.update)"
                 );
             }
-            None => {
-                self.touch();
-                debug!(
-                    target: "nexus_agent::acp",
-                    update = ?std::mem::discriminant(update),
-                    "non-renderable session/update (kept stream alive, not buffered)"
-                );
-            }
+        } else {
+            self.touch();
+            debug!(
+                target: "nexus_agent::acp",
+                update = ?std::mem::discriminant(update),
+                "non-renderable session/update (kept stream alive, not buffered)"
+            );
         }
     }
 
@@ -954,6 +965,34 @@ impl TurnActivity {
     fn take(&self) -> Vec<StreamEvent> {
         std::mem::take(&mut *self.buffer.lock().unwrap())
     }
+}
+
+/// Translate one ACP update into the events Nexus relays. The pure ACP translator deliberately
+/// preserves provider framing; this engine boundary adds one transport normalization: oversized
+/// assistant text becomes bounded UTF-8 deltas so a coalescing bridge cannot collapse progressive
+/// browser output into one WebSocket frame.
+fn translate_for_relay(update: &SessionUpdate) -> Vec<StreamEvent> {
+    let SessionUpdate::AgentMessageChunk(chunk) = update else {
+        return translate(update).into_iter().collect();
+    };
+    let ContentBlock::Text(text) = &chunk.content else {
+        return translate(update).into_iter().collect();
+    };
+    if text.text.len() <= MAX_LIVE_TEXT_DELTA_BYTES {
+        return vec![StreamEvent::text(text.text.clone())];
+    }
+
+    let mut events = Vec::new();
+    let mut start = 0;
+    while start < text.text.len() {
+        let mut end = (start + MAX_LIVE_TEXT_DELTA_BYTES).min(text.text.len());
+        while !text.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        events.push(StreamEvent::text(&text.text[start..end]));
+        start = end;
+    }
+    events
 }
 
 /// Hermes' exact ACP busy-session acknowledgement. This is emitted by adapter code, not the model,
@@ -1099,8 +1138,9 @@ impl AcpEngine {
     }
 
     /// Install the realtime relay channel for the turn about to be injected: each renderable
-    /// `session/update` is forwarded here AS IT ARRIVES, so the caller emits `agent.update` per
-    /// chunk (true streaming) instead of waiting for turn-end. Pair with [`AcpEngine::clear_live`].
+    /// `session/update` is forwarded here AS IT ARRIVES, so the caller emits bounded
+    /// `agent.update` deltas (true streaming) instead of waiting for turn-end. Pair with
+    /// [`AcpEngine::clear_live`].
     pub fn install_live(&self) -> tokio::sync::mpsc::UnboundedReceiver<StreamEvent> {
         self.updates.install_live()
     }

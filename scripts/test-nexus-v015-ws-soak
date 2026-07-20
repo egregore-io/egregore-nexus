@@ -788,11 +788,20 @@ class LaneHttp:
 
 
 def progressive_reply_contract() -> None:
-    marker = "V015_PROGRESSIVE_MARKER"
+    marker = "V015_PROGRESSIVE_MARKER_" + ("x" * 48)
     reply = module["progressive_session_reply"](marker)
+    line_count = module["PROGRESSIVE_REPLY_LINES"]
     require(
-        reply.splitlines() == [marker] * 4,
-        "progressive session reply must preserve four exact marker lines",
+        line_count >= 16,
+        "progressive session probe has too few semantic lines",
+    )
+    require(
+        len(reply.encode("utf-8")) > 512,
+        "progressive session probe must cross the Nexus text-delta boundary",
+    )
+    require(
+        reply.splitlines() == [marker] * line_count,
+        "progressive session reply must preserve every exact marker line",
     )
 
 

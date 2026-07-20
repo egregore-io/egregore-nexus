@@ -52,6 +52,7 @@ MEMORY_LIMIT_BYTES = 8 * 1024 * 1024 * 1024
 DISK_LIMIT_BYTES = 10 * 1024 * 1024 * 1024
 FRAME_HISTORY_LIMIT = 16_384
 FINGERPRINT_HISTORY_LIMIT = 16_384
+PROGRESSIVE_REPLY_LINES = 16
 MEMORY_TREND_MIN_GROWTH = 512 * 1024 * 1024
 DISK_TREND_MIN_GROWTH = 512 * 1024 * 1024
 PACKAGE_NAMES = ("@egregore/nexus", "@egregore/nexus-cli", "@egregore/nexus-gateway")
@@ -1199,7 +1200,7 @@ def session_event(frame: dict[str, Any]) -> dict[str, Any]:
 
 
 def progressive_session_reply(marker: str) -> str:
-    return "\n".join((marker,) * 4)
+    return "\n".join((marker,) * PROGRESSIVE_REPLY_LINES)
 
 
 @dataclass(frozen=True)
@@ -1259,7 +1260,8 @@ class AgentSessionLane(FrameLane):
             "mode": "session",
             "target": {"name": self.agent.name, "agentId": self.agent.agent_id},
             "text": (
-                "Reply with exactly these four identical marker lines and no other text:\n"
+                f"Reply with exactly these {PROGRESSIVE_REPLY_LINES} identical marker lines "
+                "and no other text:\n"
                 f"{reply}"
             ),
             "clientMessageId": client_message_id,

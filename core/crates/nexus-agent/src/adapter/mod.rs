@@ -189,9 +189,10 @@ pub trait Adapter: Send + Sync {
     async fn kill(&self) {}
 
     /// Install the REALTIME relay channel for the turn about to be injected: each renderable
-    /// `session/update` is forwarded as it arrives, so the caller emits `agent.update` per chunk
-    /// (true streaming). Returns `None` when the adapter has no live engine ([`MockAdapter`] →
-    /// the caller falls back to draining [`Adapter::stream_updates`] at turn-end). The real ACP
+    /// `session/update` is forwarded as it arrives, so the caller emits bounded `agent.update`
+    /// deltas (true streaming). An oversized provider text update may normalize into multiple
+    /// exact slices. Returns `None` when the adapter has no live engine ([`MockAdapter`] → the
+    /// caller falls back to draining [`Adapter::stream_updates`] at turn-end). The real ACP
     /// adapters override to return `Some` from their engine. Pair with [`Adapter::clear_live`].
     fn install_live(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<StreamEvent>> {
         None

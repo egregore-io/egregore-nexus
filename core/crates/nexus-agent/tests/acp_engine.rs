@@ -156,6 +156,50 @@ async fn engine_open_inject_stream_round_trip() {
     );
 }
 
+/// Real Codex ACP can coalesce a complete assistant reply into one large
+/// `AgentMessageChunk`. The Nexus session stream still exposes bounded, ordered deltas, and
+/// concatenating them preserves the exact UTF-8 provider reply.
+#[tokio::test]
+async fn engine_normalizes_one_coalesced_reply_into_bounded_text_deltas() {
+    let original = "αβγδ progressive reply line\n".repeat(64);
+    let mut command = fake_command();
+    command
+        .env
+        .push(("FAKE_ACP_REPLY".to_string(), "coalesced".to_string()));
+    command
+        .env
+        .push(("FAKE_ACP_REPLY_BODY".to_string(), original.clone()));
+    let engine = AcpEngine::new();
+    engine
+        .spawn_and_initialize(&command)
+        .await
+        .expect("spawn + ACP initialize against a coalescing bridge");
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .expect("session/new");
+
+    engine
+        .inject("produce one coalesced reply".to_string())
+        .await
+        .expect("session/prompt turn completes");
+
+    let chunks = reply_chunks(engine.take_updates());
+    assert!(
+        chunks.len() >= 2,
+        "one coalesced ACP reply must become multiple bounded Nexus deltas"
+    );
+    assert!(
+        chunks.iter().all(|chunk| chunk.len() <= 512),
+        "every normalized delta must honor the byte ceiling"
+    );
+    assert_eq!(
+        chunks.concat(),
+        original,
+        "delta normalization must preserve the exact UTF-8 reply"
+    );
+}
+
 #[tokio::test]
 async fn session_new_timeout_is_terminal_and_reaps_the_harness() {
     let engine = AcpEngine::new().with_session_open_timeout(std::time::Duration::from_millis(100));

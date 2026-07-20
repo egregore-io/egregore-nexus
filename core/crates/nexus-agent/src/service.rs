@@ -330,9 +330,10 @@ async fn relay_turn(
     }
 
     // REALTIME relay: install the live channel BEFORE injecting and drain it concurrently with
-    // the turn — emitting one `agent.update` per `session/update` AS IT ARRIVES (true streaming,
-    // the AionUi `responseStream` model). The gateway maps each to AG-UI. Adapters with no live
-    // engine (the mock) return `None` → we fall back to a single turn-end drain below.
+    // the turn — emitting bounded `agent.update` deltas AS `session/update` arrives (true
+    // streaming, the AionUi `responseStream` model). A coalesced provider text update may become
+    // multiple exact deltas; the gateway maps each to AG-UI. Adapters with no live engine (the
+    // mock) return `None` → we fall back to a single turn-end drain below.
     let drain = adapter.install_live().map(|mut rx| {
         let events = events.clone();
         let sid = recipient.clone();

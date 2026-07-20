@@ -28,14 +28,16 @@
 //!       daemon must parse this and `BusPort::send` it as a DM from the agent,
 //!     - `FAKE_ACP_REPLY=bare`         → a bare `$FAKE_ACP_REPLY_BODY` (default `pong`) with NO
 //!       envelope — the daemon must default-route it as a DM back to the turn's sender.
+//!     - `FAKE_ACP_REPLY=coalesced`    → one `AgentMessageChunk` containing the entire reply body,
+//!       matching real ACP bridges that coalesce a completed response.
 //!     - `FAKE_ACP_REPLY=passthrough`  → the full renderable `session/update` stream, in order
 //!       (`AvailableCommandsUpdate → AgentThoughtChunk → ToolCall → ToolCallUpdate(completed) →
 //!       AgentMessageChunk → turn-end`), for the ACP pass-through e2e: the daemon must relay these
 //!       as ordered tagged `agent.update` events (`Commands, Thinking, ToolCall, ToolCall, Text`).
 //!
-//!   The reply body is always split across **multiple** `AgentMessageChunk`s (and followed by the
-//!   turn-end `PromptResponse`) so the client's turn-end detection and stream reassembly are
-//!   exercised exactly as they would be against a real, multi-chunk model turn.
+//!   Normal modes split the reply across **multiple** `AgentMessageChunk`s; `coalesced` deliberately
+//!   emits one. Both are followed by the turn-end `PromptResponse`, covering provider framing on
+//!   either side of Nexus's bounded text-delta normalization.
 //!
 //! Fault injection (drive the adapter's failure/liveness paths):
 //! - `FAKE_ACP_FAIL_INIT=1` — make `initialize` never respond (the client's handshake then times
@@ -203,6 +205,7 @@ fn scripted_reply(prompt_body: &str) -> Vec<String> {
             // Still split into multiple chunks so the bare-reply path also reassembles a stream.
             split_into_chunks(&body)
         }
+        Ok("coalesced") => vec![body],
         // Default: echo the prompt back (original behaviour; inbound-relay assertion).
         _ => vec!["echo: ".to_string(), prompt_body.to_string()],
     }
