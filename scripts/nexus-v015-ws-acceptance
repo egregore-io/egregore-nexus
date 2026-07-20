@@ -946,7 +946,7 @@ def validate_runtime_observation(
             "actual cgroup limits are not 8 GiB, zero extra swap, and 1024 PIDs"
         )
 
-    expected_home = str(candidate.lab_root)
+    expected_home = str(candidate.lab_root / "harness-home")
     expected_nexus_home = str(candidate.lab_root / "nexus")
     if observation.home != expected_home or observation.nexus_home != expected_nexus_home:
         raise AcceptanceFailure(

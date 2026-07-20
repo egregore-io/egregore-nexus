@@ -85,7 +85,7 @@ class WsAcceptanceContracts(unittest.TestCase):
                 "rustc": "rustc 1.90.0",
             },
             "environment": {
-                "HOME": str(root),
+                "HOME": str(root / "harness-home"),
                 "NEXUS_HOME": str(root / "nexus"),
                 "API_TOKEN": "<redacted>",
             },
@@ -942,7 +942,7 @@ class WsAcceptanceContracts(unittest.TestCase):
                         "limits": {"cpus": 6, "memoryBytes": 8589934592, "pids": 1024}
                     },
                     "environment": {
-                        "HOME": str(root),
+                        "HOME": str(root / "harness-home"),
                         "NEXUS_HOME": str(root / "nexus"),
                         "NEXUS_V015_NATIVE_BIN": readiness["nativeResolved"],
                         "NEXUS_V015_NATIVE_BIN_SHA256": readiness["nativeSha256"],
@@ -964,7 +964,7 @@ class WsAcceptanceContracts(unittest.TestCase):
                 memory_max="8589934592",
                 memory_swap_max="0",
                 pids_max="1024",
-                home=str(root),
+                home=str(root / "harness-home"),
                 nexus_home=str(root / "nexus"),
                 install_tree_sha256=readiness["installTreeSha256"],
                 daemon_pid=101,
