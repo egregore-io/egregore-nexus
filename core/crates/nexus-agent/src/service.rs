@@ -555,6 +555,14 @@ impl AgentTurnExecutionPort for Agent {
             .map_err(|error| error.to_contract_error())
     }
 
+    async fn compact(&self, recipient: &SessionId) -> Result<(), ContractError> {
+        self.adapter_for(recipient)
+            .map_err(to_contract)?
+            .compact()
+            .await
+            .map_err(|error| error.into_contract_error(recipient))
+    }
+
     async fn steer_observed(
         &self,
         recipient: &SessionId,

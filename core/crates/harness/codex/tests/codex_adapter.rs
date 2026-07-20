@@ -78,6 +78,21 @@ async fn codex_adapter_full_turn_over_acp() {
     assert_eq!(chunks, vec!["echo: ".to_string(), "status?".to_string()]);
 }
 
+#[tokio::test]
+async fn codex_adapter_compact_uses_the_acp_native_command() {
+    let adapter = CodexAdapter::with_command(fake_command());
+    adapter.open_session().await.expect("open_session");
+
+    adapter.compact().await.expect("compact");
+
+    let chunks = reply_chunks(adapter.stream_updates().await.expect("stream_updates"));
+    assert_eq!(
+        chunks,
+        vec!["echo: ".to_string(), "/compact".to_string()],
+        "the pinned codex-acp bridge recognizes /compact and maps it to thread/compact/start"
+    );
+}
+
 #[test]
 fn codex_resolves_pinned_app_server_acp_command_without_legacy_flags() {
     let _lock = COMMAND_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

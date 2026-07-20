@@ -164,6 +164,15 @@ pub trait Adapter: Send + Sync {
         ))
     }
 
+    /// Trigger transport-native context compaction for the current session. Adapters must
+    /// override this only when their protocol exposes a real compact operation; the default
+    /// fails closed so `/compact` is never injected as ordinary model text by accident.
+    async fn compact(&self) -> Result<(), AdapterInjectError> {
+        Err(AdapterInjectError::Contract(NexusError::Adapter(
+            "compact is not supported by this adapter".into(),
+        )))
+    }
+
     /// Inject one rendered prompt and, when the adapter can identify the prompt-accepted boundary,
     /// place `accepted_event` at the front of the turn's stream before assistant output.
     ///
