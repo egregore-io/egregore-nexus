@@ -918,6 +918,12 @@ class WsAcceptanceContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             install = root / "install"
+            gateway_entrypoint = install / "bin" / "nexus-gateway.mjs"
+            gateway_entrypoint.parent.mkdir(parents=True)
+            gateway_entrypoint.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+            gateway_launcher = root / "lab-bin" / "nexus-gateway"
+            gateway_launcher.parent.mkdir()
+            gateway_launcher.symlink_to(gateway_entrypoint)
             readiness = {
                 "containerId": "a" * 64,
                 "imageDigest": "sha256:" + "b" * 64,
@@ -925,7 +931,7 @@ class WsAcceptanceContracts(unittest.TestCase):
                 "nexusResolved": str(install / "bin" / "nexus.mjs"),
                 "nativeResolved": str(install / "native" / "nexus"),
                 "nativeSha256": "f" * 64,
-                "gatewayResolved": str(install / "bin" / "nexus-gateway.mjs"),
+                "gatewayResolved": str(gateway_entrypoint),
                 "gatewaySha256": "d" * 64,
                 "lensRendererMode": "production",
                 "lensApp": "/tmp/nexus-lens-app.contract",
@@ -973,7 +979,7 @@ class WsAcceptanceContracts(unittest.TestCase):
                 gateway_pid=202,
                 gateway_url="http://127.0.0.1:4101",
                 gateway_listener_owned=True,
-                gateway_argv=("node", readiness["gatewayResolved"]),
+                gateway_argv=("node", str(gateway_launcher)),
                 gateway_entrypoint=readiness["gatewayResolved"],
                 gateway_entrypoint_sha256=readiness["gatewaySha256"],
                 lens_pid=303,

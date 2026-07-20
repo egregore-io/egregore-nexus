@@ -993,9 +993,11 @@ def validate_runtime_observation(
     expected_gateway = readiness.get("gatewayResolved")
     expected_gateway_hash = readiness.get("gatewaySha256")
     if (
-        observation.gateway_entrypoint != expected_gateway
+        not isinstance(expected_gateway, str)
+        or not isinstance(expected_gateway_hash, str)
+        or observation.gateway_entrypoint != expected_gateway
         or observation.gateway_entrypoint_sha256 != expected_gateway_hash
-        or expected_gateway not in observation.gateway_argv
+        or not argv_binds_path(observation.gateway_argv, Path(expected_gateway))
     ):
         raise AcceptanceFailure("actual Gateway process is not the packed candidate entrypoint")
     validate_lens_ledger(readiness, environment)
