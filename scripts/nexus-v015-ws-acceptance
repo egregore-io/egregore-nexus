@@ -850,7 +850,13 @@ class LiveAgent:
 
 
 def parse_readiness(path: Path, lab_root: Path) -> dict[str, str]:
-    raw = checked_file(path, lab_root, "candidate readiness ledger")
+    raw = checked_file(
+        path,
+        lab_root,
+        "candidate readiness ledger",
+        expected_uid=0,
+        expected_mode=0o444,
+    )
     try:
         text = raw.decode("utf-8")
     except UnicodeError as error:
@@ -1225,10 +1231,24 @@ def observe_runtime(candidate: Candidate) -> RuntimeObservation:
     return observation
 
 
-def require_bound_file(path: Path, expected: object, label: str, root: Path) -> None:
+def require_bound_file(
+    path: Path,
+    expected: object,
+    label: str,
+    root: Path,
+    *,
+    expected_uid: int | None = None,
+    expected_mode: int | None = None,
+) -> None:
     if not isinstance(expected, str) or SHA256.fullmatch(expected) is None:
         raise AcceptanceFailure(f"{label} expected hash is invalid")
-    raw = checked_file(path, root, label)
+    raw = checked_file(
+        path,
+        root,
+        label,
+        expected_uid=expected_uid,
+        expected_mode=expected_mode,
+    )
     actual = sha256_bytes(raw)
     if actual != expected:
         raise AcceptanceFailure(f"{label} hash mismatch: expected {expected}, got {actual}")
@@ -2040,7 +2060,14 @@ def validate_candidate(lab_root: Path, evidence_dir: Path, run_id: str) -> Candi
     if observed_tarballs != set(tarball_paths.values()):
         raise AcceptanceFailure("candidate tarball directory has extra or missing entries")
     readiness_expected = environment.get("NEXUS_V015_READINESS_LEDGER_SHA256")
-    require_bound_file(readiness_path, readiness_expected, "candidate readiness ledger", lab_root)
+    require_bound_file(
+        readiness_path,
+        readiness_expected,
+        "candidate readiness ledger",
+        lab_root,
+        expected_uid=0,
+        expected_mode=0o444,
+    )
     native_path = validate_native_binding(
         install_root,
         nested_cli,
@@ -2334,7 +2361,13 @@ def candidate_verification_document(
     expected_readiness = candidate.lab_root / "lab" / "candidate-ready.v1"
     if readiness_path != expected_readiness:
         raise AcceptanceFailure("candidate readiness path is not canonical")
-    readiness = checked_file(readiness_path, candidate.lab_root, "candidate readiness ledger")
+    readiness = checked_file(
+        readiness_path,
+        candidate.lab_root,
+        "candidate readiness ledger",
+        expected_uid=0,
+        expected_mode=0o444,
+    )
     document: dict[str, Any] = {
         "schemaVersion": 1,
         "status": "PASS",

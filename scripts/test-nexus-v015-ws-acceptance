@@ -270,7 +270,19 @@ class WsAcceptanceContracts(unittest.TestCase):
                 root,
                 root / "install",
             )
-            document = module["candidate_verification_document"](candidate)
+            readiness_bytes = readiness.read_bytes()
+            checker = mock.Mock(return_value=readiness_bytes)
+            globals_ = module["candidate_verification_document"].__globals__
+            with mock.patch.dict(globals_, {"checked_file": checker}):
+                document = module["candidate_verification_document"](candidate)
+
+        checker.assert_called_once_with(
+            readiness,
+            root,
+            "candidate readiness ledger",
+            expected_uid=0,
+            expected_mode=0o444,
+        )
 
         self.assertEqual(document["status"], "PASS")
         self.assertEqual(document["runId"], "contract-run")
@@ -284,6 +296,46 @@ class WsAcceptanceContracts(unittest.TestCase):
             "--verify-candidate-only",
         ])
         self.assertTrue(parsed.verify_candidate_only)
+
+    def test_readiness_reads_require_root_owned_immutable_authority(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        root = Path("/tmp/nexus-lens-home")
+        readiness = root / "lab" / "candidate-ready.v1"
+        raw = b"schema=1\nrunId=contract-run\n"
+
+        parse_checker = mock.Mock(return_value=raw)
+        parse_globals = module["parse_readiness"].__globals__
+        with mock.patch.dict(parse_globals, {"checked_file": parse_checker}):
+            self.assertEqual(
+                module["parse_readiness"](readiness, root),
+                {"schema": "1", "runId": "contract-run"},
+            )
+        parse_checker.assert_called_once_with(
+            readiness,
+            root,
+            "candidate readiness ledger",
+            expected_uid=0,
+            expected_mode=0o444,
+        )
+
+        bound_checker = mock.Mock(return_value=raw)
+        bound_globals = module["require_bound_file"].__globals__
+        with mock.patch.dict(bound_globals, {"checked_file": bound_checker}):
+            module["require_bound_file"](
+                readiness,
+                digest(raw),
+                "candidate readiness ledger",
+                root,
+                expected_uid=0,
+                expected_mode=0o444,
+            )
+        bound_checker.assert_called_once_with(
+            readiness,
+            root,
+            "candidate readiness ledger",
+            expected_uid=0,
+            expected_mode=0o444,
+        )
 
     def test_post_acceptance_revalidates_candidate_and_runtime_before_publish(self) -> None:
         module = runpy.run_path(str(TARGET))
