@@ -292,7 +292,7 @@ async function queueEvents(
   const result = await db.execute({
     sql:
       "SELECT e.seq, e.session_id, e.command_id, e.client_message_id, " +
-      "c.kind, c.caller_name, c.caller_session_id, c.caller_agent_id, c.caller_kind, " +
+      "c.kind, c.caller_name, c.caller_session_id, c.caller_agent_id, c.caller_principal_id, c.caller_kind, " +
       "e.state, e.mode, e.revision FROM command_intent_events e " +
       "JOIN command_intents c ON c.command_id = e.command_id " +
       "WHERE e.seq > ? ORDER BY e.seq LIMIT 500",
@@ -312,6 +312,8 @@ async function queueEvents(
       typeof row.caller_session_id === "string" ? row.caller_session_id : undefined,
     callerAgentId:
       typeof row.caller_agent_id === "string" ? row.caller_agent_id : undefined,
+    callerPrincipalId:
+      typeof row.caller_principal_id === "string" ? row.caller_principal_id : undefined,
     callerKind: typeof row.caller_kind === "string" ? row.caller_kind : undefined,
     state: String(row.state) as CommandQueueState,
     mode: String(row.mode),

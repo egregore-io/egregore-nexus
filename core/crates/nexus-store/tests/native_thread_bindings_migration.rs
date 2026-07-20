@@ -8,7 +8,7 @@ use nexus_store::{migrate_identity_with_fault, MigrationFault, Store};
 const BASELINE_SCHEMA: &str = include_str!("../../../migrations/0001_init.sql");
 const IDENTITY_SCHEMA: &str = include_str!("../../../migrations/identity/0001_identity.sql");
 const LEGACY_MARKER: &str = "v0.1.0_identity";
-const PROVIDER_MARKER: &str = "v0.1.6_identity_provider";
+const CURRENT_IDENTITY_MARKER: &str = "v0.1.6_identity_caller_principal";
 const LEGACY_NATIVE_THREAD_BINDINGS_SCHEMA: &str = r#"
 CREATE TABLE native_thread_bindings (
   harness          TEXT NOT NULL,
@@ -67,7 +67,10 @@ async fn legacy_native_binding_upgrades_and_roundtrips_provider_kind() {
         .expect("claim provider binding");
     assert_eq!(inserted.provider, "telegram");
     assert_eq!(inserted.kind, "im");
-    assert_eq!(schema_marker(store.conn.raw()).await, PROVIDER_MARKER);
+    assert_eq!(
+        schema_marker(store.conn.raw()).await,
+        CURRENT_IDENTITY_MARKER
+    );
 
     drop(store);
     cleanup_store(&path);
@@ -101,7 +104,10 @@ async fn injected_fault_rolls_back_both_alters_and_marker_then_clean_retry_succe
     assert!(!columns.iter().any(|name| name == "harness"));
     assert!(columns.iter().any(|name| name == "provider"));
     assert!(columns.iter().any(|name| name == "kind"));
-    assert_eq!(schema_marker(store.conn.raw()).await, PROVIDER_MARKER);
+    assert_eq!(
+        schema_marker(store.conn.raw()).await,
+        CURRENT_IDENTITY_MARKER
+    );
 
     drop(store);
     cleanup_store(&path);
@@ -121,7 +127,10 @@ async fn upgraded_identity_migration_is_idempotent() {
     let columns = table_columns(store.conn.raw(), "native_thread_bindings").await;
     assert_eq!(columns.iter().filter(|name| *name == "provider").count(), 1);
     assert_eq!(columns.iter().filter(|name| *name == "kind").count(), 1);
-    assert_eq!(schema_marker(store.conn.raw()).await, PROVIDER_MARKER);
+    assert_eq!(
+        schema_marker(store.conn.raw()).await,
+        CURRENT_IDENTITY_MARKER
+    );
 
     drop(store);
     cleanup_store(&path);
@@ -144,6 +153,12 @@ async fn seed_legacy_identity(path: &Path) {
     conn.execute_batch(IDENTITY_SCHEMA)
         .await
         .expect("create raw split-identity schema");
+    conn.execute(
+        "ALTER TABLE command_intents DROP COLUMN caller_principal_id",
+        (),
+    )
+    .await
+    .expect("restore the verbatim v0.1.5 command intent schema");
     conn.execute_batch("DROP TABLE native_thread_bindings;")
         .await
         .expect("remove current native binding table");

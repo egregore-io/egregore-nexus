@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS command_intents (
   caller_agent_id   TEXT,
   caller_runtime_id TEXT,
   caller_client_key TEXT,
+  caller_principal_id TEXT,
   caller_kind       TEXT,
   caller_tier       TEXT,
   idempotency_key   TEXT,

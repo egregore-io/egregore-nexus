@@ -1494,6 +1494,7 @@ fn command_row(
         caller_agent_id: caller.agent_id,
         caller_runtime_id: caller.runtime_id,
         caller_client_key: caller.client_key,
+        caller_principal_id: caller.principal_id,
         caller_kind: Some(entity_kind::dotted(caller.locality, caller.kind)),
         caller_tier: Some(tier_token(caller.tier).into()),
         idempotency_key,

@@ -70,6 +70,7 @@ async fn fresh_store_creates_one_complete_named_baseline_and_reopens_idempotentl
             (1, "v0.1.0_baseline".into()),
             (2, "v0.1.5_message_hooks".into()),
             (3, "v0.1.5_delivery_timing".into()),
+            (4, "v0.1.6_caller_principal".into()),
         ]
     );
 }
@@ -109,6 +110,7 @@ async fn baseline_contains_current_identity_routing_and_delivery_columns() {
         ("subscriptions", "subscriber_agent_id"),
         ("command_intents", "caller_agent_id"),
         ("command_intents", "caller_runtime_id"),
+        ("command_intents", "caller_principal_id"),
         ("command_intents", "idempotency_key"),
         ("command_intents", "revision"),
         ("developer_events", "data_json"),
@@ -150,6 +152,14 @@ async fn public_v010_baseline_upgrades_to_message_hook_schema_without_losing_row
     store
         .conn
         .execute(
+            "ALTER TABLE command_intents DROP COLUMN caller_principal_id",
+            (),
+        )
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute(
             "INSERT INTO schema_migrations(version, name, applied_at)
              VALUES (1, 'v0.1.0_baseline', 1)",
             (),
@@ -177,6 +187,7 @@ async fn public_v010_baseline_upgrades_to_message_hook_schema_without_losing_row
             (1, "v0.1.0_baseline".into()),
             (2, "v0.1.5_message_hooks".into()),
             (3, "v0.1.5_delivery_timing".into()),
+            (4, "v0.1.6_caller_principal".into()),
         ]
     );
     assert!(column_exists(&store, "messages", "mention_json").await);

@@ -27,6 +27,7 @@ pub struct CommandIntentRow {
     pub caller_agent_id: Option<String>,
     pub caller_runtime_id: Option<String>,
     pub caller_client_key: Option<String>,
+    pub caller_principal_id: Option<String>,
     pub caller_kind: Option<String>,
     pub caller_tier: Option<String>,
     pub idempotency_key: Option<String>,
@@ -74,6 +75,7 @@ pub struct NewCommandIntent {
     pub caller_agent_id: Option<String>,
     pub caller_runtime_id: Option<String>,
     pub caller_client_key: Option<String>,
+    pub caller_principal_id: Option<String>,
     pub caller_kind: Option<String>,
     pub caller_tier: Option<String>,
     pub idempotency_key: Option<String>,
@@ -102,10 +104,10 @@ impl<'a> CommandIntents<'a> {
             .execute(
                 "INSERT INTO command_intents (command_id, kind, status, project, caller_name, \
                  caller_session_id, caller_agent_id, caller_runtime_id, caller_client_key, \
-                 caller_kind, caller_tier, idempotency_key, request_json, result_json, \
+                 caller_principal_id, caller_kind, caller_tier, idempotency_key, request_json, result_json, \
                  error_json, attempts, created_at, claimed_at, started_at, lease_until, completed_at) VALUES \
-                 (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, NULL, 0, \
-                 ?13, NULL, NULL, NULL, NULL)",
+                 (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, NULL, 0, \
+                 ?14, NULL, NULL, NULL, NULL)",
                 params![
                     row.command_id,
                     row.kind,
@@ -115,6 +117,7 @@ impl<'a> CommandIntents<'a> {
                     row.caller_agent_id,
                     row.caller_runtime_id,
                     row.caller_client_key,
+                    row.caller_principal_id,
                     row.caller_kind,
                     row.caller_tier,
                     row.idempotency_key,
@@ -1145,17 +1148,17 @@ enum ClaimFilter<'a> {
 }
 
 const COLUMNS: &str = "command_id, kind, status, project, caller_name, caller_session_id, \
-     caller_agent_id, caller_runtime_id, caller_client_key, caller_kind, caller_tier, \
+     caller_agent_id, caller_runtime_id, caller_client_key, caller_principal_id, caller_kind, caller_tier, \
      idempotency_key, request_json, result_json, error_json, attempts, revision, created_at, claimed_at, started_at, lease_until, \
      completed_at";
 
 const SELECT: &str = "SELECT command_id, kind, status, project, caller_name, caller_session_id, \
-     caller_agent_id, caller_runtime_id, caller_client_key, caller_kind, caller_tier, \
+     caller_agent_id, caller_runtime_id, caller_client_key, caller_principal_id, caller_kind, caller_tier, \
      idempotency_key, request_json, result_json, error_json, attempts, revision, created_at, claimed_at, started_at, lease_until, \
      completed_at FROM command_intents";
 
 fn row_to_command_intent(row: &libsql::Row) -> Result<CommandIntentRow, NexusError> {
-    let caller_kind = canonical_caller_kind(get_opt_text(row, 9)?)?;
+    let caller_kind = canonical_caller_kind(get_opt_text(row, 10)?)?;
     Ok(CommandIntentRow {
         command_id: get_text(row, 0)?,
         kind: get_text(row, 1)?,
@@ -1166,19 +1169,20 @@ fn row_to_command_intent(row: &libsql::Row) -> Result<CommandIntentRow, NexusErr
         caller_agent_id: get_opt_text(row, 6)?,
         caller_runtime_id: get_opt_text(row, 7)?,
         caller_client_key: get_opt_text(row, 8)?,
+        caller_principal_id: get_opt_text(row, 9)?,
         caller_kind,
-        caller_tier: get_opt_text(row, 10)?,
-        idempotency_key: get_opt_text(row, 11)?,
-        request_json: get_text(row, 12)?,
-        result_json: get_opt_text(row, 13)?,
-        error_json: get_opt_text(row, 14)?,
-        attempts: get_opt_int(row, 15)?.unwrap_or(0),
-        revision: get_opt_int(row, 16)?.unwrap_or(1),
-        created_at: get_opt_int(row, 17)?.unwrap_or(0),
-        claimed_at: get_opt_int(row, 18)?,
-        started_at: get_opt_int(row, 19)?,
-        lease_until: get_opt_int(row, 20)?,
-        completed_at: get_opt_int(row, 21)?,
+        caller_tier: get_opt_text(row, 11)?,
+        idempotency_key: get_opt_text(row, 12)?,
+        request_json: get_text(row, 13)?,
+        result_json: get_opt_text(row, 14)?,
+        error_json: get_opt_text(row, 15)?,
+        attempts: get_opt_int(row, 16)?.unwrap_or(0),
+        revision: get_opt_int(row, 17)?.unwrap_or(1),
+        created_at: get_opt_int(row, 18)?.unwrap_or(0),
+        claimed_at: get_opt_int(row, 19)?,
+        started_at: get_opt_int(row, 20)?,
+        lease_until: get_opt_int(row, 21)?,
+        completed_at: get_opt_int(row, 22)?,
     })
 }
 
@@ -1213,6 +1217,7 @@ fn matching_existing_command(
         && existing.caller_agent_id == requested.caller_agent_id
         && existing.caller_runtime_id == requested.caller_runtime_id
         && existing.caller_client_key == requested.caller_client_key
+        && existing.caller_principal_id == requested.caller_principal_id
         && existing.caller_kind == requested.caller_kind
         && existing.caller_tier == requested.caller_tier
         && existing.idempotency_key == requested.idempotency_key

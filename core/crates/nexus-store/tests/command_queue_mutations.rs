@@ -43,6 +43,7 @@ async fn prompt(store: &Store, command_id: &str, created_at: i64) {
             caller_agent_id: None,
             caller_runtime_id: Some("local-operator".into()),
             caller_client_key: None,
+            caller_principal_id: None,
             caller_kind: Some("human".into()),
             caller_tier: Some("admin".into()),
             idempotency_key: Some(format!("cm_{command_id}")),

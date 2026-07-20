@@ -426,7 +426,7 @@ async fn queue_events_after(
         .query(
             "SELECT e.seq, e.session_id, e.command_id, e.client_message_id, \
                     c.kind, c.caller_name, c.caller_session_id, c.caller_agent_id, \
-                    c.caller_kind, e.state, e.mode, e.revision \
+                    c.caller_principal_id, c.caller_kind, e.state, e.mode, e.revision \
              FROM command_intent_events e \
              JOIN command_intents c ON c.command_id = e.command_id \
              WHERE e.seq > ?1 ORDER BY e.seq LIMIT 500",
@@ -445,10 +445,11 @@ async fn queue_events_after(
             caller_name: get_text(&row, 5)?,
             caller_session_id: get_opt_text(&row, 6)?,
             caller_agent_id: get_opt_text(&row, 7)?.map(AgentId),
-            caller_kind: get_opt_text(&row, 8)?,
-            state: command_queue_event_state(&get_text(&row, 9)?),
-            mode: get_text(&row, 10)?,
-            revision: get_opt_int(&row, 11)?.unwrap_or_default(),
+            caller_principal_id: get_opt_text(&row, 8)?,
+            caller_kind: get_opt_text(&row, 9)?,
+            state: command_queue_event_state(&get_text(&row, 10)?),
+            mode: get_text(&row, 11)?,
+            revision: get_opt_int(&row, 12)?.unwrap_or_default(),
         });
     }
     Ok(CommandQueueEventsPage {

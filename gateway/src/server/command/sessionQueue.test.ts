@@ -35,6 +35,7 @@ CREATE TABLE command_intents (
   caller_name TEXT NOT NULL,
   caller_session_id TEXT,
   caller_agent_id TEXT,
+  caller_principal_id TEXT,
   caller_kind TEXT,
   request_json TEXT NOT NULL,
   error_json TEXT,
@@ -337,6 +338,7 @@ describe("durable session command queue", () => {
           commandKind: "harness.prompt",
           callerName: "Operator",
           callerSessionId: "s_human",
+          callerPrincipalId: "h_operator",
           callerKind: "human",
           state: CommandQueueState.Completed,
           mode: "queue",
@@ -358,7 +360,11 @@ describe("durable session command queue", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      events: [{ commandId: "cmd_done", state: "completed" }],
+      events: [{
+        commandId: "cmd_done",
+        state: "completed",
+        callerPrincipalId: "h_operator",
+      }],
       latestSeq: 13,
     });
     expect(daemonQueueRead).toHaveBeenCalledWith({
@@ -390,9 +396,16 @@ describe("durable session command queue", () => {
     await db.execute({
       sql:
         "INSERT INTO command_intents " +
-        "(command_id, kind, status, project, caller_name, caller_session_id, caller_kind, " +
-        "request_json, revision, created_at) VALUES (?, 'metadata.set', 'done', ?, ?, ?, ?, '{}', 1, 11)",
-      args: ["cmd_other", "other-metadata", "Other Operator", "s_other_human", "human"],
+        "(command_id, kind, status, project, caller_name, caller_session_id, caller_principal_id, caller_kind, " +
+        "request_json, revision, created_at) VALUES (?, 'metadata.set', 'done', ?, ?, ?, ?, ?, '{}', 1, 11)",
+      args: [
+        "cmd_other",
+        "other-metadata",
+        "Other Operator",
+        "s_other_human",
+        "x_other",
+        "external.human",
+      ],
     });
     await db.execute({
       sql:
@@ -414,7 +427,12 @@ describe("durable session command queue", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      events: [{ seq: 2, commandId: "cmd_other" }],
+      events: [{
+        seq: 2,
+        commandId: "cmd_other",
+        callerPrincipalId: "x_other",
+        callerKind: "external.human",
+      }],
       nextSeq: 2,
       latestSeq: 2,
       gap: false,

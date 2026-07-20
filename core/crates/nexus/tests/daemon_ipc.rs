@@ -9,7 +9,7 @@ use nexus::daemon::{command_worker, daemon_ipc, AppState};
 use nexus_common::config::GatewayProjectionDeliveryMode;
 use nexus_common::Config;
 use nexus_contracts::{
-    AgentId, DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, HistoryRequest, Kind,
+    AgentId, DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, HistoryRequest, Kind, Locality,
     MemberListRequest, RegisterRequest, RegisterResponse, SearchMode, SearchRequest, SessionId,
     ThreadId, Tier, Whoami, DAEMON_IPC_PROTOCOL_VERSION,
 };
@@ -178,7 +178,19 @@ async fn enqueue_call_returns_a_durable_receipt_without_waiting_for_execution() 
         version: DAEMON_IPC_PROTOCOL_VERSION,
         token: "boot-token".into(),
         request_id: "rpc-prompt-enqueue".into(),
-        caller: None,
+        caller: Some(DaemonIpcCaller {
+            name: Some("outside".into()),
+            project: "default".into(),
+            session_id: Some("s_external".into()),
+            agent_id: None,
+            runtime_id: None,
+            client_key: Some("external-client".into()),
+            kind: Kind::Human,
+            locality: Locality::External,
+            access: Some("guest".into()),
+            principal_id: Some("x_external_abc".into()),
+            tier: Tier::Agent,
+        }),
         call: DaemonIpcCall::Enqueue {
             command_id: "cmd-prompt-enqueue".into(),
             kind: nexus_store::command_kinds::harness::PROMPT.into(),
@@ -215,6 +227,8 @@ async fn enqueue_call_returns_a_durable_receipt_without_waiting_for_execution() 
         .unwrap()
         .expect("durable queued row");
     assert_eq!(row.status, "pending");
+    assert_eq!(row.caller_principal_id.as_deref(), Some("x_external_abc"));
+    assert_eq!(row.caller_kind.as_deref(), Some("external.human"));
 }
 
 #[tokio::test]
@@ -572,6 +586,7 @@ async fn local_queue_mutation_executes_atomically_inside_the_daemon_owner() {
             caller_agent_id: None,
             caller_runtime_id: Some("local-operator".into()),
             caller_client_key: None,
+            caller_principal_id: None,
             caller_kind: Some("human".into()),
             caller_tier: Some("admin".into()),
             idempotency_key: Some("cm_queue_redirect".into()),
@@ -757,6 +772,7 @@ async fn local_queue_read_returns_typed_snapshot_and_transitions_without_raw_sto
             caller_agent_id: None,
             caller_runtime_id: Some("local-operator".into()),
             caller_client_key: None,
+            caller_principal_id: None,
             caller_kind: Some("human".into()),
             caller_tier: Some("admin".into()),
             idempotency_key: Some("cm_queue_read".into()),

@@ -18,6 +18,7 @@ fn pending(id: &str, created_at: i64) -> NewCommandIntent {
         caller_agent_id: Some("a_human".to_string()),
         caller_runtime_id: Some("s_human".to_string()),
         caller_client_key: Some("ck_human".to_string()),
+        caller_principal_id: None,
         caller_kind: Some("human".to_string()),
         caller_tier: Some("admin".to_string()),
         idempotency_key: None,

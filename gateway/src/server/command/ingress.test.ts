@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS command_intents (
   caller_agent_id   TEXT,
   caller_runtime_id TEXT,
   caller_client_key TEXT,
+  caller_principal_id TEXT,
   caller_kind       TEXT,
   caller_tier       TEXT,
   idempotency_key   TEXT,
@@ -655,9 +656,11 @@ describe("submitCommandIntent", () => {
       },
     );
     const row = (await direct.execute(
-      "SELECT caller_kind FROM command_intents WHERE command_id = 'cmd_external_direct'",
+      "SELECT caller_kind, caller_principal_id FROM command_intents " +
+      "WHERE command_id = 'cmd_external_direct'",
     )).rows[0];
     expect(row?.caller_kind).toBe("external.human");
+    expect(row?.caller_principal_id).toBe("x_outside");
   });
 
   it("dedupes retry-prone writes with the same idempotency key", async () => {

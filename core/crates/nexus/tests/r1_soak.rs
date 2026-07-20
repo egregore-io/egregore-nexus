@@ -52,6 +52,7 @@ async fn command_intent_wake_signal_arrives_before_poll_floor() {
             caller_agent_id: None,
             caller_runtime_id: None,
             caller_client_key: None,
+            caller_principal_id: None,
             caller_kind: Some("agent".to_string()),
             caller_tier: Some("admin".to_string()),
             idempotency_key: None,

@@ -9,6 +9,7 @@ CREATE TABLE command_intents (
   command_id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL,
   project TEXT NOT NULL, caller_name TEXT NOT NULL, caller_session_id TEXT,
   caller_agent_id TEXT, caller_runtime_id TEXT, caller_client_key TEXT,
+  caller_principal_id TEXT,
   caller_kind TEXT, caller_tier TEXT, idempotency_key TEXT, request_json TEXT NOT NULL,
   result_json TEXT, error_json TEXT, attempts INTEGER NOT NULL DEFAULT 0,
   revision INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, claimed_at INTEGER,

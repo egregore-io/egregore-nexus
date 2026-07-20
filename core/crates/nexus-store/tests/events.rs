@@ -42,6 +42,7 @@ async fn command_intent_insert_signals_topic_before_poll_fallback() {
             caller_agent_id: None,
             caller_runtime_id: None,
             caller_client_key: None,
+            caller_principal_id: None,
             caller_kind: None,
             caller_tier: None,
             idempotency_key: None,

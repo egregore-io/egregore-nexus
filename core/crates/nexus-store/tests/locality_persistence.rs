@@ -45,6 +45,7 @@ fn intent(command_id: &str, caller_kind: &str) -> NewCommandIntent {
         caller_agent_id: None,
         caller_runtime_id: None,
         caller_client_key: None,
+        caller_principal_id: None,
         caller_kind: Some(caller_kind.into()),
         caller_tier: Some("agent".into()),
         idempotency_key: None,

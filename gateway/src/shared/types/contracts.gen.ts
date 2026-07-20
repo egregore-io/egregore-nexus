@@ -559,6 +559,7 @@ export interface CommandQueueTransition {
 	callerName: string;
 	callerSessionId?: string;
 	callerAgentId?: AgentId;
+	callerPrincipalId?: string;
 	callerKind?: string;
 	state: CommandQueueState;
 	mode: string;

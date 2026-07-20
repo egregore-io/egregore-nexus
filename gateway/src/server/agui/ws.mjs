@@ -482,6 +482,7 @@ function completedCommandReceipt(transition) {
   const callerName = stringField(transition.callerName);
   const callerSessionId = stringField(transition.callerSessionId);
   const callerAgentId = stringField(transition.callerAgentId);
+  const callerPrincipalId = stringField(transition.callerPrincipalId);
   const callerKind = stringField(transition.callerKind);
   const revision = nonNegativeInteger(transition.revision);
   const seq = nonNegativeInteger(transition.seq);
@@ -504,6 +505,7 @@ function completedCommandReceipt(transition) {
     callerName,
     callerSessionId,
     ...(callerAgentId ? { callerAgentId } : {}),
+    ...(callerPrincipalId ? { callerPrincipalId } : {}),
   };
 }
 

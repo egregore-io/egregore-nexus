@@ -10,14 +10,17 @@ use nexus_common::{now, NexusError};
 use crate::error::store_err;
 use crate::state::Store;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
-pub const CURRENT_SCHEMA_NAME: &str = "v0.1.5_delivery_timing";
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_NAME: &str = "v0.1.6_caller_principal";
 const BASELINE_SCHEMA_VERSION: i64 = 1;
 const BASELINE_SCHEMA_NAME: &str = "v0.1.0_baseline";
 const MESSAGE_HOOKS_SCHEMA_VERSION: i64 = 2;
 const MESSAGE_HOOKS_SCHEMA_NAME: &str = "v0.1.5_message_hooks";
+const DELIVERY_TIMING_SCHEMA_VERSION: i64 = 3;
+const DELIVERY_TIMING_SCHEMA_NAME: &str = "v0.1.5_delivery_timing";
 pub(crate) const IDENTITY_SCHEMA_NAME: &str = "v0.1.0_identity";
 pub(crate) const IDENTITY_PROVIDER_SCHEMA_NAME: &str = "v0.1.6_identity_provider";
+pub(crate) const IDENTITY_CALLER_PRINCIPAL_SCHEMA_NAME: &str = "v0.1.6_identity_caller_principal";
 pub(crate) const TRANSPORT_SCHEMA_NAME: &str = "v0.1.0_transport";
 
 /// Reachable test seam for proving that the identity-provider migration is atomic.
@@ -31,6 +34,7 @@ pub enum MigrationFault {
 const BASELINE_SCHEMA: &str = include_str!("../../../migrations/0001_init.sql");
 const MESSAGE_HOOKS_SCHEMA: &str = include_str!("../../../migrations/0002_message_hooks.sql");
 const DELIVERY_TIMING_SCHEMA: &str = include_str!("../../../migrations/0003_delivery_timing.sql");
+const CALLER_PRINCIPAL_SCHEMA: &str = include_str!("../../../migrations/0004_caller_principal.sql");
 const EPHEMERAL_STREAM_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS mem.stream_events (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -191,28 +195,49 @@ impl Store {
                 self.validate_objects(CORE_REQUIRED_OBJECTS).await?;
                 self.validate_message_hook_schema().await?;
                 self.validate_delivery_timing_schema().await?;
+                self.validate_caller_principal_schema().await?;
             }
-            Some(marker) if marker == MESSAGE_HOOKS_SCHEMA_NAME => {
-                self.upgrade_message_hooks_to_delivery_timing().await?;
+            Some(marker) if marker == DELIVERY_TIMING_SCHEMA_NAME => {
+                self.upgrade_delivery_timing_to_caller_principal().await?;
                 self.validate_objects(CORE_REQUIRED_OBJECTS).await?;
                 self.validate_message_hook_schema().await?;
                 self.validate_delivery_timing_schema().await?;
+                self.validate_caller_principal_schema().await?;
+            }
+            Some(marker) if marker == MESSAGE_HOOKS_SCHEMA_NAME => {
+                self.upgrade_message_hooks_to_delivery_timing().await?;
+                self.upgrade_delivery_timing_to_caller_principal().await?;
+                self.validate_objects(CORE_REQUIRED_OBJECTS).await?;
+                self.validate_message_hook_schema().await?;
+                self.validate_delivery_timing_schema().await?;
+                self.validate_caller_principal_schema().await?;
             }
             Some(marker) if marker == BASELINE_SCHEMA_NAME => {
                 self.upgrade_v010_to_message_hooks().await?;
                 self.upgrade_message_hooks_to_delivery_timing().await?;
+                self.upgrade_delivery_timing_to_caller_principal().await?;
                 self.validate_objects(CORE_REQUIRED_OBJECTS).await?;
                 self.validate_message_hook_schema().await?;
                 self.validate_delivery_timing_schema().await?;
+                self.validate_caller_principal_schema().await?;
             }
             Some(marker) if marker == IDENTITY_SCHEMA_NAME => {
                 self.validate_legacy_identity_schema().await?;
                 self.upgrade_identity_provider(MigrationFault::None).await?;
                 self.validate_identity_provider_schema().await?;
+                self.upgrade_identity_caller_principal().await?;
+                self.validate_caller_principal_schema().await?;
             }
             Some(marker) if marker == IDENTITY_PROVIDER_SCHEMA_NAME => {
                 self.validate_identity_schema().await?;
                 self.validate_identity_provider_schema().await?;
+                self.upgrade_identity_caller_principal().await?;
+                self.validate_caller_principal_schema().await?;
+            }
+            Some(marker) if marker == IDENTITY_CALLER_PRINCIPAL_SCHEMA_NAME => {
+                self.validate_identity_schema().await?;
+                self.validate_identity_provider_schema().await?;
+                self.validate_caller_principal_schema().await?;
             }
             Some(marker) if marker == TRANSPORT_SCHEMA_NAME => {}
             Some(marker) => return Err(unsupported_schema(&marker)),
@@ -224,6 +249,7 @@ impl Store {
                 self.validate_objects(CORE_REQUIRED_OBJECTS).await?;
                 self.validate_message_hook_schema().await?;
                 self.validate_delivery_timing_schema().await?;
+                self.validate_caller_principal_schema().await?;
             }
             None => {
                 return Err(NexusError::Store(
@@ -301,6 +327,19 @@ impl Store {
         if let Err(error) = tx
             .execute(
                 "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?1, ?2, ?3)",
+                libsql::params![
+                    DELIVERY_TIMING_SCHEMA_VERSION,
+                    DELIVERY_TIMING_SCHEMA_NAME,
+                    now()
+                ],
+            )
+            .await
+        {
+            return rollback_error(tx, error).await;
+        }
+        if let Err(error) = tx
+            .execute(
+                "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?1, ?2, ?3)",
                 libsql::params![CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_NAME, now()],
             )
             .await
@@ -334,6 +373,27 @@ impl Store {
     async fn upgrade_message_hooks_to_delivery_timing(&self) -> Result<(), NexusError> {
         let tx = self.begin_write_txn("v015_delivery_timing_schema").await?;
         if let Err(error) = tx.execute_batch(DELIVERY_TIMING_SCHEMA).await {
+            return rollback_error(tx, error).await;
+        }
+        if let Err(error) = tx
+            .execute(
+                "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?1, ?2, ?3)",
+                libsql::params![
+                    DELIVERY_TIMING_SCHEMA_VERSION,
+                    DELIVERY_TIMING_SCHEMA_NAME,
+                    now()
+                ],
+            )
+            .await
+        {
+            return rollback_error(tx, error).await;
+        }
+        tx.commit().await
+    }
+
+    async fn upgrade_delivery_timing_to_caller_principal(&self) -> Result<(), NexusError> {
+        let tx = self.begin_write_txn("v016_caller_principal_schema").await?;
+        if let Err(error) = tx.execute_batch(CALLER_PRINCIPAL_SCHEMA).await {
             return rollback_error(tx, error).await;
         }
         if let Err(error) = tx
@@ -384,6 +444,12 @@ impl Store {
         }
         if markers
             .iter()
+            .all(|(_, name)| name == IDENTITY_CALLER_PRINCIPAL_SCHEMA_NAME)
+        {
+            return Ok(Some(IDENTITY_CALLER_PRINCIPAL_SCHEMA_NAME.into()));
+        }
+        if markers
+            .iter()
             .all(|(_, name)| name == TRANSPORT_SCHEMA_NAME)
         {
             return Ok(Some(TRANSPORT_SCHEMA_NAME.into()));
@@ -391,7 +457,10 @@ impl Store {
         let marker = match markers.as_slice() {
             [(BASELINE_SCHEMA_VERSION, name)] => name.clone(),
             [(BASELINE_SCHEMA_VERSION, _), (MESSAGE_HOOKS_SCHEMA_VERSION, name)] => name.clone(),
-            [(BASELINE_SCHEMA_VERSION, _), (MESSAGE_HOOKS_SCHEMA_VERSION, _), (CURRENT_SCHEMA_VERSION, name)] => {
+            [(BASELINE_SCHEMA_VERSION, _), (MESSAGE_HOOKS_SCHEMA_VERSION, _), (DELIVERY_TIMING_SCHEMA_VERSION, name)] => {
+                name.clone()
+            }
+            [(BASELINE_SCHEMA_VERSION, _), (MESSAGE_HOOKS_SCHEMA_VERSION, _), (DELIVERY_TIMING_SCHEMA_VERSION, _), (CURRENT_SCHEMA_VERSION, name)] => {
                 name.clone()
             }
             _ => {
@@ -551,6 +620,33 @@ impl Store {
         tx.commit().await
     }
 
+    async fn upgrade_identity_caller_principal(&self) -> Result<(), NexusError> {
+        let tx = self
+            .begin_write_txn("v016_identity_caller_principal_migration")
+            .await?;
+        if let Err(error) = tx.execute_batch(CALLER_PRINCIPAL_SCHEMA).await {
+            return rollback_error(tx, error).await;
+        }
+        if let Err(error) = tx.execute("DELETE FROM schema_migrations", ()).await {
+            return rollback_error(tx, error).await;
+        }
+        if let Err(error) = tx
+            .execute(
+                "INSERT INTO schema_migrations(version, name, applied_at)
+                 VALUES (?1, ?2, ?3)",
+                libsql::params![
+                    BASELINE_SCHEMA_VERSION,
+                    IDENTITY_CALLER_PRINCIPAL_SCHEMA_NAME,
+                    now()
+                ],
+            )
+            .await
+        {
+            return rollback_error(tx, error).await;
+        }
+        tx.commit().await
+    }
+
     async fn validate_message_hook_schema(&self) -> Result<(), NexusError> {
         for (object, column) in [
             ("messages", "mention_json"),
@@ -576,6 +672,18 @@ impl Store {
                     "incomplete {CURRENT_SCHEMA_NAME} Nexus schema: missing {object}.{column}"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    async fn validate_caller_principal_schema(&self) -> Result<(), NexusError> {
+        if !self
+            .column_exists("command_intents", "caller_principal_id")
+            .await?
+        {
+            return Err(NexusError::Store(format!(
+                "incomplete {CURRENT_SCHEMA_NAME} Nexus schema: missing command_intents.caller_principal_id"
+            )));
         }
         Ok(())
     }
@@ -646,7 +754,9 @@ pub async fn migrate_identity_with_fault(
         Some(marker) if marker == IDENTITY_SCHEMA_NAME => {
             store.validate_legacy_identity_schema().await?;
             store.upgrade_identity_provider(fault).await?;
-            store.validate_identity_provider_schema().await
+            store.validate_identity_provider_schema().await?;
+            store.upgrade_identity_caller_principal().await?;
+            store.validate_caller_principal_schema().await
         }
         Some(marker) if marker == IDENTITY_PROVIDER_SCHEMA_NAME => {
             if fault != MigrationFault::None {
@@ -655,7 +765,19 @@ pub async fn migrate_identity_with_fault(
                 ));
             }
             store.validate_identity_schema().await?;
-            store.validate_identity_provider_schema().await
+            store.validate_identity_provider_schema().await?;
+            store.upgrade_identity_caller_principal().await?;
+            store.validate_caller_principal_schema().await
+        }
+        Some(marker) if marker == IDENTITY_CALLER_PRINCIPAL_SCHEMA_NAME => {
+            if fault != MigrationFault::None {
+                return Err(NexusError::Invalid(
+                    "identity migration fault requires a legacy identity schema".into(),
+                ));
+            }
+            store.validate_identity_schema().await?;
+            store.validate_identity_provider_schema().await?;
+            store.validate_caller_principal_schema().await
         }
         Some(marker) => Err(unsupported_schema(&marker)),
         None => Err(unsupported_schema("missing identity schema marker")),

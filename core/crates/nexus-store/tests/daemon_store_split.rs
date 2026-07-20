@@ -78,7 +78,8 @@ async fn legacy_identity_marker_ladder_reopens_and_is_canonicalized() {
             .identity()
             .conn
             .execute_batch(
-                "DROP TABLE native_thread_bindings;
+                "ALTER TABLE command_intents DROP COLUMN caller_principal_id;
+                 DROP TABLE native_thread_bindings;
                  CREATE TABLE native_thread_bindings (
                    harness TEXT NOT NULL,
                    native_thread_id TEXT NOT NULL,
@@ -124,7 +125,10 @@ async fn legacy_identity_marker_ladder_reopens_and_is_canonicalized() {
             row.get::<String>(1).expect("identity marker name"),
         ));
     }
-    assert_eq!(markers, vec![(1, "v0.1.6_identity_provider".into())]);
+    assert_eq!(
+        markers,
+        vec![(1, "v0.1.6_identity_caller_principal".into())]
+    );
 
     drop(rows);
     drop(reopened);
@@ -530,6 +534,7 @@ async fn command_claim_resolves_volatile_runtime_without_cross_database_sql() {
             caller_agent_id: None,
             caller_runtime_id: None,
             caller_client_key: None,
+            caller_principal_id: None,
             caller_kind: Some("human".into()),
             caller_tier: Some("admin".into()),
             idempotency_key: Some("split-claim".into()),

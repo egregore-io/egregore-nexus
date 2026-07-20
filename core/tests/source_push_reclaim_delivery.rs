@@ -163,6 +163,7 @@ async fn reclaimed_signed_source_push_reuses_commit_and_injects_once() {
             caller_agent_id: None,
             caller_runtime_id: Some(format!("source:{SOURCE}")),
             caller_client_key: None,
+            caller_principal_id: None,
             caller_kind: Some("notification".into()),
             caller_tier: Some("agent".into()),
             idempotency_key: Some(COMMAND_KEY.into()),

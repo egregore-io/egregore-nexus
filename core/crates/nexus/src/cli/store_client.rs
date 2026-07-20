@@ -337,6 +337,7 @@ impl StoreClient {
                         caller_agent_id: self.caller.agent_id.clone(),
                         caller_runtime_id: self.caller.runtime_id.clone(),
                         caller_client_key: self.caller.client_key.clone(),
+                        caller_principal_id: None,
                         caller_kind: Some(entity_kind::dotted(
                             self.caller.locality,
                             self.caller.kind,
@@ -359,6 +360,7 @@ impl StoreClient {
                         caller_agent_id: self.caller.agent_id.clone(),
                         caller_runtime_id: self.caller.runtime_id.clone(),
                         caller_client_key: self.caller.client_key.clone(),
+                        caller_principal_id: None,
                         caller_kind: Some(entity_kind::dotted(
                             self.caller.locality,
                             self.caller.kind,

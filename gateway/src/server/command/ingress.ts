@@ -487,9 +487,9 @@ async function insertCommandIntent(
       sql:
         "INSERT INTO command_intents " +
         "(command_id, kind, status, project, caller_name, caller_session_id, " +
-        "caller_agent_id, caller_runtime_id, caller_client_key, caller_kind, caller_tier, " +
+        "caller_agent_id, caller_runtime_id, caller_client_key, caller_principal_id, caller_kind, caller_tier, " +
         "idempotency_key, request_json, result_json, error_json, attempts, created_at, claimed_at, started_at, lease_until, " +
-        "completed_at) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, " +
+        "completed_at) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, " +
         "NULL, NULL, NULL, NULL) " +
         "RETURNING command_id, status, created_at, revision, " +
         "(SELECT session_id FROM command_intent_events e WHERE e.command_id = command_intents.command_id " +
@@ -505,6 +505,7 @@ async function insertCommandIntent(
         insert.commandCaller.agentId ?? null,
         insert.commandCaller.runtimeId ?? insert.commandCaller.sessionId ?? null,
         insert.commandCaller.clientKey ?? null,
+        insert.commandCaller.principalId ?? null,
         dottedEntityKind(insert.commandCaller.locality, insert.commandCaller.kind),
         insert.commandCaller.tier,
         insert.idempotencyKey ?? null,
