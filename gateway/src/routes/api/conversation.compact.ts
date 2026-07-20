@@ -18,6 +18,11 @@ import {
   webAuthModeFromEnv,
 } from "@server/auth/webAuthMode";
 
+// Native compaction may wait for an active turn to settle and then perform model-backed
+// summarization. Keep the generic IPC deadline short, but give this explicitly long-running
+// operation the same bounded window its WebSocket command surface advertises.
+const COMPACT_COMMAND_TIMEOUT_MS = 120_000;
+
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -81,7 +86,7 @@ export async function handleConversationCompactPost(request: Request): Promise<R
         ...(body.clientMessageId ? { clientMessageId: body.clientMessageId } : {}),
       },
       identity ?? undefined,
-      {},
+      { timeoutMs: COMPACT_COMMAND_TIMEOUT_MS },
       body.clientMessageId,
     );
     return json({ ok: true, result }, 201);
