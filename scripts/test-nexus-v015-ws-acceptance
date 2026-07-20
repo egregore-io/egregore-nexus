@@ -1703,6 +1703,36 @@ class WsAcceptanceContracts(unittest.TestCase):
                 "gatewayTarball": "gatewayTarballSha256",
             },
         )
+        self.assertEqual(
+            module["READINESS_BINDING_AUTHORITIES"],
+            {
+                "labProcess": (0, 0o555),
+                "labAgent": (0, 0o555),
+                "labFixture": (0, 0o555),
+                "nexusTarball": (0, 0o444),
+                "cliTarball": (0, 0o444),
+                "gatewayTarball": (0, 0o444),
+            },
+        )
+
+        readiness: dict[str, str] = {}
+        for key, hash_key in module["READINESS_BINDING_HASHES"].items():
+            readiness[key] = f"/candidate/{key}"
+            readiness[hash_key] = "a" * 64
+        checker = mock.Mock()
+        function_globals = module["validate_readiness_bindings"].__globals__
+        with mock.patch.dict(function_globals, {"require_bound_file": checker}):
+            module["validate_readiness_bindings"](
+                readiness,
+                Path("/tmp/nexus-lens-home"),
+            )
+        calls = {call.args[2]: call for call in checker.call_args_list}
+        for key, (expected_uid, expected_mode) in module[
+            "READINESS_BINDING_AUTHORITIES"
+        ].items():
+            call = calls[f"readiness {key}"]
+            self.assertEqual(call.kwargs["expected_uid"], expected_uid)
+            self.assertEqual(call.kwargs["expected_mode"], expected_mode)
 
     def test_harness_version_requires_one_recorded_semver_line(self) -> None:
         module = runpy.run_path(str(TARGET))

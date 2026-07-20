@@ -97,6 +97,14 @@ READINESS_BINDING_HASHES = {
     "cliTarball": "cliTarballSha256",
     "gatewayTarball": "gatewayTarballSha256",
 }
+READINESS_BINDING_AUTHORITIES = {
+    "labProcess": (0, 0o555),
+    "labAgent": (0, 0o555),
+    "labFixture": (0, 0o555),
+    "nexusTarball": (0, 0o444),
+    "cliTarball": (0, 0o444),
+    "gatewayTarball": (0, 0o444),
+}
 
 
 class AcceptanceFailure(RuntimeError):
@@ -1255,6 +1263,26 @@ def require_bound_file(
         raise AcceptanceFailure(f"{label} hash mismatch: expected {expected}, got {actual}")
 
 
+def validate_readiness_bindings(
+    readiness: dict[str, str],
+    lab_root: Path,
+) -> None:
+    for key, hash_key in READINESS_BINDING_HASHES.items():
+        path = Path(readiness[key])
+        binding_root = lab_root if inside(path, lab_root) else Path("/")
+        expected_uid, expected_mode = READINESS_BINDING_AUTHORITIES.get(
+            key, (None, None)
+        )
+        require_bound_file(
+            path,
+            readiness[hash_key],
+            f"readiness {key}",
+            binding_root,
+            expected_uid=expected_uid,
+            expected_mode=expected_mode,
+        )
+
+
 def validate_image_and_limits(manifest: dict[str, Any]) -> None:
     image = manifest.get("image")
     if (
@@ -2064,21 +2092,7 @@ def validate_candidate(lab_root: Path, evidence_dir: Path, run_id: str) -> Candi
     for key, expected in expected_environment.items():
         if environment.get(key) != expected:
             raise AcceptanceFailure(f"packed manifest binding {key} mismatch")
-    bindings = {
-        "nexusResolved": Path(readiness["nexusResolved"]),
-        "gatewayResolved": Path(readiness["gatewayResolved"]),
-        "webuiResolved": Path(readiness["webuiResolved"]),
-        "labProcess": Path(readiness["labProcess"]),
-        "labAgent": Path(readiness["labAgent"]),
-        "labFixture": Path(readiness["labFixture"]),
-        "nexusTarball": Path(readiness["nexusTarball"]),
-        "cliTarball": Path(readiness["cliTarball"]),
-        "gatewayTarball": Path(readiness["gatewayTarball"]),
-    }
-    for key, path in bindings.items():
-        hash_key = READINESS_BINDING_HASHES[key]
-        binding_root = lab_root if inside(path, lab_root) else Path("/")
-        require_bound_file(path, readiness[hash_key], f"readiness {key}", binding_root)
+    validate_readiness_bindings(readiness, lab_root)
     try:
         observed_tarballs = set(Path("/tmp/nexus-lab-packs").iterdir())
     except OSError as error:
