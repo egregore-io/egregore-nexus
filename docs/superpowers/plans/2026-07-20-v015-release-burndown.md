@@ -196,7 +196,7 @@
 - Execute: `scripts/nexus-docker-test-env`
 - Produce: candidate tarballs, native binary, readiness receipt, manifest, and container image under the isolated lab
 
-- [ ] **Step 1: Remove only the previous disposable validator.**
+- [x] **Step 1: Remove only the previous disposable validator.**
 
   ```bash
   cd /home/earldennison/Projects/egregore-nexus
