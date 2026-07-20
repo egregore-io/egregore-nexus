@@ -181,7 +181,7 @@ impl AppState {
 
         let mut torn_down = 0;
         for row in rows {
-            if row.kind != kind_token(Kind::Agent) || row.transport.is_none() {
+            if !row.is_agent() || row.transport.is_none() {
                 continue;
             }
             self.teardown_harness_row(&row).await;
@@ -253,7 +253,7 @@ impl AppState {
         let project = row.project.clone();
         let client_key = row.client_key.clone().unwrap_or_else(|| session.0.clone());
 
-        if row.kind != "agent" {
+        if !row.is_agent() {
             return Ok(session);
         }
         let requested_thread_id = requested_thread_id.map(str::to_string);
@@ -445,7 +445,7 @@ impl AppState {
         let project = row.project.clone();
         let client_key = row.client_key.clone().unwrap_or_else(|| session.0.clone());
 
-        if row.kind != "agent" {
+        if !row.is_agent() {
             return Ok(session);
         }
         let Some(supervisor) = self.pty.clone() else {
@@ -580,7 +580,7 @@ impl AppState {
         let client_key = row.client_key.clone().unwrap_or_else(|| session.0.clone());
 
         // Only AGENTS have a harness to revive — a DM/whatever can target an operator/app member.
-        if row.kind != "agent" {
+        if !row.is_agent() {
             return Ok(session);
         }
         if row.agent.as_deref() == Some("codex")

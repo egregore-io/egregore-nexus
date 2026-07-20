@@ -33,7 +33,7 @@ import {
   createHumanReadDeliveryMarker,
   type HumanReadDeliveryMarker,
 } from "@server/delivery/humanRead";
-import { Kind, Tier } from "@shared/types";
+import { Kind, Locality, Tier } from "@shared/types";
 
 const API_KEY = "test-secret-key";
 const NOTIFY_HMAC_SECRET = "notify-test-secret";
@@ -751,6 +751,9 @@ describe("public API — reads go to the read-view (NOT the daemon)", () => {
           name: "etan",
           project: "nexus",
           kind: Kind.Human,
+          locality: Locality.External,
+          access: "guest",
+          principalId: "x_etan",
           tier: Tier.Admin,
           sessionId: "s_etan_browser",
           agentId: "a_etan_browser",
@@ -764,6 +767,10 @@ describe("public API — reads go to the read-view (NOT the daemon)", () => {
       name: "etan",
       agentId: "a_etan_browser",
       kind: "human",
+      locality: "external",
+      entityKind: "external.human",
+      access: "guest",
+      principalId: "x_etan",
       tier: "admin",
       project: "nexus",
       presence: "online",

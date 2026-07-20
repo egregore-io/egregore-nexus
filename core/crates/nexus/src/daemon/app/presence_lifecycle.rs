@@ -127,7 +127,7 @@ impl AppState {
         let rows = Sessions::new(&self.store).list_all().await?;
         let registry = self.presence.registry();
         for row in rows {
-            if row.kind != kind_token(Kind::Agent) {
+            if !row.is_agent() {
                 continue;
             }
             if !matches!(row.presence.as_deref(), Some("online") | Some("busy")) {
@@ -152,7 +152,7 @@ impl AppState {
         let rows = Sessions::new(&self.store).list_all().await?;
         let registry = self.presence.registry();
         for row in rows {
-            if row.kind != kind_token(Kind::Agent) || row.transport.is_none() {
+            if !row.is_agent() || row.transport.is_none() {
                 continue;
             }
             if registry.is_present(&row.session_id) {

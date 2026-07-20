@@ -19,6 +19,8 @@ fn full_flow_uses_consistent_top_level_names() {
         runtime_credential: None,
         tier: Tier::Agent,
         kind: None,
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     };
@@ -100,6 +102,8 @@ fn full_flow_uses_consistent_top_level_names() {
         provenance: Provenance {
             from: "dylan".into(),
             kind: Kind::Agent,
+            locality: Default::default(),
+            access: None,
             thread: None,
             topic: None,
             stamp: None,

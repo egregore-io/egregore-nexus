@@ -605,6 +605,8 @@ async fn routing_repositories_resolve_identity_without_cross_database_sql() {
         provenance: Provenance {
             from: "sender".into(),
             kind: Kind::Agent,
+            locality: Default::default(),
+            access: None,
             thread: None,
             topic: None,
             stamp: None,

@@ -167,6 +167,9 @@ impl SourceService {
             name: req.source.clone(),
             project: caller.project.clone(),
             tier: caller.tier,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         };
 
         // 6. Publish to topic via the bus publish fan-out.

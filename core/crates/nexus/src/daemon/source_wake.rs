@@ -84,7 +84,7 @@ impl AppState {
         };
 
         let row = match row {
-            Ok(Some(row)) if row.kind == "agent" => row,
+            Ok(Some(row)) if row.is_agent() => row,
             Ok(Some(_)) => return,
             Ok(None) => {
                 self.mark_source_wake_error(

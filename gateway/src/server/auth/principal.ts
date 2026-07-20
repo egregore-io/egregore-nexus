@@ -1,4 +1,4 @@
-import { Kind, Tier } from "@shared/types";
+import { Kind, Locality, Tier } from "@shared/types";
 import type {
   CredentialFacet,
   GatewayCallerIdentity,
@@ -26,6 +26,7 @@ export const HUMAN_ADMIN_SCOPES: PrincipalScope[] = [
 
 export interface PrincipalAttributes {
   kind: Kind;
+  locality: Locality;
   tier: Tier;
   credentialFacet: CredentialFacet;
   scopes: PrincipalScope[];
@@ -34,6 +35,7 @@ export interface PrincipalAttributes {
 export function humanPrincipalAttributes(): PrincipalAttributes {
   return {
     kind: Kind.Human,
+    locality: Locality.Local,
     tier: Tier.Admin,
     credentialFacet: "human",
     scopes: [...HUMAN_ADMIN_SCOPES],
@@ -43,6 +45,7 @@ export function humanPrincipalAttributes(): PrincipalAttributes {
 export function localPrincipalAttributes(): PrincipalAttributes {
   return {
     kind: Kind.Human,
+    locality: Locality.Local,
     tier: Tier.Admin,
     credentialFacet: "local",
     scopes: [...HUMAN_ADMIN_SCOPES],

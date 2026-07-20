@@ -7,6 +7,7 @@
 use libsql::params;
 
 use nexus_common::NexusError;
+use nexus_contracts::entity_kind;
 
 use crate::error::{store_err, store_msg};
 use crate::repos::sessions::{get_opt_int, get_opt_text, get_text};
@@ -93,7 +94,8 @@ impl<'a> CommandIntents<'a> {
 
     /// Insert a new pending command intent. The command id is caller-provided so submitters can
     /// poll the same row for completion.
-    pub async fn insert_pending(&self, row: NewCommandIntent) -> Result<(), NexusError> {
+    pub async fn insert_pending(&self, mut row: NewCommandIntent) -> Result<(), NexusError> {
+        normalize_caller_kind(&mut row)?;
         self
             .store
             .identity_conn()
@@ -132,8 +134,9 @@ impl<'a> CommandIntents<'a> {
     /// result of a command it did not submit.
     pub async fn insert_pending_or_resume(
         &self,
-        row: NewCommandIntent,
+        mut row: NewCommandIntent,
     ) -> Result<String, NexusError> {
+        normalize_caller_kind(&mut row)?;
         let command_id = row.command_id.clone();
         if let Some(existing) = self.get(&command_id).await? {
             return matching_existing_command(&existing, &row, "command id");
@@ -157,8 +160,9 @@ impl<'a> CommandIntents<'a> {
     /// retried call polls the first row instead of executing a duplicate write.
     pub async fn insert_pending_idempotent(
         &self,
-        row: NewCommandIntent,
+        mut row: NewCommandIntent,
     ) -> Result<String, NexusError> {
+        normalize_caller_kind(&mut row)?;
         let command_id = row.command_id.clone();
         let project = row.project.clone();
         let kind = row.kind.clone();
@@ -1151,6 +1155,7 @@ const SELECT: &str = "SELECT command_id, kind, status, project, caller_name, cal
      completed_at FROM command_intents";
 
 fn row_to_command_intent(row: &libsql::Row) -> Result<CommandIntentRow, NexusError> {
+    let caller_kind = canonical_caller_kind(get_opt_text(row, 9)?)?;
     Ok(CommandIntentRow {
         command_id: get_text(row, 0)?,
         kind: get_text(row, 1)?,
@@ -1161,7 +1166,7 @@ fn row_to_command_intent(row: &libsql::Row) -> Result<CommandIntentRow, NexusErr
         caller_agent_id: get_opt_text(row, 6)?,
         caller_runtime_id: get_opt_text(row, 7)?,
         caller_client_key: get_opt_text(row, 8)?,
-        caller_kind: get_opt_text(row, 9)?,
+        caller_kind,
         caller_tier: get_opt_text(row, 10)?,
         idempotency_key: get_opt_text(row, 11)?,
         request_json: get_text(row, 12)?,
@@ -1175,6 +1180,21 @@ fn row_to_command_intent(row: &libsql::Row) -> Result<CommandIntentRow, NexusErr
         lease_until: get_opt_int(row, 20)?,
         completed_at: get_opt_int(row, 21)?,
     })
+}
+
+fn normalize_caller_kind(row: &mut NewCommandIntent) -> Result<(), NexusError> {
+    row.caller_kind = canonical_caller_kind(row.caller_kind.take())?;
+    Ok(())
+}
+
+fn canonical_caller_kind(value: Option<String>) -> Result<Option<String>, NexusError> {
+    value
+        .map(|value| {
+            entity_kind::parse(&value)
+                .map(|(locality, kind)| entity_kind::dotted(locality, kind))
+                .ok_or_else(|| NexusError::Invalid(format!("unknown stored caller kind {value:?}")))
+        })
+        .transpose()
 }
 
 fn is_unique_constraint(err: &NexusError) -> bool {

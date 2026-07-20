@@ -257,6 +257,8 @@ async fn graceful_shutdown_cancels_delivery_loops_before_killing_adapters() {
         provenance: Provenance {
             from: "operator".into(),
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
             thread: None,
             topic: None,
             stamp: None,
@@ -987,6 +989,8 @@ async fn daemon_boot_replays_one_unsettled_delivery_and_auto_wakes_its_target() 
             provenance: Provenance {
                 from: "operator".into(),
                 kind: Kind::Human,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,
@@ -1235,6 +1239,9 @@ async fn split_daemon_exposes_no_arbitrary_product_history_query_surface() {
                 runtime_id: Some("local-operator".into()),
                 client_key: None,
                 kind: Kind::Human,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
                 tier: Tier::Admin,
             }),
             call: DaemonIpcCall::Query {
@@ -1266,6 +1273,9 @@ async fn split_daemon_exposes_no_arbitrary_product_history_query_surface() {
                 runtime_id: Some("local-operator".into()),
                 client_key: None,
                 kind: Kind::Human,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
                 tier: Tier::Admin,
             }),
             call: DaemonIpcCall::Query {
@@ -1300,6 +1310,8 @@ fn agent(name: &str, client_key: &str) -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Agent,
         kind: Some(Kind::Agent),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: Some("/work/repo".into()),
     }

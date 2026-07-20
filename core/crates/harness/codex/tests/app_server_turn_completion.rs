@@ -557,6 +557,8 @@ async fn accepted_then_final_usage_limit_settles_store_error_without_delivery() 
             provenance: Provenance {
                 from: "alex".into(),
                 kind: Kind::Human,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,

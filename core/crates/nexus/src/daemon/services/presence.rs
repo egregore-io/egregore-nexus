@@ -219,7 +219,7 @@ impl PresenceWriter {
         else {
             return Ok(());
         };
-        if row.kind != "agent" {
+        if !row.is_agent() {
             return Ok(());
         }
         self.events

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use nexus_common::now;
 use nexus_contracts::{
-    codes, AgentId, Caller, CommandQueueMutationRequest, ContractError, DaemonIpcCall,
+    codes, entity_kind, AgentId, Caller, CommandQueueMutationRequest, ContractError, DaemonIpcCall,
     DaemonIpcCaller, DaemonIpcRequest, DaemonIpcResponse, Kind, MessageId, Presence, Request,
     RpcError, SessionId, Tier, Whoami, DAEMON_IPC_PROTOCOL_VERSION, JSONRPC_VERSION,
 };
@@ -585,6 +585,9 @@ async fn handle_query(
             name: local_operator_display_name(),
             project: caller.project,
             tier: Tier::Admin,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         }),
         Some(caller) => match resolve_registered_query_caller(state, &caller).await {
             Ok(caller) => Some(caller),
@@ -1302,6 +1305,14 @@ async fn resolve_registered_query_caller(
                     "admin" => Tier::Admin,
                     _ => Tier::Agent,
                 },
+                locality: session
+                    .entity_kind()
+                    .map_err(|error| error.to_contract_error())?
+                    .0,
+                access: session
+                    .access()
+                    .map_err(|error| error.to_contract_error())?,
+                principal_id: evidence.principal_id.clone(),
             }
         }
         None => match session.name.as_deref() {
@@ -1348,7 +1359,9 @@ fn validate_query_caller(
             "daemon IPC caller agent does not match registered client key",
         ));
     }
-    if session.kind != kind_token(evidence.kind) || session.tier != tier_token(evidence.tier) {
+    if session.kind != entity_kind::dotted(evidence.locality, evidence.kind)
+        || session.tier != tier_token(evidence.tier)
+    {
         return Err(unauthorized(
             "daemon IPC caller kind or tier does not match registered client key",
         ));
@@ -1481,7 +1494,7 @@ fn command_row(
         caller_agent_id: caller.agent_id,
         caller_runtime_id: caller.runtime_id,
         caller_client_key: caller.client_key,
-        caller_kind: Some(kind_token(caller.kind).into()),
+        caller_kind: Some(entity_kind::dotted(caller.locality, caller.kind)),
         caller_tier: Some(tier_token(caller.tier).into()),
         idempotency_key,
         request_json: serde_json::to_string(&params).unwrap_or_else(|_| "null".into()),
@@ -1498,16 +1511,10 @@ fn anonymous_caller() -> DaemonIpcCaller {
         runtime_id: None,
         client_key: None,
         kind: Kind::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
         tier: Tier::Agent,
-    }
-}
-
-fn kind_token(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Agent => "agent",
-        Kind::Human => "human",
-        Kind::Notification => "notification",
-        Kind::App => "app",
     }
 }
 

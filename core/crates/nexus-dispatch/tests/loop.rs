@@ -813,6 +813,8 @@ fn message(id: &str, from: &str, body: &str, kind: Kind) -> Message {
         provenance: Provenance {
             from: from.into(),
             kind,
+            locality: Default::default(),
+            access: None,
             thread: None,
             topic: None,
             stamp: None,
@@ -832,6 +834,9 @@ fn caller(session: &SessionId) -> Caller {
         name: "ana".into(),
         project: PROJECT.into(),
         tier: Tier::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 

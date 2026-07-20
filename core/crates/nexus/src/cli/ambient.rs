@@ -80,6 +80,8 @@ pub fn identity_from_env_result() -> Result<Option<RegisterRequest>, ContractErr
         runtime_credential: None,
         tier,
         kind,
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }))

@@ -25,6 +25,8 @@ fn human(name: &str, client_key: &str) -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Admin,
         kind: Some(Kind::Human),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }

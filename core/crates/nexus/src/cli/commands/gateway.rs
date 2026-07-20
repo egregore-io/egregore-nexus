@@ -248,6 +248,9 @@ async fn run_delivery_mode(
                 runtime_id: Some(crate::local_operator::LOCAL_OPERATOR_SESSION_ID.into()),
                 client_key: None,
                 kind: Kind::Human,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
                 tier: Tier::Admin,
             }),
             call: DaemonIpcCall::Query {

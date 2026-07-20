@@ -3,7 +3,8 @@
 //! `register` binds `name ↔ harness_session_id` by persisting both on the same row; these helpers
 //! own the enum↔string mapping so the service layer never hand-stringifies.
 
-use nexus_contracts::enums::{Kind, Tier};
+use nexus_contracts::entity_kind;
+use nexus_contracts::enums::{Kind, Locality, Tier};
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::Caller;
 use nexus_contracts::register::Whoami;
@@ -29,24 +30,25 @@ pub(crate) fn tier_from_str(s: &str) -> Tier {
 
 /// The kind token stored on `sessions.kind`. Defaults to `agent` when the request omits it
 /// (matching the contract: `kind` defaults to agent server-side).
-pub(crate) fn kind_str(k: Option<Kind>) -> &'static str {
-    match k.unwrap_or(Kind::Agent) {
-        Kind::Agent => "agent",
-        Kind::Human => "human",
-        Kind::Notification => "notification",
-        Kind::App => "app",
-    }
+pub(crate) fn kind_str(locality: Locality, kind: Option<Kind>) -> String {
+    entity_kind::dotted(locality, kind.unwrap_or(Kind::Agent))
 }
 
 /// Resolve a persisted [`SessionRow`] into the caller's authenticated [`Caller`] (the identity the
 /// daemon threads into every later port call — never a client-supplied `from`).
 pub(crate) fn caller_from_row(row: &SessionRow) -> Caller {
+    let (locality, _) = row
+        .entity_kind()
+        .expect("SessionRow kind was validated by the store repository");
     Caller {
         agent_id: None,
         session: SessionId(row.session_id.0.clone()),
         name: row.display_name(),
         project: row.project.clone(),
         tier: tier_from_str(&row.tier),
+        locality,
+        access: row.access().ok().flatten(),
+        principal_id: None,
     }
 }
 

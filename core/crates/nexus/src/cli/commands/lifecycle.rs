@@ -285,6 +285,8 @@ pub fn register_request(a: &RegisterArgs) -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Agent,
         kind: a.kind,
+        locality: Default::default(),
+        access: None,
         role: a.role.clone(),
         cwd: a.cwd.clone(),
     }
@@ -607,6 +609,8 @@ fn build_register_request(
         runtime_credential,
         tier: Tier::Agent,
         kind: a.kind,
+        locality: Default::default(),
+        access: None,
         role: a.role,
         cwd: a.cwd,
     })

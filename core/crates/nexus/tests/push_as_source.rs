@@ -46,6 +46,9 @@ impl nexus_contracts::IdentityPort for MockIdentity {
             name: name.to_string(),
             project: PROJECT.to_string(),
             tier: Tier::Agent,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         })
     }
     async fn members(
@@ -254,6 +257,9 @@ fn operator_caller() -> Caller {
         name: "operator".into(),
         project: PROJECT.into(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 

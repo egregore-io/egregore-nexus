@@ -47,6 +47,8 @@ fn register_request(name: &str, client_key: &str) -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Agent,
         kind: None,
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -855,6 +857,9 @@ fn caller_for(session: &SessionId, name: &str) -> Caller {
         name: name.into(),
         project: "p_demo".into(),
         tier: Tier::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 

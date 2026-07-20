@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { migrateGatewayStore } from "../store/migrations";
 import {
   canonicalDmHistory,
+  canonicalMessageById,
   canonicalAgentShow,
   canonicalAgentAccessGrantsByAgentId,
   canonicalAgentSessionTarget,
@@ -18,6 +19,37 @@ import {
 } from "./canonical";
 
 describe("canonical Gateway REST reads", () => {
+  it("preserves projected locality/access and refuses unknown entity kinds", async () => {
+    const db = createClient({ url: ":memory:" });
+    await migrateGatewayStore(db);
+    await db.execute({
+      sql: `INSERT INTO bus_messages
+        (message_id, kind, from_name, to_name, body, provenance_json, created_at)
+        VALUES (?, 'dm', 'outside', 'operator', 'hello', ?, 1)`,
+      args: [
+        "m_external",
+        JSON.stringify({
+          from: "outside",
+          kind: "human",
+          locality: "external",
+          access: "guest",
+        }),
+      ],
+    });
+
+    await expect(canonicalMessageById(db, "m_external", "operator"))
+      .resolves.toMatchObject({
+        provenance: { kind: "human", locality: "external", access: "guest" },
+      });
+    await db.execute({
+      sql: "UPDATE bus_messages SET provenance_json = ? WHERE message_id = ?",
+      args: [JSON.stringify({ kind: "remote.human" }), "m_external"],
+    });
+    await expect(canonicalMessageById(db, "m_external", "operator"))
+      .rejects.toThrow(/unknown entity kind/);
+    db.close();
+  });
+
   it("serves threads, DMs, topics, notifications and opaque cursor pages", async () => {
     const db = createClient({ url: ":memory:" });
     await migrateGatewayStore(db);

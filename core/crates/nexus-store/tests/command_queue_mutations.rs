@@ -12,8 +12,8 @@ async fn store(active_turn: bool) -> Store {
     store
         .conn
         .execute(
-            "INSERT INTO sessions (session_id, agent_id, name, agent, transport, project, created_at) \
-             VALUES ('s_otto', 'a_otto', 'otto', 'codex', 'codex-appserver', 'default', 1)",
+            "INSERT INTO sessions (session_id, agent_id, name, agent, kind, transport, project, created_at) \
+             VALUES ('s_otto', 'a_otto', 'otto', 'codex', 'agent', 'codex-appserver', 'default', 1)",
             (),
         )
         .await
@@ -186,8 +186,8 @@ async fn stable_agent_id_prefers_its_active_runtime_over_a_newer_stale_session_f
     store
         .conn
         .execute(
-            "INSERT INTO sessions (session_id, agent_id, name, agent, transport, project, created_at) \
-             VALUES ('s_otto_stale', 'a_otto', 'otto-stale', 'claude', 'acp', 'other', 2)",
+            "INSERT INTO sessions (session_id, agent_id, name, agent, kind, transport, project, created_at) \
+             VALUES ('s_otto_stale', 'a_otto', 'otto-stale', 'claude', 'agent', 'acp', 'other', 2)",
             (),
         )
         .await

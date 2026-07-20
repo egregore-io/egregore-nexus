@@ -5,7 +5,8 @@ use libsql::params;
 
 use nexus_common::presence::presence_token;
 use nexus_common::{now, NexusError};
-use nexus_contracts::enums::Presence;
+use nexus_contracts::entity_kind;
+use nexus_contracts::enums::{Kind, Presence};
 use nexus_contracts::ids::SessionId;
 
 use crate::error::store_err;
@@ -44,9 +45,10 @@ impl<'a> Sessions<'a> {
 
     /// Insert a new session row (presence `online`, not paused, `created_at = now()`).
     pub async fn create(&self, s: NewSession) -> Result<SessionId, NexusError> {
-        let session_id = self.insert(s.clone()).await?;
+        let is_agent = is_agent_kind(&s.kind)?;
+        let session_id = self.insert(s.clone(), None).await?;
         let ts = now();
-        if s.kind == "agent" {
+        if is_agent {
             if let Some(name) = s.name.as_deref() {
                 self.append_lifecycle(name, &session_id, "started", None, ts)
                     .await?;
@@ -65,12 +67,21 @@ impl<'a> Sessions<'a> {
     /// [`remove_staged_registration`](Self::remove_staged_registration), so readers never receive
     /// a `started` fact for an identity that did not finish registering.
     pub async fn create_staged_registration(&self, s: NewSession) -> Result<SessionId, NexusError> {
-        self.insert(s).await
+        self.insert(s, None).await
+    }
+
+    /// Insert a staged registration with the caller's parallel identity facets already durable.
+    pub async fn create_staged_registration_with_metadata(
+        &self,
+        s: NewSession,
+        metadata_json: Option<String>,
+    ) -> Result<SessionId, NexusError> {
+        self.insert(s, metadata_json).await
     }
 
     /// Publish the compatibility lifecycle fact for a fully-bound staged registration.
     pub async fn finalize_staged_registration(&self, row: &SessionRow) -> Result<(), NexusError> {
-        let result = if row.kind == "agent" {
+        let result = if row.is_agent() {
             match row.name.as_deref() {
                 Some(name) => {
                     self.append_lifecycle(name, &row.session_id, "started", None, now())
@@ -99,21 +110,26 @@ impl<'a> Sessions<'a> {
         Ok(())
     }
 
-    async fn insert(&self, s: NewSession) -> Result<SessionId, NexusError> {
+    async fn insert(
+        &self,
+        s: NewSession,
+        metadata_json: Option<String>,
+    ) -> Result<SessionId, NexusError> {
         let ts = now();
         let session_id = s.session_id.clone();
+        let kind = canonical_kind(&s.kind)?;
         self.store
             .conn
             .execute(
                 "INSERT INTO sessions (session_id, name, agent, kind, role, tier, \
                  harness_session_id, client_key, cwd, project, presence, paused, created_at, \
-                 transport) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'online', 0, ?11, ?12)",
+                 transport, metadata_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'online', 0, ?11, ?12, ?13)",
                 params![
                     s.session_id.0.clone(),
                     s.name,
                     s.agent,
-                    s.kind,
+                    kind,
                     s.role,
                     s.tier,
                     s.harness_session_id,
@@ -121,7 +137,8 @@ impl<'a> Sessions<'a> {
                     s.cwd,
                     s.project,
                     ts,
-                    s.transport
+                    s.transport,
+                    metadata_json
                 ],
             )
             .await
@@ -266,7 +283,8 @@ impl<'a> Sessions<'a> {
     pub async fn rebind_name_to_session(&self, s: NewSession) -> Result<SessionId, NexusError> {
         let new_session_id = s.session_id.0.clone();
         let event_session_id = SessionId(new_session_id.clone());
-        let is_agent = s.kind == "agent";
+        let is_agent = is_agent_kind(&s.kind)?;
+        let kind = canonical_kind(&s.kind)?;
         let name = s
             .name
             .clone()
@@ -286,7 +304,7 @@ impl<'a> Sessions<'a> {
                 params![
                     new_session_id.clone(),
                     s.agent,
-                    s.kind,
+                    kind,
                     s.role,
                     s.tier,
                     s.harness_session_id,
@@ -883,11 +901,12 @@ const SELECT: &str = "SELECT session_id, name, agent, kind, role, tier, harness_
      last_heartbeat, created_at, transport, metadata_json, agent_id FROM sessions";
 
 fn row_to_session(row: &libsql::Row) -> Result<SessionRow, NexusError> {
+    let kind = canonical_kind(&get_text(row, 3)?)?;
     Ok(SessionRow {
         session_id: SessionId(get_text(row, 0)?),
         name: get_opt_text(row, 1)?,
         agent: get_opt_text(row, 2)?,
-        kind: get_text(row, 3)?,
+        kind,
         role: get_opt_text(row, 4)?,
         tier: get_text(row, 5)?,
         harness_session_id: get_opt_text(row, 6)?,
@@ -905,6 +924,18 @@ fn row_to_session(row: &libsql::Row) -> Result<SessionRow, NexusError> {
         metadata_json: get_opt_text(row, 18)?,
         agent_id: get_opt_text(row, 19)?,
     })
+}
+
+fn canonical_kind(value: &str) -> Result<String, NexusError> {
+    entity_kind::parse(value)
+        .map(|(locality, kind)| entity_kind::dotted(locality, kind))
+        .ok_or_else(|| NexusError::Invalid(format!("unknown stored session kind {value:?}")))
+}
+
+fn is_agent_kind(value: &str) -> Result<bool, NexusError> {
+    entity_kind::parse(value)
+        .map(|(_, kind)| kind == Kind::Agent)
+        .ok_or_else(|| NexusError::Invalid(format!("unknown session kind {value:?}")))
 }
 
 fn lifecycle_for_presence_transition(previous: &str, next: &str) -> Option<&'static str> {

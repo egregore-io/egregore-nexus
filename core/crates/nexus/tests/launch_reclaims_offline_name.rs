@@ -511,7 +511,7 @@ async fn launch_reclaims_a_dead_name_for_the_new_session() {
     assert_ne!(client_key, NEW_SESSION);
     assert_eq!(row.presence.as_deref(), Some("online"));
     assert_eq!(row.agent.as_deref(), Some("codex"));
-    assert_eq!(row.kind, "agent");
+    assert_eq!(row.kind, "local.agent");
     assert_eq!(row.tier, "agent");
     assert_eq!(row.cwd.as_deref(), Some("/tmp/new-cwd"));
     assert_eq!(row.transport.as_deref(), Some("acp"));
@@ -909,6 +909,9 @@ async fn codex_resume_after_remove_reuses_preserved_durable_thread_on_owner_row(
         name: "operator".into(),
         project: PROJECT.into(),
         tier: nexus_contracts::Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     state
         .remove_agent(
@@ -1350,6 +1353,9 @@ async fn admin_remove_preserves_codex_native_resume_state() {
         name: "operator".into(),
         project: PROJECT.into(),
         tier: nexus_contracts::Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     let removed = state
         .remove_agent(&admin, None, "beatrice", false)
@@ -1428,6 +1434,9 @@ async fn admin_delete_removes_codex_native_thread_ownership() {
         name: "operator".into(),
         project: PROJECT.into(),
         tier: nexus_contracts::Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     state
         .delete_agent(
@@ -1509,6 +1518,9 @@ async fn admin_remove_final_flushes_codex_rollout_while_preserving_sidecar() {
         name: "operator".into(),
         project: PROJECT.into(),
         tier: nexus_contracts::Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     let removed = state
         .remove_agent(&admin, None, "beatrice", false)
@@ -1594,6 +1606,9 @@ async fn admin_remove_preserves_all_native_session_bindings() {
         name: "operator".into(),
         project: PROJECT.into(),
         tier: nexus_contracts::Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     let removed = state
         .remove_agent(&admin, None, "beatrice", false)
@@ -1701,6 +1716,9 @@ async fn admin_delete_releases_all_native_session_bindings() {
         name: "operator".into(),
         project: PROJECT.into(),
         tier: nexus_contracts::Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     state.delete_agent(&admin, None, "beatrice").await.unwrap();
 
@@ -1787,6 +1805,9 @@ async fn admin_delete_releases_native_bindings_when_archive_final_flush_fails() 
         name: "operator".into(),
         project: PROJECT.into(),
         tier: nexus_contracts::Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     state.delete_agent(&admin, None, "beatrice").await.unwrap();
 

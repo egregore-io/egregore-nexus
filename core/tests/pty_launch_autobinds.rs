@@ -166,6 +166,8 @@ async fn launch_autobinds_pty_but_durable_dm_fails_before_raw_write() {
             runtime_credential: None,
             tier: Tier::Agent,
             kind: Some(Kind::Agent),
+            locality: Default::default(),
+            access: None,
             role: None,
             cwd: None,
         },
@@ -178,6 +180,9 @@ async fn launch_autobinds_pty_but_durable_dm_fails_before_raw_write() {
         name: "ben".into(),
         project: PROJECT.into(),
         tier: Tier::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
 
     // ben DMs ada through the bus → ada's bell rings → her drain loop drains the in_flight row →
@@ -253,6 +258,9 @@ async fn passive_pty_text_reaches_stream_events() {
             name: "Local Operator".into(),
             project: PROJECT.into(),
             tier: Tier::Admin,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         }),
         "prompt",
         PromptRequest {

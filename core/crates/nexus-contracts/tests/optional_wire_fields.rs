@@ -56,7 +56,7 @@ fn representative_contract_modules_round_trip_with_absent_optionals() {
         "from": "ana",
         "scope": "dm",
         "body": "hello",
-        "provenance": {"from": "ana", "kind": "agent"},
+        "provenance": {"from": "ana", "kind": "agent", "locality": "local"},
         "createdAt": 1
     }));
     assert_absent_round_trip::<NotifyRequest>(json!({"source": "ci", "payload": {"ok": true}}));
@@ -80,7 +80,8 @@ fn representative_contract_modules_round_trip_with_absent_optionals() {
         "harnessSessionId": "native_1",
         "project": "default",
         "clientKey": "client_1",
-        "tier": "agent"
+        "tier": "agent",
+        "locality": "local"
     }));
     assert_absent_round_trip::<HistoryRequest>(json!({}));
     assert_absent_round_trip::<SendRequest>(json!({
@@ -159,6 +160,8 @@ fn representative_dm_and_thread_frames_are_smaller_and_accept_legacy_nulls() {
         provenance: Provenance {
             from: "ana".into(),
             kind: Kind::Agent,
+            locality: Default::default(),
+            access: None,
             thread: provenance_thread,
             topic: None,
             stamp: None,

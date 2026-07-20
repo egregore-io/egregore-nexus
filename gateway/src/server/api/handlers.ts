@@ -92,11 +92,13 @@ import { longPollCanonicalPage } from "@server/messagePost/longPoll";
 import { gatewayChangeBus } from "@server/store/changeBus";
 import {
   Kind,
+  Locality,
   Tier,
   type Ack,
   type NotifySendRequest,
   type SendRequest,
 } from "@shared/types";
+import { dottedEntityKind } from "@server/identity/entityKind";
 
 /** Maximum time an authorized read may wait for its best-effort human delivery receipt. */
 const HUMAN_READ_RECEIPT_TIMEOUT_MS = 250;
@@ -284,11 +286,17 @@ export const getProjects: Handler = async ({ deps }) =>
 export const getWhoami: Handler = async ({ req }) => {
   const caller = req.caller;
   if (!caller) return fail(401, "not logged in", "unauthorized");
+  const kind = caller.kind ?? Kind.Human;
+  const locality = caller.locality ?? Locality.Local;
   return ok({
     name: caller.name,
     ...(caller.agentId ? { agentId: caller.agentId } : {}),
     sessionId: caller.sessionId ?? "",
-    kind: caller.kind ?? Kind.Human,
+    kind,
+    locality,
+    entityKind: dottedEntityKind(locality, kind),
+    ...(caller.access ? { access: caller.access } : {}),
+    ...(caller.principalId ? { principalId: caller.principalId } : {}),
     tier: caller.tier ?? Tier.Agent,
     project: caller.project,
     presence: "online",

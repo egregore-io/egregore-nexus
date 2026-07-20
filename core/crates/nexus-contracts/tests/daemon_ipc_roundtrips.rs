@@ -1,6 +1,6 @@
 use nexus_contracts::{
-    DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, DaemonIpcResponse, Kind, RpcError, Tier,
-    DAEMON_IPC_PROTOCOL_VERSION,
+    DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, DaemonIpcResponse, Kind, Locality, RpcError,
+    Tier, DAEMON_IPC_PROTOCOL_VERSION,
 };
 use serde_json::json;
 
@@ -18,6 +18,9 @@ fn daemon_ipc_command_roundtrip_keeps_caller_and_ledger_identity() {
             runtime_id: Some("r_casey".into()),
             client_key: Some("client-casey".into()),
             kind: Kind::Agent,
+            locality: Locality::External,
+            access: Some("guest".into()),
+            principal_id: Some("x_casey".into()),
             tier: Tier::Agent,
         }),
         call: DaemonIpcCall::Command {
@@ -32,6 +35,9 @@ fn daemon_ipc_command_roundtrip_keeps_caller_and_ledger_identity() {
     assert_eq!(encoded["call"]["mode"], "command");
     assert_eq!(encoded["call"]["commandId"], "cmd-17");
     assert_eq!(encoded["caller"]["project"], "metadata-only");
+    assert_eq!(encoded["caller"]["locality"], "external");
+    assert_eq!(encoded["caller"]["access"], "guest");
+    assert_eq!(encoded["caller"]["principalId"], "x_casey");
     assert_eq!(
         serde_json::from_value::<DaemonIpcRequest>(encoded).unwrap(),
         frame

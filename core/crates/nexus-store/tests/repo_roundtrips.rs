@@ -30,6 +30,8 @@ mod search_index {
             provenance: Provenance {
                 from: from.into(),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,
@@ -735,6 +737,8 @@ mod inbox {
             provenance: Provenance {
                 from: "ben".into(),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,
@@ -2126,6 +2130,8 @@ mod sessions {
             provenance: Provenance {
                 from: from.to_string(),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,
@@ -3140,6 +3146,8 @@ mod messages {
             provenance: Provenance {
                 from: "etan".into(),
                 kind: Kind::Human,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,

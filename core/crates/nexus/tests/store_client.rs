@@ -203,6 +203,8 @@ fn agent_register(name: &str, client_key: &str) -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Agent,
         kind: Some(Kind::Agent),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -211,6 +213,8 @@ fn agent_register(name: &str, client_key: &str) -> RegisterRequest {
 fn app_register(name: &str, client_key: &str) -> RegisterRequest {
     RegisterRequest {
         kind: Some(Kind::App),
+        locality: Default::default(),
+        access: None,
         ..agent_register(name, client_key)
     }
 }
@@ -1015,7 +1019,7 @@ async fn store_client_submits_command_intents_with_caller_metadata() {
     assert_eq!(row.project, "demo");
     assert_eq!(row.caller_name, "ada");
     assert_eq!(row.caller_client_key.as_deref(), Some("ck_ada"));
-    assert_eq!(row.caller_kind.as_deref(), Some("human"));
+    assert_eq!(row.caller_kind.as_deref(), Some("local.human"));
     assert_eq!(row.caller_tier.as_deref(), Some("admin"));
 
     CommandIntents::new(&store)
@@ -1106,6 +1110,8 @@ async fn ambient_store_client_follows_registered_client_key_after_rename() {
             runtime_credential: None,
             tier: Tier::Agent,
             kind: Some(Kind::Agent),
+            locality: Default::default(),
+            access: None,
             role: None,
             cwd: None,
         },
@@ -1122,7 +1128,7 @@ async fn ambient_store_client_follows_registered_client_key_after_rename() {
     let row = first_command(&store).await;
     assert_eq!(row.caller_name, "after-rename");
     assert_eq!(row.caller_client_key.as_deref(), Some("ck_rename"));
-    assert_eq!(row.caller_kind.as_deref(), Some("agent"));
+    assert_eq!(row.caller_kind.as_deref(), Some("local.agent"));
     assert_eq!(row.caller_tier.as_deref(), Some("agent"));
     assert_eq!(row.caller_session_id, None);
 
@@ -1173,6 +1179,8 @@ async fn ambient_store_client_follows_registered_client_key_across_project_metad
             runtime_credential: None,
             tier: Tier::Agent,
             kind: Some(Kind::Agent),
+            locality: Default::default(),
+            access: None,
             role: None,
             cwd: None,
         },

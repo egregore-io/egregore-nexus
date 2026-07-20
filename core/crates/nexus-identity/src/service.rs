@@ -17,7 +17,7 @@ use nexus_contracts::admin::AssignRoleResponse;
 use nexus_contracts::admin::{
     AdminAssignRequest, AdminAssignResponse, AdminRenameRequest, AdminRenameResponse,
 };
-use nexus_contracts::enums::Presence;
+use nexus_contracts::enums::{Kind, Locality, Presence};
 use nexus_contracts::events::WsEvent;
 use nexus_contracts::ids::{AgentId, SessionId};
 use nexus_contracts::ports::{Caller, EventSink, IdentityPort, PortResult};
@@ -98,7 +98,7 @@ impl Identity {
         // the caller shape. Stable agent ids still select the current runtime for real agents,
         // but can never turn a non-agent session into an agent principal.
         if let Some(row) = repo.find_by_session_id(&caller.session).await? {
-            if row.kind != "agent" {
+            if !row.is_agent() {
                 return Ok(row);
             }
         }
@@ -124,6 +124,10 @@ impl Identity {
         req: &RegisterRequest,
     ) -> Result<(), NexusError> {
         let canonical_name = req.agent_id.as_ref().and(req.name.as_deref());
+        let requested_kind = kind_str(req.locality, req.kind);
+        let requested_is_agent = req.kind.unwrap_or(Kind::Agent) == Kind::Agent;
+        let metadata_json =
+            metadata_with_access(row.metadata_json.as_deref(), req.access.as_deref())?;
         // Persist the (possibly new) harness binding + client_key + back-online presence in one
         // statement via the store connection (the daemon is the sole writer).
         self.store
@@ -131,8 +135,9 @@ impl Identity {
             .execute(
                 "UPDATE sessions SET harness_session_id = ?2, client_key = ?3, agent = ?4, \
                  tier = ?5, presence = 'online', last_heartbeat = ?6, \
-                 agent_id = CASE WHEN kind = 'agent' THEN agent_id ELSE NULL END, \
-                 name = CASE WHEN ?7 IS NULL THEN name ELSE ?7 END \
+                 kind = ?7, metadata_json = ?8, \
+                 agent_id = CASE WHEN ?9 = 1 THEN agent_id ELSE NULL END, \
+                 name = CASE WHEN ?10 IS NULL THEN name ELSE ?10 END \
                  WHERE session_id = ?1",
                 libsql::params![
                     row.session_id.0.clone(),
@@ -141,12 +146,15 @@ impl Identity {
                     req.harness.as_str().to_string(),
                     tier_str(req.tier).to_string(),
                     now(),
+                    requested_kind,
+                    metadata_json,
+                    i64::from(requested_is_agent),
                     canonical_name
                 ],
             )
             .await
             .map_err(|e| NexusError::Store(e.to_string()))?;
-        if row.kind == "agent" {
+        if row.is_agent() {
             if let Some(name) = row.name.as_deref() {
                 if let Err(error) = DeveloperEvents::new(&self.store)
                     .append_agent_lifecycle(name, &row.session_id, "started", None, now())
@@ -850,7 +858,7 @@ impl Identity {
         row: &SessionRow,
         lifecycle: &str,
     ) -> Result<(), NexusError> {
-        if row.kind != "agent" {
+        if !row.is_agent() {
             return Ok(());
         }
         if let Some(name) = row.name.as_deref() {
@@ -884,7 +892,7 @@ impl Identity {
         lifecycle: &str,
         data: serde_json::Value,
     ) {
-        if row.kind != "agent" {
+        if !row.is_agent() {
             return;
         }
         let data_json = match serde_json::to_string(&data) {
@@ -931,7 +939,7 @@ impl Identity {
         agent_name: &str,
         data: serde_json::Value,
     ) {
-        if row.is_some_and(|row| row.kind != "agent") {
+        if row.is_some_and(|row| !row.is_agent()) {
             return;
         }
         let data_json = match serde_json::to_string(&data) {
@@ -975,6 +983,27 @@ impl Identity {
     }
 }
 
+fn metadata_with_access(
+    existing: Option<&str>,
+    access: Option<&str>,
+) -> Result<Option<String>, NexusError> {
+    let Some(access) = access else {
+        return Ok(existing.map(str::to_string));
+    };
+    let mut metadata = match existing {
+        Some(raw) => serde_json::from_str::<serde_json::Value>(raw)
+            .map_err(|error| NexusError::Invalid(format!("invalid session metadata: {error}")))?,
+        None => serde_json::json!({}),
+    };
+    let object = metadata
+        .as_object_mut()
+        .ok_or_else(|| NexusError::Invalid("session metadata must be a JSON object".into()))?;
+    object.insert("access".into(), serde_json::Value::String(access.into()));
+    serde_json::to_string(&metadata)
+        .map(Some)
+        .map_err(|error| NexusError::Internal(format!("encode session metadata: {error}")))
+}
+
 fn scopes_allow_runtime_register(scopes_json: &str) -> bool {
     serde_json::from_str::<Vec<String>>(scopes_json)
         .map(|scopes| scopes.iter().any(|scope| scope == "runtime:register"))
@@ -985,8 +1014,9 @@ fn scopes_allow_runtime_register(scopes_json: &str) -> bool {
 impl IdentityPort for Identity {
     async fn register(&self, mut req: RegisterRequest) -> PortResult<RegisterResponse> {
         let result: Result<RegisterResponse, NexusError> = async {
-            let requested_kind = kind_str(req.kind);
-            if requested_kind != "agent" && req.agent_id.is_some() {
+            let requested_kind = kind_str(req.locality, req.kind);
+            let requested_nature = req.kind.unwrap_or(Kind::Agent);
+            if requested_nature != Kind::Agent && req.agent_id.is_some() {
                 return Err(NexusError::Invalid(
                     "only agent registrations may bind an agent_id".into(),
                 ));
@@ -1009,20 +1039,20 @@ impl IdentityPort for Identity {
                 RegisterOutcome::Resumed(_) => None,
             };
             let generated_agent_id = staged_session_id.as_ref().and_then(|session_id| {
-                (requested_kind == "agent" && req.agent_id.is_none())
+                (requested_nature == Kind::Agent && req.agent_id.is_none())
                     .then(|| format!("a_{}", session_id.0))
             });
 
             let completion: Result<(RegisterResponse, Option<String>), NexusError> = async {
             let (session_id, lifecycle, publish_resume_status, publish_spawn) = match outcome {
                 RegisterOutcome::Resumed(row) => {
-                    if row.kind != requested_kind {
+                    if row.entity_kind()? != (req.locality, requested_nature) {
                         return Err(NexusError::Invalid(format!(
                             "registered client key belongs to session kind {}, not {requested_kind}",
                             row.kind
                         )));
                     }
-                    if row.kind == "agent" {
+                    if row.is_agent() {
                         self.preflight_resumed_session(&row, &req).await?;
                     } else {
                         // Older builds could persist an agent binding/runtime on a human browser
@@ -1040,7 +1070,7 @@ impl IdentityPort for Identity {
                     // An explicit immutable identity is already fully preflighted. Stamp it on the
                     // staged compatibility row before runtime creation so no post-runtime write can
                     // fail and leave the newly active runtime detached from its session.
-                    if row.kind == "agent" {
+                    if row.is_agent() {
                         if let Some(prepared) = prepared_agent.as_ref() {
                             Sessions::new(&self.store)
                                 .set_agent_id(&row.session_id, &prepared.agent.agent_id)
@@ -1054,7 +1084,7 @@ impl IdentityPort for Identity {
                 .find_by_session_id(&session_id)
                 .await?
                 .ok_or_else(|| NexusError::NotFound(session_id.0.clone()))?;
-            let (agent_id, bound_credential_id) = if row.kind == "agent" {
+            let (agent_id, bound_credential_id) = if row.is_agent() {
                 let (agent_id, credential_id) = self
                     .bind_agent_runtime(&row, &req, credential_verified)
                     .await?;
@@ -1082,7 +1112,7 @@ impl IdentityPort for Identity {
                     );
                 }
             }
-            if publish_spawn && row.kind == "agent" {
+            if publish_spawn && row.is_agent() {
                 // Publish the first spawn only after the stable identity and runtime binding have
                 // committed. Gateway runtime projections require the durable agent id; emitting
                 // the pre-bind session row would create an unprocessable ordered poison event.
@@ -1096,7 +1126,7 @@ impl IdentityPort for Identity {
             }
             self.append_agent_lifecycle_best_effort(&row, lifecycle)
                 .await;
-            if publish_resume_status && row.kind == "agent" {
+            if publish_resume_status && row.is_agent() {
                 self.events
                     .emit(WsEvent::AgentStatus {
                         session_id: row.session_id.clone(),
@@ -1172,7 +1202,7 @@ impl IdentityPort for Identity {
         let result: Result<Whoami, NexusError> = async {
             let row = self.row_for(caller).await?;
             let mut who = whoami_from_row(&row);
-            if row.kind != "agent" {
+            if !row.is_agent() {
                 who.agent_id = None;
                 return Ok(who);
             }
@@ -1180,7 +1210,7 @@ impl IdentityPort for Identity {
                 .agent_id
                 .clone()
                 .or_else(|| row.agent_id.clone().map(AgentId));
-            if who.agent_id.is_none() && row.kind == "agent" {
+            if who.agent_id.is_none() && row.is_agent() {
                 if let Some(name) = row.name.as_deref() {
                     who.agent_id = self.agent_id_for_name(name).await?;
                 }
@@ -1258,9 +1288,11 @@ impl IdentityPort for Identity {
             let include_dead = req.include_dead.unwrap_or(false);
             let mut members = Vec::new();
             for row in rows {
-                if row.kind != "agent" {
+                let (locality, nature) = row.entity_kind()?;
+                if nature != Kind::Agent && locality == Locality::Local {
                     continue;
                 }
+                let access = row.access()?;
                 // A stale heartbeat downgrades effective presence to offline (backend §8).
                 // Birth counts as the first heartbeat (D9/N22): fresh launches must not
                 // read as offline before their harness's first own heartbeat.
@@ -1277,12 +1309,13 @@ impl IdentityPort for Identity {
                 if presence == Presence::Offline && !include_offline {
                     continue;
                 }
-                let agent_id = match row.agent_id.as_deref() {
-                    Some(agent_id) => Some(AgentId(agent_id.to_string())),
-                    None => match row.name.as_deref() {
+                let agent_id = match (nature, row.agent_id.as_deref()) {
+                    (Kind::Agent, Some(agent_id)) => Some(AgentId(agent_id.to_string())),
+                    (Kind::Agent, None) => match row.name.as_deref() {
                         Some(name) => self.agent_id_for_name(name).await?,
                         None => None,
                     },
+                    _ => None,
                 };
                 // Dead-marking is durable lifecycle state, separate
                 // from presence. Dead rows leave the default roster; audit passes include_dead.
@@ -1302,6 +1335,8 @@ impl IdentityPort for Identity {
                     name: row.name,
                     session_id: row.session_id,
                     agent: row.agent,
+                    locality,
+                    access,
                     role: row.role,
                     presence,
                     current_work: row.current_work,
@@ -1350,7 +1385,7 @@ impl IdentityPort for Identity {
                 current_work = Some(work.clone());
             }
 
-            if publish_status && row.kind == "agent" {
+            if publish_status && row.is_agent() {
                 self.events
                     .emit(WsEvent::AgentStatus {
                         session_id: SessionId(row.session_id.0.clone()),
@@ -1390,7 +1425,7 @@ impl IdentityPort for Identity {
                 )
                 .await?;
             }
-            if restored_online && row.kind == "agent" {
+            if restored_online && row.is_agent() {
                 self.events
                     .emit(WsEvent::AgentStatus {
                         session_id: row.session_id,
@@ -1842,9 +1877,10 @@ impl IdentityPort for Identity {
             let before = sessions.find_by_session_id(session).await?;
             sessions.set_presence(session, Presence::Offline).await?;
             AgentRuntimes::new(&self.store).stop(&session.0).await?;
-            if before.as_ref().is_some_and(|row| {
-                row.kind == "agent" && row.presence.as_deref() != Some("offline")
-            }) {
+            if before
+                .as_ref()
+                .is_some_and(|row| row.is_agent() && row.presence.as_deref() != Some("offline"))
+            {
                 self.events
                     .emit(WsEvent::AgentStatus {
                         session_id: session.clone(),

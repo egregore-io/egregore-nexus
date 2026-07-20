@@ -21,7 +21,8 @@ import type {
   CommandIntentSender,
   GatewayCallerIdentity,
 } from "@server/api/http";
-import { Kind, Tier } from "@shared/types";
+import { Kind, Locality, Tier } from "@shared/types";
+import { dottedEntityKind } from "@server/identity/entityKind";
 import { beginIngress, settleIngress, type GatewayIngressRow } from "@server/store/repos/ingress";
 
 export const COMMAND_KINDS = {
@@ -137,7 +138,10 @@ interface CommandCallerRow {
   agentId?: string;
   runtimeId?: string;
   clientKey?: string;
-  kind: string;
+  kind: Kind;
+  locality: Locality;
+  access?: string;
+  principalId?: string;
   tier: string;
 }
 
@@ -349,6 +353,8 @@ async function registerHumanCaller(
         clientKey,
         tier: caller.tier ?? Tier.Admin,
         kind: Kind.Human,
+        locality: caller.locality ?? Locality.Local,
+        ...(caller.access ? { access: caller.access } : {}),
       },
       daemonCaller(callerRow(caller)),
       {
@@ -481,7 +487,7 @@ async function insertCommandIntent(
         insert.commandCaller.agentId ?? null,
         insert.commandCaller.runtimeId ?? insert.commandCaller.sessionId ?? null,
         insert.commandCaller.clientKey ?? null,
-        insert.commandCaller.kind,
+        dottedEntityKind(insert.commandCaller.locality, insert.commandCaller.kind),
         insert.commandCaller.tier,
         insert.idempotencyKey ?? null,
         JSON.stringify(insert.req),
@@ -573,6 +579,9 @@ function callerRow(caller: GatewayCallerIdentity | undefined): CommandCallerRow 
     runtimeId: caller.runtimeId ?? caller.sessionId,
     clientKey: caller.clientKey,
     kind: caller.kind ?? Kind.Human,
+    locality: caller.locality ?? Locality.Local,
+    access: caller.access,
+    principalId: caller.principalId,
     tier: caller.tier ?? Tier.Admin,
   };
 }
@@ -586,6 +595,9 @@ function daemonCaller(caller: CommandCallerRow): DaemonIpcCaller {
     ...(caller.runtimeId ? { runtimeId: caller.runtimeId } : {}),
     ...(caller.clientKey ? { clientKey: caller.clientKey } : {}),
     kind: caller.kind as DaemonIpcCaller["kind"],
+    locality: caller.locality,
+    ...(caller.access ? { access: caller.access } : {}),
+    ...(caller.principalId ? { principalId: caller.principalId } : {}),
     tier: caller.tier as DaemonIpcCaller["tier"],
   };
 }

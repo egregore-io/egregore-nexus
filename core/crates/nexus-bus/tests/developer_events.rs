@@ -86,6 +86,9 @@ impl IdentityPort for MockIdentity {
             name: name.to_string(),
             project: project.to_string(),
             tier: Tier::Agent,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         })
     }
 
@@ -121,12 +124,18 @@ fn caller(name: &str, session: &str) -> Caller {
         name: name.into(),
         project: PROJECT.into(),
         tier: Tier::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 
 fn admin_caller(name: &str, session: &str) -> Caller {
     Caller {
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
         ..caller(name, session)
     }
 }

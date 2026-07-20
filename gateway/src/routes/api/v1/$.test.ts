@@ -10,12 +10,12 @@ import { createClient, type Client } from "@libsql/client";
 import { initSchema } from "@server/conversation/store";
 import { seedDb } from "@drizzle/__mocks__/seedDb";
 import { registerHuman } from "@server/identity/human";
-import { issueBearerToken } from "@server/identity/bearer";
+import { currentBearer, issueBearerToken } from "@server/identity/bearer";
 import type { CommandIntentSender, MessagePostSender } from "@server/api/http";
 import { AGENT_ATTACH_SCOPE } from "@server/auth/principal";
 import { localOperatorCaller } from "@server/auth/webAuthMode";
 import { migrateGatewayStore } from "@server/store/migrations";
-import { Kind, Tier } from "@shared/types";
+import { Kind, Locality, Tier } from "@shared/types";
 // The chokepoint must expose a `makeDispatch` factory for DI; we test that.
 import { makeDispatch } from "./$";
 
@@ -32,6 +32,38 @@ async function makeDb(): Promise<Client> {
   await initSchema(db);
   return db;
 }
+
+it("preserves dotted bearer locality through the stored caller evidence", async () => {
+  const db = await makeDb();
+  let id = 0;
+  const deps = {
+    db,
+    now: () => 2_000_000,
+    genId: () => `external_${++id}`,
+    randomSecret: (prefix: string) => `${prefix}_secret_${++id}`,
+  };
+  const issued = await issueBearerToken(
+    {
+      actor: {
+        name: "outside",
+        project: "default",
+        kind: Kind.Human,
+        locality: Locality.External,
+        tier: Tier.Admin,
+        scopes: ["message:read"],
+      },
+      scopes: ["message:read"],
+    },
+    deps,
+  );
+  await expect(currentBearer(issued.accessToken, deps)).resolves.toMatchObject({
+    kind: Kind.Human,
+    locality: Locality.External,
+  });
+  expect((await db.execute("SELECT actor_kind FROM rest_bearer_token")).rows[0]?.actor_kind)
+    .toBe("external.human");
+  db.close();
+});
 
 const COMMAND_DDL = `
 CREATE TABLE IF NOT EXISTS command_intents (
@@ -226,7 +258,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
       caller_session_id: "sess_mock_chokepoint",
       caller_agent_id: null,
       caller_runtime_id: "sess_mock_chokepoint",
-      caller_kind: "human",
+      caller_kind: "local.human",
       caller_tier: "admin",
       idempotency_key: "web:post:backend:client-1",
     });
@@ -784,7 +816,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
       caller_session_id: "local-operator",
       caller_runtime_id: "local-operator",
       caller_client_key: null,
-      caller_kind: "human",
+      caller_kind: "local.human",
       caller_tier: "admin",
     });
   });

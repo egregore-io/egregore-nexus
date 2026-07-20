@@ -201,12 +201,18 @@ fn agent_caller(agent_id: &str, name: &str, session_id: &str) -> Caller {
         name: name.to_string(),
         project: PROJECT.to_string(),
         tier: Tier::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 
 fn sender() -> Caller {
     Caller {
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
         ..agent_caller("a_sender", "sender", "s_sender")
     }
 }

@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
-use crate::enums::{Kind, Scope};
+use crate::enums::{Kind, Locality, Scope};
 use crate::ids::{MessageId, ProjectId, ThreadId, TopicId};
 
 /// Cryptographic, verifiable sender stamp stored on every message (backend §1).
@@ -35,6 +35,12 @@ pub struct Provenance {
     pub from: String,
     /// `agent` | `human` | `notification` (the `kind` attr).
     pub kind: Kind,
+    /// Entity origin, independent of its closed nature. Legacy messages default to local.
+    #[serde(default)]
+    pub locality: Locality,
+    /// Provider or policy-defined access label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
     /// Thread NAME (omitted for DMs) — the `thread` attr.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,

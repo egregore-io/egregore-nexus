@@ -136,6 +136,9 @@ mod tests {
                     name: name.to_string(),
                     project: project.to_string(),
                     tier: Tier::Agent,
+                    locality: Default::default(),
+                    access: None,
+                    principal_id: None,
                 }),
                 None => Err(ContractError {
                     code: nexus_contracts::codes::NOT_FOUND,
@@ -196,6 +199,9 @@ mod tests {
             name: name.into(),
             project: PROJECT.into(),
             tier: Tier::Agent,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         }
     }
 
@@ -206,6 +212,9 @@ mod tests {
             name: name.into(),
             project: PROJECT.into(),
             tier: Tier::Agent,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         }
     }
 

@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
-use crate::{Kind, RpcError, Tier};
+use crate::{Kind, Locality, RpcError, Tier};
 
 /// Initial daemon IPC protocol version.
 pub const DAEMON_IPC_PROTOCOL_VERSION: u32 = 1;
@@ -36,6 +36,12 @@ pub struct DaemonIpcCaller {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_key: Option<String>,
     pub kind: Kind,
+    #[serde(default)]
+    pub locality: Locality,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
     pub tier: Tier,
 }
 

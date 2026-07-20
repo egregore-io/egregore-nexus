@@ -6,6 +6,7 @@ import {
   type MessagePageOptions,
 } from "../store/repos/messages";
 import { Kind, Scope, type Message, type Provenance } from "@shared/types";
+import { parseEntityKind } from "@server/identity/entityKind";
 import type {
   AgentAccessGrantRow,
   AgentOwnerRow,
@@ -624,9 +625,12 @@ export async function canonicalMessageById(
   }
   const raw = parseObject(row.provenance_json);
   const from = optionalString(row.from_name) ?? optionalString(row.from_agent_id) ?? "unknown";
+  const entityKind = parseEntityKind(raw.kind ?? Kind.Agent, raw.locality);
   const provenance: Provenance = {
     from: typeof raw.from === "string" ? raw.from : from,
-    kind: parseKind(raw.kind),
+    kind: entityKind.kind,
+    locality: entityKind.locality,
+    access: optionalString(raw.access),
     thread: typeof raw.thread === "string" ? raw.thread : undefined,
     topic: typeof raw.topic === "string" ? raw.topic : undefined,
     stamp: isStamp(raw.stamp) ? raw.stamp : undefined,
@@ -827,19 +831,6 @@ async function canonicalIdentity(db: Client, id: string): Promise<CanonicalIdent
   }
   const row = result.rows[0];
   return row ? canonicalIdentityFromRow(row) : undefined;
-}
-
-function parseKind(value: unknown): Kind {
-  switch (value) {
-    case Kind.Human:
-      return Kind.Human;
-    case Kind.Notification:
-      return Kind.Notification;
-    case Kind.App:
-      return Kind.App;
-    default:
-      return Kind.Agent;
-  }
 }
 
 function isStamp(value: unknown): value is Provenance["stamp"] & object {

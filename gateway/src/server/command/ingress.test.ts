@@ -11,7 +11,7 @@ import {
 import { localOperatorCaller } from "@server/auth/webAuthMode";
 import { migrateGatewayStore } from "@server/store/migrations";
 import { DaemonIpcError } from "@server/daemon/ipc";
-import { Kind, Tier } from "@shared/types";
+import { Kind, Locality, Tier } from "@shared/types";
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS command_intents (
@@ -566,7 +566,7 @@ describe("submitCommandIntent", () => {
       caller_session_id: "local-operator",
       caller_runtime_id: "local-operator",
       caller_client_key: null,
-      caller_kind: "human",
+      caller_kind: "local.human",
       caller_tier: "admin",
       created_at: 1_000,
     });
@@ -574,6 +574,61 @@ describe("submitCommandIntent", () => {
       name: "backend",
       members: ["blake"],
     });
+  });
+
+  it("persists dotted caller locality and forwards parallel caller evidence", async () => {
+    const db = await makeDb();
+    const caller = {
+      name: "outside",
+      project: "default",
+      kind: Kind.Human,
+      locality: Locality.External,
+      access: "guest",
+      principalId: "x_outside",
+      sessionId: "s_outside",
+      clientKey: "ck_outside",
+    };
+    const daemonCaller = vi.fn(async () => ({ ok: true }));
+
+    await submitCommandIntent(
+      COMMAND_KINDS.threadCreate,
+      { name: "outside-thread" },
+      caller,
+      {
+        daemonCommand: daemonCaller,
+        genCommandId: () => "cmd_external_daemon",
+      },
+    );
+    expect(daemonCaller).toHaveBeenCalledWith(
+      COMMAND_KINDS.threadCreate,
+      { name: "outside-thread" },
+      expect.objectContaining({
+        kind: "human",
+        locality: "external",
+        access: "guest",
+        principalId: "x_outside",
+      }),
+      expect.any(Object),
+    );
+
+    const direct = await makeDb();
+    await submitCommandIntent(
+      COMMAND_KINDS.threadCreate,
+      { name: "outside-thread" },
+      caller,
+      {
+        db: direct,
+        genCommandId: () => "cmd_external_direct",
+        now: () => 1_000,
+        sleep: async () => {
+          await complete(direct, "cmd_external_direct", null);
+        },
+      },
+    );
+    const row = (await direct.execute(
+      "SELECT caller_kind FROM command_intents WHERE command_id = 'cmd_external_direct'",
+    )).rows[0];
+    expect(row?.caller_kind).toBe("external.human");
   });
 
   it("dedupes retry-prone writes with the same idempotency key", async () => {

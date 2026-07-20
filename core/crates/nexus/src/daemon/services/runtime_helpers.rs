@@ -361,7 +361,7 @@ pub(crate) fn codex_resume_session_owner_matches(
 }
 
 pub(crate) fn protected_remove_target(row: &SessionRow) -> bool {
-    row.kind == kind_token(Kind::Human)
+    row.is_human()
         || row.tier == tier_token(Tier::Admin)
         || row
             .role

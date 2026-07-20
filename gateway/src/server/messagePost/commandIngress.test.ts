@@ -103,7 +103,7 @@ describe("sendViaCommandIngress", () => {
       caller_agent_id: null,
       caller_runtime_id: "s_human",
       caller_client_key: "ck_human",
-      caller_kind: "human",
+      caller_kind: "local.human",
       caller_tier: "admin",
       attempts: 0,
       created_at: 1_000,

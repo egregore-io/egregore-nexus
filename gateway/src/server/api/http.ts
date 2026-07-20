@@ -7,7 +7,7 @@ import type { Client } from "@libsql/client";
 
 import type { ReadDb } from "@drizzle/client";
 import type { HumanReadDeliveryMarker } from "@server/delivery/humanRead";
-import type { Ack, SendRequest, Kind, Tier } from "@shared/types";
+import type { Ack, SendRequest, Kind, Locality, Tier } from "@shared/types";
 import type { SourceRow, SourceSecretRow } from "@server/read/queries";
 
 /** Credential facet that produced the gateway caller Principal. */
@@ -27,6 +27,9 @@ export interface GatewayCallerIdentity {
   name: string;
   project: string;
   kind?: Kind;
+  locality?: Locality;
+  access?: string;
+  principalId?: string;
   tier?: Tier;
   scopes?: PrincipalScope[];
   credentialFacet?: CredentialFacet;

@@ -79,6 +79,8 @@ pub(crate) async fn broadcast_messages(
     let provenance = Provenance {
         from: caller.name.clone(),
         kind: sender_kind,
+        locality: caller.locality,
+        access: caller.access.clone(),
         thread: spec.thread_name.clone(),
         topic: spec.topic_name.clone(),
         stamp: None,

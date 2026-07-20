@@ -444,6 +444,9 @@ fn agent_caller() -> Caller {
         name: "ben".into(),
         project: "proj".into(),
         tier: Tier::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 
@@ -454,6 +457,9 @@ fn admin_caller() -> Caller {
         name: "operator".into(),
         project: "proj".into(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 
@@ -535,6 +541,8 @@ async fn send_commits_before_a_cold_target_finishes_reviving() {
             runtime_credential: None,
             tier: Tier::Admin,
             kind: Some(nexus_contracts::Kind::Human),
+            locality: Default::default(),
+            access: None,
             role: None,
             cwd: None,
         })
@@ -552,6 +560,8 @@ async fn send_commits_before_a_cold_target_finishes_reviving() {
             runtime_credential: None,
             tier: Tier::Agent,
             kind: Some(nexus_contracts::Kind::Agent),
+            locality: Default::default(),
+            access: None,
             role: None,
             cwd: None,
         })
@@ -639,6 +649,8 @@ async fn registration_does_not_start_a_drain_loop_before_the_harness_is_live() {
             runtime_credential: None,
             tier: Tier::Admin,
             kind: Some(nexus_contracts::Kind::Human),
+            locality: Default::default(),
+            access: None,
             role: None,
             cwd: None,
         })
@@ -656,6 +668,8 @@ async fn registration_does_not_start_a_drain_loop_before_the_harness_is_live() {
             runtime_credential: None,
             tier: Tier::Agent,
             kind: Some(nexus_contracts::Kind::Agent),
+            locality: Default::default(),
+            access: None,
             role: None,
             cwd: None,
         })
@@ -1704,7 +1718,7 @@ async fn prompt_preserves_authenticated_human_provenance_in_stream_and_replay() 
             "text": "hello session",
             "clientMessageId": "you:test:1",
             "name": "operator",
-            "kind": "human",
+            "kind": "local.human",
         })
     );
     assert_ne!(data["name"], "hugo");
@@ -1731,7 +1745,7 @@ async fn prompt_preserves_authenticated_human_provenance_in_stream_and_replay() 
             "id": "you:test:1",
             "clientMessageId": "you:test:1",
             "name": "operator",
-            "kind": "human",
+            "kind": "local.human",
         })
     );
 }
@@ -1801,7 +1815,7 @@ async fn steer_emits_accepted_user_input_with_native_source() {
     assert_eq!(data["source"], "steer");
     assert_eq!(data["clientMessageId"], "steer:1");
     assert_eq!(data["name"], "operator");
-    assert_eq!(data["kind"], "human");
+    assert_eq!(data["kind"], "local.human");
     assert_ne!(data["name"], "codex-steer");
 
     state
@@ -1819,7 +1833,7 @@ async fn steer_emits_accepted_user_input_with_native_source() {
     assert_eq!(durable.len(), 1);
     let content: serde_json::Value = serde_json::from_str(&durable[0].content_json).unwrap();
     assert_eq!(content["blocks"][0]["name"], "operator");
-    assert_eq!(content["blocks"][0]["kind"], "human");
+    assert_eq!(content["blocks"][0]["kind"], "local.human");
 }
 
 #[tokio::test]
@@ -2240,6 +2254,8 @@ async fn ensure_in_workspace_moves_a_cross_workspace_agent() {
             runtime_credential: None,
             tier: Tier::Agent,
             kind: None,
+            locality: Default::default(),
+            access: None,
             role: None,
             cwd: None,
         })

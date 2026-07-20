@@ -169,6 +169,9 @@ fn local_operator(project: &str) -> Caller {
         name: "operator".to_string(),
         project: project.to_string(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 
@@ -221,6 +224,8 @@ pub fn reg(name: &str, ck: &str, project: &str) -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Agent,
         kind: Some(nexus_contracts::Kind::Agent),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }

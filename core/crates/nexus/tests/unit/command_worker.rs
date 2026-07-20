@@ -412,6 +412,8 @@ fn human_register(name: &str, client_key: &str) -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Admin,
         kind: Some(Kind::Human),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -609,7 +611,7 @@ async fn durable_interrupt_runs_once_on_the_control_lane_with_the_authenticated_
     let row = repo.get("cmd_interrupt_control").await.unwrap().unwrap();
     assert_eq!(row.status, "done");
     assert_eq!(row.caller_session_id, Some(operator.session_id.0));
-    assert_eq!(row.caller_kind.as_deref(), Some("human"));
+    assert_eq!(row.caller_kind.as_deref(), Some("local.human"));
 }
 
 #[tokio::test]

@@ -64,6 +64,9 @@ async fn positional_dm_target_accepts_a_stable_agent_id_without_a_name() {
         name: "operator".into(),
         project: "default".into(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
 
     let ack = bus
@@ -127,6 +130,9 @@ async fn named_agent_dm_resolves_the_alias_then_routes_by_stable_agent_id() {
         name: "operator".into(),
         project: "default".into(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
 
     bus.send(
@@ -177,6 +183,9 @@ impl nexus_contracts::IdentityPort for TestIdentity {
             name: name.into(),
             project: project.into(),
             tier: Tier::Agent,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         })
     }
 
@@ -313,6 +322,9 @@ async fn one_shot_notify_resolves_group_thread_and_unnamed_id_with_one_body_each
         name: "operator".into(),
         project: "default".into(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
 
     let cases = [

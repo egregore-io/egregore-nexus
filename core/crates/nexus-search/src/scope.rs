@@ -66,6 +66,9 @@ mod tests {
             name: name.into(),
             project: "p_demo".into(),
             tier: Tier::Agent,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         }
     }
 

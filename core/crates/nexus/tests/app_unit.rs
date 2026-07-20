@@ -325,6 +325,8 @@ async fn first_failed_bootstrap_revive_keeps_delivery_pending() {
         provenance: nexus_contracts::message::Provenance {
             from: "operator".into(),
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
             thread: None,
             topic: None,
             stamp: None,
@@ -407,6 +409,8 @@ async fn third_failed_bootstrap_revive_moves_delivery_to_dlq() {
         provenance: nexus_contracts::message::Provenance {
             from: "operator".into(),
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
             thread: None,
             topic: None,
             stamp: None,
@@ -473,6 +477,8 @@ async fn respawn_pending_agents_preserves_dead_recipient_failure_in_dlq() {
         provenance: nexus_contracts::message::Provenance {
             from: "operator".into(),
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
             thread: None,
             topic: None,
             stamp: None,
@@ -970,6 +976,9 @@ fn admin_caller() -> Caller {
         name: "operator".into(),
         project: "default".into(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 
@@ -980,6 +989,9 @@ fn agent_caller() -> Caller {
         name: "bot".into(),
         project: "default".into(),
         tier: Tier::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 

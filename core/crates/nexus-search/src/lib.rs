@@ -100,6 +100,9 @@ mod tests {
             name: name.into(),
             project: "p_demo".into(),
             tier: Tier::Agent,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         }
     }
 
@@ -117,6 +120,8 @@ mod tests {
             provenance: Provenance {
                 from: from.into(),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,
@@ -157,6 +162,8 @@ mod tests {
             provenance: Provenance {
                 from: from.into(),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
                 thread: Some("backend".into()),
                 topic: None,
                 stamp: None,

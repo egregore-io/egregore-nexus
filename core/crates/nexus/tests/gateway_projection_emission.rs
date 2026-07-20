@@ -90,6 +90,9 @@ impl IdentityPort for TestIdentity {
             name: name.into(),
             project: project.into(),
             tier: Tier::Agent,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         })
     }
 
@@ -172,6 +175,9 @@ fn caller() -> Caller {
         name: "sender".into(),
         project: "caller-metadata".into(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 
@@ -266,6 +272,9 @@ async fn human_thread_and_dm_projections_never_claim_an_agent_identity() {
         name: "browser-user".into(),
         project: "caller-metadata".into(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
 
     bus.send(

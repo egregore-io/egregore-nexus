@@ -51,6 +51,8 @@ fn register_request(
         runtime_credential: None,
         tier,
         kind: Some(kind),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -207,6 +209,9 @@ fn caller_for_session(
         name: name.into(),
         project: "default".into(),
         tier,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 
@@ -726,6 +731,9 @@ async fn command_worker_rejects_runtime_client_key_after_credential_revoke() {
             name: "operator".into(),
             project: "default".into(),
             tier: Tier::Admin,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         }),
         revoke,
     )

@@ -42,17 +42,31 @@ describe("canonical Gateway projection application", () => {
           fromName: "ada",
           toAgentId: "a_blake",
           body: "hello",
-          provenance: { from: "ada", kind: "agent" },
+          provenance: {
+            from: "ada",
+            kind: "human",
+            locality: "external",
+            access: "guest",
+          },
           project: "metadata-only",
           createdAt: 10,
         },
       }),
     ).resolves.toBe("applied");
-    expect((await db.execute(
-      "SELECT message_id, body, metadata_json, mention_json FROM bus_messages",
-    )).rows).toMatchObject([
-      { message_id: "m1", body: "hello", metadata_json: "{}", mention_json: "[]" },
-    ]);
+    const projected = (await db.execute(
+      "SELECT message_id, body, provenance_json, metadata_json, mention_json FROM bus_messages",
+    )).rows[0];
+    expect(projected).toMatchObject({
+      message_id: "m1",
+      body: "hello",
+      metadata_json: "{}",
+      mention_json: "[]",
+    });
+    expect(JSON.parse(String(projected?.provenance_json))).toMatchObject({
+      kind: "human",
+      locality: "external",
+      access: "guest",
+    });
     expect((await db.execute("SELECT daemon_epoch, through_seq FROM projection_cursors")).rows)
       .toMatchObject([{ daemon_epoch: "boot-1", through_seq: 1 }]);
   });

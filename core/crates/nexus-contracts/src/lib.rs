@@ -66,6 +66,7 @@ pub mod admin;
 pub mod agents;
 pub mod batch;
 pub mod daemon_ipc;
+pub mod entity_kind;
 pub mod enums;
 pub mod events;
 pub mod gateway_projection;
@@ -115,7 +116,7 @@ pub use daemon_ipc::{
     DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, DaemonIpcResponse,
     DAEMON_IPC_PROTOCOL_VERSION,
 };
-pub use enums::{AgentAccessRole, DeliveryState, Kind, Presence, Scope, Tier};
+pub use enums::{AgentAccessRole, DeliveryState, Kind, Locality, Presence, Scope, Tier};
 pub use events::{
     AgentUpdateKind, DeveloperEventEnvelope, DeveloperEventKind, DeveloperToolCallPhase,
     ToolCallData, WsEvent,

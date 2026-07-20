@@ -395,7 +395,7 @@ impl AppState {
         // loop before the turn executor is actually bound; pending mail would otherwise be claimed
         // and terminalized as `session not registered` milliseconds before startup completes.
         let harness_still_opening = self.agent.is_harness_alive(&row.session_id) == Some(false);
-        if row.kind == "agent" && !externally_drained {
+        if row.is_agent() && !externally_drained {
             // The same stable session may first register as an external pull client and later
             // acquire a daemon-managed transport. Retire that old ownership before making the
             // harness loop wakeable; otherwise the active subscription suppresses the loop and
@@ -471,7 +471,7 @@ impl AppState {
             .ok_or_else(|| {
                 NexusError::NotFound(format!("session:{}", session.0)).to_contract_error()
             })?;
-        if row.kind != "agent" {
+        if !row.is_agent() {
             return Err(NexusError::Invalid(format!(
                 "{}:{} is not an agent session",
                 row.display_name(),
@@ -540,7 +540,7 @@ impl AppState {
         else {
             return Ok(());
         };
-        if row.kind != "agent" {
+        if !row.is_agent() {
             return Ok(());
         }
         if let Some(name) = row.name.as_deref() {

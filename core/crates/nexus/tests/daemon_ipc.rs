@@ -35,6 +35,8 @@ fn register_request() -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Agent,
         kind: Some(Kind::Agent),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -258,6 +260,9 @@ async fn query_call_routes_inside_daemon_without_creating_command_row() {
             runtime_id: Some("local-operator".into()),
             client_key: None,
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Admin,
         }),
         call: DaemonIpcCall::Query {
@@ -299,6 +304,9 @@ async fn local_daemon_status_query_reads_store_inside_owner_process() {
             runtime_id: Some("local-operator".into()),
             client_key: None,
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Admin,
         }),
         call: DaemonIpcCall::Query {
@@ -336,6 +344,9 @@ async fn local_operator_can_show_and_hot_apply_gateway_delivery_mode() {
         runtime_id: Some("local-operator".into()),
         client_key: None,
         kind: Kind::Human,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
         tier: Tier::Admin,
     };
     let query = |request_id: &str, method: &str, params: serde_json::Value| DaemonIpcRequest {
@@ -407,6 +418,9 @@ async fn local_gateway_read_executes_select_inside_the_daemon_and_rejects_writes
         runtime_id: Some("local-operator".into()),
         client_key: None,
         kind: Kind::Human,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
         tier: Tier::Admin,
     };
     let query = DaemonIpcRequest {
@@ -479,6 +493,9 @@ async fn legacy_gateway_export_is_bounded_typed_and_cursor_paginated() {
             runtime_id: Some("local-operator".into()),
             client_key: None,
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Admin,
         }),
         call: DaemonIpcCall::Query {
@@ -529,8 +546,8 @@ async fn local_queue_mutation_executes_atomically_inside_the_daemon_owner() {
         .store
         .conn
         .execute(
-            "INSERT INTO sessions (session_id, agent_id, name, agent, transport, project, created_at) \
-             VALUES ('s_queue', 'a_queue', 'queue-agent', 'codex', 'codex-appserver', 'runtime-label', 1)",
+            "INSERT INTO sessions (session_id, agent_id, name, agent, kind, transport, project, created_at) \
+             VALUES ('s_queue', 'a_queue', 'queue-agent', 'codex', 'agent', 'codex-appserver', 'runtime-label', 1)",
             (),
         )
         .await
@@ -581,6 +598,9 @@ async fn local_queue_mutation_executes_atomically_inside_the_daemon_owner() {
             runtime_id: Some("local-operator".into()),
             client_key: None,
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Admin,
         }),
         call: DaemonIpcCall::Query {
@@ -687,6 +707,9 @@ async fn authenticated_daemon_query_treats_the_registered_session_agent_id_as_ex
                 runtime_id: None,
                 client_key: Some("ck_registered_missing_owner".into()),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
                 tier: Tier::Agent,
             }),
             call: DaemonIpcCall::Query {
@@ -717,8 +740,8 @@ async fn local_queue_read_returns_typed_snapshot_and_transitions_without_raw_sto
         .store
         .conn
         .execute(
-            "INSERT INTO sessions (session_id, agent_id, name, agent, transport, project, created_at) \
-             VALUES ('s_queue_read', 'a_queue_read', 'queue-reader', 'codex', \
+            "INSERT INTO sessions (session_id, agent_id, name, agent, kind, transport, project, created_at) \
+             VALUES ('s_queue_read', 'a_queue_read', 'queue-reader', 'codex', 'agent', \
              'codex-appserver', 'default', 1)",
             (),
         )
@@ -756,6 +779,9 @@ async fn local_queue_read_returns_typed_snapshot_and_transitions_without_raw_sto
         runtime_id: Some("local-operator".into()),
         client_key: None,
         kind: Kind::Human,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
         tier: Tier::Admin,
     };
     let read = |request_id: &str, params: serde_json::Value| DaemonIpcRequest {
@@ -887,6 +913,9 @@ async fn local_human_read_settlement_updates_only_the_authenticated_session_rows
             runtime_id: Some("local-operator".into()),
             client_key: None,
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Admin,
         }),
         call: DaemonIpcCall::Query {
@@ -937,6 +966,9 @@ async fn legacy_mcp_identity_resolution_runs_inside_daemon_store_owner() {
             runtime_id: Some("local-operator".into()),
             client_key: None,
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Admin,
         }),
         call: DaemonIpcCall::Query {
@@ -977,6 +1009,9 @@ async fn registered_query_caller_is_canonicalized_by_client_key_after_rename() {
             runtime_id: Some(registered.session_id.0.clone()),
             client_key: Some("client-ipc-agent".into()),
             kind: Kind::Agent,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Agent,
         }),
         call: DaemonIpcCall::Query {
@@ -1059,6 +1094,9 @@ async fn registered_query_caller_prefers_the_authenticated_session_agent_id_over
                 runtime_id: Some("s_stable_ipc".into()),
                 client_key: Some("ck_stable_ipc".into()),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
                 tier: Tier::Agent,
             }),
             call: DaemonIpcCall::Query {
@@ -1151,6 +1189,9 @@ async fn wsl_ambient_whoami_resolves_renamed_agent_by_stable_identity() {
                 runtime_id: None,
                 client_key: Some(ambient.client_key),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
                 tier: Tier::Agent,
             }),
             call: DaemonIpcCall::Query {
@@ -1226,6 +1267,9 @@ async fn unnamed_registered_query_caller_resolves_whoami_by_stable_agent_id() {
                 runtime_id: None,
                 client_key: Some(client_key.into()),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
                 tier: Tier::Agent,
             }),
             call: DaemonIpcCall::Query {
@@ -1265,6 +1309,9 @@ async fn bounded_binary_frame_roundtrips_over_one_local_connection() {
             runtime_id: Some("local-operator".into()),
             client_key: None,
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Admin,
         }),
         call: DaemonIpcCall::Query {
@@ -1312,6 +1359,9 @@ async fn unix_listener_publishes_boot_manifest_and_serves_real_client() {
             runtime_id: Some("local-operator".into()),
             client_key: None,
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Admin,
         }),
         call: DaemonIpcCall::Query {
@@ -1339,6 +1389,9 @@ async fn unix_listener_publishes_boot_manifest_and_serves_real_client() {
                 runtime_id: Some("local-operator".into()),
                 client_key: None,
                 kind: Kind::Human,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
                 tier: Tier::Admin,
             }),
             call: DaemonIpcCall::Query {

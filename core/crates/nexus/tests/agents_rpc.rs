@@ -101,6 +101,9 @@ fn caller(name: &str, project: &str, tier: Tier) -> Caller {
         name: name.into(),
         project: project.into(),
         tier,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 
@@ -182,6 +185,8 @@ async fn register_agent_runtime_with_client_key(
         runtime_credential: None,
         tier: Tier::Agent,
         kind: Some(Kind::Agent),
+        locality: Default::default(),
+        access: None,
         role: Some("backend".into()),
         cwd: Some("/repo".into()),
     };
@@ -210,6 +215,8 @@ async fn register_human_runtime(
         runtime_credential: None,
         tier,
         kind: Some(Kind::Human),
+        locality: Default::default(),
+        access: None,
         role: Some("operator".into()),
         cwd: Some("/repo".into()),
     };
@@ -1611,6 +1618,9 @@ async fn stable_co_owner_grant_never_falls_back_to_a_reused_principal_name() {
         name: "principal".into(),
         project: "other-project".into(),
         tier: Tier::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     assert_ne!(name_reuser_caller.agent_id, Some(principal_id));
 
@@ -1686,6 +1696,9 @@ async fn stable_owner_never_falls_back_to_an_idless_human_with_the_same_name() {
             name: "owner".into(),
             project: "other-project".into(),
             tier: Tier::Agent,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         },
         "agent.grantAccess",
         &AgentAccessGrantRequest {
@@ -3090,6 +3103,8 @@ async fn runtime_list_returns_registered_runtime_for_agent() {
         runtime_credential: Some(credential.secret),
         tier: Tier::Agent,
         kind: Some(Kind::Agent),
+        locality: Default::default(),
+        access: None,
         role: Some("backend".into()),
         cwd: Some("/repo".into()),
     };

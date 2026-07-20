@@ -121,6 +121,9 @@ fn caller(name: &str, project: &str, tier: Tier) -> Caller {
         name: name.into(),
         project: project.into(),
         tier,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 
@@ -286,6 +289,8 @@ async fn boot_respawn_with_stale_resume_key_delivers_pending_dm() {
             runtime_credential: None,
             tier: Tier::Admin,
             kind: Some(Kind::Agent),
+            locality: Default::default(),
+            access: None,
             role: None,
             cwd: None,
         },
@@ -305,6 +310,8 @@ async fn boot_respawn_with_stale_resume_key_delivers_pending_dm() {
             runtime_credential: None,
             tier: Tier::Agent,
             kind: Some(Kind::Agent),
+            locality: Default::default(),
+            access: None,
             role: None,
             cwd: None,
         },

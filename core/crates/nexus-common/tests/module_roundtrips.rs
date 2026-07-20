@@ -76,6 +76,8 @@ mod provenance {
         let p = Provenance {
             from: "ben".into(),
             kind: Kind::Agent,
+            locality: Default::default(),
+            access: None,
             thread: None,
             topic: None,
             stamp: None,
@@ -91,6 +93,8 @@ mod provenance {
         let p = Provenance {
             from: "etan".into(),
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
             thread: None,
             topic: None,
             stamp: None,
@@ -106,6 +110,8 @@ mod provenance {
         let p = Provenance {
             from: "dylan".into(),
             kind: Kind::Agent,
+            locality: Default::default(),
+            access: None,
             thread: Some("backend".into()),
             topic: None,
             stamp: None,
@@ -315,6 +321,8 @@ register/wake directive: {rendered}"
         let p = Provenance {
             from: "dylan".into(),
             kind: Kind::Agent,
+            locality: Default::default(),
+            access: None,
             thread: Some("backend".into()),
             topic: None,
             stamp: None,
@@ -333,6 +341,8 @@ register/wake directive: {rendered}"
         let pt = Provenance {
             from: "dylan".into(),
             kind: Kind::Agent,
+            locality: Default::default(),
+            access: None,
             thread: None,
             topic: Some("ci".into()),
             stamp: None,

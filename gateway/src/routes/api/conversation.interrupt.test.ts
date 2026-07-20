@@ -74,7 +74,7 @@ describe("POST /api/conversation/interrupt", () => {
       kind: "harness.interrupt",
       caller_name: local.name,
       caller_session_id: "local-operator",
-      caller_kind: "human",
+      caller_kind: "local.human",
       idempotency_key: "cm_interrupt",
       status: "done",
     });

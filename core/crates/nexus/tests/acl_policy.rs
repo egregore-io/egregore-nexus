@@ -27,6 +27,8 @@ fn register_agent(name: &str, client_key: &str) -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Agent,
         kind: Some(Kind::Agent),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -36,6 +38,8 @@ fn register_admin(name: &str, client_key: &str) -> RegisterRequest {
     RegisterRequest {
         tier: Tier::Admin,
         kind: Some(Kind::Human),
+        locality: Default::default(),
+        access: None,
         ..register_agent(name, client_key)
     }
 }

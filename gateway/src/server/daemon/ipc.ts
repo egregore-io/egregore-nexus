@@ -10,6 +10,7 @@ const DEFAULT_TIMEOUT_MS = 10_000;
 const ENDPOINT_MANIFEST = "daemon-ipc-endpoint.json";
 
 export type DaemonCallerKind = "agent" | "human" | "app" | "notification";
+export type DaemonCallerLocality = "local" | "external" | "trusted";
 export type DaemonCallerTier = "agent" | "admin";
 
 export interface DaemonIpcCaller {
@@ -20,6 +21,9 @@ export interface DaemonIpcCaller {
   runtimeId?: string;
   clientKey?: string;
   kind: DaemonCallerKind;
+  locality?: DaemonCallerLocality;
+  access?: string;
+  principalId?: string;
   tier: DaemonCallerTier;
 }
 

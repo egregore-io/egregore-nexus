@@ -22,8 +22,8 @@ use tokio::task::JoinHandle;
 
 use nexus_common::{now, NexusError};
 use nexus_contracts::{
-    codes, AgentId, Caller, ContractError, MessageId, NotifyCommandRequest, NotifyRequest,
-    PromptRequest, Request, SessionId, Tier, JSONRPC_VERSION,
+    codes, entity_kind, AgentId, Caller, ContractError, Kind, Locality, MessageId,
+    NotifyCommandRequest, NotifyRequest, PromptRequest, Request, SessionId, Tier, JSONRPC_VERSION,
 };
 use nexus_store::command_kinds;
 use nexus_store::repos::{AgentRef, Agents, CommandIntentRow, CommandIntents, Inbox, Sessions};
@@ -1048,6 +1048,9 @@ async fn resolve_command_caller(
             name: row.caller_name.clone(),
             project: row.project.clone(),
             tier: nexus_contracts::Tier::Admin,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         });
     }
 
@@ -1058,6 +1061,9 @@ async fn resolve_command_caller(
             name: row.caller_name.clone(),
             project: row.project.clone(),
             tier: Tier::Agent,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         });
     }
 
@@ -1077,15 +1083,23 @@ async fn resolve_command_caller(
             "command intent caller client key is not registered",
         ));
     };
-    let caller = if session.kind != "agent" {
+    let caller = if !session.is_agent() {
         // The registered session kind is authoritative. Ignore pre-fix `agent_id` residue (and
         // mutable caller labels) so a durable human/app credential cannot inherit an agent alias.
+        let (locality, _) = session
+            .entity_kind()
+            .map_err(|error| error.to_contract_error())?;
         Caller {
             agent_id: None,
             session: session.session_id.clone(),
             name: session.display_name(),
             project: session.project.clone(),
             tier: tier_from_session(&session),
+            locality,
+            access: session
+                .access()
+                .map_err(|error| error.to_contract_error())?,
+            principal_id: None,
         }
     } else if let Some(agent_id) = session.agent_id.as_deref() {
         let agent = Agents::new(&state.store)
@@ -1097,14 +1111,22 @@ async fn resolve_command_caller(
                     "command intent caller registered agent id is not a durable identity",
                 )
             })?;
+        let (locality, _) = session
+            .entity_kind()
+            .map_err(|error| error.to_contract_error())?;
         Caller {
             agent_id: Some(AgentId(agent.agent_id)),
             session: session.session_id.clone(),
             name: agent.name.unwrap_or_else(|| session.display_name()),
             project: session.project.clone(),
             tier: tier_from_session(&session),
+            locality,
+            access: session
+                .access()
+                .map_err(|error| error.to_contract_error())?,
+            principal_id: None,
         }
-    } else if session.kind == "agent" {
+    } else if session.is_agent() {
         let session_name = session.name.as_deref().ok_or_else(|| {
             unauthorized_command_caller(
                 "command intent caller agent session has no durable agent identity",
@@ -1137,13 +1159,15 @@ fn is_local_operator(row: &CommandIntentRow) -> bool {
             None | Some(LOCAL_OPERATOR_SESSION_ID)
         )
         && row.caller_client_key.is_none()
-        && row.caller_kind.as_deref() == Some("human")
+        && row.caller_kind.as_deref()
+            == Some(entity_kind::dotted(Locality::Local, Kind::Human).as_str())
         && row.caller_tier.as_deref() == Some("admin")
 }
 
 fn is_verified_source_push(row: &CommandIntentRow) -> bool {
     row.kind == command_kinds::source::PUSH
-        && row.caller_kind.as_deref() == Some("notification")
+        && row.caller_kind.as_deref()
+            == Some(entity_kind::dotted(Locality::Local, Kind::Notification).as_str())
         && row.caller_tier.as_deref() == Some("agent")
         && row.caller_client_key.is_none()
 }
@@ -1181,7 +1205,7 @@ fn validate_command_caller_row(
             ));
         }
     }
-    if session.kind == "agent" {
+    if session.is_agent() {
         if let Some(caller_agent_id) = row.caller_agent_id.as_deref() {
             if caller.agent_id.as_ref().map(|id| id.0.as_str()) != Some(caller_agent_id) {
                 return Err(unauthorized_command_caller(

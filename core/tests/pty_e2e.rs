@@ -110,6 +110,9 @@ async fn live_claude_receives_a_dm_and_its_reply_reaches_the_store() {
         name: "operator".into(),
         project: PROJECT.into(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     // A FRESH, unique cwd per launch so the harness's transcript dir is BRAND NEW — otherwise the
     // tailer would replay a stale transcript from a prior run (which may already contain "OK"/a
@@ -154,6 +157,8 @@ async fn live_claude_receives_a_dm_and_its_reply_reaches_the_store() {
             runtime_credential: None,
             tier: Tier::Agent,
             kind: Some(Kind::Agent),
+            locality: Default::default(),
+            access: None,
             role: None,
             cwd: None,
         },
@@ -165,6 +170,9 @@ async fn live_claude_receives_a_dm_and_its_reply_reaches_the_store() {
         name: "ben".into(),
         project: PROJECT.into(),
         tier: Tier::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     let body = format!(
         "This is an automated end-to-end test. Reply with exactly the word OK and the marker {marker}. \

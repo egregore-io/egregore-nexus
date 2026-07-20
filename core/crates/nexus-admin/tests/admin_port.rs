@@ -150,6 +150,9 @@ fn caller(tier: Tier) -> Caller {
         name: "x".into(),
         project: "p".into(),
         tier,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 

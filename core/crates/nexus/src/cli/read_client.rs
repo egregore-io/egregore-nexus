@@ -17,10 +17,10 @@ use nexus_contracts::{
     codes, AgentId, AgentRuntimeListRequest, AgentRuntimeListResponse, AgentRuntimeSummary,
     AgentShowRequest, AgentShowResponse, AgentSummary, Caller, ContractError, DaemonIpcCall,
     DaemonIpcCaller, DaemonIpcRequest, HarnessId, HeartbeatResponse, HistoryRequest,
-    HistoryResponse, IdentityPort, Kind, MemberListRequest, MemberListResponse, MemberSummary,
-    Message, MessageId, Presence, RegisterRequest, RegisterResponse, SearchPort, SearchRequest,
-    SearchResponse, SessionId, Source, SourceListResponse, SourceRef, SpawnRequest, StatusRequest,
-    StatusResponse, ThreadListResponse, ThreadMembersRequest, ThreadSummary, Tier,
+    HistoryResponse, IdentityPort, Kind, Locality, MemberListRequest, MemberListResponse,
+    MemberSummary, Message, MessageId, Presence, RegisterRequest, RegisterResponse, SearchPort,
+    SearchRequest, SearchResponse, SessionId, Source, SourceListResponse, SourceRef, SpawnRequest,
+    StatusRequest, StatusResponse, ThreadListResponse, ThreadMembersRequest, ThreadSummary, Tier,
     TopicListResponse, TopicSummary, Whoami, DAEMON_IPC_PROTOCOL_VERSION,
 };
 use nexus_store::repos::{
@@ -71,6 +71,9 @@ struct ReadCaller {
     client_key: Option<String>,
     kind: Kind,
     tier: Tier,
+    locality: Locality,
+    access: Option<String>,
+    principal_id: Option<String>,
 }
 
 /// Daemon launch request needed to revive a dead headed runtime before terminal attach.
@@ -150,6 +153,9 @@ impl ReadClient {
                 client_key,
                 kind,
                 tier,
+                locality: Locality::Local,
+                access: None,
+                principal_id: None,
             },
             Config::default().heartbeat_ttl_ms,
         )
@@ -284,6 +290,8 @@ impl ReadClient {
             None => sessions.list_all().await.map_err(store_err)?,
         };
         for row in rows {
+            let (locality, nature) = row.entity_kind().map_err(store_err)?;
+            let access = row.access().map_err(store_err)?;
             let stale = nexus_common::presence::is_stale(
                 row.last_heartbeat.or(Some(row.created_at)),
                 ts,
@@ -297,12 +305,13 @@ impl ReadClient {
             if presence == Presence::Offline && !include_offline {
                 continue;
             }
-            let agent_id = match row.agent_id.as_deref() {
-                Some(agent_id) => Some(AgentId(agent_id.to_string())),
-                None => match row.name.as_deref() {
+            let agent_id = match (nature, row.agent_id.as_deref()) {
+                (Kind::Agent, Some(agent_id)) => Some(AgentId(agent_id.to_string())),
+                (Kind::Agent, None) => match row.name.as_deref() {
                     Some(name) => self.agent_id_for_name(name).await?,
                     None => None,
                 },
+                _ => None,
             };
             // Dead-marking is durable agent state,
             // separate from presence. Dead rows leave the default roster; audit views
@@ -322,6 +331,8 @@ impl ReadClient {
                 name: row.name,
                 session_id: row.session_id,
                 agent: row.agent,
+                locality,
+                access,
                 role: row.role,
                 presence,
                 current_work: row.current_work,
@@ -546,7 +557,7 @@ impl ReadClient {
                 row.session_id.0
             ),
         })?;
-        if row.kind != "agent" {
+        if !row.is_agent() {
             return Err(ContractError {
                 code: codes::INVALID_PARAMS,
                 message: format!("{row_name} is not an agent runtime"),
@@ -672,6 +683,8 @@ impl ReadClient {
 
     async fn caller(&self) -> Result<Caller, ContractError> {
         if let Some(row) = self.session_row().await? {
+            let (locality, _) = row.entity_kind().map_err(store_err)?;
+            let access = row.access().map_err(store_err)?;
             let agent_id = match row.agent_id.as_deref() {
                 Some(agent_id) => Some(AgentId(agent_id.to_string())),
                 None => match row.name.as_deref() {
@@ -695,6 +708,9 @@ impl ReadClient {
                 name: row.display_name(),
                 project: row.project,
                 tier: tier_from_store(&row.tier),
+                locality,
+                access,
+                principal_id: None,
             });
         }
         if self.caller.is_local_operator() {
@@ -709,6 +725,9 @@ impl ReadClient {
                 name: self.caller.name.clone(),
                 project: self.caller.project.clone(),
                 tier: Tier::Admin,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
             });
         }
         Err(ContractError {
@@ -1253,6 +1272,9 @@ impl ReadCaller {
             client_key: None,
             kind: Kind::Human,
             tier: Tier::Admin,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         }
     }
 
@@ -1272,6 +1294,9 @@ impl ReadCaller {
             client_key: Some(identity.client_key),
             kind,
             tier: identity.tier,
+            locality: identity.locality,
+            access: identity.access,
+            principal_id: None,
         }
     }
 
@@ -1290,6 +1315,9 @@ impl ReadCaller {
             runtime_id: self.session_id.clone(),
             client_key: self.client_key.clone(),
             kind: self.kind,
+            locality: self.locality,
+            access: self.access.clone(),
+            principal_id: self.principal_id.clone(),
             tier: self.tier,
         }
     }
