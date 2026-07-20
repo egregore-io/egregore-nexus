@@ -267,6 +267,175 @@ async fn seed_agent_runtime(store: &Store, agent_id: &str, name: &str, session_i
         .unwrap();
 }
 
+async fn assert_ambiguous_fossil_thread_member_fails_before_fanout(store: Arc<Store>) {
+    seed_agent_runtime(&store, "a_sender", "sender", "s_sender").await;
+    store
+        .identity_conn()
+        .execute("DROP INDEX idx_agents_name_unique", ())
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute("DROP INDEX idx_sessions_name", ())
+        .await
+        .unwrap();
+    seed_agent_runtime(&store, "a_fossil_one", "fossil", "s_fossil_one").await;
+    seed_agent_runtime(&store, "a_fossil_two", "fossil", "s_fossil_two").await;
+
+    let thread_id = ThreadId("t_ambiguous_fossil".into());
+    Threads::new(&store)
+        .create(&thread_id, "ambiguous-fossil", PROJECT, "sender")
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO thread_members (thread_id, session_name, agent_id, joined_at) \
+             VALUES (?1, 'sender', 'a_sender', 1), (?1, 'fossil', NULL, 2)",
+            libsql::params![thread_id.0.clone()],
+        )
+        .await
+        .unwrap();
+
+    let realtime = Arc::new(MockRealtime::default());
+    let bus = Bus::new(
+        store.clone(),
+        realtime.clone(),
+        Arc::new(RejectResolveIdentity),
+        Arc::new(NullSink),
+    );
+    let error = bus
+        .send(
+            &caller_with_agent("sender", "s_sender", "a_sender"),
+            SendRequest {
+                to: SendTarget::Post {
+                    thread: "ambiguous-fossil".into(),
+                },
+                summary: None,
+                body: "must not commit ambiguous fossil fanout".into(),
+                mention: vec![],
+                metadata: None,
+                idempotency_key: Some("ambiguous-fossil-send".into()),
+            },
+        )
+        .await
+        .expect_err("a fossil alias must resolve globally and uniquely");
+
+    assert_eq!(error.code, nexus_contracts::codes::INVALID_PARAMS);
+    assert!(error.message.contains("ambiguous"));
+    assert_eq!(realtime.count.load(Ordering::SeqCst), 0);
+    for table in ["messages", "in_flight"] {
+        let mut rows = store
+            .conn
+            .query(&format!("SELECT COUNT(*) FROM {table}"), ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn thread_fossil_aliases_must_be_globally_unique_before_fanout() {
+    assert_ambiguous_fossil_thread_member_fails_before_fanout(migrated_store().await).await;
+}
+
+#[tokio::test]
+async fn split_thread_fossil_aliases_must_be_globally_unique_before_fanout() {
+    let (_directory, store) = split_store().await;
+    assert_ambiguous_fossil_thread_member_fails_before_fanout(store).await;
+}
+
+async fn assert_stable_thread_edge_never_alias_hops(store: Arc<Store>) {
+    seed_agent_runtime(&store, "a_sender", "sender", "s_sender").await;
+    Agents::new(&store)
+        .create(NewAgent {
+            agent_id: "a_offline_target".into(),
+            project: PROJECT.into(),
+            name: Some("current-offline-name".into()),
+            default_harness: Some("claude".into()),
+            role: None,
+            tier: Some("agent".into()),
+            owner: None,
+        })
+        .await
+        .unwrap();
+    seed_agent_runtime(
+        &store,
+        "a_alias_owner",
+        "stale-target-alias",
+        "s_alias_owner",
+    )
+    .await;
+    let thread_id = ThreadId("t_stable_no_alias_hop".into());
+    Threads::new(&store)
+        .create(&thread_id, "stable-no-alias-hop", PROJECT, "sender")
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO thread_members (thread_id, session_name, agent_id, joined_at) \
+             VALUES (?1, 'sender', 'a_sender', 1), \
+                    (?1, 'stale-target-alias', 'a_offline_target', 2)",
+            libsql::params![thread_id.0.clone()],
+        )
+        .await
+        .unwrap();
+    let realtime = Arc::new(MockRealtime::default());
+    let bus = Bus::new(
+        store.clone(),
+        realtime.clone(),
+        Arc::new(RejectResolveIdentity),
+        Arc::new(NullSink),
+    );
+
+    let ack = bus
+        .send(
+            &caller_with_agent("sender", "s_sender", "a_sender"),
+            SendRequest {
+                to: SendTarget::Post {
+                    thread: "stable-no-alias-hop".into(),
+                },
+                summary: None,
+                body: "stable edge stays with its immutable owner".into(),
+                mention: Vec::new(),
+                metadata: None,
+                idempotency_key: Some("stable-no-alias-hop".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(ack.fanout, Some(0));
+    assert!(realtime.recipients().is_empty());
+    let mut rows = store
+        .conn
+        .query(
+            "SELECT COUNT(*) FROM in_flight WHERE message_id = ?1",
+            libsql::params![ack.message_id.0],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn stable_thread_edge_never_falls_back_to_another_agents_alias() {
+    assert_stable_thread_edge_never_alias_hops(migrated_store().await).await;
+}
+
+#[tokio::test]
+async fn split_stable_thread_edge_never_falls_back_to_another_agents_alias() {
+    let (_directory, store) = split_store().await;
+    assert_stable_thread_edge_never_alias_hops(store).await;
+}
+
 #[tokio::test]
 async fn split_authority_thread_post_composes_identity_and_transport_edges() {
     let (_directory, store) = split_store().await;
@@ -902,7 +1071,7 @@ async fn direct_dm_agent_id_ignores_mismatched_display_name_for_routing() {
 }
 
 #[tokio::test]
-async fn direct_dm_name_with_agent_id_prefix_still_routes_by_name() {
+async fn positional_dm_token_prefers_an_exact_agent_id_over_a_colliding_alias() {
     let store = migrated_store().await;
     seed_agent_runtime(
         &store,
@@ -938,7 +1107,7 @@ async fn direct_dm_name_with_agent_id_prefix_still_routes_by_name() {
             SendRequest {
                 to: SendTarget::dm_name("a_team"),
                 summary: None,
-                body: "the name field is a name".into(),
+                body: "the stable id wins over its alias collision".into(),
                 mention: vec![],
                 metadata: None,
                 idempotency_key: Some("prefixed-name-dm-1".into()),
@@ -948,10 +1117,7 @@ async fn direct_dm_name_with_agent_id_prefix_still_routes_by_name() {
         .unwrap();
 
     assert_eq!(ack.fanout, Some(1));
-    assert_eq!(
-        realtime.recipients(),
-        vec![SessionId("s_named_team".into())]
-    );
+    assert_eq!(realtime.recipients(), vec![SessionId("s_id_owner".into())]);
 }
 
 #[tokio::test]

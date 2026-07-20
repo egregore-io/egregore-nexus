@@ -40,7 +40,7 @@ core/crates/nexus/src/cli/commands/mcp/mod.rs|20
 core/crates/nexus/src/cli/commands/resume.rs|3
 core/crates/nexus/src/cli/commands/source.rs|17
 core/crates/nexus/src/cli/mod.rs|6
-core/crates/nexus/src/cli/read_client.rs|5
+core/crates/nexus/src/cli/read_client.rs|1
 core/crates/nexus/src/cli/render.rs|5
 core/crates/nexus/src/cli/store_client.rs|4
 core/crates/nexus/src/daemon/agent_session_materializer.rs|8

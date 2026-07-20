@@ -44,9 +44,64 @@ impl<'a> Sessions<'a> {
 
     /// Insert a new session row (presence `online`, not paused, `created_at = now()`).
     pub async fn create(&self, s: NewSession) -> Result<SessionId, NexusError> {
+        let session_id = self.insert(s.clone()).await?;
+        let ts = now();
+        if s.kind == "agent" {
+            if let Some(name) = s.name.as_deref() {
+                self.append_lifecycle(name, &session_id, "started", None, ts)
+                    .await?;
+            }
+        }
+        self.store.events().session_lifecycle_changed().signal();
+        Ok(session_id)
+    }
+
+    /// Insert the compatibility row for a registration without publishing lifecycle truth yet.
+    ///
+    /// Identity registration spans the transport and identity authorities in split-store mode.
+    /// The service stages this row, binds the stable runtime, and only then calls
+    /// [`finalize_staged_registration`](Self::finalize_staged_registration). If binding fails it
+    /// removes the invisible row with
+    /// [`remove_staged_registration`](Self::remove_staged_registration), so readers never receive
+    /// a `started` fact for an identity that did not finish registering.
+    pub async fn create_staged_registration(&self, s: NewSession) -> Result<SessionId, NexusError> {
+        self.insert(s).await
+    }
+
+    /// Publish the compatibility lifecycle fact for a fully-bound staged registration.
+    pub async fn finalize_staged_registration(&self, row: &SessionRow) -> Result<(), NexusError> {
+        let result = if row.kind == "agent" {
+            match row.name.as_deref() {
+                Some(name) => {
+                    self.append_lifecycle(name, &row.session_id, "started", None, now())
+                        .await
+                }
+                None => Ok(()),
+            }
+        } else {
+            Ok(())
+        };
+        self.store.events().session_lifecycle_changed().signal();
+        result
+    }
+
+    /// Remove a registration row that never crossed the stable identity/runtime boundary.
+    pub async fn remove_staged_registration(&self, session: &SessionId) -> Result<(), NexusError> {
+        self.store
+            .conn
+            .execute(
+                "DELETE FROM sessions WHERE session_id = ?1",
+                params![session.0.clone()],
+            )
+            .await
+            .map_err(store_err)?;
+        self.store.events().session_lifecycle_changed().signal();
+        Ok(())
+    }
+
+    async fn insert(&self, s: NewSession) -> Result<SessionId, NexusError> {
         let ts = now();
         let session_id = s.session_id.clone();
-        let name = s.name.clone();
         self.store
             .conn
             .execute(
@@ -71,12 +126,7 @@ impl<'a> Sessions<'a> {
             )
             .await
             .map_err(store_err)?;
-        if let Some(name) = name.as_deref() {
-            self.append_lifecycle(name, &session_id, "started", None, ts)
-                .await?;
-        }
-        self.store.events().session_lifecycle_changed().signal();
-        Ok(s.session_id)
+        Ok(session_id)
     }
 
     /// Find a session by its idempotency `client_key` (the resume path).
@@ -216,6 +266,7 @@ impl<'a> Sessions<'a> {
     pub async fn rebind_name_to_session(&self, s: NewSession) -> Result<SessionId, NexusError> {
         let new_session_id = s.session_id.0.clone();
         let event_session_id = SessionId(new_session_id.clone());
+        let is_agent = s.kind == "agent";
         let name = s
             .name
             .clone()
@@ -257,8 +308,10 @@ impl<'a> Sessions<'a> {
             )
             .await
             .map_err(store_err)?;
-        self.append_lifecycle(&name, &event_session_id, "started", None, ts)
-            .await?;
+        if is_agent {
+            self.append_lifecycle(&name, &event_session_id, "started", None, ts)
+                .await?;
+        }
         self.store.events().session_lifecycle_changed().signal();
         Ok(existing.session_id)
     }
@@ -339,6 +392,17 @@ impl<'a> Sessions<'a> {
     /// Durable identity reads use `agents.role`; member/whoami compatibility views use
     /// `sessions.role`, so admin role assignment keeps both columns aligned.
     pub async fn set_role(&self, session: &SessionId, role: &str) -> Result<(), NexusError> {
+        self.set_role_value(session, Some(role)).await
+    }
+
+    /// Set or clear the compatibility display role.
+    ///
+    /// The nullable form lets cross-database callers compensate to the exact prior state.
+    pub async fn set_role_value(
+        &self,
+        session: &SessionId,
+        role: Option<&str>,
+    ) -> Result<(), NexusError> {
         self.store
             .conn
             .execute(
@@ -592,6 +656,34 @@ impl<'a> Sessions<'a> {
             .await
     }
 
+    /// Resolve a legacy session-only name globally without guessing across duplicate metadata.
+    /// Canonical durable-agent paths resolve through [`Agents`] first; this fallback exists only
+    /// for fossils and non-agent principals that have no durable agent row.
+    pub async fn find_unique_by_name_any_project(
+        &self,
+        name: &str,
+    ) -> Result<Option<SessionRow>, NexusError> {
+        let mut rows = self
+            .store
+            .conn
+            .query(
+                &format!("{SELECT} WHERE name = ?1 ORDER BY created_at LIMIT 2"),
+                params![name],
+            )
+            .await
+            .map_err(store_err)?;
+        let Some(first) = rows.next().await.map_err(store_err)? else {
+            return Ok(None);
+        };
+        let first = row_to_session(&first)?;
+        if rows.next().await.map_err(store_err)?.is_some() {
+            return Err(NexusError::Ambiguous(format!(
+                "session name {name:?} matches multiple legacy identities; address a durable agent by a_* id"
+            )));
+        }
+        Ok(Some(first))
+    }
+
     /// Find a session by its `session_id` (any project). Used on boot re-spawn to resolve a
     /// pending recipient back to its `name`/`kind`/`project`.
     pub async fn find_by_session_id(
@@ -672,8 +764,20 @@ impl<'a> Sessions<'a> {
         else {
             return Ok(None);
         };
-        self.find_by_session_id(&SessionId(runtime.runtime_id))
-            .await
+        let runtime_id = runtime.runtime_id;
+        let Some(session) = self
+            .find_by_session_id(&SessionId(runtime_id.clone()))
+            .await?
+        else {
+            return Ok(None);
+        };
+        if session.agent_id.as_deref() != Some(agent_id) {
+            return Err(NexusError::Invalid(format!(
+                "active runtime {runtime_id} belongs to agent {agent_id}, but its session row belongs to {}",
+                session.agent_id.as_deref().unwrap_or("<unbound>")
+            )));
+        }
+        Ok(Some(session))
     }
 
     /// Check whether a session named `name` already exists in `project` (collision guard).

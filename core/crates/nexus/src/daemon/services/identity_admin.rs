@@ -35,6 +35,14 @@ struct AclPrincipalRefs {
     agent_id: Option<String>,
 }
 
+enum AclCallerPrincipal {
+    StableAgent(String),
+    Legacy {
+        session_id: String,
+        allow_unbound_name: bool,
+    },
+}
+
 #[derive(Clone)]
 pub(crate) struct IdentityAdminService {
     store: Arc<Store>,
@@ -135,22 +143,6 @@ impl IdentityAdminService {
         NexusError::NotFound(format!("agent:{}", id.into())).to_contract_error()
     }
 
-    fn enforce_project_override(caller: &Caller, project: &str) -> Result<(), ContractError> {
-        if caller.tier == Tier::Admin || project == caller.project {
-            Ok(())
-        } else {
-            Err(NexusError::Unauthorized.to_contract_error())
-        }
-    }
-
-    fn enforce_agent_read_scope(caller: &Caller, agent: &AgentRow) -> Result<(), ContractError> {
-        if caller.tier == Tier::Admin || agent.project == caller.project {
-            Ok(())
-        } else {
-            Err(Self::agent_not_found(agent.display_name()))
-        }
-    }
-
     async fn resolve_agent(
         &self,
         agent_id: Option<&AgentId>,
@@ -171,11 +163,15 @@ impl IdentityAdminService {
         if name.is_empty() {
             return Err(Self::invalid_agent_params("agent name is required"));
         }
-        agents
-            .find_by_name(name)
-            .await
-            .map_err(|e| e.to_contract_error())?
-            .ok_or_else(|| Self::agent_not_found(name))
+        let parsed = AgentRef::parse(name);
+        match agents.resolve_ref("", &parsed, true).await {
+            Ok(agent) => Ok(agent),
+            Err(NexusError::NotFound(_)) if matches!(parsed, AgentRef::Id(_)) => agents
+                .resolve_ref("", &AgentRef::Name(name.to_string()), true)
+                .await
+                .map_err(|error| error.to_contract_error()),
+            Err(error) => Err(error.to_contract_error()),
+        }
     }
 
     pub(crate) async fn caller_is_human_admin(
@@ -227,13 +223,7 @@ impl IdentityAdminService {
         {
             return Ok(true);
         }
-        let session = match agent.name.as_deref() {
-            Some(name) => Sessions::new(&self.store)
-                .find_by_name(&agent.project, name)
-                .await
-                .map_err(|e| e.to_contract_error())?,
-            None => None,
-        };
+        let session = self.session_row_for_agent_id(&agent.agent_id).await?;
         Ok(session.as_ref().is_some_and(protected_remove_target))
     }
 
@@ -242,25 +232,38 @@ impl IdentityAdminService {
         caller: &Caller,
         agent: &AgentRow,
     ) -> Result<(), ContractError> {
-        if Self::caller_is_agent_owner(caller, agent) {
+        if self.caller_is_agent_owner(caller, agent).await? {
             return Ok(());
         }
         let grants = AgentAccessGrants::new(&self.store);
-        if let Some(caller_agent_id) = caller.agent_id.as_ref() {
-            if grants
-                .is_co_owner_agent_id(&agent.agent_id, &caller_agent_id.0)
-                .await
-                .map_err(|e| e.to_contract_error())?
-            {
-                return Ok(());
+        match self.acl_caller_principal(caller).await? {
+            Some(AclCallerPrincipal::StableAgent(caller_agent_id)) => {
+                if grants
+                    .is_co_owner_agent_id(&agent.agent_id, &caller_agent_id)
+                    .await
+                    .map_err(|e| e.to_contract_error())?
+                {
+                    return Ok(());
+                }
             }
-        }
-        if grants
-            .is_co_owner(&agent.agent_id, &caller.project, &caller.name)
-            .await
-            .map_err(|e| e.to_contract_error())?
-        {
-            return Ok(());
+            Some(AclCallerPrincipal::Legacy {
+                session_id,
+                allow_unbound_name,
+            }) => {
+                if grants
+                    .is_co_owner_legacy_principal(
+                        &agent.agent_id,
+                        &session_id,
+                        &caller.name,
+                        allow_unbound_name,
+                    )
+                    .await
+                    .map_err(|e| e.to_contract_error())?
+                {
+                    return Ok(());
+                }
+            }
+            None => {}
         }
         if self.agent_acl_admin_override_allowed(caller, agent).await? {
             return Ok(());
@@ -268,18 +271,97 @@ impl IdentityAdminService {
         Err(NexusError::Unauthorized.to_contract_error())
     }
 
-    /// Return whether `caller` owns `agent`, preferring durable ids when both sides have them.
-    fn caller_is_agent_owner(caller: &Caller, agent: &AgentRow) -> bool {
-        if let (Some(owner_agent_id), Some(caller_agent_id)) =
-            (agent.owner_agent_id.as_deref(), caller.agent_id.as_ref())
-        {
-            return owner_agent_id == caller_agent_id.0;
+    /// Return whether `caller` owns `agent`, preferring durable ids whenever the owner has one.
+    ///
+    /// Older caller envelopes may not carry `agent_id`. Resolve that caller label globally before
+    /// comparing it to a durable owner id; project metadata must never change ownership authority.
+    async fn caller_is_agent_owner(
+        &self,
+        caller: &Caller,
+        agent: &AgentRow,
+    ) -> Result<bool, ContractError> {
+        if let Some(owner_agent_id) = agent.owner_agent_id.as_deref() {
+            return Ok(matches!(
+                self.acl_caller_principal(caller).await?,
+                Some(AclCallerPrincipal::StableAgent(caller_agent_id))
+                    if caller_agent_id == owner_agent_id
+            ));
         }
-        agent.owner_name.as_deref() == Some(caller.name.as_str())
-            && agent
-                .owner_project
-                .as_deref()
-                .map_or(true, |project| project == caller.project)
+        if let Some(owner_session_id) = agent.owner_session_id.as_deref() {
+            return Ok(caller.session.0 == owner_session_id);
+        }
+        Ok(matches!(
+            self.acl_caller_principal(caller).await?,
+            Some(AclCallerPrincipal::Legacy {
+                allow_unbound_name: true,
+                ..
+            })
+        ) && agent.owner_name.as_deref() == Some(caller.name.as_str()))
+    }
+
+    /// Recover the stable identity behind an older caller envelope, or prove the compatibility
+    /// identity behind a genuinely name/session-keyed ACL edge.
+    ///
+    /// Exact authenticated session state wins. A caller envelope that predates `agent_id` may still
+    /// recover the globally unique durable agent named by that envelope. Name-only fossils are
+    /// accepted only when no durable agent or session currently owns the label, so a human/app or
+    /// another stable identity cannot acquire authority by reusing it.
+    async fn acl_caller_principal(
+        &self,
+        caller: &Caller,
+    ) -> Result<Option<AclCallerPrincipal>, ContractError> {
+        if let Some(agent_id) = caller.agent_id.as_ref() {
+            return Ok(Some(AclCallerPrincipal::StableAgent(agent_id.0.clone())));
+        }
+        let sessions = Sessions::new(&self.store);
+        if let Some(row) = sessions
+            .find_by_session_id(&caller.session)
+            .await
+            .map_err(|error| error.to_contract_error())?
+        {
+            if row.display_name() != caller.name {
+                return Ok(None);
+            }
+            if let Some(agent_id) = row.agent_id {
+                return Ok(Some(AclCallerPrincipal::StableAgent(agent_id)));
+            }
+            let allow_unbound_name = if row.kind == kind_token(Kind::Agent) {
+                match sessions.find_unique_by_name_any_project(&caller.name).await {
+                    Ok(Some(unique)) => unique.session_id == row.session_id,
+                    Ok(None) | Err(NexusError::NotFound(_)) | Err(NexusError::Ambiguous(_)) => {
+                        false
+                    }
+                    Err(error) => return Err(error.to_contract_error()),
+                }
+            } else {
+                false
+            };
+            return Ok(Some(AclCallerPrincipal::Legacy {
+                session_id: row.session_id.0,
+                allow_unbound_name,
+            }));
+        }
+
+        match Agents::new(&self.store)
+            .resolve_ref("", &AgentRef::Name(caller.name.clone()), true)
+            .await
+        {
+            Ok(agent) => {
+                return Ok(Some(AclCallerPrincipal::StableAgent(agent.agent_id)));
+            }
+            Err(NexusError::NotFound(_)) => {}
+            Err(NexusError::Ambiguous(_)) => return Ok(None),
+            Err(error) => return Err(error.to_contract_error()),
+        }
+
+        match sessions.find_unique_by_name_any_project(&caller.name).await {
+            Ok(None) | Err(NexusError::NotFound(_)) => Ok(Some(AclCallerPrincipal::Legacy {
+                session_id: caller.session.0.clone(),
+                allow_unbound_name: true,
+            })),
+            Ok(Some(_)) | Err(NexusError::Ambiguous(_)) => Ok(None),
+            Err(error) => Err(error.to_contract_error()),
+        }
     }
 
     async fn enforce_agent_owner_transfer_authority(
@@ -287,7 +369,7 @@ impl IdentityAdminService {
         caller: &Caller,
         agent: &AgentRow,
     ) -> Result<(), ContractError> {
-        if Self::caller_is_agent_owner(caller, agent)
+        if self.caller_is_agent_owner(caller, agent).await?
             || self.agent_acl_admin_override_allowed(caller, agent).await?
         {
             Ok(())
@@ -350,14 +432,23 @@ impl IdentityAdminService {
             });
         }
 
-        match agents
-            .resolve_ref(project, &AgentRef::parse(principal), false)
-            .await
-        {
+        let parsed = AgentRef::parse(principal);
+        let resolved = match agents.resolve_ref("", &parsed, true).await {
+            Err(NexusError::NotFound(_)) if matches!(parsed, AgentRef::Id(_)) => {
+                agents
+                    .resolve_ref("", &AgentRef::Name(principal.to_string()), true)
+                    .await
+            }
+            result => result,
+        };
+        match resolved {
             Ok(agent) => {
                 return Ok(AclPrincipalRefs {
-                    name: principal.to_string(),
-                    project: project.to_string(),
+                    name: agent
+                        .require_name("ACL principal")
+                        .map_err(|e| e.to_contract_error())?
+                        .to_string(),
+                    project: agent.project.clone(),
                     session_id: self.acl_session_id_for_agent(&agent.agent_id).await?,
                     agent_id: Some(agent.agent_id),
                 });
@@ -366,22 +457,18 @@ impl IdentityAdminService {
             Err(e) => return Err(e.to_contract_error()),
         }
 
-        let session_id = sessions
-            .find_by_name(project, principal)
+        let session = sessions
+            .find_unique_by_name_any_project(principal)
             .await
-            .map_err(|e| e.to_contract_error())?
-            .map(|row| row.session_id.0);
-        let agent_id = agents
-            .find_by_name(principal)
-            .await
-            .map_err(|e| e.to_contract_error())?
-            .filter(|row| row.project == project)
-            .map(|row| row.agent_id);
+            .map_err(|e| e.to_contract_error())?;
         Ok(AclPrincipalRefs {
             name: principal.to_string(),
-            project: project.to_string(),
-            session_id,
-            agent_id,
+            project: session
+                .as_ref()
+                .map(|row| row.project.clone())
+                .unwrap_or_else(|| project.to_string()),
+            session_id: session.as_ref().map(|row| row.session_id.0.clone()),
+            agent_id: session.and_then(|row| row.agent_id),
         })
     }
 
@@ -467,6 +554,27 @@ impl IdentityAdminService {
         Ok(())
     }
 
+    async fn republish_materialized_identity(&self, agent: &AgentRow) {
+        match self.session_row_for_agent_id(&agent.agent_id).await {
+            Ok(Some(session)) => {
+                self.events
+                    .emit(WsEvent::AgentSpawned {
+                        session_id: session.session_id,
+                        name: agent.name.clone(),
+                        agent_id: Some(agent.agent_id.clone()),
+                    })
+                    .await;
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                target: "nexus::gateway_projection",
+                agent_id = %agent.agent_id,
+                %error,
+                "failed to republish changed materialized identity projection"
+            ),
+        }
+    }
+
     /// Admin-guarded: assign a durable agent identity to a project-scoped message-policy group.
     ///
     /// Group assignment is policy metadata only. It does not write messages, enqueue deliveries, or
@@ -486,9 +594,6 @@ impl IdentityAdminService {
             .resolve_agent(req.agent_id.as_ref(), Some(&req.name))
             .await?;
         let project = req.project.unwrap_or_else(|| caller.project.clone());
-        if row.project != project {
-            return Err(Self::agent_not_found(&req.name));
-        }
         let agent_id = AgentId(row.agent_id.clone());
         let row_name = row
             .require_name("agent group assignment")
@@ -529,27 +634,16 @@ impl IdentityAdminService {
             .to_contract_error());
         }
         let row = self.resolve_agent(Some(agent_id), Some(&req.name)).await?;
-        Agents::new(&self.store)
-            .set_role(&row.agent_id, role)
+        self.admin
+            .assign_role(
+                caller,
+                AssignRoleRequest {
+                    agent_id: None,
+                    name: row.agent_id,
+                    role: role.to_string(),
+                },
+            )
             .await
-            .map_err(|e| e.to_contract_error())?;
-        if let Some(session) = self.session_row_for_agent_id(&row.agent_id).await? {
-            let sessions = Sessions::new(&self.store);
-            if session.agent_id.as_deref() != Some(row.agent_id.as_str()) {
-                sessions
-                    .set_agent_id(&session.session_id, &row.agent_id)
-                    .await
-                    .map_err(|e| e.to_contract_error())?;
-            }
-            sessions
-                .set_role(&session.session_id, role)
-                .await
-                .map_err(|e| e.to_contract_error())?;
-        }
-        Ok(AssignRoleResponse {
-            name: row.name,
-            role: role.to_string(),
-        })
     }
 
     /// Admin-guarded: move an exact agent session to another project when `agent_id` is supplied.
@@ -604,10 +698,21 @@ impl IdentityAdminService {
             .set_project(&session.session_id, &req.project)
             .await
             .map_err(|e| e.to_contract_error())?;
-        Agents::new(&self.store)
+        if let Err(error) = Agents::new(&self.store)
             .set_project(&row.agent_id, &req.project)
             .await
-            .map_err(|e| e.to_contract_error())?;
+        {
+            if let Err(compensation) = sessions
+                .set_project(&session.session_id, &session.project)
+                .await
+            {
+                return Err(NexusError::Store(format!(
+                    "{error}; transport project compensation failed: {compensation}"
+                ))
+                .to_contract_error());
+            }
+            return Err(error.to_contract_error());
+        }
         self.events
             .emit(WsEvent::AgentSpawned {
                 session_id: session.session_id,
@@ -625,10 +730,9 @@ impl IdentityAdminService {
     /// Human-admin-only: set a durable agent identity's authorization tier.
     ///
     /// Agent-admins may use admin capability, but they cannot mint new admins. The grant updates
-    /// both the stable identity row and any live compatibility session so the next resolved command
-    /// sees the new ceiling without requiring a restart. Registered human admins remain scoped to
-    /// their project; the implicit local operator is the machine owner and may administer a named
-    /// agent in any local project because the CLI has no project selector for this verb.
+    /// both the stable identity row and any materialized compatibility session so the next resolved
+    /// command sees the new ceiling without requiring a restart. Project remains descriptive
+    /// metadata; it is not an identity or authorization partition.
     pub async fn grant_agent_tier(
         &self,
         caller: &Caller,
@@ -640,19 +744,8 @@ impl IdentityAdminService {
         let row = self
             .resolve_agent(req.agent_id.as_ref(), Some(&req.name))
             .await?;
-        if row.project != caller.project && caller.session.0 != LOCAL_OPERATOR_SESSION_ID {
-            return Err(Self::agent_not_found(&req.name));
-        }
-
         let sessions = Sessions::new(&self.store);
-        let session = sessions
-            .find_by_name(
-                &row.project,
-                row.require_name("grant tier")
-                    .map_err(|e| e.to_contract_error())?,
-            )
-            .await
-            .map_err(|e| e.to_contract_error())?;
+        let session = self.session_row_for_agent_id(&row.agent_id).await?;
         if matches!(session.as_ref(), Some(s) if s.kind != kind_token(Kind::Agent)) {
             return Err(NexusError::Unauthorized.to_contract_error());
         }
@@ -711,14 +804,16 @@ impl IdentityAdminService {
         })
     }
 
-    /// List durable agents, scoped to the caller's project unless an admin supplies an override.
+    /// List durable agents through an explicit presentation filter.
+    ///
+    /// The caller project is the compatibility default when the request omits that filter; it is
+    /// not used to authorize or resolve an identity.
     pub async fn list_agent_identities(
         &self,
         caller: &Caller,
         req: AgentListRequest,
     ) -> Result<AgentListResponse, ContractError> {
         let project = req.project.unwrap_or_else(|| caller.project.clone());
-        Self::enforce_project_override(caller, &project)?;
         let runtimes = AgentRuntimes::new(&self.store);
         let mut agents = Vec::new();
         for row in Agents::new(&self.store)
@@ -738,13 +833,12 @@ impl IdentityAdminService {
     /// Show a durable agent identity and its runtime history.
     pub async fn show_agent_identity(
         &self,
-        caller: &Caller,
+        _caller: &Caller,
         req: AgentShowRequest,
     ) -> Result<AgentShowResponse, ContractError> {
         let row = self
             .resolve_agent(req.agent_id.as_ref(), req.name.as_deref())
             .await?;
-        Self::enforce_agent_read_scope(caller, &row)?;
         let runtimes_repo = AgentRuntimes::new(&self.store);
         let active = runtimes_repo
             .active_for_agent(&row.agent_id)
@@ -813,6 +907,7 @@ impl IdentityAdminService {
             }),
         )
         .await?;
+        self.republish_materialized_identity(&target).await;
 
         Ok(AgentAccessGrantResponse {
             name: target.name,
@@ -863,7 +958,11 @@ impl IdentityAdminService {
                 revoked_by_id || revoked_by_name
             }
             None => grants
-                .revoke(&target.agent_id, &project, principal)
+                .revoke(
+                    &target.agent_id,
+                    &principal_refs.project,
+                    &principal_refs.name,
+                )
                 .await
                 .map_err(|e| e.to_contract_error())?,
         };
@@ -880,6 +979,7 @@ impl IdentityAdminService {
             }),
         )
         .await?;
+        self.republish_materialized_identity(&target).await;
 
         Ok(AgentAccessRevokeResponse {
             name: target.name,
@@ -932,6 +1032,7 @@ impl IdentityAdminService {
             }),
         )
         .await?;
+        self.republish_materialized_identity(&target).await;
 
         Ok(AgentOwnerTransferResponse {
             name: target.name,
@@ -1011,13 +1112,12 @@ impl IdentityAdminService {
     /// List runtimes for a durable agent identity.
     pub async fn list_agent_runtimes(
         &self,
-        caller: &Caller,
+        _caller: &Caller,
         req: AgentRuntimeListRequest,
     ) -> Result<AgentRuntimeListResponse, ContractError> {
         let row = self
             .resolve_agent(req.agent_id.as_ref(), req.name.as_deref())
             .await?;
-        Self::enforce_agent_read_scope(caller, &row)?;
         let runtimes = AgentRuntimes::new(&self.store)
             .list_for_agent(&row.agent_id, req.include_stopped.unwrap_or(false))
             .await

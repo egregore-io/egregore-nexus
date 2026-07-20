@@ -409,6 +409,25 @@ impl CodexAppServerTransport {
         Ok(())
     }
 
+    /// Interrupt the currently active native Codex turn for a bound session.
+    pub async fn interrupt_active_turn(&self, recipient: &SessionId) -> PortResult<()> {
+        let (client, thread_id) = self.client_for(recipient)?;
+        let turn_id = self
+            .turn_tracker
+            .active_turn_id(&thread_id)
+            .ok_or_else(|| ContractError {
+                code: nexus_contracts::codes::ACTIVE_TURN_REQUIRED,
+                message: "no active turn to interrupt".into(),
+            })?;
+        client
+            .turn_interrupt(&thread_id, &turn_id)
+            .await
+            .map_err(|error| ContractError {
+                code: -32004,
+                message: error.to_string(),
+            })
+    }
+
     /// Probe liveness for the heartbeat keeper.
     /// `Some(true)` only if the Codex turn client is bound to the actual agent session. A live
     /// app-server process without a bound Codex session is not agent liveness.
@@ -508,6 +527,10 @@ impl AgentTurnExecutionPort for CodexAppServerTransport {
         accepted_event: WsEvent,
     ) -> PortResult<SteerResponse> {
         CodexAppServerTransport::steer_observed(self, recipient, text, events, accepted_event).await
+    }
+
+    async fn interrupt_active_turn(&self, recipient: &SessionId) -> PortResult<()> {
+        CodexAppServerTransport::interrupt_active_turn(self, recipient).await
     }
 
     fn steer_capability(&self, recipient: &SessionId) -> SteerCapability {

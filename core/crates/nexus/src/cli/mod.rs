@@ -18,12 +18,7 @@ use nexus_contracts::{Ack, ContractError};
 use read_client::ReadClient;
 use store_client::StoreClient;
 
-const LONG_VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " (revision ",
-    env!("NEXUS_BUILD_REVISION"),
-    ")"
-);
+const LONG_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The `nexus` CLI root.
 #[derive(Parser, Debug)]

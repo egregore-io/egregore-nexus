@@ -216,6 +216,7 @@ async fn transfer_owner(
 
 async fn list(client: &ReadClient, json: bool) -> ExitCode {
     let req = MemberListRequest {
+        project: None,
         include_offline: Some(true),
         include_dead: None,
     };

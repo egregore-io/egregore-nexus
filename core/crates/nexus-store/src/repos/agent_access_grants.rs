@@ -251,6 +251,30 @@ impl<'a> AgentAccessGrants<'a> {
             .is_some())
     }
 
+    /// Snapshot every delegated principal for one stable managed-agent identity.
+    pub async fn list_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<AgentAccessGrantRow>, NexusError> {
+        let mut rows = self
+            .store
+            .identity_conn()
+            .query(
+                &format!(
+                    "{SELECT} WHERE agent_id = ?1 \
+                     ORDER BY principal_project, principal_name"
+                ),
+                params![agent_id],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut grants = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            grants.push(row_to_grant(&row)?);
+        }
+        Ok(grants)
+    }
+
     /// Id-keyed twin of [`Self::is_co_owner`].
     pub async fn is_co_owner_agent_id(
         &self,
@@ -280,6 +304,68 @@ impl<'a> AgentAccessGrants<'a> {
                 .map(|row| row.role.as_str()),
             Some(ROLE_CO_OWNER)
         ))
+    }
+
+    /// Resolve one truly legacy co-owner principal after stable-id lookup has failed closed.
+    ///
+    /// Session-bound legacy rows use the immutable session id. Only callers already proven to be
+    /// globally unique ID-less agent sessions may consult an older name-only row. Rows carrying a
+    /// stable `principal_agent_id` are never visible here, so a different stable identity cannot
+    /// inherit them by reusing the old label.
+    pub async fn is_co_owner_legacy_principal(
+        &self,
+        agent_id: &str,
+        principal_session_id: &str,
+        principal_name: &str,
+        allow_unbound_name: bool,
+    ) -> Result<bool, NexusError> {
+        let mut session_rows = self
+            .store
+            .identity_conn()
+            .query(
+                &format!(
+                    "{SELECT} WHERE agent_id = ?1 AND principal_agent_id IS NULL \
+                     AND principal_session_id = ?2 ORDER BY principal_project LIMIT 2"
+                ),
+                params![agent_id, principal_session_id],
+            )
+            .await
+            .map_err(store_err)?;
+        if let Some(first) = session_rows.next().await.map_err(store_err)? {
+            let first = row_to_grant(&first)?;
+            if session_rows.next().await.map_err(store_err)?.is_some() {
+                return Err(NexusError::Ambiguous(format!(
+                    "legacy ACL principal session {principal_session_id:?} matches multiple grants"
+                )));
+            }
+            return Ok(first.role == ROLE_CO_OWNER);
+        }
+        if !allow_unbound_name {
+            return Ok(false);
+        }
+        let mut rows = self
+            .store
+            .identity_conn()
+            .query(
+                &format!(
+                    "{SELECT} WHERE agent_id = ?1 AND principal_agent_id IS NULL \
+                     AND principal_session_id IS NULL AND principal_name = ?2 \
+                     ORDER BY principal_project LIMIT 2"
+                ),
+                params![agent_id, principal_name],
+            )
+            .await
+            .map_err(store_err)?;
+        let Some(first) = rows.next().await.map_err(store_err)? else {
+            return Ok(false);
+        };
+        let first = row_to_grant(&first)?;
+        if rows.next().await.map_err(store_err)?.is_some() {
+            return Err(NexusError::Ambiguous(format!(
+                "legacy ACL principal name {principal_name:?} matches multiple grants; address it by stable principal agent id"
+            )));
+        }
+        Ok(first.role == ROLE_CO_OWNER)
     }
 }
 

@@ -358,6 +358,7 @@ pub async fn dispatch_with_idempotency(
         }
         "members" => {
             let req = MemberListRequest {
+                project: None,
                 include_offline: Some(true),
                 include_dead: None,
             };

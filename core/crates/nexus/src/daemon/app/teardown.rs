@@ -8,31 +8,83 @@ impl AppState {
     /// `agent_id` when known and keeps the name as the compatibility fallback.
     pub async fn evict_agent(
         &self,
+        agent_id: Option<&AgentId>,
         name: &str,
         _project: &str,
-    ) -> Result<(), nexus_contracts::ContractError> {
+    ) -> Result<String, nexus_contracts::ContractError> {
+        let agents = Agents::new(&self.store);
+        let (resolved_name, resolved_agent_id, legacy_name) = if let Some(agent_id) = agent_id {
+            let agent = agents
+                .find_by_id(&agent_id.0)
+                .await
+                .map_err(|error| error.to_contract_error())?
+                .ok_or_else(|| {
+                    NexusError::NotFound(format!("agent id {}", agent_id.0)).to_contract_error()
+                })?;
+            (agent.display_name(), Some(agent.agent_id), None)
+        } else {
+            let exact = if name.starts_with("a_") {
+                agents
+                    .find_by_id(name)
+                    .await
+                    .map_err(|error| error.to_contract_error())?
+            } else {
+                None
+            };
+            let agent = match exact {
+                Some(agent) => Some(agent),
+                None => {
+                    let mut matches = agents
+                        .find_all_by_name(name)
+                        .await
+                        .map_err(|error| error.to_contract_error())?;
+                    match matches.len() {
+                        0 => None,
+                        1 => Some(matches.remove(0)),
+                        count => {
+                            return Err(NexusError::Ambiguous(format!(
+                                "agent name {name:?} matches {count} identities; address it by stable agent id"
+                            ))
+                            .to_contract_error())
+                        }
+                    }
+                }
+            };
+            match agent {
+                Some(agent) => (agent.display_name(), Some(agent.agent_id), None),
+                None => {
+                    let session = Sessions::new(&self.store)
+                        .find_unique_by_name_any_project(name)
+                        .await
+                        .map_err(|error| error.to_contract_error())?
+                        .ok_or_else(|| NexusError::NotFound(name.into()).to_contract_error())?;
+                    let display_name = session.display_name();
+                    (display_name.clone(), session.agent_id, Some(display_name))
+                }
+            }
+        };
         nexus_store::repos::Threads::new(&self.store)
-            .remove_member_all(name)
+            .remove_member_all_ref(legacy_name.as_deref(), resolved_agent_id.as_deref())
             .await
             .map_err(|e| e.to_contract_error())?;
-        Ok(())
+        Ok(resolved_name)
     }
 
     /// Resolve the exact session row targeted by an admin request carrying optional stable identity.
     ///
     /// Id-capable callers select the active runtime row for that `agent_id`, falling back to the
-    /// newest compatibility row. The resolved row must still belong to the caller's project, matching
-    /// the legacy project-scoped name lookup used when no id is supplied.
+    /// newest compatibility row. Project is descriptive metadata and cannot redirect an immutable
+    /// id or select between fossil aliases; a name-only request must resolve globally and uniquely.
     pub(crate) async fn resolve_session_for_agent_request(
         &self,
-        caller_project: &str,
+        _caller_project: &str,
         agent_id: Option<&AgentId>,
         name: &str,
     ) -> Result<Option<SessionRow>, ContractError> {
         let sessions = Sessions::new(&self.store);
         let Some(agent_id) = agent_id else {
             return sessions
-                .find_by_name(caller_project, name)
+                .find_unique_by_name_any_project(name)
                 .await
                 .map_err(|e| e.to_contract_error());
         };
@@ -48,7 +100,7 @@ impl AppState {
                 .await
                 .map_err(|e| e.to_contract_error())?,
         };
-        Ok(row.filter(|row| row.project == caller_project))
+        Ok(row)
     }
 
     /// Persist the explicit request id onto a selected session row after authorization succeeds.
@@ -74,8 +126,8 @@ impl AppState {
     /// Return the stable identity tied to an already-selected session row.
     ///
     /// Remove/delete cascades must prefer `sessions.agent_id`; legacy rows can still recover the id
-    /// from their exact runtime row, then finally from a project-scoped durable identity with the same
-    /// current display name.
+    /// from their exact runtime row, then finally from one globally unique durable identity with the
+    /// same current display name.
     pub(crate) async fn agent_id_for_selected_session(
         &self,
         row: &SessionRow,
@@ -93,11 +145,18 @@ impl AppState {
         let Some(name) = row.name.as_deref() else {
             return Ok(None);
         };
-        Ok(Agents::new(&self.store)
-            .find_by_project_name(&row.project, name)
+        match Agents::new(&self.store)
+            .resolve_ref(
+                &row.project,
+                &nexus_store::repos::AgentRef::Name(name.to_string()),
+                true,
+            )
             .await
-            .map_err(|e| e.to_contract_error())?
-            .map(|agent| agent.agent_id))
+        {
+            Ok(agent) => Ok(Some(agent.agent_id)),
+            Err(NexusError::NotFound(_)) => Ok(None),
+            Err(error) => Err(error.to_contract_error()),
+        }
     }
 
     /// REMOVE — detach a session from live delivery while retaining its store rows and inbox.
@@ -233,20 +292,22 @@ impl AppState {
     }
 
     /// Kill the named agent's live harness (tmux/PTY) via the [`PtySupervisor`], best-effort. Resolves
-    /// `name`→session (the caller's `project` first, then any project — a DM/admin target is a direct
-    /// address). No-op (returns `false`) when there's no supervisor or no live harness. This is the
+    /// `name`→one globally unique compatibility session; project is display metadata and cannot
+    /// select between duplicate names. No-op (returns `false`) when there's no supervisor, no live
+    /// harness, or the fossil name is ambiguous. This is the
     /// `--kill` half of `admin.remove`: the Admin port tears down the loop, but the harness PROCESS is
     /// the supervisor's to terminate.
-    pub async fn kill_harness(&self, name: &str, project: &str) -> bool {
+    pub async fn kill_harness(&self, name: &str, _project: &str) -> bool {
         use nexus_store::repos::Sessions;
         let Some(pty) = &self.pty else {
             return false;
         };
         let sessions = Sessions::new(&self.store);
-        let row = match sessions.find_by_name(project, name).await {
-            Ok(Some(r)) => Some(r),
-            _ => sessions.find_by_name_any_project(name).await.ok().flatten(),
-        };
+        let row = sessions
+            .find_unique_by_name_any_project(name)
+            .await
+            .ok()
+            .flatten();
         match row {
             Some(r) => pty.kill(&r.session_id),
             None => false,
@@ -498,23 +559,15 @@ impl AppState {
     pub(crate) async fn resolve_session_by_name(
         &self,
         name: &str,
-        project: &str,
+        _project: &str,
     ) -> Result<SessionRow, nexus_contracts::ContractError> {
-        let sessions = Sessions::new(&self.store);
-        match sessions
-            .find_by_name(project, name)
+        Sessions::new(&self.store)
+            .find_unique_by_name_any_project(name)
             .await
             .map_err(|e| e.to_contract_error())?
-        {
-            Some(r) => Ok(r),
-            None => sessions
-                .find_by_name_any_project(name)
-                .await
-                .map_err(|e| e.to_contract_error())?
-                .ok_or_else(|| nexus_contracts::ContractError {
-                    code: nexus_contracts::codes::NOT_FOUND,
-                    message: format!("no agent named {name}"),
-                }),
-        }
+            .ok_or_else(|| nexus_contracts::ContractError {
+                code: nexus_contracts::codes::NOT_FOUND,
+                message: format!("no agent named {name}"),
+            })
     }
 }

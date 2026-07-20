@@ -16,6 +16,7 @@ use crate::cli::render::finish_with;
 /// `nexus members` — directory + presence + current_work.
 #[derive(Args, Debug)]
 pub struct MembersArgs {
+    /// Filter by project metadata. Omit to list the global directory.
     #[arg(long)]
     pub project: Option<String>,
     /// Include offline members (maps to `MemberListRequest.include_offline`).
@@ -29,13 +30,19 @@ pub struct MembersArgs {
     pub presence: bool,
 }
 
-/// `nexus members` — `--include-offline` is the only flag that touches the request; `--presence` is
-/// a render-only column toggle.
-pub async fn members(client: &ReadClient, a: MembersArgs, json: bool) -> ExitCode {
-    let req = MemberListRequest {
+#[doc(hidden)]
+pub fn member_list_request(a: &MembersArgs) -> MemberListRequest {
+    MemberListRequest {
+        project: a.project.clone(),
         include_offline: Some(a.include_offline),
         include_dead: Some(a.include_dead),
-    };
+    }
+}
+
+/// `nexus members` — project/offline/dead filters cross the read contract; `--presence` is a
+/// render-only column toggle.
+pub async fn members(client: &ReadClient, a: MembersArgs, json: bool) -> ExitCode {
+    let req = member_list_request(&a);
     let show_presence = a.presence;
     let res: Result<MemberListResponse, _> = client.members(req).await;
     finish_with(res, json, move |l| {

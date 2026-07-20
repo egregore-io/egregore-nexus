@@ -143,6 +143,32 @@ async fn name_resolution_is_project_scoped_with_explicit_any_project_opt_in() {
 }
 
 #[tokio::test]
+async fn widened_name_resolution_rejects_cross_project_legacy_ambiguity() {
+    let store = migrated().await;
+    store
+        .identity_conn()
+        .execute("DROP INDEX idx_agents_name_unique", ())
+        .await
+        .unwrap();
+    let agents = Agents::new(&store);
+    agents
+        .create(new_agent("a_dee_a", "proj-a", "dee"))
+        .await
+        .unwrap();
+    agents
+        .create(new_agent("a_dee_b", "proj-b", "dee"))
+        .await
+        .unwrap();
+
+    let error = agents
+        .resolve_ref("proj-a", &AgentRef::Name("dee".into()), true)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, NexusError::Ambiguous(_)));
+}
+
+#[tokio::test]
 async fn rename_does_not_move_id_keyed_edges() {
     let store = migrated().await;
     let agents = Agents::new(&store);
@@ -269,6 +295,43 @@ async fn id_keyed_grant_reads_are_rename_proof() {
 }
 
 #[tokio::test]
+async fn access_grant_snapshot_lists_only_the_requested_stable_agent() {
+    let store = migrated().await;
+    let grants = AgentAccessGrants::new(&store);
+    for (agent_id, principal, principal_agent_id, role) in [
+        (
+            "a_target",
+            "delegate-one",
+            Some("a_delegate_one"),
+            ROLE_VIEWER,
+        ),
+        ("a_target", "delegate-two", None, ROLE_CO_OWNER),
+        ("a_other", "unrelated", Some("a_unrelated"), ROLE_VIEWER),
+    ] {
+        grants
+            .grant(NewAgentAccessGrant {
+                agent_id: agent_id.to_string(),
+                principal_project: "default".to_string(),
+                principal_name: principal.to_string(),
+                principal_session_id: None,
+                principal_agent_id: principal_agent_id.map(str::to_string),
+                role: role.to_string(),
+                granted_by_name: "owner".to_string(),
+                granted_by_project: "default".to_string(),
+            })
+            .await
+            .unwrap();
+    }
+
+    let rows = grants.list_for_agent("a_target").await.unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].principal_name, "delegate-one");
+    assert_eq!(rows[1].principal_name, "delegate-two");
+    assert!(rows.iter().all(|row| row.agent_id == "a_target"));
+}
+
+#[tokio::test]
 async fn active_runtime_session_resolves_by_agent_id() {
     let store = migrated().await;
     Agents::new(&store)
@@ -317,6 +380,43 @@ async fn active_runtime_session_resolves_by_agent_id() {
         .unwrap()
         .expect("id-keyed session row");
     assert_eq!(compat.agent_id.as_deref(), Some("a_fay"));
+}
+
+#[tokio::test]
+async fn active_runtime_session_rejects_a_session_owned_by_another_agent() {
+    let store = migrated().await;
+    let agents = Agents::new(&store);
+    agents
+        .create(new_agent("a_expected", "default", "expected"))
+        .await
+        .unwrap();
+    agents
+        .create(new_agent("a_other", "default", "other"))
+        .await
+        .unwrap();
+    AgentRuntimes::new(&store)
+        .create(new_runtime("s_shared", "a_expected"))
+        .await
+        .unwrap();
+    let sessions = Sessions::new(&store);
+    sessions
+        .create(new_session("s_shared", "default", "other"))
+        .await
+        .unwrap();
+    sessions
+        .set_agent_id(&SessionId("s_shared".into()), "a_other")
+        .await
+        .unwrap();
+
+    let error = sessions
+        .active_runtime_session_for_agent("a_expected")
+        .await
+        .expect_err("runtime/session ownership mismatch must fail closed");
+
+    assert!(matches!(error, NexusError::Invalid(_)));
+    assert!(error.to_string().contains("s_shared"));
+    assert!(error.to_string().contains("a_expected"));
+    assert!(error.to_string().contains("a_other"));
 }
 
 #[tokio::test]

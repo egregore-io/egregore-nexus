@@ -587,6 +587,10 @@ async fn routing_repositories_resolve_identity_without_cross_database_sql() {
             })
             .await
             .expect("create live session");
+        Sessions::new(&store)
+            .set_agent_id(&SessionId(runtime_id.into()), agent_id)
+            .await
+            .expect("bind live session to its stable agent identity");
     }
 
     let message = Message {

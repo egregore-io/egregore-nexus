@@ -395,10 +395,23 @@ impl AppState {
         // loop before the turn executor is actually bound; pending mail would otherwise be claimed
         // and terminalized as `session not registered` milliseconds before startup completes.
         let harness_still_opening = self.agent.is_harness_alive(&row.session_id) == Some(false);
-        if row.kind == "agent"
-            && !externally_drained
-            && !self.inbox_subscription_owns_delivery(&row.session_id).await
-        {
+        if row.kind == "agent" && !externally_drained {
+            // The same stable session may first register as an external pull client and later
+            // acquire a daemon-managed transport. Retire that old ownership before making the
+            // harness loop wakeable; otherwise the active subscription suppresses the loop and
+            // strands every later delivery. Failure is fail-closed: never create two consumers.
+            if let Err(error) = nexus_store::repos::InboxSubscriptions::new(&self.store)
+                .mark_inactive_for_session(&row.session_id.0, now())
+                .await
+            {
+                tracing::error!(
+                    target: "nexus::delivery",
+                    session = %row.session_id,
+                    %error,
+                    "failed to retire external inbox ownership during managed transport rebind"
+                );
+                return;
+            }
             if harness_still_opening {
                 if let Some(wiring) = &self.loop_wiring {
                     wiring

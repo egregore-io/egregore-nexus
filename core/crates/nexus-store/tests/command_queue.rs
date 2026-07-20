@@ -1,5 +1,6 @@
 //! Durable session-command queue transitions and atomic redirect promotion.
 
+use nexus_common::NexusError;
 use nexus_contracts::{AgentId, CommandQueueState, SessionId};
 use nexus_store::command_kinds;
 use nexus_store::repos::{CommandIntents, CommandQueue, NewCommandIntent, NewSession, Sessions};
@@ -255,6 +256,32 @@ async fn typed_snapshot_projects_daemon_queue_truth_for_name_or_agent_id() {
 }
 
 #[tokio::test]
+async fn name_only_queue_target_rejects_ambiguous_legacy_sessions() {
+    let store = store().await;
+    store
+        .conn
+        .execute("DROP INDEX idx_sessions_name", ())
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO sessions (session_id, name, agent, kind, tier, project, created_at) \
+             VALUES ('s_otto_duplicate', 'otto', 'claude', 'agent', 'agent', 'other', 2)",
+            (),
+        )
+        .await
+        .unwrap();
+
+    let error = CommandQueue::new(&store)
+        .snapshot_with_active_sessions(Some("otto"), None, &[])
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, NexusError::Ambiguous(_)));
+}
+
+#[tokio::test]
 async fn split_store_snapshot_reads_runtime_from_transport_and_queue_from_identity() {
     let daemon = DaemonStore::open(":memory:").await.unwrap();
     let store = daemon.compatibility_store();
@@ -370,6 +397,98 @@ async fn typed_transition_read_is_bounded_and_reports_cursor_gaps() {
     assert!(gap.events.is_empty());
     assert_eq!(gap.next_seq, 3);
     assert_eq!(gap.latest_seq, 5);
+}
+
+#[tokio::test]
+async fn terminal_command_events_preserve_kind_and_authenticated_caller_for_every_session_action() {
+    let store = store().await;
+    let intents = CommandIntents::new(&store);
+
+    for (offset, kind) in [
+        command_kinds::harness::PROMPT,
+        command_kinds::harness::STEER,
+        command_kinds::harness::INTERRUPT,
+        command_kinds::harness::COMPACT,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let command_id = format!("cmd_receipt_{offset}");
+        let client_message_id = format!("cm_receipt_{offset}");
+        intents
+            .insert_pending(NewCommandIntent {
+                command_id: command_id.clone(),
+                kind: kind.into(),
+                project: "presentation-only".into(),
+                caller_name: "Operator".into(),
+                caller_session_id: Some("s_human".into()),
+                caller_agent_id: None,
+                caller_runtime_id: Some("s_human".into()),
+                caller_client_key: Some("nexus_ck_human".into()),
+                caller_kind: Some("human".into()),
+                caller_tier: Some("admin".into()),
+                idempotency_key: Some(client_message_id.clone()),
+                request_json: serde_json::json!({
+                    "name": "otto",
+                    "agentId": "a_otto",
+                    "clientMessageId": client_message_id,
+                    "text": "only prompt and steer require text"
+                })
+                .to_string(),
+                created_at: 100 + offset as i64,
+            })
+            .await
+            .unwrap();
+        let claimed = intents
+            .claim_next_kind(200 + offset as i64, 1_000, kind)
+            .await
+            .unwrap()
+            .unwrap();
+        intents
+            .mark_done_for_claim(
+                &command_id,
+                claimed.claimed_at.unwrap(),
+                r#"{"ok":true}"#,
+                300 + offset as i64,
+            )
+            .await
+            .unwrap();
+    }
+
+    let events = CommandQueue::new(&store)
+        .events_after(0)
+        .await
+        .unwrap()
+        .events
+        .into_iter()
+        .filter(|event| event.state == CommandQueueState::Completed)
+        .collect::<Vec<_>>();
+
+    assert_eq!(events.len(), 4);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.command_kind.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            command_kinds::harness::PROMPT,
+            command_kinds::harness::STEER,
+            command_kinds::harness::INTERRUPT,
+            command_kinds::harness::COMPACT,
+        ]
+    );
+    for event in events {
+        assert_eq!(event.session_id.as_deref(), Some("s_otto"));
+        assert_eq!(event.caller_name, "Operator");
+        assert_eq!(event.caller_session_id.as_deref(), Some("s_human"));
+        assert_eq!(event.caller_agent_id, None);
+        assert_eq!(event.caller_kind.as_deref(), Some("human"));
+        assert!(event
+            .client_message_id
+            .as_deref()
+            .unwrap()
+            .starts_with("cm_receipt_"));
+    }
 }
 
 #[tokio::test]

@@ -11,17 +11,18 @@ use async_trait::async_trait;
 
 use nexus::daemon::{dispatch, AppState, WsSink};
 use nexus_contracts::{
-    codes, Ack, AckRequest, AckResponse, AckThreadsRequest, AssignProjectRequest,
+    codes, Ack, AckRequest, AckResponse, AckThreadsRequest, AgentUpdateKind, AssignProjectRequest,
     AssignProjectResponse, AssignRoleRequest, AssignRoleResponse, Caller, ChannelOp,
-    ChannelRequest, ConsumeRequest, ContractError, CreateThreadRequest, GrantTierRequest,
-    HeartbeatResponse, HistoryRequest, HistoryResponse, JoinThreadRequest, LeaveThreadRequest,
-    MemberListRequest, MemberListResponse, MessageId, MetadataEntityKind, MetadataResponse,
-    MonitorRequest, NexusBatch, NotifyRequest, NotifyResponse, NotifySendRequest, NotifyTarget,
-    PortResult, RegisterRequest, RegisterResponse, RemoveRequest, RemoveResponse, Request,
-    RequestId, RouteForwardRequest, SearchRequest, SearchResponse, SendRequest, SendTarget,
-    SessionId, SpawnRequest, SpawnResponse, StatusRequest, StatusResponse, SubscribeRequest,
-    SubscribeResponse, ThreadListResponse, ThreadMemberRequest, ThreadMembersRequest,
-    ThreadMembersResponse, Tier, TopicListResponse, UnsubscribeRequest, Whoami,
+    ChannelRequest, ConsumeRequest, ContractError, CreateThreadRequest, EventSink,
+    GrantTierRequest, HeartbeatResponse, HistoryRequest, HistoryResponse, JoinThreadRequest,
+    LeaveThreadRequest, MemberListRequest, MemberListResponse, MessageId, MetadataEntityKind,
+    MetadataResponse, MonitorRequest, NexusBatch, NotifyRequest, NotifyResponse, NotifySendRequest,
+    NotifyTarget, PortResult, RegisterRequest, RegisterResponse, RemoveRequest, RemoveResponse,
+    Request, RequestId, RouteForwardRequest, SearchRequest, SearchResponse, SendRequest,
+    SendTarget, SessionId, SpawnRequest, SpawnResponse, StatusRequest, StatusResponse,
+    SubscribeRequest, SubscribeResponse, ThreadListResponse, ThreadMemberRequest,
+    ThreadMembersRequest, ThreadMembersResponse, Tier, TopicListResponse, UnsubscribeRequest,
+    Whoami, WsEvent,
 };
 use nexus_store::repos::{
     Agents, DeveloperEvents, NewAgent, NewSession, Sessions, AGENT_LIFECYCLE_TOPIC,
@@ -145,6 +146,19 @@ impl MockBus {
 
 #[async_trait]
 impl nexus_contracts::BusPort for MockBus {
+    async fn preflight_send(&self, _caller: &Caller, _req: &SendRequest) -> PortResult<()> {
+        Ok(())
+    }
+    async fn preflight_notify_target(
+        &self,
+        _caller: &Caller,
+        target: &nexus_contracts::NotifyTarget,
+    ) -> PortResult<Option<nexus_contracts::AgentId>> {
+        Ok(match target {
+            nexus_contracts::NotifyTarget::Agent { agent_id } => Some(agent_id.clone()),
+            _ => None,
+        })
+    }
     async fn send(&self, _caller: &Caller, _req: SendRequest) -> PortResult<Ack> {
         Ok(Ack {
             message_id: MessageId("m_mock".into()),
@@ -237,6 +251,9 @@ impl nexus_contracts::AgentTurnExecutionPort for MockAgent {
             turn_id: Some("turn_native".into()),
         })
     }
+    async fn compact(&self, _recipient: &SessionId) -> PortResult<()> {
+        Ok(())
+    }
     async fn launch(&self, _req: SpawnRequest) -> PortResult<SpawnResponse> {
         Ok(SpawnResponse {
             session_id: SessionId("s_launched".into()),
@@ -244,6 +261,58 @@ impl nexus_contracts::AgentTurnExecutionPort for MockAgent {
     }
     async fn remove(&self, _req: RemoveRequest) -> PortResult<RemoveResponse> {
         unimplemented!()
+    }
+}
+
+#[derive(Default)]
+struct RecipientRecordingAgent {
+    recipients: Mutex<Vec<SessionId>>,
+}
+
+impl RecipientRecordingAgent {
+    fn recipients(&self) -> Vec<SessionId> {
+        self.recipients.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl nexus_contracts::AgentTurnExecutionPort for RecipientRecordingAgent {
+    async fn inject_turn(&self, _r: &SessionId, _b: &NexusBatch) -> PortResult<()> {
+        Ok(())
+    }
+
+    async fn prompt(&self, recipient: &SessionId, _text: String) -> PortResult<()> {
+        self.recipients.lock().unwrap().push(recipient.clone());
+        Ok(())
+    }
+
+    async fn steer_observed(
+        &self,
+        recipient: &SessionId,
+        _text: String,
+        events: Arc<dyn nexus_contracts::EventSink>,
+        accepted_event: nexus_contracts::WsEvent,
+    ) -> PortResult<nexus_contracts::SteerResponse> {
+        self.recipients.lock().unwrap().push(recipient.clone());
+        events.emit(accepted_event).await;
+        Ok(nexus_contracts::SteerResponse {
+            accepted: true,
+            delivery: nexus_contracts::SteerDelivery::Steered,
+            turn_id: Some("turn_recorded".into()),
+        })
+    }
+
+    async fn compact(&self, recipient: &SessionId) -> PortResult<()> {
+        self.recipients.lock().unwrap().push(recipient.clone());
+        Ok(())
+    }
+
+    async fn launch(&self, _req: SpawnRequest) -> PortResult<SpawnResponse> {
+        unreachable!("routing fixtures pre-register every target")
+    }
+
+    async fn remove(&self, _req: RemoveRequest) -> PortResult<RemoveResponse> {
+        unreachable!("routing fixtures do not remove agents")
     }
 }
 
@@ -386,6 +455,25 @@ fn admin_caller() -> Caller {
         project: "proj".into(),
         tier: Tier::Admin,
     }
+}
+
+async fn register_admin_human(store: &Store) {
+    Sessions::new(store)
+        .create(NewSession {
+            session_id: SessionId("s_admin".into()),
+            name: Some("operator".into()),
+            agent: None,
+            kind: "human".into(),
+            role: Some("operator".into()),
+            tier: "admin".into(),
+            harness_session_id: None,
+            client_key: Some("ck_operator".into()),
+            cwd: None,
+            project: "proj".into(),
+            transport: None,
+        })
+        .await
+        .unwrap();
 }
 
 fn req(method: &str, params: Option<serde_json::Value>) -> Request {
@@ -1555,7 +1643,7 @@ async fn unauthenticated_send_is_rejected() {
 }
 
 #[tokio::test]
-async fn prompt_emits_user_input_in_volatile_agent_session_lane() {
+async fn prompt_preserves_authenticated_human_provenance_in_stream_and_replay() {
     use nexus_store::repos::{AgentSessionMessages, NewSession, Sessions, StreamEvents};
 
     let store = Arc::new(Store::open(":memory:").await.unwrap());
@@ -1577,6 +1665,7 @@ async fn prompt_emits_user_input_in_volatile_agent_session_lane() {
         })
         .await
         .unwrap();
+    register_admin_human(&store).await;
     let state = AppState::new(
         store.clone(),
         WsSink::new(16, Some(store.clone())),
@@ -1592,7 +1681,7 @@ async fn prompt_emits_user_input_in_volatile_agent_session_lane() {
 
     let resp = dispatch(
         &state,
-        Some(agent_caller()),
+        Some(admin_caller()),
         req(
             "prompt",
             Some(serde_json::json!({
@@ -1614,22 +1703,42 @@ async fn prompt_emits_user_input_in_volatile_agent_session_lane() {
         serde_json::json!({
             "text": "hello session",
             "clientMessageId": "you:test:1",
+            "name": "operator",
+            "kind": "human",
         })
     );
+    assert_ne!(data["name"], "hugo");
 
+    state
+        .ws
+        .emit(WsEvent::AgentUpdate {
+            session_id: session.clone(),
+            kind: AgentUpdateKind::TurnEnd,
+            data: serde_json::json!({}),
+        })
+        .await;
     let durable = AgentSessionMessages::new(&store)
         .messages_for_session(&session, 10)
         .await
         .unwrap();
-    assert!(
-        durable.is_empty(),
-        "prompt input should not fsync a recorded session message before turn_end"
+    assert_eq!(durable.len(), 1);
+    let content: serde_json::Value = serde_json::from_str(&durable[0].content_json).unwrap();
+    assert_eq!(
+        content["blocks"][0],
+        serde_json::json!({
+            "type": "text",
+            "text": "hello session",
+            "id": "you:test:1",
+            "clientMessageId": "you:test:1",
+            "name": "operator",
+            "kind": "human",
+        })
     );
 }
 
 #[tokio::test]
 async fn steer_emits_accepted_user_input_with_native_source() {
-    use nexus_store::repos::{NewSession, Sessions, StreamEvents};
+    use nexus_store::repos::{AgentSessionMessages, NewSession, Sessions, StreamEvents};
 
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
@@ -1650,6 +1759,7 @@ async fn steer_emits_accepted_user_input_with_native_source() {
         })
         .await
         .unwrap();
+    register_admin_human(&store).await;
     let state = AppState::new(
         store.clone(),
         WsSink::new(16, Some(store.clone())),
@@ -1665,7 +1775,7 @@ async fn steer_emits_accepted_user_input_with_native_source() {
 
     let response = dispatch(
         &state,
-        Some(agent_caller()),
+        Some(admin_caller()),
         req(
             "steer",
             Some(serde_json::json!({
@@ -1690,10 +1800,30 @@ async fn steer_emits_accepted_user_input_with_native_source() {
     let data: serde_json::Value = serde_json::from_str(&rows[0].data).unwrap();
     assert_eq!(data["source"], "steer");
     assert_eq!(data["clientMessageId"], "steer:1");
+    assert_eq!(data["name"], "operator");
+    assert_eq!(data["kind"], "human");
+    assert_ne!(data["name"], "codex-steer");
+
+    state
+        .ws
+        .emit(WsEvent::AgentUpdate {
+            session_id: session.clone(),
+            kind: AgentUpdateKind::TurnEnd,
+            data: serde_json::json!({}),
+        })
+        .await;
+    let durable = AgentSessionMessages::new(&store)
+        .messages_for_session(&session, 10)
+        .await
+        .unwrap();
+    assert_eq!(durable.len(), 1);
+    let content: serde_json::Value = serde_json::from_str(&durable[0].content_json).unwrap();
+    assert_eq!(content["blocks"][0]["name"], "operator");
+    assert_eq!(content["blocks"][0]["kind"], "human");
 }
 
 #[tokio::test]
-async fn prompt_by_agent_id_rejects_cross_project_target_before_revive() {
+async fn stable_agent_id_routes_prompt_steer_compact_and_warm_across_project_metadata() {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
     Agents::new(&store)
@@ -1742,22 +1872,347 @@ async fn prompt_by_agent_id_rejects_cross_project_target_before_revive() {
         "proj".into(),
     );
 
-    let resp = dispatch(
+    for (method, params) in [
+        (
+            "prompt",
+            serde_json::json!({
+                "name": "stale-hugo",
+                "agentId": "a_other",
+                "text": "route by stable id",
+            }),
+        ),
+        (
+            "steer",
+            serde_json::json!({
+                "name": "stale-hugo",
+                "agentId": "a_other",
+                "text": "route by stable id",
+            }),
+        ),
+        (
+            "compact",
+            serde_json::json!({
+                "name": "stale-hugo",
+                "agentId": "a_other",
+            }),
+        ),
+        (
+            "warm",
+            serde_json::json!({
+                "name": "stale-hugo",
+                "agentId": "a_other",
+            }),
+        ),
+    ] {
+        let response = dispatch(&state, Some(agent_caller()), req(method, Some(params))).await;
+
+        assert!(
+            response.error.is_none(),
+            "{method} must route the stable id across project metadata: {:?}",
+            response.error,
+        );
+    }
+}
+
+#[tokio::test]
+async fn name_only_id_shaped_alias_routes_prompt_steer_compact_and_warm() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    Agents::new(&store)
+        .create(NewAgent {
+            agent_id: "a_alias_owner".into(),
+            project: "identity-metadata".into(),
+            name: Some("a_route_alias".into()),
+            default_harness: Some("claude".into()),
+            role: None,
+            tier: Some("agent".into()),
+            owner: None,
+        })
+        .await
+        .unwrap();
+    let alias_session = SessionId("s_route_alias".into());
+    Sessions::new(&store)
+        .create(NewSession {
+            session_id: alias_session.clone(),
+            name: Some("a_route_alias".into()),
+            agent: Some("claude".into()),
+            kind: "agent".into(),
+            role: None,
+            tier: "agent".into(),
+            harness_session_id: None,
+            client_key: Some("ck_route_alias".into()),
+            cwd: None,
+            project: "runtime-metadata".into(),
+            transport: Some("pty".into()),
+        })
+        .await
+        .unwrap();
+    Sessions::new(&store)
+        .set_agent_id(&alias_session, "a_alias_owner")
+        .await
+        .unwrap();
+    let agent = Arc::new(RecipientRecordingAgent::default());
+    let state = AppState::new(
+        store,
+        WsSink::new(16, None),
+        Arc::new(MockIdentity),
+        agent.clone(),
+        Arc::new(MockRealtime),
+        Arc::new(MockBus::default()),
+        Arc::new(MockSearch),
+        Arc::new(MockNotify),
+        Arc::new(MockAdmin),
+        "caller-metadata".into(),
+    );
+
+    for (method, params) in [
+        (
+            "prompt",
+            serde_json::json!({"name":"a_route_alias","text":"alias prompt"}),
+        ),
+        (
+            "steer",
+            serde_json::json!({"name":"a_route_alias","text":"alias steer"}),
+        ),
+        ("compact", serde_json::json!({"name":"a_route_alias"})),
+        ("warm", serde_json::json!({"name":"a_route_alias"})),
+    ] {
+        let response = dispatch(&state, Some(agent_caller()), req(method, Some(params))).await;
+        assert!(
+            response.error.is_none(),
+            "{method} must preserve an unowned id-shaped alias: {:?}",
+            response.error,
+        );
+    }
+    assert_eq!(
+        agent.recipients(),
+        vec![alias_session.clone(), alias_session.clone(), alias_session,],
+    );
+}
+
+#[tokio::test]
+async fn name_only_id_shaped_collision_routes_every_command_to_the_exact_agent_id() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    for (agent_id, name) in [
+        ("a_route_exact", "exact-display"),
+        ("a_route_alias_owner", "a_route_exact"),
+    ] {
+        Agents::new(&store)
+            .create(NewAgent {
+                agent_id: agent_id.into(),
+                project: "identity-metadata".into(),
+                name: Some(name.into()),
+                default_harness: Some("claude".into()),
+                role: None,
+                tier: Some("agent".into()),
+                owner: None,
+            })
+            .await
+            .unwrap();
+    }
+    let sessions = Sessions::new(&store);
+    for (session_id, agent_id, name) in [
+        ("s_route_exact", "a_route_exact", "exact-display"),
+        ("s_route_alias", "a_route_alias_owner", "a_route_exact"),
+    ] {
+        let session = SessionId(session_id.into());
+        sessions
+            .create(NewSession {
+                session_id: session.clone(),
+                name: Some(name.into()),
+                agent: Some("claude".into()),
+                kind: "agent".into(),
+                role: None,
+                tier: "agent".into(),
+                harness_session_id: None,
+                client_key: Some(format!("ck_{session_id}")),
+                cwd: None,
+                project: "runtime-metadata".into(),
+                transport: Some("pty".into()),
+            })
+            .await
+            .unwrap();
+        sessions.set_agent_id(&session, agent_id).await.unwrap();
+    }
+    let agent = Arc::new(RecipientRecordingAgent::default());
+    let state = AppState::new(
+        store,
+        WsSink::new(16, None),
+        Arc::new(MockIdentity),
+        agent.clone(),
+        Arc::new(MockRealtime),
+        Arc::new(MockBus::default()),
+        Arc::new(MockSearch),
+        Arc::new(MockNotify),
+        Arc::new(MockAdmin),
+        "caller-metadata".into(),
+    );
+
+    for (method, params) in [
+        (
+            "prompt",
+            serde_json::json!({"name":"a_route_exact","text":"exact prompt"}),
+        ),
+        (
+            "steer",
+            serde_json::json!({"name":"a_route_exact","text":"exact steer"}),
+        ),
+        ("compact", serde_json::json!({"name":"a_route_exact"})),
+        ("warm", serde_json::json!({"name":"a_route_exact"})),
+    ] {
+        let response = dispatch(&state, Some(agent_caller()), req(method, Some(params))).await;
+        assert!(
+            response.error.is_none(),
+            "{method} must prefer the exact stable id over the alias collision: {:?}",
+            response.error,
+        );
+    }
+    assert_eq!(
+        agent.recipients(),
+        vec![
+            SessionId("s_route_exact".into()),
+            SessionId("s_route_exact".into()),
+            SessionId("s_route_exact".into()),
+        ],
+    );
+    assert_eq!(
+        state
+            .ensure_alive("a_route_exact", "unrelated-project")
+            .await
+            .unwrap(),
+        SessionId("s_route_exact".into()),
+    );
+}
+
+#[tokio::test]
+async fn prompt_rejects_ambiguous_legacy_names_instead_of_preferring_caller_project() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    store
+        .conn
+        .execute("DROP INDEX idx_sessions_name", ())
+        .await
+        .unwrap();
+    for (session_id, project) in [("s_legacy_local", "proj"), ("s_legacy_other", "other")] {
+        Sessions::new(&store)
+            .create(NewSession {
+                session_id: SessionId(session_id.into()),
+                name: Some("legacy-duplicate".into()),
+                agent: Some("claude".into()),
+                kind: "agent".into(),
+                role: None,
+                tier: "agent".into(),
+                harness_session_id: None,
+                client_key: Some(format!("ck_{session_id}")),
+                cwd: None,
+                project: project.into(),
+                transport: Some("acp".into()),
+            })
+            .await
+            .unwrap();
+    }
+    let state = AppState::new(
+        store,
+        WsSink::new(16, None),
+        Arc::new(MockIdentity),
+        Arc::new(MockAgent),
+        Arc::new(MockRealtime),
+        Arc::new(MockBus::default()),
+        Arc::new(MockSearch),
+        Arc::new(MockNotify),
+        Arc::new(MockAdmin),
+        "proj".into(),
+    );
+
+    let response = dispatch(
         &state,
         Some(agent_caller()),
         req(
             "prompt",
             Some(serde_json::json!({
-                "name": "stale-hugo",
-                "agentId": "a_other",
-                "text": "must not cross projects",
+                "name": "legacy-duplicate",
+                "text": "must not guess",
             })),
         ),
     )
     .await;
 
-    let err = resp.error.expect("cross-project agent id must be rejected");
-    assert_eq!(err.code, codes::NOT_FOUND);
+    let error = response.error.expect("ambiguous fossil names must fail");
+    assert_eq!(error.code, codes::INVALID_PARAMS);
+    assert!(error.message.contains("ambiguous"));
+}
+
+#[tokio::test]
+async fn prompt_does_not_hide_ambiguous_durable_agents_behind_one_fossil_session() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    store
+        .conn
+        .execute("DROP INDEX idx_agents_name_unique", ())
+        .await
+        .unwrap();
+    for agent_id in ["a_ambiguous_one", "a_ambiguous_two"] {
+        Agents::new(&store)
+            .create(NewAgent {
+                agent_id: agent_id.into(),
+                project: "identity-metadata".into(),
+                name: Some("ambiguous-agent".into()),
+                default_harness: Some("claude".into()),
+                role: None,
+                tier: Some("agent".into()),
+                owner: None,
+            })
+            .await
+            .unwrap();
+    }
+    Sessions::new(&store)
+        .create(NewSession {
+            session_id: SessionId("s_unique_fossil".into()),
+            name: Some("ambiguous-agent".into()),
+            agent: Some("claude".into()),
+            kind: "agent".into(),
+            role: None,
+            tier: "agent".into(),
+            harness_session_id: None,
+            client_key: Some("ck_unique_fossil".into()),
+            cwd: None,
+            project: "transport-metadata".into(),
+            transport: Some("acp".into()),
+        })
+        .await
+        .unwrap();
+    let state = AppState::new(
+        store,
+        WsSink::new(16, None),
+        Arc::new(MockIdentity),
+        Arc::new(MockAgent),
+        Arc::new(MockRealtime),
+        Arc::new(MockBus::default()),
+        Arc::new(MockSearch),
+        Arc::new(MockNotify),
+        Arc::new(MockAdmin),
+        "proj".into(),
+    );
+
+    let response = dispatch(
+        &state,
+        Some(agent_caller()),
+        req(
+            "prompt",
+            Some(serde_json::json!({
+                "name": "ambiguous-agent",
+                "text": "must not fossil-fallback",
+            })),
+        ),
+    )
+    .await;
+
+    let error = response
+        .error
+        .expect("durable ambiguity must remain visible");
+    assert_eq!(error.code, codes::INVALID_PARAMS);
+    assert!(error.message.contains("ambiguous"));
 }
 
 /// Adding a thread member who lives in another workspace must MOVE its session into the thread's

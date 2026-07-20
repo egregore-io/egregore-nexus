@@ -537,6 +537,7 @@ async fn launch_display_name(
         return name.to_string();
     }
     read.members(nexus_contracts::MemberListRequest {
+        project: None,
         include_offline: Some(true),
         include_dead: None,
     })

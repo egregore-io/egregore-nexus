@@ -249,6 +249,16 @@ mod tests {
         }
     }
 
+    async fn seed_legacy_sessions(store: &Store, pairs: &[(&str, &str)]) {
+        let sessions = Sessions::new(store);
+        for (name, session_id) in pairs {
+            sessions
+                .create(new_session(session_id, name))
+                .await
+                .unwrap();
+        }
+    }
+
     async fn seed_agent_runtime(store: &Store, agent_id: &str, name: &str, session_id: &str) {
         Agents::new(store)
             .create(new_agent(agent_id, name))
@@ -595,6 +605,11 @@ mod tests {
                 threads.add_member(&tid, m).await.unwrap();
             }
         }
+        seed_legacy_sessions(
+            &store,
+            &[("ben", "s_ben"), ("dylan", "s_dylan"), ("ana", "s_ana")],
+        )
+        .await;
         let id = identity(&[("ben", "s_ben"), ("dylan", "s_dylan"), ("ana", "s_ana")]);
         let (bus, realtime) = build(store.clone(), id);
 
@@ -857,6 +872,11 @@ mod tests {
                 .unwrap();
             threads.add_member(&tid, "ben").await.unwrap();
         }
+        seed_legacy_sessions(
+            &store,
+            &[("ben", "s_ben"), ("ana", "s_ana"), ("dylan", "s_dylan")],
+        )
+        .await;
         let id = identity(&[("ben", "s_ben"), ("ana", "s_ana"), ("dylan", "s_dylan")]);
         let (bus, realtime) = build(store.clone(), id);
 
@@ -1001,6 +1021,7 @@ mod tests {
                 threads.add_member(&tid, m).await.unwrap();
             }
         }
+        seed_legacy_sessions(&store, &[("ben", "s_ben"), ("dylan", "s_dylan")]).await;
         let id = identity(&[
             ("ben", "s_ben"),
             ("dylan", "s_dylan"),

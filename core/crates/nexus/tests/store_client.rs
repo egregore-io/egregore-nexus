@@ -1142,6 +1142,70 @@ async fn ambient_store_client_follows_registered_client_key_after_rename() {
 }
 
 #[tokio::test]
+async fn ambient_store_client_follows_registered_client_key_across_project_metadata() {
+    let store = migrated_store().await;
+    Sessions::new(&store)
+        .create(NewSession {
+            session_id: nexus_contracts::SessionId("s_cross_project_key".into()),
+            name: Some("canonical-cross-project".into()),
+            agent: Some("claude".into()),
+            kind: "agent".into(),
+            role: None,
+            tier: "agent".into(),
+            harness_session_id: Some("hs_cross_project".into()),
+            client_key: Some("ck_cross_project".into()),
+            cwd: None,
+            project: "actual-project".into(),
+            transport: Some("pty".into()),
+        })
+        .await
+        .unwrap();
+
+    let client = StoreClient::from_store_with_identity_for_tests_resolving(
+        store.clone(),
+        RegisterRequest {
+            agent_id: None,
+            name: Some("stale-name".into()),
+            harness: hid("claude"),
+            harness_session_id: "stale-harness".into(),
+            project: "stale-project-metadata".into(),
+            client_key: "ck_cross_project".into(),
+            runtime_credential: None,
+            tier: Tier::Agent,
+            kind: Some(Kind::Agent),
+            role: None,
+            cwd: None,
+        },
+    )
+    .await
+    .unwrap()
+    .with_timeout(Duration::from_secs(2));
+
+    let pending = tokio::spawn({
+        let client = client.clone();
+        async move { client.message_post_send(&dm_request()).await }
+    });
+    let row = first_command(&store).await;
+    assert_eq!(row.caller_name, "canonical-cross-project");
+    assert_eq!(row.project, "actual-project");
+    assert_eq!(row.caller_client_key.as_deref(), Some("ck_cross_project"));
+
+    CommandIntents::new(&store)
+        .mark_error(
+            &row.command_id,
+            &serde_json::to_string(&ContractError {
+                code: codes::INTERNAL_ERROR,
+                message: "stop test".into(),
+            })
+            .unwrap(),
+            2,
+        )
+        .await
+        .unwrap();
+    let _ = pending.await.unwrap();
+}
+
+#[tokio::test]
 async fn store_client_polls_done_result_json_into_typed_ack() {
     let store = migrated_store().await;
     let client = StoreClient::from_store_with_caller_for_tests(

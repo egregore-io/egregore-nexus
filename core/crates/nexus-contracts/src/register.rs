@@ -119,6 +119,10 @@ pub struct MemberSummary {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MemberListRequest {
+    /// Optional directory metadata filter. `None` returns the global directory; projects never
+    /// act as a routing or authorization boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     /// Include offline members (default false).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_offline: Option<bool>,

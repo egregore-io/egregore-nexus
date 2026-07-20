@@ -9,9 +9,9 @@ use nexus::daemon::{command_worker, daemon_ipc, AppState};
 use nexus_common::config::GatewayProjectionDeliveryMode;
 use nexus_common::Config;
 use nexus_contracts::{
-    DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, HistoryRequest, Kind, MemberListRequest,
-    RegisterRequest, RegisterResponse, SearchMode, SearchRequest, SessionId, ThreadId, Tier,
-    Whoami, DAEMON_IPC_PROTOCOL_VERSION,
+    AgentId, DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, HistoryRequest, Kind,
+    MemberListRequest, RegisterRequest, RegisterResponse, SearchMode, SearchRequest, SessionId,
+    ThreadId, Tier, Whoami, DAEMON_IPC_PROTOCOL_VERSION,
 };
 use nexus_store::repos::{
     Agents, CommandIntents, NewAgent, NewSession, Sessions, Sources, Threads,
@@ -530,7 +530,7 @@ async fn local_queue_mutation_executes_atomically_inside_the_daemon_owner() {
         .conn
         .execute(
             "INSERT INTO sessions (session_id, agent_id, name, agent, transport, project, created_at) \
-             VALUES ('s_queue', 'a_queue', 'queue-agent', 'codex', 'codex-appserver', 'default', 1)",
+             VALUES ('s_queue', 'a_queue', 'queue-agent', 'codex', 'codex-appserver', 'runtime-label', 1)",
             (),
         )
         .await
@@ -549,7 +549,7 @@ async fn local_queue_mutation_executes_atomically_inside_the_daemon_owner() {
         .insert_pending(nexus_store::repos::NewCommandIntent {
             command_id: "cmd_queue_redirect".into(),
             kind: nexus_store::command_kinds::harness::PROMPT.into(),
-            project: "default".into(),
+            project: "accepted-label".into(),
             caller_name: "Alex".into(),
             caller_session_id: Some("local-operator".into()),
             caller_agent_id: None,
@@ -575,7 +575,7 @@ async fn local_queue_mutation_executes_atomically_inside_the_daemon_owner() {
         request_id: "rpc-queue-mutate".into(),
         caller: Some(DaemonIpcCaller {
             name: Some("Nexus Gateway".into()),
-            project: "default".into(),
+            project: "caller-label".into(),
             session_id: Some("local-operator".into()),
             agent_id: None,
             runtime_id: Some("local-operator".into()),
@@ -586,7 +586,7 @@ async fn local_queue_mutation_executes_atomically_inside_the_daemon_owner() {
         call: DaemonIpcCall::Query {
             method: "local.sessionQueue.mutate".into(),
             params: serde_json::json!({
-                "project": "default",
+                "project": "target-label",
                 "now": 9_000,
                 "request": {
                     "name": "queue-agent",
@@ -617,6 +617,97 @@ async fn local_queue_mutation_executes_atomically_inside_the_daemon_owner() {
         .unwrap();
     assert_eq!(row.kind, nexus_store::command_kinds::harness::STEER);
     assert_eq!(row.revision, 2);
+}
+
+#[tokio::test]
+async fn authenticated_daemon_query_treats_the_registered_session_agent_id_as_exclusive() {
+    let state = state().await;
+    Agents::new(&state.store)
+        .create(NewAgent {
+            agent_id: "a_alias_owner".into(),
+            project: "alias-project".into(),
+            name: Some("a_missing_registered_owner".into()),
+            default_harness: Some("other".into()),
+            role: None,
+            tier: Some("agent".into()),
+            owner: None,
+        })
+        .await
+        .unwrap();
+    for (session_id, name, project, client_key, agent_id) in [
+        (
+            "s_alias_owner",
+            "a_missing_registered_owner",
+            "alias-project",
+            "ck_alias_owner",
+            "a_alias_owner",
+        ),
+        (
+            "s_registered_missing_owner",
+            "registered-caller",
+            "actual-project",
+            "ck_registered_missing_owner",
+            "a_missing_registered_owner",
+        ),
+    ] {
+        Sessions::new(&state.store)
+            .create(NewSession {
+                session_id: SessionId(session_id.into()),
+                name: Some(name.into()),
+                agent: Some("other".into()),
+                kind: "agent".into(),
+                role: None,
+                tier: "agent".into(),
+                harness_session_id: Some(format!("hs_{session_id}")),
+                client_key: Some(client_key.into()),
+                cwd: None,
+                project: project.into(),
+                transport: Some("pty".into()),
+            })
+            .await
+            .unwrap();
+        Sessions::new(&state.store)
+            .set_agent_id(&SessionId(session_id.into()), agent_id)
+            .await
+            .unwrap();
+    }
+
+    let response = daemon_ipc::handle_request(
+        &state,
+        "boot-token",
+        DaemonIpcRequest {
+            version: DAEMON_IPC_PROTOCOL_VERSION,
+            token: "boot-token".into(),
+            request_id: "rpc-exclusive-stored-agent".into(),
+            caller: Some(DaemonIpcCaller {
+                name: Some("stale-display".into()),
+                project: "stale-project-metadata".into(),
+                session_id: None,
+                agent_id: None,
+                runtime_id: None,
+                client_key: Some("ck_registered_missing_owner".into()),
+                kind: Kind::Agent,
+                tier: Tier::Agent,
+            }),
+            call: DaemonIpcCall::Query {
+                method: "whoami".into(),
+                params: serde_json::json!({}),
+            },
+        },
+    )
+    .await;
+
+    let error = response
+        .error
+        .expect("missing stored agent id must fail closed");
+    assert!(matches!(
+        error.code,
+        nexus_contracts::codes::NOT_FOUND | nexus_contracts::codes::UNAUTHORIZED
+    ));
+    assert_ne!(
+        response.result,
+        Some(serde_json::json!({ "agentId": "a_alias_owner" }))
+    );
 }
 
 #[tokio::test]
@@ -899,6 +990,89 @@ async fn registered_query_caller_is_canonicalized_by_client_key_after_rename() {
     let whoami: Whoami = serde_json::from_value(response.result.unwrap()).unwrap();
     assert_eq!(whoami.name.as_deref(), Some("ipc-agent"));
     assert_eq!(whoami.session_id, registered.session_id);
+}
+
+#[tokio::test]
+async fn registered_query_caller_prefers_the_authenticated_session_agent_id_over_a_reused_name() {
+    let state = state().await;
+    state
+        .store
+        .conn
+        .execute("DROP INDEX idx_sessions_name", ())
+        .await
+        .unwrap();
+    for (agent_id, name) in [
+        ("a_stable_ipc", "current-name"),
+        ("a_wrong_ipc", "reused-name"),
+    ] {
+        Agents::new(&state.store)
+            .create(NewAgent {
+                agent_id: agent_id.into(),
+                project: "identity-metadata".into(),
+                name: Some(name.into()),
+                default_harness: Some("opencode".into()),
+                role: None,
+                tier: Some("agent".into()),
+                owner: None,
+            })
+            .await
+            .unwrap();
+    }
+    for (session_id, agent_id, client_key) in [
+        ("s_stable_ipc", "a_stable_ipc", "ck_stable_ipc"),
+        ("s_wrong_ipc", "a_wrong_ipc", "ck_wrong_ipc"),
+    ] {
+        Sessions::new(&state.store)
+            .create(NewSession {
+                session_id: SessionId(session_id.into()),
+                name: Some("reused-name".into()),
+                agent: Some("opencode".into()),
+                kind: "agent".into(),
+                role: None,
+                tier: "agent".into(),
+                harness_session_id: None,
+                client_key: Some(client_key.into()),
+                cwd: None,
+                project: "transport-metadata".into(),
+                transport: Some("pty".into()),
+            })
+            .await
+            .unwrap();
+        Sessions::new(&state.store)
+            .set_agent_id(&SessionId(session_id.into()), agent_id)
+            .await
+            .unwrap();
+    }
+
+    let response = daemon_ipc::handle_request(
+        &state,
+        "boot-token",
+        DaemonIpcRequest {
+            version: DAEMON_IPC_PROTOCOL_VERSION,
+            token: "boot-token".into(),
+            request_id: "rpc-stable-ipc-whoami".into(),
+            caller: Some(DaemonIpcCaller {
+                name: Some("reused-name".into()),
+                project: "stale-caller-metadata".into(),
+                session_id: Some("s_stable_ipc".into()),
+                agent_id: None,
+                runtime_id: Some("s_stable_ipc".into()),
+                client_key: Some("ck_stable_ipc".into()),
+                kind: Kind::Agent,
+                tier: Tier::Agent,
+            }),
+            call: DaemonIpcCall::Query {
+                method: "whoami".into(),
+                params: serde_json::Value::Null,
+            },
+        },
+    )
+    .await;
+
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let whoami: Whoami = serde_json::from_value(response.result.unwrap()).unwrap();
+    assert_eq!(whoami.agent_id, Some(AgentId("a_stable_ipc".into())));
+    assert_eq!(whoami.name.as_deref(), Some("current-name"));
 }
 
 #[tokio::test]
@@ -1278,6 +1452,7 @@ async fn read_client_members_query_uses_daemon_ipc() {
 
     let response = client
         .members(MemberListRequest {
+            project: None,
             include_offline: Some(true),
             include_dead: Some(true),
         })

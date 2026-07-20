@@ -551,6 +551,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_interrupt_routes_to_native_transport_or_fallback_without_cross_delivery() {
+        use nexus_harness_codex::app_server::CodexAppServerClient;
+
+        let (sock, calls) =
+            test_support::spawn_fake_server("interrupt", "native-and-fallback").await;
+        let native_transport = CodexAppServerTransport::new();
+        let native = SessionId("s_native_interrupt".into());
+        let client = Arc::new(
+            CodexAppServerClient::connect(&sock, "nexus-interrupt")
+                .await
+                .expect("client connect"),
+        );
+        native_transport.bind(native.clone(), client, "thread-native".into());
+        native_transport
+            .turn_tracker()
+            .observe_active_turn("thread-native", "turn-native");
+
+        let non_native = SessionId("s_fallback_interrupt".into());
+        let fallback = FakeAcp::with_liveness(Some(true));
+        let router = RoutingTurnExec::new(
+            native_transport,
+            PtyTransport::default(),
+            Arc::new(fallback.clone()),
+        );
+
+        router.interrupt_active_turn(&native).await.unwrap();
+        router.interrupt_active_turn(&non_native).await.unwrap();
+
+        let recorded = calls.lock().unwrap();
+        assert!(recorded.iter().any(|call| {
+            call.get("method").and_then(|value| value.as_str()) == Some("turn/interrupt")
+                && call.get("params")
+                    == Some(&serde_json::json!({
+                        "threadId": "thread-native",
+                        "turnId": "turn-native"
+                    }))
+        }));
+        drop(recorded);
+        assert_eq!(fallback.interrupt_sessions(), vec![non_native]);
+    }
+
+    #[tokio::test]
     async fn is_harness_alive_routes_correctly_and_does_not_collapse_unbound_to_some_false() {
         let transport = PtyTransport::default();
         let session_a = SessionId("s_pty".into());

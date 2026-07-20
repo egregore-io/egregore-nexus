@@ -148,7 +148,8 @@ pub struct CommandExpectedRevision {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandQueueMutationRequest {
-    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
     pub action: CommandQueueAction,
@@ -197,6 +198,14 @@ pub struct CommandQueueTransition {
     pub command_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_message_id: Option<String>,
+    pub command_kind: String,
+    pub caller_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_agent_id: Option<AgentId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_kind: Option<String>,
     pub state: CommandQueueState,
     pub mode: String,
     #[typeshare(serialized_as = "number")]
@@ -300,6 +309,9 @@ pub struct CompactRequest {
     pub agent_id: Option<AgentId>,
     /// The target agent's registered name fallback (resolved to its live session).
     pub name: String,
+    /// Client-generated id used to correlate the terminal command receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
 }
 
 /// Response: whether compaction was started (completion streams via observe).
@@ -308,4 +320,27 @@ pub struct CompactRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CompactResponse {
     pub started: bool,
+}
+
+/// Interrupt the active turn on one agent session without injecting replacement text.
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InterruptRequest {
+    /// The stable target agent id. When present, it is authoritative over `name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
+    /// The target agent's registered name fallback.
+    pub name: String,
+    /// Client-generated id used to correlate the terminal command receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<String>,
+}
+
+/// Response emitted only after the adapter accepted the interrupt.
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct InterruptResponse {
+    pub interrupted: bool,
 }

@@ -373,7 +373,7 @@ CREATE INDEX IF NOT EXISTS idx_command_queue_mutations_completed
 -- that event visible to SQLite's RETURNING projection while preserving one atomic transaction.
 CREATE TRIGGER trg_command_intent_queue_insert
 BEFORE INSERT ON command_intents
-WHEN NEW.kind IN ('harness.prompt', 'harness.steer')
+WHEN NEW.kind IN ('harness.prompt', 'harness.steer', 'harness.interrupt', 'harness.compact')
 BEGIN
   INSERT INTO command_intent_events (
     project, session_id, command_id, client_message_id, state, mode, revision, created_at
@@ -383,7 +383,7 @@ BEGIN
       (SELECT session_id FROM command_intent_events
        WHERE command_id = NEW.command_id AND session_id IS NOT NULL
        ORDER BY seq DESC LIMIT 1),
-      (SELECT session_id FROM sessions s WHERE s.project = NEW.project AND (
+      (SELECT session_id FROM sessions s WHERE (
         (json_extract(NEW.request_json, '$.agentId') IS NOT NULL
          AND s.agent_id = json_extract(NEW.request_json, '$.agentId'))
         OR (json_extract(NEW.request_json, '$.agentId') IS NULL
@@ -393,7 +393,12 @@ BEGIN
     NEW.command_id,
     json_extract(NEW.request_json, '$.clientMessageId'),
     'queued',
-    CASE WHEN NEW.kind = 'harness.steer' THEN 'redirect' ELSE 'queue' END,
+    CASE NEW.kind
+      WHEN 'harness.steer' THEN 'redirect'
+      WHEN 'harness.interrupt' THEN 'interrupt'
+      WHEN 'harness.compact' THEN 'compact'
+      ELSE 'queue'
+    END,
     NEW.revision,
     NEW.created_at
   );
@@ -402,8 +407,8 @@ END;
 CREATE TRIGGER trg_command_intent_queue_update
 BEFORE UPDATE ON command_intents
 WHEN NEW.revision != OLD.revision
- AND (NEW.kind IN ('harness.prompt', 'harness.steer')
-      OR OLD.kind IN ('harness.prompt', 'harness.steer'))
+ AND (NEW.kind IN ('harness.prompt', 'harness.steer', 'harness.interrupt', 'harness.compact')
+      OR OLD.kind IN ('harness.prompt', 'harness.steer', 'harness.interrupt', 'harness.compact'))
 BEGIN
   INSERT INTO command_intent_events (
     project, session_id, command_id, client_message_id, state, mode, revision, created_at
@@ -413,7 +418,7 @@ BEGIN
       (SELECT session_id FROM command_intent_events
        WHERE command_id = NEW.command_id AND session_id IS NOT NULL
        ORDER BY seq DESC LIMIT 1),
-      (SELECT session_id FROM sessions s WHERE s.project = NEW.project AND (
+      (SELECT session_id FROM sessions s WHERE (
         (json_extract(NEW.request_json, '$.agentId') IS NOT NULL
          AND s.agent_id = json_extract(NEW.request_json, '$.agentId'))
         OR (json_extract(NEW.request_json, '$.agentId') IS NULL
@@ -431,7 +436,12 @@ BEGIN
       WHEN NEW.status = 'cancelled' THEN 'cancelled'
       ELSE 'failed'
     END,
-    CASE WHEN NEW.kind = 'harness.steer' THEN 'redirect' ELSE 'queue' END,
+    CASE NEW.kind
+      WHEN 'harness.steer' THEN 'redirect'
+      WHEN 'harness.interrupt' THEN 'interrupt'
+      WHEN 'harness.compact' THEN 'compact'
+      ELSE 'queue'
+    END,
     NEW.revision,
     COALESCE(NEW.completed_at, NEW.started_at, NEW.claimed_at, NEW.created_at)
   );

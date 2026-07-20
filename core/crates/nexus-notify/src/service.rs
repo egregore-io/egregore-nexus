@@ -14,15 +14,15 @@
 //!     (in-flight + bell → §2 delivery). **Pub = monitor, routing = dispatch.**
 //! 5. **Emit** `notification.received` with `routed_to` (web console audit).
 //!
-//! Verified public ingest derives a distinct Message Post idempotency key for Pub, topic, and each
-//! DM. Command reclaim can therefore resume partial fan-out without duplicating a routed message,
-//! delivery row, or harness injection. The legacy standalone message and `notifications` audit row
-//! are observational and not part of that atomic boundary; a commit-before-command-receipt crash
-//! may recreate those rows.
+//! Verified public ingest derives one deterministic standalone message id, notification audit id,
+//! and a distinct Message Post idempotency key for Pub, topic, and each DM. Command reclaim can
+//! therefore resume partial fan-out without duplicating any canonical fact, delivery row, harness
+//! injection, or audit event.
 //!
 //! `forward` is the admin one-shot ad-hoc forward (tier-gated, **not** a standing rule). `channel`
 //! manages the Pub-feed topic / route config.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use nexus_common::{now, NexusError};
@@ -32,7 +32,7 @@ use nexus_contracts::events::WsEvent;
 use nexus_contracts::ids::{MessageId, ProjectId, TopicId};
 use nexus_contracts::message::{Message, Provenance};
 use nexus_contracts::notify::{NotifyRequest, NotifyResponse};
-use nexus_contracts::ports::{BusPort, Caller, EventSink, NotifyPort, PortResult};
+use nexus_contracts::ports::{BusPort, Caller, EventSink, NotifyPort, PortResult, PreparedBusSend};
 use nexus_contracts::send::{SendRequest, SendTarget};
 use nexus_store::repos::{Messages, Notifications, Topics};
 use nexus_store::Store;
@@ -93,16 +93,19 @@ impl Notify {
 
         // ---- Step 1+2: bad signature → record (hmac_ok=false, empty routed_to) and DROP. ----
         if !hmac_ok {
-            let notif_id = self
-                .store_notifications()
-                .record(
-                    Some(&req.source),
-                    req.topic.as_deref(),
-                    false,
-                    &payload_json,
-                    "", // dropped: no recipients, no agent path
-                )
-                .await?;
+            let notif_id = if self.store.has_split_authority() {
+                format!("n_{}", nexus_common::new_message_id().0)
+            } else {
+                self.store_notifications()
+                    .record(
+                        Some(&req.source),
+                        req.topic.as_deref(),
+                        false,
+                        &payload_json,
+                        "", // dropped: no recipients, no agent path
+                    )
+                    .await?
+            };
             // No message, no Pub feed, no routing, no event — the body never touches an agent.
             return Ok(NotifyResponse {
                 notif_id: MessageId(notif_id),
@@ -111,24 +114,16 @@ impl Notify {
             });
         }
 
-        // ---- Step 3: ingest as a durable `notification`-kind message. ----
         let mut caller = system_caller(&req);
         if let Some(project) = explicit_project {
             caller.project = project;
         }
         let topic_for_msg = req.topic.clone().unwrap_or_else(|| pub_topic().to_string());
         let summary = render_summary(&req);
-        let msg_id = self
-            .store_notification_message(&caller, &req, &topic_for_msg, &summary)
-            .await?;
-
-        // ---- Resolve dispatch recipients (route-by-source/topic) — Pub is separate/always. ----
         let subscriptions = self.subscriptions_for(req.topic.as_deref()).await?;
         let recipients = self.rules.resolve(&req, &subscriptions);
+        let explicit_recipients = dedupe_explicit_recipients(explicit_recipients, &[]);
 
-        // ---- Step 4a: Pub feed — ALWAYS append to the `pub` monitor topic. ----
-        // A publish to a topic fans out only to its explicit subscribers (a monitor view); this is
-        // never, by itself, a push into an agent's turn path.
         let pub_req = SendRequest {
             to: SendTarget::Publish {
                 topic: pub_topic().to_string(),
@@ -139,13 +134,115 @@ impl Notify {
             metadata: None,
             idempotency_key: notification_effect_key(idempotency_root, "pub", pub_topic()),
         };
-        // A Pub publish with no subscribers is a no-op fan-out, not an error.
-        if let Err(e) = self
-            .bus
-            .send_with_kind(&caller, pub_req, Kind::Notification)
+        let routed_topic_req = req.topic.as_deref().and_then(|topic| {
+            (!recipients.is_empty()).then(|| SendRequest {
+                to: SendTarget::Publish {
+                    topic: topic.to_string(),
+                },
+                summary: Some(summary.clone()),
+                body: payload_json.clone(),
+                mention: Vec::new(),
+                metadata: None,
+                idempotency_key: notification_effect_key(idempotency_root, "topic", topic),
+            })
+        });
+        let standing_dm_reqs = if req.topic.is_none() {
+            recipients
+                .iter()
+                .map(|name| {
+                    (
+                        name.clone(),
+                        notification_dm_request(
+                            name,
+                            &summary,
+                            &payload_json,
+                            notification_effect_key(idempotency_root, "dm", name),
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let explicit_dm_reqs = explicit_recipients
+            .iter()
+            .map(|name| {
+                (
+                    name.clone(),
+                    notification_dm_request(
+                        name,
+                        &summary,
+                        &payload_json,
+                        notification_effect_key(idempotency_root, "dm", name),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // A verified command is one logical ingest with several bus effects. Prepare every target
+        // and `before_send` hook before the standalone notification message, Pub row, delivery
+        // row, or wake can commit. The concrete bus freezes each resolved recipient set inside the
+        // preparation, so alias changes between this barrier and commit cannot reroute an effect.
+        let mut prepared_effects = idempotency_root.is_some().then(VecDeque::new);
+        if let Some(prepared) = prepared_effects.as_mut() {
+            let requests = std::iter::once(&pub_req)
+                .chain(routed_topic_req.iter())
+                .chain(
+                    standing_dm_reqs
+                        .iter()
+                        .chain(explicit_dm_reqs.iter())
+                        .map(|(_, request)| request),
+                );
+            for request in requests {
+                match self
+                    .bus
+                    .prepare_send(&caller, request.clone(), Some(Kind::Notification))
+                    .await
+                {
+                    Ok(effect) => prepared.push_back(effect),
+                    Err(error) => {
+                        discard_prepared_effects(self.bus.as_ref(), &caller, prepared).await;
+                        return Err(NexusError::from(error));
+                    }
+                }
+            }
+        }
+
+        // ---- Step 3: ingest as a durable `notification`-kind message. ----
+        let (msg_id, _) = match self
+            .store_notification_message(&caller, &req, &topic_for_msg, &summary, idempotency_root)
             .await
         {
-            tracing::debug!(error = %e, "pub-feed publish returned a port error (treated as soft)");
+            Ok(message_id) => message_id,
+            Err(error) => {
+                if let Some(prepared) = prepared_effects.as_mut() {
+                    discard_prepared_effects(self.bus.as_ref(), &caller, prepared).await;
+                }
+                return Err(error);
+            }
+        };
+        for effect in Messages::new(&self.store)
+            .gateway_projection_effects(&msg_id)
+            .await?
+        {
+            self.events.project(effect).await;
+        }
+
+        // ---- Step 4a: Pub feed — ALWAYS append to the `pub` monitor topic. ----
+        // A publish to a topic fans out only to its explicit subscribers (a monitor view); this is
+        // never, by itself, a push into an agent's turn path.
+        // A Pub publish with no subscribers is a no-op fan-out, not an error.
+        if let Err(error) =
+            dispatch_notification_effect(self.bus.as_ref(), &caller, pub_req, &mut prepared_effects)
+                .await
+        {
+            if prepared_effects.is_some() {
+                // A durable verified ingest may be reclaimed after cancellation or a partial
+                // commit. Leave every accepted preparation in the concrete bus ledger so the
+                // same idempotency root reuses the frozen targets and hook output.
+                return Err(NexusError::from(error));
+            }
+            tracing::debug!(%error, "pub-feed publish returned a port error (treated as soft)");
         }
 
         // ---- Step 4b: routed dispatch (in-flight + bell → §2 delivery). ----
@@ -154,82 +251,123 @@ impl Notify {
         // route-by-source rules dispatch to their named target via a DM. Either way `routed_to`
         // records the resolved recipient set for the web console audit.
         let mut routed_to: Vec<String> = Vec::new();
-        if let Some(topic) = req.topic.as_deref() {
-            if !recipients.is_empty() {
-                // Dispatch to the topic's subscribers via a topic publish (one fan-out write).
-                let route_req = SendRequest {
-                    to: SendTarget::Publish {
-                        topic: topic.to_string(),
-                    },
-                    summary: Some(summary.clone()),
-                    body: payload_json.clone(),
-                    mention: Vec::new(),
-                    metadata: None,
-                    idempotency_key: notification_effect_key(idempotency_root, "topic", topic),
-                };
-                match self
-                    .bus
-                    .send_with_kind(&caller, route_req, Kind::Notification)
-                    .await
+        if req.topic.is_some() {
+            if let Some(route_req) = routed_topic_req {
+                match dispatch_notification_effect(
+                    self.bus.as_ref(),
+                    &caller,
+                    route_req,
+                    &mut prepared_effects,
+                )
+                .await
                 {
                     Ok(_) => routed_to.extend(recipients.iter().cloned()),
-                    Err(e) => {
-                        tracing::warn!(topic = %topic, error = %e, "notification topic dispatch failed");
+                    Err(error) => {
+                        if prepared_effects.is_some() {
+                            return Err(NexusError::from(error));
+                        }
+                        tracing::warn!(topic = %topic_for_msg, %error, "notification topic dispatch failed");
                     }
                 }
             }
         } else {
             // No topic but a standing route-by-source rule matched: one-shot DM per target.
-            for name in &recipients {
-                if send_notification_dm(
+            for (name, dm) in standing_dm_reqs {
+                match send_notification_dm(
                     self.bus.as_ref(),
                     &caller,
-                    name,
-                    &summary,
-                    &payload_json,
-                    notification_effect_key(idempotency_root, "dm", name),
+                    dm,
+                    &name,
+                    &mut prepared_effects,
                 )
                 .await
                 {
-                    routed_to.push(name.clone());
+                    Ok(true) => routed_to.push(name),
+                    Ok(false) => {}
+                    Err(error) => {
+                        return Err(error);
+                    }
                 }
             }
         }
 
-        for name in dedupe_explicit_recipients(explicit_recipients, &routed_to) {
-            if send_notification_dm(
-                self.bus.as_ref(),
-                &caller,
-                &name,
-                &summary,
-                &payload_json,
-                notification_effect_key(idempotency_root, "dm", &name),
-            )
-            .await
+        for (name, dm) in explicit_dm_reqs {
+            if routed_to.iter().any(|routed| routed == &name) {
+                discard_next_prepared_effect(self.bus.as_ref(), &caller, &mut prepared_effects)
+                    .await;
+                continue;
+            }
+            match send_notification_dm(self.bus.as_ref(), &caller, dm, &name, &mut prepared_effects)
+                .await
             {
-                routed_to.push(name);
+                Ok(true) => routed_to.push(name),
+                Ok(false) => {}
+                Err(error) => return Err(error),
             }
         }
 
+        if let Some(prepared) = prepared_effects.as_mut() {
+            debug_assert!(
+                prepared.is_empty(),
+                "every prepared effect must be consumed"
+            );
+            discard_prepared_effects(self.bus.as_ref(), &caller, prepared).await;
+        }
+
         // ---- Record the audit row with the resolved recipients. ----
-        let notif_id = self
-            .store_notifications()
-            .record(
-                Some(&req.source),
-                req.topic.as_deref(),
+        let routed_csv = routed_to.join(",");
+        // Gateway's canonical notification audit is keyed by this standalone message id. Reuse
+        // it for the compatibility response/local audit so every authority sees one logical id.
+        let stable_notif_id = idempotency_root.is_some().then(|| msg_id.0.clone());
+        let (notif_id, audit_inserted, routed_to) = if self.store.has_split_authority() {
+            (
+                stable_notif_id
+                    .unwrap_or_else(|| format!("n_{}", nexus_common::new_message_id().0)),
                 true,
-                &payload_json,
-                &routed_to.join(","),
+                routed_to,
             )
-            .await?;
+        } else if let Some(stable_notif_id) = stable_notif_id {
+            let (row, inserted) = self
+                .store_notifications()
+                .record_once(
+                    &stable_notif_id,
+                    Some(&req.source),
+                    req.topic.as_deref(),
+                    true,
+                    &payload_json,
+                    &routed_csv,
+                )
+                .await?;
+            (
+                row.notif_id,
+                inserted,
+                csv_recipients(row.routed_to.as_deref()),
+            )
+        } else {
+            (
+                self.store_notifications()
+                    .record(
+                        Some(&req.source),
+                        req.topic.as_deref(),
+                        true,
+                        &payload_json,
+                        &routed_csv,
+                    )
+                    .await?,
+                true,
+                routed_to,
+            )
+        };
 
         // ---- Step 5: emit `notification.received` with routed_to (web console). ----
-        self.events
-            .emit(WsEvent::NotificationReceived {
-                notif_id: MessageId(notif_id.clone()),
-                routed_to: routed_to.clone(),
-            })
-            .await;
+        if audit_inserted {
+            self.events
+                .emit(WsEvent::NotificationReceived {
+                    notif_id: MessageId(notif_id.clone()),
+                    routed_to: routed_to.clone(),
+                })
+                .await;
+        }
 
         let _ = msg_id; // the durable message id; the response keys off the audit notif_id.
         Ok(NotifyResponse {
@@ -246,9 +384,21 @@ impl Notify {
         req: &NotifyRequest,
         topic: &str,
         summary: &str,
-    ) -> Result<MessageId, NexusError> {
+        idempotency_root: Option<&str>,
+    ) -> Result<(MessageId, bool), NexusError> {
         let created_at = now();
-        let id = MessageId(format!("m_{}", nexus_common::new_message_id().0));
+        let stable_id = notification_ingest_id(idempotency_root, "message", "m_notify");
+        let id = MessageId(
+            stable_id.unwrap_or_else(|| format!("m_{}", nexus_common::new_message_id().0)),
+        );
+        if idempotency_root.is_some()
+            && Messages::new(&self.store)
+                .get(NOTIFY_PROJECT, &id)
+                .await?
+                .is_some()
+        {
+            return Ok((id, false));
+        }
         let provenance = Provenance {
             from: caller.name.clone(),
             kind: Kind::Notification,
@@ -268,7 +418,16 @@ impl Notify {
             provenance,
             created_at,
         };
-        Messages::new(&self.store).insert(&msg).await
+        match Messages::new(&self.store).insert(&msg).await {
+            Ok(message_id) => Ok((message_id, true)),
+            Err(error) if idempotency_root.is_some() && is_unique_constraint(&error) => {
+                match Messages::new(&self.store).get(NOTIFY_PROJECT, &id).await? {
+                    Some(_) => Ok((id, false)),
+                    None => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Read the `(topic, subscriber)` pairs the resolver needs. For a topic-bearing notification we
@@ -385,25 +544,82 @@ impl NotifyPort for Notify {
 async fn send_notification_dm(
     bus: &dyn BusPort,
     caller: &Caller,
+    dm: SendRequest,
+    name: &str,
+    prepared_effects: &mut Option<VecDeque<PreparedBusSend>>,
+) -> Result<bool, NexusError> {
+    let verified = prepared_effects.is_some();
+    match dispatch_notification_effect(bus, caller, dm, prepared_effects).await {
+        Ok(_) => Ok(true),
+        Err(error) if verified => Err(NexusError::from(error)),
+        Err(error) => {
+            tracing::warn!(recipient = %name, %error, "notification route target failed");
+            Ok(false)
+        }
+    }
+}
+
+async fn dispatch_notification_effect(
+    bus: &dyn BusPort,
+    caller: &Caller,
+    request: SendRequest,
+    prepared_effects: &mut Option<VecDeque<PreparedBusSend>>,
+) -> PortResult<nexus_contracts::Ack> {
+    match prepared_effects {
+        Some(prepared) => {
+            let effect = prepared
+                .pop_front()
+                .ok_or_else(|| nexus_contracts::ContractError {
+                    code: nexus_contracts::codes::INTERNAL_ERROR,
+                    message: "verified notification lost a prepared bus effect".into(),
+                })?;
+            bus.commit_prepared(caller, effect).await
+        }
+        None => {
+            bus.send_with_kind(caller, request, Kind::Notification)
+                .await
+        }
+    }
+}
+
+async fn discard_next_prepared_effect(
+    bus: &dyn BusPort,
+    caller: &Caller,
+    prepared_effects: &mut Option<VecDeque<PreparedBusSend>>,
+) {
+    let Some(effect) = prepared_effects.as_mut().and_then(VecDeque::pop_front) else {
+        return;
+    };
+    if let Err(error) = bus.discard_prepared(caller, effect).await {
+        tracing::warn!(%error, "failed to discard skipped notification preparation");
+    }
+}
+
+async fn discard_prepared_effects(
+    bus: &dyn BusPort,
+    caller: &Caller,
+    prepared: &mut VecDeque<PreparedBusSend>,
+) {
+    while let Some(effect) = prepared.pop_front() {
+        if let Err(error) = bus.discard_prepared(caller, effect).await {
+            tracing::warn!(%error, "failed to discard rejected notification preparation");
+        }
+    }
+}
+
+fn notification_dm_request(
     name: &str,
     summary: &str,
     body: &str,
     idempotency_key: Option<String>,
-) -> bool {
-    let dm = SendRequest {
+) -> SendRequest {
+    SendRequest {
         to: SendTarget::dm_name(name.to_string()),
         summary: Some(summary.to_string()),
         body: body.to_string(),
         mention: Vec::new(),
         metadata: None,
         idempotency_key,
-    };
-    match bus.send_with_kind(caller, dm, Kind::Notification).await {
-        Ok(_) => true,
-        Err(e) => {
-            tracing::warn!(recipient = %name, error = %e, "notification route target failed");
-            false
-        }
     }
 }
 
@@ -428,6 +644,29 @@ pub fn notification_effect_key(root: Option<&str>, effect: &str, target: &str) -
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     Some(format!("notify-effect:{hex}"))
+}
+
+fn notification_ingest_id(root: Option<&str>, effect: &str, prefix: &str) -> Option<String> {
+    let root = root.map(str::trim).filter(|root| !root.is_empty())?;
+    let mut hash = Sha256::new();
+    for component in [root, effect] {
+        hash.update((component.len() as u64).to_be_bytes());
+        hash.update(component.as_bytes());
+    }
+    Some(format!("{prefix}_{:x}", hash.finalize()))
+}
+
+fn csv_recipients(csv: Option<&str>) -> Vec<String> {
+    csv.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|recipient| !recipient.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_unique_constraint(error: &NexusError) -> bool {
+    matches!(error, NexusError::Store(message) if message.contains("UNIQUE constraint failed"))
 }
 
 fn dedupe_explicit_recipients(recipients: Vec<String>, already_routed: &[String]) -> Vec<String> {

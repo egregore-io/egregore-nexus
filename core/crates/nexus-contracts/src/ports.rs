@@ -214,6 +214,34 @@ pub struct Caller {
     pub tier: crate::enums::Tier,
 }
 
+/// A message whose target, policy, and `before_send` hook have been accepted but whose durable
+/// Message Post has not committed yet.
+///
+/// A capable bus returns an opaque `preparation_id` that binds the evaluated message to its
+/// already-resolved recipient set. The trait defaults fail closed instead of pretending an
+/// ordinary preflight/send pair has these semantics. Callers must either commit or discard every
+/// preparation they receive.
+#[derive(Debug)]
+pub struct PreparedBusSend {
+    preparation_id: String,
+}
+
+impl PreparedBusSend {
+    /// Construct an opaque concrete-bus preparation. This is public only because the contracts
+    /// and bus implementations live in separate crates; commit still authenticates and consumes
+    /// the unguessable token from the concrete bus's private in-memory ledger.
+    #[doc(hidden)]
+    pub fn resolved(preparation_id: String) -> Self {
+        Self { preparation_id }
+    }
+
+    /// Opaque implementation-owned token.
+    #[doc(hidden)]
+    pub fn preparation_id(&self) -> &str {
+        &self.preparation_id
+    }
+}
+
 /// Register-once + presence + tiers (backend §8). Implemented by `nexus-identity`.
 #[async_trait]
 pub trait IdentityPort: Send + Sync {
@@ -221,9 +249,10 @@ pub trait IdentityPort: Send + Sync {
     async fn register(&self, req: RegisterRequest) -> PortResult<RegisterResponse>;
     /// Resolve the caller's bound identity (`whoami`).
     async fn whoami(&self, caller: &Caller) -> PortResult<Whoami>;
-    /// Resolve a name -> its live `Caller` (used by daemon ingress paths that receive ambient
-    /// identity instead of a pre-resolved caller).
-    async fn resolve(&self, project: &str, name: &str) -> PortResult<Caller>;
+    /// Resolve a stable agent id or globally unique name -> its live `Caller` (used by daemon
+    /// ingress paths that receive ambient identity instead of a pre-resolved caller). `project` is
+    /// compatibility metadata and never narrows canonical target resolution.
+    async fn resolve(&self, project: &str, name_or_id: &str) -> PortResult<Caller>;
     /// Directory / presence.
     async fn members(
         &self,
@@ -331,6 +360,70 @@ pub use DispatchPort as RealtimePort;
 /// The one `to` contract: DM | thread | topic, fan-out, no orchestrator (backend §3).
 #[async_trait]
 pub trait BusPort: Send + Sync {
+    /// Resolve and validate one send target without committing a message, delivery row, or wake.
+    /// Multi-effect producers use this to fail atomically before their first durable side effect.
+    async fn preflight_send(&self, caller: &Caller, req: &SendRequest) -> PortResult<()>;
+    /// Resolve, authorize, and run `before_send` without committing any message/delivery/wake.
+    /// The concrete bus freezes the resolved recipients and evaluated hook result in an opaque
+    /// preparation so a later commit cannot re-resolve a renamed alias or execute the hook twice.
+    async fn prepare_send(
+        &self,
+        _caller: &Caller,
+        _req: SendRequest,
+        _sender_kind: Option<Kind>,
+    ) -> PortResult<PreparedBusSend> {
+        Err(ContractError {
+            code: crate::codes::METHOD_NOT_FOUND,
+            message: "atomic prepared sends are not supported by this bus".into(),
+        })
+    }
+    /// Resolve, authorize, and run `before_send` for a one-shot notification before daemon
+    /// lifecycle state is touched.
+    async fn prepare_notify(
+        &self,
+        _caller: &Caller,
+        _req: NotifySendRequest,
+    ) -> PortResult<PreparedBusSend> {
+        Err(ContractError {
+            code: crate::codes::METHOD_NOT_FOUND,
+            message: "atomic prepared notifications are not supported by this bus".into(),
+        })
+    }
+    /// Return the lifecycle hold target authenticated by the concrete preparation ledger.
+    /// Callers must never trust target data carried by or reconstructed from an opaque handle.
+    async fn prepared_hold_agent(
+        &self,
+        _caller: &Caller,
+        _prepared: &PreparedBusSend,
+    ) -> PortResult<Option<AgentId>> {
+        Err(ContractError {
+            code: crate::codes::METHOD_NOT_FOUND,
+            message: "atomic prepared sends are not supported by this bus".into(),
+        })
+    }
+    /// Commit exactly one preparation. Implementations must consume the opaque token without
+    /// resolving aliases or executing hooks again.
+    async fn commit_prepared(
+        &self,
+        _caller: &Caller,
+        _prepared: PreparedBusSend,
+    ) -> PortResult<Ack> {
+        Err(ContractError {
+            code: crate::codes::METHOD_NOT_FOUND,
+            message: "atomic prepared sends are not supported by this bus".into(),
+        })
+    }
+    /// Abandon an accepted preparation without committing any durable effect.
+    async fn discard_prepared(
+        &self,
+        _caller: &Caller,
+        _prepared: PreparedBusSend,
+    ) -> PortResult<()> {
+        Err(ContractError {
+            code: crate::codes::METHOD_NOT_FOUND,
+            message: "atomic prepared sends are not supported by this bus".into(),
+        })
+    }
     /// Resolve `to` and deliver (write message + in_flight rows + ring bells). Returns the `Ack`.
     async fn send(&self, caller: &Caller, req: SendRequest) -> PortResult<Ack>;
     /// Trusted internal-origin variant used by notification transports whose synthetic caller has
@@ -351,6 +444,14 @@ pub trait BusPort: Send + Sync {
             message: "one-shot notify is not supported by this bus".into(),
         })
     }
+    /// Resolve a one-shot notification before daemon lifecycle state is touched. A single-agent
+    /// target returns its immutable id so the caller can hold that exact runtime; fan-out targets
+    /// return `None` after successful validation.
+    async fn preflight_notify_target(
+        &self,
+        caller: &Caller,
+        target: &crate::notify::NotifyTarget,
+    ) -> PortResult<Option<crate::ids::AgentId>>;
     async fn create_thread(&self, caller: &Caller, req: CreateThreadRequest) -> PortResult<()>;
     async fn join_thread(&self, caller: &Caller, req: JoinThreadRequest) -> PortResult<()>;
     async fn leave_thread(&self, caller: &Caller, req: LeaveThreadRequest) -> PortResult<()>;

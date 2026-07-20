@@ -14,8 +14,8 @@ use nexus_contracts::{
 use nexus_notify::{Notify, RouteRule, RoutingRules};
 use nexus_store::command_kinds;
 use nexus_store::repos::{
-    AgentRuntimes, Agents, CommandIntents, NewCommandIntent, Notifications, Sessions, Sources,
-    Threads, Topics,
+    AgentRuntimes, Agents, CommandIntents, NewAgent, NewCommandIntent, Notifications, Sessions,
+    Sources, Threads, Topics,
 };
 use nexus_store::Store;
 
@@ -88,11 +88,13 @@ async fn message_post_command_intent_writes_canonical_bus_rows() {
         .register(human_register("Alex Morgan", "ck_operator"))
         .await
         .unwrap();
-    state
+    let blake = state
         .identity
         .register(human_register("Blake Human", "ck_blake"))
         .await
         .unwrap();
+    assert_eq!(alex.agent_id, None);
+    assert_eq!(blake.agent_id, None);
     let caller = state
         .identity
         .resolve("default", "Alex Morgan")
@@ -155,7 +157,8 @@ async fn message_post_command_intent_writes_canonical_bus_rows() {
         .store
         .conn
         .query(
-            "SELECT from_name, kind, to_name, body, provenance FROM messages \
+            "SELECT from_name, kind, to_name, body, provenance, from_agent_id, sender_session_id \
+             FROM messages \
              WHERE body = 'hello over command ingress'",
             (),
         )
@@ -169,13 +172,18 @@ async fn message_post_command_intent_writes_canonical_bus_rows() {
     let provenance: serde_json::Value =
         serde_json::from_str(&row.get::<String>(4).unwrap()).unwrap();
     assert_eq!(provenance["kind"], "human");
+    assert_eq!(row.get::<Option<String>>(5).unwrap(), None);
+    assert_eq!(
+        row.get::<Option<String>>(6).unwrap().as_deref(),
+        Some(alex.session_id.0.as_str())
+    );
 
     let mut rows = state
         .store
         .conn
         .query(
             &format!(
-                "SELECT COUNT(*) FROM in_flight WHERE message_id = '{}'",
+                "SELECT COUNT(*), COUNT(recipient_agent_id) FROM in_flight WHERE message_id = '{}'",
                 message_id.replace('\'', "''")
             ),
             (),
@@ -184,6 +192,20 @@ async fn message_post_command_intent_writes_canonical_bus_rows() {
         .unwrap();
     let row = rows.next().await.unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 1);
+    assert_eq!(row.get::<i64>(1).unwrap(), 0);
+    for table in ["agents", "agent_runtimes"] {
+        let mut rows = state
+            .store
+            .identity_conn()
+            .query(&format!("SELECT COUNT(*) FROM {table}"), ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            0,
+            "human thread participants must not materialize {table} rows"
+        );
+    }
 }
 
 #[tokio::test]
@@ -194,11 +216,13 @@ async fn message_post_command_intent_keeps_dm_fanout_internal() {
         .register(human_register("Alex Morgan", "ck_operator"))
         .await
         .unwrap();
-    state
+    let bianca = state
         .identity
         .register(human_register("Bianca", "ck_bianca"))
         .await
         .unwrap();
+    assert_eq!(alex.agent_id, None);
+    assert_eq!(bianca.agent_id, None);
 
     let request = SendRequest {
         to: SendTarget::dm_name("Bianca"),
@@ -240,6 +264,32 @@ async fn message_post_command_intent_keeps_dm_fanout_internal() {
     assert!(
         result.get("fanout").is_none(),
         "recipient fanout is daemon-owned bookkeeping, not a public result field"
+    );
+    let mut rows = state
+        .store
+        .conn
+        .query(
+            "SELECT from_name, from_agent_id, to_name, to_agent_id, provenance, \
+                    sender_session_id \
+             FROM messages WHERE body = 'fanout should count a live DM recipient'",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().expect("human DM message row");
+    assert_eq!(row.get::<String>(0).unwrap(), "Alex Morgan");
+    assert_eq!(row.get::<Option<String>>(1).unwrap(), None);
+    assert_eq!(
+        row.get::<Option<String>>(2).unwrap().as_deref(),
+        Some("Bianca")
+    );
+    assert_eq!(row.get::<Option<String>>(3).unwrap(), None);
+    let provenance: serde_json::Value =
+        serde_json::from_str(&row.get::<String>(4).unwrap()).unwrap();
+    assert_eq!(provenance["kind"], "human");
+    assert_eq!(
+        row.get::<Option<String>>(5).unwrap().as_deref(),
+        Some(alex.session_id.0.as_str())
     );
 }
 
@@ -1161,6 +1211,10 @@ async fn verified_notification_command_reclaim_reuses_the_routed_message_and_del
         "sha256=885609237a82d763d6361c1b7310be67ba6c194be50142dbca3006fb81f34607";
 
     let (mut state, mock) = test_state_with_notify_secret_and_mock().await;
+    Topics::new(&state.store)
+        .ensure("pub", "nexus")
+        .await
+        .unwrap();
     let recipient = state
         .launch_agent(
             SpawnRequest {
@@ -1329,8 +1383,24 @@ async fn verified_notification_command_reclaim_reuses_the_routed_message_and_del
         .unwrap();
     assert_eq!(
         rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
-        2,
-        "legacy audit rows are the documented non-atomic boundary"
+        1,
+        "command reclaim must retain one idempotent notification audit"
+    );
+    let mut rows = state
+        .store
+        .conn
+        .query(
+            "SELECT COUNT(*) FROM messages \
+             WHERE message_id LIKE 'm_notify_%' \
+               AND body = '{\"marker\":\"PUBLIC-NOTIFY-RECLAIM\"}'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        1,
+        "command reclaim must retain one standalone notification message"
     );
 }
 
@@ -1342,6 +1412,10 @@ async fn verified_notification_to_unreachable_target_is_terminal_without_retry()
         "sha256=4d0a64b97d5aa84576a6b4412f0f33d4a821dadb94ecad4b3ec66f4742b0aa72";
 
     let mut state = test_state_with_notify_secret().await;
+    Topics::new(&state.store)
+        .ensure("pub", "nexus")
+        .await
+        .unwrap();
     let recipient = state
         .identity
         .register(agent_register("dead-notify-recipient", "ck_dead_notify"))
@@ -1472,6 +1546,10 @@ async fn verified_notification_uses_pull_owner_and_reclaim_has_no_second_batch()
         "sha256=b221cf27dbd1fb000da3bac7bc8973490115623b0c7fdfa67a07e233952d6417";
 
     let mut state = test_state_with_notify_secret().await;
+    Topics::new(&state.store)
+        .ensure("pub", "nexus")
+        .await
+        .unwrap();
     let recipient = state
         .identity
         .register(agent_register("pull-notify-recipient", "ck_pull_notify"))
@@ -1708,6 +1786,98 @@ async fn invalid_verified_notification_envelope_creates_no_notification_state() 
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn verified_notification_rejects_ambiguous_routes_before_pub_or_ingest() {
+    const TIMESTAMP: i64 = 1_784_000_000_000;
+    const RAW_BODY: &str = r#"{"source":"ci","payload":{"marker":"PUBLIC-NOTIFY-RECLAIM"}}"#;
+    const SIGNATURE: &str =
+        "sha256=885609237a82d763d6361c1b7310be67ba6c194be50142dbca3006fb81f34607";
+
+    let mut state = test_state_with_notify_secret().await;
+    Topics::new(&state.store)
+        .ensure("pub", "nexus")
+        .await
+        .unwrap();
+    state
+        .store
+        .identity_conn()
+        .execute("DROP INDEX idx_agents_name_unique", ())
+        .await
+        .unwrap();
+    for (agent_id, project) in [("a_route_one", "one"), ("a_route_two", "two")] {
+        Agents::new(&state.store)
+            .create(NewAgent {
+                agent_id: agent_id.into(),
+                project: project.into(),
+                name: Some("ambiguous-route".into()),
+                default_harness: Some("claude".into()),
+                role: None,
+                tier: Some("agent".into()),
+                owner: None,
+            })
+            .await
+            .unwrap();
+    }
+    state.notify = Arc::new(Notify::new(
+        state.store.clone(),
+        state.bus.clone(),
+        Arc::new(state.ws.clone()),
+        RoutingRules::new(vec![RouteRule {
+            source: Some("ci".into()),
+            topic: None,
+            to: "ambiguous-route".into(),
+        }]),
+    ));
+    let request = NotifyCommandRequest {
+        raw_body: RAW_BODY.into(),
+        timestamp: TIMESTAMP.to_string(),
+        signature: SIGNATURE.into(),
+    };
+    CommandIntents::new(&state.store)
+        .insert_pending(NewCommandIntent {
+            command_id: "cmd_public_notify_ambiguous".into(),
+            kind: command_kinds::notification::NOTIFY.into(),
+            project: "metadata-only".into(),
+            caller_name: "ci".into(),
+            caller_session_id: Some("source:ci".into()),
+            caller_agent_id: None,
+            caller_runtime_id: Some("source:ci".into()),
+            caller_client_key: None,
+            caller_kind: Some("notification".into()),
+            caller_tier: Some("agent".into()),
+            idempotency_key: Some("notify:ambiguous-route".into()),
+            request_json: serde_json::to_string(&request).unwrap(),
+            created_at: TIMESTAMP,
+        })
+        .await
+        .unwrap();
+
+    assert!(command_worker::process_next(&state).await.unwrap());
+    let command = CommandIntents::new(&state.store)
+        .get("cmd_public_notify_ambiguous")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(command.status, "error");
+    let error = command.error_json.unwrap();
+    assert!(error.contains("ambiguous"), "unexpected error: {error}");
+    let mut rows = state
+        .store
+        .conn
+        .query(
+            "SELECT (SELECT COUNT(*) FROM notifications), \
+                    (SELECT COUNT(*) FROM messages), \
+                    (SELECT COUNT(*) FROM in_flight)",
+            (),
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 0);
+    assert_eq!(row.get::<i64>(1).unwrap(), 0);
+    assert_eq!(row.get::<i64>(2).unwrap(), 0);
 }
 
 #[tokio::test]

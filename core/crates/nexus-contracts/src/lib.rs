@@ -144,15 +144,17 @@ pub use notify::{
 };
 pub use ports::{
     AdminPort, AgentTurnExecutionPort, BusPort, Caller, ContractError, DispatchPort, EventSink,
-    IdentityPort, InjectError, InjectResult, NotifyPort, OperatorAction, PortResult, ProviderError,
-    ProviderLimit, ProviderLimitReason, RealtimePort, ResetHint, SearchPort,
+    IdentityPort, InjectError, InjectResult, NotifyPort, OperatorAction, PortResult,
+    PreparedBusSend, ProviderError, ProviderLimit, ProviderLimitReason, RealtimePort, ResetHint,
+    SearchPort,
 };
 pub use project::{Project, RegisterProjectRequest, RegisterProjectResponse};
 pub use prompt::{
     CommandExpectedRevision, CommandQueueAction, CommandQueueEntry, CommandQueueMutationRequest,
     CommandQueueMutationResponse, CommandQueueReceipt, CommandQueueSnapshot, CommandQueueState,
-    CommandQueueTransition, CompactRequest, CompactResponse, PromptRequest, PromptResponse,
-    SteerCapability, SteerDelivery, SteerRequest, SteerResponse, WarmRequest, WarmResponse,
+    CommandQueueTransition, CompactRequest, CompactResponse, InterruptRequest, InterruptResponse,
+    PromptRequest, PromptResponse, SteerCapability, SteerDelivery, SteerRequest, SteerResponse,
+    WarmRequest, WarmResponse,
 };
 pub use register::{
     HeartbeatRequest, HeartbeatResponse, MemberListRequest, MemberListResponse, MemberSummary,

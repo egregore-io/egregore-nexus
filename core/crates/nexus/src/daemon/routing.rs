@@ -32,12 +32,13 @@ use nexus_contracts::{
     DlqRequeueRequest, GrantTierRequest, HistoryRequest, InboxSubscribeRequest,
     InboxSubscribeResponse, InboxSubscriptionAckRequest, InboxSubscriptionBatch,
     InboxSubscriptionNextRequest, InboxSubscriptionNextResponse, InboxSubscriptionStatusResponse,
-    InboxUnsubscribeRequest, JoinThreadRequest, LeaveThreadRequest, MemberListRequest,
-    MessageMetadataMergeRequest, MetadataSetRequest, MonitorRequest, NexusBatch, NotifyRequest,
-    NotifySendRequest, NotifyTarget, PushRequest, ReadRequest, RegisterRequest, RemoveRequest,
-    RemoveResponse, RenameThreadRequest, Request, Response, RouteForwardRequest, RpcError,
-    SearchRequest, SendRequest, SourceRef, SourceRegisterRequest, SpawnRequest, StatusRequest,
-    SteerRequest, SubscribeRequest, ThreadMembersRequest, Tier, UnsubscribeRequest, WsEvent,
+    InboxUnsubscribeRequest, InterruptRequest, InterruptResponse, JoinThreadRequest,
+    LeaveThreadRequest, MemberListRequest, MessageMetadataMergeRequest, MetadataSetRequest,
+    MonitorRequest, NexusBatch, NotifyRequest, NotifySendRequest, NotifyTarget, PushRequest,
+    ReadRequest, RegisterRequest, RemoveRequest, RemoveResponse, RenameThreadRequest, Request,
+    Response, RouteForwardRequest, RpcError, SearchRequest, SendRequest, SourceRef,
+    SourceRegisterRequest, SpawnRequest, StatusRequest, SteerRequest, SubscribeRequest,
+    ThreadMembersRequest, Tier, UnsubscribeRequest, WsEvent,
 };
 use nexus_store::repos::{
     caller_subscription_id, subscription_now, Agents, DeadLetterFilter, DeadLetterMutation,
@@ -139,28 +140,6 @@ async fn notify_thread_add(
         .map_err(|e| contract_to_rpc(&e))
 }
 
-async fn prompt_target_row(
-    state: &AppState,
-    project: &str,
-    name: &str,
-) -> Result<SessionRow, RpcError> {
-    let sessions = Sessions::new(&state.store);
-    match sessions
-        .find_by_name(project, name)
-        .await
-        .map_err(|e| contract_to_rpc(&e.to_contract_error()))?
-    {
-        Some(row) => Ok(row),
-        None => sessions
-            .find_by_name_any_project(name)
-            .await
-            .map_err(|e| contract_to_rpc(&e.to_contract_error()))?
-            .ok_or_else(|| {
-                invalid_params(format!("prompt target {name} was not found after revive"))
-            }),
-    }
-}
-
 async fn prompt_target_row_by_session(
     state: &AppState,
     session: &nexus_contracts::SessionId,
@@ -177,9 +156,8 @@ async fn prompt_target_row_by_session(
         })
 }
 
-async fn ensure_alive_agent_in_caller_project(
+async fn ensure_alive_agent_by_id(
     state: &AppState,
-    caller: &Caller,
     agent_id: &nexus_contracts::AgentId,
 ) -> Result<nexus_contracts::SessionId, RpcError> {
     let agent = Agents::new(&state.store)
@@ -192,15 +170,6 @@ async fn ensure_alive_agent_in_caller_project(
                     .to_contract_error(),
             )
         })?;
-    if agent.project != caller.project {
-        return Err(contract_to_rpc(
-            &NexusError::NotFound(format!(
-                "agent id {} does not exist in project {}",
-                agent_id.0, caller.project
-            ))
-            .to_contract_error(),
-        ));
-    }
     state
         .ensure_alive_agent(&agent.agent_id)
         .await
@@ -388,6 +357,17 @@ async fn inbox_subscribe(
     caller: &Caller,
     req: InboxSubscribeRequest,
 ) -> Result<InboxSubscribeResponse, RpcError> {
+    if let Some(row) = Sessions::new(&state.store)
+        .find_by_session_id(&caller.session)
+        .await
+        .map_err(|error| contract_to_rpc(&error.to_contract_error()))?
+    {
+        if row.kind == "agent" && !AppState::is_externally_drained_session(&row) {
+            return Err(invalid_params(
+                "managed agent inbox is daemon-owned; use automatic delivery instead of inbox.subscribe",
+            ));
+        }
+    }
     let subscription_id = caller_subscription_id(&caller.project, &caller.session.0);
     InboxSubscriptions::new(&state.store)
         .upsert_active(NewInboxSubscription {
@@ -519,6 +499,18 @@ async fn session_client_key(state: &AppState, caller: &Caller) -> Result<Option<
         .and_then(|row| row.client_key))
 }
 
+async fn authenticated_caller_kind(state: &AppState, caller: &Caller) -> Result<String, RpcError> {
+    if caller.session.0 == crate::local_operator::LOCAL_OPERATOR_SESSION_ID {
+        return Ok("human".into());
+    }
+    Ok(Sessions::new(&state.store)
+        .find_by_session_id(&caller.session)
+        .await
+        .map_err(|e| contract_to_rpc(&e.to_contract_error()))?
+        .map(|row| row.kind)
+        .unwrap_or_else(|| "agent".into()))
+}
+
 async fn require_owned_subscription(
     repo: &InboxSubscriptions<'_>,
     caller: &Caller,
@@ -529,7 +521,7 @@ async fn require_owned_subscription(
         .await
         .map_err(|e| contract_to_rpc(&e.to_contract_error()))?
         .ok_or_else(|| invalid_params(format!("subscription {subscription_id} not found")))?;
-    if row.project != caller.project || row.caller_session_id != caller.session.0 {
+    if row.caller_session_id != caller.session.0 {
         return Err(unauthorized("subscription belongs to a different caller"));
     }
     if row.status != "active" {
@@ -855,16 +847,13 @@ async fn route_request_inner(
             let r: nexus_contracts::PromptRequest = parse(p)?;
             // Revive the agent via the correct backend for its transport (pty or acp), then inject.
             let session = match r.agent_id.as_ref() {
-                Some(agent_id) => ensure_alive_agent_in_caller_project(state, c, agent_id).await,
+                Some(agent_id) => ensure_alive_agent_by_id(state, agent_id).await,
                 None => state
                     .ensure_alive(&r.name, &c.project)
                     .await
                     .map_err(|e| contract_to_rpc(&e)),
             }?;
-            let row = match r.agent_id.as_ref() {
-                Some(_) => prompt_target_row_by_session(state, &session).await?,
-                None => prompt_target_row(state, &c.project, &r.name).await?,
-            };
+            let row = prompt_target_row_by_session(state, &session).await?;
             match prompt_slash_action(&row, &r.text).map_err(|e| contract_to_rpc(&e))? {
                 Some(PromptSlashAction::NativeCompact) => {
                     state
@@ -879,6 +868,7 @@ async fn route_request_inner(
                 }
                 Some(PromptSlashAction::PromptVerbatim) | None => {}
             }
+            let caller_kind = authenticated_caller_kind(state, c).await?;
             state
                 .agent
                 .prompt_observed(
@@ -891,6 +881,8 @@ async fn route_request_inner(
                         data: json!({
                             "text": r.text,
                             "clientMessageId": r.client_message_id,
+                            "name": c.name,
+                            "kind": caller_kind,
                         }),
                     },
                 )
@@ -906,16 +898,14 @@ async fn route_request_inner(
             let c = require(caller)?;
             let r: SteerRequest = parse(p)?;
             let session = match r.agent_id.as_ref() {
-                Some(agent_id) => ensure_alive_agent_in_caller_project(state, c, agent_id).await,
+                Some(agent_id) => ensure_alive_agent_by_id(state, agent_id).await,
                 None => state
                     .ensure_alive(&r.name, &c.project)
                     .await
                     .map_err(|e| contract_to_rpc(&e)),
             }?;
-            let row = match r.agent_id.as_ref() {
-                Some(_) => prompt_target_row_by_session(state, &session).await?,
-                None => prompt_target_row(state, &c.project, &r.name).await?,
-            };
+            prompt_target_row_by_session(state, &session).await?;
+            let caller_kind = authenticated_caller_kind(state, c).await?;
             let response = state
                 .agent
                 .steer_observed(
@@ -929,13 +919,34 @@ async fn route_request_inner(
                             "text": r.text,
                             "clientMessageId": r.client_message_id,
                             "source": "steer",
-                            "name": row.name,
+                            "name": c.name,
+                            "kind": caller_kind,
                         }),
                     },
                 )
                 .await
                 .map_err(|e| contract_to_rpc(&e))?;
             Ok(serde_json::to_value(response).unwrap())
+        }
+        // EXPLICIT active-turn stop. Unlike steer this never injects replacement text; the
+        // adapter owns the correct interrupt mechanism for native and headed transports.
+        "interrupt" => {
+            let c = require(caller)?;
+            let r: InterruptRequest = parse(p)?;
+            let session = match r.agent_id.as_ref() {
+                Some(agent_id) => ensure_alive_agent_by_id(state, agent_id).await,
+                None => state
+                    .ensure_alive(&r.name, &c.project)
+                    .await
+                    .map_err(|e| contract_to_rpc(&e)),
+            }?;
+            prompt_target_row_by_session(state, &session).await?;
+            state
+                .agent
+                .interrupt_active_turn(&session)
+                .await
+                .map_err(|e| contract_to_rpc(&e))?;
+            Ok(serde_json::to_value(InterruptResponse { interrupted: true }).unwrap())
         }
         // NATIVE context compaction — same resolve+revive spine as `prompt`, but the
         // transport runs the REAL operation (codex `thread/compact/start`; headed PTY
@@ -945,7 +956,7 @@ async fn route_request_inner(
             let c = require(caller)?;
             let r: nexus_contracts::CompactRequest = parse(p)?;
             let session = match r.agent_id.as_ref() {
-                Some(agent_id) => ensure_alive_agent_in_caller_project(state, c, agent_id).await,
+                Some(agent_id) => ensure_alive_agent_by_id(state, agent_id).await,
                 None => state
                     .ensure_alive(&r.name, &c.project)
                     .await
@@ -967,7 +978,7 @@ async fn route_request_inner(
             let c = require(caller)?;
             let r: nexus_contracts::WarmRequest = parse(p)?;
             match r.agent_id.as_ref() {
-                Some(agent_id) => ensure_alive_agent_in_caller_project(state, c, agent_id).await,
+                Some(agent_id) => ensure_alive_agent_by_id(state, agent_id).await,
                 None => state
                     .ensure_alive(&r.name, &c.project)
                     .await
@@ -1312,12 +1323,12 @@ async fn route_request_inner(
         "admin.evict" => {
             let c = require_admin(caller)?;
             let r: RemoveRequest = parse(p)?;
-            state
-                .evict_agent(&r.name, &c.project)
+            let name = state
+                .evict_agent(r.agent_id.as_ref(), &r.name, &c.project)
                 .await
                 .map_err(|e| contract_to_rpc(&e))?;
             Ok(serde_json::to_value(RemoveResponse {
-                name: Some(r.name),
+                name: Some(name),
                 status: "evicted".into(),
             })
             .unwrap())

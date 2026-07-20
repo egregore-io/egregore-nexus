@@ -185,9 +185,10 @@ impl<'a> Agents<'a> {
     ///
     /// Stable-identity edge resolution rules:
     /// 1. `a_*` ids resolve directly; a missing id is a loud [`NexusError::NotFound`].
-    /// 2. Names resolve project-scoped in `project`.
-    /// 3. `any_project` is an explicit legacy opt-in for direct-address paths: it may widen the
-    ///    search, but MUST fail loudly on cross-project ambiguity instead of guessing.
+    /// 2. Canonical direct-address paths set `any_project`; names then resolve globally and MUST
+    ///    fail loudly on legacy cross-project ambiguity instead of preferring local metadata.
+    /// 3. Metadata-management paths may retain an explicitly project-scoped lookup by leaving
+    ///    `any_project` false.
     pub async fn resolve_ref(
         &self,
         project: &str,
@@ -200,14 +201,15 @@ impl<'a> Agents<'a> {
                 .await?
                 .ok_or_else(|| NexusError::NotFound(format!("agent id {id} does not exist"))),
             AgentRef::Name(name) => {
-                if let Some(row) = self.find_by_project_name(project, name).await? {
-                    return Ok(row);
-                }
                 if !any_project {
-                    return Err(NexusError::NotFound(format!(
-                        "agent named {name:?} does not exist in project {project:?} \
-                         (pass an a_* id or the owning project for cross-project addresses)"
-                    )));
+                    return self
+                        .find_by_project_name(project, name)
+                        .await?
+                        .ok_or_else(|| {
+                            NexusError::NotFound(format!(
+                                "agent named {name:?} does not exist in project {project:?}"
+                            ))
+                        });
                 }
                 let mut matches = self.find_all_by_name(name).await?;
                 match matches.len() {
@@ -242,6 +244,18 @@ impl<'a> Agents<'a> {
     /// Roles are display metadata only; policy and routing must not read this field for
     /// authorization or fan-out decisions.
     pub async fn set_role(&self, agent_id: &str, role: &str) -> Result<(), NexusError> {
+        self.set_role_value(agent_id, Some(role)).await
+    }
+
+    /// Set or clear the durable display role by stable id.
+    ///
+    /// The nullable form is used by split-authority compensation so a failed second write can
+    /// restore the exact pre-call value rather than inventing a replacement label.
+    pub async fn set_role_value(
+        &self,
+        agent_id: &str,
+        role: Option<&str>,
+    ) -> Result<(), NexusError> {
         self.store
             .identity_conn()
             .execute(

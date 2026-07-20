@@ -18,26 +18,35 @@ impl AppState {
         name_or_id: &str,
         project: &str,
     ) -> Result<SessionId, nexus_contracts::ContractError> {
-        match Agents::new(&self.store)
-            .resolve_ref(project, &AgentRef::parse(name_or_id), true)
+        let agents = Agents::new(&self.store);
+        let parsed = AgentRef::parse(name_or_id);
+        if let AgentRef::Id(agent_id) = &parsed {
+            if agents
+                .find_by_id(agent_id)
+                .await
+                .map_err(|error| error.to_contract_error())?
+                .is_some()
+            {
+                return self.ensure_alive_agent(agent_id).await;
+            }
+        }
+        match agents
+            .resolve_ref("", &AgentRef::Name(name_or_id.to_string()), true)
             .await
         {
             Ok(agent) => match self.ensure_alive_agent(&agent.agent_id).await {
                 Ok(session) => Ok(session),
-                Err(e)
-                    if e.code == nexus_contracts::codes::NOT_FOUND
-                        && !name_or_id.starts_with("a_") =>
-                {
+                Err(error) if error.code == nexus_contracts::codes::NOT_FOUND => {
                     let row = self.resolve_session_by_name(name_or_id, project).await?;
                     self.ensure_alive_row(row).await
                 }
-                Err(e) => Err(e),
+                Err(error) => Err(error),
             },
-            Err(_) if !name_or_id.starts_with("a_") => {
+            Err(NexusError::NotFound(_)) => {
                 let row = self.resolve_session_by_name(name_or_id, project).await?;
                 self.ensure_alive_row(row).await
             }
-            Err(e) => Err(e.to_contract_error()),
+            Err(error) => Err(error.to_contract_error()),
         }
     }
 
@@ -103,10 +112,11 @@ impl AppState {
     pub async fn teardown_harness(&self, name: &str, project: &str) {
         use nexus_store::repos::Sessions;
         let sessions = Sessions::new(&self.store);
-        let row = match sessions.find_by_name(project, name).await {
-            Ok(Some(r)) => Some(r),
-            _ => sessions.find_by_name_any_project(name).await.ok().flatten(),
-        };
+        let row = sessions
+            .find_unique_by_name_any_project(name)
+            .await
+            .ok()
+            .flatten();
         if let Some(row) = row.as_ref() {
             self.teardown_harness_row(row).await;
             return;

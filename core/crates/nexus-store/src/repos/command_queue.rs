@@ -48,7 +48,11 @@ struct QueueTarget<'a> {
 impl<'a> QueueTarget<'a> {
     fn from_request(request: &'a CommandQueueMutationRequest) -> Self {
         Self {
-            name: Some(request.name.trim()),
+            name: request
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty()),
             agent_id: request.agent_id.as_ref().map(|id| id.0.as_str()),
         }
     }
@@ -129,6 +133,7 @@ impl<'a> CommandQueue<'a> {
     }
 
     /// Apply one idempotent compare-and-set mutation under the store's single write transaction.
+    /// `project` is retained only as audit metadata; command identity and queue cursors are global.
     pub async fn mutate(
         &self,
         project: &str,
@@ -147,8 +152,15 @@ impl<'a> CommandQueue<'a> {
         now: i64,
         active_sessions: &[SessionId],
     ) -> Result<CommandQueueMutationOutcome, NexusError> {
-        if request.name.trim().is_empty() {
-            return Ok(error_outcome(request, "name is required", 400));
+        if request
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .is_none()
+            && request.agent_id.is_none()
+        {
+            return Ok(error_outcome(request, "name or agentId is required", 400));
         }
         if request.client_mutation_id.trim().is_empty() {
             return Ok(error_outcome(request, "clientMutationId is required", 400));
@@ -163,7 +175,7 @@ impl<'a> CommandQueue<'a> {
             .begin_identity_write_txn("command_queue_mutation")
             .await?;
 
-        if let Some(previous) = replay(&tx, project, request, &canonical).await? {
+        if let Some(previous) = replay(&tx, request, &canonical).await? {
             tx.commit().await?;
             return Ok(previous);
         }
@@ -176,8 +188,7 @@ impl<'a> CommandQueue<'a> {
         )
         .await?;
 
-        let (outcome, effect) =
-            apply_mutation(&tx, project, request, target, now, &runtime).await?;
+        let (outcome, effect) = apply_mutation(&tx, request, target, now, &runtime).await?;
         let response_json = serde_json::to_string(&outcome.body).map_err(store_msg)?;
         tx.execute(
             "UPDATE command_queue_mutations SET response_status = ?1, response_json = ?2 \
@@ -205,15 +216,14 @@ impl<'a> CommandQueue<'a> {
 
 async fn replay(
     tx: &WriteTxn,
-    project: &str,
     request: &CommandQueueMutationRequest,
     canonical: &Value,
 ) -> Result<Option<CommandQueueMutationOutcome>, NexusError> {
     let mut rows = tx
         .query(
             "SELECT request_json, response_status, response_json FROM command_queue_mutations \
-             WHERE project = ?1 AND client_mutation_id = ?2 LIMIT 1",
-            params![project, request.client_mutation_id.as_str()],
+             WHERE client_mutation_id = ?1 ORDER BY created_at LIMIT 1",
+            params![request.client_mutation_id.as_str()],
         )
         .await?;
     let Some(row) = rows.next().await.map_err(store_err)? else {
@@ -250,9 +260,12 @@ async fn target_runtime(
 ) -> Result<TargetRuntime, NexusError> {
     let sessions = Sessions::new(store);
     let session = match target.agent_id {
-        Some(agent_id) => sessions.find_by_agent_id(agent_id).await?,
+        Some(agent_id) => match sessions.active_runtime_session_for_agent(agent_id).await? {
+            Some(session) => Some(session),
+            None => sessions.find_by_agent_id(agent_id).await?,
+        },
         None => match target.name {
-            Some(name) => sessions.find_by_name_any_project(name).await?,
+            Some(name) => sessions.find_unique_by_name_any_project(name).await?,
             None => None,
         },
     };
@@ -411,8 +424,12 @@ async fn queue_events_after(
     }
     let mut rows = identity
         .query(
-            "SELECT seq, session_id, command_id, client_message_id, state, mode, revision \
-             FROM command_intent_events WHERE seq > ?1 ORDER BY seq LIMIT 500",
+            "SELECT e.seq, e.session_id, e.command_id, e.client_message_id, \
+                    c.kind, c.caller_name, c.caller_session_id, c.caller_agent_id, \
+                    c.caller_kind, e.state, e.mode, e.revision \
+             FROM command_intent_events e \
+             JOIN command_intents c ON c.command_id = e.command_id \
+             WHERE e.seq > ?1 ORDER BY e.seq LIMIT 500",
             params![after_seq],
         )
         .await
@@ -424,9 +441,14 @@ async fn queue_events_after(
             session_id: get_opt_text(&row, 1)?,
             command_id: get_text(&row, 2)?,
             client_message_id: get_opt_text(&row, 3)?,
-            state: command_queue_event_state(&get_text(&row, 4)?),
-            mode: get_text(&row, 5)?,
-            revision: get_opt_int(&row, 6)?.unwrap_or_default(),
+            command_kind: get_text(&row, 4)?,
+            caller_name: get_text(&row, 5)?,
+            caller_session_id: get_opt_text(&row, 6)?,
+            caller_agent_id: get_opt_text(&row, 7)?.map(AgentId),
+            caller_kind: get_opt_text(&row, 8)?,
+            state: command_queue_event_state(&get_text(&row, 9)?),
+            mode: get_text(&row, 10)?,
+            revision: get_opt_int(&row, 11)?.unwrap_or_default(),
         });
     }
     Ok(CommandQueueEventsPage {
@@ -463,7 +485,6 @@ fn command_queue_event_state(state: &str) -> CommandQueueState {
 
 async fn apply_mutation(
     tx: &WriteTxn,
-    project: &str,
     request: &CommandQueueMutationRequest,
     target: QueueTarget<'_>,
     now: i64,
@@ -493,22 +514,22 @@ async fn apply_mutation(
                     QueueEffect::None,
                 ));
             }
-            if !command_matches_target(tx, project, command_id, target, runtime).await? {
+            if !command_matches_target(tx, command_id, target, runtime).await? {
                 return Ok((cas_conflict(request), QueueEffect::None));
             }
             let changed = tx
                 .execute(
                     "UPDATE command_intents SET kind = ?1, revision = revision + 1 \
-                     WHERE command_id = ?2 AND project = ?3 AND kind = ?4 \
-                       AND status = 'pending' AND revision = ?5",
-                    params![STEER, command_id, project, PROMPT, expected_revision],
+                     WHERE command_id = ?2 AND kind = ?3 \
+                       AND status = 'pending' AND revision = ?4",
+                    params![STEER, command_id, PROMPT, expected_revision],
                 )
                 .await?;
             if changed != 1 {
                 return Ok((cas_conflict(request), QueueEffect::None));
             }
-            let revision = command_revision(tx, project, command_id).await?;
-            let seq = latest_queue_seq(tx, project).await?;
+            let revision = command_revision(tx, command_id).await?;
+            let seq = latest_queue_seq(tx).await?;
             Ok((
                 success_outcome(request, runtime, CommandQueueState::Queued, seq, revision),
                 QueueEffect::WakeRedirect,
@@ -521,22 +542,22 @@ async fn apply_mutation(
                     QueueEffect::None,
                 ));
             };
-            if !command_matches_target(tx, project, command_id, target, runtime).await? {
+            if !command_matches_target(tx, command_id, target, runtime).await? {
                 return Ok((cas_conflict(request), QueueEffect::None));
             }
             let changed = tx
                 .execute(
                     "UPDATE command_intents SET status = 'cancelled', revision = revision + 1, \
-                     completed_at = ?1, lease_until = NULL WHERE command_id = ?2 AND project = ?3 \
-                       AND kind = ?4 AND status = 'pending' AND revision = ?5",
-                    params![now, command_id, project, PROMPT, expected_revision],
+                     completed_at = ?1, lease_until = NULL WHERE command_id = ?2 \
+                       AND kind = ?3 AND status = 'pending' AND revision = ?4",
+                    params![now, command_id, PROMPT, expected_revision],
                 )
                 .await?;
             if changed != 1 {
                 return Ok((cas_conflict(request), QueueEffect::None));
             }
-            let revision = command_revision(tx, project, command_id).await?;
-            let seq = latest_queue_seq(tx, project).await?;
+            let revision = command_revision(tx, command_id).await?;
+            let seq = latest_queue_seq(tx).await?;
             Ok((
                 success_outcome(
                     request,
@@ -574,34 +595,33 @@ async fn apply_mutation(
                     QueueEffect::None,
                 ));
             };
-            if !command_matches_target(tx, project, command_id, target, runtime).await? {
+            if !command_matches_target(tx, command_id, target, runtime).await? {
                 return Ok((cas_conflict(request), QueueEffect::None));
             }
             let changed = tx
                 .execute(
                     "UPDATE command_intents SET request_json = json_set(request_json, '$.text', ?1), \
-                     revision = revision + 1 WHERE command_id = ?2 AND project = ?3 AND kind = ?4 \
-                       AND status = 'pending' AND revision = ?5",
-                    params![text, command_id, project, PROMPT, expected_revision],
+                     revision = revision + 1 WHERE command_id = ?2 AND kind = ?3 \
+                       AND status = 'pending' AND revision = ?4",
+                    params![text, command_id, PROMPT, expected_revision],
                 )
                 .await?;
             if changed != 1 {
                 return Ok((cas_conflict(request), QueueEffect::None));
             }
-            let revision = command_revision(tx, project, command_id).await?;
-            let seq = latest_queue_seq(tx, project).await?;
+            let revision = command_revision(tx, command_id).await?;
+            let seq = latest_queue_seq(tx).await?;
             Ok((
                 success_outcome(request, runtime, CommandQueueState::Queued, seq, revision),
                 QueueEffect::None,
             ))
         }
-        CommandQueueAction::Reorder => reorder(tx, project, request, target, runtime).await,
+        CommandQueueAction::Reorder => reorder(tx, request, target, runtime).await,
     }
 }
 
 async fn reorder(
     tx: &WriteTxn,
-    project: &str,
     request: &CommandQueueMutationRequest,
     target: QueueTarget<'_>,
     runtime: &TargetRuntime,
@@ -632,14 +652,14 @@ async fn reorder(
 
     let mut created_at = Vec::with_capacity(request.command_ids.len());
     for command_id in &request.command_ids {
-        if !command_matches_target(tx, project, command_id, target, runtime).await? {
+        if !command_matches_target(tx, command_id, target, runtime).await? {
             return Ok((reorder_conflict(request), QueueEffect::None));
         }
         let mut rows = tx
             .query(
                 "SELECT created_at, revision FROM command_intents WHERE command_id = ?1 \
-                 AND project = ?2 AND kind = ?3 AND status = 'pending' LIMIT 1",
-                params![command_id.as_str(), project, PROMPT],
+                 AND kind = ?2 AND status = 'pending' LIMIT 1",
+                params![command_id.as_str(), PROMPT],
             )
             .await?;
         let Some(row) = rows.next().await.map_err(store_err)? else {
@@ -660,12 +680,11 @@ async fn reorder(
         let changed = tx
             .execute(
                 "UPDATE command_intents SET created_at = ?1, revision = revision + 1 \
-                 WHERE command_id = ?2 AND project = ?3 AND kind = ?4 \
-                   AND status = 'pending' AND revision = ?5",
+                 WHERE command_id = ?2 AND kind = ?3 \
+                   AND status = 'pending' AND revision = ?4",
                 params![
                     base + i64::try_from(index).map_err(store_msg)?,
                     command_id.as_str(),
-                    project,
                     PROMPT,
                     expected[command_id.as_str()]
                 ],
@@ -675,7 +694,7 @@ async fn reorder(
             return Ok((reorder_revision_conflict(request), QueueEffect::None));
         }
     }
-    let seq = latest_queue_seq(tx, project).await?;
+    let seq = latest_queue_seq(tx).await?;
     Ok((
         success_outcome(request, runtime, CommandQueueState::Queued, seq, None),
         QueueEffect::None,
@@ -684,15 +703,14 @@ async fn reorder(
 
 async fn command_matches_target(
     tx: &WriteTxn,
-    project: &str,
     command_id: &str,
     target: QueueTarget<'_>,
     runtime: &TargetRuntime,
 ) -> Result<bool, NexusError> {
     let mut rows = tx
         .query(
-            "SELECT request_json FROM command_intents WHERE command_id = ?1 AND project = ?2 LIMIT 1",
-            params![command_id, project],
+            "SELECT request_json FROM command_intents WHERE command_id = ?1 LIMIT 1",
+            params![command_id],
         )
         .await?;
     let Some(row) = rows.next().await.map_err(store_err)? else {
@@ -728,15 +746,11 @@ async fn command_matches_target(
         .unwrap_or(false))
 }
 
-async fn command_revision(
-    tx: &WriteTxn,
-    project: &str,
-    command_id: &str,
-) -> Result<Option<i64>, NexusError> {
+async fn command_revision(tx: &WriteTxn, command_id: &str) -> Result<Option<i64>, NexusError> {
     let mut rows = tx
         .query(
-            "SELECT revision FROM command_intents WHERE project = ?1 AND command_id = ?2",
-            params![project, command_id],
+            "SELECT revision FROM command_intents WHERE command_id = ?1",
+            params![command_id],
         )
         .await?;
     match rows.next().await.map_err(store_err)? {
@@ -745,11 +759,11 @@ async fn command_revision(
     }
 }
 
-async fn latest_queue_seq(tx: &WriteTxn, project: &str) -> Result<i64, NexusError> {
+async fn latest_queue_seq(tx: &WriteTxn) -> Result<i64, NexusError> {
     let mut rows = tx
         .query(
-            "SELECT COALESCE(MAX(seq), 0) FROM command_intent_events WHERE project = ?1",
-            params![project],
+            "SELECT COALESCE(MAX(seq), 0) FROM command_intent_events",
+            (),
         )
         .await?;
     match rows.next().await.map_err(store_err)? {
@@ -770,7 +784,7 @@ fn canonical_request(request: &CommandQueueMutationRequest) -> Result<Value, Nex
     let mut expected = request.expected_revisions.clone();
     expected.sort_by(|left, right| left.command_id.cmp(&right.command_id));
     Ok(json!({
-        "name": request.name.trim(),
+        "name": request.name.as_deref().map(str::trim),
         "agentId": request.agent_id,
         "action": serde_json::to_value(request.action).map_err(store_msg)?,
         "commandId": request.command_id,

@@ -27,13 +27,13 @@ use nexus_contracts::register::{
     Whoami,
 };
 use nexus_store::repos::{
-    AgentCredentials, AgentRuntimes, Agents, DeveloperEvents, IdentitySessions, NewAgent,
+    AgentCredentials, AgentRef, AgentRuntimes, Agents, DeveloperEvents, IdentitySessions, NewAgent,
     NewAgentRuntime, NewDeveloperEvent, Sessions, AGENT_LIFECYCLE_TOPIC,
 };
 use nexus_store::types::{AgentRow, SessionRow};
 use nexus_store::Store;
 
-use crate::binding::{assert_project, caller_from_row, is_live, tier_str, whoami_from_row};
+use crate::binding::{caller_from_row, is_live, kind_str, tier_str, whoami_from_row};
 use crate::error::to_port;
 use crate::presence::{is_stale, presence_for_state, presence_from_str};
 use crate::registry::{resolve_register, RegisterOutcome};
@@ -74,6 +74,11 @@ pub struct Identity {
     heartbeat_ttl_ms: i64,
 }
 
+struct PreparedAgentRegistration {
+    agent: AgentRow,
+    credential_id: String,
+}
+
 impl Identity {
     /// Build an identity service over the shared store + event sink, taking the heartbeat TTL from
     /// [`Config`]. A stale heartbeat (older than the TTL) reports the member as `offline`.
@@ -85,23 +90,30 @@ impl Identity {
         }
     }
 
-    /// Load the caller's current row, asserting it still belongs to the caller's project.
+    /// Load the authenticated caller's current row by immutable identity/session first.
+    /// Project and display name are mutable metadata and cannot redirect an authenticated caller.
     async fn row_for(&self, caller: &Caller) -> Result<SessionRow, NexusError> {
+        let repo = Sessions::new(&self.store);
+        // A persisted human/app session is authoritative over any pre-fix `agent_id` residue in
+        // the caller shape. Stable agent ids still select the current runtime for real agents,
+        // but can never turn a non-agent session into an agent principal.
+        if let Some(row) = repo.find_by_session_id(&caller.session).await? {
+            if row.kind != "agent" {
+                return Ok(row);
+            }
+        }
         if let Some(agent_id) = caller.agent_id.as_ref() {
-            let row = self
+            return self
                 .session_for_agent_id(&agent_id.0)
                 .await?
-                .ok_or_else(|| NexusError::NotFound(format!("agent id {}", agent_id.0)))?;
-            assert_project(&row, &caller.project)?;
+                .ok_or_else(|| NexusError::NotFound(format!("agent id {}", agent_id.0)));
+        }
+        if let Some(row) = repo.find_by_session_id(&caller.session).await? {
             return Ok(row);
         }
-        let repo = Sessions::new(&self.store);
-        let row = repo
-            .find_by_name(&caller.project, &caller.name)
+        repo.find_unique_by_name_any_project(&caller.name)
             .await?
-            .ok_or_else(|| NexusError::NotFound(caller.name.clone()))?;
-        assert_project(&row, &caller.project)?;
-        Ok(row)
+            .ok_or_else(|| NexusError::NotFound(caller.name.clone()))
     }
 
     /// Rebind a resumed session to a possibly-new `harness_session_id` (and refresh its
@@ -111,38 +123,45 @@ impl Identity {
         row: &SessionRow,
         req: &RegisterRequest,
     ) -> Result<(), NexusError> {
+        let canonical_name = req.agent_id.as_ref().and(req.name.as_deref());
         // Persist the (possibly new) harness binding + client_key + back-online presence in one
         // statement via the store connection (the daemon is the sole writer).
         self.store
             .conn
             .execute(
                 "UPDATE sessions SET harness_session_id = ?2, client_key = ?3, agent = ?4, \
-                 tier = ?5, presence = 'online', last_heartbeat = ?6 WHERE session_id = ?1",
+                 tier = ?5, presence = 'online', last_heartbeat = ?6, \
+                 agent_id = CASE WHEN kind = 'agent' THEN agent_id ELSE NULL END, \
+                 name = CASE WHEN ?7 IS NULL THEN name ELSE ?7 END \
+                 WHERE session_id = ?1",
                 libsql::params![
                     row.session_id.0.clone(),
                     req.harness_session_id.clone(),
                     req.client_key.clone(),
                     req.harness.as_str().to_string(),
                     tier_str(req.tier).to_string(),
-                    now()
+                    now(),
+                    canonical_name
                 ],
             )
             .await
             .map_err(|e| NexusError::Store(e.to_string()))?;
-        if let Some(name) = row.name.as_deref() {
-            if let Err(error) = DeveloperEvents::new(&self.store)
-                .append_agent_lifecycle(name, &row.session_id, "started", None, now())
-                .await
-            {
-                tracing::warn!(
-                    target: "nexus::identity",
-                    name = name,
-                    session = %row.session_id,
-                    error = ?error,
-                    "failed to append resume-started lifecycle telemetry"
-                );
-            } else {
-                self.store.events().session_lifecycle_changed().signal();
+        if row.kind == "agent" {
+            if let Some(name) = row.name.as_deref() {
+                if let Err(error) = DeveloperEvents::new(&self.store)
+                    .append_agent_lifecycle(name, &row.session_id, "started", None, now())
+                    .await
+                {
+                    tracing::warn!(
+                        target: "nexus::identity",
+                        name = name,
+                        session = %row.session_id,
+                        error = ?error,
+                        "failed to append resume-started lifecycle telemetry"
+                    );
+                } else {
+                    self.store.events().session_lifecycle_changed().signal();
+                }
             }
         }
         Ok(())
@@ -155,21 +174,34 @@ impl Identity {
         row: &SessionRow,
         req: &RegisterRequest,
         credential_verified: bool,
-    ) -> Result<AgentId, NexusError> {
+    ) -> Result<(AgentId, Option<String>), NexusError> {
         let agents = Agents::new(&self.store);
         let row_name = row.require_name("agent runtime binding")?;
-        let agent_id = if let Some(requested) = req.agent_id.as_ref() {
+        let agent_id = if let Some(stored_agent_id) = row.agent_id.as_deref() {
+            if req
+                .agent_id
+                .as_ref()
+                .is_some_and(|requested| requested.0 != stored_agent_id)
+            {
+                return Err(NexusError::Invalid(format!(
+                    "session {} is bound to {}, not {}",
+                    row.session_id,
+                    stored_agent_id,
+                    req.agent_id.as_ref().expect("checked above").0.as_str()
+                )));
+            }
+            let agent = agents
+                .find_by_id(stored_agent_id)
+                .await?
+                .ok_or_else(|| NexusError::NotFound(format!("agent:{stored_agent_id}")))?;
+            if agent.disabled_at.is_some() {
+                return Err(NexusError::Unauthorized);
+            }
+            agent.agent_id
+        } else if let Some(requested) = req.agent_id.as_ref() {
             if let Some(agent) = agents.find_by_id(&requested.0).await? {
                 if agent.disabled_at.is_some() {
                     return Err(NexusError::Unauthorized);
-                }
-                if agent.name.as_deref() != Some(row_name) {
-                    return Err(NexusError::Invalid(format!(
-                        "agent_id {} is bound to {}, not {}",
-                        requested.0,
-                        agent.display_name(),
-                        row_name
-                    )));
                 }
                 agent.agent_id
             } else if let Some(existing_by_name) = agents.find_by_name(row_name).await? {
@@ -190,29 +222,43 @@ impl Identity {
                     })
                     .await?
             }
-        } else if let Some(existing) = agents.find_by_name(row_name).await? {
-            if existing.disabled_at.is_some() {
-                return Err(NexusError::Unauthorized);
-            }
-            existing.agent_id
         } else {
-            let generated = format!("a_{}", row.session_id.0);
-            agents
-                .create(NewAgent {
-                    agent_id: generated,
-                    project: row.project.clone(),
-                    name: Some(row_name.to_string()),
-                    default_harness: row.agent.clone(),
-                    role: row.role.clone(),
-                    tier: Some(row.tier.clone()),
-                    owner: None,
-                })
-                .await?
+            let mut matching_agents = agents.find_all_by_name(row_name).await?;
+            match matching_agents.len() {
+                0 => {
+                    let generated = format!("a_{}", row.session_id.0);
+                    agents
+                        .create(NewAgent {
+                            agent_id: generated,
+                            project: row.project.clone(),
+                            name: Some(row_name.to_string()),
+                            default_harness: row.agent.clone(),
+                            role: row.role.clone(),
+                            tier: Some(row.tier.clone()),
+                            owner: None,
+                        })
+                        .await?
+                }
+                1 => {
+                    let existing = matching_agents.remove(0);
+                    if existing.disabled_at.is_some() {
+                        return Err(NexusError::Unauthorized);
+                    }
+                    existing.agent_id
+                }
+                count => {
+                    return Err(NexusError::Ambiguous(format!(
+                        "agent name {row_name:?} matches {count} identities; address it by stable agent id"
+                    )))
+                }
+            }
         };
 
-        if !credential_verified {
-            self.enforce_runtime_credential(&agent_id, req).await?;
-        }
+        let credential_id = if credential_verified {
+            None
+        } else {
+            self.enforce_runtime_credential(&agent_id, req).await?
+        };
 
         let runtimes = AgentRuntimes::new(&self.store);
         if let Some(existing_runtime) = runtimes.find_by_runtime_id(&row.session_id.0).await? {
@@ -247,12 +293,15 @@ impl Identity {
                 .await?;
         }
 
-        Ok(AgentId(agent_id))
+        Ok((AgentId(agent_id), credential_id))
     }
 
-    async fn preflight_requested_agent(&self, req: &RegisterRequest) -> Result<bool, NexusError> {
+    async fn preflight_requested_agent(
+        &self,
+        req: &RegisterRequest,
+    ) -> Result<Option<PreparedAgentRegistration>, NexusError> {
         let Some(requested) = req.agent_id.as_ref() else {
-            return Ok(false);
+            return Ok(None);
         };
         let agent = Agents::new(&self.store)
             .find_by_id(&requested.0)
@@ -261,31 +310,106 @@ impl Identity {
         if agent.disabled_at.is_some() {
             return Err(NexusError::Unauthorized);
         }
-        let req_name = req.name.as_deref().ok_or_else(|| {
-            NexusError::Invalid("register name is required before whoami staging is active".into())
-        })?;
-        if agent.name.as_deref() != Some(req_name) {
-            return Err(NexusError::Invalid(format!(
-                "agent_id {} is bound to {}, not {}",
-                requested.0,
-                agent.display_name(),
-                req_name
-            )));
+        let credential_id = self
+            .enforce_runtime_credential(&agent.agent_id, req)
+            .await?
+            .ok_or(NexusError::Unauthorized)?;
+        Ok(Some(PreparedAgentRegistration {
+            agent,
+            credential_id,
+        }))
+    }
+
+    /// Validate the immutable owner of a resumed compatibility row before `rebind_resume` writes
+    /// any new native key, client key, or presence. A stored `agent_id` is exclusive: it is never
+    /// reinterpreted as a display alias when the durable row is absent.
+    async fn preflight_resumed_session(
+        &self,
+        row: &SessionRow,
+        req: &RegisterRequest,
+    ) -> Result<(), NexusError> {
+        let agents = Agents::new(&self.store);
+        if let Some(stored_agent_id) = row.agent_id.as_deref() {
+            if req
+                .agent_id
+                .as_ref()
+                .is_some_and(|requested| requested.0 != stored_agent_id)
+            {
+                return Err(NexusError::Invalid(format!(
+                    "session {} is bound to {}, not {}",
+                    row.session_id,
+                    stored_agent_id,
+                    req.agent_id.as_ref().expect("checked above").0
+                )));
+            }
+            let agent = agents
+                .find_by_id(stored_agent_id)
+                .await?
+                .ok_or_else(|| NexusError::NotFound(format!("agent:{stored_agent_id}")))?;
+            if agent.disabled_at.is_some() {
+                return Err(NexusError::Unauthorized);
+            }
+            if let Some(runtime) = AgentRuntimes::new(&self.store)
+                .find_by_runtime_id(&row.session_id.0)
+                .await?
+            {
+                if runtime.agent_id != stored_agent_id {
+                    return Err(NexusError::Invalid(format!(
+                        "runtime {} is bound to {}, not {}",
+                        row.session_id, runtime.agent_id, stored_agent_id
+                    )));
+                }
+            }
+            return Ok(());
         }
-        self.enforce_runtime_credential(&agent.agent_id, req)
-            .await?;
-        Ok(true)
+
+        let expected_agent_id = if let Some(requested) = req.agent_id.as_ref() {
+            // The runtime credential already authenticated this exact immutable id. Compatibility
+            // aliases are not consulted and therefore cannot make the exact-id path ambiguous.
+            requested.0.clone()
+        } else {
+            let matches = match row.name.as_deref() {
+                Some(name) => agents.find_all_by_name(name).await?,
+                None => Vec::new(),
+            };
+            if matches.len() > 1 {
+                return Err(NexusError::Ambiguous(format!(
+                    "agent name {:?} matches {} identities; address it by stable agent id",
+                    row.name.as_deref().unwrap_or("<unnamed>"),
+                    matches.len()
+                )));
+            }
+            matches
+                .first()
+                .map(|agent| agent.agent_id.clone())
+                .unwrap_or_else(|| format!("a_{}", row.session_id.0))
+        };
+        if let Some(runtime) = AgentRuntimes::new(&self.store)
+            .find_by_runtime_id(&row.session_id.0)
+            .await?
+        {
+            if runtime.agent_id != expected_agent_id {
+                return Err(NexusError::Invalid(format!(
+                    "runtime {} is bound to {}, not {}",
+                    row.session_id, runtime.agent_id, expected_agent_id
+                )));
+            }
+        }
+        Ok(())
     }
 
     async fn enforce_runtime_credential(
         &self,
         agent_id: &str,
         req: &RegisterRequest,
-    ) -> Result<(), NexusError> {
+    ) -> Result<Option<String>, NexusError> {
         match req.runtime_credential.as_deref() {
-            Some(secret) => self.verify_runtime_credential(agent_id, secret).await,
+            Some(secret) => self
+                .verify_runtime_credential(agent_id, secret)
+                .await
+                .map(Some),
             None if req.agent_id.is_some() => Err(NexusError::Unauthorized),
-            None => Ok(()),
+            None => Ok(None),
         }
     }
 
@@ -293,7 +417,7 @@ impl Identity {
         &self,
         agent_id: &str,
         secret: &str,
-    ) -> Result<(), NexusError> {
+    ) -> Result<String, NexusError> {
         let expected = hash_runtime_credential(secret);
         let credentials = AgentCredentials::new(&self.store)
             .find_active(agent_id)
@@ -302,20 +426,21 @@ impl Identity {
             if credential.secret_hash == expected
                 && scopes_allow_runtime_register(&credential.scopes_json)
             {
-                AgentCredentials::new(&self.store)
-                    .touch_last_used(&credential.credential_id)
-                    .await?;
-                return Ok(());
+                return Ok(credential.credential_id);
             }
         }
         Err(NexusError::Unauthorized)
     }
 
     async fn agent_id_for_name(&self, name: &str) -> Result<Option<AgentId>, NexusError> {
-        Ok(Agents::new(&self.store)
-            .find_by_name(name)
-            .await?
-            .map(|row| AgentId(row.agent_id)))
+        let mut matches = Agents::new(&self.store).find_all_by_name(name).await?;
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(Some(AgentId(matches.remove(0).agent_id))),
+            count => Err(NexusError::Ambiguous(format!(
+                "agent name {name:?} matches {count} identities; address it by stable agent id"
+            ))),
+        }
     }
 
     /// Atomically rename the compatibility session, durable agent identity, and legacy
@@ -432,13 +557,13 @@ impl Identity {
         )
         .await?;
 
-        tx.execute(
-            "UPDATE agent_group_members \
-             SET agent_name = ?4 \
-             WHERE project = ?1 AND (agent_name = ?2 OR agent_id = ?3)",
-            libsql::params![project, previous, agent_id, new_name],
-        )
-        .await?;
+        if let Some(agent_id) = agent_id.as_deref() {
+            tx.execute(
+                "UPDATE agent_group_members SET agent_name = ?2 WHERE agent_id = ?1",
+                libsql::params![agent_id, new_name],
+            )
+            .await?;
+        }
 
         tx.commit().await?;
         Ok(())
@@ -474,7 +599,7 @@ impl Identity {
     async fn rename_transport_identity_refs(
         &self,
         session: Option<&SessionId>,
-        project: &str,
+        _project: &str,
         previous: Option<&str>,
         new_name: &str,
         agent_id: Option<&str>,
@@ -528,13 +653,13 @@ impl Identity {
             libsql::params![previous, new_name],
         )
         .await?;
-        tx.execute(
-            "UPDATE agent_group_members
-             SET agent_name = ?4
-             WHERE project = ?1 AND (agent_name = ?2 OR agent_id = ?3)",
-            libsql::params![project, previous, agent_id, new_name],
-        )
-        .await?;
+        if let Some(agent_id) = agent_id {
+            tx.execute(
+                "UPDATE agent_group_members SET agent_name = ?2 WHERE agent_id = ?1",
+                libsql::params![agent_id, new_name],
+            )
+            .await?;
+        }
         tx.commit().await
     }
 
@@ -605,6 +730,26 @@ impl Identity {
         }
     }
 
+    /// Resolve an admin-facing token once, with immutable ids taking precedence over mutable
+    /// aliases. An id-shaped display name remains a compatibility fallback only when no durable
+    /// identity owns that exact id.
+    async fn resolve_admin_agent_token(&self, token: &str) -> Result<AgentRow, NexusError> {
+        let agents = Agents::new(&self.store);
+        if token.starts_with("a_") {
+            if let Some(agent) = agents.find_by_id(token).await? {
+                return Ok(agent);
+            }
+        }
+        let mut matches = agents.find_all_by_name(token).await?;
+        match matches.len() {
+            0 => Err(NexusError::NotFound(format!("agent {token}"))),
+            1 => Ok(matches.remove(0)),
+            count => Err(NexusError::Ambiguous(format!(
+                "agent name {token:?} matches {count} identities; address it by stable agent id"
+            ))),
+        }
+    }
+
     async fn resolve_admin_rename_source(
         &self,
         source: &str,
@@ -620,11 +765,7 @@ impl Identity {
                 Some(agent_id) => agent_id.to_string(),
                 None => {
                     let name = row.require_name("admin rename")?;
-                    agents
-                        .find_by_name(name)
-                        .await?
-                        .ok_or_else(|| NexusError::NotFound(format!("agent:{name}")))?
-                        .agent_id
+                    self.resolve_admin_agent_token(name).await?.agent_id
                 }
             };
             let agent = agents
@@ -635,32 +776,29 @@ impl Identity {
         }
 
         if source.starts_with("a_") {
-            let agent = agents
-                .find_by_id(source)
-                .await?
-                .ok_or_else(|| NexusError::NotFound(format!("agent id {source}")))?;
+            let agent = self.resolve_admin_agent_token(source).await?;
             let row = self.session_for_agent_id(&agent.agent_id).await?;
             return Ok((row, agent));
         }
 
-        if let Some(agent) = agents.find_by_name(source).await? {
-            let row = self.session_for_agent_id(&agent.agent_id).await?;
-            return Ok((row, agent));
+        match self.resolve_admin_agent_token(source).await {
+            Ok(agent) => {
+                let row = self.session_for_agent_id(&agent.agent_id).await?;
+                return Ok((row, agent));
+            }
+            Err(NexusError::NotFound(_)) => {}
+            Err(error) => return Err(error),
         }
 
         let row = sessions
-            .find_by_name_any_project(source)
+            .find_unique_by_name_any_project(source)
             .await?
             .ok_or_else(|| NexusError::NotFound(source.to_string()))?;
         let agent_id = match row.agent_id.as_deref() {
             Some(agent_id) => agent_id.to_string(),
             None => {
                 let name = row.require_name("admin rename")?;
-                agents
-                    .find_by_name(name)
-                    .await?
-                    .ok_or_else(|| NexusError::NotFound(format!("agent:{name}")))?
-                    .agent_id
+                self.resolve_admin_agent_token(name).await?.agent_id
             }
         };
         let agent = agents
@@ -845,37 +983,106 @@ fn scopes_allow_runtime_register(scopes_json: &str) -> bool {
 
 #[async_trait]
 impl IdentityPort for Identity {
-    async fn register(&self, req: RegisterRequest) -> PortResult<RegisterResponse> {
+    async fn register(&self, mut req: RegisterRequest) -> PortResult<RegisterResponse> {
         let result: Result<RegisterResponse, NexusError> = async {
+            let requested_kind = kind_str(req.kind);
+            if requested_kind != "agent" && req.agent_id.is_some() {
+                return Err(NexusError::Invalid(
+                    "only agent registrations may bind an agent_id".into(),
+                ));
+            }
             let _transition = self.store.lock_presence_transition().await;
-            let credential_verified = self.preflight_requested_agent(&req).await?;
+            let prepared_agent = self.preflight_requested_agent(&req).await?;
+            if let Some(canonical_name) = prepared_agent
+                .as_ref()
+                .and_then(|prepared| prepared.agent.name.clone())
+            {
+                // Immutable identity wins over a stale pre-rename label supplied by the runtime.
+                // Persist and return the durable canonical alias rather than creating a second
+                // compatibility name for the same agent.
+                req.name = Some(canonical_name);
+            }
+            let credential_verified = prepared_agent.is_some();
             let outcome = resolve_register(&self.store, &req).await?;
+            let staged_session_id = match &outcome {
+                RegisterOutcome::Created(row) => Some(row.session_id.clone()),
+                RegisterOutcome::Resumed(_) => None,
+            };
+            let generated_agent_id = staged_session_id.as_ref().and_then(|session_id| {
+                (requested_kind == "agent" && req.agent_id.is_none())
+                    .then(|| format!("a_{}", session_id.0))
+            });
+
+            let completion: Result<(RegisterResponse, Option<String>), NexusError> = async {
             let (session_id, lifecycle, publish_resume_status, publish_spawn) = match outcome {
                 RegisterOutcome::Resumed(row) => {
+                    if row.kind != requested_kind {
+                        return Err(NexusError::Invalid(format!(
+                            "registered client key belongs to session kind {}, not {requested_kind}",
+                            row.kind
+                        )));
+                    }
+                    if row.kind == "agent" {
+                        self.preflight_resumed_session(&row, &req).await?;
+                    } else {
+                        // Older builds could persist an agent binding/runtime on a human browser
+                        // session. Kind is the authority: remove only that disposable runtime;
+                        // the durable agent and all of its real runtimes remain intact.
+                        AgentRuntimes::new(&self.store)
+                            .remove_non_agent_residue(&row.session_id.0)
+                            .await?;
+                    }
                     let publish = row.presence.as_deref() != Some("online");
                     self.rebind_resume(&row, &req).await?;
                     (row.session_id, "resume", publish, false)
                 }
-                RegisterOutcome::Created(row) => (row.session_id, "register", false, true),
+                RegisterOutcome::Created(row) => {
+                    // An explicit immutable identity is already fully preflighted. Stamp it on the
+                    // staged compatibility row before runtime creation so no post-runtime write can
+                    // fail and leave the newly active runtime detached from its session.
+                    if row.kind == "agent" {
+                        if let Some(prepared) = prepared_agent.as_ref() {
+                            Sessions::new(&self.store)
+                                .set_agent_id(&row.session_id, &prepared.agent.agent_id)
+                                .await?;
+                        }
+                    }
+                    (row.session_id, "register", false, true)
+                }
             };
             let row = Sessions::new(&self.store)
                 .find_by_session_id(&session_id)
                 .await?
                 .ok_or_else(|| NexusError::NotFound(session_id.0.clone()))?;
-            let agent_id = self
-                .bind_agent_runtime(&row, &req, credential_verified)
-                .await?;
-            // Stamp the durable identity on the session row itself. Fan-out and resolve
-            // paths fall back to `sessions.agent_id` when the runtime row is stopped or
-            // flapping; a NULL here made that fallback structurally dead for CLI-registered
-            // sessions and silently dropped them from thread fan-out (gate-caught
-            // 2026-07-10, N17).
-            if row.agent_id.as_deref() != Some(agent_id.0.as_str()) {
-                Sessions::new(&self.store)
-                    .set_agent_id(&row.session_id, &agent_id.0)
+            let (agent_id, bound_credential_id) = if row.kind == "agent" {
+                let (agent_id, credential_id) = self
+                    .bind_agent_runtime(&row, &req, credential_verified)
                     .await?;
-            }
+                // Stamp the durable identity on an agent session itself. Human principals are
+                // durable session identities, but never become agent identities or runtimes.
+                if row.agent_id.as_deref() != Some(agent_id.0.as_str()) {
+                    Sessions::new(&self.store)
+                        .set_agent_id(&row.session_id, &agent_id.0)
+                        .await?;
+                }
+                (Some(agent_id), credential_id)
+            } else {
+                (None, None)
+            };
             if publish_spawn {
+                if let Err(error) = Sessions::new(&self.store)
+                    .finalize_staged_registration(&row)
+                    .await
+                {
+                    tracing::warn!(
+                        target: "nexus::identity",
+                        session = %row.session_id,
+                        error = ?error,
+                        "failed to publish staged registration lifecycle telemetry"
+                    );
+                }
+            }
+            if publish_spawn && row.kind == "agent" {
                 // Publish the first spawn only after the stable identity and runtime binding have
                 // committed. Gateway runtime projections require the durable agent id; emitting
                 // the pre-bind session row would create an unprocessable ordered poison event.
@@ -883,7 +1090,7 @@ impl IdentityPort for Identity {
                     .emit(WsEvent::AgentSpawned {
                         session_id: SessionId(row.session_id.0.clone()),
                         name: row.name.clone(),
-                        agent_id: Some(agent_id.0.clone()),
+                        agent_id: agent_id.as_ref().map(|id| id.0.clone()),
                     })
                     .await;
             }
@@ -898,11 +1105,64 @@ impl IdentityPort for Identity {
                     })
                     .await;
             }
-            Ok(RegisterResponse {
-                agent_id: Some(agent_id),
-                session_id,
-                directive: startup_directive(),
-            })
+            Ok((
+                RegisterResponse {
+                    agent_id,
+                    session_id,
+                    directive: startup_directive(),
+                },
+                bound_credential_id,
+            ))
+            }
+            .await;
+
+            match completion {
+                Ok((response, bound_credential_id)) => {
+                    let credential_id = prepared_agent
+                        .as_ref()
+                        .map(|prepared| prepared.credential_id.as_str())
+                        .or(bound_credential_id.as_deref());
+                    if let Some(credential_id) = credential_id {
+                        if let Err(error) = AgentCredentials::new(&self.store)
+                            .touch_last_used(credential_id)
+                            .await
+                        {
+                            tracing::warn!(
+                                target: "nexus::identity",
+                                credential_id,
+                                error = ?error,
+                                "failed to update registration credential audit timestamp"
+                            );
+                        }
+                    }
+                    Ok(response)
+                }
+                Err(error) => {
+                    let Some(session_id) = staged_session_id else {
+                        return Err(error);
+                    };
+                    if let Err(cleanup) = AgentRuntimes::new(&self.store)
+                        .remove_staged_registration(
+                            &session_id.0,
+                            generated_agent_id.as_deref(),
+                        )
+                        .await
+                    {
+                        return Err(NexusError::Store(format!(
+                            "{error}; identity registration rollback failed: {cleanup}"
+                        )));
+                    }
+                    if let Err(cleanup) = Sessions::new(&self.store)
+                        .remove_staged_registration(&session_id)
+                        .await
+                    {
+                        return Err(NexusError::Store(format!(
+                            "{error}; session registration rollback failed: {cleanup}"
+                        )));
+                    }
+                    Err(error)
+                }
+            }
         }
         .await;
         to_port(result)
@@ -912,10 +1172,22 @@ impl IdentityPort for Identity {
         let result: Result<Whoami, NexusError> = async {
             let row = self.row_for(caller).await?;
             let mut who = whoami_from_row(&row);
-            who.agent_id = caller.agent_id.clone();
-            if who.agent_id.is_none() {
+            if row.kind != "agent" {
+                who.agent_id = None;
+                return Ok(who);
+            }
+            who.agent_id = caller
+                .agent_id
+                .clone()
+                .or_else(|| row.agent_id.clone().map(AgentId));
+            if who.agent_id.is_none() && row.kind == "agent" {
                 if let Some(name) = row.name.as_deref() {
                     who.agent_id = self.agent_id_for_name(name).await?;
+                }
+            }
+            if let Some(agent_id) = who.agent_id.as_ref() {
+                if let Some(agent) = Agents::new(&self.store).find_by_id(&agent_id.0).await? {
+                    who.name = agent.name.or(who.name);
                 }
             }
             Ok(who)
@@ -924,25 +1196,47 @@ impl IdentityPort for Identity {
         to_port(result)
     }
 
-    async fn resolve(&self, project: &str, name: &str) -> PortResult<Caller> {
+    async fn resolve(&self, project: &str, name_or_id: &str) -> PortResult<Caller> {
         let result: Result<Caller, NexusError> = async {
-            let repo = Sessions::new(&self.store);
-            let row = repo
-                .find_by_name(project, name)
-                .await?
-                .ok_or_else(|| NexusError::NotFound(name.to_string()))?;
-            assert_project(&row, project)?;
-            let mut caller = caller_from_row(&row);
-            if let Some(agent_id) = self.agent_id_for_name(name).await? {
-                if let Some(runtime) = AgentRuntimes::new(&self.store)
-                    .active_for_agent(&agent_id.0)
-                    .await?
-                {
-                    caller.session = SessionId(runtime.runtime_id);
+            let agents = Agents::new(&self.store);
+            let agent_ref = AgentRef::parse(name_or_id);
+            let resolved_agent = match agents.resolve_ref(project, &agent_ref, true).await {
+                Err(NexusError::NotFound(_)) if matches!(agent_ref, AgentRef::Id(_)) => {
+                    // An id-shaped display alias remains a compatibility fallback only when no
+                    // immutable id owns the token. An existing stable id always wins.
+                    agents
+                        .resolve_ref(project, &AgentRef::Name(name_or_id.to_string()), true)
+                        .await
                 }
-                caller.agent_id = Some(agent_id);
+                resolved => resolved,
+            };
+            match resolved_agent {
+                Ok(agent) => {
+                    let row = self
+                        .session_for_agent_id(&agent.agent_id)
+                        .await?
+                        .ok_or_else(|| {
+                            NexusError::NotFound(format!(
+                                "agent id {} has no runtime session",
+                                agent.agent_id
+                            ))
+                        })?;
+                    let mut caller = caller_from_row(&row);
+                    if let Some(name) = agent.name {
+                        caller.name = name;
+                    }
+                    caller.agent_id = Some(AgentId(agent.agent_id));
+                    Ok(caller)
+                }
+                Err(NexusError::NotFound(_)) => {
+                    let row = Sessions::new(&self.store)
+                        .find_unique_by_name_any_project(name_or_id)
+                        .await?
+                        .ok_or_else(|| NexusError::NotFound(name_or_id.to_string()))?;
+                    Ok(caller_from_row(&row))
+                }
+                Err(error) => Err(error),
             }
-            Ok(caller)
         }
         .await;
         to_port(result)
@@ -950,17 +1244,23 @@ impl IdentityPort for Identity {
 
     async fn members(
         &self,
-        caller: &Caller,
+        _caller: &Caller,
         req: MemberListRequest,
     ) -> PortResult<MemberListResponse> {
         let result: Result<MemberListResponse, NexusError> = async {
             let repo = Sessions::new(&self.store);
-            let rows = repo.list(&caller.project).await?;
+            let rows = match req.project.as_deref() {
+                Some(project) => repo.list(project).await?,
+                None => repo.list_all().await?,
+            };
             let ts = now();
             let include_offline = req.include_offline.unwrap_or(false);
             let include_dead = req.include_dead.unwrap_or(false);
             let mut members = Vec::new();
             for row in rows {
+                if row.kind != "agent" {
+                    continue;
+                }
                 // A stale heartbeat downgrades effective presence to offline (backend §8).
                 // Birth counts as the first heartbeat (D9/N22): fresh launches must not
                 // read as offline before their harness's first own heartbeat.
@@ -977,12 +1277,12 @@ impl IdentityPort for Identity {
                 if presence == Presence::Offline && !include_offline {
                     continue;
                 }
-                let agent_id = if let Some(name) = row.name.as_deref() {
-                    self.agent_id_for_name(name)
-                        .await?
-                        .or_else(|| row.agent_id.clone().map(AgentId))
-                } else {
-                    row.agent_id.clone().map(AgentId)
+                let agent_id = match row.agent_id.as_deref() {
+                    Some(agent_id) => Some(AgentId(agent_id.to_string())),
+                    None => match row.name.as_deref() {
+                        Some(name) => self.agent_id_for_name(name).await?,
+                        None => None,
+                    },
                 };
                 // Dead-marking is durable lifecycle state, separate
                 // from presence. Dead rows leave the default roster; audit passes include_dead.
@@ -1112,59 +1412,81 @@ impl IdentityPort for Identity {
     ) -> PortResult<AssignProjectResponse> {
         let result: Result<AssignProjectResponse, NexusError> = async {
             let repo = Sessions::new(&self.store);
-
-            // Locate the session across any project.
-            let row = repo
-                .find_by_name_any_project(name)
+            let agent = self.resolve_admin_agent_token(name).await?;
+            let row = self
+                .session_for_agent_id(&agent.agent_id)
                 .await?
-                .ok_or_else(|| NexusError::NotFound(name.to_string()))?;
+                .ok_or_else(|| NexusError::NotFound(agent.display_name()))?;
 
             if row.project == to_project {
                 return Ok(AssignProjectResponse {
-                    name: Some(name.to_string()),
+                    name: agent.name,
                     project: to_project.to_string(),
                 });
             }
 
             // Collision guard: the target project must not already hold this name.
-            if repo.name_exists_in(to_project, name).await? {
-                return Err(NexusError::DuplicateName(format!(
-                    "{name} already bound in project {to_project}"
-                )));
+            if let Some(row_name) = row.name.as_deref() {
+                if let Some(existing) = repo.find_by_name(to_project, row_name).await? {
+                    if existing.session_id != row.session_id {
+                        return Err(NexusError::DuplicateName(format!(
+                            "{row_name} already bound in project {to_project}"
+                        )));
+                    }
+                }
             }
 
             // Mutate the project column on both the compatibility session and the durable agent
             // row in a single transaction (same pattern as `rename_identity_refs`) so a crash
             // between the two updates can never leave sessions.project and agents.project
             // disagreeing. The daemon is the sole writer.
-            let tx = self
-                .store
-                .begin_write_txn("identity_assign_project")
+            if self.store.has_split_authority() {
+                // The compatibility session and durable identity live in separate databases in
+                // production split mode, so route both writes by their already-selected stable
+                // keys. Project is metadata, never an authority or subsequent routing key.
+                repo.set_project(&row.session_id, to_project).await?;
+                if let Err(error) = Agents::new(&self.store)
+                    .set_project(&agent.agent_id, to_project)
+                    .await
+                {
+                    if let Err(compensation) = repo.set_project(&row.session_id, &row.project).await
+                    {
+                        return Err(NexusError::Store(format!(
+                            "{error}; transport project compensation failed: {compensation}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            } else {
+                let tx = self
+                    .store
+                    .begin_write_txn("identity_assign_project")
+                    .await?;
+                tx.execute(
+                    "UPDATE sessions SET project = ?2 WHERE session_id = ?1",
+                    libsql::params![row.session_id.0.clone(), to_project],
+                )
                 .await?;
-            tx.execute(
-                "UPDATE sessions SET project = ?2 WHERE session_id = ?1",
-                libsql::params![row.session_id.0.clone(), to_project],
-            )
-            .await?;
-            tx.execute(
-                "UPDATE agents SET project = ?2 WHERE name = ?1",
-                libsql::params![name, to_project],
-            )
-            .await?;
-            tx.commit().await?;
+                tx.execute(
+                    "UPDATE agents SET project = ?2 WHERE agent_id = ?1",
+                    libsql::params![agent.agent_id.clone(), to_project],
+                )
+                .await?;
+                tx.commit().await?;
+            }
 
             // Emit a resync: AgentSpawned signals the new project's member list has changed.
             // (Same event used on first register — the UI reconciles the member roster on it.)
             self.events
                 .emit(WsEvent::AgentSpawned {
                     session_id: SessionId(row.session_id.0.clone()),
-                    name: Some(name.to_string()),
-                    agent_id: row.agent_id.clone(),
+                    name: agent.name.clone(),
+                    agent_id: Some(agent.agent_id.clone()),
                 })
                 .await;
 
             Ok(AssignProjectResponse {
-                name: Some(name.to_string()),
+                name: agent.name,
                 project: to_project.to_string(),
             })
         }
@@ -1180,19 +1502,43 @@ impl IdentityPort for Identity {
             }
 
             let agents = Agents::new(&self.store);
-            let agent = agents
-                .find_by_name(name)
-                .await?
-                .ok_or_else(|| NexusError::NotFound(name.to_string()))?;
-            agents.set_role(&agent.agent_id, role).await?;
+            let agent = self.resolve_admin_agent_token(name).await?;
+            let session = self.session_for_agent_id(&agent.agent_id).await?;
+            let Some(session) = session else {
+                agents.set_role(&agent.agent_id, role).await?;
+                return Ok(AssignRoleResponse {
+                    name: agent.name,
+                    role: role.to_string(),
+                });
+            };
 
-            if let Some(session) = Sessions::new(&self.store)
-                .find_by_name(&agent.project, name)
-                .await?
-            {
-                Sessions::new(&self.store)
-                    .set_role(&session.session_id, role)
-                    .await?;
+            if self.store.has_split_authority() {
+                let sessions = Sessions::new(&self.store);
+                sessions.set_role(&session.session_id, role).await?;
+                if let Err(error) = agents.set_role(&agent.agent_id, role).await {
+                    if let Err(compensation) = sessions
+                        .set_role_value(&session.session_id, session.role.as_deref())
+                        .await
+                    {
+                        return Err(NexusError::Store(format!(
+                            "{error}; transport role compensation failed: {compensation}"
+                        )));
+                    }
+                    return Err(error);
+                }
+            } else {
+                let tx = self.store.begin_write_txn("identity_assign_role").await?;
+                tx.execute(
+                    "UPDATE sessions SET role = ?2 WHERE session_id = ?1",
+                    libsql::params![session.session_id.0, role],
+                )
+                .await?;
+                tx.execute(
+                    "UPDATE agents SET role = ?2 WHERE agent_id = ?1",
+                    libsql::params![agent.agent_id.clone(), role],
+                )
+                .await?;
+                tx.commit().await?;
             }
 
             Ok(AssignRoleResponse {

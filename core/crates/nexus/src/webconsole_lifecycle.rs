@@ -85,6 +85,7 @@ pub struct WebconsoleLifecycleError {
     code: &'static str,
     message: String,
     hint: Option<String>,
+    data: Option<serde_json::Value>,
     exit_code: u8,
 }
 
@@ -94,6 +95,7 @@ impl WebconsoleLifecycleError {
             code: "WEBCONSOLE_NOT_INSTALLED",
             message: "Nexus Webconsole is not installed".into(),
             hint: Some("Install it with npm install -g @egregore/nexus".into()),
+            data: None,
             exit_code: 3,
         }
     }
@@ -103,6 +105,7 @@ impl WebconsoleLifecycleError {
             code: "WEBCONSOLE_LIFECYCLE_FAILED",
             message: message.into(),
             hint: None,
+            data: None,
             exit_code: 1,
         }
     }
@@ -119,9 +122,35 @@ impl WebconsoleLifecycleError {
         self.hint.as_deref()
     }
 
+    pub fn data(&self) -> Option<&serde_json::Value> {
+        self.data.as_ref()
+    }
+
     pub fn exit_code(&self) -> u8 {
         self.exit_code
     }
+}
+
+#[doc(hidden)]
+pub fn classify_webconsole_start_error(
+    message: impl Into<String>,
+    options: &WebconsoleStartOptions,
+) -> WebconsoleLifecycleError {
+    let message = message.into();
+    let occupied_prefix = format!("Webconsole port {} is occupied", options.port);
+    if message.starts_with(&occupied_prefix) {
+        return WebconsoleLifecycleError {
+            code: "WEBCONSOLE_PORT_OCCUPIED",
+            message,
+            hint: None,
+            data: Some(serde_json::json!({
+                "host": options.host,
+                "port": options.port,
+            })),
+            exit_code: 1,
+        };
+    }
+    WebconsoleLifecycleError::lifecycle(message)
 }
 
 impl From<lifecycle::LifecycleError> for WebconsoleLifecycleError {
@@ -210,7 +239,7 @@ pub async fn start_webconsole(
     let mut backend = SystemWebconsoleBackend::new();
     let runtime = start_webconsole_with(&mut backend, &options)
         .await
-        .map_err(WebconsoleLifecycleError::lifecycle)?;
+        .map_err(|error| classify_webconsole_start_error(error, &options))?;
     Ok(backend.report(runtime))
 }
 
@@ -222,7 +251,7 @@ pub async fn launch_webconsole(
     let mut backend = SystemWebconsoleBackend::new();
     let runtime = launch_webconsole_with(&mut backend, &options, no_open)
         .await
-        .map_err(WebconsoleLifecycleError::lifecycle)?;
+        .map_err(|error| classify_webconsole_start_error(error, &options))?;
     Ok(backend.report(runtime))
 }
 
@@ -248,7 +277,7 @@ pub async fn restart_webconsole(
     stop_webconsole_with(&mut backend, false).map_err(WebconsoleLifecycleError::lifecycle)?;
     let runtime = start_webconsole_with(&mut backend, &options)
         .await
-        .map_err(WebconsoleLifecycleError::lifecycle)?;
+        .map_err(|error| classify_webconsole_start_error(error, &options))?;
     Ok(backend.report(runtime))
 }
 
@@ -463,16 +492,13 @@ impl WebconsoleBackend for SystemWebconsoleBackend {
             .open(&self.paths.log)
             .map_err(|error| error.to_string())?;
         let stderr = log.try_clone().map_err(|error| error.to_string())?;
-        let mut command = webconsole_command(installation);
+        let mut command = build_webconsole_spawn_command(
+            installation,
+            gateway_url,
+            options,
+            &self.paths.discovery,
+        );
         command
-            .arg("--host")
-            .arg(&options.host)
-            .arg("--port")
-            .arg(options.port.to_string())
-            .arg("--gateway-url")
-            .arg(gateway_url)
-            .arg("--discovery")
-            .arg(&self.paths.discovery)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));
@@ -608,6 +634,26 @@ fn webconsole_command(installation: &WebconsoleInstallation) -> Command {
             command
         }
     }
+}
+
+#[doc(hidden)]
+pub fn build_webconsole_spawn_command(
+    installation: &WebconsoleInstallation,
+    gateway_url: &str,
+    options: &WebconsoleStartOptions,
+    discovery: &Path,
+) -> Command {
+    let mut command = webconsole_command(installation);
+    command
+        .arg("--host")
+        .arg(&options.host)
+        .arg("--port")
+        .arg(options.port.to_string())
+        .arg("--gateway-url")
+        .arg(gateway_url)
+        .arg("--discovery")
+        .arg(discovery);
+    command
 }
 
 fn runtime_status(paths: &WebconsolePaths) -> WebconsoleRuntimeStatus {

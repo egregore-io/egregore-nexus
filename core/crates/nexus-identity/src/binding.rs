@@ -3,7 +3,6 @@
 //! `register` binds `name ↔ harness_session_id` by persisting both on the same row; these helpers
 //! own the enum↔string mapping so the service layer never hand-stringifies.
 
-use nexus_common::NexusError;
 use nexus_contracts::enums::{Kind, Tier};
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::Caller;
@@ -69,16 +68,6 @@ pub(crate) fn whoami_from_row(row: &SessionRow) -> Whoami {
 /// `DuplicateName`). Offline rows are stale identities and do not block.
 pub(crate) fn is_live(row: &SessionRow) -> bool {
     !matches!(row.presence.as_deref(), Some("offline"))
-}
-
-/// Guard: a found row must belong to the requested project (defense-in-depth; the store reads are
-/// already project-scoped, but the service crosses no project boundary).
-pub(crate) fn assert_project(row: &SessionRow, project: &str) -> Result<(), NexusError> {
-    if row.project == project {
-        Ok(())
-    } else {
-        Err(NexusError::ProjectScope)
-    }
 }
 
 #[cfg(test)]

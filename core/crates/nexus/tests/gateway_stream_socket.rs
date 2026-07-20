@@ -15,7 +15,7 @@ use nexus_contracts::{
     GATEWAY_PROJECTION_VERSION,
 };
 use nexus_store::{
-    repos::{NewSession, Sessions, StreamEvents},
+    repos::{AgentRuntimes, Agents, NewAgent, NewAgentRuntime, NewSession, Sessions, StreamEvents},
     Store,
 };
 use nexus_transcript::{ToolCallObservation, ToolCallPhase};
@@ -876,6 +876,19 @@ async fn ws_sink_enriches_ordered_fleet_status_with_authoritative_activity() {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
     let session = SessionId("s_percy".to_string());
+    let agent_id = "a_percy";
+    Agents::new(&store)
+        .create(NewAgent {
+            agent_id: agent_id.to_string(),
+            project: "default".to_string(),
+            name: Some("percy".to_string()),
+            default_harness: Some("codex".to_string()),
+            role: None,
+            tier: Some("agent".to_string()),
+            owner: None,
+        })
+        .await
+        .unwrap();
     Sessions::new(&store)
         .create(NewSession {
             session_id: session.clone(),
@@ -889,6 +902,22 @@ async fn ws_sink_enriches_ordered_fleet_status_with_authoritative_activity() {
             cwd: None,
             project: "default".to_string(),
             transport: Some("codex-appserver".to_string()),
+        })
+        .await
+        .unwrap();
+    Sessions::new(&store)
+        .set_agent_id(&session, agent_id)
+        .await
+        .unwrap();
+    AgentRuntimes::new(&store)
+        .create(NewAgentRuntime {
+            runtime_id: session.0.clone(),
+            agent_id: agent_id.to_string(),
+            harness: "codex".to_string(),
+            cwd: None,
+            transport: Some("codex-appserver".to_string()),
+            presence: Some("busy".to_string()),
+            active: true,
         })
         .await
         .unwrap();

@@ -126,6 +126,21 @@ struct MockBus;
 
 #[async_trait]
 impl nexus_contracts::BusPort for MockBus {
+    async fn preflight_send(&self, _caller: &Caller, _req: &SendRequest) -> PortResult<()> {
+        Ok(())
+    }
+
+    async fn preflight_notify_target(
+        &self,
+        _caller: &Caller,
+        target: &nexus_contracts::NotifyTarget,
+    ) -> PortResult<Option<nexus_contracts::AgentId>> {
+        Ok(match target {
+            nexus_contracts::NotifyTarget::Agent { agent_id } => Some(agent_id.clone()),
+            _ => None,
+        })
+    }
+
     async fn send(&self, _caller: &Caller, _req: SendRequest) -> PortResult<Ack> {
         Ok(Ack {
             message_id: MessageId("m_test".into()),

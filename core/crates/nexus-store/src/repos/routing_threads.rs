@@ -160,11 +160,23 @@ impl<'a> RoutingThreads<'a> {
         session_name: &str,
         agent_id: Option<&str>,
     ) -> Result<(), NexusError> {
+        self.remove_member_all_ref(Some(session_name), agent_id)
+            .await
+    }
+
+    /// Remove every routing membership matching the stable identity and/or legacy display name.
+    /// Callers with an explicit stable id pass no name so stale aliases cannot widen deletion.
+    pub async fn remove_member_all_ref(
+        &self,
+        session_name: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> Result<(), NexusError> {
         self.store
             .identity_conn()
             .execute(
                 "DELETE FROM routing_thread_members
-                 WHERE session_name = ?1 OR (?2 IS NOT NULL AND agent_id = ?2)",
+                 WHERE (?1 IS NOT NULL AND session_name = ?1)
+                    OR (?2 IS NOT NULL AND agent_id = ?2)",
                 params![session_name, agent_id],
             )
             .await

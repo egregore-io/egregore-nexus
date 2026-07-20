@@ -160,6 +160,7 @@ fn render_error(error: &WebconsoleLifecycleError, json: bool) -> ExitCode {
                     "code": error.code(),
                     "message": error.message(),
                     "hint": error.hint(),
+                    "data": error.data(),
                 }
             })
         );
