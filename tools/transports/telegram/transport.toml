@@ -1,0 +1,14 @@
+name = "telegram"
+provider = "telegram"
+entry = "telegram_bridge.py"
+args = []
+
+[config]
+stateDir = "gateway/transports/telegram"
+groupThread = "telegram"
+media = "refuse"
+pollTimeoutSeconds = 20
+pollIntervalSeconds = 0.25
+
+[secretRefs]
+TELEGRAM_BOT_TOKEN = "transport.telegram.bot_token"
