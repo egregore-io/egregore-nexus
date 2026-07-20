@@ -3284,11 +3284,22 @@ class BackendAcceptance:
         codex = self.soak.sessions["codex"]
         session_attempt = await codex.begin_prompt(session_marker, timeout=120)
         await codex.close()
-        await self.restart(target)
-        developer_result, session_result = await asyncio.gather(
-            self.soak.finish_message(developer_attempt, timeout=120),
-            codex.finish_prompt(session_attempt, timeout=240),
+        developer_result: dict[str, object] | None = None
+        session_result: dict[str, object] | None = None
+
+        async def finish_straddled_traffic() -> None:
+            nonlocal developer_result, session_result
+            developer_result, session_result = await asyncio.gather(
+                self.soak.finish_message(developer_attempt, timeout=120),
+                codex.finish_prompt(session_attempt, timeout=240),
+            )
+
+        await self.restart(
+            target,
+            before_post_restart_human_write=finish_straddled_traffic,
         )
+        if developer_result is None or session_result is None:
+            raise AcceptanceFailure("straddled traffic did not finish after reconnect")
         record = {
             "target": target,
             "developer": {
@@ -3588,7 +3599,12 @@ class BackendAcceptance:
                 "idWithStaleNameAndProjectMetadata": id_first,
             })
 
-    async def restart(self, target: str) -> None:
+    async def restart(
+        self,
+        target: str,
+        *,
+        before_post_restart_human_write: Any | None = None,
+    ) -> None:
         before = await asyncio.to_thread(self.core["lifecycle_state"], self.candidate.lab_root / "nexus")
         fleet_cursor_before = self.fleet_cursor
         cursors = {
@@ -3670,6 +3686,8 @@ class BackendAcceptance:
                 "ack": ack,
                 "event": event,
             }
+        if before_post_restart_human_write is not None:
+            await before_post_restart_human_write()
         human = await self.human_write(f"after-{target}-{len(self.restart_timeline) + 1}")
         checkpoint = {
             "target": target,

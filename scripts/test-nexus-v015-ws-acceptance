@@ -1692,6 +1692,84 @@ class WsAcceptanceContracts(unittest.TestCase):
             backend.record_observations.assert_not_called()
             self.assertTrue(backend.soak.closed)
 
+    def test_straddled_restart_finishes_the_accepted_session_before_human_traffic(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        backend = module["BackendAcceptance"].__new__(module["BackendAcceptance"])
+        backend.candidate = type("Candidate", (), {"run_id": "contract-run"})()
+        backend.straddled_replay = []
+        order: list[str] = []
+
+        developer_attempt = type(
+            "DeveloperAttempt",
+            (),
+            {"message_id": "m-straddled"},
+        )()
+        session_attempt = type(
+            "SessionAttempt",
+            (),
+            {
+                "client_message_id": "cm-straddled",
+                "command_id": "cmd-straddled",
+            },
+        )()
+
+        class DeveloperLane:
+            async def close(self) -> None:
+                order.append("developer-closed")
+
+        class SessionLane:
+            async def begin_prompt(self, *_args: object, **_kwargs: object) -> object:
+                order.append("session-accepted")
+                return session_attempt
+
+            async def close(self) -> None:
+                order.append("session-closed")
+
+            async def finish_prompt(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+                order.append("session-finished")
+                return {"cursorAfter": 3}
+
+        class Soak:
+            developer = DeveloperLane()
+            thread = "contract-thread"
+            thread_topic = "sys.thread.contract-thread"
+            sessions = {"codex": SessionLane()}
+
+            async def begin_message(self, *_args: object) -> object:
+                order.append("developer-accepted")
+                return developer_attempt
+
+            async def finish_message(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+                order.append("developer-finished")
+                return {"cursorAfter": 2}
+
+        backend.soak = Soak()
+
+        async def restart(
+            target: str,
+            *,
+            before_post_restart_human_write: object,
+        ) -> None:
+            self.assertEqual(target, "gateway")
+            order.append("restart-recovered")
+            await before_post_restart_human_write()
+            order.append("human-write")
+
+        backend.restart = restart
+        result = asyncio.run(backend.straddle_restart("gateway"))
+
+        self.assertEqual(result["session"]["clientMessageId"], "cm-straddled")
+        self.assertLess(order.index("developer-finished"), order.index("human-write"))
+        self.assertLess(order.index("session-finished"), order.index("human-write"))
+        source = TARGET.read_text(encoding="utf-8")
+        restart_body = source.split("    async def restart(", 1)[1].split(
+            "    async def final_invariants", 1
+        )[0]
+        self.assertLess(
+            restart_body.index("await before_post_restart_human_write()"),
+            restart_body.index("human = await self.human_write"),
+        )
+
     def test_backend_run_drives_every_release_boundary_before_observation(self) -> None:
         module = runpy.run_path(str(TARGET))
         source = TARGET.read_text(encoding="utf-8")
