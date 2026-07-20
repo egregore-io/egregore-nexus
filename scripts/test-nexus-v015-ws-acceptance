@@ -1188,6 +1188,38 @@ class WsAcceptanceContracts(unittest.TestCase):
                         root,
                     )
 
+    def test_soak_loader_preserves_root_owned_script_authority(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        soak = Path("/tmp/nexus-lab-bin/nexus-v015-ws-soak")
+        candidate = module["Candidate"](
+            "contract-run",
+            "sha256:" + "d" * 64,
+            {"environment": {}},
+            Path("/tmp/nexus-lens-home/evidence/contract-run"),
+            Path("/tmp/nexus-lens-home"),
+            Path("/tmp/nexus-lab-install.Ab12"),
+            readiness={},
+        )
+        checker = mock.Mock(return_value=b"#!/usr/bin/env python3\n")
+        validator = mock.Mock()
+        globals_ = module["load_soak_core"].__globals__
+        with mock.patch.dict(
+            globals_,
+            {
+                "SOAK_CORE": soak,
+                "validate_support_script_bindings": validator,
+                "checked_file": checker,
+            },
+        ), mock.patch.object(globals_["runpy"], "run_path", return_value={"ok": True}):
+            self.assertEqual(module["load_soak_core"](candidate), {"ok": True})
+        checker.assert_called_once_with(
+            soak,
+            Path("/"),
+            "WebSocket soak core",
+            expected_uid=0,
+            expected_mode=0o555,
+        )
+
     def test_final_release_tools_are_root_owned_immutable_and_manifest_bound(self) -> None:
         module = runpy.run_path(str(TARGET))
         with tempfile.TemporaryDirectory() as raw:

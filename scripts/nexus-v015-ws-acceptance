@@ -2422,7 +2422,13 @@ def load_soak_core(candidate: Candidate) -> dict[str, Any]:
         environment,
         Path("/"),
     )
-    raw = checked_file(SOAK_CORE, Path("/"), "WebSocket soak core")
+    raw = checked_file(
+        SOAK_CORE,
+        Path("/"),
+        "WebSocket soak core",
+        expected_uid=0,
+        expected_mode=0o555,
+    )
     if not raw.startswith(b"#!/usr/bin/env python3"):
         raise AcceptanceFailure("WebSocket soak core has an unexpected interpreter")
     return runpy.run_path(str(SOAK_CORE))
