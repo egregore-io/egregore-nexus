@@ -51,6 +51,7 @@ import {
   type CommandIngressSenderOptions,
 } from "@server/messagePost/commandIngress";
 import {
+  COMMAND_KINDS,
   createCommandIngressSubmitter,
   type CommandIngressOptions,
 } from "@server/command/ingress";
@@ -304,6 +305,11 @@ export function makeDispatch(deps: DispatchDeps) {
           error: { code: "forbidden", message: "agent session owner required" },
         }, 403);
       }
+      void commands.submit(
+        COMMAND_KINDS.harnessWarm,
+        { name: target.owner.name, agentId: target.owner.agentId },
+        apiReq.caller,
+      ).catch(() => {});
       return withAgentSessionBinding(handleSessionEvents(request, target.sessionId), target);
     }
 

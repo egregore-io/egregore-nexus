@@ -369,6 +369,41 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
     canonicalDb.close();
   });
 
+  it("warms the exact stable agent when an authorized canonical session lane reconnects", async () => {
+    const canonicalDb = await makeCanonicalDb();
+    await canonicalDb.batch([
+      `INSERT INTO identities VALUES
+        ('a_target','current-target','old-owner-name','agent','agent',
+         '{"ownerAgentId":"a_owner"}',1)`,
+      `INSERT INTO runtime_descriptors VALUES
+        ('r_target','a_target','s_target','codex','headless',NULL,NULL,NULL,'offline',2)`,
+    ], "write");
+    const submit = vi.fn(async () => ({ warmed: true }));
+    const commands: CommandIntentSender = {
+      submit: submit as CommandIntentSender["submit"],
+    };
+    const dispatch = makeDispatch({
+      db: async () => db,
+      canonicalDb: () => canonicalDb,
+      authMode: "local",
+      commands,
+    });
+
+    const response = await dispatch(new Request(
+      "http://localhost/api/v1/agent-sessions/s_target/events?view=agui",
+    ));
+
+    expect(response.status).toBe(200);
+    await vi.waitFor(() => expect(submit).toHaveBeenCalledOnce());
+    expect(submit).toHaveBeenCalledWith(
+      "harness.warm",
+      { name: "current-target", agentId: "a_target" },
+      localOperatorCaller(),
+    );
+    await response.body?.cancel();
+    canonicalDb.close();
+  });
+
   it("does not let a mutable owner-name match override a different stable owner id", async () => {
     const canonicalDb = await makeCanonicalDb();
     await canonicalDb.batch([
@@ -399,11 +434,16 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
         randomSecret: (prefix) => `${prefix}_secret_${++idSeq}`,
       },
     );
+    const submit = vi.fn(async () => ({ warmed: true }));
+    const commands: CommandIntentSender = {
+      submit: submit as CommandIntentSender["submit"],
+    };
     const dispatch = makeDispatch({
       db: async () => db,
       canonicalDb: () => canonicalDb,
       authMode: "remote",
       now: () => 2_000_000,
+      commands,
     });
 
     const response = await dispatch(new Request(
@@ -415,6 +455,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
     await expect(response.json()).resolves.toEqual({
       error: { code: "forbidden", message: "agent session owner required" },
     });
+    expect(submit).not.toHaveBeenCalled();
     canonicalDb.close();
   });
 
