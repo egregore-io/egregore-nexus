@@ -1963,7 +1963,6 @@ def validate_restart_transition(
             or before.daemon_start_ticks == after.daemon_start_ticks
             or before.daemon_boot_id == after.daemon_boot_id
             or before.daemon_created_at == after.daemon_created_at
-            or before.daemon_ipc_inode == after.daemon_ipc_inode
             or before.stream_boot_id == after.stream_boot_id
             or before.stream_created_at == after.stream_created_at
         ):

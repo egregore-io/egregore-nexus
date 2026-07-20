@@ -268,6 +268,11 @@ gateway_after = replace(
     gateway_discovery_sha256="d" * 64,
 )
 validate_restart_transition("daemon", base, daemon_after)
+validate_restart_transition(
+    "daemon",
+    base,
+    replace(daemon_after, daemon_ipc_inode=base.daemon_ipc_inode),
+)
 validate_restart_transition("gateway", base, gateway_after)
 validate_restart_transition(
     "gateway",
