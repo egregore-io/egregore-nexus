@@ -9,6 +9,7 @@ export interface GatewayIngressRow {
   error?: unknown;
   createdAt: number;
   updatedAt: number;
+  callerPrincipalId?: string;
 }
 
 export interface BeginIngressInput {
@@ -16,6 +17,7 @@ export interface BeginIngressInput {
   commandId?: string;
   request: unknown;
   now: number;
+  callerPrincipalId?: string;
 }
 
 export async function beginIngress(
@@ -25,9 +27,16 @@ export async function beginIngress(
   const result = await db.execute({
     sql: `INSERT OR IGNORE INTO gateway_ingress
           (idempotency_key, command_id, status, request_json, result_json,
-           error_json, created_at, updated_at)
-          VALUES (?, ?, 'pending', ?, NULL, NULL, ?, ?)`,
-    args: [input.idempotencyKey, input.commandId ?? null, JSON.stringify(input.request), input.now, input.now],
+           error_json, created_at, updated_at, caller_principal_id)
+          VALUES (?, ?, 'pending', ?, NULL, NULL, ?, ?, ?)`,
+    args: [
+      input.idempotencyKey,
+      input.commandId ?? null,
+      JSON.stringify(input.request),
+      input.now,
+      input.now,
+      input.callerPrincipalId ?? null,
+    ],
   });
   const row = await getIngress(db, input.idempotencyKey);
   if (!row) throw new Error(`failed to create Gateway ingress ${input.idempotencyKey}`);
@@ -84,6 +93,7 @@ function mapIngress(row: Row): GatewayIngressRow {
     error: optionalJson(row.error_json),
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
+    callerPrincipalId: optionalString(row.caller_principal_id),
   };
 }
 

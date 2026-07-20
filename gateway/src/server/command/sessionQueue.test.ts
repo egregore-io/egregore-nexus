@@ -472,16 +472,33 @@ describe("durable session command queue", () => {
     await insertCommand(runtimeDb, "cmd_split_store", "pending", 10);
     const identityDb = createClient({ url: ":memory:" });
     await identityDb.executeMultiple(`
+      CREATE TABLE human_user (
+        name_key TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        password_hash TEXT NOT NULL,
+        client_key TEXT NOT NULL UNIQUE,
+        project TEXT NOT NULL,
+        daemon_session_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        human_user_id TEXT NOT NULL UNIQUE
+      );
       CREATE TABLE human_session (
         cookie_token TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         client_key TEXT NOT NULL,
         project TEXT NOT NULL,
         daemon_session_id TEXT NOT NULL,
-        created_at INTEGER NOT NULL
+        created_at INTEGER NOT NULL,
+        human_user_id TEXT NOT NULL,
+        principal_id TEXT NOT NULL
       );
+      INSERT INTO human_user VALUES
+        ('alex', 'Alex', 'unused', 'client-1', 'default', 'human-session-1', 1, 1,
+         'hu_aaaaaaaaaaaaaaaaaaaaaaaa');
       INSERT INTO human_session VALUES
-        ('cookie-1', 'Alex', 'client-1', 'default', 'human-session-1', 1);
+        ('cookie-1', 'Alex', 'client-1', 'default', 'human-session-1', 1,
+         'hu_aaaaaaaaaaaaaaaaaaaaaaaa', 'h_aaaaaaaaaaaaaaaaaaaaaaaa');
     `);
 
     const response = await handleConversationQueueGet(

@@ -391,7 +391,12 @@ async function submitThroughGatewayIngress<T>(input: GatewayIngressSubmission<T>
   const begun = await beginIngress(input.db, {
     idempotencyKey: key,
     commandId: input.commandId,
-    request: { kind: input.kind, params: input.req },
+    request: {
+      kind: input.kind,
+      params: input.req,
+      caller: gatewayCallerEvidence(input.caller),
+    },
+    callerPrincipalId: input.caller.principalId,
     now: input.now(),
   });
   if (!begun.created) {
@@ -423,8 +428,21 @@ async function submitThroughGatewayIngress<T>(input: GatewayIngressSubmission<T>
 }
 
 function ingressScope(input: GatewayIngressSubmission<unknown>): string {
-  const principal = input.caller.clientKey ?? input.caller.sessionId ?? input.caller.agentId ?? input.caller.name;
+  const principal = input.caller.principalId ?? input.caller.clientKey ?? input.caller.sessionId ??
+    input.caller.agentId ?? input.caller.name;
   return `${input.kind}:${principal}:${input.idempotencyKey}`;
+}
+
+function gatewayCallerEvidence(caller: CommandCallerRow): Record<string, unknown> {
+  return {
+    name: caller.name,
+    project: caller.project,
+    kind: dottedEntityKind(caller.locality, caller.kind),
+    ...(caller.access ? { access: caller.access } : {}),
+    ...(caller.principalId ? { principalId: caller.principalId } : {}),
+    ...(caller.sessionId ? { sessionId: caller.sessionId } : {}),
+    ...(caller.agentId ? { agentId: caller.agentId } : {}),
+  };
 }
 
 function isTerminalDaemonRejection(error: unknown): boolean {

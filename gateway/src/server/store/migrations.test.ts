@@ -7,6 +7,7 @@ import {
   migrateGatewayStore,
 } from "./migrations";
 import { GATEWAY_CANONICAL_TABLES } from "./schema";
+import { currentHuman } from "../identity/human";
 
 describe("Gateway v0.1.0 store baseline", () => {
   it("creates one complete named baseline and reopens idempotently", async () => {
@@ -58,6 +59,57 @@ describe("Gateway v0.1.0 store baseline", () => {
     expect(versions.rows).toMatchObject([
       { version: CURRENT_GATEWAY_SCHEMA_VERSION, name: CURRENT_GATEWAY_SCHEMA_NAME },
     ]);
+    db.close();
+  });
+
+  it("backfills immutable human ids, principals, and live sessions without invalidating cookies", async () => {
+    const db = createClient({ url: ":memory:" });
+    await createGatewayV1StoreForTest(db);
+    await db.execute({
+      sql: `INSERT INTO human_user
+              (name_key, name, password_hash, client_key, project, daemon_session_id,
+               created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      args: ["legacy", "Legacy Human", "hash", "ck_legacy", "default", "s_legacy", 1, 1],
+    });
+    await db.execute({
+      sql: `INSERT INTO human_session
+              (cookie_token, name, client_key, project, daemon_session_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)`,
+      args: ["cookie_legacy", "Legacy Human", "ck_legacy", "default", "s_legacy", 1],
+    });
+
+    await migrateGatewayStore(db);
+
+    const user = (await db.execute(
+      "SELECT human_user_id, name, client_key FROM human_user WHERE name_key = 'legacy'",
+    )).rows[0]!;
+    expect(String(user.human_user_id)).toMatch(/^hu_[a-f0-9]{24}$/);
+    expect(user).toMatchObject({ name: "Legacy Human", client_key: "ck_legacy" });
+
+    const session = (await db.execute(
+      "SELECT human_user_id, principal_id, cookie_token FROM human_session WHERE cookie_token = 'cookie_legacy'",
+    )).rows[0]!;
+    expect(session.human_user_id).toBe(user.human_user_id);
+    expect(String(session.principal_id)).toMatch(/^h_[a-f0-9]{24}$/);
+
+    const principal = (await db.execute({
+      sql: "SELECT principal_id, kind, access FROM principals WHERE principal_id = ?",
+      args: [String(session.principal_id)],
+    })).rows[0]!;
+    expect(principal).toMatchObject({
+      principal_id: session.principal_id,
+      kind: "local.human",
+      access: "admin",
+    });
+
+    await expect(currentHuman("cookie_legacy", { db })).resolves.toMatchObject({
+      name: "Legacy Human",
+      clientKey: "ck_legacy",
+      sessionId: "s_legacy",
+      humanUserId: user.human_user_id,
+      principalId: session.principal_id,
+    });
     db.close();
   });
 

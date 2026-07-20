@@ -294,9 +294,38 @@ async function exerciseRemotePackedLanes(
     try {
       await seed.batch([
         {
+          sql: `INSERT INTO human_user
+                (name_key, name, password_hash, client_key, project, daemon_session_id,
+                 created_at, updated_at, human_user_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          args: [
+            "packed-human",
+            "packed-human",
+            "unused",
+            "nexus_ck_packed_human",
+            "metadata-only",
+            "s_previous_boot",
+            1_780_000_000_000,
+            1_780_000_000_000,
+            "hu_aaaaaaaaaaaaaaaaaaaaaaaa",
+          ],
+        },
+        {
+          sql: `INSERT INTO principals
+                (principal_id, kind, access, created_at)
+                VALUES (?, ?, ?, ?)`,
+          args: [
+            "h_aaaaaaaaaaaaaaaaaaaaaaaa",
+            "local.human",
+            "admin",
+            1_780_000_000_000,
+          ],
+        },
+        {
           sql: `INSERT INTO human_session
-                (cookie_token, name, client_key, project, daemon_session_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)`,
+                (cookie_token, name, client_key, project, daemon_session_id, created_at,
+                 human_user_id, principal_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           args: [
             "human-packed",
             "packed-human",
@@ -304,6 +333,8 @@ async function exerciseRemotePackedLanes(
             "metadata-only",
             "s_previous_boot",
             1_780_000_000_000,
+            "hu_aaaaaaaaaaaaaaaaaaaaaaaa",
+            "h_aaaaaaaaaaaaaaaaaaaaaaaa",
           ],
         },
         {

@@ -328,6 +328,35 @@ describe("submitCommandIntent", () => {
     expect(calls).toBe(1);
   });
 
+  it("persists gateway-local principal evidence around daemon IPC", async () => {
+    const ingressDb = createClient({ url: ":memory:" });
+    await migrateGatewayStore(ingressDb);
+    await submitCommandIntent(
+      COMMAND_KINDS.messagePostSend,
+      { body: "principal evidence" },
+      {
+        ...localOperatorCaller(),
+        principalId: "h_operator",
+      },
+      {
+        ingressDb,
+        genCommandId: () => "cmd_principal_evidence",
+        now: () => 1_000,
+        daemonCommand: async () => ({ messageId: "m_principal" }),
+      },
+      "principal-evidence",
+    );
+
+    const row = (await ingressDb.execute(
+      `SELECT request_json, caller_principal_id FROM gateway_ingress
+       WHERE command_id = 'cmd_principal_evidence'`,
+    )).rows[0]!;
+    expect(row.caller_principal_id).toBe("h_operator");
+    expect(JSON.parse(String(row.request_json))).toMatchObject({
+      caller: { principalId: "h_operator" },
+    });
+  });
+
   it("maps an absent daemon to an explicit transport-unavailable 503 without terminal settlement", async () => {
     const ingressDb = createClient({ url: ":memory:" });
     await migrateGatewayStore(ingressDb);
