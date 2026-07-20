@@ -1122,18 +1122,22 @@ class WsAcceptanceContracts(unittest.TestCase):
             webconsole = root / "nexus-v015-webconsole-acceptance"
             webconsole_evidence = root / "nexus-v015-webconsole-evidence-verify"
             validator = root / "nexus-v015-evidence-validate"
+            assembler = root / "nexus-v015-release-assemble"
             webconsole.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
             webconsole_evidence.write_text(
                 "#!/usr/bin/env python3\n", encoding="utf-8"
             )
             validator.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            assembler.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             webconsole.chmod(0o555)
             webconsole_evidence.chmod(0o555)
             validator.chmod(0o555)
+            assembler.chmod(0o555)
             function_globals = module["validate_final_support_script_bindings"].__globals__
             function_globals["WEBCONSOLE_ACCEPTANCE_BIN"] = webconsole
             function_globals["WEBCONSOLE_EVIDENCE_VERIFIER_BIN"] = webconsole_evidence
             function_globals["EVIDENCE_VALIDATOR_BIN"] = validator
+            function_globals["RELEASE_ASSEMBLER_BIN"] = assembler
             readiness = {
                 "webconsoleAcceptance": str(webconsole),
                 "webconsoleAcceptanceSha256": digest(webconsole.read_bytes()),
@@ -1143,6 +1147,8 @@ class WsAcceptanceContracts(unittest.TestCase):
                 ),
                 "evidenceValidator": str(validator),
                 "evidenceValidatorSha256": digest(validator.read_bytes()),
+                "releaseAssembler": str(assembler),
+                "releaseAssemblerSha256": digest(assembler.read_bytes()),
             }
             environment = {
                 "NEXUS_V015_WEBCONSOLE_ACCEPTANCE": str(webconsole),
@@ -1158,6 +1164,10 @@ class WsAcceptanceContracts(unittest.TestCase):
                 "NEXUS_V015_EVIDENCE_VALIDATOR": str(validator),
                 "NEXUS_V015_EVIDENCE_VALIDATOR_SHA256": readiness[
                     "evidenceValidatorSha256"
+                ],
+                "NEXUS_V015_RELEASE_ASSEMBLER": str(assembler),
+                "NEXUS_V015_RELEASE_ASSEMBLER_SHA256": readiness[
+                    "releaseAssemblerSha256"
                 ],
             }
             real_fstat = os.fstat

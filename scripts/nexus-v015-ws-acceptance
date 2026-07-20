@@ -47,6 +47,7 @@ WEBCONSOLE_EVIDENCE_VERIFIER_BIN = Path(
     "/tmp/nexus-lab-bin/nexus-v015-webconsole-evidence-verify"
 )
 EVIDENCE_VALIDATOR_BIN = Path("/tmp/nexus-lab-bin/nexus-v015-evidence-validate")
+RELEASE_ASSEMBLER_BIN = Path("/tmp/nexus-lab-bin/nexus-v015-release-assemble")
 NEXUS_BIN = Path("/tmp/nexus-lab-bin/nexus")
 GATEWAY_BIN = Path("/tmp/nexus-lab-bin/nexus-gateway")
 WEBUI_BIN = Path("/tmp/nexus-lab-bin/nexus-webui")
@@ -1645,6 +1646,14 @@ def validate_final_support_script_bindings(
             EVIDENCE_VALIDATOR_BIN,
             "evidence validator",
         ),
+        (
+            "releaseAssembler",
+            "releaseAssemblerSha256",
+            "NEXUS_V015_RELEASE_ASSEMBLER",
+            "NEXUS_V015_RELEASE_ASSEMBLER_SHA256",
+            RELEASE_ASSEMBLER_BIN,
+            "release assembler",
+        ),
     )
     for path_key, hash_key, environment_path, environment_hash, path, label in bindings:
         digest_value = readiness.get(hash_key)
@@ -1872,6 +1881,7 @@ def validate_candidate(lab_root: Path, evidence_dir: Path, run_id: str) -> Candi
         "webconsoleAcceptance", "webconsoleAcceptanceSha256",
         "webconsoleEvidenceVerifier", "webconsoleEvidenceVerifierSha256",
         "evidenceValidator", "evidenceValidatorSha256",
+        "releaseAssembler", "releaseAssemblerSha256",
     }
     if set(readiness) != required:
         raise AcceptanceFailure("candidate readiness ledger has unexpected or missing fields")
@@ -2033,6 +2043,10 @@ def validate_candidate(lab_root: Path, evidence_dir: Path, run_id: str) -> Candi
         "NEXUS_V015_EVIDENCE_VALIDATOR": readiness["evidenceValidator"],
         "NEXUS_V015_EVIDENCE_VALIDATOR_SHA256": readiness[
             "evidenceValidatorSha256"
+        ],
+        "NEXUS_V015_RELEASE_ASSEMBLER": readiness["releaseAssembler"],
+        "NEXUS_V015_RELEASE_ASSEMBLER_SHA256": readiness[
+            "releaseAssemblerSha256"
         ],
     }
     for key, expected in expected_environment.items():
