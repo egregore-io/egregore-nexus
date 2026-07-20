@@ -1129,7 +1129,8 @@ def _process_environment(pid: int, label: str) -> dict[str, str]:
 
 def _listener_inodes(port: int) -> set[str]:
     result: set[str] = set()
-    for path in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+    net_root = Path("/proc") / str(os.getpid()) / "net"
+    for path in (net_root / "tcp", net_root / "tcp6"):
         text = checked_system_text(path, f"kernel TCP listener table {path.name}")
         for line in text.splitlines()[1:]:
             fields = line.split()

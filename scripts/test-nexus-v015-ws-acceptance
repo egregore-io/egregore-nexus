@@ -380,6 +380,18 @@ class WsAcceptanceContracts(unittest.TestCase):
                 module["argv_binds_path"](["node", "nexus-gateway"], expected)
             )
 
+    def test_listener_tables_use_the_numeric_process_network_namespace(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        reader = mock.Mock(return_value="sl local_address rem_address st tx_queue")
+        globals_ = module["_listener_inodes"].__globals__
+        with mock.patch.dict(globals_, {"checked_system_text": reader}):
+            with mock.patch.object(globals_["os"], "getpid", return_value=4321):
+                self.assertEqual(module["_listener_inodes"](4101), set())
+        self.assertEqual(
+            [call.args[0] for call in reader.call_args_list],
+            [Path("/proc/4321/net/tcp"), Path("/proc/4321/net/tcp6")],
+        )
+
     def test_post_acceptance_revalidates_candidate_and_runtime_before_publish(self) -> None:
         module = runpy.run_path(str(TARGET))
         candidate = module["Candidate"](
