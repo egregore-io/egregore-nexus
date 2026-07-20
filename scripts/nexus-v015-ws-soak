@@ -1198,6 +1198,10 @@ def session_event(frame: dict[str, Any]) -> dict[str, Any]:
     return event if isinstance(event, dict) else frame
 
 
+def progressive_session_reply(marker: str) -> str:
+    return "\n".join((marker,) * 4)
+
+
 @dataclass(frozen=True)
 class PromptAttempt:
     marker: str
@@ -1249,11 +1253,15 @@ class AgentSessionLane(FrameLane):
         client_message_id = f"cm-{marker}"
         start_index = len(self.frames)
         before_cursor = self.last_numeric_cursor
+        reply = progressive_session_reply(marker)
         await self.send({
             "t": "input",
             "mode": "session",
             "target": {"name": self.agent.name, "agentId": self.agent.agent_id},
-            "text": f"Reply briefly with this exact soak marker: {marker}",
+            "text": (
+                "Reply with exactly these four identical marker lines and no other text:\n"
+                f"{reply}"
+            ),
             "clientMessageId": client_message_id,
         })
         ack = await self.wait_for(
@@ -1355,10 +1363,11 @@ class AgentSessionLane(FrameLane):
                 f"{client_message_id}: contentFrames={len(assistant_deltas)}"
             )
         assistant_text = "".join(assistant_deltas)
-        if assistant_text.strip() != marker:
+        expected_reply = progressive_session_reply(marker)
+        if assistant_text.strip() != expected_reply:
             raise SoakFailure(
                 f"{self.agent.kind} assistant marker mismatch for {client_message_id}: "
-                f"expected {marker!r}, got {assistant_text!r}"
+                f"expected {expected_reply!r}, got {assistant_text!r}"
             )
         await self.wait_for(
             lambda frame: (

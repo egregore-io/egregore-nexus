@@ -777,8 +777,21 @@ class LaneHttp:
     csrf = "fixture"
 
 
+def progressive_reply_contract() -> None:
+    marker = "V015_PROGRESSIVE_MARKER"
+    reply = module["progressive_session_reply"](marker)
+    require(
+        reply.splitlines() == [marker] * 4,
+        "progressive session reply must preserve four exact marker lines",
+    )
+
+
+progressive_reply_contract()
+
+
 async def reject_single_frame_assistant_output() -> None:
     marker = "V015_PROGRESSIVE_MARKER"
+    reply = module["progressive_session_reply"](marker)
     lane = module["AgentSessionLane"](
         LaneEvidence(),
         module["Ledger"](),
@@ -805,7 +818,7 @@ async def reject_single_frame_assistant_output() -> None:
                     "event": {
                         "type": "TEXT_MESSAGE_CONTENT",
                         "messageId": "assistant-progressive",
-                        "delta": marker,
+                        "delta": reply,
                     }
                 },
                 {"event": {"type": "TEXT_MESSAGE_END", "messageId": "assistant-progressive"}},
@@ -830,6 +843,8 @@ else:
 
 async def correlate_prompt_across_an_explicit_boundary() -> None:
     marker = "V015_CROSS_RESTART_MARKER"
+    reply = module["progressive_session_reply"](marker)
+    midpoint = len(reply) // 2
     lane = module["AgentSessionLane"](
         LaneEvidence(),
         module["Ledger"](),
@@ -869,14 +884,14 @@ async def correlate_prompt_across_an_explicit_boundary() -> None:
             "event": {
                 "type": "TEXT_MESSAGE_CONTENT",
                 "messageId": "assistant-cross-restart",
-                "delta": "V015_CROSS_",
+                "delta": reply[:midpoint],
             }
         },
         {
             "event": {
                 "type": "TEXT_MESSAGE_CONTENT",
                 "messageId": "assistant-cross-restart",
-                "delta": "RESTART_MARKER",
+                "delta": reply[midpoint:],
             }
         },
         {"event": {"type": "TEXT_MESSAGE_END", "messageId": "assistant-cross-restart"}},
