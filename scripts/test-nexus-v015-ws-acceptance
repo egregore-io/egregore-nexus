@@ -1951,6 +1951,28 @@ class WsAcceptanceContracts(unittest.TestCase):
                 )
             )
 
+    def test_bus_action_marker_must_be_the_unique_terminal_line(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        marker = "V015_AGENT_DONE_current"
+
+        module["require_terminal_marker"](
+            "Both sends returned message-ID receipts.\n\nV015_AGENT_DONE_current",
+            marker,
+            "claude bus-action",
+        )
+        for invalid in (
+            "prefix V015_AGENT_DONE_current",
+            "V015_AGENT_DONE_current\nunexpected trailing text",
+            "V015_AGENT_DONE_current\nV015_AGENT_DONE_current",
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(module["AcceptanceFailure"], "marker mismatch"):
+                    module["require_terminal_marker"](
+                        invalid,
+                        marker,
+                        "claude bus-action",
+                    )
+
     def test_daemon_restart_accepts_only_gap_or_ordered_fleet_resync_as_boot_reset(self) -> None:
         module = runpy.run_path(str(TARGET))
         backend = module["BackendAcceptance"].__new__(module["BackendAcceptance"])

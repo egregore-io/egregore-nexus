@@ -2616,6 +2616,23 @@ class GateObservations:
         return payloads
 
 
+def require_terminal_marker(
+    assistant_text: object,
+    expected_text: str,
+    label: str,
+) -> None:
+    if not isinstance(assistant_text, str):
+        raise AcceptanceFailure(f"{label} assistant marker mismatch: {assistant_text!r}")
+    normalized = assistant_text.strip()
+    lines = normalized.splitlines()
+    if (
+        not lines
+        or lines[-1].strip() != expected_text
+        or normalized.count(expected_text) != 1
+    ):
+        raise AcceptanceFailure(f"{label} assistant marker mismatch: {assistant_text!r}")
+
+
 async def wait_correlated_assistant_reply(
     core: dict[str, Any],
     lane: Any,
@@ -2732,10 +2749,7 @@ async def wait_correlated_assistant_reply(
         )
     final_assistant = assistant_messages[-1]
     assistant_text = final_assistant["text"]
-    if not isinstance(assistant_text, str) or assistant_text.strip() != expected_text:
-        raise AcceptanceFailure(
-            f"{label} assistant marker mismatch: {assistant_text!r}"
-        )
+    require_terminal_marker(assistant_text, expected_text, label)
     return {
         "runId": run_id,
         "assistantMessageId": final_assistant["messageId"],
@@ -3545,8 +3559,8 @@ class BackendAcceptance:
         instruction = (
             f"Use your Nexus dm tool exactly once to send {dm_marker!r} to {self.human_name!r}. "
             f"Use your Nexus thread post tool exactly once to post {thread_marker!r} to "
-            f"thread {self.soak.thread!r}. After both tools succeed, reply in this session with "
-            f"exactly {assistant_marker!r} and no other text."
+            f"thread {self.soak.thread!r}. After both tools succeed, end your reply with "
+            f"{assistant_marker!r} as its final standalone line, with nothing after it."
         )
         session_start = len(lane.frames)
         dm_start = len(self.human_dm.frames)
