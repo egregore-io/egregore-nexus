@@ -115,6 +115,8 @@ async fn baseline_contains_current_identity_routing_and_delivery_columns() {
         ("agent_acl_grants", "principal_agent_id"),
         ("agent_acl_grants", "granted_by_agent_id"),
         ("initial_prompt_deliveries", "client_message_id"),
+        ("native_thread_bindings", "provider"),
+        ("native_thread_bindings", "kind"),
         ("inbox_subscription_batches", "message_signature"),
         ("native_thread_bindings", "native_thread_id"),
         ("producer_identities", "producer_id"),

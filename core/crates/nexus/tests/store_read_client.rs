@@ -1215,7 +1215,8 @@ async fn read_client_native_resume_rejects_an_ambiguous_idless_agent_alias() {
         .unwrap();
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: "native-resume-one".into(),
             agent_id: "a_resume_one".into(),
             project: "one".into(),
@@ -1882,7 +1883,8 @@ async fn read_client_prefers_identity_owned_codex_thread_over_sidecar_thread() {
         .unwrap();
     NativeThreadBindings::new(&state.store)
         .claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: "codex-thread-identity".into(),
             agent_id,
             project: "default".into(),

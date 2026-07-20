@@ -177,13 +177,14 @@ impl AgentRuntimeRow {
     }
 }
 
-/// Durable ownership binding between a harness-native conversation/session id and a Nexus agent.
+/// Durable ownership binding between a provider-native conversation/session id and a Nexus agent.
 ///
 /// Runtime rows can be stopped, deleted, or replaced. This row answers the separate identity
 /// question: "which stable agent owns this native conversation?"
 #[derive(Debug, Clone, PartialEq)]
 pub struct NativeThreadBindingRow {
-    pub harness: String,
+    pub provider: String,
+    pub kind: String,
     pub native_thread_id: String,
     pub agent_id: String,
     pub project: String,

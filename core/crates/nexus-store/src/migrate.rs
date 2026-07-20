@@ -17,7 +17,16 @@ const BASELINE_SCHEMA_NAME: &str = "v0.1.0_baseline";
 const MESSAGE_HOOKS_SCHEMA_VERSION: i64 = 2;
 const MESSAGE_HOOKS_SCHEMA_NAME: &str = "v0.1.5_message_hooks";
 pub(crate) const IDENTITY_SCHEMA_NAME: &str = "v0.1.0_identity";
+pub(crate) const IDENTITY_PROVIDER_SCHEMA_NAME: &str = "v0.1.6_identity_provider";
 pub(crate) const TRANSPORT_SCHEMA_NAME: &str = "v0.1.0_transport";
+
+/// Reachable test seam for proving that the identity-provider migration is atomic.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationFault {
+    None,
+    AfterFirstStatement,
+}
 
 const BASELINE_SCHEMA: &str = include_str!("../../../migrations/0001_init.sql");
 const MESSAGE_HOOKS_SCHEMA: &str = include_str!("../../../migrations/0002_message_hooks.sql");
@@ -197,7 +206,13 @@ impl Store {
                 self.validate_delivery_timing_schema().await?;
             }
             Some(marker) if marker == IDENTITY_SCHEMA_NAME => {
+                self.validate_legacy_identity_schema().await?;
+                self.upgrade_identity_provider(MigrationFault::None).await?;
+                self.validate_identity_provider_schema().await?;
+            }
+            Some(marker) if marker == IDENTITY_PROVIDER_SCHEMA_NAME => {
                 self.validate_identity_schema().await?;
+                self.validate_identity_provider_schema().await?;
             }
             Some(marker) if marker == TRANSPORT_SCHEMA_NAME => {}
             Some(marker) => return Err(unsupported_schema(&marker)),
@@ -363,6 +378,12 @@ impl Store {
         }
         if markers
             .iter()
+            .all(|(_, name)| name == IDENTITY_PROVIDER_SCHEMA_NAME)
+        {
+            return Ok(Some(IDENTITY_PROVIDER_SCHEMA_NAME.into()));
+        }
+        if markers
+            .iter()
             .all(|(_, name)| name == TRANSPORT_SCHEMA_NAME)
         {
             return Ok(Some(TRANSPORT_SCHEMA_NAME.into()));
@@ -444,6 +465,92 @@ impl Store {
         Ok(())
     }
 
+    async fn validate_legacy_identity_schema(&self) -> Result<(), NexusError> {
+        self.validate_identity_schema().await?;
+        if !self
+            .column_exists("native_thread_bindings", "harness")
+            .await?
+            || self
+                .column_exists("native_thread_bindings", "provider")
+                .await?
+            || self.column_exists("native_thread_bindings", "kind").await?
+        {
+            return Err(NexusError::Store(
+                "incomplete v0.1.0 identity schema: native_thread_bindings must have harness and no provider/kind columns"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn validate_identity_provider_schema(&self) -> Result<(), NexusError> {
+        for column in ["provider", "kind"] {
+            if !self.column_exists("native_thread_bindings", column).await? {
+                return Err(NexusError::Store(format!(
+                    "incomplete {IDENTITY_PROVIDER_SCHEMA_NAME} identity schema: missing native_thread_bindings.{column}"
+                )));
+            }
+        }
+        if self
+            .column_exists("native_thread_bindings", "harness")
+            .await?
+        {
+            return Err(NexusError::Store(format!(
+                "incomplete {IDENTITY_PROVIDER_SCHEMA_NAME} identity schema: legacy native_thread_bindings.harness remains"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn upgrade_identity_provider(&self, fault: MigrationFault) -> Result<(), NexusError> {
+        let tx = self
+            .begin_write_txn("v016_identity_provider_migration")
+            .await?;
+        if let Err(error) = tx
+            .execute(
+                "ALTER TABLE native_thread_bindings RENAME COLUMN harness TO provider",
+                (),
+            )
+            .await
+        {
+            return rollback_error(tx, error).await;
+        }
+        if fault == MigrationFault::AfterFirstStatement {
+            return rollback_error(
+                tx,
+                NexusError::Store("injected identity migration fault after first statement".into()),
+            )
+            .await;
+        }
+        if let Err(error) = tx
+            .execute(
+                "ALTER TABLE native_thread_bindings ADD COLUMN kind TEXT NOT NULL DEFAULT 'harness'",
+                (),
+            )
+            .await
+        {
+            return rollback_error(tx, error).await;
+        }
+        if let Err(error) = tx.execute("DELETE FROM schema_migrations", ()).await {
+            return rollback_error(tx, error).await;
+        }
+        if let Err(error) = tx
+            .execute(
+                "INSERT INTO schema_migrations(version, name, applied_at)
+                 VALUES (?1, ?2, ?3)",
+                libsql::params![
+                    BASELINE_SCHEMA_VERSION,
+                    IDENTITY_PROVIDER_SCHEMA_NAME,
+                    now()
+                ],
+            )
+            .await
+        {
+            return rollback_error(tx, error).await;
+        }
+        tx.commit().await
+    }
+
     async fn validate_message_hook_schema(&self) -> Result<(), NexusError> {
         for (object, column) in [
             ("messages", "mention_json"),
@@ -522,6 +629,36 @@ impl Store {
             .await
             .map_err(store_err)?;
         Ok(())
+    }
+}
+
+/// Migrate one legacy identity database through the externally reachable fault seam.
+#[doc(hidden)]
+pub async fn migrate_identity_with_fault(
+    identity_db_path: &Path,
+    fault: MigrationFault,
+) -> Result<(), NexusError> {
+    let location = identity_db_path
+        .to_str()
+        .ok_or_else(|| NexusError::Invalid("identity database path is not valid UTF-8".into()))?;
+    let store = Store::open(location).await?;
+    match store.schema_marker().await? {
+        Some(marker) if marker == IDENTITY_SCHEMA_NAME => {
+            store.validate_legacy_identity_schema().await?;
+            store.upgrade_identity_provider(fault).await?;
+            store.validate_identity_provider_schema().await
+        }
+        Some(marker) if marker == IDENTITY_PROVIDER_SCHEMA_NAME => {
+            if fault != MigrationFault::None {
+                return Err(NexusError::Invalid(
+                    "identity migration fault requires a legacy identity schema".into(),
+                ));
+            }
+            store.validate_identity_schema().await?;
+            store.validate_identity_provider_schema().await
+        }
+        Some(marker) => Err(unsupported_schema(&marker)),
+        None => Err(unsupported_schema("missing identity schema marker")),
     }
 }
 

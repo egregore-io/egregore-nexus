@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use nexus_common::NexusError;
 
-use crate::migrate::{IDENTITY_SCHEMA_NAME, TRANSPORT_SCHEMA_NAME};
+use crate::migrate::{IDENTITY_PROVIDER_SCHEMA_NAME, TRANSPORT_SCHEMA_NAME};
 use crate::Store;
 
 pub const PERSISTENT_CONTINUITY_TABLES: &[&str] = &[
@@ -82,7 +82,9 @@ impl DaemonStore {
             .execute_batch(IDENTITY_SCHEMA)
             .await
             .map_err(store_error)?;
-        identity.mark_schema_variant(IDENTITY_SCHEMA_NAME).await?;
+        identity
+            .mark_schema_variant(IDENTITY_PROVIDER_SCHEMA_NAME)
+            .await?;
 
         let transport = Arc::new(Store::open(":memory:").await?);
         transport.migrate().await?;

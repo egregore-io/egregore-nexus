@@ -21,5 +21,7 @@ pub mod state;
 pub mod types;
 
 pub use daemon_store::DaemonStore;
+#[doc(hidden)]
+pub use migrate::{migrate_identity_with_fault, MigrationFault};
 pub use search_index::SearchHit;
 pub use state::{Store, StoreLocation, WriteTxn};

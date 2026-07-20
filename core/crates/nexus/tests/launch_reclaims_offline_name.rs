@@ -844,7 +844,8 @@ async fn codex_resume_without_name_reuses_durable_native_owner() {
         .unwrap();
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: CODEX_THREAD.into(),
             agent_id: "a_otto".into(),
             project: PROJECT.into(),
@@ -893,7 +894,8 @@ async fn codex_resume_after_remove_reuses_preserved_durable_thread_on_owner_row(
         .unwrap();
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: CODEX_THREAD.into(),
             agent_id: "a_otto_removed".into(),
             project: PROJECT.into(),
@@ -971,7 +973,8 @@ async fn codex_resume_with_different_explicit_name_rejects_durable_owner() {
         .unwrap();
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: CODEX_THREAD.into(),
             agent_id: "a_otto".into(),
             project: PROJECT.into(),
@@ -1035,7 +1038,8 @@ async fn codex_launch_explicit_agent_id_resume_validates_thread_before_active_ru
         .unwrap();
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: CODEX_THREAD.into(),
             agent_id: "a_celia".into(),
             project: PROJECT.into(),
@@ -1320,7 +1324,8 @@ async fn admin_remove_preserves_codex_native_resume_state() {
         .unwrap();
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: CODEX_THREAD.into(),
             agent_id: "a_beatrice".into(),
             project: PROJECT.into(),
@@ -1418,7 +1423,8 @@ async fn admin_delete_removes_codex_native_thread_ownership() {
         .unwrap();
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: CODEX_THREAD.into(),
             agent_id: "a_beatrice_delete".into(),
             project: PROJECT.into(),

@@ -550,7 +550,8 @@ CREATE INDEX IF NOT EXISTS idx_transcript_archive_agent
   ON transcript_archive(agent_name, project, updated_at);
 
 CREATE TABLE IF NOT EXISTS native_thread_bindings (
-  harness          TEXT NOT NULL,
+  provider         TEXT NOT NULL,
+  kind             TEXT NOT NULL DEFAULT 'harness',
   native_thread_id TEXT NOT NULL,
   agent_id         TEXT NOT NULL,
   project          TEXT NOT NULL,
@@ -559,7 +560,7 @@ CREATE TABLE IF NOT EXISTS native_thread_bindings (
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL,
   released_at      INTEGER,
-  PRIMARY KEY (harness, native_thread_id)
+  PRIMARY KEY (provider, native_thread_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_native_thread_bindings_agent

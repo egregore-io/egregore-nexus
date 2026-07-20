@@ -78,7 +78,25 @@ async fn legacy_identity_marker_ladder_reopens_and_is_canonicalized() {
             .identity()
             .conn
             .execute_batch(
-                "DELETE FROM schema_migrations;
+                "DROP TABLE native_thread_bindings;
+                 CREATE TABLE native_thread_bindings (
+                   harness TEXT NOT NULL,
+                   native_thread_id TEXT NOT NULL,
+                   agent_id TEXT NOT NULL,
+                   project TEXT NOT NULL,
+                   first_runtime_id TEXT,
+                   last_runtime_id TEXT,
+                   created_at INTEGER NOT NULL,
+                   updated_at INTEGER NOT NULL,
+                   released_at INTEGER,
+                   PRIMARY KEY (harness, native_thread_id)
+                 );
+                 CREATE INDEX idx_native_thread_bindings_agent
+                   ON native_thread_bindings(agent_id, updated_at DESC);
+                 CREATE INDEX idx_native_thread_bindings_runtime
+                   ON native_thread_bindings(last_runtime_id)
+                   WHERE last_runtime_id IS NOT NULL;
+                 DELETE FROM schema_migrations;
                  INSERT INTO schema_migrations(version, name, applied_at)
                    VALUES (1, 'v0.1.0_identity', 1),
                           (3, 'v0.1.0_identity', 3);",
@@ -106,7 +124,7 @@ async fn legacy_identity_marker_ladder_reopens_and_is_canonicalized() {
             row.get::<String>(1).expect("identity marker name"),
         ));
     }
-    assert_eq!(markers, vec![(1, "v0.1.0_identity".into())]);
+    assert_eq!(markers, vec![(1, "v0.1.6_identity_provider".into())]);
 
     drop(rows);
     drop(reopened);

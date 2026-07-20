@@ -296,7 +296,8 @@ impl<'a> HermesRuntimeStateRepo<'a> {
         };
         NativeThreadBindings::new(self.store)
             .claim(NewNativeThreadBinding {
-                harness: "hermes".into(),
+                provider: "hermes".into(),
+                kind: "harness".into(),
                 native_thread_id: hermes_session_id.to_string(),
                 agent_id,
                 project: row.project,
