@@ -1021,6 +1021,98 @@ async def correlate_prompt_to_its_run_when_backlog_arrives_after_send() -> None:
 asyncio.run(correlate_prompt_to_its_run_when_backlog_arrives_after_send())
 
 
+async def reject_assistant_output_from_a_later_unrelated_run() -> None:
+    marker = "V015_EMPTY_TURN_MARKER"
+    lane = module["AgentSessionLane"](
+        LaneEvidence(),
+        module["Ledger"](),
+        LaneHttp(),
+        agents[1],
+    )
+
+    class Socket:
+        async def send(self, raw: str) -> None:
+            request = json.loads(raw)
+            frame = {
+                "t": "input.ack",
+                "clientMessageId": request["clientMessageId"],
+                "commandId": "command-empty-turn",
+            }
+            lane.frames.append(frame)
+            lane.consume(frame)
+            lane.changed.set()
+
+    lane.socket = Socket()
+    attempt = await lane.begin_prompt(marker, timeout=1)
+    delayed_frames = [
+        {
+            "event": {"type": "RUN_STARTED", "runId": "run-empty-current"},
+            "cursor": "cursor-70",
+        },
+        {
+            "event": {"type": "TEXT_MESSAGE_END", "messageId": attempt.client_message_id},
+            "cursor": "cursor-70",
+        },
+        {
+            "event": {"type": "RUN_FINISHED", "runId": "run-empty-current"},
+            "cursor": "cursor-71",
+        },
+        {
+            "event": {"type": "RUN_STARTED", "runId": "run-unrelated-later"},
+            "cursor": "cursor-80",
+        },
+        {
+            "event": {
+                "type": "TEXT_MESSAGE_START",
+                "role": "assistant",
+                "messageId": "assistant-unrelated-later",
+            },
+            "cursor": "cursor-81",
+        },
+        {
+            "event": {
+                "type": "TEXT_MESSAGE_CONTENT",
+                "messageId": "assistant-unrelated-later",
+                "delta": "Peer ack from another turn, ",
+            },
+            "cursor": "cursor-82",
+        },
+        {
+            "event": {
+                "type": "TEXT_MESSAGE_CONTENT",
+                "messageId": "assistant-unrelated-later",
+                "delta": "no action needed.",
+            },
+            "cursor": "cursor-83",
+        },
+        {
+            "event": {"type": "TEXT_MESSAGE_END", "messageId": "assistant-unrelated-later"},
+            "cursor": "cursor-84",
+        },
+        {
+            "event": {"type": "RUN_FINISHED", "runId": "run-unrelated-later"},
+            "cursor": "cursor-84",
+        },
+    ]
+    for frame in delayed_frames:
+        lane.frames.append(frame)
+        lane.consume(frame)
+    lane.changed.set()
+
+    try:
+        await lane.finish_prompt(attempt, timeout=0.05)
+    except SoakFailure as error:
+        require(
+            "current run" in str(error).lower(),
+            "later unrelated assistant output was misattributed to the submitted prompt",
+        )
+    else:
+        raise AssertionError("later unrelated assistant output satisfied the prompt gate")
+
+
+asyncio.run(reject_assistant_output_from_a_later_unrelated_run())
+
+
 async def correlate_developer_message_across_an_explicit_boundary() -> None:
     topic = "sys.message.thread.contract"
     soak = object.__new__(module["Soak"])

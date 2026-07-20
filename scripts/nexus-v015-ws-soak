@@ -1326,37 +1326,54 @@ class AgentSessionLane(FrameLane):
             )
         started = starts[0]
         run_id = session_event(started)["runId"]
-        assistant_start = await self.wait_for(
+        terminal = await self.wait_for(
             lambda frame: (
-                session_event(frame).get("type") == "TEXT_MESSAGE_START"
-                and session_event(frame).get("role") == "assistant"
-                and isinstance(session_event(frame).get("messageId"), str)
-                and bool(session_event(frame).get("messageId"))
+                session_event(frame).get("type") == "RUN_FINISHED"
+                and session_event(frame).get("runId") == run_id
+                and (numeric_cursor(frame) or -1) > before_cursor
             ),
             after=echo_index + 1,
             timeout=timeout,
-            label=f"session assistant start {client_message_id}",
+            label=f"session terminal event {client_message_id}",
         )
-        assistant_message_id = session_event(assistant_start)["messageId"]
-        assistant_start_index = next(
+        terminal_index = next(
             index
             for index in range(echo_index + 1, len(self.frames))
-            if self.frames[index] is assistant_start
+            if self.frames[index] is terminal
         )
-        assistant_end = await self.wait_for(
-            lambda frame: (
-                session_event(frame).get("type") == "TEXT_MESSAGE_END"
-                and session_event(frame).get("messageId") == assistant_message_id
-            ),
-            after=assistant_start_index + 1,
-            timeout=timeout,
-            label=f"session assistant end {client_message_id}",
-        )
-        assistant_end_index = next(
-            index
-            for index in range(assistant_start_index + 1, len(self.frames))
-            if self.frames[index] is assistant_end
-        )
+        assistant_starts = [
+            (index, frame)
+            for index, frame in enumerate(
+                self.frames[echo_index + 1 : terminal_index],
+                start=echo_index + 1,
+            )
+            if session_event(frame).get("type") == "TEXT_MESSAGE_START"
+            and session_event(frame).get("role") == "assistant"
+            and isinstance(session_event(frame).get("messageId"), str)
+            and bool(session_event(frame).get("messageId"))
+        ]
+        if len(assistant_starts) != 1:
+            raise SoakFailure(
+                f"{self.agent.kind} current run has no exact assistant output for "
+                f"{client_message_id}: count={len(assistant_starts)} runId={run_id}"
+            )
+        assistant_start_index, assistant_start = assistant_starts[0]
+        assistant_message_id = session_event(assistant_start)["messageId"]
+        assistant_ends = [
+            (index, frame)
+            for index, frame in enumerate(
+                self.frames[assistant_start_index + 1 : terminal_index],
+                start=assistant_start_index + 1,
+            )
+            if session_event(frame).get("type") == "TEXT_MESSAGE_END"
+            and session_event(frame).get("messageId") == assistant_message_id
+        ]
+        if len(assistant_ends) != 1:
+            raise SoakFailure(
+                f"{self.agent.kind} current run has no exact assistant end for "
+                f"{client_message_id}: count={len(assistant_ends)} runId={run_id}"
+            )
+        assistant_end_index, _assistant_end = assistant_ends[0]
         assistant_deltas = [
             str(session_event(frame).get("delta"))
             for frame in self.frames[assistant_start_index + 1 : assistant_end_index]
@@ -1377,16 +1394,6 @@ class AgentSessionLane(FrameLane):
                 f"{self.agent.kind} assistant marker mismatch for {client_message_id}: "
                 f"expected {expected_reply!r}, got {assistant_text!r}"
             )
-        await self.wait_for(
-            lambda frame: (
-                session_event(frame).get("type") == "RUN_FINISHED"
-                and session_event(frame).get("runId") == run_id
-                and (numeric_cursor(frame) or -1) > before_cursor
-            ),
-            after=assistant_end_index + 1,
-            timeout=timeout,
-            label=f"session terminal event {client_message_id}",
-        )
         completion_count = sum(
             session_event(frame).get("type") == "RUN_FINISHED"
             and session_event(frame).get("runId") == run_id
