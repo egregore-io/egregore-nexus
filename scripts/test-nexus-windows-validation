@@ -94,14 +94,21 @@ def main() -> int:
         'cargo.exe test --workspace --no-fail-fast',
         'name = "rust-native-teardown-stress"',
         'for ($iteration = 1; $iteration -le 100; $iteration++)',
-        'NEXUS_BUILD_REVISION',
         'original_revision',
         'name = "npm-cli-smoke"',
-        'Windows npm launcher reports the wrong source revision',
+        '$ExpectedVersion',
+        '$VersionOutput -ne "nexus $ExpectedVersion"',
+        'Windows npm launcher reports the wrong release version',
         "node.exe packages/nexus-cli/bin/nexus.mjs daemon install --help",
         "node.exe scripts/nexus-cli-command-surface-smoke.mjs",
         'name = "gateway-gates"',
         "pnpm.cmd --dir gateway webconsole:build",
+        'name = "webconsole-command-shim-lifecycle"',
+        'Program Files\\Egregore Nexus',
+        'nexus-webui.cmd',
+        'nexus-gateway.cmd',
+        'webconsole start --host 127.0.0.1 --port',
+        'webconsole stop --force',
         'name = "nexus-exe"',
         'name = "gateway-headless"',
         'name = "gateway-web"',
@@ -134,6 +141,8 @@ def main() -> int:
         failures.append("recipe still performs the duplicate headless Gateway build")
     if 'CARGO_BUILD_JOBS = "4"' in recipe or 'RUST_TEST_THREADS = "4"' in recipe:
         failures.append("recipe exceeds the resource-capped Windows validation concurrency")
+    if "wrong source revision" in recipe or "revision $env:NEXUS_BUILD_REVISION" in recipe:
+        failures.append("Windows launcher still requires revision text in --version output")
 
     if failures:
         print("FAIL optional Windows validation contract")

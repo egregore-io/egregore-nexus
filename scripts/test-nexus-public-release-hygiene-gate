@@ -14,7 +14,12 @@ GATE = ROOT / "scripts/nexus-public-release-hygiene-gate"
 
 
 class PublicReleaseHygieneGateTests(unittest.TestCase):
-    def run_gate(self, files: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    def run_gate(
+        self,
+        files: dict[str, str],
+        *,
+        commit_message: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory(prefix="nexus-public-hygiene-") as raw:
             root = Path(raw)
             paths = root / "paths.txt"
@@ -23,8 +28,35 @@ class PublicReleaseHygieneGateTests(unittest.TestCase):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content, encoding="utf-8")
             paths.write_text("".join(f"{path}\n" for path in files), encoding="utf-8")
+            command = [
+                str(GATE),
+                "--root",
+                str(root),
+                "--paths-file",
+                str(paths),
+            ]
+            if commit_message is None:
+                command.append("--skip-commit-metadata")
+            else:
+                subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+                subprocess.run(
+                    ["git", "config", "user.name", "Release Test"],
+                    cwd=root,
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.email", "release@example.invalid"],
+                    cwd=root,
+                    check=True,
+                )
+                subprocess.run(["git", "add", "--", *files], cwd=root, check=True)
+                subprocess.run(
+                    ["git", "commit", "-q", "-m", commit_message],
+                    cwd=root,
+                    check=True,
+                )
             return subprocess.run(
-                [str(GATE), "--root", str(root), "--paths-file", str(paths)],
+                command,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -108,6 +140,28 @@ class PublicReleaseHygieneGateTests(unittest.TestCase):
         )
         self.assertEqual(private_key.returncode, 1, private_key.stdout)
         self.assertIn("embedded_private_key", private_key.stdout)
+
+    def test_accepts_commit_metadata_without_attribution_trailers(self) -> None:
+        result = self.run_gate(
+            {"README.md": "Public release notes.\n"},
+            commit_message="docs: publish release notes",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_rejects_commit_attribution_trailers(self) -> None:
+        messages = (
+            "docs: publish release notes\n\nCo-Authored-By: Contributor <person@example.invalid>",
+            "docs: publish release notes\n\nGenerated-By: Codex",
+            "docs: publish release notes\n\nWritten with Claude",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                result = self.run_gate(
+                    {"README.md": "Public release notes.\n"},
+                    commit_message=message,
+                )
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("commit_attribution_trailer", result.stdout)
 
 
 if __name__ == "__main__":

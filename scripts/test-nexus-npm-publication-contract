@@ -183,7 +183,7 @@ cat >"$TMP/nexus.c" <<C
 #include <stdio.h>
 int main(int argc, char **argv) {
   if (argc == 2 && argv[1][0] == '-' && argv[1][1] == '-') {
-    puts("nexus ${VERSION} (revision publication-contract)");
+    puts("nexus ${VERSION}");
     return 0;
   }
   return 0;
@@ -195,7 +195,7 @@ PACKED=$(
   "$ROOT/scripts/nexus-pack-native-npm" \
     --target linux-x64-gnu --binary "$TMP/nexus" --output "$TMP/assembly"
 )
-"$PACKED" --version | grep -q 'revision publication-contract'
+test "$("$PACKED" --version)" = "nexus ${VERSION}"
 
 SECTIONS=$(readelf -SW "$PACKED")
 if printf '%s\n' "$SECTIONS" | grep -Eq '\.(symtab|debug_[^ ]*|comment)([[:space:]]|$)'; then

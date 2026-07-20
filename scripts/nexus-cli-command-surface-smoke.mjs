@@ -16,8 +16,7 @@ const resolvedLauncher = resolve(launcher);
 const version = run(["--version"]);
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const expectedVersion = readFileSync(resolve(repoRoot, "VERSION"), "utf8").trim();
-const escapedVersion = expectedVersion.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-assert.match(version, new RegExp(`^nexus ${escapedVersion} \\(revision [^)]+\\)`));
+assert.equal(version.trim(), `nexus ${expectedVersion}`);
 
 const queue = [[]];
 const visited = new Set();

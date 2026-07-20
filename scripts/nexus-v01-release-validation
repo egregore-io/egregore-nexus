@@ -22,6 +22,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+VERSION = (Path(__file__).resolve().parent.parent / "VERSION").read_text(
+    encoding="utf-8"
+).strip()
+
+
 PUBLIC_LEAF_COMMANDS = {
     "register",
     "launch",
@@ -419,19 +424,19 @@ class Runner:
         return result
 
     def require_exact_binary(self) -> bool:
-        """Fail closed when the executable under test is not built from the ledger commit."""
+        """Fail closed when the executable under test is not the release version."""
 
         result, stdout, _ = self.command(
             label="fixture:exact-binary",
             facet="fixture",
             argv=["--version"],
-            expected="The executable revision is the exact source commit named by this ledger.",
+            expected=f"The executable reports exactly nexus {VERSION}.",
         )
-        matches = f"(revision {self.ledger.commit})" in stdout
+        matches = stdout.strip() == f"nexus {VERSION}"
         self.require(
             result,
             matches,
-            f"binary revision matches {self.ledger.commit}",
+            f"binary version matches {VERSION}",
         )
         return result.status == "pass"
 

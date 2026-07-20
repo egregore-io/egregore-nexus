@@ -112,12 +112,11 @@ command = '''
 $nativeRoot = "packages\nexus-cli\native\win32-x64-msvc"
 New-Item -ItemType Directory -Force -Path $nativeRoot | Out-Null
 Copy-Item "C:\w\cache\cargo-target\release\nexus.exe" (Join-Path $nativeRoot "nexus.exe") -Force
-$SourceProvenance = Get-Content -LiteralPath ".git\egregore-source.json" -Raw | ConvertFrom-Json
-$env:NEXUS_BUILD_REVISION = [string]$SourceProvenance.original_revision
+$ExpectedVersion = '0.1.5'
 $VersionOutput = (& node.exe packages/nexus-cli/bin/nexus.mjs --version | Out-String).Trim()
 if ($LASTEXITCODE -ne 0) { throw "Windows npm launcher version probe failed" }
-if ($VersionOutput -notlike "*revision $env:NEXUS_BUILD_REVISION)*") {
-    throw "Windows npm launcher reports the wrong source revision: $VersionOutput"
+if ($VersionOutput -ne "nexus $ExpectedVersion") {
+    throw "Windows npm launcher reports the wrong release version: $VersionOutput"
 }
 Write-Output $VersionOutput
 & node.exe packages/nexus-cli/bin/nexus.mjs daemon install --help
@@ -141,6 +140,68 @@ command = '''
 & pnpm.cmd --dir gateway test
 & pnpm.cmd --dir gateway build:gateway-package
 & pnpm.cmd --dir gateway webconsole:build
+'''
+
+[[steps]]
+name = "webconsole-command-shim-lifecycle"
+workdir = "C:\\w\\src\\egregore-nexus"
+timeout_seconds = 900
+command = '''
+$ErrorActionPreference = 'Stop'
+$Nexus = (Resolve-Path "$env:CARGO_TARGET_DIR\release\nexus.exe").Path
+$Node = (Get-Command node.exe).Source
+$ShimRoot = Join-Path $env:NEXUS_HOME 'Program Files\Egregore Nexus'
+New-Item -ItemType Directory -Force -Path $ShimRoot | Out-Null
+$WebuiSource = (Resolve-Path 'gateway\webconsole\bin\nexus-webui.mjs').Path
+$GatewaySource = (Resolve-Path 'gateway\scripts\nexus-gateway.mjs').Path
+$WebuiShim = Join-Path $ShimRoot 'nexus-webui.cmd'
+$GatewayShim = Join-Path $ShimRoot 'nexus-gateway.cmd'
+Set-Content -LiteralPath $WebuiShim -Encoding Ascii -Value @(
+    '@echo off',
+    ('"{0}" "{1}" %*' -f $Node, $WebuiSource)
+)
+Set-Content -LiteralPath $GatewayShim -Encoding Ascii -Value @(
+    '@echo off',
+    ('"{0}" "{1}" %*' -f $Node, $GatewaySource)
+)
+$env:NEXUS_WEBUI_BIN = $WebuiShim
+$env:NEXUS_GATEWAY_BIN = $GatewayShim
+
+$Listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+$Listener.Start()
+$WebconsolePort = ([System.Net.IPEndPoint]$Listener.LocalEndpoint).Port
+$Listener.Stop()
+
+try {
+    $StartText = (& $Nexus --json webconsole start --host 127.0.0.1 --port $WebconsolePort | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw "Windows Webconsole start failed: $StartText" }
+    $Start = $StartText | ConvertFrom-Json
+    if ($Start.runtime.state -ne 'live' -or [int]$Start.runtime.port -ne $WebconsolePort) {
+        throw "Windows Webconsole start returned the wrong runtime: $StartText"
+    }
+    $StatusText = (& $Nexus --json webconsole status | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw "Windows Webconsole status failed: $StatusText" }
+    $Status = $StatusText | ConvertFrom-Json
+    if ($Status.runtime.state -ne 'live' -or [int]$Status.runtime.port -ne $WebconsolePort) {
+        throw "Windows Webconsole status did not preserve the shim argv: $StatusText"
+    }
+}
+finally {
+    & $Nexus webconsole stop --force | Out-Null
+    & $Nexus gateway stop --force | Out-Null
+    & $Nexus daemon stop | Out-Null
+}
+
+$Probe = [System.Net.Sockets.TcpClient]::new()
+try {
+    $Connect = $Probe.ConnectAsync('127.0.0.1', $WebconsolePort)
+    if ($Connect.Wait(500) -and $Probe.Connected) {
+        throw "Windows Webconsole listener survived webconsole stop --force"
+    }
+}
+finally {
+    $Probe.Dispose()
+}
 '''
 
 [[artifacts]]

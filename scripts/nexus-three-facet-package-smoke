@@ -16,7 +16,6 @@ esac
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 "$ROOT/scripts/nexus-version" check >/dev/null
 VERSION=$(tr -d '\n' < "$ROOT/VERSION")
-VERSION_PATTERN=${VERSION//./\\.}
 
 # This fixture owns a disposable daemon and Gateway. Never let an ambient agent session inherit
 # operator authority or route the smoke test into the caller's live Nexus runtime.
@@ -67,8 +66,7 @@ mkdir -p "$TMP/packs" "$TMP/cargo-home" "$TMP/stack-install" \
 (cd "$ROOT/core" && \
   cargo package --workspace --exclude nexus-acceptance --no-verify --keep-going --allow-dirty && \
   cargo install --path crates/nexus --bin nexus --root "$TMP/cargo-home" --locked --force)
-"$TMP/cargo-home/bin/nexus" --version | grep -Fq "nexus $VERSION (revision "
-"$TMP/cargo-home/bin/nexus" --version | grep -Eq 'revision [^)]+\)'
+test "$("$TMP/cargo-home/bin/nexus" --version)" = "nexus $VERSION"
 test "$(wc -c <"$TMP/cargo-home/bin/nexus")" -lt 104857600
 NEXUS_HOME="$TMP/nexus-home" NEXUS_DB_PATH="$TMP/nexus-home/nexus.db" \
   "$TMP/cargo-home/bin/nexus" daemon start >/dev/null
@@ -152,8 +150,8 @@ wait_http "http://127.0.0.1:$WEBUI_PORT/health" "$TMP/webui.log"
 curl -fsS "http://127.0.0.1:$WEBUI_PORT/" | grep -q '<div id="root"></div>'
 curl -fsS "http://127.0.0.1:$WEBUI_PORT/api/v1/health" | grep -q 'ok'
 
-HOME="$TMP/empty-home" CARGO_HOME="$TMP/empty-cargo" \
-  "$STACK_BIN/nexus" --version | grep -Eq "nexus ${VERSION_PATTERN} \\(revision [^)]+\\)"
+test "$(HOME="$TMP/empty-home" CARGO_HOME="$TMP/empty-cargo" \
+  "$STACK_BIN/nexus" --version)" = "nexus $VERSION"
 
 node -e '
 const fs = require("node:fs");

@@ -54,6 +54,10 @@ jobs:
       - name: Verify distribution version
         shell: bash
         run: node scripts/nexus-version check
+      - name: Verify native packager failure contracts
+        if: matrix.target == 'linux-x64-gnu'
+        shell: bash
+        run: scripts/test-nexus-pack-native-npm
       - uses: pnpm/action-setup@v4
         if: matrix.target == 'win32-x64-msvc'
         with:

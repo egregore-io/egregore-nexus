@@ -89,6 +89,16 @@ CONTENT_SCAN_EXEMPT = {
     "scripts/test-nexus-public-release-hygiene-gate",
 }
 THIRD_PARTY_PREFIXES = ("core/vendor/",)
+COMMIT_ATTRIBUTION_TRAILER = re.compile(
+    r"^(?:co-authored-by|(?:ai-|assistant-)?(?:generated|written|assisted)-by|"
+    r"codex(?:-| )?attribution):\s*.+$",
+    re.IGNORECASE,
+)
+COMMIT_ASSISTANT_ATTRIBUTION = re.compile(
+    r"^(?:generated|written|created)\s+(?:by|with)\s+"
+    r"(?:AI|Codex|Claude|ChatGPT|OpenAI)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -157,10 +167,45 @@ def content_findings(root: Path, relative: str) -> list[Finding]:
     return findings
 
 
+def commit_metadata_findings(root: Path) -> list[Finding]:
+    revisions = subprocess.run(
+        ["git", "rev-list", "HEAD"],
+        cwd=root,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+    ).stdout.splitlines()
+    findings: list[Finding] = []
+    for revision in revisions:
+        body = subprocess.run(
+            ["git", "show", "-s", "--format=%B", revision],
+            cwd=root,
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        for line_number, line in enumerate(body.splitlines(), start=1):
+            if COMMIT_ATTRIBUTION_TRAILER.match(line) or COMMIT_ASSISTANT_ATTRIBUTION.match(line):
+                findings.append(
+                    Finding(
+                        "commit_attribution_trailer",
+                        f"git:{revision}",
+                        line_number,
+                        line.strip()[:240],
+                    )
+                )
+    return findings
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--paths-file", type=Path)
+    parser.add_argument(
+        "--skip-commit-metadata",
+        action="store_true",
+        help="scan only the supplied tree (for isolated fixture tests)",
+    )
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
@@ -175,6 +220,15 @@ def main() -> int:
     for relative in paths:
         findings.extend(path_findings(relative))
         findings.extend(content_findings(root, relative))
+    if not args.skip_commit_metadata:
+        try:
+            findings.extend(commit_metadata_findings(root))
+        except (OSError, subprocess.CalledProcessError) as error:
+            print(
+                f"public release hygiene gate failed to inspect commit metadata: {error}",
+                file=sys.stderr,
+            )
+            return 2
 
     if args.json:
         print(
