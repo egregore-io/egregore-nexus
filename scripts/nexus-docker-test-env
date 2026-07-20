@@ -1822,10 +1822,10 @@ cmd_lab_gate() {
     requested_all=1; run_backend=1; run_webui=1
   fi
   if [ "$run_backend" -eq 1 ]; then
-    exec_interactive bash -lc '/tmp/nexus-lab-bin/nexus-v015-ws-acceptance --mode "${NEXUS_LAB_MODE:-source}" --evidence-dir "$NEXUS_LAB_ROOT/evidence"'
+    exec_interactive bash -c '/tmp/nexus-lab-bin/nexus-v015-ws-acceptance --mode "${NEXUS_LAB_MODE:-source}" --evidence-dir "$NEXUS_LAB_ROOT/evidence"'
   fi
   if [ "$requested_all" -eq 1 ]; then
-    exec_interactive bash -lc '/tmp/nexus-lab-bin/nexus-hooks-practical-gate --packed-v015 --evidence-dir "$NEXUS_LAB_ROOT/evidence" --run-id "$NEXUS_V015_RUN_ID"'
+    exec_interactive bash -c '/tmp/nexus-lab-bin/nexus-hooks-practical-gate --packed-v015 --evidence-dir "$NEXUS_LAB_ROOT/evidence" --run-id "$NEXUS_V015_RUN_ID"'
   fi
   local readiness_sha256="" candidate_digest="" candidate_sha256=""
   if [ "$run_ocular" -eq 1 ] || [ "$run_webui" -eq 1 ]; then
@@ -1870,13 +1870,13 @@ cmd_lab_gate() {
   if [ "$run_webui" -eq 1 ]; then
     readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" "$mode")
     if [ "$mode" = packed ]; then
-      exec_interactive bash -lc '/tmp/nexus-lab-bin/nexus webconsole stop --force >"$NEXUS_LAB_ROOT/lab/webconsole-d2-preflight-stop.log"'
-      exec_interactive bash -lc '/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance --nexus-bin /tmp/nexus-lab-bin/nexus --run-id "$NEXUS_V015_RUN_ID" --evidence-root "$NEXUS_LAB_ROOT/evidence/$NEXUS_V015_RUN_ID"'
+      exec_interactive bash -c '/tmp/nexus-lab-bin/nexus webconsole stop --force >"$NEXUS_LAB_ROOT/lab/webconsole-d2-preflight-stop.log"'
+      exec_interactive bash -c '/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance --nexus-bin /tmp/nexus-lab-bin/nexus --run-id "$NEXUS_V015_RUN_ID" --evidence-root "$NEXUS_LAB_ROOT/evidence/$NEXUS_V015_RUN_ID"'
       local post_webconsole_readiness_sha256
       post_webconsole_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" "$mode")
       [ "$post_webconsole_readiness_sha256" = "$readiness_sha256" ] \
         || die "candidate readiness ledger changed during Webconsole acceptance"
-      exec_interactive bash -lc '/tmp/nexus-lab-bin/nexus webconsole start --host 127.0.0.1 --port 4200 >"$NEXUS_LAB_ROOT/lab/webconsole-ocular-start.log"'
+      exec_interactive bash -c '/tmp/nexus-lab-bin/nexus webconsole start --host 127.0.0.1 --port 4200 >"$NEXUS_LAB_ROOT/lab/webconsole-ocular-start.log"'
       wait_lab_http "http://127.0.0.1:4200/health" "Nexus Webconsole after D2"
     else
       wait_lab_http "http://127.0.0.1:4200/health" "source-mode Nexus Webconsole"
@@ -1951,7 +1951,7 @@ cmd_lab_gate() {
     require_container_lab_mode packed
     verify_packed_host_config "$CONTAINER_ID"
     verify_lab_readiness "$CONTAINER_ID" packed >/dev/null
-    exec_interactive bash -lc '
+    exec_interactive bash -c '
       set -euo pipefail
       ready="$NEXUS_LAB_ROOT/lab/candidate-ready.v1"
       [ -f "$ready" ] && [ ! -L "$ready" ] && [ "$(stat -c %h "$ready")" = 1 ] \

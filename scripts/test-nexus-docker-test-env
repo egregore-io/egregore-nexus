@@ -274,11 +274,11 @@ import sys
 import textwrap
 
 source = Path(sys.argv[1]).read_text(encoding="utf-8")
-needle = "    exec_interactive bash -lc '\n      set -euo pipefail\n      ready=\"$NEXUS_LAB_ROOT/lab/candidate-ready.v1\""
+needle = "    exec_interactive bash -c '\n      set -euo pipefail\n      ready=\"$NEXUS_LAB_ROOT/lab/candidate-ready.v1\""
 start = source.find(needle)
 if start < 0:
     raise SystemExit("packed soak handoff body is missing")
-start += len("    exec_interactive bash -lc '\n")
+start += len("    exec_interactive bash -c '\n")
 end = source.find("\n    '\n", start)
 if end < 0:
     raise SystemExit("packed soak handoff body is unterminated")
@@ -1070,6 +1070,11 @@ fi
 # The packed release lab must pass the immutable readiness probe before the
 # acceptance command. The probe itself contains exact link topology and hashes
 # all three executable surfaces.
+if grep -Fq 'exec_interactive bash -lc' "$TARGET"; then
+  echo 'packed gates must not use a login shell that replaces the container-bound harness PATH' >&2
+  exit 1
+fi
+grep -Fq "exec_interactive bash -c '/tmp/nexus-lab-bin/nexus-v015-ws-acceptance" "$TARGET"
 grep -Fq 'expected_nexus=/tmp/nexus-target/debug/nexus' "$TARGET"
 grep -Fq '/tmp/nexus-lab-install.*/bin/nexus' "$TARGET"
 grep -Fq 'expected_nexus_resolved=$install_root/lib/node_modules/@egregore/nexus/bin/nexus.mjs' "$TARGET"
