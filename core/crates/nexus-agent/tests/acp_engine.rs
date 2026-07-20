@@ -18,6 +18,8 @@ use serde_json::json;
 /// The compiled fake harness binary. `CARGO_BIN_EXE_<name>` is injected by Cargo because the
 /// harness is a `[[bin]]` of this crate, so it is always built before these tests run.
 const FAKE_HARNESS: &str = env!("CARGO_BIN_EXE_fake_acp_agent");
+const CLAUDE_INTERRUPTED_HANDOFF: &str =
+    "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null";
 
 /// Concatenate the reply text from a drained stream — i.e. the `text` of every `Text`-kind event,
 /// in order. The full-stream pass-through also relays thinking / tool-call / plan events; the
@@ -375,6 +377,80 @@ async fn engine_preserves_structured_acp_server_error_as_retryable_provider_fail
     assert_eq!(error.reason, "server_error");
     assert_eq!(error.source, "claude.acp.prompt_error");
     assert!(error.retryable);
+}
+
+/// Claude's ACP bridge can append an interrupt-and-send replacement prompt, return this exact
+/// bridge diagnostic for the cancelled request, and then stream the replacement model turn. The
+/// durable delivery must wait for that causal model output instead of recording an error or
+/// retrying the prompt that is already present in Claude's transcript.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_observed_interrupted_handoff_settles_only_after_model_output() {
+    let engine = AcpEngine::for_harness(HarnessId::new("claude").unwrap());
+    let mut command = fake_prompt_error_command(json!(CLAUDE_INTERRUPTED_HANDOFF));
+    command.env.extend([
+        (
+            "FAKE_ACP_PROMPT_ERROR_THEN_REPLY_MS".to_string(),
+            "50".to_string(),
+        ),
+        ("FAKE_ACP_REPLY".to_string(), "bare".to_string()),
+        ("FAKE_ACP_REPLY_BODY".to_string(), "r".to_string()),
+    ]);
+    engine
+        .spawn_and_initialize(&command)
+        .await
+        .expect("spawn + initialize");
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .expect("session/new");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        engine.inject_with_accepted_event(
+            "interrupt-and-send replacement".to_string(),
+            Some(StreamEvent {
+                kind: AgentUpdateKind::UserInput,
+                data: json!({"text": "accepted input"}),
+            }),
+        ),
+    )
+    .await
+    .expect("Claude replacement handoff must settle after model output")
+    .expect("causal replacement model output proves recipient delivery");
+
+    assert_eq!(
+        reply_text(engine.take_updates()),
+        "r",
+        "the replacement output remains available to the relay"
+    );
+}
+
+/// The same diagnostic without a subsequent model event is not delivery evidence. Keep the
+/// obligation pending for the engine's existing completion timeout; never accept the diagnostic
+/// itself as success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_observed_interrupted_handoff_without_model_output_stays_unsettled() {
+    let engine = AcpEngine::for_harness(HarnessId::new("claude").unwrap());
+    let command = fake_prompt_error_command(json!(CLAUDE_INTERRUPTED_HANDOFF));
+    engine
+        .spawn_and_initialize(&command)
+        .await
+        .expect("spawn + initialize");
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .expect("session/new");
+
+    let mut delivery = Box::pin(engine.inject_with_accepted_event(
+        "replacement with no model output".to_string(),
+        Some(StreamEvent::text("accepted input")),
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), &mut delivery)
+            .await
+            .is_err(),
+        "the bridge diagnostic alone must not settle or fail the durable delivery"
+    );
 }
 
 #[tokio::test]

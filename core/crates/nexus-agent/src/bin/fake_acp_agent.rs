@@ -55,6 +55,10 @@
 //! - `FAKE_ACP_PROMPT_ERROR_DATA=<json>` — return a structured ACP error from `session/prompt`
 //!   before streaming. Adapter tests use this to prove provider-limit classification happens before
 //!   `session/prompt failed: ...` stringification.
+//! - `FAKE_ACP_PROMPT_ERROR_THEN_REPLY_MS=<milliseconds>` — when paired with
+//!   `FAKE_ACP_PROMPT_ERROR_DATA`, return the scripted prompt error first, then emit the configured
+//!   reply chunks after the delay. This reproduces a bridge handoff that appends the replacement
+//!   prompt but answers the old request with a diagnostic before the replacement model turn emits.
 //! - `FAKE_ACP_HERMES_QUEUE_PROMOTE_MS=<milliseconds>` — reproduce Hermes 0.17's busy-session
 //!   behavior: answer the incoming prompt immediately with `EndTurn` plus a "Queued for the next
 //!   turn" agent update, then later emit the exact prompt as a `UserMessageChunk` followed by a
@@ -321,7 +325,27 @@ async fn main() -> Result<()> {
                 if let Ok(raw) = std::env::var("FAKE_ACP_PROMPT_ERROR_DATA") {
                     let data = serde_json::from_str::<serde_json::Value>(&raw)
                         .unwrap_or_else(|_| serde_json::Value::String(raw));
-                    return Err(agent_client_protocol::Error::internal_error().data(data));
+                    let result = responder.respond_with_error(
+                        agent_client_protocol::Error::internal_error().data(data),
+                    );
+                    if let Some(delay_ms) = std::env::var("FAKE_ACP_PROMPT_ERROR_THEN_REPLY_MS")
+                        .ok()
+                        .and_then(|raw| raw.parse::<u64>().ok())
+                    {
+                        let reply_chunks: Vec<String> = scripted_reply(&body)
+                            .into_iter()
+                            .filter(|chunk| !chunk.is_empty())
+                            .collect();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            for chunk in reply_chunks {
+                                let _ =
+                                    cx.send_notification(message_chunk(session_id.clone(), &chunk));
+                                tokio::task::yield_now().await;
+                            }
+                        });
+                    }
+                    return result;
                 }
 
                 if std::env::var("FAKE_ACP_PROMPT_ERROR").as_deref()

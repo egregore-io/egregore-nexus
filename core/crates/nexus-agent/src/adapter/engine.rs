@@ -599,6 +599,17 @@ enum TurnEnd {
     /// content. Observed Hermes turns accept this only after a real renderable harness event; the
     /// synthetic accepted-input event is deliberately excluded.
     Quiescent,
+    /// The bridge appended an interrupt-and-send replacement prompt, answered the cancelled
+    /// request with its exact handoff diagnostic, and then emitted real replacement model output.
+    /// The model-output boundary prevents retrying a prompt already present in its context.
+    InterruptedPromptHandoff,
+}
+
+const INTERRUPTED_HANDOFF_DIAGNOSTIC: &str =
+    "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null";
+
+fn is_interrupted_prompt_handoff(error: &agent_client_protocol::Error) -> bool {
+    error.data.as_ref().and_then(serde_json::Value::as_str) == Some(INTERRUPTED_HANDOFF_DIAGNOSTIC)
 }
 
 /// Resolve once the reply stream has **streamed content and then gone quiet** for `window`.
@@ -1420,8 +1431,9 @@ impl AcpEngine {
     /// Like [`AcpEngine::inject`], but prepends a synthetic stream event immediately after the ACP
     /// prompt request is submitted and before assistant updates can be relayed. Presence of this
     /// event identifies durable observed delivery, which normally requires the canonical
-    /// `PromptResponse`. Hermes may also settle from quiescence after a real model event; the
-    /// synthetic accepted event alone is never sufficient.
+    /// `PromptResponse`. Hermes may also settle from quiescence after a real model event. The
+    /// exact interrupt-and-send handoff diagnostic may settle only after subsequent replacement
+    /// model output becomes quiescent. The synthetic accepted event alone is never sufficient.
     pub async fn inject_with_accepted_event(
         &self,
         prompt: String,
@@ -1521,7 +1533,21 @@ impl AcpEngine {
                 }
             } else if require_terminal_response {
                 // Other durable bus deliveries require the authoritative ACP terminal response.
-                TurnEnd::Response(prompt_response.await)
+                // The ACP bridge has one bounded handoff exception: after cancel + replace it
+                // can append the replacement prompt, answer the cancelled request with a machine
+                // diagnostic, then stream the replacement model turn. Never retry that already-
+                // appended prompt; require a new real model event and quiescence instead.
+                let response = prompt_response.await;
+                if response
+                    .as_ref()
+                    .err()
+                    .is_some_and(is_interrupted_prompt_handoff)
+                {
+                    wait_for_model_quiescence(&activity, model_events_before, quiescence).await;
+                    TurnEnd::InterruptedPromptHandoff
+                } else {
+                    TurnEnd::Response(response)
+                }
             } else {
                 tokio::select! {
                     // (1) Canonical: the prompt request was answered. This is the authoritative end.
@@ -1620,6 +1646,17 @@ impl AcpEngine {
                     quiescence_ms = quiescence.as_millis() as u64,
                     "ACP turn-end inferred from stream quiescence (no PromptResponse; bridge went \
                      idle after streaming the reply)"
+                );
+                Ok(())
+            }
+            Ok(TurnEnd::InterruptedPromptHandoff) => {
+                info!(
+                    target: "nexus_agent::acp",
+                    acp_session = %acp_session,
+                    buffered_chunks = buffered,
+                    model_events,
+                    quiescence_ms = quiescence.as_millis() as u64,
+                    "ACP replacement handoff completed after causal model output"
                 );
                 Ok(())
             }
