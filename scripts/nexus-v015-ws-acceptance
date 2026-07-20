@@ -609,6 +609,10 @@ def require_queue_snapshot(frame: dict[str, Any], session_id: str) -> None:
         raise AcceptanceFailure("queue.snapshot has no valid global reconnect seq")
 
 
+class ExactRosterPending(AcceptanceFailure):
+    """The exact stable roster exists but has not returned fully online yet."""
+
+
 def require_exact_roster(rows: object, agents: Iterable[object]) -> None:
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise AcceptanceFailure("exact roster is not an array of member rows")
@@ -624,8 +628,15 @@ def require_exact_roster(rows: object, agents: Iterable[object]) -> None:
         if agent_id in by_id:
             raise AcceptanceFailure(f"exact roster has duplicate agentId {agent_id}")
         by_id[agent_id] = row
-    if set(by_id) != set(expected):
+    extra_ids = set(by_id) - set(expected)
+    missing_ids = set(expected) - set(by_id)
+    if extra_ids:
         raise AcceptanceFailure(
+            "exact roster differs from live-agent truth: "
+            f"expected={sorted(expected)} observed={sorted(by_id)}"
+        )
+    if missing_ids:
+        raise ExactRosterPending(
             "exact roster differs from live-agent truth: "
             f"expected={sorted(expected)} observed={sorted(by_id)}"
         )
@@ -638,7 +649,30 @@ def require_exact_roster(rows: object, agents: Iterable[object]) -> None:
         if name != getattr(agent, "name") or session_id != getattr(agent, "session_id"):
             raise AcceptanceFailure(f"exact roster identity mismatch for {agent_id}")
         if state not in online_states:
-            raise AcceptanceFailure(f"exact roster member {agent_id} is not online")
+            raise ExactRosterPending(f"exact roster member {agent_id} is not online")
+
+
+async def wait_for_exact_roster(
+    identity_reader: Any,
+    nexus_bin: str,
+    agents: Iterable[object],
+    *,
+    timeout: float = 30,
+    interval: float = 0.25,
+) -> list[dict[str, Any]]:
+    deadline = time.monotonic() + timeout
+    while True:
+        rows = await asyncio.to_thread(identity_reader, nexus_bin)
+        try:
+            require_exact_roster(rows, agents)
+        except ExactRosterPending as error:
+            if time.monotonic() >= deadline:
+                raise AcceptanceFailure(
+                    f"exact roster did not converge before timeout: {error}"
+                ) from error
+            await asyncio.sleep(interval)
+            continue
+        return rows
 
 
 def require_queue_agreement(
@@ -3657,9 +3691,12 @@ class BackendAcceptance:
         for topic, cursor in cursors["humanDm"].items():
             if self.human_dm.cursors.get(topic, -1) < cursor:
                 raise AcceptanceFailure(f"human DM cursor regressed across {target} restart")
-        rows = await asyncio.to_thread(self.core["identity_rows"], str(NEXUS_BIN))
+        rows = await wait_for_exact_roster(
+            self.core["identity_rows"],
+            str(NEXUS_BIN),
+            self.live_agents,
+        )
         self.core["check_identities"](rows, self.soak.agents, self.soak.ledger)
-        require_exact_roster(rows, self.live_agents)
         dlq = await asyncio.to_thread(self.core["dlq_total"], str(NEXUS_BIN))
         self.soak.ledger.failure["deadLetters"] = max(
             self.soak.ledger.failure["deadLetters"],

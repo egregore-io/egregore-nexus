@@ -1817,6 +1817,61 @@ class WsAcceptanceContracts(unittest.TestCase):
         with self.assertRaisesRegex(module["AcceptanceFailure"], "duplicate"):
             module["require_exact_roster"]([rows[0], rows[0], rows[1]], agents)
 
+    def test_exact_roster_waits_for_daemon_reregistration_without_accepting_drift(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        agents = (
+            type("Agent", (), {"agent_id": "a_codex", "name": "codex", "session_id": "s_c"})(),
+            type("Agent", (), {"agent_id": "a_claude", "name": "claude", "session_id": "s_h"})(),
+        )
+        pending = [
+            {"agentId": "a_codex", "name": "codex", "sessionId": "s_c", "status": "offline"},
+            {"agentId": "a_claude", "name": "claude", "sessionId": "s_h", "status": "online"},
+        ]
+        ready = [
+            {**pending[0], "status": "online"},
+            pending[1],
+        ]
+        snapshots = iter((pending, ready))
+        reads: list[str] = []
+
+        def identity_rows(nexus_bin: str) -> list[dict[str, object]]:
+            reads.append(nexus_bin)
+            return next(snapshots)
+
+        rows = asyncio.run(
+            module["wait_for_exact_roster"](
+                identity_rows,
+                "/candidate/nexus",
+                agents,
+                timeout=1,
+                interval=0,
+            )
+        )
+        self.assertEqual(rows, ready)
+        self.assertEqual(reads, ["/candidate/nexus", "/candidate/nexus"])
+
+        stale_reads = 0
+
+        def stale_roster(_nexus_bin: str) -> list[dict[str, object]]:
+            nonlocal stale_reads
+            stale_reads += 1
+            return [
+                *pending,
+                {"agentId": "a_stale", "name": "stale", "sessionId": "s_old", "status": "online"},
+            ]
+
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "differs from live-agent truth"):
+            asyncio.run(
+                module["wait_for_exact_roster"](
+                    stale_roster,
+                    "/candidate/nexus",
+                    agents,
+                    timeout=1,
+                    interval=0,
+                )
+            )
+        self.assertEqual(stale_reads, 1)
+
     def test_rest_and_websocket_queue_snapshots_must_match_exactly(self) -> None:
         module = runpy.run_path(str(TARGET))
         rest = {
