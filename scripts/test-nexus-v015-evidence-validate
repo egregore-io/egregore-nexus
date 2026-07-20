@@ -21,12 +21,11 @@ from unittest import mock
 SCRIPT_DIR = Path(__file__).resolve().parent
 TARGET = SCRIPT_DIR / "nexus-v015-evidence-validate"
 RUN_ID = "v015-fixture-run"
-SOURCE_NAMES = ("nexus", "lens", "egregore", "pactree", "pactreePython", "pactreeFs")
+SOURCE_NAMES = ("nexus",)
 PACKAGE_NAMES = ("@egregore/nexus", "@egregore/nexus-cli", "@egregore/nexus-gateway")
-OCULAR_CASES = tuple(f"O{index}" for index in range(1, 19))
 WEBUI_CASES = tuple(f"W{index}" for index in range(1, 9))
-EXPECTED_CASES = OCULAR_CASES + WEBUI_CASES
-OCULAR_ARTIFACTS = (
+EXPECTED_CASES = WEBUI_CASES
+WEBUI_ARTIFACTS = (
     "preScreenshot",
     "postScreenshot",
     "dom",
@@ -35,9 +34,7 @@ OCULAR_ARTIFACTS = (
     "websocket",
     "processLogs",
     "health",
-    "pactbin2",
 )
-WEBUI_ARTIFACTS = OCULAR_ARTIFACTS[:-1]
 SOAK_COUNTERS = (
     "deadLetters",
     "lostAcceptedMessages",
@@ -62,7 +59,6 @@ RESULT_SPECS = {
     "D1": ("results/D1-clean-packed-install/result.json", ("packedInventory", "installLog", "foreignCwd", "shutdown")),
     "D2": ("results/D2-webconsole-cli/result.json", ("cliTranscript", "discoveryRecovery", "occupiedPort")),
     "D3": ("results/D3-webui-browser/result.json", ("browserTranscript", "attribution", "reconnect")),
-    "E1": ("results/E1-pactbin2-session-store/result.json", ("revisions", "roundTrip", "damageFixtures")),
     "E2": ("results/E2-lens-ocular/result.json", ("ocularSummary", "affordanceCoverage", "artifactsIndex")),
     "F1": ("results/F1-live-codex-claude/result.json", ("codex", "claude", "deliveryMatrix")),
     "F2": ("results/F2-message-hooks/result.json", ("shell", "javascript", "python", "timing")),
@@ -349,11 +345,8 @@ class EvidenceFixture:
 
     def _build_cases(self) -> None:
         for case_id in EXPECTED_CASES:
-            ocular = case_id.startswith("O")
-            surface = "ocular" if ocular else "webui"
-            required = list(OCULAR_ARTIFACTS if ocular else WEBUI_ARTIFACTS)
-            if case_id in {"O3", "O4"}:
-                required.append("mechanism")
+            surface = "webui"
+            required = list(WEBUI_ARTIFACTS)
             case_directory = Path(f"{case_id}-20260720T000000Z")
             artifacts = {}
             for name in required:
@@ -372,11 +365,7 @@ class EvidenceFixture:
                 elif name == "network":
                     artifact_data = b"[]\n"
                 elif name == "websocket":
-                    artifact_data = (
-                        b'[{"payload":"input.ack"}]\n'
-                        if case_id in {"O3", "O4"}
-                        else b"[]\n"
-                    )
+                    artifact_data = b"[]\n"
                 elif name == "processLogs":
                     artifact_data = json.dumps(
                         {
@@ -411,11 +400,6 @@ class EvidenceFixture:
                             "body": '{"ok":true}',
                         }
                     ).encode("utf-8") + b"\n"
-                elif name == "pactbin2":
-                    artifact_path = case_directory / "pactbin2.pact"
-                    artifact_data = b"PACTBIN2" + b"\0" * 4088
-                elif name == "mechanism":
-                    artifact_data = b'{"pushFrames":1,"postCommitWakes":1,"timerReads":0}\n'
                 else:
                     raise AssertionError(f"unhandled fixture artifact: {name}")
                 artifacts[name] = self.artifact(artifact_path, artifact_data)
@@ -430,12 +414,6 @@ class EvidenceFixture:
                 "requiredArtifacts": required,
                 "artifacts": artifacts,
             }
-            if case_id in {"O3", "O4"}:
-                manifest["mechanism"] = {
-                    "pushFrames": 1,
-                    "postCommitWakes": 1,
-                    "timerReads": 0,
-                }
             manifest_path = self.root / case_directory / "manifest.json"
             self.case_meta[case_id] = manifest_path
             write_json(manifest_path, manifest)
@@ -805,6 +783,14 @@ class EvidenceValidatorTests(unittest.TestCase):
         self.assertIn(f"validated {len(EXPECTED_CASES)} cases", result.stdout)
         self.assertIn(f"{len(RESULT_SPECS)} canonical results", result.stdout)
         self.assertIn(fixture.candidate_digest, result.stdout)
+
+    def test_nexus_release_does_not_require_pactbin_or_the_O_catalog(self) -> None:
+        fixture = self.fixture("nexus-only-ocular-gate")
+        self.assertEqual(tuple(fixture.case_meta), WEBUI_CASES)
+        self.assertNotIn("E1", fixture.result_paths)
+        self.assertFalse(any("pactbin" in path.name.lower() for path in fixture.root.rglob("*")))
+        result = self.run_validator(fixture.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_run_root_and_readiness_must_match_the_canonical_lab_authority(self) -> None:
         fixture = self.fixture("canonical-authority")
@@ -1343,28 +1329,28 @@ class EvidenceValidatorTests(unittest.TestCase):
         write_json(review.result_paths["REVIEW"], document)
         self.assert_invalid(review, "REVIEW_DISPOSITION")
 
-    def test_exact_case_set_rejects_missing_duplicate_and_mechanism_pseudocases(self) -> None:
+    def test_exact_case_set_rejects_missing_duplicate_and_unexpected_cases(self) -> None:
         missing = self.fixture("missing-case")
-        missing.case_meta["O18"].unlink()
+        missing.case_meta["W8"].unlink()
         self.assert_invalid(missing, "CASE_MISSING")
 
         duplicate = self.fixture("duplicate-case")
-        duplicate_path = duplicate.root / "O1-copy" / "manifest.json"
+        duplicate_path = duplicate.root / "W1-copy" / "manifest.json"
         duplicate_path.parent.mkdir(parents=True)
-        shutil.copy2(duplicate.case_meta["O1"], duplicate_path)
+        shutil.copy2(duplicate.case_meta["W1"], duplicate_path)
         self.assert_invalid(duplicate, "CASE_DUPLICATE")
 
-        pseudo = self.fixture("mechanism-pseudocase")
-        document = read_json(pseudo.case_meta["O3"])
-        document["case"] = "O3a"
-        write_json(pseudo.case_meta["O3"], document)
+        pseudo = self.fixture("unexpected-case")
+        document = read_json(pseudo.case_meta["W3"])
+        document["case"] = "W3a"
+        write_json(pseudo.case_meta["W3"], document)
         self.assert_invalid(pseudo, "CASE_UNEXPECTED")
 
     def test_case_manifest_v2_is_readiness_bound_and_directory_scoped(self) -> None:
         stale = self.fixture("case-stale-readiness")
-        document = read_json(stale.case_meta["O1"])
+        document = read_json(stale.case_meta["W1"])
         document["readinessSha256"] = "f" * 64
-        write_json(stale.case_meta["O1"], document)
+        write_json(stale.case_meta["W1"], document)
         self.assert_invalid(stale, "READINESS_AUTHORITY")
 
         obsolete = self.fixture("case-obsolete-schema")
@@ -1380,9 +1366,9 @@ class EvidenceValidatorTests(unittest.TestCase):
         self.assert_invalid(wrong_version, "SCHEMA_VERSION")
 
         extra = self.fixture("case-extra-field")
-        document = read_json(extra.case_meta["O2"])
+        document = read_json(extra.case_meta["W2"])
         document["candidateDigest"] = "0" * 64
-        write_json(extra.case_meta["O2"], document)
+        write_json(extra.case_meta["W2"], document)
         self.assert_invalid(extra, "CASE_SCHEMA")
 
         escaped = self.fixture("case-artifact-other-directory")
@@ -1397,20 +1383,6 @@ class EvidenceValidatorTests(unittest.TestCase):
         write_json(escaped.case_meta["W2"], document)
         self.assert_invalid(escaped, "ARTIFACT_PATH")
 
-    def test_O3_and_O4_fold_push_mechanism_evidence_into_the_case(self) -> None:
-        missing = self.fixture("missing-mechanism")
-        document = read_json(missing.case_meta["O3"])
-        document["requiredArtifacts"].remove("mechanism")
-        document["artifacts"].pop("mechanism")
-        write_json(missing.case_meta["O3"], document)
-        self.assert_invalid(missing, "ARTIFACT_REQUIRED")
-
-        polling = self.fixture("timer-polling")
-        document = read_json(polling.case_meta["O4"])
-        document["mechanism"]["timerReads"] = 1
-        write_json(polling.case_meta["O4"], document)
-        self.assert_invalid(polling, "MECHANISM_EVIDENCE")
-
     def test_case_artifact_contract_cannot_be_weakened_by_metadata(self) -> None:
         fixture = self.fixture("case-artifacts")
         document = read_json(fixture.case_meta["W4"])
@@ -1418,16 +1390,6 @@ class EvidenceValidatorTests(unittest.TestCase):
         document["artifacts"].pop("websocket")
         write_json(fixture.case_meta["W4"], document)
         self.assert_invalid(fixture, "ARTIFACT_REQUIRED")
-
-    def test_pactbin2_case_artifact_is_the_actual_store_bytes(self) -> None:
-        fixture = self.fixture("pactbin2-magic")
-        document = read_json(fixture.case_meta["O5"])
-        record = document["artifacts"]["pactbin2"]
-        artifact = fixture.root / record["path"]
-        artifact.write_bytes(b"not a Pact file\n")
-        record["sha256"] = sha256(artifact)
-        write_json(fixture.case_meta["O5"], document)
-        self.assert_invalid(fixture, "PACTBIN2_EVIDENCE")
 
     def test_case_artifact_payloads_are_semantic_evidence_not_placeholders(self) -> None:
         mutations = (
@@ -1450,29 +1412,17 @@ class EvidenceValidatorTests(unittest.TestCase):
         for name, payload, code in mutations:
             with self.subTest(name=name):
                 fixture = self.fixture(f"case-payload-{name}")
-                document = read_json(fixture.case_meta["O5"])
+                document = read_json(fixture.case_meta["W5"])
                 record = document["artifacts"][name]
                 artifact = fixture.root / record["path"]
                 artifact.write_bytes(payload)
                 record["sha256"] = sha256(artifact)
-                write_json(fixture.case_meta["O5"], document)
+                write_json(fixture.case_meta["W5"], document)
                 self.assert_invalid(fixture, code)
-
-        mechanism = self.fixture("case-payload-mechanism")
-        document = read_json(mechanism.case_meta["O3"])
-        record = document["artifacts"]["mechanism"]
-        artifact = mechanism.root / record["path"]
-        artifact.write_text(
-            '{"pushFrames":2,"postCommitWakes":1,"timerReads":0}\n',
-            encoding="utf-8",
-        )
-        record["sha256"] = sha256(artifact)
-        write_json(mechanism.case_meta["O3"], document)
-        self.assert_invalid(mechanism, "MECHANISM_EVIDENCE")
 
     def test_textual_case_artifacts_reject_unredacted_credentials(self) -> None:
         fixture = self.fixture("case-credential-leak")
-        document = read_json(fixture.case_meta["O2"])
+        document = read_json(fixture.case_meta["W2"])
         record = document["artifacts"]["console"]
         artifact = fixture.root / record["path"]
         artifact.write_text(
@@ -1480,7 +1430,7 @@ class EvidenceValidatorTests(unittest.TestCase):
             encoding="utf-8",
         )
         record["sha256"] = sha256(artifact)
-        write_json(fixture.case_meta["O2"], document)
+        write_json(fixture.case_meta["W2"], document)
         self.assert_invalid(fixture, "EVIDENCE_REDACTION")
 
     def test_duplicate_JSON_keys_and_nonfinite_numbers_are_rejected(self) -> None:
@@ -1517,7 +1467,7 @@ class EvidenceValidatorTests(unittest.TestCase):
         self.assert_invalid(document_link, "DOCUMENT_SYMLINK")
 
         artifact_link = self.fixture("artifact-parent-link")
-        document = read_json(artifact_link.case_meta["O5"])
+        document = read_json(artifact_link.case_meta["W5"])
         artifact = artifact_link.root / document["artifacts"]["dom"]["path"]
         real_artifact = artifact.with_name(artifact.name + "-real")
         artifact.rename(real_artifact)
@@ -1537,19 +1487,19 @@ class EvidenceValidatorTests(unittest.TestCase):
 
     def test_cross_case_hardlink_reuse_is_rejected(self) -> None:
         fixture = self.fixture("hardlink-reuse")
-        first = read_json(fixture.case_meta["O1"])
-        second = read_json(fixture.case_meta["O2"])
+        first = read_json(fixture.case_meta["W1"])
+        second = read_json(fixture.case_meta["W2"])
         first_path = fixture.root / first["artifacts"]["dom"]["path"]
         second_path = fixture.root / second["artifacts"]["dom"]["path"]
         second_path.unlink()
         os.link(first_path, second_path)
         second["artifacts"]["dom"]["sha256"] = sha256(first_path)
-        write_json(fixture.case_meta["O2"], second)
+        write_json(fixture.case_meta["W2"], second)
         self.assert_invalid(fixture, "HARDLINK_REUSE")
 
     def test_artifact_missing_tamper_and_traversal_fail_closed(self) -> None:
         missing = self.fixture("missing-artifact")
-        document = read_json(missing.case_meta["O2"])
+        document = read_json(missing.case_meta["W2"])
         artifact = missing.root / document["artifacts"]["dom"]["path"]
         artifact.unlink()
         self.assert_invalid(missing, "ARTIFACT_MISSING")
@@ -1561,9 +1511,9 @@ class EvidenceValidatorTests(unittest.TestCase):
         self.assert_invalid(tampered, "ARTIFACT_HASH")
 
         traversal = self.fixture("artifact-traversal")
-        document = read_json(traversal.case_meta["O4"])
+        document = read_json(traversal.case_meta["W4"])
         document["artifacts"]["console"]["path"] = "../outside.json"
-        write_json(traversal.case_meta["O4"], document)
+        write_json(traversal.case_meta["W4"], document)
         self.assert_invalid(traversal, "ARTIFACT_PATH")
 
     def test_soak_requires_finite_correlated_thirty_minute_timestamps(self) -> None:

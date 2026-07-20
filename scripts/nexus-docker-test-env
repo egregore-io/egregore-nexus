@@ -1778,7 +1778,7 @@ cmd_lab_gate() {
   local release_capture_dir="" host_before_snapshot="" host_after_snapshot=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --all) requested_all=1; run_backend=1; run_ocular=1; run_webui=1; shift ;;
+      --all) requested_all=1; run_backend=1; run_webui=1; shift ;;
       --backend-only) run_backend=1; shift ;;
       --ocular) run_ocular=1; shift ;;
       --webui) run_webui=1; shift ;;
@@ -1819,7 +1819,7 @@ cmd_lab_gate() {
   prepare_existing_lab "$mode"
   [ "$CONTAINER_RUNNING" = true ] || die "container $NAME is not running"
   if [ "$run_backend" -eq 0 ] && [ "$run_ocular" -eq 0 ] && [ "$run_webui" -eq 0 ]; then
-    run_backend=1; run_ocular=1; run_webui=1
+    requested_all=1; run_backend=1; run_webui=1
   fi
   if [ "$run_backend" -eq 1 ]; then
     exec_interactive bash -lc '/tmp/nexus-lab-bin/nexus-v015-ws-acceptance --mode "${NEXUS_LAB_MODE:-source}" --evidence-dir "$NEXUS_LAB_ROOT/evidence"'
@@ -1939,11 +1939,11 @@ cmd_lab_gate() {
       NEXUS_V015_CANDIDATE_DIGEST="$candidate_digest" \
       OCULAR_LAB=1 \
       OCULAR_EVIDENCE_DIR="$LAB_ROOT/evidence/$V015_RUN_ID" \
-      node tests/ocular/aggregate.mjs --release
+      node tests/ocular/aggregate.mjs --nexus-release
     local post_aggregate_readiness_sha256
     post_aggregate_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" "$mode")
     [ "$post_aggregate_readiness_sha256" = "$surface_readiness_sha256" ] \
-      || die "candidate readiness ledger changed during Lens evidence aggregation"
+      || die "candidate readiness ledger changed during Nexus ocular evidence aggregation"
   fi
   if [ "$run_soak" -eq 1 ]; then
     require_named_container_id "$CONTAINER_ID"
@@ -2093,7 +2093,6 @@ result_paths = {
     "D1": "results/D1-clean-packed-install/result.json",
     "D2": "results/D2-webconsole-cli/result.json",
     "D3": "results/D3-webui-browser/result.json",
-    "E1": "results/E1-pactbin2-session-store/result.json",
     "E2": "results/E2-lens-ocular/result.json",
     "F1": "results/F1-live-codex-claude/result.json",
     "F2": "results/F2-message-hooks/result.json",

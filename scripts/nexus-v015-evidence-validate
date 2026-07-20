@@ -19,13 +19,12 @@ from typing import Any, NoReturn
 
 
 VERSION = "0.1.5"
-SOURCE_NAMES = ("nexus", "lens", "egregore", "pactree", "pactreePython", "pactreeFs")
+SOURCE_NAMES = ("nexus",)
 PACKAGE_NAMES = ("@egregore/nexus", "@egregore/nexus-cli", "@egregore/nexus-gateway")
-OCULAR_CASES = tuple(f"O{index}" for index in range(1, 19))
 WEBUI_CASES = tuple(f"W{index}" for index in range(1, 9))
-EXPECTED_CASES = OCULAR_CASES + WEBUI_CASES
+EXPECTED_CASES = WEBUI_CASES
 EXPECTED_CASE_SET = frozenset(EXPECTED_CASES)
-OCULAR_ARTIFACTS = (
+WEBUI_ARTIFACTS = (
     "preScreenshot",
     "postScreenshot",
     "dom",
@@ -34,10 +33,7 @@ OCULAR_ARTIFACTS = (
     "websocket",
     "processLogs",
     "health",
-    "pactbin2",
 )
-WEBUI_ARTIFACTS = OCULAR_ARTIFACTS[:-1]
-MECHANISM_CASES = frozenset({"O3", "O4"})
 SOAK_COUNTERS = (
     "deadLetters",
     "lostAcceptedMessages",
@@ -120,10 +116,6 @@ RESULT_SPECS: dict[str, tuple[Path, tuple[str, ...]]] = {
         Path("results/D3-webui-browser/result.json"),
         ("browserTranscript", "attribution", "reconnect"),
     ),
-    "E1": (
-        Path("results/E1-pactbin2-session-store/result.json"),
-        ("revisions", "roundTrip", "damageFixtures"),
-    ),
     "E2": (
         Path("results/E2-lens-ocular/result.json"),
         ("ocularSummary", "affordanceCoverage", "artifactsIndex"),
@@ -192,9 +184,9 @@ SENSITIVE_ENV_PATTERN = re.compile(r"(?:TOKEN|KEY|SECRET|PASSWORD|COOKIE|AUTH)",
 USAGE = """Usage: scripts/nexus-v015-evidence-validate [--seal] RUN_DIR
 
 Validate one immutable v0.1.5 evidence ledger containing:
-  manifest.json (packed candidate, six sources, three npm tarballs, native hash)
-  all canonical A1-F3 results plus clean diff and review dispositions
-  exactly O1-O18 and W1-W8 ocular-evidence/2 human-path case manifests
+  manifest.json (packed candidate, Nexus source ledger, three npm tarballs, native hash)
+  all canonical Nexus A1-F3 results plus clean diff and review dispositions
+  exactly W1-W8 ocular-evidence/2 WebUI case manifests and bound LP evidence
   a finite, correlated, zero-failure soak of at least 1800 seconds
 
 Documents and artifacts must be regular in-tree files, may not traverse
@@ -1277,7 +1269,6 @@ class Validator:
         metadata_path: Path,
         owner: str,
         artifact_parent: Path | None = None,
-        required_prefix: bytes | None = None,
     ) -> tuple[str, bytes]:
         if not isinstance(record, dict) or set(record) != {"path", "sha256"}:
             self.error("ARTIFACTS_INVALID", metadata_path, "artifact record must contain path and sha256")
@@ -1304,12 +1295,6 @@ class Validator:
                 "ARTIFACT_HASH",
                 metadata_path,
                 f"artifact SHA-256 mismatch for {relative.as_posix()}: expected {expected}, got {actual}",
-            )
-        if required_prefix is not None and not raw.startswith(required_prefix):
-            self.error(
-                "PACTBIN2_EVIDENCE",
-                metadata_path,
-                f"{relative.as_posix()} is not a PACTBIN2 store artifact",
             )
         self.declared_files.add(relative)
         return relative.as_posix(), raw
@@ -1346,7 +1331,6 @@ class Validator:
                 metadata_path,
                 f"{owner}:{name}",
                 artifact_parent,
-                b"PACTBIN2" if name == "pactbin2" else None,
             )
             if relative in seen_paths:
                 self.error("ARTIFACT_PATH_DUPLICATE", metadata_path, f"duplicate artifact path: {relative}")
@@ -2127,8 +2111,6 @@ class Validator:
 
     def validate_case_artifact_payloads(
         self,
-        case_id: str,
-        document: dict[str, Any],
         path: Path,
         payloads: dict[str, bytes],
     ) -> None:
@@ -2232,20 +2214,6 @@ class Validator:
                 "health evidence must record a timestamped HTTP 200 response",
             )
 
-        if case_id in MECHANISM_CASES:
-            mechanism = self.case_artifact_json(
-                payloads["mechanism"], path, "MECHANISM_EVIDENCE"
-            )
-            if (
-                mechanism != document.get("mechanism")
-                or len(websocket) < document["mechanism"]["pushFrames"]
-            ):
-                self.error(
-                    "MECHANISM_EVIDENCE",
-                    path,
-                    "mechanism artifact must match its summary and observed pushed frames",
-                )
-
     def validate_cases(self) -> None:
         for case_id, (path, document) in self.discover_cases().items():
             expected_fields = {
@@ -2265,8 +2233,6 @@ class Validator:
                 "requiredArtifacts",
                 "artifacts",
             }
-            if case_id in MECHANISM_CASES:
-                expected_fields.add("mechanism")
             if set(document) != expected_fields or document.get("schema") != "ocular-evidence/2":
                 self.error(
                     "CASE_SCHEMA",
@@ -2275,32 +2241,16 @@ class Validator:
                 )
             self.validate_case_identity(document, path)
             self.validate_outcome(document, path)
-            expected_surface = "ocular" if case_id.startswith("O") else "webui"
-            if document.get("surface") != expected_surface:
-                self.error("CASE_SURFACE", path, f"{case_id} surface must be {expected_surface!r}")
-            expected_artifacts = OCULAR_ARTIFACTS if expected_surface == "ocular" else WEBUI_ARTIFACTS
-            if case_id in MECHANISM_CASES:
-                expected_artifacts = expected_artifacts + ("mechanism",)
-                mechanism = document.get("mechanism")
-                if (
-                    not isinstance(mechanism, dict)
-                    or set(mechanism) != {"pushFrames", "postCommitWakes", "timerReads"}
-                    or not is_int(mechanism.get("pushFrames"))
-                    or mechanism["pushFrames"] < 1
-                    or not is_int(mechanism.get("postCommitWakes"))
-                    or mechanism["postCommitWakes"] < 1
-                    or not is_int(mechanism.get("timerReads"))
-                    or mechanism["timerReads"] != 0
-                ):
-                    self.error("MECHANISM_EVIDENCE", path, "push must be observed with zero timer reads")
+            if document.get("surface") != "webui":
+                self.error("CASE_SURFACE", path, f"{case_id} surface must be 'webui'")
             payloads = self.validate_artifacts(
                 document,
                 path,
                 f"case:{case_id}",
-                expected_artifacts,
+                WEBUI_ARTIFACTS,
                 path.parent,
             )
-            self.validate_case_artifact_payloads(case_id, document, path, payloads)
+            self.validate_case_artifact_payloads(path, payloads)
 
     def result_json_paths(self) -> set[str]:
         return {

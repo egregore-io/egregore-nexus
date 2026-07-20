@@ -45,7 +45,7 @@ class WsAcceptanceContracts(unittest.TestCase):
 
     def manifest_fixture(self, root: Path) -> dict[str, object]:
         sources = {}
-        for name in ("nexus", "lens", "egregore", "pactree", "pactreePython", "pactreeFs"):
+        for name in ("nexus",):
             sources[name] = {
                 "revision": "a" * 40,
                 "dirty": False,
@@ -771,6 +771,26 @@ class WsAcceptanceContracts(unittest.TestCase):
             dependency.chmod(0o644)
             inventory = module["full_install_inventory"](root)
             self.assertIn("lib/node_modules/dep/index.js", inventory)
+
+    def test_full_install_inventory_hashes_legitimate_empty_dependency_files(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            dependency = root / "lib" / "node_modules" / "dep" / "types.mjs"
+            dependency.parent.mkdir(parents=True)
+            dependency.write_bytes(b"")
+            dependency.chmod(0o644)
+
+            inventory = module["full_install_inventory"](root)
+
+            self.assertEqual(
+                inventory["lib/node_modules/dep/types.mjs"]["sha256"],
+                hashlib.sha256(b"").hexdigest(),
+            )
+            self.assertEqual(
+                inventory["lib/node_modules/dep/types.mjs"]["size"],
+                0,
+            )
 
     def test_cli_version_must_be_exactly_nexus_0_1_5(self) -> None:
         module = runpy.run_path(str(TARGET))

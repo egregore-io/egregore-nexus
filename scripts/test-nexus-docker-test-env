@@ -203,6 +203,10 @@ if grep -Fq 'node tests/ocular/run.mjs --all' "$TARGET" \
 fi
 grep -Fq 'node tests/ocular/run.mjs' "$TARGET"
 grep -Fq 'node tests/ocular/webui-run.mjs' "$TARGET"
+if grep -Fq -- '--all) requested_all=1; run_backend=1; run_ocular=1' "$TARGET"; then
+  echo 'Nexus --all must not enable the separate Lens/Pactree product catalog' >&2
+  exit 1
+fi
 
 grep -Fq '/work/egregore-v2/egregore/providers/claude-code' "$TARGET"
 grep -Fq '/work/egregore-v2/egregore/providers/codex' "$TARGET"
@@ -1261,10 +1265,11 @@ for mode in packed; do
 done
 
 # The canonical --all handoff must include the visible Lens plugin gate and
-# the O/W aggregate producer before the soak/final seal.  The candidate digest
-# is derived by the bound release assembler from this run's manifest; neither
-# runner may invent it.  Exercise the complete Docker argv/order instead of
-# accepting source tokens alone.
+# the Nexus-only W/LP aggregate before the soak/final seal. The Lens/Pactree O
+# catalog remains an explicit separate tool and cannot veto Nexus. The
+# candidate digest is derived by the bound release assembler from this run's
+# manifest; neither runner may invent it. Exercise the complete Docker
+# argv/order instead of accepting source tokens alone.
 mkdir -p "$TMP/all-handoff-bin"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
@@ -1284,7 +1289,7 @@ printf '%s\n' \
   '  exec*"nexus-v015-ws-soak"*) echo soak-complete ;;' \
   '  exec*"lab-agent launch codex"*) echo codex-ready ;;' \
   '  exec*"lab-agent launch claude"*) echo claude-ready ;;' \
-  '  exec*"tests/ocular/run.mjs --release"*) echo ocular-complete ;;' \
+  '  exec*"tests/ocular/run.mjs --release"*) echo forbidden-ocular-product-gate; exit 95 ;;' \
   '  exec*"webconsole stop --force"*) echo webconsole-stopped ;;' \
   '  exec*"nexus-v015-webconsole-acceptance"*) echo webconsole-complete ;;' \
   '  exec*"webconsole start --host 127.0.0.1 --port 4200"*) echo webconsole-started ;;' \
@@ -1292,7 +1297,7 @@ printf '%s\n' \
   '  exec*"tests/ocular/webui-run.mjs --release"*) echo webui-complete ;;' \
   '  exec*"nexus-v015-release-assemble"*"--print-candidate-digest"*) printf "sha256:"; printf "d%.0s" {1..64}; echo ;;' \
   '  exec*"tests/ocular/live-plugin.mjs --release"*) echo live-plugin-complete ;;' \
-  '  exec*"tests/ocular/aggregate.mjs --release"*) echo aggregate-complete ;;' \
+  '  exec*"tests/ocular/aggregate.mjs --nexus-release"*) echo aggregate-complete ;;' \
   '  cp*) echo release-input-copied ;;' \
   '  exec*"python3 -"*) cat >/dev/null; echo diff-review-ready ;;' \
   '  exec*"NEXUS_V015_RELEASE_INPUT_DIR="*) echo release-inputs-ready ;;' \
@@ -1309,7 +1314,7 @@ DOCKER_FAKE_LOG="$TMP/all-handoff.log" \
   "$TARGET" lab-gate --mode packed --all --soak 1800 \
   >"$TMP/all-handoff.out" 2>"$TMP/all-handoff.err"
 for marker in \
-  backend-complete hooks-complete ocular-complete webui-complete \
+  backend-complete hooks-complete webui-complete \
   live-plugin-complete aggregate-complete assemble-complete; do
   grep -Fq "$marker" "$TMP/all-handoff.out"
 done
@@ -1328,14 +1333,17 @@ if grep -Eq 'LENS_NEXUS_(GATEWAY_URL|BEARER)' "$TMP/all-handoff.log"; then
   exit 1
 fi
 grep -Fq 'node tests/ocular/live-plugin.mjs --release' "$TMP/all-handoff.log"
-grep -Fq 'node tests/ocular/aggregate.mjs --release' "$TMP/all-handoff.log"
+grep -Fq 'node tests/ocular/aggregate.mjs --nexus-release' "$TMP/all-handoff.log"
+if grep -Fq 'tests/ocular/run.mjs --release' "$TMP/all-handoff.log"; then
+  echo 'Nexus --all must not run the separate Lens/Pactree product catalog' >&2
+  exit 1
+fi
 mapfile -t digest_lines < <(grep -n \
   'nexus-v015-release-assemble.*--print-candidate-digest' \
   "$TMP/all-handoff.log" | cut -d: -f1)
-ocular_line=$(grep -n 'tests/ocular/run.mjs --release' "$TMP/all-handoff.log" | cut -d: -f1)
 webui_line=$(grep -n 'tests/ocular/webui-run.mjs --release' "$TMP/all-handoff.log" | cut -d: -f1)
 live_line=$(grep -n 'tests/ocular/live-plugin.mjs --release' "$TMP/all-handoff.log" | cut -d: -f1)
-aggregate_line=$(grep -n 'tests/ocular/aggregate.mjs --release' "$TMP/all-handoff.log" | cut -d: -f1)
+aggregate_line=$(grep -n 'tests/ocular/aggregate.mjs --nexus-release' "$TMP/all-handoff.log" | cut -d: -f1)
 soak_line=$(grep -n 'export NEXUS_V015_SOAK_PASSWORD=' \
   "$TMP/all-handoff.log" | tail -n1 | cut -d: -f1)
 assemble_line=$(grep -n 'nexus-v015-release-assemble.*--host-before' \
@@ -1343,10 +1351,9 @@ assemble_line=$(grep -n 'nexus-v015-release-assemble.*--host-before' \
 seal_line=$(grep -n 'nexus-v015-evidence-validate --seal' \
   "$TMP/all-handoff.log" | tail -n1 | cut -d: -f1)
 test "${#digest_lines[@]}" -ge 2
-test -n "$ocular_line" && test -n "$webui_line"
+test -n "$webui_line"
 test -n "$live_line" && test -n "$aggregate_line" && test -n "$soak_line"
 test -n "$assemble_line" && test -n "$seal_line"
-test "${digest_lines[0]}" -lt "$ocular_line"
 test "${digest_lines[0]}" -lt "$webui_line"
 test "$webui_line" -lt "${digest_lines[-1]}"
 test "${digest_lines[-1]}" -lt "$live_line"

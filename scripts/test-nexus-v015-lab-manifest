@@ -22,7 +22,7 @@ NEXUS_TAR_SHA=$(sha256sum "$TMP/container/packs/nexus.tgz" | cut -d' ' -f1)
 CLI_TAR_SHA=$(sha256sum "$TMP/container/packs/nexus-cli.tgz" | cut -d' ' -f1)
 GATEWAY_TAR_SHA=$(sha256sum "$TMP/container/packs/nexus-gateway.tgz" | cut -d' ' -f1)
 
-for repo in nexus lens egregore pactree pactree-py pactree-fs; do
+for repo in nexus; do
   path="$TMP/repos/$repo"
   mkdir -p "$path"
   git -C "$path" init -q
@@ -244,8 +244,6 @@ SH
 chmod +x "$TMP/bin/docker"
 
 PATH="$TMP/bin:/usr/bin:/bin" "$TARGET" --help >"$TMP/help"
-grep -Fq 'PACTREE_REPO="${NEXUS_V015_PACTREE_REPO:-}"' "$TARGET"
-grep -Fq 'PACTREE_PY_REPO="${NEXUS_V015_PACTREE_PY_REPO:-}"' "$TARGET"
 grep -Fq '[ "$NEXUS_VERSION" = "nexus $VERSION" ]' "$TARGET"
 grep -Fq -- "--container" "$TMP/help"
 grep -Fq -- "--mode" "$TMP/help"
@@ -263,11 +261,6 @@ COMMON_ENV=(
   "DOCKER_FIXTURE_CLEANED=$TMP/cleaned"
   "DOCKER_FIXTURE_VERIFIED=$TMP/verified"
   "NEXUS_V015_NEXUS_REPO=$TMP/repos/nexus"
-  "NEXUS_V015_LENS_REPO=$TMP/repos/lens"
-  "NEXUS_V015_EGREGORE_REPO=$TMP/repos/egregore"
-  "NEXUS_V015_PACTREE_REPO=$TMP/repos/pactree"
-  "NEXUS_V015_PACTREE_PY_REPO=$TMP/repos/pactree-py"
-  "NEXUS_V015_PACTREE_FS_REPO=$TMP/repos/pactree-fs"
 )
 
 env "${COMMON_ENV[@]}" "$TARGET" \
@@ -336,7 +329,7 @@ done
   echo 'source final verification did not reach the mutation barrier' >&2
   exit 1
 }
-printf 'late mutation\n' >"$TMP/repos/lens/late.txt"
+printf 'late mutation\n' >"$TMP/repos/nexus/late.txt"
 touch "$FINAL_CONTINUE"
 set +e
 wait "$FINAL_PID"
@@ -345,7 +338,7 @@ set -e
 [ "$FINAL_STATUS" -ne 0 ]
 grep -Fq 'source changed after manifest snapshot was captured' "$TMP/source-final-race.stderr"
 [ ! -e "$TMP/out/source-final-race" ]
-rm -f "$TMP/repos/lens/late.txt" "$FINAL_READY" "$FINAL_CONTINUE"
+rm -f "$TMP/repos/nexus/late.txt" "$FINAL_READY" "$FINAL_CONTINUE"
 
 # The readiness ledger is one root-authority fd snapshot. Duplicate keys,
 # mutable metadata, multiply-linked files, and either an inode or byte change
@@ -388,7 +381,7 @@ jq -e '
   .schemaVersion == 1 and .runId == "fixture-run" and .mode == "packed" and
   .container == {limits:{cpus:6,memoryBytes:8589934592,pids:1024}} and
   (.image.digest | test("^sha256:[0-9a-f]{64}$")) and
-  (.sources | keys | sort) == (["nexus","lens","egregore","pactree","pactreePython","pactreeFs"] | sort) and
+  (.sources | keys) == ["nexus"] and
   ([.sources[] | keys | sort] | all(. == ["dirty","dirtyPaths","revision"])) and
   [.packages[].name] == ["@egregore/nexus","@egregore/nexus-cli","@egregore/nexus-gateway"] and
   ([.packages[].version] | all(. == "0.1.5")) and

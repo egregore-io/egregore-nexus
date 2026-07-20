@@ -4,7 +4,7 @@
 
 **Goal:** Produce one immutable packed Nexus v0.1.5 candidate whose complete required evidence validates and can receive a final ship/no-ship decision.
 
-**Architecture:** Preserve the daemon as transport/identity authority, Gateway as browser REST/WebSocket authority, and Lens as a projection/control client. Freeze the already-reviewed source changes first, then build exactly once and run every required gate against that same packed candidate; any source or artifact mutation after the build invalidates the run and returns to the candidate-build task.
+**Architecture:** Preserve the daemon as transport/identity authority and Gateway as browser REST/WebSocket authority. The packed candidate, readiness decision, and source ledger contain Nexus only. The existing Lens working tree remains the real CDP ocular client for Nexus WebSockets and user-facing chat surfaces; it may be dirty or uncommitted because it is validation tooling, not a Nexus release source, and its exact ocular artifacts bind what actually ran. Every visual chat action is driven through `lens.nexus`, never Egregore chat. Egregore or Pactree packages may remain present as Lens implementation dependencies, but their repositories, revisions, cleanliness, and product behavior are outside the Nexus release gate. Freeze the already-reviewed Nexus source changes first, then build exactly once and run every required Nexus gate against that same packed candidate; any Nexus source or packed-artifact mutation after the build invalidates the run and returns to the candidate-build task.
 
 **Tech Stack:** Rust/Cargo, TypeScript/Node/pnpm/Vitest, Python/pytest, Electron/CDP, Docker, SQLite/libsql, Bash, npm packed artifacts.
 
@@ -194,7 +194,7 @@
 
 **Files:**
 - Execute: `scripts/nexus-docker-test-env`
-- Produce: candidate tarballs, native binary, readiness receipt, manifest, and container image under the isolated lab
+- Produce: Nexus candidate tarballs, native binary, readiness receipt, manifest, and container image under the isolated lab
 
 - [x] **Step 1: Remove only the previous disposable validator.**
 
@@ -214,7 +214,7 @@
   scripts/nexus-docker-test-env lab-status --mode packed
   ```
 
-  Expected: one 6-CPU/8-GiB/1,024-PID validator, candidate-bound readiness, healthy daemon/Gateway/Lens, and no host runtime mutation.
+  Expected: one 6-CPU/8-GiB/1,024-PID validator, candidate-bound readiness, healthy daemon/Gateway/Lens ocular client, and no host runtime mutation. The Nexus source ledger is independent of the Lens/Egregore/Pactree working-tree state; any Egregore/Pactree packages present support the Lens shell only and no Egregore chat/product gate runs.
 
 - [ ] **Step 3: Freeze the candidate identity.**
 
@@ -222,13 +222,14 @@
   scripts/nexus-docker-test-env lab-evidence --mode packed
   ```
 
-  Expected: one run ID, readiness SHA-256, candidate digest, exact native hash, three npm tarball hashes, image digest, source ledger, and toolchain ledger.
+  Expected: one run ID, readiness SHA-256, candidate digest, exact native hash, three npm tarball hashes, image digest, a Nexus-only source ledger, and the toolchain ledger.
 
 ### Task 5: Run all packed functional gates
 
 **Files:**
-- Execute: packed CLI/Gateway/Webconsole/Lens/WebUI/hook producers
-- Produce: canonical A1–F2 and O1–O18/W1–W8 evidence
+- Execute: packed CLI/Gateway/Webconsole/WebUI/hook producers
+- Execute: the existing Lens LP1–LP16 ocular validator against the ready candidate
+- Produce: canonical Nexus evidence, W1–W8 WebUI evidence, and candidate-bound Lens ocular evidence without grading Lens/Egregore/Pactree source revisions
 
 - [ ] **Step 1: Run the complete packed gate without soak.**
 
@@ -237,7 +238,7 @@
   scripts/nexus-docker-test-env lab-gate --mode packed
   ```
 
-  Expected: backend, D2, F2, O1–O18, W1–W8, live-plugin LP1–LP16, aggregate E1/E2/D3, and pre-soak sealing producers all report PASS; any REFUSED/SKIP/FAIL stops the run.
+  Expected: backend, D2, F2, W1–W8, Lens LP1–LP16, and pre-soak sealing producers all report PASS for Nexus behavior. The gate records the actual Lens ocular bytes that ran but does not require clean/committed Lens, Egregore, or Pactree repositories and does not run their separate product suites.
 
 - [ ] **Step 2: Verify every chat surface explicitly.**
 

@@ -211,6 +211,7 @@ def checked_file(
     expected_uid: int | None = None,
     expected_mode: int | None = None,
     include_info: bool = False,
+    allow_empty: bool = False,
 ) -> bytes | tuple[bytes, os.stat_result]:
     path = absolute(path)
     root = absolute(root)
@@ -266,7 +267,7 @@ def checked_file(
         after.st_ctime_ns,
     ):
         raise AcceptanceFailure(f"{label} changed while being read: {path}")
-    if not data:
+    if not data and not allow_empty:
         raise AcceptanceFailure(f"{label} is empty: {path}")
     if include_info:
         return data, after
@@ -443,14 +444,7 @@ def validate_manifest_contract(manifest: dict[str, Any], run_id: str) -> None:
     if manifest.get("mode") != "packed":
         raise AcceptanceFailure("packed manifest mode must be exactly packed")
 
-    source_names = (
-        "nexus",
-        "lens",
-        "egregore",
-        "pactree",
-        "pactreePython",
-        "pactreeFs",
-    )
+    source_names = ("nexus",)
     sources = manifest.get("sources")
     if not isinstance(sources, dict) or set(sources) != set(source_names):
         raise AcceptanceFailure("packed manifest source set is invalid")
@@ -1456,7 +1450,12 @@ def full_install_inventory(root: Path) -> dict[str, dict[str, object]]:
                 }
                 visit(Path(entry.path), child_relative)
             elif stat.S_ISREG(info.st_mode):
-                raw = checked_file(Path(entry.path), root, f"packed install entry {key}")
+                raw = checked_file(
+                    Path(entry.path),
+                    root,
+                    f"packed install entry {key}",
+                    allow_empty=True,
+                )
                 inventory[key] = {
                     "kind": "file",
                     "sha256": sha256_bytes(raw),

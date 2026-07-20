@@ -869,18 +869,8 @@ PY
 }
 
 NEXUS_REPO="${NEXUS_V015_NEXUS_REPO:-$REPO}"
-LENS_REPO="${NEXUS_V015_LENS_REPO:-$HOME/Projects/egregore-lens}"
-EGREGORE_REPO="${NEXUS_V015_EGREGORE_REPO:-$HOME/Projects/egregore-v2}"
-PACTREE_REPO="${NEXUS_V015_PACTREE_REPO:-}"
-PACTREE_PY_REPO="${NEXUS_V015_PACTREE_PY_REPO:-}"
-PACTREE_FS_REPO="${NEXUS_V015_PACTREE_FS_REPO:-$HOME/Projects/pactree-fs}"
 
 source_record "$NEXUS_REPO" "$TMP/nexus.source" >"$TMP/nexus.json"
-source_record "$LENS_REPO" "$TMP/lens.source" >"$TMP/lens.json"
-source_record "$EGREGORE_REPO" "$TMP/egregore.source" >"$TMP/egregore.json"
-source_record "$PACTREE_REPO" "$TMP/pactree.source" >"$TMP/pactree.json"
-source_record "$PACTREE_PY_REPO" "$TMP/pactree-py.source" >"$TMP/pactree-py.json"
-source_record "$PACTREE_FS_REPO" "$TMP/pactree-fs.source" >"$TMP/pactree-fs.json"
 
 IMAGE_ID=$(docker container inspect -f '{{.Image}}' "$CONTAINER")
 CONTAINER_ID=$(docker container inspect -f '{{.Id}}' "$CONTAINER")
@@ -1209,12 +1199,7 @@ jq -n \
   --argjson rawEnvironment "$ENVIRONMENT" \
   --argjson bindings "$BINDINGS" \
   --argjson packages "$PACKAGE_ROWS" \
-  --slurpfile nexus "$TMP/nexus.json" \
-  --slurpfile lens "$TMP/lens.json" \
-  --slurpfile egregore "$TMP/egregore.json" \
-  --slurpfile pactree "$TMP/pactree.json" \
-  --slurpfile pactreePy "$TMP/pactree-py.json" \
-  --slurpfile pactreeFs "$TMP/pactree-fs.json" '
+  --slurpfile nexus "$TMP/nexus.json" '
     def redacted_environment:
       $rawEnvironment
       | map(capture("^(?<key>[^=]+)=(?<value>.*)$"))
@@ -1280,10 +1265,7 @@ jq -n \
       schemaVersion: 1,
       runId: $runId,
       mode: "packed",
-      sources: {
-        nexus: $nexus[0], lens: $lens[0], egregore: $egregore[0],
-        pactree: $pactree[0], pactreePython: $pactreePy[0], pactreeFs: $pactreeFs[0]
-      },
+      sources: {nexus: $nexus[0]},
       native: {path:"candidate/native/nexus",sha256:$nativeSha256},
       packages: $packages,
       image: {digest:$imageDigest},
@@ -1293,9 +1275,9 @@ jq -n \
     }
   ' >"$STAGE/manifest.json"
 
-# All six repositories must still be the exact fd-backed snapshots encoded in
-# the manifest.  This closes the otherwise mixed-time window created by the
-# Docker/package capture work between the first repository and publication.
+# The Nexus repository must still be the exact fd-backed snapshot encoded in
+# the manifest. This closes the otherwise mixed-time window created by the
+# Docker/package capture work between the first read and publication.
 if [ -n "${NEXUS_V015_SOURCE_FINAL_PAUSE_READY:-}" ] \
     && [ -n "${NEXUS_V015_SOURCE_FINAL_PAUSE_CONTINUE:-}" ]; then
   : >"$NEXUS_V015_SOURCE_FINAL_PAUSE_READY"
@@ -1313,11 +1295,6 @@ READINESS_FINAL_SNAPSHOT=$(readiness_snapshot_program | docker exec -i \
 [ "$READINESS_FINAL_SNAPSHOT" = "$READINESS_SNAPSHOT" ] \
   || die "candidate readiness changed during manifest capture"
 verify_source_record "$NEXUS_REPO" "$TMP/nexus.source"
-verify_source_record "$LENS_REPO" "$TMP/lens.source"
-verify_source_record "$EGREGORE_REPO" "$TMP/egregore.source"
-verify_source_record "$PACTREE_REPO" "$TMP/pactree.source"
-verify_source_record "$PACTREE_PY_REPO" "$TMP/pactree-py.source"
-verify_source_record "$PACTREE_FS_REPO" "$TMP/pactree-fs.source"
 
 chmod 0400 "$STAGE/manifest.json"
 secure_tree_program | python3 - inspect \
