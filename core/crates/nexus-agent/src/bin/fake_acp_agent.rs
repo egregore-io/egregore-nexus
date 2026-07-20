@@ -466,7 +466,24 @@ async fn main() -> Result<()> {
                 // `session/prompt` request is left open forever. A client that keys turn-end off the
                 // prompt response (correct) must time out and surface an error; a client with no
                 // bound on that wait hangs the turn — and the per-agent loop — indefinitely.
-                if std::env::var("FAKE_ACP_NO_TURN_END").is_ok() {
+                let omit_turn_end_once = std::env::var("FAKE_ACP_NO_TURN_END_ONCE")
+                    .ok()
+                    .is_some_and(|path| {
+                        match std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(path)
+                        {
+                            Ok(_) => true,
+                            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                                false
+                            }
+                            Err(error) => {
+                                panic!("creating one-shot no-turn-end marker failed: {error}")
+                            }
+                        }
+                    });
+                if std::env::var("FAKE_ACP_NO_TURN_END").is_ok() || omit_turn_end_once {
                     return Ok(());
                 }
 

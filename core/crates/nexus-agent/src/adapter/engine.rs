@@ -612,6 +612,10 @@ enum TurnEnd {
     /// request with its exact handoff diagnostic, and then emitted real replacement model output.
     /// The model-output boundary prevents retrying a prompt already present in its context.
     InterruptedPromptHandoff,
+    /// Nexus successfully sent `session/cancel` for this locally active turn. ACP cancel is a
+    /// notification, so some bridges leave the old `session/prompt` unanswered until a replacement
+    /// arrives. This boundary releases local serialization so that replacement can be sent.
+    Cancelled,
 }
 
 const INTERRUPTED_HANDOFF_DIAGNOSTIC: &str =
@@ -1029,6 +1033,11 @@ pub struct AcpEngine {
     /// concurrently. Holding `conn` across the prompt response used to make cancellation
     /// impossible: the cancel notification waited behind the very turn it needed to stop.
     turn_lock: AsyncMutex<()>,
+    /// Monotonic accepted-cancel generation. A prompt snapshots it after acquiring `turn_lock`, so
+    /// a stale cancellation can never terminate the next prompt.
+    cancel_generation: std::sync::atomic::AtomicU64,
+    /// Wakes the locally active prompt when `cancel_generation` advances.
+    cancel_notify: tokio::sync::Notify,
     /// Per-turn reply buffer + stream-activity signal shared with the notification handler.
     updates: Arc<TurnActivity>,
     /// Handle to the spawned child process retained for [`AcpEngine::kill`]. Populated by
@@ -1068,6 +1077,8 @@ impl AcpEngine {
         Self {
             conn: AsyncMutex::new(None),
             turn_lock: AsyncMutex::new(()),
+            cancel_generation: std::sync::atomic::AtomicU64::new(0),
+            cancel_notify: tokio::sync::Notify::new(),
             updates: Arc::new(TurnActivity::new()),
             child: Arc::new(Mutex::new(None)),
             kill_tx: Mutex::new(None),
@@ -1118,8 +1129,9 @@ impl AcpEngine {
     /// Cancel the active ACP turn for this engine's current session.
     ///
     /// `session/cancel` is a notification and therefore returns once it is accepted by the SDK
-    /// connection. The next prompt remains serialized by `turn_lock` until the cancelled prompt
-    /// observes its terminal response, so redirect-now cannot overlap two model turns.
+    /// connection. Advancing `cancel_generation` then closes the exact locally active prompt wait:
+    /// bridges that answer only after receiving a replacement cannot otherwise release
+    /// `turn_lock`, making the replacement structurally impossible to send.
     pub async fn cancel_active_turn(&self) -> Result<(), NexusError> {
         let (connection, session_id) = {
             let guard = self.conn.lock().await;
@@ -1134,7 +1146,24 @@ impl AcpEngine {
         connection
             .send_notification(CancelNotification::new(session_id))
             .map_err(|e| NexusError::Adapter(format!("session/cancel failed: {e}")))?;
+        self.cancel_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.cancel_notify.notify_waiters();
         Ok(())
+    }
+
+    async fn wait_for_cancel_after(&self, observed_generation: u64) {
+        loop {
+            let notified = self.cancel_notify.notified();
+            if self
+                .cancel_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != observed_generation
+            {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Install the realtime relay channel for the turn about to be injected: each renderable
@@ -1487,6 +1516,9 @@ impl AcpEngine {
         // Prompt turns are serialized independently of the connection handle. Cancellation must
         // be able to acquire/clone `conn` while this turn is awaiting its response.
         let _turn = self.turn_lock.lock().await;
+        let cancel_generation = self
+            .cancel_generation
+            .load(std::sync::atomic::Ordering::Acquire);
 
         // Fresh buffer for this turn. Snapshot the (monotonic) activity counter so we measure only
         // THIS turn's stream traffic, never a stale notification from a prior turn.
@@ -1533,7 +1565,7 @@ impl AcpEngine {
         let timeout = turn_timeout();
         let quiescence = quiescence_window();
         let mut prompt_response = Box::pin(prompt_turn.block_task());
-        let outcome = tokio::time::timeout(timeout, async {
+        let prompt_outcome = async {
             if require_terminal_response
                 && self
                     .harness
@@ -1601,6 +1633,13 @@ impl AcpEngine {
                     // silent. Never used by the observed durable bus-delivery seam.
                     () = wait_for_quiescence(&activity, quiescence) => TurnEnd::Quiescent,
                 }
+            }
+        };
+        let outcome = tokio::time::timeout(timeout, async {
+            tokio::select! {
+                biased;
+                turn_end = prompt_outcome => turn_end,
+                () = self.wait_for_cancel_after(cancel_generation) => TurnEnd::Cancelled,
             }
         })
         .await;
@@ -1702,6 +1741,16 @@ impl AcpEngine {
                     model_events,
                     quiescence_ms = quiescence.as_millis() as u64,
                     "ACP replacement handoff completed after causal model output"
+                );
+                Ok(())
+            }
+            Ok(TurnEnd::Cancelled) => {
+                info!(
+                    target: "nexus_agent::acp",
+                    acp_session = %acp_session,
+                    buffered_chunks = buffered,
+                    model_events,
+                    "ACP session/cancel accepted; releasing the old local turn for replacement"
                 );
                 Ok(())
             }

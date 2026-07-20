@@ -510,6 +510,84 @@ async fn claude_observed_interrupted_handoff_without_model_output_stays_unsettle
     );
 }
 
+/// `session/cancel` is a notification: a bridge may accept it but leave the cancelled
+/// `session/prompt` request unanswered until a replacement prompt arrives. Nexus must release its
+/// local prompt serialization boundary at the accepted cancel, otherwise the replacement can
+/// never be sent and the session remains deaf until the ten-minute turn timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_cancel_releases_unanswered_prompt_for_the_replacement_turn() {
+    let marker = std::env::temp_dir().join(format!(
+        "nexus-acp-cancel-handoff-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let engine = Arc::new(AcpEngine::for_harness(HarnessId::new("claude").unwrap()));
+    let command = HarnessCommand {
+        program: FAKE_HARNESS.to_string(),
+        args: vec![],
+        cwd: None,
+        env: vec![(
+            "FAKE_ACP_NO_TURN_END_ONCE".to_string(),
+            marker.display().to_string(),
+        )],
+    };
+    engine
+        .spawn_and_initialize(&command)
+        .await
+        .expect("spawn + initialize");
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .expect("session/new");
+
+    let first_engine = Arc::clone(&engine);
+    let first = tokio::spawn(async move {
+        first_engine
+            .inject_with_accepted_event(
+                "turn that the bridge never answers".to_string(),
+                Some(StreamEvent::text("accepted first input")),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !marker.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first prompt must reach the fake ACP bridge");
+
+    engine
+        .cancel_active_turn()
+        .await
+        .expect("session/cancel must be accepted");
+    tokio::time::timeout(std::time::Duration::from_secs(2), first)
+        .await
+        .expect("accepted cancel must release the unanswered local prompt")
+        .expect("first inject task must join")
+        .expect("an intentionally cancelled accepted prompt is a closed turn");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        engine.inject_with_accepted_event(
+            "replacement must not wait ten minutes".to_string(),
+            Some(StreamEvent::text("accepted replacement input")),
+        ),
+    )
+    .await
+    .expect("replacement prompt must cross the released serialization boundary")
+    .expect("the replacement turn must complete");
+    assert!(
+        reply_text(engine.take_updates()).contains("replacement must not wait ten minutes"),
+        "the completed replacement output must remain available to the relay"
+    );
+
+    let _ = std::fs::remove_file(marker);
+}
+
 #[tokio::test]
 async fn hermes_adapter_classifies_structured_acp_provider_limit() {
     let adapter = HermesAdapter::with_command(fake_prompt_error_command(json!({
