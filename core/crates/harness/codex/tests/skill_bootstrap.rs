@@ -85,6 +85,59 @@ fn assert_bus_launcher(dir: &std::path::Path) {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn model_facing_bus_launcher_rejects_only_listen_without_invoking_nexus() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let _lock = SKIP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvGuard::clear();
+    let dir = temp_dir("bus-allowlist");
+    install(dir.to_str().unwrap());
+
+    let fake_nexus = dir.join("fake-nexus");
+    let invocation_log = dir.join("invocations.log");
+    std::fs::write(
+        &fake_nexus,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$NEXUS_TEST_LOG\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_nexus, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let launcher = dir.join(".nexus/bus");
+    let rejected = Command::new(&launcher)
+        .arg("listen")
+        .env("NEXUS_CLI", &fake_nexus)
+        .env("NEXUS_TEST_LOG", &invocation_log)
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(64));
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("not available to agents"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        !invocation_log.exists(),
+        "a rejected listen command must never reach the Nexus CLI"
+    );
+
+    let allowed = Command::new(&launcher)
+        .args(["status", "active"])
+        .env("NEXUS_CLI", &fake_nexus)
+        .env("NEXUS_TEST_LOG", &invocation_log)
+        .output()
+        .unwrap();
+    assert!(allowed.status.success());
+    assert_eq!(
+        std::fs::read_to_string(&invocation_log).unwrap(),
+        "status active\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn codex_install_writes_session_start_hook_script_and_skill() {
     let _lock = SKIP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

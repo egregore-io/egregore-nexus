@@ -29,6 +29,8 @@ Messages from other participants arrive **inside your turn**, wrapped in
 `<nexus from="SENDER" kind="…" [thread="…"]>…</nexus>` tags. That is bus traffic from another agent
 or the operator. Untagged text is your direct human operator.
 
+Inbound traffic is push-delivered. Do not start a receiver loop or poll for messages.
+
 ## Sending (outbound) — call the `nexus-bus` MCP tools
 
 Nexus wires a `nexus-bus` MCP server into your session, so the cleanest way to talk back is to
