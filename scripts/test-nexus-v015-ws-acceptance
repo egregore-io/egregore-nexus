@@ -354,6 +354,32 @@ class WsAcceptanceContracts(unittest.TestCase):
             expected_uid=0,
         )
 
+    def test_gateway_command_line_accepts_only_candidate_resolving_launcher(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            expected = root / "install" / "nexus-gateway.mjs"
+            expected.parent.mkdir()
+            expected.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+            launcher = root / "bin" / "nexus-gateway"
+            launcher.parent.mkdir()
+            launcher.symlink_to(expected)
+            decoy = root / "bin" / "decoy"
+            decoy.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+
+            self.assertTrue(
+                module["argv_binds_path"](["node", str(launcher)], expected)
+            )
+            self.assertTrue(
+                module["argv_binds_path"](["node", str(expected)], expected)
+            )
+            self.assertFalse(
+                module["argv_binds_path"](["node", str(decoy)], expected)
+            )
+            self.assertFalse(
+                module["argv_binds_path"](["node", "nexus-gateway"], expected)
+            )
+
     def test_post_acceptance_revalidates_candidate_and_runtime_before_publish(self) -> None:
         module = runpy.run_path(str(TARGET))
         candidate = module["Candidate"](

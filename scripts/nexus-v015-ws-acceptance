@@ -1081,6 +1081,23 @@ def _process_argv(pid: int, label: str) -> tuple[str, ...]:
     return rows
 
 
+def argv_binds_path(argv: tuple[str, ...] | list[str], expected: Path) -> bool:
+    try:
+        expected_resolved = absolute(expected.resolve(strict=True))
+    except OSError:
+        return False
+    for argument in argv:
+        path = Path(argument)
+        if not path.is_absolute():
+            continue
+        try:
+            if absolute(path.resolve(strict=True)) == expected_resolved:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _process_cwd(pid: int, label: str) -> Path:
     try:
         target = os.readlink(Path("/proc") / str(pid) / "cwd")
@@ -1190,7 +1207,7 @@ def observe_runtime(candidate: Candidate) -> RuntimeObservation:
     )
     gateway_argv = _process_argv(gateway_pid, "Gateway")
     expected_gateway = Path(candidate.readiness.get("gatewayResolved", ""))
-    if str(expected_gateway) not in gateway_argv:
+    if not argv_binds_path(gateway_argv, expected_gateway):
         raise AcceptanceFailure("actual Gateway command line omits the packed entrypoint")
     gateway_bytes = checked_file(
         expected_gateway,
