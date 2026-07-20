@@ -2,6 +2,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Notify;
+
 use nexus_common::{Config, HookGatewayMode};
 use nexus_contracts::{
     AgentTurnExecutionPort, InterruptRequest, Kind, NexusBatch, NotifySendRequest, NotifyTarget,
@@ -19,6 +21,13 @@ use super::*;
 
 struct FirstPromptHangs {
     calls: AtomicUsize,
+}
+
+#[derive(Default)]
+struct PromptDispatchBarrier {
+    calls: AtomicUsize,
+    entered: Notify,
+    release: Notify,
 }
 
 #[derive(Default)]
@@ -89,6 +98,28 @@ impl AgentTurnExecutionPort for FirstPromptHangs {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutionPort for PromptDispatchBarrier {
+    async fn inject_turn(&self, _recipient: &SessionId, _batch: &NexusBatch) -> PortResult<()> {
+        Ok(())
+    }
+
+    async fn launch(&self, _req: SpawnRequest) -> PortResult<SpawnResponse> {
+        unimplemented!("command-worker shutdown tests do not launch harnesses")
+    }
+
+    async fn remove(&self, _req: RemoveRequest) -> PortResult<RemoveResponse> {
+        unimplemented!("command-worker shutdown tests do not remove harnesses")
+    }
+
+    async fn prompt(&self, _recipient: &SessionId, _text: String) -> PortResult<()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_one();
+        self.release.notified().await;
         Ok(())
     }
 }
@@ -515,6 +546,106 @@ async fn harness_prompt_claim_lease_outlives_execution_timeout() {
             > i64::try_from(HARNESS_PROMPT_EXECUTION_TIMEOUT.as_millis()).unwrap(),
         "prompt claim must not expire before the prompt execution timeout fires"
     );
+}
+
+#[tokio::test]
+async fn graceful_shutdown_drains_the_active_prompt_and_fences_new_claims() {
+    let exec = Arc::new(PromptDispatchBarrier::default());
+    let state = test_state_with_turn_exec(exec.clone()).await;
+    let operator = state
+        .identity
+        .register(human_register("Alex Morgan", "ck_shutdown_operator"))
+        .await
+        .unwrap();
+    state
+        .identity
+        .register(human_register("Target Human", "ck_shutdown_target"))
+        .await
+        .unwrap();
+    let repo = CommandIntents::new(&state.store);
+    repo.insert_pending(prompt_intent(
+        "cmd_shutdown_active",
+        &operator,
+        "Alex Morgan",
+        "ck_shutdown_operator",
+        "reach the accepted boundary",
+        1,
+    ))
+    .await
+    .unwrap();
+
+    let worker = spawn(state.clone());
+    tokio::time::timeout(Duration::from_secs(1), exec.entered.notified())
+        .await
+        .expect("the active prompt must enter the transport boundary");
+
+    begin_shutdown(&state).await;
+    repo.insert_pending(prompt_intent(
+        "cmd_shutdown_next_boot",
+        &operator,
+        "Alex Morgan",
+        "ck_shutdown_operator",
+        "wait for the next daemon",
+        2,
+    ))
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !worker.is_finished(),
+        "shutdown must wait for the active dispatch boundary"
+    );
+    exec.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("the command worker should drain after the active prompt settles")
+        .expect("the command worker must not panic during shutdown");
+
+    let active = repo.get("cmd_shutdown_active").await.unwrap().unwrap();
+    assert_eq!(active.status, "done");
+    let next = repo.get("cmd_shutdown_next_boot").await.unwrap().unwrap();
+    assert_eq!(next.status, "pending");
+    assert_eq!(exec.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn graceful_shutdown_finishes_a_prompt_claimed_before_its_actor_starts() {
+    let exec = Arc::new(PromptDispatchBarrier::default());
+    let state = test_state_with_turn_exec(exec.clone()).await;
+    let operator = state
+        .identity
+        .register(human_register("Alex Morgan", "ck_shutdown_claim_operator"))
+        .await
+        .unwrap();
+    let target = state
+        .identity
+        .register(human_register("Target Human", "ck_shutdown_claim_target"))
+        .await
+        .unwrap();
+    let repo = CommandIntents::new(&state.store);
+    repo.insert_pending(prompt_intent(
+        "cmd_shutdown_claimed",
+        &operator,
+        "Alex Morgan",
+        "ck_shutdown_claim_operator",
+        "finish the owned dispatch",
+        1,
+    ))
+    .await
+    .unwrap();
+    let row = claim_next_for_lane(&state, WorkerLane::HarnessPrompt)
+        .await
+        .unwrap()
+        .expect("the prompt should be owned before shutdown starts");
+
+    begin_shutdown(&state).await;
+    exec.release.notify_one();
+    run_harness_prompt_session_actor(state.clone(), target.session_id.0, row).await;
+
+    let row = repo.get("cmd_shutdown_claimed").await.unwrap().unwrap();
+    assert_eq!(row.status, "done");
+    assert_eq!(exec.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

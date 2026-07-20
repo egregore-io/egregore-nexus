@@ -1071,7 +1071,8 @@ impl<'a> CommandIntents<'a> {
         }
     }
 
-    /// Reap claimed rows left in-flight when the daemon performs an explicit lifecycle shutdown.
+    /// Reap claimed rows whose dispatch boundary did not finish within the daemon's bounded
+    /// graceful drain. These rows are externally ambiguous and must not be replayed automatically.
     pub async fn reap_claimed_for_shutdown(&self, now: i64) -> Result<u64, NexusError> {
         let error_json = r#"{"message":"daemon shutdown"}"#;
         let updated = self

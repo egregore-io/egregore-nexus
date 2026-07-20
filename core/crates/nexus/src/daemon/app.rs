@@ -253,6 +253,10 @@ pub struct AppState {
     /// persistent identity capsule is still being materialized.
     runtime_identity_ready: Arc<AtomicBool>,
     runtime_identity_ready_notify: Arc<Notify>,
+    /// One-way fence for graceful daemon shutdown. Once raised, command lanes finish only the
+    /// dispatch boundary they already own and refuse every later claim; newly accepted rows remain
+    /// pending for the next daemon instead of becoming ambiguous during transport teardown.
+    command_worker_shutting_down: Arc<AtomicBool>,
     /// The concrete agent service (present only on the [`AppState::wire`] path). The daemon's launch
     /// orchestration calls [`nexus_agent::Agent::open_session_for`] on it to bind the adapter under a
     /// daemon-chosen session id. `None` on the mock-port [`AppState::new`] seam → launch falls back
@@ -322,9 +326,21 @@ impl AppState {
             runtime_revive_gate: RuntimeReviveGate::default(),
             runtime_identity_ready: Arc::new(AtomicBool::new(true)),
             runtime_identity_ready_notify: Arc::new(Notify::new()),
+            command_worker_shutting_down: Arc::new(AtomicBool::new(false)),
             agent_concrete: None,
             pty: None,
         }
+    }
+
+    pub(crate) async fn begin_command_worker_shutdown(&self) {
+        let _claim_fence = self.store.write_lock().lock_owned().await;
+        self.command_worker_shutting_down
+            .store(true, Ordering::Release);
+        self.store.notify_command_intent_inserted();
+    }
+
+    pub(crate) fn command_worker_is_shutting_down(&self) -> bool {
+        self.command_worker_shutting_down.load(Ordering::Acquire)
     }
 
     /// Heartbeat freshness window used by daemon-side stale-session reapers.
