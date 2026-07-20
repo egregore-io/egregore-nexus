@@ -13,8 +13,8 @@ export async function createGatewayStore(config: GatewayStoreConfig): Promise<Cl
   await ensureParentDirectory(config.url);
   const db = createClient(config);
   try {
-    await db.execute("PRAGMA journal_mode = WAL");
     await db.execute("PRAGMA busy_timeout = 5000");
+    await db.execute("PRAGMA journal_mode = WAL");
     await db.execute("PRAGMA synchronous = NORMAL");
     await migrateGatewayStore(db);
     return db;
