@@ -1292,7 +1292,7 @@ class AgentSessionLane(FrameLane):
         command_id = attempt.command_id
         start_index = attempt.start_index
         before_cursor = attempt.before_cursor
-        await self.wait_for(
+        echo = await self.wait_for(
             lambda frame: (
                 session_event(frame).get("type") == "TEXT_MESSAGE_END"
                 and session_event(frame).get("messageId") == client_message_id
@@ -1304,19 +1304,27 @@ class AgentSessionLane(FrameLane):
         echo_index = next(
             index
             for index in range(start_index, len(self.frames))
-            if session_event(self.frames[index]).get("type") == "TEXT_MESSAGE_END"
-            and session_event(self.frames[index]).get("messageId") == client_message_id
+            if self.frames[index] is echo
         )
-        started = await self.wait_for(
-            lambda frame: (
-                session_event(frame).get("type") == "RUN_STARTED"
-                and isinstance(session_event(frame).get("runId"), str)
-                and bool(session_event(frame).get("runId"))
-            ),
-            after=start_index,
-            timeout=timeout,
-            label=f"session run start {client_message_id}",
-        )
+        echo_cursor = numeric_cursor(echo)
+        if echo_cursor is None or echo_cursor <= before_cursor:
+            raise SoakFailure(
+                f"session user echo has no new cursor for {client_message_id}: {echo!r}"
+            )
+        starts = [
+            frame
+            for frame in self.frames[start_index : echo_index + 1]
+            if session_event(frame).get("type") == "RUN_STARTED"
+            and numeric_cursor(frame) == echo_cursor
+            and isinstance(session_event(frame).get("runId"), str)
+            and bool(session_event(frame).get("runId"))
+        ]
+        if len(starts) != 1:
+            raise SoakFailure(
+                f"session user echo has no exact correlated run start for "
+                f"{client_message_id}: count={len(starts)} cursor={echo_cursor}"
+            )
+        started = starts[0]
         run_id = session_event(started)["runId"]
         assistant_start = await self.wait_for(
             lambda frame: (

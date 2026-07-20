@@ -805,8 +805,14 @@ async def reject_single_frame_assistant_output() -> None:
             client_message_id = request["clientMessageId"]
             frames = [
                 {"t": "input.ack", "clientMessageId": client_message_id, "commandId": "c-1"},
-                {"event": {"type": "TEXT_MESSAGE_END", "messageId": client_message_id}},
-                {"event": {"type": "RUN_STARTED", "runId": "run-progressive"}},
+                {
+                    "event": {"type": "RUN_STARTED", "runId": "run-progressive"},
+                    "cursor": "cursor-1",
+                },
+                {
+                    "event": {"type": "TEXT_MESSAGE_END", "messageId": client_message_id},
+                    "cursor": "cursor-1",
+                },
                 {
                     "event": {
                         "type": "TEXT_MESSAGE_START",
@@ -871,8 +877,14 @@ async def correlate_prompt_across_an_explicit_boundary() -> None:
         "accepted session input was not recorded before the restart boundary",
     )
     post_restart = [
-        {"event": {"type": "TEXT_MESSAGE_END", "messageId": attempt.client_message_id}},
-        {"event": {"type": "RUN_STARTED", "runId": "run-cross-restart"}},
+        {
+            "event": {"type": "RUN_STARTED", "runId": "run-cross-restart"},
+            "cursor": "cursor-1",
+        },
+        {
+            "event": {"type": "TEXT_MESSAGE_END", "messageId": attempt.client_message_id},
+            "cursor": "cursor-1",
+        },
         {
             "event": {
                 "type": "TEXT_MESSAGE_START",
@@ -908,6 +920,95 @@ async def correlate_prompt_across_an_explicit_boundary() -> None:
 
 
 asyncio.run(correlate_prompt_across_an_explicit_boundary())
+
+
+async def correlate_prompt_to_its_run_when_backlog_arrives_after_send() -> None:
+    marker = "V015_BACKLOG_CORRELATION_MARKER"
+    reply = module["progressive_session_reply"](marker)
+    midpoint = len(reply) // 2
+    lane = module["AgentSessionLane"](
+        LaneEvidence(),
+        module["Ledger"](),
+        LaneHttp(),
+        agents[0],
+    )
+
+    class Socket:
+        async def send(self, raw: str) -> None:
+            request = json.loads(raw)
+            frame = {
+                "t": "input.ack",
+                "clientMessageId": request["clientMessageId"],
+                "commandId": "command-backlog-correlation",
+            }
+            lane.frames.append(frame)
+            lane.consume(frame)
+            lane.changed.set()
+
+    lane.socket = Socket()
+    attempt = await lane.begin_prompt(marker, timeout=1)
+    delayed_frames = [
+        {
+            "event": {"type": "RUN_STARTED", "runId": "run-stale"},
+            "cursor": "cursor-41",
+        },
+        {
+            "event": {"type": "RUN_FINISHED", "runId": "run-stale"},
+            "cursor": "cursor-42",
+        },
+        {
+            "event": {"type": "RUN_STARTED", "runId": "run-current"},
+            "cursor": "cursor-50",
+        },
+        {
+            "event": {"type": "TEXT_MESSAGE_END", "messageId": attempt.client_message_id},
+            "cursor": "cursor-50",
+        },
+        {
+            "event": {
+                "type": "TEXT_MESSAGE_START",
+                "role": "assistant",
+                "messageId": "assistant-backlog-correlation",
+            },
+            "cursor": "cursor-51",
+        },
+        {
+            "event": {
+                "type": "TEXT_MESSAGE_CONTENT",
+                "messageId": "assistant-backlog-correlation",
+                "delta": reply[:midpoint],
+            },
+            "cursor": "cursor-52",
+        },
+        {
+            "event": {
+                "type": "TEXT_MESSAGE_CONTENT",
+                "messageId": "assistant-backlog-correlation",
+                "delta": reply[midpoint:],
+            },
+            "cursor": "cursor-53",
+        },
+        {
+            "event": {
+                "type": "TEXT_MESSAGE_END",
+                "messageId": "assistant-backlog-correlation",
+            },
+            "cursor": "cursor-54",
+        },
+        {
+            "event": {"type": "RUN_FINISHED", "runId": "run-current"},
+            "cursor": "cursor-54",
+        },
+    ]
+    for frame in delayed_frames:
+        lane.frames.append(frame)
+        lane.consume(frame)
+    lane.changed.set()
+    proof = await lane.finish_prompt(attempt, timeout=0.05)
+    require(proof["completionCount"] == 1, "current prompt terminal was not exact-once")
+
+
+asyncio.run(correlate_prompt_to_its_run_when_backlog_arrives_after_send())
 
 
 async def correlate_developer_message_across_an_explicit_boundary() -> None:
