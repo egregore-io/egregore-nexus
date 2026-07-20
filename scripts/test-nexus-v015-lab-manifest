@@ -237,7 +237,13 @@ case "$*" in
   exec*"NEXUS_EXPECTED_CONTAINER_ID="*) cat "$DOCKER_FIXTURE_BINDINGS" ;;
   exec*"/tmp/nexus-lab-bin/nexus --version"*) echo 'nexus 0.1.5' ;;
   exec*"node --version"*) echo 'v24.18.0' ;;
-  exec*"rustc --version"*) echo 'rustc 1.90.0 (fixture)' ;;
+  exec*"PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin rustc --version"*)
+    echo 'rustc 1.90.0 (fixture)'
+    ;;
+  exec*"rustc --version"*)
+    echo 'rustc is not available in a container login-shell PATH' >&2
+    exit 127
+    ;;
   *) echo "unexpected docker call: $*" >&2; exit 98 ;;
 esac
 SH

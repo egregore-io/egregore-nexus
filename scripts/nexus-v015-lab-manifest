@@ -1130,7 +1130,8 @@ jq -e . >/dev/null <<<"$BINDINGS" || die "packed runtime binding capture failed"
 
 NEXUS_VERSION=$(docker exec "$CONTAINER" bash -lc '/tmp/nexus-lab-bin/nexus --version')
 NODE_VERSION=$(docker exec "$CONTAINER" bash -lc 'node --version')
-RUST_VERSION=$(docker exec "$CONTAINER" bash -lc 'rustc --version')
+RUST_VERSION=$(docker exec "$CONTAINER" bash -lc \
+  'PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin rustc --version')
 [ "$NEXUS_VERSION" = "nexus $VERSION" ] \
   || die "packed Nexus launcher does not report nexus $VERSION exactly"
 
