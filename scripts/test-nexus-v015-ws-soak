@@ -269,6 +269,11 @@ gateway_after = replace(
 )
 validate_restart_transition("daemon", base, daemon_after)
 validate_restart_transition("gateway", base, gateway_after)
+validate_restart_transition(
+    "gateway",
+    base,
+    replace(gateway_after, gateway_discovery_inode=base.gateway_discovery_inode),
+)
 expect_failure(lambda: validate_restart_transition("daemon", base, base), "daemon restart")
 expect_failure(lambda: validate_restart_transition("gateway", base, base), "gateway restart")
 expect_failure(

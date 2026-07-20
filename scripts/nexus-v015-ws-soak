@@ -1986,7 +1986,6 @@ def validate_restart_transition(
             before.gateway_pid == after.gateway_pid
             or before.gateway_start_ticks == after.gateway_start_ticks
             or before.gateway_bound_at == after.gateway_bound_at
-            or before.gateway_discovery_inode == after.gateway_discovery_inode
             or before.gateway_discovery_sha256 == after.gateway_discovery_sha256
         ):
             raise SoakFailure("Gateway restart did not change PID, generation, and discovery")
