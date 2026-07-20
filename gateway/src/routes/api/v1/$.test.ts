@@ -165,6 +165,21 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
     vi.mocked(spawn).mockClear();
   });
 
+  it("keeps remote-human health public without cookie, bearer, or scopes", async () => {
+    const canonicalDb = await makeCanonicalDb();
+    const dispatch = makeDispatch({
+      db: async () => db,
+      canonicalDb: () => canonicalDb,
+      authMode: "remote",
+    });
+
+    const res = await dispatch(new Request("http://localhost/api/v1/health"));
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ status: "ok" });
+    expect(spawn).not.toHaveBeenCalled();
+  });
+
   it("writes a command intent with human identity when a valid nexus_human cookie is present", async () => {
     // Seed a human session so currentHuman resolves.
     const { commands: seedCommands } = makeCommandCapture();

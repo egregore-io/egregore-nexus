@@ -387,7 +387,9 @@ async function exerciseRemotePackedLanes(
       stdio: ["ignore", "pipe", "pipe"],
     });
     try {
-      await waitForHealth(child, port, { cookie });
+      // Health is the unauthenticated startup/readiness contract even when the
+      // installed Gateway runs in remote-human auth mode.
+      await waitForHealth(child, port);
     } catch (error) {
       throw new Error(`${String(error)}; push=${JSON.stringify(push.frames)}`);
     }

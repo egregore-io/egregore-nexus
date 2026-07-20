@@ -488,6 +488,9 @@ function routePolicyFor(apiReq: ApiRequest): RoutePolicy {
   const method = apiReq.method.toUpperCase();
   const path = apiReq.path.replace(/\/+$/, "") || "/";
 
+  if (method === "GET" && path === "/api/v1/health") {
+    return {};
+  }
   if (method === "GET" && /^\/api\/v1\/agents\/[^/]+\/terminal$/.test(path)) {
     return { scope: AGENT_ATTACH_SCOPE, tier: Tier.Agent };
   }
