@@ -787,6 +787,44 @@ class LaneHttp:
     csrf = "fixture"
 
 
+async def inbound_frame_limit_contract() -> None:
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    async def connect(url: str, **options: object) -> object:
+        captured["url"] = url
+        captured.update(options)
+        return sentinel
+
+    prior = sys.modules.get("websockets")
+    sys.modules["websockets"] = SimpleNamespace(connect=connect)
+    try:
+        lane = module["FrameLane"](
+            "frame-limit",
+            LaneEvidence(),
+            module["Ledger"](),
+        )
+        opened = await lane._open("ws://127.0.0.1/session", "cookie", "csrf")
+    finally:
+        if prior is None:
+            del sys.modules["websockets"]
+        else:
+            sys.modules["websockets"] = prior
+
+    require(opened is sentinel, "frame lane did not return the opened socket")
+    require(
+        captured.get("max_size") == module["MAX_INBOUND_FRAME_BYTES"],
+        "frame lane did not apply the explicit inbound-frame bound",
+    )
+    require(
+        module["MAX_INBOUND_FRAME_BYTES"] >= 8 * 1024 * 1024,
+        "inbound-frame bound cannot carry a maximum canonical queue snapshot",
+    )
+
+
+asyncio.run(inbound_frame_limit_contract())
+
+
 def progressive_reply_contract() -> None:
     marker = "V015_PROGRESSIVE_MARKER_" + ("x" * 48)
     reply = module["progressive_session_reply"](marker)

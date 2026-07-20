@@ -2066,6 +2066,16 @@ class WsAcceptanceContracts(unittest.TestCase):
         self.assertLess(steer_send, active_terminal)
         self.assertLess(active_terminal, compact_send)
 
+    def test_backpressure_raw_client_uses_the_soak_inbound_frame_bound(self) -> None:
+        source = TARGET.read_text(encoding="utf-8")
+        body = source.split("        async def open_raw", 1)[1].split(
+            "        try:", 1
+        )[0]
+        self.assertIn(
+            '"max_size": self.core["MAX_INBOUND_FRAME_BYTES"]',
+            body,
+        )
+
     def test_exact_roster_rejects_stale_or_duplicate_rows(self) -> None:
         module = runpy.run_path(str(TARGET))
         agents = (

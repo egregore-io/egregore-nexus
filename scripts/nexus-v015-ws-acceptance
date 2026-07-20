@@ -4286,6 +4286,7 @@ class BackendAcceptance:
                 "close_timeout": 5,
                 "ping_interval": None,
                 "max_queue": max_queue,
+                "max_size": self.core["MAX_INBOUND_FRAME_BYTES"],
             }
             try:
                 return await websockets.connect(
