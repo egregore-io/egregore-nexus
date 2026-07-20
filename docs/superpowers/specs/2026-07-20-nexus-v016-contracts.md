@@ -101,7 +101,9 @@ bridge -> host
 `transport/hello` is the bridge's first frame. An unsupported version disables
 the bridge without a restart loop. `transport/deliver` addresses the provider
 chat in `externalChatId`; the bridge performs no user or lane resolution to
-send it.
+send it. `ingressId` is the bridge's idempotency key (for example, the provider
+update ID). The host dedupes ingress on `(provider, ingressId)`: a duplicate
+`ingressId` is acknowledged but MUST NOT be ingressed again.
 
 A bridge MUST durably journal `obligationId -> externalMessageId`. It appends
 and fsyncs that entry after the provider send succeeds and before emitting
@@ -138,11 +140,14 @@ CREATE TABLE transport_outbox (
 );
 ```
 
-The obligation ID is deterministic for the canonical tuple
-`{messageId, provider, externalChatId}`. Exactly one producer exists: the
-Gateway's idempotent durable message-ingest transaction. Human-originated API
-messages and agent-originated projection ingest use that same producer.
-Ephemeral projection delivery and replay do not create another producer.
+`obligation_id = "ob_" +
+sha256hex(canonicalJson({messageId, provider, externalChatId})).slice(0,24)` —
+canonical JSON with sorted keys, no whitespace. This exact derivation is
+frozen: replay idempotency (`INSERT OR IGNORE`) depends on every producer and
+every version deriving identically. Exactly one producer exists: the Gateway's
+idempotent durable message-ingest transaction. Human-originated API messages
+and agent-originated projection ingest use that same producer. Ephemeral
+projection delivery and replay do not create another producer.
 
 The host drains `pending` obligations in provider order. A matching receipt
 settles an obligation. Restart re-drains pending obligations only. Replaying
