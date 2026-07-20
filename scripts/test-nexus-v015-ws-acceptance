@@ -1027,13 +1027,23 @@ class WsAcceptanceContracts(unittest.TestCase):
                 expected.update(b"\0" + b"444" + b"\0")
                 expected.update(digest(rows[relative]).encode("ascii") + b"\n")
             try:
-                first = module["lens_tree_digest"](app)
+                first = module["lens_tree_digest"](
+                    app, expected_uid=os.geteuid()
+                )
                 self.assertEqual(first, expected.hexdigest())
+                wrong_uid = 1 if os.geteuid() == 0 else 0
+                with self.assertRaisesRegex(module["AcceptanceFailure"], "ownership"):
+                    module["lens_tree_digest"](app, expected_uid=wrong_uid)
                 changed = app / "a.txt"
                 changed.chmod(0o644)
                 changed.write_bytes(b"mutated\n")
                 changed.chmod(0o444)
-                self.assertNotEqual(module["lens_tree_digest"](app), first)
+                self.assertNotEqual(
+                    module["lens_tree_digest"](
+                        app, expected_uid=os.geteuid()
+                    ),
+                    first,
+                )
             finally:
                 app.chmod(0o755)
                 nested.chmod(0o755)
@@ -1050,7 +1060,9 @@ class WsAcceptanceContracts(unittest.TestCase):
             app.chmod(0o555)
             try:
                 with self.assertRaisesRegex(module["AcceptanceFailure"], "symlink"):
-                    module["lens_tree_digest"](app)
+                    module["lens_tree_digest"](
+                        app, expected_uid=os.geteuid()
+                    )
             finally:
                 app.chmod(0o755)
 

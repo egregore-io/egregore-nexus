@@ -1755,7 +1755,7 @@ def install_tree_digest(install_root: Path) -> str:
     return sha256_bytes(canonical_json(full_install_inventory(install_root)))
 
 
-def lens_tree_digest(root: Path) -> str:
+def lens_tree_digest(root: Path, *, expected_uid: int = 0) -> str:
     """Match the sealed Lens tree digest emitted by the packed lab topology."""
     root = absolute(root)
     try:
@@ -1765,7 +1765,7 @@ def lens_tree_digest(root: Path) -> str:
     if (
         not stat.S_ISDIR(root_info.st_mode)
         or stat.S_ISLNK(root_info.st_mode)
-        or root_info.st_uid != os.geteuid()
+        or root_info.st_uid != expected_uid
         or stat.S_IMODE(root_info.st_mode) != 0o555
     ):
         raise AcceptanceFailure("packed Lens app root ownership or mode is invalid")
@@ -1784,7 +1784,7 @@ def lens_tree_digest(root: Path) -> str:
                 raise AcceptanceFailure(
                     f"cannot inspect packed Lens entry {child_relative}: {error}"
                 ) from error
-            if info.st_uid != os.geteuid():
+            if info.st_uid != expected_uid:
                 raise AcceptanceFailure(
                     f"packed Lens entry owner mismatch: {child_relative}"
                 )
@@ -1815,7 +1815,13 @@ def lens_tree_digest(root: Path) -> str:
         raise AcceptanceFailure("packed Lens app tree is empty")
     digest = hashlib.sha256()
     for relative, path, mode in sorted(files, key=lambda row: row[0]):
-        raw = checked_file(path, root, f"packed Lens file {relative}")
+        raw = checked_file(
+            path,
+            root,
+            f"packed Lens file {relative}",
+            expected_uid=expected_uid,
+            expected_mode=0o444,
+        )
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
         digest.update(f"{mode:o}".encode("ascii"))
@@ -1987,7 +1993,13 @@ def validate_candidate(lab_root: Path, evidence_dir: Path, run_id: str) -> Candi
         raise AcceptanceFailure(f"canonical Lens app link cannot resolve: {error}") from error
     if resolved_lens_link != lens_app or lens_main != lens_app / "electron" / "main.cjs":
         raise AcceptanceFailure("canonical Lens app/main topology mismatch")
-    checked_file(lens_main, lens_app, "packed Lens Electron main")
+    checked_file(
+        lens_main,
+        lens_app,
+        "packed Lens Electron main",
+        expected_uid=0,
+        expected_mode=0o444,
+    )
     if lens_tree_digest(lens_app) != readiness["lensTreeSha256"]:
         raise AcceptanceFailure("packed Lens app tree differs from readiness")
     expected_environment = {
