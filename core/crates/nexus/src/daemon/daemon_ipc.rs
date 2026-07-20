@@ -484,9 +484,9 @@ async fn handle_enqueue(
 ) -> DaemonIpcResponse {
     let row = command_row(caller, command_id, kind, params, idempotency_key);
     let commands = CommandIntents::new(&state.store);
-    let durable_command_id = match commands.insert_pending_or_resume(row).await {
+    let durable_command_id = match insert_before_shutdown_fence(state, row).await {
         Ok(command_id) => command_id,
-        Err(error) => return store_failure(request_id, error.to_contract_error()),
+        Err(error) => return store_failure(request_id, error),
     };
     let receipt = match commands.receipt(&durable_command_id).await {
         Ok(Some(receipt)) => receipt,
@@ -1404,9 +1404,9 @@ async fn handle_command(
         idempotency_key,
     );
     let commands = CommandIntents::new(&state.store);
-    let durable_command_id = match commands.insert_pending_or_resume(row).await {
+    let durable_command_id = match insert_before_shutdown_fence(state, row).await {
         Ok(command_id) => command_id,
-        Err(error) => return store_failure(request_id, error.to_contract_error()),
+        Err(error) => return store_failure(request_id, error),
     };
 
     loop {
@@ -1455,6 +1455,28 @@ async fn handle_command(
             _ => state.store.wait_for_command_completion_after(epoch).await,
         }
     }
+}
+
+/// Linearize durable ingress against the daemon shutdown fence.
+///
+/// If insertion owns the store write gate first, shutdown waits and the worker drains that row. If
+/// shutdown owns it first, the request is rejected without a durable acceptance that a new boot
+/// could no longer authenticate from its boot-local session registry.
+async fn insert_before_shutdown_fence(
+    state: &AppState,
+    row: NewCommandIntent,
+) -> Result<String, ContractError> {
+    let _ingress_guard = state.store.write_lock().lock_owned().await;
+    if state.command_worker_is_shutting_down() {
+        return Err(ContractError {
+            code: codes::INTERNAL_ERROR,
+            message: "daemon is shutting down; retry against the next boot".into(),
+        });
+    }
+    CommandIntents::new(&state.store)
+        .insert_pending_or_resume(row)
+        .await
+        .map_err(|error| error.to_contract_error())
 }
 
 fn command_row(

@@ -67,10 +67,35 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
     tokio::spawn(supervise_worker_lanes(state))
 }
 
-/// Fence new claims and wake idle lanes so the daemon can drain dispatch boundaries before it
-/// tears down harness transports. Rows accepted after this point remain pending for the next boot.
+/// Fence new ingress and wake idle lanes so the daemon can drain every command accepted before
+/// this boundary, plus the provider turns those commands start, before tearing down transports.
 pub async fn begin_shutdown(state: &AppState) {
     state.begin_command_worker_shutdown().await;
+}
+
+/// Await every transport-reported active turn without inferring completion from rendered output.
+///
+/// A transport that reports an active session is required to expose its authoritative completion
+/// boundary. If that contract is temporarily unavailable, keep the shutdown drain open; the
+/// caller's outer timeout remains the only authority allowed to abandon the graceful path.
+pub async fn wait_for_active_turns(state: &AppState) {
+    loop {
+        let sessions = state.agent.active_turn_sessions();
+        if sessions.is_empty() {
+            return;
+        }
+        for session in sessions {
+            if let Err(error) = state.agent.wait_for_turn_completion(&session).await {
+                tracing::warn!(
+                    %error,
+                    session_id = %session.0,
+                    "active turn completion boundary unavailable during shutdown"
+                );
+                tokio::time::sleep(POLL_INTERVAL).await;
+                break;
+            }
+        }
+    }
 }
 
 /// Claim and execute at most one pending command. Returns `true` when a row was claimed.
@@ -210,9 +235,6 @@ async fn run_worker_loop(state: AppState, lane: WorkerLane) {
     }
 
     loop {
-        if state.command_worker_is_shutting_down() {
-            return;
-        }
         if matches!(lane, WorkerLane::Control) {
             if let Err(err) = maybe_reap_operational_tables(&state, &mut retention_state).await {
                 tracing::warn!(error = %err, "operational retention reap failed");
@@ -221,6 +243,20 @@ async fn run_worker_loop(state: AppState, lane: WorkerLane) {
         let idle_epoch = state.store.command_intents_epoch();
         match process_next_for_lane(&state, lane).await {
             Ok(true) => {}
+            Ok(false) if state.command_worker_is_shutting_down() => {
+                match lane_has_unsettled_commands(&state, lane).await {
+                    Ok(false) => return,
+                    Ok(true) => wait_for_command_intent_or_poll(&state, idle_epoch).await,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            ?lane,
+                            "failed to verify command lane drain during shutdown"
+                        );
+                        wait_for_command_intent_or_poll(&state, idle_epoch).await;
+                    }
+                }
+            }
             Ok(false) => wait_for_command_intent_or_poll(&state, idle_epoch).await,
             Err(err) => {
                 tracing::warn!(error = %err, ?lane, "command worker tick failed");
@@ -233,14 +269,10 @@ async fn run_worker_loop(state: AppState, lane: WorkerLane) {
 async fn run_harness_prompt_worker_loop(state: AppState) {
     let mut actors = PromptActorSet::default();
     loop {
-        if state.command_worker_is_shutting_down() {
-            actors.wait_for_shutdown().await;
-            return;
-        }
         actors.reap_finished();
         let idle_epoch = state.store.command_intents_epoch();
         let actor_sessions = actors.active_sessions();
-        match claim_next_harness_prompt_with_fence(&state, &actor_sessions).await {
+        match claim_next_harness_prompt_serialized(&state, &actor_sessions).await {
             Ok(Some(row)) => match resolve_harness_prompt_target_session(&state, &row).await {
                 Ok(Some(session_id)) => {
                     if let Err(row) = actors.spawn(state.clone(), session_id, row) {
@@ -280,6 +312,22 @@ async fn run_harness_prompt_worker_loop(state: AppState) {
                     }
                 }
             },
+            Ok(None) if state.command_worker_is_shutting_down() => {
+                actors.wait_for_shutdown().await;
+                wait_for_active_turns(&state).await;
+                match lane_has_unsettled_commands(&state, WorkerLane::HarnessPrompt).await {
+                    Ok(false) => return,
+                    Ok(true) => continue,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            lane = ?WorkerLane::HarnessPrompt,
+                            "failed to verify prompt lane drain during shutdown"
+                        );
+                        wait_for_command_intent_or_poll(&state, idle_epoch).await;
+                    }
+                }
+            }
             Ok(None) => wait_for_command_intent_or_poll(&state, idle_epoch).await,
             Err(err) => {
                 tracing::warn!(
@@ -368,9 +416,6 @@ async fn run_harness_prompt_session_actor(
         let row = match next_row.take() {
             Some(row) => row,
             None => {
-                if state.command_worker_is_shutting_down() {
-                    return;
-                }
                 if state
                     .agent
                     .active_turn_sessions()
@@ -400,9 +445,6 @@ async fn run_harness_prompt_session_actor(
                 session_id = %session_id,
                 "harness prompt session actor execution failed"
             );
-        }
-        if state.command_worker_is_shutting_down() {
-            return;
         }
     }
 }
@@ -480,9 +522,6 @@ async fn claim_next_for_lane(
     // before any command execution, so long-running prompts, launches, and inbox waits remain
     // isolated by lane.
     let _claim_guard = state.store.write_lock().lock_owned().await;
-    if state.command_worker_is_shutting_down() {
-        return Ok(None);
-    }
     let repo = CommandIntents::new(&state.store);
     let row = match lane {
         WorkerLane::Any => repo.claim_next(now(), LEASE_MS).await?,
@@ -558,14 +597,11 @@ async fn claim_next_harness_prompt(
         .await
 }
 
-async fn claim_next_harness_prompt_with_fence(
+async fn claim_next_harness_prompt_serialized(
     state: &AppState,
     actor_sessions: &[String],
 ) -> Result<Option<CommandIntentRow>, NexusError> {
     let _claim_guard = state.store.write_lock().lock_owned().await;
-    if state.command_worker_is_shutting_down() {
-        return Ok(None);
-    }
     claim_next_harness_prompt(state, actor_sessions).await
 }
 
@@ -574,9 +610,6 @@ async fn claim_next_harness_prompt_for_session(
     session_id: &str,
 ) -> Result<Option<CommandIntentRow>, NexusError> {
     let _claim_guard = state.store.write_lock().lock_owned().await;
-    if state.command_worker_is_shutting_down() {
-        return Ok(None);
-    }
     CommandIntents::new(&state.store)
         .claim_next_ready_harness_prompt_for_session(now(), HARNESS_PROMPT_LEASE_MS, session_id)
         .await
@@ -652,6 +685,42 @@ enum WorkerLane {
     HarnessWarm,
     HarnessCompact,
     HarnessLaunch,
+}
+
+impl WorkerLane {
+    fn owns_kind(self, kind: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::InboxConsume => matches!(
+                kind,
+                command_kinds::inbox::CONSUME | command_kinds::inbox::SUBSCRIPTION_NEXT
+            ),
+            Self::HarnessPrompt => kind == command_kinds::harness::PROMPT,
+            Self::HarnessSteer => kind == command_kinds::harness::STEER,
+            Self::HarnessWarm => kind == command_kinds::harness::WARM,
+            Self::HarnessCompact => kind == command_kinds::harness::COMPACT,
+            Self::HarnessLaunch => kind == command_kinds::harness::LAUNCH,
+            Self::Control => {
+                !Self::InboxConsume.owns_kind(kind)
+                    && !Self::HarnessPrompt.owns_kind(kind)
+                    && !Self::HarnessSteer.owns_kind(kind)
+                    && !Self::HarnessWarm.owns_kind(kind)
+                    && !Self::HarnessCompact.owns_kind(kind)
+                    && !Self::HarnessLaunch.owns_kind(kind)
+            }
+        }
+    }
+}
+
+async fn lane_has_unsettled_commands(
+    state: &AppState,
+    lane: WorkerLane,
+) -> Result<bool, NexusError> {
+    Ok(CommandIntents::new(&state.store)
+        .lane_depths()
+        .await?
+        .into_iter()
+        .any(|depth| lane.owns_kind(&depth.kind) && depth.pending + depth.claimed > 0))
 }
 
 async fn execute(state: &AppState, row: CommandIntentRow) -> Result<Value, ContractError> {

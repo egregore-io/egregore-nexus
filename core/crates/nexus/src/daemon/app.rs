@@ -333,7 +333,7 @@ impl AppState {
     }
 
     pub(crate) async fn begin_command_worker_shutdown(&self) {
-        let _claim_fence = self.store.write_lock().lock_owned().await;
+        let _ingress_and_claim_fence = self.store.write_lock().lock_owned().await;
         self.command_worker_shutting_down
             .store(true, Ordering::Release);
         self.store.notify_command_intent_inserted();

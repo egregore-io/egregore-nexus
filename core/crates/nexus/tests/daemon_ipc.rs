@@ -216,6 +216,43 @@ async fn enqueue_call_returns_a_durable_receipt_without_waiting_for_execution() 
 }
 
 #[tokio::test]
+async fn shutdown_fence_rejects_new_enqueue_before_durable_acceptance() {
+    let state = state().await;
+    command_worker::begin_shutdown(&state).await;
+    let request = DaemonIpcRequest {
+        version: DAEMON_IPC_PROTOCOL_VERSION,
+        token: "boot-token".into(),
+        request_id: "rpc-after-shutdown-fence".into(),
+        caller: None,
+        call: DaemonIpcCall::Enqueue {
+            command_id: "cmd-after-shutdown-fence".into(),
+            kind: nexus_store::command_kinds::harness::PROMPT.into(),
+            params: serde_json::json!({
+                "name": "ipc-agent",
+                "text": "must retry against the next daemon",
+                "clientMessageId": "client-after-shutdown-fence"
+            }),
+            idempotency_key: Some("client-after-shutdown-fence".into()),
+        },
+    };
+
+    let response = daemon_ipc::handle_request(&state, "boot-token", request).await;
+    let error = response
+        .error
+        .expect("post-fence ingress must fail before durable acceptance");
+    assert_eq!(error.code, nexus_contracts::codes::INTERNAL_ERROR);
+    assert!(error.message.contains("shutting down"));
+    assert!(
+        CommandIntents::new(&state.store)
+            .get("cmd-after-shutdown-fence")
+            .await
+            .unwrap()
+            .is_none(),
+        "a rejected post-fence command must leave no durable row"
+    );
+}
+
+#[tokio::test]
 async fn wrong_boot_token_is_rejected_before_command_insert() {
     let state = state().await;
     let request = DaemonIpcRequest {
