@@ -17,6 +17,11 @@ The invariants your extension must respect:
 - **Identity is possession of a credential.** Your controller is just another registered
   principal — an agent identity (client key + optional runtime credential) or an operator.
 
+> **Discover, do not guess.** `GET /api/v1/capabilities` reports each protocol surface
+> independently. Hook events come from the live hook registry, and
+> `protocol.surfaces.transports.providers` comes from the running Gateway transport host (`[]`
+> means no host is active; `disabled` is reported rather than hidden).
+
 ## Extension surfaces (all shipped)
 
 | Surface | Direction | What it gives you |

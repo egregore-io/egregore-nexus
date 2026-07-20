@@ -12,10 +12,11 @@
 // The router holds NO business logic and never writes the DB — those invariants
 // live in the handlers (each a thin translator). This file only routes, guards,
 // and maps errors.
-import type { ApiRequest, ApiResponse, ApiDeps, Handler } from "./http";
+import type { ApiRequest, ApiResponse, ApiDeps, Handler, HandlerCtx } from "./http";
 import { fail, GatewayError, ok, ValidationError } from "./http";
 import * as h from "./handlers";
 import { COMMAND_KINDS } from "@server/command/ingress";
+import { HOOK_EVENTS } from "@server/hooks/events";
 
 export type { ApiRequest, ApiResponse, ApiDeps, ReadDbGetter } from "./http";
 
@@ -185,10 +186,21 @@ function restPath(pattern: string): string {
   return `${PREFIX}${pattern}`.replace(/:([A-Za-z0-9_]+)/g, "{$1}");
 }
 
-async function getCapabilities() {
+async function getCapabilities({ deps }: HandlerCtx) {
   return ok({
     version: 1,
     principle: "REST is a projection of the daemon command/read spine",
+    protocol: {
+      gateway: "0.1.6",
+      surfaces: {
+        eventsLane: { version: 1, replay: "afterSeq-ring" },
+        sessionLane: { version: 1, replay: "cursor" },
+        threadDmRead: { version: 1, replay: "durable-cursor" },
+        notify: { version: 1, idempotency: true },
+        hooks: { version: 1, events: [...HOOK_EVENTS] },
+        transports: { version: 1, providers: [...(deps.transportStates?.() ?? [])] },
+      },
+    },
     routes: restCapabilityRoutes(),
   });
 }

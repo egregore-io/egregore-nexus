@@ -31,7 +31,11 @@ import {
 import { createGatewayStore, getGatewayStore } from "../store/client";
 import { gatewayStoreConfig } from "../store/config";
 import { CURRENT_GATEWAY_SCHEMA_VERSION } from "../store/migrations";
-import { createTransportHost, type TransportHost } from "../transport/host";
+import {
+  createTransportHost,
+  type TransportHost,
+} from "../transport/host";
+import { publishGatewayTransportHost } from "../transport/registry";
 
 export {
   closeSharedDaemonPushConnector,
@@ -158,12 +162,15 @@ export async function createHeadlessGatewayServer(
 ) {
   const hooks = await lifecycle.startHooks();
   let transportHost: TransportHost | undefined;
+  let unpublishTransportHost: (() => void) | undefined;
   try {
     await lifecycle.startProjection({
       ...(hooks ? { afterReceipt: (event) => hooks.afterReceipt(event) } : {}),
     });
     transportHost = await lifecycle.startTransports?.();
+    if (transportHost) unpublishTransportHost = publishGatewayTransportHost(transportHost);
   } catch (error) {
+    unpublishTransportHost?.();
     await lifecycle.stopTransports?.(transportHost);
     await lifecycle.stopProjection().catch(() => undefined);
     await lifecycle.stopHooks();
@@ -178,6 +185,10 @@ export async function createHeadlessGatewayServer(
   await attachHeadlessGatewayWs(server, { fetchHandler });
   let cleanup: Promise<void> | undefined;
   const stopServices = () => cleanup ??= Promise.resolve()
+    .then(() => {
+      unpublishTransportHost?.();
+      unpublishTransportHost = undefined;
+    })
     .then(() => lifecycle.stopTransports?.(transportHost))
     .then(() => lifecycle.stopProjection())
     .then(() => lifecycle.stopHooks())

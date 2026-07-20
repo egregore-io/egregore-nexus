@@ -9,6 +9,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { removeTempPath } from "../../test/removeTempPath";
 import { CURRENT_GATEWAY_SCHEMA_VERSION } from "../store/migrations";
+import { gatewayTransportStates } from "../transport/registry";
 
 vi.mock("../../routes/api/agui.observe", () => ({
   observeScoped: vi.fn(async () => json({ ok: true, route: "agent-session" })),
@@ -99,7 +100,7 @@ describe("headless gateway", () => {
         return {
           start: async () => undefined,
           stop: async () => undefined,
-          states: () => [],
+          states: () => [{ name: "fake", state: "running" as const }],
         };
       },
       async stopTransports() { calls.push("transports:stop"); },
@@ -109,8 +110,10 @@ describe("headless gateway", () => {
     });
 
     expect(calls).toEqual(["hooks:start", "projection:start", "transports:start"]);
+    expect(gatewayTransportStates()).toEqual([{ name: "fake", state: "running" }]);
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     await server.shutdown();
+    expect(gatewayTransportStates()).toEqual([]);
     expect(calls).toEqual([
       "hooks:start",
       "projection:start",

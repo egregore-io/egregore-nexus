@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { createClient } from "@libsql/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { handle } from "@server/api/router";
 import { bindLane } from "@server/store/repos/lane-bindings";
 import { migrateGatewayStore } from "@server/store/migrations";
 import { applyCanonicalProjection } from "@server/projection/apply";
@@ -12,9 +13,11 @@ import { setTransportSecret } from "./secrets";
 import {
   bindIngressAuthority,
   createTransportHost,
+  type TransportHost,
   type TransportIngressEvent,
 } from "./host";
 import { enqueueObligationsForMessage } from "./outbox";
+import { gatewayTransportStates, publishGatewayTransportHost } from "./registry";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -39,6 +42,9 @@ describe("transport host protocol", () => {
     });
     await host.start();
     await eventually(() => expect(host.states()).toContainEqual({ name: "fake", state: "running" }));
+    const unpublish = publishGatewayTransportHost(host);
+    expect(await capabilityProviders()).toEqual([{ name: "fake", state: "running" }]);
+    unpublish();
     await eventually(() => expect(ingress).toHaveBeenCalledTimes(1));
     expect(ingress.mock.calls[0]?.[0]).toMatchObject({
       ingressId: "ingress-1",
@@ -66,6 +72,9 @@ describe("transport host protocol", () => {
     const host = createTransportHost({ nexusHome: fixture.home, db: () => db, backoffBaseMs: 5 });
     await host.start();
     await eventually(() => expect(host.states()).toContainEqual({ name: "fake", state: "disabled" }));
+    const unpublish = publishGatewayTransportHost(host);
+    expect(await capabilityProviders()).toEqual([{ name: "fake", state: "disabled" }]);
+    unpublish();
     await new Promise((resolve) => setTimeout(resolve, 40));
     expect(Number(await readFile(fixture.startCount, "utf8"))).toBe(1);
     await host.stop();
@@ -270,6 +279,25 @@ describe("transport host protocol", () => {
     10_000,
   );
 });
+
+async function capabilityProviders() {
+  const response = await handle(
+    {
+      method: "GET",
+      path: "/api/v1/capabilities",
+      query: {},
+      headers: {},
+      caller: { name: "operator", project: "default" },
+    },
+    {
+      db: () => { throw new Error("capability read must not open the read DB"); },
+      transportStates: gatewayTransportStates,
+    },
+  );
+  return ((response.body as Record<string, unknown>).protocol as {
+    surfaces: { transports: { providers: ReturnType<TransportHost["states"]> } };
+  }).surfaces.transports.providers;
+}
 
 async function hostFixture(scenario: string) {
   const root = await mkdtemp(join(tmpdir(), "nexus-transport-host-"));

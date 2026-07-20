@@ -44,8 +44,9 @@ import {
 } from "./store";
 import type { HookManifest, HookRegistryReload } from "./types";
 import { setGatewayHookDiagnostics } from "./diagnostics";
+import { HOOK_EVENTS } from "./events";
 
-const SUPPORTED_EVENTS = new Set(["before_send", "after_receipt"]);
+const SUPPORTED_EVENTS = new Set<string>(HOOK_EVENTS);
 
 export interface GatewayHookConnection extends BridgeConnection {
   ready: Promise<void>;

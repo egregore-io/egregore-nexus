@@ -140,6 +140,11 @@ export interface ApiResponse {
  */
 export type ReadDbGetter = () => Promise<ReadDb> | ReadDb;
 
+export interface TransportCapabilityProvider {
+  name: string;
+  state: "starting" | "running" | "backoff" | "disabled" | "stopped";
+}
+
 /**
  * The injected dependencies. Tests pass a seeded `db` getter plus optional
  * command seams; production passes command ingress for daemon-managed writes and
@@ -159,6 +164,8 @@ export interface ApiDeps {
   sourceRegistry?: SourceRegistryReader;
   /** Read-only diagnostics for the Gateway-owned message-hook service. */
   hooks?: HookDiagnosticsReader;
+  /** Live process-local transport host registry; absent means no configured host. */
+  transportStates?: () => readonly TransportCapabilityProvider[];
   /**
    * Lazy provider for the read-only Drizzle handle (display/query). Constructed
    * ONLY when a read handler calls it — never eagerly per request.

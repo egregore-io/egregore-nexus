@@ -29,6 +29,7 @@ import {
 import { seedDb } from "@drizzle/__mocks__/seedDb";
 import type { ReadDb } from "@drizzle/client";
 import { COMMAND_KINDS } from "@server/command/ingress";
+import { HOOK_EVENTS } from "@server/hooks/events";
 import {
   createHumanReadDeliveryMarker,
   type HumanReadDeliveryMarker,
@@ -2281,6 +2282,20 @@ describe("public API — EXTENDED surface dispatches to command ingress", () => 
     expect(capabilities.status).toBe(200);
     expect(capabilities.body).toMatchObject({
       version: 1,
+      protocol: {
+        gateway: "0.1.6",
+        surfaces: {
+          eventsLane: { version: 1, replay: "afterSeq-ring" },
+          sessionLane: { version: 1, replay: "cursor" },
+          threadDmRead: { version: 1, replay: "durable-cursor" },
+          notify: { version: 1, idempotency: true },
+          hooks: {
+            version: 1,
+            events: [...HOOK_EVENTS],
+          },
+          transports: { version: 1, providers: [] },
+        },
+      },
       routes: expect.arrayContaining([
         expect.objectContaining({ method: "GET", path: "/api/v1/health", auth: false, read: "health" }),
         expect.objectContaining({ method: "GET", path: "/api/v1/search", read: "search.messages" }),
