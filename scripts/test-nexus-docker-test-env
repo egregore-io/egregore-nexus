@@ -607,6 +607,8 @@ grep -Fq "refusing runtime-state mount" "$TMP/rejected.err"
 
 mkdir -p \
   "$TMP/lab-home" \
+  "$TMP/lab-home/.codex" \
+  "$TMP/active-codex" \
   "$TMP/lab-sources/lens" \
   "$TMP/lab-sources/egregore" \
   "$TMP/lab-sources/pactree" \
@@ -614,6 +616,7 @@ mkdir -p \
   "$TMP/lab-sources/pactree-fs"
 LAB_ENV=(
   "HOME=$TMP/lab-home"
+  "CODEX_HOME=$TMP/active-codex"
   "NEXUS_DOCKER_TEST_LENS_REPO=$TMP/lab-sources/lens"
   "NEXUS_DOCKER_TEST_EGREGORE_REPO=$TMP/lab-sources/egregore"
   "NEXUS_DOCKER_TEST_PACTREE_REPO=$TMP/lab-sources/pactree"
@@ -747,6 +750,12 @@ fi
 grep -Eq '^run ' "$TMP/hostconfig-docker.log"
 grep -Fq -- '--label egregore-nexus-lab-mode=packed' "$TMP/hostconfig-docker.log"
 grep -Fq -- '--cpus 6 --memory 8g --memory-swap 8g --pids-limit 1024' "$TMP/hostconfig-docker.log"
+grep -Fq -- "-v $TMP/active-codex:/host-auth/.codex:ro" "$TMP/hostconfig-docker.log"
+if grep -Fq -- "-v $TMP/lab-home/.codex:/host-auth/.codex:ro" \
+  "$TMP/hostconfig-docker.log"; then
+  echo 'lab must mount the active CODEX_HOME, not a stale HOME/.codex fallback' >&2
+  exit 1
+fi
 if grep -Eq '(^| )exec( |$)' "$TMP/hostconfig-docker.log"; then
   echo 'HostConfig mismatch must fail before container setup or candidate build' >&2
   exit 1
