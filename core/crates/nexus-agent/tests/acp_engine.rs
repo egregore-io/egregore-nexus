@@ -72,6 +72,18 @@ fn fake_prompt_error_command(data: serde_json::Value) -> HarnessCommand {
     }
 }
 
+fn fake_prompt_error_message_command(message: &str) -> HarnessCommand {
+    HarnessCommand {
+        program: FAKE_HARNESS.to_string(),
+        args: vec![],
+        cwd: None,
+        env: vec![(
+            "FAKE_ACP_PROMPT_ERROR_MESSAGE".to_string(),
+            message.to_string(),
+        )],
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn process_group_of(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -386,7 +398,8 @@ async fn engine_preserves_structured_acp_server_error_as_retryable_provider_fail
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claude_observed_interrupted_handoff_settles_only_after_model_output() {
     let engine = AcpEngine::for_harness(HarnessId::new("claude").unwrap());
-    let mut command = fake_prompt_error_command(json!(CLAUDE_INTERRUPTED_HANDOFF));
+    let mut command =
+        fake_prompt_error_message_command(&format!("Internal error: {CLAUDE_INTERRUPTED_HANDOFF}"));
     command.env.extend([
         (
             "FAKE_ACP_PROMPT_ERROR_THEN_REPLY_MS".to_string(),

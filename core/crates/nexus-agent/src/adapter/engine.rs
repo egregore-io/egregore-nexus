@@ -607,9 +607,14 @@ enum TurnEnd {
 
 const INTERRUPTED_HANDOFF_DIAGNOSTIC: &str =
     "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null";
+const INTERRUPTED_HANDOFF_MESSAGE: &str =
+    "Internal error: [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null";
 
 fn is_interrupted_prompt_handoff(error: &agent_client_protocol::Error) -> bool {
-    error.data.as_ref().and_then(serde_json::Value::as_str) == Some(INTERRUPTED_HANDOFF_DIAGNOSTIC)
+    (error.message == INTERRUPTED_HANDOFF_MESSAGE && error.data.is_none())
+        || (error.message == "Internal error"
+            && error.data.as_ref().and_then(serde_json::Value::as_str)
+                == Some(INTERRUPTED_HANDOFF_DIAGNOSTIC))
 }
 
 /// Resolve once the reply stream has **streamed content and then gone quiet** for `window`.

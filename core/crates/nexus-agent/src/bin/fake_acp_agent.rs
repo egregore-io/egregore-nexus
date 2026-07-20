@@ -55,6 +55,8 @@
 //! - `FAKE_ACP_PROMPT_ERROR_DATA=<json>` — return a structured ACP error from `session/prompt`
 //!   before streaming. Adapter tests use this to prove provider-limit classification happens before
 //!   `session/prompt failed: ...` stringification.
+//! - `FAKE_ACP_PROMPT_ERROR_MESSAGE=<text>` — return an internal ACP error whose message is the
+//!   exact supplied text. This models bridges that encode their diagnostic in `error.message`.
 //! - `FAKE_ACP_PROMPT_ERROR_THEN_REPLY_MS=<milliseconds>` — when paired with
 //!   `FAKE_ACP_PROMPT_ERROR_DATA`, return the scripted prompt error first, then emit the configured
 //!   reply chunks after the delay. This reproduces a bridge handoff that appends the replacement
@@ -322,12 +324,18 @@ async fn main() -> Result<()> {
                 {
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
-                if let Ok(raw) = std::env::var("FAKE_ACP_PROMPT_ERROR_DATA") {
-                    let data = serde_json::from_str::<serde_json::Value>(&raw)
-                        .unwrap_or_else(|_| serde_json::Value::String(raw));
-                    let result = responder.respond_with_error(
-                        agent_client_protocol::Error::internal_error().data(data),
-                    );
+                let prompt_error = std::env::var("FAKE_ACP_PROMPT_ERROR_MESSAGE")
+                    .ok()
+                    .map(|message| agent_client_protocol::Error::new(-32603, message))
+                    .or_else(|| {
+                        std::env::var("FAKE_ACP_PROMPT_ERROR_DATA").ok().map(|raw| {
+                            let data = serde_json::from_str::<serde_json::Value>(&raw)
+                                .unwrap_or_else(|_| serde_json::Value::String(raw));
+                            agent_client_protocol::Error::internal_error().data(data)
+                        })
+                    });
+                if let Some(error) = prompt_error {
+                    let result = responder.respond_with_error(error);
                     if let Some(delay_ms) = std::env::var("FAKE_ACP_PROMPT_ERROR_THEN_REPLY_MS")
                         .ok()
                         .and_then(|raw| raw.parse::<u64>().ok())
