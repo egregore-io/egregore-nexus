@@ -1029,6 +1029,14 @@ def _checked_text(path: Path, root: Path, label: str) -> str:
         raise AcceptanceFailure(f"{label} is not UTF-8") from error
 
 
+def checked_system_text(path: Path, label: str) -> str:
+    raw = checked_file(path, Path("/"), label, expected_uid=0)
+    try:
+        return raw.decode("utf-8").strip()
+    except UnicodeError as error:
+        raise AcceptanceFailure(f"{label} is not UTF-8") from error
+
+
 def _positive_pid(value: object, label: str) -> int:
     if isinstance(value, bool):
         raise AcceptanceFailure(f"{label} is not a positive process ID")
@@ -1105,7 +1113,7 @@ def _process_environment(pid: int, label: str) -> dict[str, str]:
 def _listener_inodes(port: int) -> set[str]:
     result: set[str] = set()
     for path in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
-        text = _checked_text(path, Path("/"), f"kernel TCP listener table {path.name}")
+        text = checked_system_text(path, f"kernel TCP listener table {path.name}")
         for line in text.splitlines()[1:]:
             fields = line.split()
             if len(fields) < 10 or fields[3] != "0A":
@@ -1146,17 +1154,15 @@ def observe_runtime(candidate: Candidate) -> RuntimeObservation:
     """Capture actual container and process authority without mutating runtime."""
     lab_root = candidate.lab_root
     nexus_home = lab_root / "nexus"
-    container_id = _checked_text(Path("/etc/hostname"), Path("/"), "container hostname")
-    cpu_max = _checked_text(Path("/sys/fs/cgroup/cpu.max"), Path("/"), "cgroup cpu.max")
-    memory_max = _checked_text(
-        Path("/sys/fs/cgroup/memory.max"), Path("/"), "cgroup memory.max"
+    container_id = checked_system_text(Path("/etc/hostname"), "container hostname")
+    cpu_max = checked_system_text(Path("/sys/fs/cgroup/cpu.max"), "cgroup cpu.max")
+    memory_max = checked_system_text(
+        Path("/sys/fs/cgroup/memory.max"), "cgroup memory.max"
     )
-    memory_swap_max = _checked_text(
-        Path("/sys/fs/cgroup/memory.swap.max"),
-        Path("/"),
-        "cgroup memory.swap.max",
+    memory_swap_max = checked_system_text(
+        Path("/sys/fs/cgroup/memory.swap.max"), "cgroup memory.swap.max"
     )
-    pids_max = _checked_text(Path("/sys/fs/cgroup/pids.max"), Path("/"), "cgroup pids.max")
+    pids_max = checked_system_text(Path("/sys/fs/cgroup/pids.max"), "cgroup pids.max")
     daemon_pid = _positive_pid(
         _checked_text(nexus_home / "daemon.pid", lab_root, "daemon pid"),
         "daemon",

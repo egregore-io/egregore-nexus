@@ -337,6 +337,23 @@ class WsAcceptanceContracts(unittest.TestCase):
             expected_mode=0o444,
         )
 
+    def test_container_runtime_text_reads_require_root_authority(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        path = Path("/etc/hostname")
+        checker = mock.Mock(return_value=b"container-id\n")
+        globals_ = module["checked_system_text"].__globals__
+        with mock.patch.dict(globals_, {"checked_file": checker}):
+            self.assertEqual(
+                module["checked_system_text"](path, "container hostname"),
+                "container-id",
+            )
+        checker.assert_called_once_with(
+            path,
+            Path("/"),
+            "container hostname",
+            expected_uid=0,
+        )
+
     def test_post_acceptance_revalidates_candidate_and_runtime_before_publish(self) -> None:
         module = runpy.run_path(str(TARGET))
         candidate = module["Candidate"](
