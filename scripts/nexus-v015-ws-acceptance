@@ -3972,6 +3972,23 @@ class BackendAcceptance:
         ):
             raise AcceptanceFailure("queued input acknowledgement is incomplete")
 
+        mutation_id = f"mut-cancel-{time.time_ns()}"
+        await lane.send({
+            "t": "queue.cancel",
+            "clientMutationId": mutation_id,
+            "commandId": command_id,
+            "expectedRevision": revision,
+        })
+        cancel_ack = await lane.wait_for(
+            lambda frame: frame.get("t") == "queue.mutation.ack"
+            and frame.get("clientMutationId") == mutation_id,
+            after=start,
+            timeout=60,
+            label="queue cancellation acknowledgement",
+        )
+        if cancel_ack.get("state") != "cancelled":
+            raise AcceptanceFailure(f"queued command was not cancelled: {cancel_ack!r}")
+
         steer_id = f"cm-steer-{time.time_ns()}"
         await lane.send({
             "t": "steer",
@@ -3984,6 +4001,14 @@ class BackendAcceptance:
             after=start,
             timeout=60,
             label="steer acknowledgement",
+        )
+
+        finished = await lane.wait_for(
+            lambda frame: self.core["session_event"](frame).get("type") == "RUN_FINISHED"
+            and self.core["session_event"](frame).get("runId") == run_id,
+            after=start,
+            timeout=240,
+            label="steered active turn terminal",
         )
 
         compact_id = f"cc-compact-{time.time_ns()}"
@@ -4008,30 +4033,6 @@ class BackendAcceptance:
         )
         if compact_done.get("ok") is not True:
             raise AcceptanceFailure(f"compact command failed: {compact_done!r}")
-
-        mutation_id = f"mut-cancel-{time.time_ns()}"
-        await lane.send({
-            "t": "queue.cancel",
-            "clientMutationId": mutation_id,
-            "commandId": command_id,
-            "expectedRevision": revision,
-        })
-        cancel_ack = await lane.wait_for(
-            lambda frame: frame.get("t") == "queue.mutation.ack"
-            and frame.get("clientMutationId") == mutation_id,
-            after=start,
-            timeout=60,
-            label="queue cancellation acknowledgement",
-        )
-        if cancel_ack.get("state") != "cancelled":
-            raise AcceptanceFailure(f"queued command was not cancelled: {cancel_ack!r}")
-        finished = await lane.wait_for(
-            lambda frame: self.core["session_event"](frame).get("type") == "RUN_FINISHED"
-            and self.core["session_event"](frame).get("runId") == run_id,
-            after=start,
-            timeout=240,
-            label="steered active turn terminal",
-        )
         queued_event_count = sum(
             self.core["session_event"](frame).get("messageId") == queued_id
             for frame in lane.frames[start:]

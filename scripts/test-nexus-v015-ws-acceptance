@@ -2027,6 +2027,23 @@ class WsAcceptanceContracts(unittest.TestCase):
             ("gateway", "gateway", "daemon", "daemon"),
         )
 
+    def test_queue_control_cancels_before_steer_terminal_and_compact(self) -> None:
+        source = TARGET.read_text(encoding="utf-8")
+        body = source.split("    async def queue_steer_compact_controls", 1)[1].split(
+            "    async def queue_authority_outage_recovery", 1
+        )[0]
+
+        cancel_send = body.index('"t": "queue.cancel"')
+        cancel_confirmed = body.index('cancel_ack.get("state") != "cancelled"')
+        steer_send = body.index('"t": "steer"')
+        active_terminal = body.index('label="steered active turn terminal"')
+        compact_send = body.index('"name": "compact"')
+
+        self.assertLess(cancel_send, cancel_confirmed)
+        self.assertLess(cancel_confirmed, steer_send)
+        self.assertLess(steer_send, active_terminal)
+        self.assertLess(active_terminal, compact_send)
+
     def test_exact_roster_rejects_stale_or_duplicate_rows(self) -> None:
         module = runpy.run_path(str(TARGET))
         agents = (
