@@ -2364,7 +2364,14 @@ def launch_live_agents(
     if hook != LAB_AGENT:
         raise AcceptanceFailure("live-agent hook is not the canonical isolated-lab hook")
     hook_hash = environment.get("NEXUS_V015_LAB_AGENT_SHA256")
-    require_bound_file(hook, hook_hash, "live-agent hook", Path("/"))
+    require_bound_file(
+        hook,
+        hook_hash,
+        "live-agent hook",
+        Path("/"),
+        expected_uid=0,
+        expected_mode=0o555,
+    )
     nexus_bin = environment.get("NEXUS_V015_NEXUS_BIN")
     readiness_hash = environment.get("NEXUS_V015_READINESS_LEDGER_SHA256")
     if nexus_bin != str(NEXUS_BIN) or not isinstance(readiness_hash, str):
@@ -2396,7 +2403,14 @@ def launch_live_agents(
             raise AcceptanceFailure(
                 f"genuine {kind} harness launch failed with {result.returncode}: {detail}"
             )
-    require_bound_file(hook, hook_hash, "live-agent hook after launches", Path("/"))
+    require_bound_file(
+        hook,
+        hook_hash,
+        "live-agent hook after launches",
+        Path("/"),
+        expected_uid=0,
+        expected_mode=0o555,
+    )
 
 
 def load_soak_core(candidate: Candidate) -> dict[str, Any]:

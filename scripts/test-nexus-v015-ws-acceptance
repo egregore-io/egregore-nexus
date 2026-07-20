@@ -1830,7 +1830,7 @@ class WsAcceptanceContracts(unittest.TestCase):
             hook.write_text("#!/bin/sh\n", encoding="utf-8")
             hook.chmod(0o755)
             hook_sha256 = digest(hook.read_bytes())
-            module["launch_live_agents"].__globals__["LAB_AGENT"] = hook
+            bound_checker = mock.Mock()
             candidate = module["Candidate"](
                 "contract-run",
                 "sha256:" + "d" * 64,
@@ -1846,7 +1846,11 @@ class WsAcceptanceContracts(unittest.TestCase):
                 root,
                 root / "install",
             )
-            module["launch_live_agents"](candidate, runner=fake_run)
+            with mock.patch.dict(
+                module["launch_live_agents"].__globals__,
+                {"LAB_AGENT": hook, "require_bound_file": bound_checker},
+            ):
+                module["launch_live_agents"](candidate, runner=fake_run)
 
         self.assertEqual(
             [argv for argv, _env in calls],
@@ -1857,6 +1861,10 @@ class WsAcceptanceContracts(unittest.TestCase):
             self.assertEqual(env["NEXUS_V015_RUN_ID"], "contract-run")
             self.assertEqual(env["NEXUS_V015_NEXUS_BIN"], "/tmp/nexus-lab-bin/nexus")
             self.assertEqual(env["NEXUS_V015_READINESS_LEDGER_SHA256"], "a" * 64)
+        self.assertEqual(bound_checker.call_count, 2)
+        for call in bound_checker.call_args_list:
+            self.assertEqual(call.kwargs["expected_uid"], 0)
+            self.assertEqual(call.kwargs["expected_mode"], 0o555)
 
     def test_retired_developer_polling_source_is_detected(self) -> None:
         module = runpy.run_path(str(TARGET))
