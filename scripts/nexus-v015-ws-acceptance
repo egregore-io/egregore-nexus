@@ -2586,6 +2586,114 @@ class GateObservations:
         return payloads
 
 
+async def wait_correlated_assistant_reply(
+    core: dict[str, Any],
+    lane: Any,
+    *,
+    start_index: int,
+    before_cursor: int,
+    client_message_id: str,
+    timeout: float,
+    label: str,
+) -> dict[str, object]:
+    session_event = core["session_event"]
+    numeric_cursor = core["numeric_cursor"]
+    echo = await lane.wait_for(
+        lambda frame: (
+            session_event(frame).get("type") == "TEXT_MESSAGE_END"
+            and session_event(frame).get("messageId") == client_message_id
+        ),
+        after=start_index,
+        timeout=timeout,
+        label=f"{label} user echo",
+    )
+    echo_index = next(
+        index
+        for index in range(start_index, len(lane.frames))
+        if lane.frames[index] is echo
+    )
+    echo_cursor = numeric_cursor(echo)
+    if echo_cursor is None or echo_cursor <= before_cursor:
+        raise AcceptanceFailure(
+            f"{label} user echo has no new cursor for {client_message_id}: {echo!r}"
+        )
+    starts = [
+        frame
+        for frame in lane.frames[start_index : echo_index + 1]
+        if session_event(frame).get("type") == "RUN_STARTED"
+        and numeric_cursor(frame) == echo_cursor
+        and isinstance(session_event(frame).get("runId"), str)
+        and bool(session_event(frame).get("runId"))
+    ]
+    if len(starts) != 1:
+        raise AcceptanceFailure(
+            f"{label} user echo has no exact correlated run start for "
+            f"{client_message_id}: count={len(starts)} cursor={echo_cursor}"
+        )
+    run_id = session_event(starts[0])["runId"]
+    terminal = await lane.wait_for(
+        lambda frame: (
+            session_event(frame).get("type") == "RUN_FINISHED"
+            and session_event(frame).get("runId") == run_id
+            and (numeric_cursor(frame) or -1) > before_cursor
+        ),
+        after=echo_index + 1,
+        timeout=timeout,
+        label=f"{label} RUN_FINISHED",
+    )
+    terminal_index = next(
+        index
+        for index in range(echo_index + 1, len(lane.frames))
+        if lane.frames[index] is terminal
+    )
+    assistant_starts = [
+        (index, frame)
+        for index, frame in enumerate(
+            lane.frames[echo_index + 1 : terminal_index],
+            start=echo_index + 1,
+        )
+        if session_event(frame).get("type") == "TEXT_MESSAGE_START"
+        and session_event(frame).get("role") == "assistant"
+        and isinstance(session_event(frame).get("messageId"), str)
+        and bool(session_event(frame).get("messageId"))
+    ]
+    if len(assistant_starts) != 1:
+        raise AcceptanceFailure(
+            f"{label} current run has no exact assistant output for "
+            f"{client_message_id}: count={len(assistant_starts)} runId={run_id}"
+        )
+    assistant_start_index, assistant_start = assistant_starts[0]
+    assistant_message_id = session_event(assistant_start)["messageId"]
+    assistant_ends = [
+        (index, frame)
+        for index, frame in enumerate(
+            lane.frames[assistant_start_index + 1 : terminal_index],
+            start=assistant_start_index + 1,
+        )
+        if session_event(frame).get("type") == "TEXT_MESSAGE_END"
+        and session_event(frame).get("messageId") == assistant_message_id
+    ]
+    if len(assistant_ends) != 1:
+        raise AcceptanceFailure(
+            f"{label} current run has no exact assistant end for "
+            f"{client_message_id}: count={len(assistant_ends)} runId={run_id}"
+        )
+    assistant_end_index, _assistant_end = assistant_ends[0]
+    assistant_text = "".join(
+        str(session_event(frame).get("delta"))
+        for frame in lane.frames[assistant_start_index + 1 : assistant_end_index]
+        if session_event(frame).get("type") == "TEXT_MESSAGE_CONTENT"
+        and session_event(frame).get("messageId") == assistant_message_id
+        and isinstance(session_event(frame).get("delta"), str)
+    )
+    return {
+        "runId": run_id,
+        "assistantMessageId": assistant_message_id,
+        "assistantText": assistant_text,
+        "terminalIndex": terminal_index,
+    }
+
+
 class BackendAcceptance:
     def __init__(
         self,
@@ -3410,68 +3518,21 @@ class BackendAcceptance:
         if not isinstance(command_id, str) or not command_id:
             raise AcceptanceFailure(f"{agent.kind} bus-action ack has no commandId")
         self.soak.ledger.session_accepted.add(client_message_id)
-        started = await lane.wait_for(
-            lambda frame: (
-                self.core["session_event"](frame).get("type") == "RUN_STARTED"
-                and isinstance(self.core["session_event"](frame).get("runId"), str)
-            ),
-            after=session_start,
-            timeout=180,
-            label=f"{agent.kind} bus-action RUN_STARTED",
-        )
-        run_id = self.core["session_event"](started)["runId"]
-        assistant_start = await lane.wait_for(
-            lambda frame: (
-                self.core["session_event"](frame).get("type") == "TEXT_MESSAGE_START"
-                and self.core["session_event"](frame).get("role") == "assistant"
-            ),
-            after=session_start,
+        reply = await wait_correlated_assistant_reply(
+            self.core,
+            lane,
+            start_index=session_start,
+            before_cursor=before_cursor,
+            client_message_id=client_message_id,
             timeout=240,
-            label=f"{agent.kind} bus-action assistant start",
+            label=f"{agent.kind} bus-action",
         )
-        assistant_id = self.core["session_event"](assistant_start).get("messageId")
-        if not isinstance(assistant_id, str) or not assistant_id:
-            raise AcceptanceFailure(f"{agent.kind} bus-action assistant has no messageId")
-        assistant_start_index = next(
-            index
-            for index in range(session_start, len(lane.frames))
-            if lane.frames[index] is assistant_start
-        )
-        assistant_end = await lane.wait_for(
-            lambda frame: (
-                self.core["session_event"](frame).get("type") == "TEXT_MESSAGE_END"
-                and self.core["session_event"](frame).get("messageId") == assistant_id
-            ),
-            after=assistant_start_index + 1,
-            timeout=240,
-            label=f"{agent.kind} bus-action assistant end",
-        )
-        assistant_end_index = next(
-            index
-            for index in range(assistant_start_index + 1, len(lane.frames))
-            if lane.frames[index] is assistant_end
-        )
-        assistant_text = "".join(
-            str(self.core["session_event"](frame).get("delta"))
-            for frame in lane.frames[assistant_start_index + 1 : assistant_end_index]
-            if self.core["session_event"](frame).get("type") == "TEXT_MESSAGE_CONTENT"
-            and self.core["session_event"](frame).get("messageId") == assistant_id
-            and isinstance(self.core["session_event"](frame).get("delta"), str)
-        )
+        run_id = reply["runId"]
+        assistant_text = reply["assistantText"]
         if assistant_text.strip() != assistant_marker:
             raise AcceptanceFailure(
                 f"{agent.kind} bus-action assistant marker mismatch: {assistant_text!r}"
             )
-        await lane.wait_for(
-            lambda frame: (
-                self.core["session_event"](frame).get("type") == "RUN_FINISHED"
-                and self.core["session_event"](frame).get("runId") == run_id
-                and (self.core["numeric_cursor"](frame) or -1) > before_cursor
-            ),
-            after=assistant_end_index + 1,
-            timeout=240,
-            label=f"{agent.kind} bus-action RUN_FINISHED",
-        )
         self.soak.ledger.session_completed.add(client_message_id)
         dm_topic = f"sys.dm.{self.human_name}"
         dm_path = f"/api/v1/dms/{quote(agent.name, safe='')}/history?limit=100"

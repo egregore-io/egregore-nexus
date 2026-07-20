@@ -1770,6 +1770,126 @@ class WsAcceptanceContracts(unittest.TestCase):
             restart_body.index("human = await self.human_write"),
         )
 
+    def test_bus_action_reply_is_correlated_to_the_exact_user_echo_and_run(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        client_message_id = "cm-current-bus-action"
+
+        def event(
+            event_type: str,
+            cursor: int,
+            **fields: object,
+        ) -> dict[str, object]:
+            return {
+                "event": {
+                    "type": event_type,
+                    "streamEventId": cursor,
+                    **fields,
+                }
+            }
+
+        class Lane:
+            def __init__(self, frames: list[dict[str, object]]) -> None:
+                self.frames = frames
+
+            async def wait_for(
+                self,
+                predicate: object,
+                *,
+                after: int,
+                timeout: float,
+                label: str,
+            ) -> dict[str, object]:
+                del timeout
+                for frame in self.frames[after:]:
+                    if predicate(frame):
+                        return frame
+                raise module["AcceptanceFailure"](f"{label} timed out")
+
+        frames = [
+            event("RUN_STARTED", 41, runId="run-stale"),
+            event(
+                "TEXT_MESSAGE_START",
+                42,
+                role="assistant",
+                messageId="assistant-stale",
+            ),
+            event(
+                "TEXT_MESSAGE_CONTENT",
+                43,
+                messageId="assistant-stale",
+                delta="*Conversation interrupted*",
+            ),
+            event("TEXT_MESSAGE_END", 44, messageId="assistant-stale"),
+            event("RUN_FINISHED", 45, runId="run-stale"),
+            event("RUN_STARTED", 50, runId="run-current"),
+            event("TEXT_MESSAGE_END", 50, messageId=client_message_id),
+            event(
+                "TEXT_MESSAGE_START",
+                51,
+                role="assistant",
+                messageId="assistant-current",
+            ),
+            event(
+                "TEXT_MESSAGE_CONTENT",
+                52,
+                messageId="assistant-current",
+                delta="V015_AGENT_DONE_current",
+            ),
+            event("TEXT_MESSAGE_END", 53, messageId="assistant-current"),
+            event("RUN_FINISHED", 54, runId="run-current"),
+        ]
+        core = {
+            "session_event": lambda frame: frame["event"],
+            "numeric_cursor": lambda frame: frame["event"].get("streamEventId"),
+        }
+
+        reply = asyncio.run(
+            module["wait_correlated_assistant_reply"](
+                core,
+                Lane(frames),
+                start_index=0,
+                before_cursor=40,
+                client_message_id=client_message_id,
+                timeout=1,
+                label="codex bus-action",
+            )
+        )
+
+        self.assertEqual(reply["runId"], "run-current")
+        self.assertEqual(reply["assistantMessageId"], "assistant-current")
+        self.assertEqual(reply["assistantText"], "V015_AGENT_DONE_current")
+
+        unrelated = [
+            event("RUN_STARTED", 60, runId="run-unrelated"),
+            event("TEXT_MESSAGE_END", 60, messageId="cm-unrelated"),
+            event(
+                "TEXT_MESSAGE_START",
+                61,
+                role="assistant",
+                messageId="assistant-unrelated",
+            ),
+            event(
+                "TEXT_MESSAGE_CONTENT",
+                62,
+                messageId="assistant-unrelated",
+                delta="V015_AGENT_DONE_current",
+            ),
+            event("TEXT_MESSAGE_END", 63, messageId="assistant-unrelated"),
+            event("RUN_FINISHED", 64, runId="run-unrelated"),
+        ]
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "user echo"):
+            asyncio.run(
+                module["wait_correlated_assistant_reply"](
+                    core,
+                    Lane(unrelated),
+                    start_index=0,
+                    before_cursor=40,
+                    client_message_id=client_message_id,
+                    timeout=1,
+                    label="codex bus-action",
+                )
+            )
+
     def test_daemon_restart_accepts_only_gap_or_ordered_fleet_resync_as_boot_reset(self) -> None:
         module = runpy.run_path(str(TARGET))
         backend = module["BackendAcceptance"].__new__(module["BackendAcceptance"])
