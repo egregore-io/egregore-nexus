@@ -993,7 +993,9 @@ prepare_host_harnesses() {
           cp -a "/host-auth/hermes/$hermes_file" "$HERMES_HOME/$hermes_file"
         fi
       done
-    fi'
+    fi
+
+    /work/egregore-nexus/scripts/nexus-v015-stage-harnesses /host-node'
 }
 
 container_env_summary() {
@@ -1589,6 +1591,8 @@ cmd_lab_up() {
     -e "XDG_CONFIG_HOME=$LAB_ROOT/harness-home/.config" \
     -e "CODEX_HOME=$LAB_ROOT/harness-home/.codex" \
     -e "CLAUDE_CONFIG_DIR=$LAB_ROOT/harness-home/.claude" \
+    -e "NEXUS_V015_CODEX_BIN=$LAB_ROOT/harness-tools/codex/bin/codex.js" \
+    -e "NEXUS_V015_CLAUDE_BIN=$LAB_ROOT/harness-tools/claude" \
     -e "HERMES_HOME=$LAB_ROOT/harness-home/.hermes" \
     -e "NEXUS_OPENCODE_HOME=$LAB_ROOT/harness-home/.opencode-nexus" \
     -e "OPENCODE_DB=$LAB_ROOT/harness-home/.opencode-nexus/opencode.db" \

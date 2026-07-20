@@ -68,6 +68,10 @@ if grep -Fq '        "$packs/$cli_tar" "$packs/$gateway_tar" "$packs/$nexus_tar"
   exit 1
 fi
 "$SCRIPT_DIR/test-nexus-v015-scoped-registry"
+"$SCRIPT_DIR/test-nexus-v015-stage-harnesses"
+grep -Fq '/work/egregore-nexus/scripts/nexus-v015-stage-harnesses /host-node' "$TARGET"
+grep -Fq 'NEXUS_V015_CODEX_BIN=$LAB_ROOT/harness-tools/codex/bin/codex.js' "$TARGET"
+grep -Fq 'NEXUS_V015_CLAUDE_BIN=$LAB_ROOT/harness-tools/claude' "$TARGET"
 
 # The ocular runners execute only immutable lab-local hook copies.  Their
 # hashes are part of candidate readiness so a source-tree edit after assembly
