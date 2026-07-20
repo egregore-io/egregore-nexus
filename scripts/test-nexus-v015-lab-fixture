@@ -1,0 +1,1326 @@
+#!/usr/bin/env python3
+"""Black-box contract tests for the isolated v0.1.5 PACTBIN2 fixture hook."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+TARGET = ROOT / "scripts/nexus-v015-lab-fixture"
+KINDS = ("pactbin2-truncated", "pactbin2-bitflip")
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def pact_bytes(marker: bytes) -> bytes:
+    header = bytearray(4096)
+    header[:8] = b"PACTBIN2"
+    header[8:12] = b"\x02\x00\x00\x10"
+    header[64:72] = b"\x01\x00\x00\x00\x00\x00\x00\x00"
+    return bytes(header) + b"NEXUS-VALID-PACTBIN2\0" + marker + (b"x" * 256)
+
+
+class LabFixtureContractTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="nexus-v015-lab-fixture-")
+        self.temp = Path(self.temporary.name)
+        self.lab_root = self.temp / "nexus-lens-home"
+        self.lens_root = self.lab_root / "lens-data"
+        self.sessions_root = self.lens_root / "sessions"
+        self.lab_dir = self.lab_root / "lab"
+        self.sessions_root.mkdir(parents=True)
+        self.lab_dir.mkdir(parents=True)
+        self.validator = self.lab_root / "lens-venv" / "bin" / "python"
+        self.validator.parent.mkdir(parents=True)
+        self.validator.write_text(
+            """#!/usr/bin/env python3
+import pathlib
+import sys
+
+data = pathlib.Path(sys.argv[-1]).read_bytes()
+valid = (
+    data.startswith(b\"PACTBIN2\")
+    and len(data) > 4096
+    and data[8:12] == b\"\\x02\\x00\\x00\\x10\"
+    and b\"NEXUS-VALID-PACTBIN2\\0\" in data
+)
+if not valid:
+    print(\"PactCorruptFile: fixture validator rejected source\", file=sys.stderr)
+    raise SystemExit(1)
+""",
+            encoding="utf-8",
+        )
+        self.validator.chmod(0o755)
+        self.candidate_bytes = (
+            "schema=1\n"
+            "containerId=0123456789abcdef\n"
+            "mode=packed\n"
+            "runId=fixture-run\n"
+            "nexusLink=/tmp/nexus-lab-install/bin/nexus\n"
+            "nexusResolved=/tmp/nexus-lab-install/bin/nexus\n"
+            f"nexusSha256={'1' * 64}\n"
+            "gatewayLink=/tmp/nexus-lab-install/bin/nexus-gateway\n"
+            "gatewayResolved=/tmp/nexus-lab-install/bin/nexus-gateway\n"
+            f"gatewaySha256={'2' * 64}\n"
+            "webuiLink=/tmp/nexus-lab-install/bin/nexus-webui\n"
+            "webuiResolved=/tmp/nexus-lab-install/bin/nexus-webui\n"
+            f"webuiSha256={'3' * 64}\n"
+        ).encode()
+        self.readiness = self.lab_dir / "candidate-ready.v1"
+        self.readiness.write_bytes(self.candidate_bytes)
+        self.manifest = self.lab_dir / "fixtures.json"
+        self.env = {
+            **os.environ,
+            "HOME": str(self.temp / "unused-home"),
+            "OCULAR_LAB": "1",
+            "NEXUS_V015_ALLOW_FIXTURE_HOME": "1",
+            "NEXUS_LAB_ROOT": str(self.lab_root),
+            "LENS_DATA_HOME": str(self.lens_root),
+            "NEXUS_LAB_MODE": "packed",
+            "NEXUS_V015_RUN_ID": "fixture-run",
+        }
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def command(
+        self, *args: str, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        if not TARGET.is_file():
+            return subprocess.CompletedProcess(
+                [str(TARGET), *args],
+                127,
+                "",
+                f"implementation script is missing: {TARGET}\n",
+            )
+        return subprocess.run(
+            [str(TARGET), *args],
+            cwd=ROOT,
+            env=env or self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+
+    def add_source(self, session_id: str, data: bytes) -> Path:
+        session_dir = self.sessions_root / session_id
+        path = session_dir / "pact" / "session.pact"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(data)
+        (session_dir / "meta.json").write_text(
+            json.dumps(
+                {
+                    "title": f"Donor {session_id}",
+                    "provider": "opencode-go:deepseek-v4-flash",
+                    "scaffolds": ["shell", "internal_notes"],
+                    "scaffold_configs": {},
+                    "instructions": "",
+                    "agent_settings": {},
+                    "history_path": "history.jsonl",
+                    "created_at": 1784487683203,
+                    "updated_at": 1784490273694,
+                    "total_input_tokens": 0,
+                    "total_output_tokens": 0,
+                    "total_tokens": 0,
+                    "last_input_tokens": 0,
+                    "last_output_tokens": 0,
+                    "last_total_tokens": 0,
+                    "provider_request_count": 0,
+                    "provider_request_counts_by_turn": {},
+                    "outbound_ai_request_count": 0,
+                    "outbound_ai_request_counts_by_turn": {},
+                    "outbound_ai_request_log": [],
+                    "context_window": 1_000_000,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def install(self, kind: str, session_id: str) -> subprocess.CompletedProcess[str]:
+        return self.command("install", kind, "--session", session_id)
+
+    def load_target_module(self):
+        name = f"nexus_v015_lab_fixture_test_{id(self)}_{len(sys.modules)}"
+        loader = importlib.machinery.SourceFileLoader(name, str(TARGET))
+        spec = importlib.util.spec_from_loader(name, loader)
+        if spec is None:
+            self.fail(f"cannot load fixture hook: {TARGET}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        loader.exec_module(module)
+        self.addCleanup(sys.modules.pop, name, None)
+        return module
+
+    def test_help_is_side_effect_free_before_the_container_guard(self) -> None:
+        env = {
+            **os.environ,
+            "HOME": str(self.temp / "missing-home"),
+        }
+        before = sorted(str(path.relative_to(self.temp)) for path in self.temp.rglob("*"))
+
+        result = self.command("--help", env=env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "install pactbin2-truncated|pactbin2-bitflip --session <fixture-id>",
+            result.stdout,
+        )
+        after = sorted(str(path.relative_to(self.temp)) for path in self.temp.rglob("*"))
+        self.assertEqual(after, before)
+
+    def test_refuses_host_execution_and_unsafe_session_ids_with_typed_errors(self) -> None:
+        outside_env = {**self.env}
+        outside_env.pop("OCULAR_LAB")
+
+        outside = self.command(
+            "install", "pactbin2-truncated", "--session", "fx-safe", env=outside_env
+        )
+        traversal = self.install("pactbin2-truncated", "../escape")
+
+        self.assertEqual(outside.returncode, 3)
+        self.assertIn("error[LAB_FIXTURE_LAB_ONLY]", outside.stderr)
+        self.assertEqual(traversal.returncode, 2)
+        self.assertIn("error[LAB_FIXTURE_USAGE]", traversal.stderr)
+        self.assertFalse((self.temp / "escape").exists())
+        self.assertFalse(self.manifest.exists())
+
+    def test_installs_both_deterministic_corruptions_and_records_evidence(self) -> None:
+        source_bytes = pact_bytes(b"canonical-source")
+        source = self.add_source("source-session", source_bytes)
+
+        truncated = self.install("pactbin2-truncated", "fx-truncated")
+        bitflip = self.install("pactbin2-bitflip", "fx-bitflip")
+
+        self.assertEqual(truncated.returncode, 0, truncated.stderr)
+        self.assertEqual(bitflip.returncode, 0, bitflip.stderr)
+        self.assertEqual(json.loads(truncated.stdout)["status"], "installed")
+        self.assertEqual(json.loads(bitflip.stdout)["status"], "installed")
+        truncated_path = self.sessions_root / "fx-truncated" / "pact" / "session.pact"
+        bitflip_path = self.sessions_root / "fx-bitflip" / "pact" / "session.pact"
+        truncated_bytes = truncated_path.read_bytes()
+        bitflip_bytes = bitflip_path.read_bytes()
+        self.assertEqual(truncated_bytes, source_bytes[:4095])
+        differences = [
+            index
+            for index, (before, after) in enumerate(zip(source_bytes, bitflip_bytes))
+            if before != after
+        ]
+        self.assertEqual(differences, [10])
+        self.assertEqual(source_bytes[10] ^ bitflip_bytes[10], 0x01)
+        self.assertEqual(len(bitflip_bytes), len(source_bytes))
+        self.assertEqual(source.read_bytes(), source_bytes)
+
+        document = json.loads(self.manifest.read_text(encoding="utf-8"))
+        self.assertEqual(document["version"], 1)
+        self.assertEqual(document["runId"], "fixture-run")
+        self.assertEqual(
+            document["candidate"],
+            {
+                "containerId": "0123456789abcdef",
+                "mode": "packed",
+                "runId": "fixture-run",
+                "readinessSha256": sha256(self.candidate_bytes),
+                "nexusSha256": "1" * 64,
+                "gatewaySha256": "2" * 64,
+                "webuiSha256": "3" * 64,
+            },
+        )
+        self.assertEqual(set(document["sessions"]), set(KINDS))
+        for kind, session_id, expected_path, expected_bytes in (
+            ("pactbin2-truncated", "fx-truncated", truncated_path, truncated_bytes),
+            ("pactbin2-bitflip", "fx-bitflip", bitflip_path, bitflip_bytes),
+        ):
+            entry = document["sessions"][kind]
+            self.assertEqual(entry["sessionId"], session_id)
+            self.assertIn(session_id, entry["title"])
+            self.assertEqual(entry["pactPath"], str(expected_path))
+            expected_meta = self.sessions_root / session_id / "meta.json"
+            self.assertEqual(entry["metaPath"], str(expected_meta))
+            fixture_meta = json.loads(expected_meta.read_text(encoding="utf-8"))
+            self.assertEqual(fixture_meta["title"], entry["title"])
+            self.assertEqual(
+                fixture_meta["provider"], "opencode-go:deepseek-v4-flash"
+            )
+            self.assertEqual(fixture_meta["total_tokens"], 0)
+            self.assertEqual(entry["metaSha256"], sha256(expected_meta.read_bytes()))
+            self.assertEqual(entry["sourcePactPath"], str(source))
+            self.assertEqual(entry["sourceSha256"], sha256(source_bytes))
+            self.assertEqual(entry["fixtureSha256"], sha256(expected_bytes))
+            self.assertEqual(entry["sourceBytes"], len(source_bytes))
+            self.assertEqual(entry["fixtureBytes"], len(expected_bytes))
+        self.assertEqual(
+            document["sessions"]["pactbin2-truncated"]["corruption"],
+            {"kind": "truncate", "keepBytes": 4095},
+        )
+        self.assertEqual(
+            document["sessions"]["pactbin2-bitflip"]["corruption"],
+            {"kind": "bitflip", "byteOffset": 10, "bitMask": 1},
+        )
+        self.assertEqual(stat.S_IMODE(self.manifest.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(truncated_path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(bitflip_path.stat().st_mode), 0o600)
+        self.assertEqual(
+            stat.S_IMODE((self.sessions_root / "fx-truncated" / "meta.json").stat().st_mode),
+            0o600,
+        )
+        self.assertEqual(
+            stat.S_IMODE((self.sessions_root / "fx-bitflip" / "meta.json").stat().st_mode),
+            0o600,
+        )
+        self.assertFalse(list(self.lab_root.rglob("*.tmp-*")))
+
+    def test_source_selection_is_deterministic_and_uses_only_valid_lab_pacts(self) -> None:
+        source_z = self.add_source("source-z", pact_bytes(b"source-z"))
+        source_a = self.add_source("source-a", pact_bytes(b"source-a"))
+        self.add_source("source-0-invalid", b"PACTBIN2" + (b"x" * 5000))
+
+        result = self.install("pactbin2-truncated", "fx-deterministic")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry = json.loads(self.manifest.read_text())["sessions"]["pactbin2-truncated"]
+        self.assertEqual(entry["sourcePactPath"], str(source_a))
+        self.assertNotEqual(entry["sourcePactPath"], str(source_z))
+
+    def test_reinstall_of_the_same_fixture_is_idempotent(self) -> None:
+        self.add_source("source", pact_bytes(b"source"))
+        first = self.install("pactbin2-bitflip", "fx-repeat")
+        target = self.sessions_root / "fx-repeat" / "pact" / "session.pact"
+        before_target = target.read_bytes() if target.exists() else b""
+        before_manifest = self.manifest.read_bytes() if self.manifest.exists() else b""
+
+        second = self.install("pactbin2-bitflip", "fx-repeat")
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(json.loads(second.stdout)["status"], "unchanged")
+        self.assertEqual(target.read_bytes(), before_target)
+        self.assertEqual(self.manifest.read_bytes(), before_manifest)
+
+    def test_missing_and_invalid_sources_fail_closed(self) -> None:
+        missing = self.install("pactbin2-truncated", "fx-missing")
+        self.add_source("invalid", b"PACTBIN2" + (b"x" * 5000))
+        invalid = self.install("pactbin2-truncated", "fx-invalid")
+
+        self.assertEqual(missing.returncode, 6)
+        self.assertIn("error[LAB_FIXTURE_SOURCE_NOT_FOUND]", missing.stderr)
+        self.assertEqual(invalid.returncode, 7)
+        self.assertIn("error[LAB_FIXTURE_SOURCE_INVALID]", invalid.stderr)
+        self.assertFalse(self.manifest.exists())
+        self.assertFalse((self.sessions_root / "fx-missing").exists())
+        self.assertFalse((self.sessions_root / "fx-invalid").exists())
+
+    def test_rejects_source_and_target_symlinks_without_touching_their_referents(self) -> None:
+        outside_source_dir = self.temp / "outside-source" / "pact"
+        outside_source_dir.mkdir(parents=True)
+        outside_source = outside_source_dir / "session.pact"
+        outside_bytes = pact_bytes(b"outside")
+        outside_source.write_bytes(outside_bytes)
+        (self.sessions_root / "source-link").symlink_to(outside_source_dir.parent)
+
+        linked_source = self.install("pactbin2-truncated", "fx-source-link")
+
+        self.assertEqual(linked_source.returncode, 4)
+        self.assertIn("error[LAB_FIXTURE_PATH_UNSAFE]", linked_source.stderr)
+        self.assertEqual(outside_source.read_bytes(), outside_bytes)
+
+        (self.sessions_root / "source-link").unlink()
+        self.add_source("source", pact_bytes(b"inside"))
+        outside_target = self.temp / "outside-target"
+        outside_target.mkdir()
+        (self.sessions_root / "fx-target-link").symlink_to(outside_target)
+
+        linked_target = self.install("pactbin2-bitflip", "fx-target-link")
+
+        self.assertEqual(linked_target.returncode, 4)
+        self.assertIn("error[LAB_FIXTURE_PATH_UNSAFE]", linked_target.stderr)
+        self.assertFalse((outside_target / "pact" / "session.pact").exists())
+        self.assertFalse(self.manifest.exists())
+
+    def test_rejects_lens_data_outside_the_lab(self) -> None:
+        outside = self.temp / "outside-lens-data"
+        outside.mkdir()
+        env = {**self.env, "LENS_DATA_HOME": str(outside)}
+
+        result = self.command(
+            "install", "pactbin2-truncated", "--session", "fx", env=env
+        )
+
+        self.assertEqual(result.returncode, 4)
+        self.assertIn("error[LAB_FIXTURE_PATH_UNSAFE]", result.stderr)
+        self.assertFalse(self.manifest.exists())
+
+    def test_existing_target_and_manifest_are_never_overwritten_on_conflict(self) -> None:
+        self.add_source("source", pact_bytes(b"source"))
+        target = self.add_source("fx-existing", b"operator-original")
+
+        conflict = self.install("pactbin2-truncated", "fx-existing")
+
+        self.assertEqual(conflict.returncode, 8)
+        self.assertIn("error[LAB_FIXTURE_TARGET_EXISTS]", conflict.stderr)
+        self.assertEqual(target.read_bytes(), b"operator-original")
+        self.assertFalse(self.manifest.exists())
+
+        target.unlink()
+        target.parent.rmdir()
+        (target.parent.parent / "meta.json").unlink()
+        target.parent.parent.rmdir()
+        self.manifest.write_text("{broken", encoding="utf-8")
+        broken_before = self.manifest.read_bytes()
+
+        malformed = self.install("pactbin2-truncated", "fx-malformed-manifest")
+
+        self.assertEqual(malformed.returncode, 9)
+        self.assertIn("error[LAB_FIXTURE_MANIFEST_INVALID]", malformed.stderr)
+        self.assertEqual(self.manifest.read_bytes(), broken_before)
+        self.assertFalse((self.sessions_root / "fx-malformed-manifest").exists())
+
+    def test_candidate_ledger_is_required_and_candidate_bound(self) -> None:
+        self.add_source("source", pact_bytes(b"source"))
+        self.readiness.unlink()
+
+        missing = self.install("pactbin2-truncated", "fx-no-candidate")
+
+        self.assertEqual(missing.returncode, 5)
+        self.assertIn("error[LAB_FIXTURE_CANDIDATE_INVALID]", missing.stderr)
+        self.assertFalse(self.manifest.exists())
+
+        self.readiness.write_text(
+            self.candidate_bytes.decode().replace("mode=packed", "mode=source"),
+            encoding="utf-8",
+        )
+        mismatch = self.install("pactbin2-truncated", "fx-wrong-candidate")
+        self.assertEqual(mismatch.returncode, 5)
+        self.assertIn("error[LAB_FIXTURE_CANDIDATE_INVALID]", mismatch.stderr)
+
+        self.readiness.write_bytes(self.candidate_bytes)
+        mismatched_env = {**self.env, "NEXUS_V015_RUN_ID": "another-run"}
+        mismatched_run = self.command(
+            "install",
+            "pactbin2-truncated",
+            "--session",
+            "fx-wrong-run",
+            env=mismatched_env,
+        )
+        self.assertEqual(mismatched_run.returncode, 5)
+        self.assertIn("error[LAB_FIXTURE_CANDIDATE_INVALID]", mismatched_run.stderr)
+
+        missing_run_env = {**self.env}
+        missing_run_env.pop("NEXUS_V015_RUN_ID")
+        missing_run = self.command(
+            "install",
+            "pactbin2-truncated",
+            "--session",
+            "fx-missing-run",
+            env=missing_run_env,
+        )
+        self.assertEqual(missing_run.returncode, 5)
+        self.assertIn("error[LAB_FIXTURE_CANDIDATE_INVALID]", missing_run.stderr)
+
+    def test_publish_failures_restore_exact_fixture_and_manifest_state(self) -> None:
+        self.add_source("source", pact_bytes(b"source"))
+        module = self.load_target_module()
+
+        def state(session_id: str) -> tuple[bytes | None, bytes | None, bytes | None, bool]:
+            session = self.sessions_root / session_id
+            pact = session / "pact" / "session.pact"
+            meta = session / "meta.json"
+            return (
+                pact.read_bytes() if pact.exists() else None,
+                meta.read_bytes() if meta.exists() else None,
+                self.manifest.read_bytes() if self.manifest.exists() else None,
+                session.exists(),
+            )
+
+        real_fchmod = module.os.fchmod
+        real_fdopen = module.os.fdopen
+        real_fsync = module.os.fsync
+        real_fsync_directory = module.fsync_directory
+        real_replace = module.os.replace
+
+        def fault_patch(point: str, session_id: str):
+            fired = {"value": False}
+            if point in {"pact-fchmod", "meta-fchmod"}:
+                marker = ".session.pact.tmp-" if point == "pact-fchmod" else ".meta.json.tmp-"
+
+                def fail_fchmod(descriptor, mode):
+                    try:
+                        descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
+                    except OSError:
+                        descriptor_path = ""
+                    if not fired["value"] and marker in descriptor_path:
+                        fired["value"] = True
+                        raise OSError(f"injected {point}")
+                    return real_fchmod(descriptor, mode)
+
+                return mock.patch.object(module.os, "fchmod", side_effect=fail_fchmod), fired
+            if point in {
+                "pact-temp-write",
+                "pact-temp-flush",
+                "pact-temp-fsync",
+                "meta-temp-write",
+                "meta-temp-flush",
+                "meta-temp-fsync",
+                "manifest-temp-write",
+                "manifest-temp-flush",
+                "manifest-temp-fsync",
+            }:
+                marker = {
+                    "pact-temp-write": ".session.pact.tmp-",
+                    "pact-temp-flush": ".session.pact.tmp-",
+                    "pact-temp-fsync": ".session.pact.tmp-",
+                    "meta-temp-write": ".meta.json.tmp-",
+                    "meta-temp-flush": ".meta.json.tmp-",
+                    "meta-temp-fsync": ".meta.json.tmp-",
+                    "manifest-temp-write": ".fixtures.json.tmp-",
+                    "manifest-temp-flush": ".fixtures.json.tmp-",
+                    "manifest-temp-fsync": ".fixtures.json.tmp-",
+                }[point]
+
+                if point.endswith("-write") or point.endswith("-flush"):
+                    operation = point.rsplit("-", 1)[1]
+
+                    class FaultingHandle:
+                        def __init__(self, handle):
+                            self.handle = handle
+
+                        def __enter__(self):
+                            self.handle.__enter__()
+                            return self
+
+                        def __exit__(self, *args):
+                            return self.handle.__exit__(*args)
+
+                        def write(self, data):
+                            if operation == "write" and not fired["value"]:
+                                fired["value"] = True
+                                self.handle.write(data[: max(1, len(data) // 3)])
+                                raise OSError(f"injected partial {point}")
+                            return self.handle.write(data)
+
+                        def flush(self):
+                            if operation == "flush" and not fired["value"]:
+                                fired["value"] = True
+                                raise OSError(f"injected {point}")
+                            return self.handle.flush()
+
+                        def fileno(self):
+                            return self.handle.fileno()
+
+                    def faulting_fdopen(descriptor, *args, **kwargs):
+                        try:
+                            descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
+                        except OSError:
+                            descriptor_path = ""
+                        handle = real_fdopen(descriptor, *args, **kwargs)
+                        return FaultingHandle(handle) if marker in descriptor_path else handle
+
+                    return mock.patch.object(
+                        module.os,
+                        "fdopen",
+                        side_effect=faulting_fdopen,
+                    ), fired
+
+                def fail_temp_fsync(descriptor):
+                    try:
+                        descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
+                    except OSError:
+                        descriptor_path = ""
+                    if not fired["value"] and marker in descriptor_path:
+                        fired["value"] = True
+                        raise OSError(f"injected {point}")
+                    return real_fsync(descriptor)
+
+                return mock.patch.object(module.os, "fsync", side_effect=fail_temp_fsync), fired
+            if point in {
+                "pact-post-link-capture",
+                "meta-post-link-capture",
+                "manifest-post-replace-capture",
+            }:
+                failing_path = {
+                    "pact-post-link-capture": self.sessions_root / session_id / "pact" / "session.pact",
+                    "meta-post-link-capture": self.sessions_root / session_id / "meta.json",
+                    "manifest-post-replace-capture": self.manifest,
+                }[point]
+                real_owned_path = module.owned_path
+
+                def fail_capture(path):
+                    if not fired["value"] and path == failing_path:
+                        fired["value"] = True
+                        raise OSError(f"injected {point}")
+                    return real_owned_path(path)
+
+                return mock.patch.object(module, "owned_path", side_effect=fail_capture), fired
+            if point in {"pact-link-fsync", "meta-link-fsync", "manifest-post-replace-fsync"}:
+                failing_name = {
+                    "pact-link-fsync": "pact",
+                    "meta-link-fsync": session_id,
+                    "manifest-post-replace-fsync": "lab",
+                }[point]
+
+                def fail_directory_fsync(path):
+                    post_replace_ready = True
+                    if point == "manifest-post-replace-fsync":
+                        try:
+                            post_replace_ready = session_id in self.manifest.read_text(
+                                encoding="utf-8"
+                            )
+                        except (FileNotFoundError, UnicodeDecodeError):
+                            post_replace_ready = False
+                    if (
+                        not fired["value"]
+                        and path.name == failing_name
+                        and post_replace_ready
+                    ):
+                        fired["value"] = True
+                        raise OSError(f"injected {point}")
+                    return real_fsync_directory(path)
+
+                return (
+                    mock.patch.object(
+                        module,
+                        "fsync_directory",
+                        side_effect=fail_directory_fsync,
+                    ),
+                    fired,
+                )
+
+            def fail_manifest_replace(source, destination):
+                if not fired["value"] and str(destination) == str(self.manifest):
+                    fired["value"] = True
+                    raise OSError("injected manifest replace")
+                return real_replace(source, destination)
+
+            return mock.patch.object(module.os, "replace", side_effect=fail_manifest_replace), fired
+
+        points = (
+            "pact-fchmod",
+            "pact-temp-write",
+            "pact-temp-flush",
+            "pact-temp-fsync",
+            "pact-link-fsync",
+            "pact-post-link-capture",
+            "meta-fchmod",
+            "meta-temp-write",
+            "meta-temp-flush",
+            "meta-temp-fsync",
+            "meta-link-fsync",
+            "meta-post-link-capture",
+            "manifest-temp-write",
+            "manifest-temp-flush",
+            "manifest-temp-fsync",
+            "manifest-replace",
+            "manifest-post-replace-capture",
+            "manifest-post-replace-fsync",
+        )
+        for scenario in ("empty", "existing"):
+            if scenario == "existing":
+                first = module.install("pactbin2-truncated", "fx-first", self.env)
+                self.assertEqual(first["status"], "installed")
+            manifest_before = self.manifest.read_bytes() if self.manifest.exists() else None
+            kind = "pactbin2-truncated" if scenario == "empty" else "pactbin2-bitflip"
+            for point in points:
+                session_id = f"fx-{scenario}-{point}"
+                before = state(session_id)
+                patcher, fired = fault_patch(point, session_id)
+                with self.subTest(scenario=scenario, point=point):
+                    with patcher:
+                        with self.assertRaises(Exception):
+                            module.install(kind, session_id, self.env)
+                    self.assertTrue(fired["value"], f"fault point did not fire: {point}")
+                    self.assertEqual(state(session_id), before)
+                    self.assertEqual(
+                        self.manifest.read_bytes() if self.manifest.exists() else None,
+                        manifest_before,
+                    )
+                    self.assertFalse(list(self.lab_root.rglob("*.tmp-*")))
+                    self.assertFalse(list(self.lab_root.rglob(".fixtures.json.backup-*")))
+
+    def test_manifest_replace_error_after_visible_mutation_rolls_back_empty_and_existing_state(self) -> None:
+        self.add_source("source", pact_bytes(b"source"))
+        module = self.load_target_module()
+        real_replace = module.os.replace
+
+        for scenario in ("empty", "existing"):
+            if scenario == "existing":
+                first = module.install("pactbin2-truncated", "fx-first", self.env)
+                self.assertEqual(first["status"], "installed")
+            manifest_before = self.manifest.read_bytes() if self.manifest.exists() else None
+            session_id = f"fx-post-replace-{scenario}"
+            fired = {"value": False}
+
+            def replace_then_raise(source, destination):
+                result = real_replace(source, destination)
+                if (
+                    Path(destination) == self.manifest
+                    and Path(source).name.startswith(".fixtures.json.tmp-")
+                    and not fired["value"]
+                ):
+                    fired["value"] = True
+                    raise OSError("injected error after visible manifest replace")
+                return result
+
+            with self.subTest(scenario=scenario), mock.patch.object(
+                module.os,
+                "replace",
+                side_effect=replace_then_raise,
+            ):
+                with self.assertRaisesRegex(OSError, "after visible manifest replace"):
+                    module.install("pactbin2-bitflip", session_id, self.env)
+
+            self.assertTrue(fired["value"])
+            self.assertEqual(
+                self.manifest.read_bytes() if self.manifest.exists() else None,
+                manifest_before,
+            )
+            self.assertFalse((self.sessions_root / session_id).exists())
+            self.assertFalse(list(self.lab_dir.glob(".fixtures.json.backup-*")))
+            self.assertFalse(list(self.lab_dir.glob(".fixtures.json.restore-*")))
+            self.assertFalse(list(self.lab_dir.glob(".fixtures.json.tmp-*")))
+
+    def test_manifest_replace_error_with_failed_state_probe_is_fail_closed(self) -> None:
+        self.add_source("source", pact_bytes(b"source"))
+        module = self.load_target_module()
+        real_replace = module.os.replace
+        real_lstat = module.Path.lstat
+
+        for scenario in ("empty", "existing"):
+            if scenario == "existing":
+                first = module.install("pactbin2-truncated", "fx-first", self.env)
+                self.assertEqual(first["status"], "installed")
+            manifest_before = self.manifest.read_bytes() if self.manifest.exists() else None
+            session_id = f"fx-probe-failure-{scenario}"
+            replace_fired = {"value": False}
+            probe_fired = {"value": False}
+
+            def replace_then_raise(source, destination):
+                result = real_replace(source, destination)
+                if (
+                    Path(destination) == self.manifest
+                    and Path(source).name.startswith(".fixtures.json.tmp-")
+                    and not replace_fired["value"]
+                ):
+                    replace_fired["value"] = True
+                    raise OSError("injected post-mutation replace error")
+                return result
+
+            def fail_first_manifest_probe(path, *args, **kwargs):
+                if (
+                    Path(path) == self.manifest
+                    and replace_fired["value"]
+                    and not probe_fired["value"]
+                ):
+                    probe_fired["value"] = True
+                    raise OSError("injected manifest state probe failure")
+                return real_lstat(path, *args, **kwargs)
+
+            with self.subTest(scenario=scenario), mock.patch.object(
+                module.os,
+                "replace",
+                side_effect=replace_then_raise,
+            ), mock.patch.object(module.Path, "lstat", new=fail_first_manifest_probe):
+                with self.assertRaisesRegex(OSError, "state could not be classified"):
+                    module.install("pactbin2-bitflip", session_id, self.env)
+
+            self.assertTrue(replace_fired["value"])
+            self.assertTrue(probe_fired["value"])
+            self.assertEqual(
+                self.manifest.read_bytes() if self.manifest.exists() else None,
+                manifest_before,
+            )
+            self.assertFalse((self.sessions_root / session_id).exists())
+            self.assertFalse(list(self.lab_dir.glob(".fixtures.json.backup-*")))
+            self.assertFalse(list(self.lab_dir.glob(".fixtures.json.restore-*")))
+            self.assertFalse(list(self.lab_dir.glob(".fixtures.json.tmp-*")))
+
+    def test_failed_manifest_restore_keeps_a_consistent_state_and_recovery_material(self) -> None:
+        self.add_source("source", pact_bytes(b"source"))
+        module = self.load_target_module()
+        first = module.install("pactbin2-truncated", "fx-first", self.env)
+        self.assertEqual(first["status"], "installed")
+        manifest_before = self.manifest.read_bytes()
+        real_fsync_directory = module.fsync_directory
+        real_replace = module.os.replace
+
+        post_replace_failed = {"value": False}
+
+        def fail_post_replace_fsync(path):
+            if path == self.lab_dir and not post_replace_failed["value"]:
+                try:
+                    is_new_manifest = "fx-restore-replace" in self.manifest.read_text(
+                        encoding="utf-8"
+                    )
+                except (FileNotFoundError, UnicodeDecodeError):
+                    is_new_manifest = False
+                if is_new_manifest:
+                    post_replace_failed["value"] = True
+                    raise OSError("injected post-replace fsync")
+            return real_fsync_directory(path)
+
+        restore_replace_failed = {"value": False}
+
+        def fail_restore_replace(source, destination):
+            if (
+                post_replace_failed["value"]
+                and not restore_replace_failed["value"]
+                and str(destination) == str(self.manifest)
+            ):
+                restore_replace_failed["value"] = True
+                raise OSError("injected restore replace")
+            return real_replace(source, destination)
+
+        with mock.patch.object(
+            module, "fsync_directory", side_effect=fail_post_replace_fsync
+        ), mock.patch.object(module.os, "replace", side_effect=fail_restore_replace):
+            with self.assertRaises(Exception):
+                module.install("pactbin2-bitflip", "fx-restore-replace", self.env)
+
+        self.assertTrue(post_replace_failed["value"])
+        self.assertTrue(restore_replace_failed["value"])
+        committed = json.loads(self.manifest.read_text(encoding="utf-8"))
+        entry = committed["sessions"]["pactbin2-bitflip"]
+        self.assertTrue(Path(entry["pactPath"]).is_file())
+        self.assertTrue(Path(entry["metaPath"]).is_file())
+        backups = list(self.lab_dir.glob(".fixtures.json.backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), manifest_before)
+
+        committed_manifest = self.manifest.read_bytes()
+        Path(entry["pactPath"]).unlink()
+        Path(entry["metaPath"]).unlink()
+        Path(entry["pactPath"]).parent.rmdir()
+        Path(entry["pactPath"]).parent.parent.rmdir()
+        self.manifest.write_bytes(manifest_before)
+        for backup in backups:
+            backup.unlink()
+
+        # A restore that reaches the old bytes but cannot fsync the directory is
+        # rollback-consistent and retains the exact backup for operator recovery.
+        restore_fsync_calls = {"lab": 0, "commit_failed": False}
+
+        def fail_commit_and_restore_fsync(path):
+            if path == self.lab_dir:
+                try:
+                    is_new_manifest = "fx-restore-fsync" in self.manifest.read_text(
+                        encoding="utf-8"
+                    )
+                except (FileNotFoundError, UnicodeDecodeError):
+                    is_new_manifest = False
+                if is_new_manifest or restore_fsync_calls["commit_failed"]:
+                    restore_fsync_calls["lab"] += 1
+                    restore_fsync_calls["commit_failed"] = True
+                    raise OSError("injected commit/restore fsync")
+            return real_fsync_directory(path)
+
+        with mock.patch.object(
+            module, "fsync_directory", side_effect=fail_commit_and_restore_fsync
+        ):
+            with self.assertRaises(Exception):
+                module.install("pactbin2-bitflip", "fx-restore-fsync", self.env)
+
+        self.assertEqual(self.manifest.read_bytes(), manifest_before)
+        self.assertNotEqual(self.manifest.read_bytes(), committed_manifest)
+        self.assertTrue(
+            (self.sessions_root / "fx-restore-fsync" / "pact" / "session.pact").is_file()
+        )
+        self.assertTrue((self.sessions_root / "fx-restore-fsync" / "meta.json").is_file())
+        self.assertGreaterEqual(
+            len(list(self.lab_dir.glob(".fixtures.json.backup-*"))),
+            1,
+        )
+
+    def test_empty_manifest_rollback_fsync_failure_retains_fixture_files(self) -> None:
+        self.add_source("source", pact_bytes(b"source"))
+        module = self.load_target_module()
+        real_fsync_directory = module.fsync_directory
+        calls = {"lab": 0, "commit_failed": False}
+
+        def fail_commit_and_rollback_fsync(path):
+            if path == self.lab_dir:
+                try:
+                    new_visible = "fx-empty-indeterminate" in self.manifest.read_text(
+                        encoding="utf-8"
+                    )
+                except (FileNotFoundError, UnicodeDecodeError):
+                    new_visible = False
+                if new_visible or calls["commit_failed"]:
+                    calls["lab"] += 1
+                    calls["commit_failed"] = True
+                    raise OSError("injected empty commit/rollback fsync")
+            return real_fsync_directory(path)
+
+        with mock.patch.object(
+            module,
+            "fsync_directory",
+            side_effect=fail_commit_and_rollback_fsync,
+        ):
+            with self.assertRaises(Exception):
+                module.install("pactbin2-truncated", "fx-empty-indeterminate", self.env)
+
+        self.assertFalse(self.manifest.exists())
+        self.assertTrue(
+            (
+                self.sessions_root
+                / "fx-empty-indeterminate"
+                / "pact"
+                / "session.pact"
+            ).is_file()
+        )
+        self.assertTrue(
+            (self.sessions_root / "fx-empty-indeterminate" / "meta.json").is_file()
+        )
+
+    def test_donor_snapshot_write_flush_and_fsync_failures_leave_no_residue(self) -> None:
+        module = self.load_target_module()
+        paths = module.resolve_lab_paths(self.env)
+        real_fdopen = module.os.fdopen
+        real_fsync = module.os.fsync
+
+        for point in ("write", "flush", "fsync"):
+            fired = {"value": False}
+
+            class FaultingHandle:
+                def __init__(self, handle):
+                    self.handle = handle
+
+                def __enter__(self):
+                    self.handle.__enter__()
+                    return self
+
+                def __exit__(self, *args):
+                    return self.handle.__exit__(*args)
+
+                def write(self, data):
+                    if point == "write" and not fired["value"]:
+                        fired["value"] = True
+                        self.handle.write(data[:3])
+                        raise OSError("injected donor partial write")
+                    return self.handle.write(data)
+
+                def flush(self):
+                    if point == "flush" and not fired["value"]:
+                        fired["value"] = True
+                        raise OSError("injected donor flush")
+                    return self.handle.flush()
+
+                def fileno(self):
+                    return self.handle.fileno()
+
+            def faulting_fdopen(descriptor, *args, **kwargs):
+                descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
+                handle = real_fdopen(descriptor, *args, **kwargs)
+                if ".pact-source.tmp-" in descriptor_path:
+                    return FaultingHandle(handle)
+                return handle
+
+            def faulting_fsync(descriptor):
+                descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
+                if point == "fsync" and not fired["value"] and ".pact-source.tmp-" in descriptor_path:
+                    fired["value"] = True
+                    raise OSError("injected donor fsync")
+                return real_fsync(descriptor)
+
+            with self.subTest(point=point), mock.patch.object(
+                module.os,
+                "fdopen",
+                side_effect=faulting_fdopen,
+            ), mock.patch.object(module.os, "fsync", side_effect=faulting_fsync):
+                with self.assertRaises(Exception):
+                    module.snapshot_is_valid(paths, pact_bytes(b"source"))
+                self.assertTrue(fired["value"])
+                self.assertFalse(list(self.lab_dir.glob(".pact-source.tmp-*")))
+
+    def test_existing_manifest_backup_is_durable_before_destructive_replace(self) -> None:
+        self.add_source("source", pact_bytes(b"source"))
+        module = self.load_target_module()
+        first = module.install("pactbin2-truncated", "fx-first", self.env)
+        self.assertEqual(first["status"], "installed")
+        manifest_before = self.manifest.read_bytes()
+        real_fsync_directory = module.fsync_directory
+        fired = {"value": False}
+
+        def fail_backup_fsync(path):
+            if (
+                path == self.lab_dir
+                and not fired["value"]
+                and list(self.lab_dir.glob(".fixtures.json.backup-*"))
+            ):
+                fired["value"] = True
+                raise OSError("injected backup directory fsync")
+            return real_fsync_directory(path)
+
+        with mock.patch.object(module, "fsync_directory", side_effect=fail_backup_fsync):
+            with self.assertRaises(Exception):
+                module.install("pactbin2-bitflip", "fx-backup-fsync", self.env)
+
+        self.assertTrue(fired["value"])
+        self.assertEqual(self.manifest.read_bytes(), manifest_before)
+        self.assertFalse((self.sessions_root / "fx-backup-fsync").exists())
+        self.assertFalse(list(self.lab_dir.glob(".fixtures.json.backup-*")))
+
+    def test_backup_creation_rejects_a_swapped_source_before_manifest_replace(self) -> None:
+        self.add_source("source", pact_bytes(b"source"))
+        module = self.load_target_module()
+        first = module.install("pactbin2-truncated", "fx-first", self.env)
+        self.assertEqual(first["status"], "installed")
+        manifest_before = self.manifest.read_bytes()
+        real_link = module.os.link
+        attacker = b'{"owner":"attacker-backup"}\n'
+        fired = {"value": False}
+
+        def swap_new_backup(source, destination, *args, **kwargs):
+            result = real_link(source, destination, *args, **kwargs)
+            destination_path = Path(destination)
+            if (
+                not fired["value"]
+                and destination_path.name.startswith(".fixtures.json.backup-")
+            ):
+                fired["value"] = True
+                destination_path.unlink()
+                destination_path.write_bytes(attacker)
+            return result
+
+        with mock.patch.object(module.os, "link", side_effect=swap_new_backup):
+            with self.assertRaises(Exception):
+                module.install("pactbin2-bitflip", "fx-backup-source-swap", self.env)
+
+        self.assertTrue(fired["value"])
+        self.assertEqual(self.manifest.read_bytes(), manifest_before)
+        self.assertFalse((self.sessions_root / "fx-backup-source-swap").exists())
+        backups = list(self.lab_dir.glob(".fixtures.json.backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), attacker)
+
+    def test_pre_restore_backup_swap_is_indeterminate_and_never_installs_attacker(self) -> None:
+        self.add_source("source", pact_bytes(b"source"))
+        module = self.load_target_module()
+        first = module.install("pactbin2-truncated", "fx-first", self.env)
+        self.assertEqual(first["status"], "installed")
+        manifest_before = self.manifest.read_bytes()
+        real_fsync_directory = module.fsync_directory
+        attacker = b'{"owner":"attacker-restore"}\n'
+        fired = {"value": False}
+
+        def swap_backup_then_fail_commit(path):
+            try:
+                new_visible = "fx-pre-restore-swap" in self.manifest.read_text(
+                    encoding="utf-8"
+                )
+            except (FileNotFoundError, UnicodeDecodeError):
+                new_visible = False
+            if path == self.lab_dir and new_visible and not fired["value"]:
+                backup = next(iter(self.lab_dir.glob(".fixtures.json.backup-*")))
+                backup.unlink()
+                backup.write_bytes(attacker)
+                fired["value"] = True
+                raise OSError("injected commit fsync after backup swap")
+            return real_fsync_directory(path)
+
+        with mock.patch.object(
+            module,
+            "fsync_directory",
+            side_effect=swap_backup_then_fail_commit,
+        ):
+            with self.assertRaises(module.ManifestPublishError) as raised:
+                module.install("pactbin2-bitflip", "fx-pre-restore-swap", self.env)
+
+        self.assertEqual(raised.exception.state, "indeterminate")
+        self.assertTrue(fired["value"])
+        self.assertNotEqual(self.manifest.read_bytes(), attacker)
+        self.assertIn(b"fx-pre-restore-swap", self.manifest.read_bytes())
+        self.assertTrue(
+            (self.sessions_root / "fx-pre-restore-swap" / "pact" / "session.pact").is_file()
+        )
+        backups = list(self.lab_dir.glob(".fixtures.json.backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), attacker)
+        self.assertNotEqual(backups[0].read_bytes(), manifest_before)
+
+    def test_restore_link_identity_is_checked_before_replacing_the_manifest(self) -> None:
+        self.add_source("source", pact_bytes(b"source"))
+        module = self.load_target_module()
+        first = module.install("pactbin2-truncated", "fx-first", self.env)
+        self.assertEqual(first["status"], "installed")
+        manifest_before = self.manifest.read_bytes()
+        real_fsync_directory = module.fsync_directory
+        real_link = module.os.link
+        commit_failed = {"value": False}
+        restore_swapped = {"value": False}
+
+        def fail_commit_fsync(path):
+            try:
+                new_visible = "fx-restore-link-swap" in self.manifest.read_text(
+                    encoding="utf-8"
+                )
+            except (FileNotFoundError, UnicodeDecodeError):
+                new_visible = False
+            if path == self.lab_dir and new_visible and not commit_failed["value"]:
+                commit_failed["value"] = True
+                raise OSError("injected commit fsync")
+            return real_fsync_directory(path)
+
+        def swap_restore_link(source, destination, *args, **kwargs):
+            result = real_link(source, destination, *args, **kwargs)
+            destination_path = Path(destination)
+            if destination_path.name.startswith(".fixtures.json.restore-"):
+                restore_swapped["value"] = True
+                destination_path.unlink()
+                destination_path.write_bytes(b'{"owner":"attacker-restore-link"}\n')
+            return result
+
+        with mock.patch.object(
+            module,
+            "fsync_directory",
+            side_effect=fail_commit_fsync,
+        ), mock.patch.object(module.os, "link", side_effect=swap_restore_link):
+            with self.assertRaises(module.ManifestPublishError) as raised:
+                module.install("pactbin2-bitflip", "fx-restore-link-swap", self.env)
+
+        self.assertEqual(raised.exception.state, "indeterminate")
+        self.assertTrue(commit_failed["value"])
+        self.assertTrue(restore_swapped["value"])
+        self.assertIn(b"fx-restore-link-swap", self.manifest.read_bytes())
+        self.assertTrue(
+            (self.sessions_root / "fx-restore-link-swap" / "pact" / "session.pact").is_file()
+        )
+        backups = list(self.lab_dir.glob(".fixtures.json.backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), manifest_before)
+
+    def test_restore_link_is_revalidated_after_replace_before_rollback_commits(self) -> None:
+        self.add_source("source", pact_bytes(b"source"))
+        module = self.load_target_module()
+        first = module.install("pactbin2-truncated", "fx-first", self.env)
+        self.assertEqual(first["status"], "installed")
+        manifest_before = self.manifest.read_bytes()
+        attacker = b'{"owner":"attacker-after-validation"}\n'
+        real_fsync_directory = module.fsync_directory
+        real_replace = module.os.replace
+        commit_failed = {"value": False}
+        restore_swapped = {"value": False}
+
+        def fail_commit_fsync(path):
+            try:
+                new_visible = "fx-restore-replace-swap" in self.manifest.read_text(
+                    encoding="utf-8"
+                )
+            except (FileNotFoundError, UnicodeDecodeError):
+                new_visible = False
+            if path == self.lab_dir and new_visible and not commit_failed["value"]:
+                commit_failed["value"] = True
+                raise OSError("injected commit fsync")
+            return real_fsync_directory(path)
+
+        def swap_restore_immediately_before_replace(source, destination):
+            source_path = Path(source)
+            destination_path = Path(destination)
+            if (
+                source_path.name.startswith(".fixtures.json.restore-")
+                and destination_path == self.manifest
+            ):
+                restore_swapped["value"] = True
+                source_path.unlink()
+                source_path.write_bytes(attacker)
+            return real_replace(source, destination)
+
+        with mock.patch.object(
+            module,
+            "fsync_directory",
+            side_effect=fail_commit_fsync,
+        ), mock.patch.object(
+            module.os,
+            "replace",
+            side_effect=swap_restore_immediately_before_replace,
+        ):
+            with self.assertRaises(module.ManifestPublishError) as raised:
+                module.install("pactbin2-bitflip", "fx-restore-replace-swap", self.env)
+
+        self.assertEqual(raised.exception.state, "indeterminate")
+        self.assertTrue(commit_failed["value"])
+        self.assertTrue(restore_swapped["value"])
+        self.assertEqual(self.manifest.read_bytes(), attacker)
+        self.assertTrue(
+            (self.sessions_root / "fx-restore-replace-swap" / "pact" / "session.pact").is_file()
+        )
+        backups = list(self.lab_dir.glob(".fixtures.json.backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), manifest_before)
+
+    def test_session_directory_is_fsynced_before_the_manifest_commit(self) -> None:
+        self.add_source("source", pact_bytes(b"source"))
+        module = self.load_target_module()
+        events: list[tuple[str, str]] = []
+        real_fsync_directory = module.fsync_directory
+        real_replace = module.os.replace
+
+        def record_fsync(path):
+            events.append(("fsync", str(path)))
+            return real_fsync_directory(path)
+
+        def record_replace(source, destination):
+            if Path(destination) == self.manifest:
+                events.append(("replace-manifest", str(destination)))
+            return real_replace(source, destination)
+
+        with mock.patch.object(
+            module,
+            "fsync_directory",
+            side_effect=record_fsync,
+        ), mock.patch.object(module.os, "replace", side_effect=record_replace):
+            result = module.install("pactbin2-truncated", "fx-order", self.env)
+
+        self.assertEqual(result["status"], "installed")
+        commit_index = events.index(("replace-manifest", str(self.manifest)))
+        sessions_fsync_index = events.index(("fsync", str(self.sessions_root)))
+        self.assertLess(sessions_fsync_index, commit_index)
+
+    def test_cleanup_never_unlinks_an_adversarial_replacement(self) -> None:
+        self.add_source("source", pact_bytes(b"source"))
+        module = self.load_target_module()
+        session_id = "fx-adversarial-replacement"
+        pact = self.sessions_root / session_id / "pact" / "session.pact"
+        meta = self.sessions_root / session_id / "meta.json"
+        attacker_pact = b"operator-pact-replacement"
+        attacker_meta = b'{"owner":"operator"}\n'
+
+        def replace_then_fail(_path, _document):
+            pact.unlink()
+            pact.write_bytes(attacker_pact)
+            meta.unlink()
+            meta.write_bytes(attacker_meta)
+            raise OSError("injected manifest failure after adversarial replacement")
+
+        with mock.patch.object(module, "publish_manifest", side_effect=replace_then_fail):
+            with self.assertRaises(Exception):
+                module.install("pactbin2-truncated", session_id, self.env)
+
+        self.assertEqual(pact.read_bytes(), attacker_pact)
+        self.assertEqual(meta.read_bytes(), attacker_meta)
+        self.assertTrue(pact.parent.parent.is_dir())
+        self.assertFalse(self.manifest.exists())
+
+    def test_cleanup_does_not_overwrite_a_dangling_symlink_replacement(self) -> None:
+        module = self.load_target_module()
+        managed = self.lab_dir / "managed-cleanup"
+        managed.write_bytes(b"owned")
+        captured = module.owned_path(managed)
+        missing = self.lab_dir / "missing-referent"
+        real_same_owned_path = module.same_owned_path
+        replaced = {"value": False}
+
+        def replace_destination_before_restore(owned):
+            if owned.path.name.startswith(".managed-cleanup.unlink-"):
+                managed.symlink_to(missing)
+                replaced["value"] = True
+                return False
+            return real_same_owned_path(owned)
+
+        with mock.patch.object(
+            module,
+            "same_owned_path",
+            side_effect=replace_destination_before_restore,
+        ):
+            self.assertFalse(module.unlink_owned(captured))
+
+        self.assertTrue(replaced["value"])
+        self.assertTrue(managed.is_symlink())
+        self.assertEqual(os.readlink(managed), str(missing))
+
+    def test_directory_cleanup_preserves_a_replacement_inode(self) -> None:
+        module = self.load_target_module()
+        managed = self.lab_dir / "managed-directory"
+        original = self.lab_dir / "managed-directory-original"
+        managed.mkdir()
+        captured = module.owned_directory(managed)
+        managed.rename(original)
+        managed.mkdir()
+
+        module.remove_created([], [captured])
+
+        self.assertTrue(managed.is_dir())
+        self.assertTrue(original.is_dir())
+
+    def test_directory_fsync_rejects_a_path_swap_before_open(self) -> None:
+        module = self.load_target_module()
+        managed = self.lab_dir / "fsync-directory"
+        moved = self.lab_dir / "fsync-directory-original"
+        managed.mkdir()
+        real_open = module.os.open
+        swapped = {"value": False}
+
+        def swap_before_open(path, flags, *args, **kwargs):
+            if Path(path) == managed and not swapped["value"]:
+                managed.rename(moved)
+                managed.mkdir()
+                swapped["value"] = True
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(module.os, "open", side_effect=swap_before_open):
+            with self.assertRaisesRegex(OSError, "directory changed"):
+                module.fsync_directory(managed)
+
+        self.assertTrue(swapped["value"])
+        self.assertTrue(managed.is_dir())
+        self.assertTrue(moved.is_dir())
+
+    def test_manifest_symlink_is_rejected_and_concurrent_installs_do_not_lose_entries(self) -> None:
+        self.add_source("source", pact_bytes(b"source"))
+        outside_manifest = self.temp / "outside-manifest.json"
+        outside_manifest.write_text('{"owner":"operator"}\n', encoding="utf-8")
+        self.manifest.symlink_to(outside_manifest)
+
+        linked = self.install("pactbin2-truncated", "fx-linked-manifest")
+
+        self.assertEqual(linked.returncode, 4)
+        self.assertIn("error[LAB_FIXTURE_PATH_UNSAFE]", linked.stderr)
+        self.assertEqual(outside_manifest.read_text(), '{"owner":"operator"}\n')
+
+        self.manifest.unlink()
+        if not TARGET.is_file():
+            self.fail(f"implementation script is missing: {TARGET}")
+        commands = [
+            [str(TARGET), "install", "pactbin2-truncated", "--session", "fx-a"],
+            [str(TARGET), "install", "pactbin2-bitflip", "--session", "fx-b"],
+        ]
+        processes = [
+            subprocess.Popen(
+                command,
+                cwd=ROOT,
+                env=self.env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for command in commands
+        ]
+        results = [process.communicate(timeout=10) for process in processes]
+        for process, (_stdout, stderr) in zip(processes, results):
+            self.assertEqual(process.returncode, 0, stderr)
+        document = json.loads(self.manifest.read_text())
+        self.assertEqual(set(document["sessions"]), set(KINDS))
+        expected_source = str(self.sessions_root / "source" / "pact" / "session.pact")
+        self.assertEqual(
+            {entry["sourcePactPath"] for entry in document["sessions"].values()},
+            {expected_source},
+        )
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

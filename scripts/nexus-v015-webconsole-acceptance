@@ -1,26 +1,46 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 NEXUS_BIN="${NEXUS_V015_NEXUS_BIN:-nexus}"
 HOST=127.0.0.1
-PORT=4200
-RUN_ID="${NEXUS_V015_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+PORT=0
+RUN_ID="${NEXUS_V015_RUN_ID:-}"
+AMBIENT_RUN_ID="${NEXUS_V015_RUN_ID:-}"
 EVIDENCE_DIR="${NEXUS_V015_EVIDENCE_DIR:-/tmp/nexus-lens-home/evidence}"
+EVIDENCE_ROOT="${NEXUS_V015_EVIDENCE_ROOT:-}"
+PACKED_PREFIX="${NEXUS_V015_PACKED_PREFIX:-}"
+VERIFY_RESULT_SEAL_ROOT=""
+FOREIGN_PID=""
+ACTIVE_WEBCONSOLE_PID=""
+RESULT_SEAL=""
+RESULT_SEAL_OWNED=0
+RESULT_SEAL_SNAPSHOT=""
+SUCCESS=0
+PACKED_CLI_VALIDATED=0
+LIFECYCLE_TOUCHED=0
+WEBCONSOLE_ENTRYPOINT_SNAPSHOT=""
+CLEANUP_TARGET_SNAPSHOT=""
 
 usage() {
   cat <<'USAGE'
 Usage: scripts/nexus-v015-webconsole-acceptance [options]
 
 Exercise the complete packed `nexus webconsole` lifecycle inside the isolated
-v0.1.5 validator and leave the Webconsole healthy for browser acceptance.
+v0.1.5 validator. The gate finishes with Webconsole stopped and its selected
+ephemeral ports closed; it never stops or replaces the validator Gateway.
 
 Options:
-  --nexus-bin PATH      Nexus CLI under test.
-  --host HOST           Webconsole bind host (default: 127.0.0.1).
-  --port PORT           Webconsole port (default: 4200).
-  --run-id ID           Evidence run identifier.
-  --evidence-dir PATH   Root evidence directory.
-  -h, --help            Show this help without side effects.
+  --nexus-bin PATH       Packed Nexus CLI under test.
+  --host HOST            Webconsole bind host (default: 127.0.0.1).
+  --port PORT            Webconsole port; 0 selects a fresh closed port (default: 0).
+  --run-id ID            Candidate run identifier (must match manifest.json).
+  --evidence-dir PATH    Evidence parent used with --run-id.
+  --evidence-root PATH   Run root containing the packed manifest.json.
+  --packed-prefix PATH   Clean global prefix containing only @egregore/nexus.
+  --verify-result-seal PATH
+                         Verify a completed D2 result against its detached seal.
+  -h, --help             Show this help without side effects.
 USAGE
 }
 
@@ -56,6 +76,21 @@ while [ "$#" -gt 0 ]; do
       EVIDENCE_DIR=$2
       shift 2
       ;;
+    --evidence-root)
+      [ "$#" -ge 2 ] || die "--evidence-root requires a value"
+      EVIDENCE_ROOT=$2
+      shift 2
+      ;;
+    --packed-prefix)
+      [ "$#" -ge 2 ] || die "--packed-prefix requires a value"
+      PACKED_PREFIX=$2
+      shift 2
+      ;;
+    --verify-result-seal)
+      [ "$#" -ge 2 ] || die "--verify-result-seal requires a value"
+      VERIFY_RESULT_SEAL_ROOT=$2
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -64,8 +99,192 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+for fixture_hook in \
+  NEXUS_V015_FIXTURE_FAIL_SELF_VERIFY \
+  NEXUS_V015_FIXTURE_FAIL_RESULT_FSYNC \
+  NEXUS_V015_FIXTURE_FAIL_POST_PUBLISH_VERIFY \
+  NEXUS_V015_FIXTURE_FAIL_SEAL_PARENT_FSYNC \
+  NEXUS_V015_FIXTURE_KILL_PARENT_AFTER_SEAL_COMMIT \
+  NEXUS_V015_FIXTURE_FAIL_AFTER_SEAL_PUBLISH \
+  NEXUS_V015_FIXTURE_FAIL_SEAL_UNLINK \
+  NEXUS_V015_FIXTURE_FAIL_SEAL_QUARANTINE_RENAME \
+  NEXUS_V015_FIXTURE_FAIL_SEAL_QUARANTINE_OPEN \
+  NEXUS_V015_FIXTURE_FAIL_SEAL_QUARANTINE_CHMOD \
+  NEXUS_V015_FIXTURE_FAIL_SEAL_QUARANTINE_FSYNC \
+  NEXUS_V015_FIXTURE_FAIL_SEAL_QUARANTINE_PARENT_FSYNC \
+  NEXUS_V015_FIXTURE_KILL_AFTER_SEAL_QUARANTINE_RENAME \
+  NEXUS_V015_FIXTURE_KILL_AFTER_SEAL_QUARANTINE_CHMOD \
+  NEXUS_V015_FIXTURE_FAIL_SEAL_RESTORE_PARENT_FSYNC \
+  NEXUS_V015_FIXTURE_KILL_AFTER_SEAL_RESTORE_FSYNC \
+  NEXUS_V015_FIXTURE_SWAP_SEAL_BEFORE_PUBLISH_ROLLBACK \
+  NEXUS_V015_FIXTURE_SWAP_SEAL_BEFORE_INVALIDATE \
+  NEXUS_V015_FIXTURE_GATEWAY_HOST_MODE; do
+  hook_value=${!fixture_hook-}
+  if [ -n "$hook_value" ] && [ "${NEXUS_V015_ALLOW_FIXTURE_HOME:-}" != 1 ]; then
+    die "$fixture_hook is forbidden outside the isolated fixture"
+  fi
+done
+
+if [ -n "$VERIFY_RESULT_SEAL_ROOT" ]; then
+  command -v python3 >/dev/null 2>&1 || die "required command is unavailable: python3"
+  python3 - "$VERIFY_RESULT_SEAL_ROOT" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+
+def fail(message):
+    raise SystemExit(f"D2 result seal verification failed: {message}")
+
+
+def no_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            fail(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def read_json(raw, label):
+    try:
+        return json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=no_duplicates,
+            parse_constant=lambda value: fail(f"non-finite JSON in {label}: {value}"),
+        )
+    except (UnicodeError, json.JSONDecodeError) as error:
+        fail(f"invalid {label}: {error}")
+
+
+def reject_symlink_ancestry(path):
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    cursor = Path(absolute.anchor)
+    for component in absolute.parts[1:-1]:
+        cursor /= component
+        try:
+            info = os.lstat(cursor)
+        except OSError as error:
+            fail(f"cannot inspect path ancestry {cursor}: {error}")
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            fail(f"unsafe path ancestry: {cursor}")
+
+
+def read_single_regular(path, label, expected_mode=None):
+    reject_symlink_ancestry(path)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        fail(f"cannot open {label}: {error}")
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            fail(f"{label} is not a single regular file")
+        if expected_mode is not None and stat.S_IMODE(info.st_mode) != expected_mode:
+            fail(f"{label} mode is not {expected_mode:o}")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+root = Path(os.path.abspath(sys.argv[1]))
+manifest_raw = read_single_regular(root / "manifest.json", "candidate manifest")
+result_relative = Path("results/D2-webconsole-cli/result.json")
+seal_relative = Path("results/D2-webconsole-cli.result.sha256")
+result_raw = read_single_regular(root / result_relative, "D2 result", 0o400)
+seal_raw = read_single_regular(root / seal_relative, "D2 result seal", 0o400)
+manifest = read_json(manifest_raw, "candidate manifest")
+result = read_json(result_raw, "D2 result")
+seal = read_json(seal_raw, "D2 result seal")
+packages = manifest.get("packages")
+if not isinstance(packages, list):
+    fail("candidate manifest package ledger is invalid")
+ledger = {
+    "mode": manifest.get("mode"),
+    "sources": manifest.get("sources"),
+    "nativeSha256": (manifest.get("native") or {}).get("sha256"),
+    "packages": [{
+        "name": row.get("name"),
+        "version": row.get("version"),
+        "tarballSha256": (row.get("tarball") or {}).get("sha256"),
+    } for row in packages if isinstance(row, dict)],
+    "imageDigest": (manifest.get("image") or {}).get("digest"),
+    "limits": (manifest.get("container") or {}).get("limits"),
+    "toolchains": manifest.get("toolchains"),
+    "environment": manifest.get("environment"),
+}
+candidate_raw = json.dumps(
+    ledger,
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=False,
+    allow_nan=False,
+).encode("utf-8")
+candidate_digest = "sha256:" + hashlib.sha256(candidate_raw).hexdigest()
+expected_seal = {
+    "schemaVersion": 1,
+    "runId": manifest.get("runId"),
+    "candidateDigest": candidate_digest,
+    "gate": "D2",
+    "resultPath": result_relative.as_posix(),
+    "resultSha256": hashlib.sha256(result_raw).hexdigest(),
+    "resultSize": len(result_raw),
+}
+if seal != expected_seal:
+    if isinstance(seal, dict) and seal.get("resultSha256") != expected_seal["resultSha256"]:
+        fail("result hash mismatch")
+    fail("result seal does not match the current candidate and D2 result")
+if (
+    not isinstance(result, dict)
+    or result.get("runId") != manifest.get("runId")
+    or result.get("candidateDigest") != candidate_digest
+    or result.get("gate") != "D2"
+    or result.get("status") != "PASS"
+):
+    fail("D2 result identity does not match the sealed candidate")
+print(f"D2 result seal verified: {root / seal_relative}")
+PY
+  exit 0
+fi
+
 [ "${OCULAR_LAB:-}" = 1 ] || die "refusing to run outside the isolated ocular lab"
 [ -n "${NEXUS_HOME:-}" ] || die "NEXUS_HOME is required"
+[ -n "${NEXUS_LAB_ROOT:-}" ] || die "NEXUS_LAB_ROOT is required"
+LAB_ROOT=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$NEXUS_LAB_ROOT")
+[ "$LAB_ROOT" = "$NEXUS_LAB_ROOT" ] || die "NEXUS_LAB_ROOT must be an absolute normalized path"
+CURRENT_READINESS_PATH="$LAB_ROOT/lab/candidate-ready.v1"
+if [ "${NEXUS_V015_ALLOW_FIXTURE_HOME:-}" = 1 ]; then
+  CGROUP_ROOT="${NEXUS_V015_FIXTURE_CGROUP_ROOT:-/sys/fs/cgroup}"
+  CGROUP_ROOT=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$CGROUP_ROOT")
+  case "$CGROUP_ROOT" in
+    "$LAB_ROOT"/*|/sys/fs/cgroup) ;;
+    *) die "fixture cgroup root must stay inside NEXUS_LAB_ROOT" ;;
+  esac
+  CURRENT_CONTAINER_ID="${NEXUS_V015_CURRENT_CONTAINER_ID:-}"
+  [[ "$CURRENT_CONTAINER_ID" =~ ^[0-9a-f]{64}$ ]] \
+    || die "fixture current container identity must be a 64-character hexadecimal id"
+  CURRENT_CONTAINER_MATCH=exact
+else
+  [ -z "${NEXUS_V015_FIXTURE_CGROUP_ROOT:-}" ] \
+    || die "fixture cgroup override is forbidden in release mode"
+  CGROUP_ROOT=/sys/fs/cgroup
+  [ -f /etc/hostname ] && [ ! -L /etc/hostname ] \
+    || die "current container identity is unavailable"
+  CURRENT_CONTAINER_ID=$(tr -d '\r\n' </etc/hostname)
+  [[ "$CURRENT_CONTAINER_ID" =~ ^[0-9a-f]{12,64}$ ]] \
+    || die "current container identity is invalid: $CURRENT_CONTAINER_ID"
+  CURRENT_CONTAINER_MATCH=prefix
+fi
 if [ "${NEXUS_V015_ALLOW_FIXTURE_HOME:-}" != 1 ]; then
   case "$NEXUS_HOME" in
     /tmp/nexus-lens-home/*) ;;
@@ -76,24 +295,2007 @@ fi
 case "$PORT" in
   ''|*[!0-9]*) die "--port must be an integer" ;;
 esac
-[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "--port must be a TCP port"
+[ "$PORT" -ge 0 ] && [ "$PORT" -le 65535 ] || die "--port must be 0 or a TCP port"
 
-for command in curl jq timeout; do
+for command in curl jq timeout python3 sha256sum stat readlink; do
   command -v "$command" >/dev/null 2>&1 || die "required command is unavailable: $command"
 done
 if [[ "$NEXUS_BIN" == */* ]]; then
   [ -x "$NEXUS_BIN" ] || die "Nexus CLI is not executable: $NEXUS_BIN"
+  NEXUS_LAUNCHER=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$NEXUS_BIN")
 else
-  command -v "$NEXUS_BIN" >/dev/null 2>&1 || die "Nexus CLI is unavailable: $NEXUS_BIN"
+  NEXUS_LAUNCHER=$(command -v "$NEXUS_BIN" 2>/dev/null || true)
+  [ -n "$NEXUS_LAUNCHER" ] || die "Nexus CLI is unavailable: $NEXUS_BIN"
 fi
 
-OUT="$EVIDENCE_DIR/$RUN_ID/webconsole"
-mkdir -p "$OUT"
+if [ -n "$EVIDENCE_ROOT" ]; then
+  RUN_ROOT=$EVIDENCE_ROOT
+else
+  [ -n "$RUN_ID" ] || die "--run-id or NEXUS_V015_RUN_ID is required without --evidence-root"
+  RUN_ROOT="$EVIDENCE_DIR/$RUN_ID"
+fi
+MANIFEST="$RUN_ROOT/manifest.json"
+[ -f "$MANIFEST" ] && [ ! -L "$MANIFEST" ] \
+  || die "packed candidate manifest is missing or unsafe: $MANIFEST"
 
-run_capture() {
-  local label=$1
-  shift
-  "$@" >"$OUT/$label.stdout" 2>"$OUT/$label.stderr"
+WORK=$(mktemp -d)
+capture_validated_cleanup_targets() {
+  local destination=$1
+  python3 - \
+    "${WEBCONSOLE_EXE:-}" "${WEBCONSOLE_ENTRYPOINT_SNAPSHOT:-}" \
+    "${DISCOVERY:-}" "${NEXUS_V015_ALLOW_FIXTURE_HOME:-0}" \
+    >"$destination" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+executable_raw, entrypoint_snapshot_raw, discovery_raw, fixture_raw = sys.argv[1:]
+empty = {"schemaVersion": 1, "targets": [], "stopAllowed": False, "discovery": None}
+if not executable_raw or not entrypoint_snapshot_raw or not discovery_raw:
+    print(json.dumps(empty, sort_keys=True))
+    raise SystemExit(0)
+executable = os.path.realpath(executable_raw)
+discovery = os.path.abspath(discovery_raw)
+fixture = fixture_raw == "1"
+try:
+    expected_entrypoint = json.loads(
+        Path(entrypoint_snapshot_raw).read_text(encoding="utf-8")
+    )
+except (OSError, UnicodeError, json.JSONDecodeError):
+    print(json.dumps(empty, sort_keys=True))
+    raise SystemExit(0)
+
+
+def file_record(path):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            return None, b""
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        return (
+            {
+                "device": info.st_dev,
+                "inode": info.st_ino,
+                "size": info.st_size,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            },
+            raw,
+        )
+    finally:
+        os.close(descriptor)
+
+
+try:
+    if file_record(executable)[0] != expected_entrypoint:
+        print(json.dumps(empty, sort_keys=True))
+        raise SystemExit(0)
+except OSError:
+    print(json.dumps(empty, sort_keys=True))
+    raise SystemExit(0)
+
+
+def process_matches(pid):
+    try:
+        argv = [
+            raw.decode("utf-8", "surrogateescape")
+            for raw in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if raw
+        ]
+        process_executable = os.path.basename(os.path.realpath(f"/proc/{pid}/exe"))
+        fields = (
+            Path(f"/proc/{pid}/stat")
+            .read_text(encoding="ascii")
+            .rsplit(") ", 1)[1]
+            .split()
+        )
+        start_ticks = int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+    interpreter_allowed = process_executable in {"node", "nodejs"} or (
+        fixture and (process_executable == "python" or process_executable.startswith("python3"))
+    )
+    if (
+        len(argv) < 2
+        or not interpreter_allowed
+        or not os.path.isabs(argv[1])
+        or os.path.realpath(argv[1]) != executable
+    ):
+        return None
+    discovery_indexes = [
+        index for index, value in enumerate(argv) if value == "--discovery"
+    ]
+    if len(discovery_indexes) != 1:
+        return None
+    index = discovery_indexes[0]
+    if index + 1 >= len(argv) or os.path.abspath(argv[index + 1]) != discovery:
+        return None
+    return {
+        "pid": pid,
+        "startTicks": start_ticks,
+        "argv": argv,
+        "processExecutable": os.path.realpath(f"/proc/{pid}/exe"),
+    }
+
+
+targets = []
+for entry in Path("/proc").iterdir():
+    if not entry.name.isdigit() or int(entry.name) == os.getpid():
+        continue
+    matched = process_matches(int(entry.name))
+    if matched is not None:
+        targets.append(matched)
+targets.sort(key=lambda row: row["pid"])
+target_by_pid = {row["pid"]: row for row in targets}
+
+discovery_record = None
+stop_allowed = False
+try:
+    discovery_identity, raw = file_record(discovery)
+    if discovery_identity is not None:
+        value = json.loads(raw)
+        pid = value.get("pid") if isinstance(value, dict) else None
+        recorded = value.get("executable") if isinstance(value, dict) else None
+        if (
+            isinstance(pid, int)
+            and pid in target_by_pid
+            and isinstance(recorded, str)
+            and os.path.realpath(recorded) == executable
+        ):
+            discovery_record = {
+                **discovery_identity,
+                "pid": pid,
+                "executable": recorded,
+            }
+            stop_allowed = True
+except (OSError, UnicodeError, json.JSONDecodeError):
+    pass
+
+# Cleanup authority is the one process selected by the pre-mutation discovery
+# record. Other same-shaped candidate processes are never cleanup targets.
+if stop_allowed and discovery_record is not None:
+    targets = [target_by_pid[discovery_record["pid"]]]
+else:
+    targets = []
+
+print(json.dumps({
+    "schemaVersion": 1,
+    "targets": targets,
+    "stopAllowed": stop_allowed,
+    "discovery": discovery_record,
+}, sort_keys=True))
+PY
+}
+
+cleanup_snapshot_stop_is_allowed() {
+  local snapshot=$1
+  python3 - \
+    "$snapshot" "${WEBCONSOLE_ENTRYPOINT_SNAPSHOT:-}" \
+    "${WEBCONSOLE_EXE:-}" "${DISCOVERY:-}" \
+    "${NEXUS_V015_ALLOW_FIXTURE_HOME:-0}" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+snapshot_path, entrypoint_path, executable_raw, discovery, fixture_raw = sys.argv[1:]
+fixture = fixture_raw == "1"
+try:
+    snapshot = json.loads(Path(snapshot_path).read_text(encoding="utf-8"))
+    expected_entrypoint = json.loads(Path(entrypoint_path).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if not snapshot.get("stopAllowed") or not isinstance(snapshot.get("discovery"), dict):
+    raise SystemExit(1)
+
+
+def read_record(path):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            return None, b""
+        raw = b""
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            raw += chunk
+        return (
+            {
+                "device": info.st_dev,
+                "inode": info.st_ino,
+                "size": info.st_size,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            },
+            raw,
+        )
+    finally:
+        os.close(descriptor)
+
+
+try:
+    if read_record(os.path.realpath(executable_raw))[0] != expected_entrypoint:
+        raise SystemExit(1)
+    current_discovery, discovery_raw = read_record(discovery)
+except OSError:
+    raise SystemExit(1)
+expected_discovery = {
+    key: snapshot["discovery"][key]
+    for key in ("device", "inode", "size", "sha256")
+}
+if current_discovery != expected_discovery:
+    raise SystemExit(1)
+try:
+    discovery_value = json.loads(discovery_raw)
+except (UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+if (
+    not isinstance(discovery_value, dict)
+    or discovery_value.get("pid") != snapshot["discovery"]["pid"]
+    or not isinstance(discovery_value.get("executable"), str)
+    or os.path.realpath(discovery_value["executable"]) != os.path.realpath(executable_raw)
+):
+    raise SystemExit(1)
+target = next(
+    (row for row in snapshot.get("targets", []) if row.get("pid") == snapshot["discovery"]["pid"]),
+    None,
+)
+if target is None:
+    raise SystemExit(1)
+try:
+    pid = target["pid"]
+    argv = [
+        raw.decode("utf-8", "surrogateescape")
+        for raw in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        if raw
+    ]
+    process_executable = os.path.realpath(f"/proc/{pid}/exe")
+    fields = (
+        Path(f"/proc/{pid}/stat")
+        .read_text(encoding="ascii")
+        .rsplit(") ", 1)[1]
+        .split()
+    )
+    start_ticks = int(fields[19])
+except (OSError, ValueError, IndexError):
+    raise SystemExit(1)
+indexes = [index for index, value in enumerate(argv) if value == "--discovery"]
+if not (
+    start_ticks == target["startTicks"]
+    and process_executable == target["processExecutable"]
+    and argv == target["argv"]
+    and len(indexes) == 1
+    and indexes[0] + 1 < len(argv)
+    and os.path.abspath(argv[indexes[0] + 1]) == os.path.abspath(discovery)
+):
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
+cleanup_validated_snapshot() {
+  local snapshot=$1
+  python3 - \
+    "$snapshot" "${WEBCONSOLE_ENTRYPOINT_SNAPSHOT:-}" \
+    "${WEBCONSOLE_EXE:-}" "${DISCOVERY:-}" \
+    "${NEXUS_V015_ALLOW_FIXTURE_HOME:-0}" <<'PY'
+import hashlib
+import json
+import os
+import signal
+import stat
+import sys
+import time
+from pathlib import Path
+
+snapshot_path, entrypoint_path, executable_raw, discovery, fixture_raw = sys.argv[1:]
+fixture = fixture_raw == "1"
+try:
+    snapshot = json.loads(Path(snapshot_path).read_text(encoding="utf-8"))
+    expected_entrypoint = json.loads(Path(entrypoint_path).read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(0)
+executable = os.path.realpath(executable_raw)
+
+
+def read_record(path):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            return None, b""
+        raw = b""
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            raw += chunk
+        return (
+            {
+                "device": info.st_dev,
+                "inode": info.st_ino,
+                "size": info.st_size,
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            },
+            raw,
+        )
+    finally:
+        os.close(descriptor)
+
+
+record = snapshot.get("discovery")
+
+
+def entrypoint_is_same():
+    try:
+        return read_record(executable)[0] == expected_entrypoint
+    except OSError:
+        return False
+
+
+def process_is_same(target):
+    pid = target["pid"]
+    try:
+        if not entrypoint_is_same():
+            return False
+        argv = [
+            raw.decode("utf-8", "surrogateescape")
+            for raw in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if raw
+        ]
+        process_executable = os.path.realpath(f"/proc/{pid}/exe")
+        fields = (
+            Path(f"/proc/{pid}/stat")
+            .read_text(encoding="ascii")
+            .rsplit(") ", 1)[1]
+            .split()
+        )
+        start_ticks = int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return False
+    return (
+        start_ticks == target["startTicks"]
+        and process_executable == target["processExecutable"]
+        and argv == target["argv"]
+    )
+
+
+for target in snapshot.get("targets", []):
+    if not process_is_same(target):
+        continue
+    try:
+        os.kill(target["pid"], signal.SIGTERM)
+    except ProcessLookupError:
+        continue
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and process_is_same(target):
+        time.sleep(0.05)
+    if process_is_same(target):
+        try:
+            os.kill(target["pid"], signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+if isinstance(record, dict):
+    try:
+        current, current_raw = read_record(discovery)
+        entrypoint_current = read_record(executable)[0]
+    except OSError:
+        current = None
+        entrypoint_current = None
+    expected = {key: record[key] for key in ("device", "inode", "size", "sha256")}
+    if current == expected and entrypoint_current == expected_entrypoint:
+        try:
+            value = json.loads(current_raw)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            value = None
+        pid = value.get("pid") if isinstance(value, dict) else None
+        recorded = value.get("executable") if isinstance(value, dict) else None
+        if (
+            pid == record["pid"]
+            and isinstance(recorded, str)
+            and os.path.realpath(recorded) == executable
+            and not any(process_is_same(target) for target in snapshot.get("targets", []))
+        ):
+            os.unlink(discovery)
+PY
+}
+
+invalidate_owned_result_seal() {
+  [ "$RESULT_SEAL_OWNED" -eq 1 ] || return 0
+  [ -n "$RESULT_SEAL" ] && [ -n "$RESULT_SEAL_SNAPSHOT" ] || return 1
+  python3 - \
+    "$RESULT_SEAL" "$RESULT_SEAL_SNAPSHOT" \
+    "${NEXUS_V015_FIXTURE_FAIL_SEAL_UNLINK:-0}" \
+    "${NEXUS_V015_FIXTURE_FAIL_SEAL_QUARANTINE_RENAME:-0}" \
+    "${NEXUS_V015_FIXTURE_FAIL_SEAL_QUARANTINE_OPEN:-0}" \
+    "${NEXUS_V015_FIXTURE_FAIL_SEAL_QUARANTINE_CHMOD:-0}" \
+    "${NEXUS_V015_FIXTURE_FAIL_SEAL_QUARANTINE_FSYNC:-0}" \
+    "${NEXUS_V015_FIXTURE_FAIL_SEAL_QUARANTINE_PARENT_FSYNC:-0}" \
+    "${NEXUS_V015_FIXTURE_KILL_AFTER_SEAL_QUARANTINE_RENAME:-0}" \
+    "${NEXUS_V015_FIXTURE_KILL_AFTER_SEAL_QUARANTINE_CHMOD:-0}" \
+    "${NEXUS_V015_FIXTURE_SWAP_SEAL_BEFORE_INVALIDATE:-}" <<'PY'
+import hashlib
+import json
+import os
+import secrets
+import signal
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+snapshot = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+fail_unlink = sys.argv[3] == "1"
+fail_quarantine_rename = sys.argv[4] == "1"
+fail_quarantine_open = sys.argv[5] == "1"
+fail_quarantine_chmod = sys.argv[6] == "1"
+fail_quarantine_fsync = sys.argv[7] == "1"
+fail_quarantine_parent_fsync = sys.argv[8] == "1"
+kill_after_quarantine_rename = sys.argv[9] == "1"
+kill_after_quarantine_chmod = sys.argv[10] == "1"
+swap_before_invalidate = sys.argv[11]
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+try:
+    descriptor = os.open(path, flags)
+except FileNotFoundError:
+    raise SystemExit(0)
+try:
+    info = os.fstat(descriptor)
+    chunks = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    raw = b"".join(chunks)
+    observed = {
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "size": info.st_size,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    expected = {key: snapshot[key] for key in observed}
+    if (
+        observed != expected
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_nlink != 1
+    ):
+        raise SystemExit("refusing to invalidate a replacement D2 result seal")
+
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    directory = os.open(path.parent, directory_flags)
+    try:
+        if swap_before_invalidate:
+            os.replace(swap_before_invalidate, path)
+
+        quarantine_name = f".{path.name}.invalid-{os.getpid()}-{secrets.token_hex(6)}"
+        try:
+            if fail_quarantine_rename:
+                raise OSError("fixture forced D2 seal quarantine rename failure")
+            os.replace(
+                path.name,
+                quarantine_name,
+                src_dir_fd=directory,
+                dst_dir_fd=directory,
+            )
+        except OSError:
+            # The exact owned descriptor remains authoritative if the atomic
+            # rename cannot remove its canonical name. Invalidate that inode
+            # through the retained descriptor before propagating the failure.
+            try:
+                visible = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                visible = None
+            if (
+                visible is not None
+                and visible.st_dev == expected["device"]
+                and visible.st_ino == expected["inode"]
+            ):
+                os.fchmod(descriptor, 0)
+                os.fsync(descriptor)
+                os.fsync(directory)
+            raise
+
+        # Canonical-name removal is the first durable invalidation boundary.
+        # Every later injected failure (including SIGKILL) therefore leaves the
+        # standalone verifier unable to observe a valid canonical seal.
+        os.fsync(directory)
+        if kill_after_quarantine_rename:
+            os.kill(os.getpid(), signal.SIGKILL)
+        if fail_unlink:
+            raise OSError("fixture forced owned seal unlink failure")
+        if fail_quarantine_open:
+            raise OSError("fixture forced D2 seal quarantine open failure")
+        quarantine = os.open(quarantine_name, flags, dir_fd=directory)
+        try:
+            current = os.fstat(quarantine)
+            current_raw = b""
+            while True:
+                chunk = os.read(quarantine, 1024 * 1024)
+                if not chunk:
+                    break
+                current_raw += chunk
+            current_record = {
+                "device": current.st_dev,
+                "inode": current.st_ino,
+                "size": current.st_size,
+                "sha256": hashlib.sha256(current_raw).hexdigest(),
+            }
+            if current_record != expected or not stat.S_ISREG(current.st_mode):
+                # The canonical pathname was replaced after the owned descriptor
+                # was captured. Restore that replacement to its canonical name;
+                # never mutate or unlink it as though it were ours.
+                try:
+                    os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    os.rename(
+                        quarantine_name,
+                        path.name,
+                        src_dir_fd=directory,
+                        dst_dir_fd=directory,
+                    )
+                    os.fsync(directory)
+                raise SystemExit("refusing to invalidate a replacement D2 result seal")
+            if fail_quarantine_chmod:
+                raise OSError("fixture forced D2 seal quarantine chmod failure")
+            os.fchmod(quarantine, 0)
+            if kill_after_quarantine_chmod:
+                os.kill(os.getpid(), signal.SIGKILL)
+            if fail_quarantine_fsync:
+                raise OSError("fixture forced D2 seal quarantine fsync failure")
+            os.fsync(quarantine)
+        finally:
+            os.close(quarantine)
+        if fail_quarantine_parent_fsync:
+            raise OSError("fixture forced D2 seal quarantine parent fsync failure")
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+finally:
+    os.close(descriptor)
+PY
+}
+
+cleanup() {
+  if [ -n "$FOREIGN_PID" ]; then
+    kill "$FOREIGN_PID" 2>/dev/null || true
+    wait "$FOREIGN_PID" 2>/dev/null || true
+  fi
+  if [ "$SUCCESS" -ne 1 ] \
+    && [ "$PACKED_CLI_VALIDATED" -eq 1 ] \
+    && [ "$LIFECYCLE_TOUCHED" -eq 1 ]; then
+    if [ -z "$CLEANUP_TARGET_SNAPSHOT" ] || [ ! -s "$CLEANUP_TARGET_SNAPSHOT" ]; then
+      CLEANUP_TARGET_SNAPSHOT="$WORK/cleanup-targets.snapshot"
+      capture_validated_cleanup_targets "$CLEANUP_TARGET_SNAPSHOT" 2>/dev/null || true
+    fi
+    if [ -s "$CLEANUP_TARGET_SNAPSHOT" ] \
+      && cleanup_snapshot_stop_is_allowed "$CLEANUP_TARGET_SNAPSHOT" 2>/dev/null; then
+      "$NEXUS_BIN" webconsole stop --force >/dev/null 2>&1 || true
+    fi
+    if [ -s "$CLEANUP_TARGET_SNAPSHOT" ]; then
+      cleanup_validated_snapshot "$CLEANUP_TARGET_SNAPSHOT" 2>/dev/null || true
+    fi
+  fi
+  if [ "$SUCCESS" -ne 1 ] && [ "$RESULT_SEAL_OWNED" -eq 1 ]; then
+    invalidate_owned_result_seal || {
+      echo "error: could not durably invalidate the owned D2 result seal" >&2
+    }
+  fi
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+python3 - "$MANIFEST" "$RUN_ROOT" >"$WORK/candidate.snapshot" <<'PY'
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+root = Path(sys.argv[2]).resolve()
+try:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f"invalid packed candidate manifest: {error}")
+
+required = {
+    "schemaVersion", "runId", "mode", "sources", "native", "packages",
+    "image", "container", "toolchains", "environment",
+}
+if set(manifest) != required or manifest.get("schemaVersion") != 1:
+    raise SystemExit("packed candidate manifest does not use the v0.1.5 schema")
+if not isinstance(manifest.get("runId"), str) or not manifest["runId"].strip():
+    raise SystemExit("packed candidate manifest runId is invalid")
+if manifest.get("mode") != "packed":
+    raise SystemExit("Webconsole acceptance requires a packed candidate manifest")
+if set(manifest.get("sources", {})) != {
+    "nexus", "lens", "egregore", "pactree", "pactreePython", "pactreeFs",
+}:
+    raise SystemExit("packed candidate source ledger is incomplete")
+if manifest.get("container", {}).get("limits") != {
+    "cpus": 6, "memoryBytes": 8589934592, "pids": 1024,
+}:
+    raise SystemExit("packed candidate does not use the 6 CPU / 8 GiB / 1024 PID lab contract")
+if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(manifest.get("image", {}).get("digest", ""))):
+    raise SystemExit("packed candidate image digest is invalid")
+
+
+def checked_artifact(record, label):
+    if not isinstance(record, dict) or set(record) != {"path", "sha256"}:
+        raise SystemExit(f"{label} artifact record is invalid")
+    relative = Path(str(record["path"]))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise SystemExit(f"{label} artifact escapes the run root")
+    path = root / relative
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"{label} artifact is missing or unsafe")
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    if actual != record["sha256"]:
+        raise SystemExit(f"{label} artifact hash mismatch")
+
+
+checked_artifact(manifest.get("native"), "native")
+names = ("@egregore/nexus", "@egregore/nexus-cli", "@egregore/nexus-gateway")
+packages = manifest.get("packages")
+if not isinstance(packages, list) or tuple(
+    row.get("name") if isinstance(row, dict) else None for row in packages
+) != names:
+    raise SystemExit("packed candidate package ledger is invalid")
+for row in packages:
+    if row.get("version") != "0.1.5":
+        raise SystemExit(f"packed candidate package {row.get('name')} is not 0.1.5")
+    checked_artifact(row.get("tarball"), f"package {row['name']}")
+toolchains = manifest.get("toolchains")
+if not isinstance(toolchains, dict) or "0.1.5" not in str(toolchains.get("nexus", "")):
+    raise SystemExit("packed candidate toolchain does not identify Nexus 0.1.5")
+if not isinstance(manifest.get("environment"), dict):
+    raise SystemExit("packed candidate environment ledger is invalid")
+
+ledger = {
+    "mode": manifest["mode"],
+    "sources": manifest["sources"],
+    "nativeSha256": manifest["native"]["sha256"],
+    "packages": [{
+        "name": row["name"],
+        "version": row["version"],
+        "tarballSha256": row["tarball"]["sha256"],
+    } for row in packages],
+    "imageDigest": manifest["image"]["digest"],
+    "limits": manifest["container"]["limits"],
+    "toolchains": toolchains,
+    "environment": manifest["environment"],
+}
+body = json.dumps(
+    ledger,
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=False,
+    allow_nan=False,
+).encode("utf-8")
+print(json.dumps({
+    "runId": manifest["runId"],
+    "candidateDigest": "sha256:" + hashlib.sha256(body).hexdigest(),
+    "imageDigest": manifest["image"]["digest"],
+}))
+PY
+
+MANIFEST_RUN_ID=$(jq -er '.runId' "$WORK/candidate.snapshot")
+CANDIDATE_DIGEST=$(jq -er '.candidateDigest' "$WORK/candidate.snapshot")
+IMAGE_DIGEST=$(jq -er '.imageDigest' "$WORK/candidate.snapshot")
+[ -n "$AMBIENT_RUN_ID" ] || die "current lab run id is unavailable"
+[ "$AMBIENT_RUN_ID" = "$MANIFEST_RUN_ID" ] \
+  || die "current lab run id $AMBIENT_RUN_ID does not match packed manifest run id $MANIFEST_RUN_ID"
+if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "$MANIFEST_RUN_ID" ]; then
+  die "run id $RUN_ID does not match packed manifest run id $MANIFEST_RUN_ID"
+fi
+RUN_ID=$MANIFEST_RUN_ID
+
+if [ -z "$PACKED_PREFIX" ]; then
+  candidate=$NEXUS_LAUNCHER
+  for _ in 1 2 3 4; do
+    if [ "$(basename "$candidate")" = nexus ] \
+      && [ "$(basename "$(dirname "$candidate")")" = bin ] \
+      && [ -f "$(dirname "$(dirname "$candidate")")/lib/node_modules/@egregore/nexus/package.json" ]; then
+      PACKED_PREFIX=$(dirname "$(dirname "$candidate")")
+      break
+    fi
+    [ -L "$candidate" ] || break
+    target=$(readlink "$candidate")
+    case "$target" in
+      /*) candidate=$target ;;
+      *) candidate=$(python3 -c 'import os,sys; print(os.path.abspath(os.path.join(os.path.dirname(sys.argv[1]), sys.argv[2])))' "$candidate" "$target") ;;
+    esac
+  done
+fi
+[ -n "$PACKED_PREFIX" ] || die "cannot derive the umbrella-only packed prefix from $NEXUS_LAUNCHER"
+PACKED_PREFIX=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$PACKED_PREFIX")
+
+packed_install_tree_digest() {
+  python3 - "$1" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path, PurePosixPath
+
+root = Path(os.path.abspath(sys.argv[1]))
+try:
+    root_info = os.lstat(root)
+except OSError as error:
+    raise SystemExit(f"packed install root is unavailable: {error}")
+if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+    raise SystemExit("packed install root is not a real directory")
+
+inventory = {}
+
+
+def inside(path, parent):
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def read_regular(path, expected, label):
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise SystemExit(f"packed install entry is not a single regular file: {label}")
+        if (before.st_dev, before.st_ino) != (expected.st_dev, expected.st_ino):
+            raise SystemExit(f"packed install entry changed before read: {label}")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise SystemExit(f"cannot read packed install entry {label}: {error}") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise SystemExit(f"packed install entry changed while read: {label}")
+    return b"".join(chunks)
+
+
+def visit(directory, relative):
+    try:
+        entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+    except OSError as error:
+        raise SystemExit(f"cannot inspect packed install closure: {error}") from error
+    for entry in entries:
+        child_relative = relative / entry.name
+        key = child_relative.as_posix()
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError as error:
+            raise SystemExit(f"cannot inspect packed install entry {key}: {error}") from error
+        if stat.S_ISLNK(info.st_mode):
+            try:
+                target = os.readlink(entry.path)
+                resolved = Path(os.path.realpath(Path(entry.path).parent / target))
+            except OSError as error:
+                raise SystemExit(f"cannot read packed install symlink {key}: {error}") from error
+            if not inside(resolved, root):
+                raise SystemExit(f"packed install symlink escapes prefix: {key}")
+            inventory[key] = {
+                "kind": "symlink",
+                "target": target,
+                "mode": stat.S_IMODE(info.st_mode),
+            }
+        elif stat.S_ISDIR(info.st_mode):
+            inventory[key] = {"kind": "directory", "mode": stat.S_IMODE(info.st_mode)}
+            visit(Path(entry.path), child_relative)
+        elif stat.S_ISREG(info.st_mode):
+            raw = read_regular(entry.path, info, key)
+            inventory[key] = {
+                "kind": "file",
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "size": len(raw),
+                "mode": stat.S_IMODE(info.st_mode),
+            }
+        else:
+            raise SystemExit(f"packed install has unsupported entry: {key}")
+
+
+visit(root, PurePosixPath())
+if not inventory:
+    raise SystemExit("packed install inventory is empty")
+body = json.dumps(
+    inventory,
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=False,
+    allow_nan=False,
+).encode("utf-8")
+print(hashlib.sha256(body).hexdigest())
+PY
+}
+
+OBSERVED_INSTALL_TREE_SHA256=$(packed_install_tree_digest "$PACKED_PREFIX") \
+  || die "cannot inventory the packed install dependency closure"
+
+PACKED_GATEWAY_BIN="${NEXUS_GATEWAY_BIN:-$PACKED_PREFIX/bin/nexus-gateway}"
+PACKED_WEBUI_BIN="${NEXUS_WEBUI_BIN:-$PACKED_PREFIX/bin/nexus-webui}"
+python3 - \
+  "$PACKED_PREFIX" "$NEXUS_LAUNCHER" "$PACKED_GATEWAY_BIN" "$PACKED_WEBUI_BIN" \
+  "$MANIFEST" "$RUN_ROOT" "$CURRENT_READINESS_PATH" \
+  "$CURRENT_CONTAINER_ID" "$CURRENT_CONTAINER_MATCH" "$OBSERVED_INSTALL_TREE_SHA256" \
+  >"$WORK/packed-topology.snapshot" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+import tarfile
+from pathlib import Path, PurePosixPath
+
+
+def fail(message):
+    raise SystemExit(f"umbrella-only packed prefix: {message}")
+
+
+prefix = Path(sys.argv[1])
+nexus_launcher = Path(sys.argv[2])
+gateway_launcher = Path(sys.argv[3])
+webui_launcher = Path(sys.argv[4])
+manifest_path = Path(sys.argv[5])
+run_root = Path(sys.argv[6]).resolve()
+current_readiness_path = Path(os.path.abspath(sys.argv[7]))
+current_container_id = sys.argv[8]
+current_container_match = sys.argv[9]
+observed_install_tree_sha256 = sys.argv[10]
+modules = prefix / "lib" / "node_modules"
+scope = modules / "@egregore"
+umbrella = scope / "nexus"
+if not prefix.is_dir() or not umbrella.is_dir():
+    fail("@egregore/nexus is missing")
+top_level = sorted(path.name for path in modules.iterdir() if path.is_dir())
+scope_level = sorted(path.name for path in scope.iterdir() if path.is_dir())
+if top_level != ["@egregore"] or scope_level != ["nexus"]:
+    fail(f"expected only @egregore/nexus at top level, got {top_level}/{scope_level}")
+
+try:
+    package = json.loads((umbrella / "package.json").read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    fail(f"invalid umbrella package metadata: {error}")
+expected_bin = {
+    "nexus": "bin/nexus.mjs",
+    "nexus-gateway": "bin/nexus-gateway.mjs",
+    "nexus-webui": "bin/nexus-webui.mjs",
+}
+expected_dependencies = {
+    "@egregore/nexus-cli": "0.1.5",
+    "@egregore/nexus-gateway": "0.1.5",
+}
+if package.get("name") != "@egregore/nexus" or package.get("version") != "0.1.5":
+    fail("umbrella package identity/version is wrong")
+if package.get("bin") != expected_bin or package.get("dependencies") != expected_dependencies:
+    fail("umbrella bin or dependency contract is wrong")
+
+dependencies = {}
+for name in ("nexus-cli", "nexus-gateway"):
+    path = umbrella / "node_modules" / "@egregore" / name / "package.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        fail(f"invalid nested dependency {name}: {error}")
+    expected_name = f"@egregore/{name}"
+    if value.get("name") != expected_name or value.get("version") != "0.1.5":
+        fail(f"nested dependency {name} does not match candidate version")
+    dependencies[expected_name] = value["version"]
+
+nested_cli = umbrella / "node_modules" / "@egregore" / "nexus-cli"
+nested_gateway = umbrella / "node_modules" / "@egregore" / "nexus-gateway"
+
+expected_launchers = {
+    "nexus": umbrella / "bin" / "nexus.mjs",
+    "nexusGateway": umbrella / "bin" / "nexus-gateway.mjs",
+    "nexusWebui": umbrella / "bin" / "nexus-webui.mjs",
+}
+provided = {
+    "nexus": nexus_launcher,
+    "nexusGateway": gateway_launcher,
+    "nexusWebui": webui_launcher,
+}
+resolved = {}
+for name, expected in expected_launchers.items():
+    prefix_link = prefix / "bin" / ({
+        "nexus": "nexus",
+        "nexusGateway": "nexus-gateway",
+        "nexusWebui": "nexus-webui",
+    }[name])
+    try:
+        expected_resolved = expected.resolve(strict=True)
+        prefix_resolved = prefix_link.resolve(strict=True)
+        provided_resolved = provided[name].resolve(strict=True)
+    except OSError as error:
+        fail(f"{name} launcher is missing: {error}")
+    if prefix_resolved != expected_resolved or provided_resolved != expected_resolved:
+        fail(f"{name} launcher does not resolve through @egregore/nexus")
+    resolved[name] = str(expected_resolved)
+
+
+def sha256_file(path, label):
+    try:
+        if path.is_symlink() or not path.is_file():
+            fail(f"{label} is missing or unsafe")
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as error:
+        fail(f"cannot read {label}: {error}")
+
+
+def manifest_artifact(record, label):
+    if not isinstance(record, dict) or set(record) != {"path", "sha256"}:
+        fail(f"{label} manifest artifact is invalid")
+    relative = Path(str(record["path"]))
+    if relative.is_absolute() or ".." in relative.parts:
+        fail(f"{label} manifest artifact escapes the evidence root")
+    path = run_root / relative
+    actual = sha256_file(path, label)
+    if actual != record["sha256"]:
+        fail(f"{label} manifest artifact changed")
+    return path
+
+
+def safe_link_target(relative, target, label):
+    target_path = PurePosixPath(target)
+    if target_path.is_absolute():
+        fail(f"{label} symlink target is absolute")
+    parts = list(relative.parent.parts)
+    for component in target_path.parts:
+        if component in {"", "."}:
+            continue
+        if component == "..":
+            if not parts:
+                fail(f"{label} symlink target escapes its package")
+            parts.pop()
+        else:
+            parts.append(component)
+
+
+def tar_package_inventory(tarball, label):
+    inventory = {}
+    try:
+        with tarfile.open(tarball, "r:gz") as archive:
+            for member in archive.getmembers():
+                path = PurePosixPath(member.name)
+                if path.is_absolute() or ".." in path.parts or not path.parts:
+                    fail(f"{label} tarball contains an unsafe path")
+                if path.parts[0] != "package":
+                    fail(f"{label} tarball contains a file outside package/")
+                relative = PurePosixPath(*path.parts[1:])
+                if not relative.parts or member.isdir():
+                    continue
+                key = relative.as_posix()
+                if key in inventory:
+                    fail(f"{label} tarball contains duplicate runtime entry: {key}")
+                if member.isfile():
+                    stream = archive.extractfile(member)
+                    if stream is None:
+                        fail(f"{label} tarball entry cannot be read: {key}")
+                    inventory[key] = {
+                        "kind": "file",
+                        "sha256": hashlib.sha256(stream.read()).hexdigest(),
+                        "executable": bool(member.mode & 0o111),
+                    }
+                elif member.issym():
+                    safe_link_target(relative, member.linkname, f"{label}:{key}")
+                    inventory[key] = {"kind": "symlink", "target": member.linkname}
+                else:
+                    fail(f"{label} tarball contains unsupported runtime entry: {key}")
+    except (OSError, tarfile.TarError) as error:
+        fail(f"cannot inspect {label} tarball: {error}")
+    return inventory
+
+
+def installed_package_inventory(root, label):
+    inventory = {}
+
+    def visit(directory, relative):
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as error:
+            fail(f"cannot inspect installed {label}: {error}")
+        for entry in entries:
+            child_relative = relative / entry.name
+            if not relative.parts and entry.name == "node_modules":
+                if entry.is_symlink():
+                    fail(f"installed {label} node_modules is a symlink")
+                continue
+            key = child_relative.as_posix()
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                fail(f"cannot stat installed {label}:{key}: {error}")
+            if stat.S_ISLNK(info.st_mode):
+                try:
+                    target = os.readlink(entry.path)
+                except OSError as error:
+                    fail(f"cannot read installed {label}:{key} symlink: {error}")
+                safe_link_target(child_relative, target, f"installed {label}:{key}")
+                inventory[key] = {"kind": "symlink", "target": target}
+            elif stat.S_ISREG(info.st_mode):
+                try:
+                    raw = Path(entry.path).read_bytes()
+                except OSError as error:
+                    fail(f"cannot read installed {label}:{key}: {error}")
+                inventory[key] = {
+                    "kind": "file",
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "executable": bool(info.st_mode & 0o111),
+                }
+            elif stat.S_ISDIR(info.st_mode):
+                visit(Path(entry.path), child_relative)
+            else:
+                fail(f"installed {label} has unsupported runtime entry: {key}")
+
+    if root.is_symlink() or not root.is_dir():
+        fail(f"installed {label} root is missing or unsafe")
+    visit(root, PurePosixPath())
+    return inventory
+
+
+try:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    fail(f"cannot read candidate manifest bindings: {error}")
+environment = manifest.get("environment")
+if not isinstance(environment, dict):
+    fail("candidate manifest environment is invalid")
+container_id = str(environment.get("NEXUS_V015_CONTAINER_ID", ""))
+if len(container_id) != 64 or any(character not in "0123456789abcdef" for character in container_id):
+    fail("candidate manifest container identity is invalid")
+if (
+    (current_container_match == "exact" and container_id != current_container_id)
+    or (current_container_match == "prefix" and not container_id.startswith(current_container_id))
+):
+    fail("candidate manifest does not match the current container identity")
+if environment.get("NEXUS_V015_RUN_ID") != manifest.get("runId"):
+    fail("candidate manifest run binding is invalid")
+
+gateway_module = nested_gateway / "dist-gateway" / "headless.mjs"
+nested_webui = nested_gateway / "webconsole" / "bin" / "nexus-webui.mjs"
+native_path = Path(str(environment.get("NEXUS_V015_NATIVE_BIN", "")))
+try:
+    native_relative = native_path.resolve(strict=True).relative_to(nested_cli.resolve(strict=True))
+except (OSError, ValueError) as error:
+    fail(f"candidate native binary is not inside the installed CLI package: {error}")
+
+installed_hashes = {
+    "nexus": sha256_file(expected_launchers["nexus"], "installed umbrella Nexus launcher"),
+    "nexusGateway": sha256_file(expected_launchers["nexusGateway"], "installed umbrella Gateway launcher"),
+    "nexusWebui": sha256_file(expected_launchers["nexusWebui"], "installed umbrella WebUI launcher"),
+    "cliLauncher": sha256_file(nested_cli / "bin" / "nexus.mjs", "installed CLI launcher"),
+    "gatewayModule": sha256_file(gateway_module, "installed Gateway module"),
+    "gatewayWebui": sha256_file(nested_webui, "installed Gateway WebUI launcher"),
+    "native": sha256_file(native_path, "installed native Nexus binary"),
+}
+
+install_nonce = prefix.name.removeprefix("nexus-lab-install.")
+if (
+    install_nonce == prefix.name
+    or not install_nonce
+    or not install_nonce.isalnum()
+):
+    fail("packed prefix does not contain a valid install nonce")
+
+binding_contract = {
+    "NEXUS_V015_PACKED_PREFIX": str(prefix),
+    "NEXUS_V015_NEXUS_BIN_RESOLVED": resolved["nexus"],
+    "NEXUS_V015_NEXUS_BIN_SHA256": installed_hashes["nexus"],
+    "NEXUS_V015_GATEWAY_BIN_RESOLVED": resolved["nexusGateway"],
+    "NEXUS_V015_GATEWAY_BIN_SHA256": installed_hashes["nexusGateway"],
+    "NEXUS_V015_WEBUI_BIN_RESOLVED": resolved["nexusWebui"],
+    "NEXUS_V015_WEBUI_BIN_SHA256": installed_hashes["nexusWebui"],
+    "NEXUS_V015_GATEWAY_MODULE": str(gateway_module),
+    "NEXUS_V015_GATEWAY_MODULE_SHA256": installed_hashes["gatewayModule"],
+    "NEXUS_V015_NATIVE_BIN": str(native_path),
+    "NEXUS_V015_NATIVE_BIN_SHA256": installed_hashes["native"],
+    "NEXUS_V015_CONTAINER_ID": container_id,
+    "NEXUS_V015_INSTALL_NONCE": install_nonce,
+}
+for key, expected in binding_contract.items():
+    if environment.get(key) != expected:
+        fail(f"candidate manifest binding {key} does not match the installed prefix")
+for key, expected_path in {
+    "NEXUS_V015_NEXUS_BIN": expected_launchers["nexus"],
+    "NEXUS_V015_GATEWAY_BIN": expected_launchers["nexusGateway"],
+    "NEXUS_V015_WEBUI_BIN": expected_launchers["nexusWebui"],
+}.items():
+    raw = Path(str(environment.get(key, "")))
+    try:
+        if raw.resolve(strict=True) != expected_path.resolve(strict=True):
+            fail(f"candidate manifest binding {key} resolves outside the installed umbrella")
+    except OSError as error:
+        fail(f"candidate manifest binding {key} is unavailable: {error}")
+
+packages = {
+    row.get("name"): row
+    for row in manifest.get("packages", [])
+    if isinstance(row, dict)
+}
+if set(packages) != {"@egregore/nexus", "@egregore/nexus-cli", "@egregore/nexus-gateway"}:
+    fail("candidate package artifacts are incomplete")
+tarballs = {
+    name: manifest_artifact(row.get("tarball"), f"{name} tarball")
+    for name, row in packages.items()
+}
+installed_package_roots = {
+    "@egregore/nexus": umbrella,
+    "@egregore/nexus-cli": nested_cli,
+    "@egregore/nexus-gateway": nested_gateway,
+}
+package_inventories = {}
+for package_name, installed_root in installed_package_roots.items():
+    packed_inventory = tar_package_inventory(tarballs[package_name], package_name)
+    installed_inventory = installed_package_inventory(installed_root, package_name)
+    if installed_inventory != packed_inventory:
+        missing = sorted(set(packed_inventory) - set(installed_inventory))
+        extra = sorted(set(installed_inventory) - set(packed_inventory))
+        changed = sorted(
+            key for key in set(installed_inventory) & set(packed_inventory)
+            if installed_inventory[key] != packed_inventory[key]
+        )
+        fail(
+            "installed package inventory differs from candidate tarball: "
+            f"{package_name}; missing={missing}; extra={extra}; changed={changed}"
+        )
+    encoded = json.dumps(
+        packed_inventory,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    package_inventories[package_name] = {
+        "entryCount": len(packed_inventory),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+native_artifact = manifest_artifact(manifest.get("native"), "native binary")
+if sha256_file(native_artifact, "native candidate artifact") != installed_hashes["native"]:
+    fail("installed native binary differs from the candidate artifact")
+
+readiness_path = Path(os.path.abspath(str(environment.get("NEXUS_V015_READINESS_LEDGER", ""))))
+if readiness_path != current_readiness_path:
+    fail("candidate manifest does not name the current lab readiness ledger")
+
+
+def read_single_regular(path, label):
+    cursor = Path(path.anchor)
+    for component in path.parts[1:-1]:
+        cursor /= component
+        try:
+            ancestor = os.lstat(cursor)
+        except OSError as error:
+            fail(f"cannot inspect {label} ancestry: {error}")
+        if stat.S_ISLNK(ancestor.st_mode) or not stat.S_ISDIR(ancestor.st_mode):
+            fail(f"{label} ancestry is unsafe: {cursor}")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        fail(f"cannot open {label}: {error}")
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            fail(f"{label} must be a single regular file")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return info, b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+try:
+    readiness_info, readiness_raw = read_single_regular(
+        readiness_path,
+        "candidate readiness ledger",
+    )
+except OSError as error:
+    fail(f"cannot read candidate readiness ledger: {error}")
+readiness_sha = hashlib.sha256(readiness_raw).hexdigest()
+if environment.get("NEXUS_V015_READINESS_LEDGER_SHA256") != readiness_sha:
+    fail("candidate readiness ledger hash does not match the manifest")
+try:
+    readiness_text = readiness_raw.decode("utf-8")
+except UnicodeDecodeError as error:
+    fail(f"candidate readiness ledger is not UTF-8: {error}")
+readiness = {}
+for line_number, line in enumerate(readiness_text.splitlines(), 1):
+    if not line or "=" not in line:
+        fail(f"candidate readiness ledger has invalid line {line_number}")
+    key, value = line.split("=", 1)
+    if not key or not value or key in readiness:
+        fail(f"candidate readiness ledger has invalid field {key!r}")
+    readiness[key] = value
+expected_readiness = {
+    "schema": "1",
+    "containerId": container_id,
+    "mode": "packed",
+    "runId": str(manifest.get("runId", "")),
+    "installRoot": str(prefix),
+    "installNonce": install_nonce,
+    "nativeResolved": str(native_path),
+    "nativeSha256": installed_hashes["native"],
+    "nexusLink": str(prefix / "bin" / "nexus"),
+    "nexusResolved": resolved["nexus"],
+    "nexusSha256": installed_hashes["nexus"],
+    "gatewayLink": str(prefix / "bin" / "nexus-gateway"),
+    "gatewayResolved": resolved["nexusGateway"],
+    "gatewaySha256": installed_hashes["nexusGateway"],
+    "webuiLink": str(prefix / "bin" / "nexus-webui"),
+    "webuiResolved": resolved["nexusWebui"],
+    "webuiSha256": installed_hashes["nexusWebui"],
+    "installTreeSha256": observed_install_tree_sha256,
+    "imageDigest": str(manifest.get("image", {}).get("digest", "")),
+}
+missing_readiness = sorted(set(expected_readiness) - set(readiness))
+if missing_readiness:
+    fail(f"candidate readiness ledger is missing required D2 fields: {missing_readiness}")
+if readiness["installTreeSha256"] != observed_install_tree_sha256:
+    fail("packed install dependency closure differs from the candidate readiness ledger")
+changed_readiness = sorted(
+    key for key, expected in expected_readiness.items()
+    if readiness.get(key) != expected
+)
+if changed_readiness:
+    fail(
+        "candidate readiness ledger does not match container/run/install bindings: "
+        f"{changed_readiness}"
+    )
+
+print(json.dumps({
+    "schemaVersion": 1,
+    "prefix": str(prefix),
+    "topLevelPackages": ["@egregore/nexus"],
+    "umbrellaVersion": package["version"],
+    "dependencies": dependencies,
+    "resolvedLaunchers": resolved,
+    "resolvedNative": str(native_path),
+    "gatewayModule": str(gateway_module),
+    "packageInventories": package_inventories,
+    "candidateReadiness": {
+        "path": str(readiness_path),
+        "sha256": readiness_sha,
+        "containerId": readiness["containerId"],
+        "runId": readiness["runId"],
+        "installRoot": readiness["installRoot"],
+        "installNonce": readiness["installNonce"],
+        "installTreeSha256": readiness["installTreeSha256"],
+        "extraFields": sorted(set(readiness) - set(expected_readiness)),
+    },
+    "provenance": {
+        "tarballBound": True,
+        "manifestBindingsBound": True,
+        "completePackageInventory": True,
+        "readinessBound": True,
+        "fullDependencyClosure": True,
+        "installTreeSha256": observed_install_tree_sha256,
+        "nativeSha256": installed_hashes["native"],
+        "gatewayModuleSha256": installed_hashes["gatewayModule"],
+    },
+}, sort_keys=True))
+PY
+
+NEXUS_LAUNCHER=$(jq -er '.resolvedLaunchers.nexus' "$WORK/packed-topology.snapshot")
+PACKED_GATEWAY_BIN=$(jq -er '.resolvedLaunchers.nexusGateway' "$WORK/packed-topology.snapshot")
+PACKED_WEBUI_BIN=$(jq -er '.resolvedLaunchers.nexusWebui' "$WORK/packed-topology.snapshot")
+PACKED_NATIVE_BIN=$(jq -er '.resolvedNative' "$WORK/packed-topology.snapshot")
+PACKED_GATEWAY_MODULE=$(jq -er '.gatewayModule' "$WORK/packed-topology.snapshot")
+READINESS_PATH=$(jq -er '.candidateReadiness.path' "$WORK/packed-topology.snapshot")
+READINESS_CONTAINER_ID=$(jq -er '.candidateReadiness.containerId' "$WORK/packed-topology.snapshot")
+READINESS_INSTALL_ROOT=$(jq -er '.candidateReadiness.installRoot' "$WORK/packed-topology.snapshot")
+READINESS_INSTALL_NONCE=$(jq -er '.candidateReadiness.installNonce' "$WORK/packed-topology.snapshot")
+NEXUS_BIN=$NEXUS_LAUNCHER
+export NEXUS_NATIVE_BIN="$PACKED_NATIVE_BIN"
+export NEXUS_GATEWAY_BIN="$PACKED_GATEWAY_BIN"
+export NEXUS_WEBUI_BIN="$PACKED_WEBUI_BIN"
+PACKED_CLI_VALIDATED=1
+
+OUT="$RUN_ROOT/results/D2-webconsole-cli"
+[ ! -e "$OUT" ] || die "D2 evidence already exists for run $RUN_ID: $OUT"
+RESULT_SEAL="$RUN_ROOT/results/D2-webconsole-cli.result.sha256"
+[ ! -e "$RESULT_SEAL" ] && [ ! -L "$RESULT_SEAL" ] \
+  || die "D2 result seal already exists for run $RUN_ID: $RESULT_SEAL"
+mkdir -p "$OUT"
+TRANSCRIPT="$OUT/cli-transcript.jsonl"
+RECOVERY="$OUT/discovery-recovery.jsonl"
+OCCUPIED="$OUT/occupied-port.jsonl"
+DISCOVERY="$NEXUS_HOME/webconsole.json"
+: >"$TRANSCRIPT"
+
+port_is_open() {
+  python3 - "$HOST" "$1" <<'PY'
+import socket
+import sys
+family = socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET
+with socket.socket(family) as sock:
+    if family == socket.AF_INET6:
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    sock.settimeout(0.2)
+    raise SystemExit(0 if sock.connect_ex((sys.argv[1], int(sys.argv[2]))) == 0 else 1)
+PY
+}
+
+allocate_closed_port() {
+  python3 - "$HOST" <<'PY'
+import socket
+import sys
+family = socket.AF_INET6 if ":" in sys.argv[1] else socket.AF_INET
+with socket.socket(family) as sock:
+    if family == socket.AF_INET6:
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    sock.bind((sys.argv[1], 0))
+    print(sock.getsockname()[1])
+PY
+}
+
+http_url() {
+  local host=$1 port=$2
+  if [[ "$host" == *:* ]]; then
+    printf 'http://[%s]:%s' "$host" "$port"
+  else
+    printf 'http://%s:%s' "$host" "$port"
+  fi
+}
+
+if [ "$PORT" -eq 0 ]; then
+  PORT=$(allocate_closed_port)
+fi
+port_is_open "$PORT" && die "selected Webconsole port $PORT is not closed before the gate"
+WEBCONSOLE_URL=$(http_url "$HOST" "$PORT")
+
+WEBCONSOLE_EXE="${NEXUS_WEBUI_BIN:-}"
+if [ -z "$WEBCONSOLE_EXE" ]; then
+  WEBCONSOLE_EXE=$(command -v nexus-webui 2>/dev/null || true)
+fi
+[ -n "$WEBCONSOLE_EXE" ] && [ -f "$WEBCONSOLE_EXE" ] \
+  || die "cannot resolve the packed nexus-webui executable"
+WEBCONSOLE_EXE=$(readlink -f "$WEBCONSOLE_EXE")
+WEBCONSOLE_ENTRYPOINT_SNAPSHOT="$WORK/webconsole-entrypoint.snapshot"
+python3 - "$WEBCONSOLE_EXE" >"$WEBCONSOLE_ENTRYPOINT_SNAPSHOT" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(path, flags)
+try:
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise SystemExit("packed nexus-webui entrypoint is not a single regular file")
+    raw = b""
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        raw += chunk
+finally:
+    os.close(descriptor)
+print(json.dumps({
+    "device": info.st_dev,
+    "inode": info.st_ino,
+    "size": info.st_size,
+    "sha256": hashlib.sha256(raw).hexdigest(),
+}, sort_keys=True))
+PY
+
+matching_webconsole_pids() {
+  local snapshot="$WORK/matching-webconsole.$$.snapshot"
+  capture_validated_cleanup_targets "$snapshot"
+  jq -c '[.targets[].pid]' "$snapshot"
+  rm -f "$snapshot"
+}
+
+capture_candidate_readiness() {
+  local path=$1 install_tree_sha
+  install_tree_sha=$(packed_install_tree_digest "$PACKED_PREFIX") \
+    || die "cannot inventory the packed install dependency closure"
+  python3 - \
+    "$READINESS_PATH" "$READINESS_CONTAINER_ID" "$RUN_ID" \
+    "$READINESS_INSTALL_ROOT" "$READINESS_INSTALL_NONCE" \
+    "$PACKED_PREFIX" "$NEXUS_LAUNCHER" "$PACKED_GATEWAY_BIN" "$PACKED_WEBUI_BIN" \
+    "$PACKED_NATIVE_BIN" "$PACKED_GATEWAY_MODULE" "$install_tree_sha" \
+    "$IMAGE_DIGEST" "$CGROUP_ROOT" \
+    >"$path" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+(
+    raw_path, container_id, run_id, install_root, install_nonce,
+    packed_prefix, nexus_launcher, gateway_launcher, webui_launcher,
+    native_binary, gateway_module, install_tree_sha, image_digest, cgroup_root,
+) = sys.argv[1:]
+path = Path(raw_path)
+cursor = Path(path.anchor)
+for component in path.parts[1:-1]:
+    cursor /= component
+    try:
+        ancestor = os.lstat(cursor)
+    except OSError as error:
+        raise SystemExit(f"cannot inspect candidate readiness ancestry: {error}")
+    if stat.S_ISLNK(ancestor.st_mode) or not stat.S_ISDIR(ancestor.st_mode):
+        raise SystemExit(f"candidate readiness ancestry is unsafe: {cursor}")
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+try:
+    descriptor = os.open(path, flags)
+except OSError as error:
+    raise SystemExit(f"candidate readiness ledger is unavailable: {error}")
+try:
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise SystemExit("candidate readiness ledger is not a single regular file")
+    chunks = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    raw = b"".join(chunks)
+    text = raw.decode("utf-8")
+except (OSError, UnicodeError) as error:
+    raise SystemExit(f"cannot read candidate readiness ledger: {error}")
+finally:
+    os.close(descriptor)
+fields = {}
+for line_number, line in enumerate(text.splitlines(), 1):
+    if not line or "=" not in line:
+        raise SystemExit(f"candidate readiness ledger has invalid line {line_number}")
+    key, value = line.split("=", 1)
+    if not key or not value or key in fields:
+        raise SystemExit(f"candidate readiness ledger has invalid field {key!r}")
+    fields[key] = value
+
+
+def read_cgroup_value(name):
+    path = Path(cgroup_root) / name
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode):
+                raise SystemExit(f"live cgroup authority {name} is not a regular file")
+            raw = os.read(descriptor, 4096)
+            if os.read(descriptor, 1):
+                raise SystemExit(f"live cgroup authority {name} is unexpectedly large")
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise SystemExit(f"live cgroup authority {name} is unavailable: {error}") from error
+    try:
+        return raw.decode("ascii").strip()
+    except UnicodeError as error:
+        raise SystemExit(f"live cgroup authority {name} is invalid: {error}") from error
+
+
+resource_authority = {
+    "cpuMax": read_cgroup_value("cpu.max"),
+    "memoryMax": read_cgroup_value("memory.max"),
+    "memorySwapMax": read_cgroup_value("memory.swap.max"),
+    "pidsMax": read_cgroup_value("pids.max"),
+}
+if resource_authority != {
+    "cpuMax": "600000 100000",
+    "memoryMax": "8589934592",
+    "memorySwapMax": "0",
+    "pidsMax": "1024",
+}:
+    raise SystemExit("live cgroup authority does not match the 6 CPU / 8 GiB / 1024 PID contract")
+
+expected = {
+    "schema": "1",
+    "containerId": container_id,
+    "mode": "packed",
+    "runId": run_id,
+    "installRoot": install_root,
+    "installNonce": install_nonce,
+    "nativeResolved": native_binary,
+    "nativeSha256": hashlib.sha256(Path(native_binary).read_bytes()).hexdigest(),
+    "nexusLink": str(Path(packed_prefix) / "bin" / "nexus"),
+    "nexusResolved": nexus_launcher,
+    "nexusSha256": hashlib.sha256(Path(nexus_launcher).read_bytes()).hexdigest(),
+    "gatewayLink": str(Path(packed_prefix) / "bin" / "nexus-gateway"),
+    "gatewayResolved": gateway_launcher,
+    "gatewaySha256": hashlib.sha256(Path(gateway_launcher).read_bytes()).hexdigest(),
+    "webuiLink": str(Path(packed_prefix) / "bin" / "nexus-webui"),
+    "webuiResolved": webui_launcher,
+    "webuiSha256": hashlib.sha256(Path(webui_launcher).read_bytes()).hexdigest(),
+    "installTreeSha256": install_tree_sha,
+    "imageDigest": image_digest,
+}
+missing = sorted(set(expected) - set(fields))
+if missing:
+    raise SystemExit(f"candidate readiness ledger is missing required D2 fields: {missing}")
+changed = sorted(key for key, value in expected.items() if fields.get(key) != value)
+if changed:
+    raise SystemExit(
+        "candidate readiness ledger no longer matches container/run/install bindings: "
+        f"{changed}"
+    )
+print(json.dumps({
+    "path": str(path),
+    "sha256": hashlib.sha256(raw).hexdigest(),
+    "inode": info.st_ino,
+    "device": info.st_dev,
+    "size": info.st_size,
+    "mode": stat.S_IMODE(info.st_mode),
+    "containerId": container_id,
+    "runId": run_id,
+    "installRoot": install_root,
+    "installNonce": install_nonce,
+    "nativeSha256": hashlib.sha256(Path(native_binary).read_bytes()).hexdigest(),
+    "gatewayModuleSha256": hashlib.sha256(Path(gateway_module).read_bytes()).hexdigest(),
+    "installTreeSha256": install_tree_sha,
+    "extraFields": sorted(set(fields) - set(expected)),
+    "resourceAuthority": resource_authority,
+}, sort_keys=True))
+PY
+}
+
+BASELINE_READINESS="$WORK/readiness-baseline.snapshot"
+capture_candidate_readiness "$BASELINE_READINESS"
+[ "$(jq -er '.nativeSha256' "$BASELINE_READINESS")" = \
+  "$(jq -er '.provenance.nativeSha256' "$WORK/packed-topology.snapshot")" ] \
+  || die "candidate native binary changed before D2"
+[ "$(jq -er '.gatewayModuleSha256' "$BASELINE_READINESS")" = \
+  "$(jq -er '.provenance.gatewayModuleSha256' "$WORK/packed-topology.snapshot")" ] \
+  || die "candidate Gateway module changed before D2"
+[ "$(jq -er '.installTreeSha256' "$BASELINE_READINESS")" = \
+  "$(jq -er '.provenance.installTreeSha256' "$WORK/packed-topology.snapshot")" ] \
+  || die "packed install dependency closure changed before D2"
+
+assert_candidate_readiness_unchanged() {
+  local path=$1 label=$2
+  capture_candidate_readiness "$path"
+  cmp -s "$BASELINE_READINESS" "$path" \
+    || die "candidate readiness identity changed $label"
+}
+
+capture_gateway_signature() {
+  local path=$1 status_path="$WORK/gateway-status.$$.stdout"
+  "$NEXUS_BIN" --json gateway status >"$status_path" 2>"$WORK/gateway-status.$$.stderr" \
+    || die "Gateway must be live before and throughout D2"
+  jq -e '
+    .installed == true and
+    .daemonRunning == true and
+    .runtime.state == "live" and
+    (.runtime.pid | type == "number") and
+    (.runtime.url | type == "string")
+  ' "$status_path" >/dev/null || die "Gateway status is not healthy"
+  local pid discovery sha inode size modified proc_exe cmdline process_provenance module_sha
+  pid=$(jq -er '.runtime.pid' "$status_path")
+  discovery="$NEXUS_HOME/gateway.json"
+  [ -f "$discovery" ] && [ ! -L "$discovery" ] || die "Gateway discovery is missing or unsafe"
+  kill -0 "$pid" 2>/dev/null || die "Gateway pid $pid is not alive"
+  [ -e "/proc/$pid/exe" ] || die "Gateway process metadata is unavailable for pid $pid"
+  sha=$(sha256sum "$discovery" | cut -d' ' -f1)
+  inode=$(stat -c %i "$discovery")
+  size=$(stat -c %s "$discovery")
+  modified=$(stat -c %y "$discovery")
+  proc_exe=$(readlink -f "/proc/$pid/exe")
+  cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline")
+  process_provenance=$(python3 - \
+    "$pid" \
+    "$PACKED_GATEWAY_BIN" \
+    "$PACKED_GATEWAY_MODULE" \
+    "$PACKED_PREFIX" \
+    "$(jq -er '.runtime.url' "$status_path")" \
+    "${NEXUS_V015_FIXTURE_GATEWAY_HOST_MODE:-explicit}" <<'PY'
+import hashlib
+import http.client
+import ipaddress
+import json
+import os
+import socket
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+
+pid = int(sys.argv[1])
+expected = os.path.realpath(sys.argv[2])
+expected_module = os.path.realpath(sys.argv[3])
+expected_install_root = os.path.realpath(sys.argv[4])
+gateway_url = sys.argv[5]
+host_mode = sys.argv[6]
+if host_mode not in {"explicit", "wrong", "missing"}:
+    raise SystemExit("invalid Gateway Host fixture mode")
+try:
+    argv = [
+        raw.decode("utf-8", "surrogateescape")
+        for raw in (Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0"))
+        if raw
+    ]
+except OSError as error:
+    raise SystemExit(f"cannot inspect live Gateway argv: {error}")
+if len(argv) < 2 or not os.path.isabs(argv[1]) or os.path.realpath(argv[1]) != expected:
+    raise SystemExit(
+        "live Gateway process was not launched through the validated packed Gateway entrypoint at argv[1]"
+    )
+
+try:
+    process_stat_fields = (
+        Path(f"/proc/{pid}/stat")
+        .read_text(encoding="ascii")
+        .rsplit(") ", 1)[1]
+        .split()
+    )
+    process_start_ticks = int(process_stat_fields[19])
+    ticks_per_second = int(os.sysconf("SC_CLK_TCK"))
+    process_started_boot_ns = process_start_ticks * 1_000_000_000 // ticks_per_second
+    module_ctime_ns = Path(expected_module).stat().st_ctime_ns
+except (OSError, ValueError, IndexError) as error:
+    raise SystemExit(f"cannot bind live Gateway process start to candidate module: {error}")
+module_changed_boot_ns = (
+    time.clock_gettime_ns(time.CLOCK_BOOTTIME) - (time.time_ns() - module_ctime_ns)
+)
+if module_changed_boot_ns > process_started_boot_ns + 10_000_000:
+    raise SystemExit("candidate Gateway module changed after the live process started")
+
+parsed = urllib.parse.urlsplit(gateway_url)
+if parsed.scheme != "http" or parsed.hostname is None or parsed.port is None:
+    raise SystemExit("Gateway listener or health endpoint is not owned by the live Gateway process")
+try:
+    address = ipaddress.ip_address(parsed.hostname)
+    family = socket.AF_INET if address.version == 4 else socket.AF_INET6
+    expected_addresses = {(family, address)} if address.is_loopback else set()
+except ValueError:
+    expected_addresses = set()
+if not expected_addresses:
+    raise SystemExit("Gateway listener or health endpoint is not owned by the live Gateway process")
+
+try:
+    socket_inodes = {
+        target.removeprefix("socket:[").removesuffix("]")
+        for entry in Path(f"/proc/{pid}/fd").iterdir()
+        if (target := os.readlink(entry)).startswith("socket:[") and target.endswith("]")
+    }
+except OSError as error:
+    raise SystemExit(
+        "Gateway listener or health endpoint is not owned by the live Gateway process"
+    ) from error
+
+def decode_proc_address(raw, family):
+    try:
+        encoded = bytes.fromhex(raw)
+    except ValueError as error:
+        raise ValueError("invalid proc socket address") from error
+    if family == socket.AF_INET:
+        if len(encoded) != 4:
+            raise ValueError("invalid IPv4 proc socket address")
+        encoded = encoded[::-1]
+    else:
+        if len(encoded) != 16:
+            raise ValueError("invalid IPv6 proc socket address")
+        encoded = b"".join(encoded[index:index + 4][::-1] for index in range(0, 16, 4))
+    return ipaddress.ip_address(encoded)
+
+
+owned_listeners = set()
+for table, family, family_name in (
+    (Path("/proc/net/tcp"), socket.AF_INET, "ipv4"),
+    (Path("/proc/net/tcp6"), socket.AF_INET6, "ipv6"),
+):
+    try:
+        lines = table.read_text(encoding="ascii").splitlines()[1:]
+    except OSError:
+        continue
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 10 or fields[3] != "0A":
+            continue
+        try:
+            address_raw, port_raw = fields[1].rsplit(":", 1)
+            port = int(port_raw, 16)
+            address = decode_proc_address(address_raw, family)
+        except (IndexError, ValueError):
+            continue
+        if (
+            port == parsed.port
+            and fields[9] in socket_inodes
+            and (family, address) in expected_addresses
+        ):
+            owned_listeners.add((family, address, family_name))
+if not owned_listeners:
+    raise SystemExit("Gateway listener or health endpoint is not owned by the live Gateway process")
+
+health_path = (parsed.path.rstrip("/") if parsed.path else "") + "/api/v1/health"
+health_url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, health_path, "", ""))
+connection = None
+try:
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=2)
+    connection.connect()
+    if connection.sock is None:
+        raise OSError("health connection has no selected socket")
+    selected_family = connection.sock.family
+    selected_address = ipaddress.ip_address(connection.sock.getpeername()[0])
+    selected = next(
+        (
+            (family, address, family_name)
+            for family, address, family_name in owned_listeners
+            if family == selected_family and address == selected_address
+        ),
+        None,
+    )
+    if selected is None:
+        raise OSError("health connection selected a listener not owned by the Gateway pid")
+    listener_family = selected[2]
+    listener_address = str(selected_address)
+    connection.putrequest("GET", health_path, skip_host=True)
+    if host_mode == "explicit":
+        connection.putheader("Host", parsed.netloc)
+    elif host_mode == "wrong":
+        connection.putheader("Host", "wrong.invalid")
+    connection.endheaders()
+    response = connection.getresponse()
+    health_raw = response.read()
+    if response.status != 200:
+        raise ValueError(f"unexpected status {response.status}")
+    health = json.loads(health_raw)
+    if not isinstance(health, dict) or health.get("status") != "ok":
+        raise ValueError("health status is not ok")
+except (OSError, ValueError, json.JSONDecodeError, http.client.HTTPException) as error:
+    raise SystemExit(
+        "Gateway listener or health endpoint is not owned by the live Gateway process"
+    ) from error
+finally:
+    if connection is not None:
+        connection.close()
+
+runtime = health.get("runtime")
+runtime_facets = ("entrypoint", "loadedModule", "installRoot")
+runtime_identity_reported = False
+if runtime is not None and not isinstance(runtime, dict):
+    raise SystemExit("live Gateway health runtime identity is incomplete or malformed")
+if isinstance(runtime, dict):
+    present_facets = {key for key in runtime_facets if key in runtime}
+    if present_facets:
+        if present_facets != set(runtime_facets) or any(
+            not isinstance(runtime[key], str)
+            or not runtime[key]
+            or not os.path.isabs(runtime[key])
+            for key in runtime_facets
+        ):
+            raise SystemExit("live Gateway health runtime identity is incomplete or malformed")
+        runtime_identity_reported = True
+if runtime_identity_reported:
+    if (
+        os.path.realpath(str(runtime["entrypoint"])) != expected
+        or os.path.realpath(str(runtime["loadedModule"])) != expected_module
+        or os.path.realpath(str(runtime["installRoot"])) != expected_install_root
+    ):
+        raise SystemExit("live Gateway health runtime identity is not candidate-bound")
+
+print(json.dumps({
+    "argv": argv,
+    "candidateLauncher": expected,
+    "listenerOwned": True,
+    "listenerAddress": listener_address,
+    "listenerFamily": listener_family,
+    "healthUrl": health_url,
+    "healthSha256": hashlib.sha256(health_raw).hexdigest(),
+    "runtimeIdentityReported": runtime_identity_reported,
+    "runtimeIdentityMatched": True if runtime_identity_reported else None,
+    "processStartTicks": process_start_ticks,
+    "clockTicksPerSecond": ticks_per_second,
+    "gatewayModuleCtimeNs": module_ctime_ns,
+}))
+PY
+  )
+  module_sha=$(sha256sum "$PACKED_GATEWAY_MODULE" | cut -d' ' -f1)
+  [ "$module_sha" = "$(jq -er '.provenance.gatewayModuleSha256' "$WORK/packed-topology.snapshot")" ] \
+    || die "live Gateway candidate module changed during D2"
+  jq -n \
+    --argjson pid "$pid" \
+    --arg url "$(jq -er '.runtime.url' "$status_path")" \
+    --arg discoveryPath "$discovery" \
+    --arg discoverySha256 "$sha" \
+    --argjson discoveryInode "$inode" \
+    --argjson discoverySize "$size" \
+    --arg discoveryModified "$modified" \
+    --arg processExecutable "$proc_exe" \
+    --arg processCommand "$cmdline" \
+    --argjson processArgv "$(jq -c '.argv' <<<"$process_provenance")" \
+    --arg candidateLauncher "$(jq -r '.candidateLauncher' <<<"$process_provenance")" \
+    --argjson listenerOwned "$(jq -c '.listenerOwned' <<<"$process_provenance")" \
+    --arg listenerAddress "$(jq -r '.listenerAddress' <<<"$process_provenance")" \
+    --arg listenerFamily "$(jq -r '.listenerFamily' <<<"$process_provenance")" \
+    --arg healthUrl "$(jq -r '.healthUrl' <<<"$process_provenance")" \
+    --arg healthSha256 "$(jq -r '.healthSha256' <<<"$process_provenance")" \
+    --argjson runtimeIdentityReported "$(jq -c '.runtimeIdentityReported' <<<"$process_provenance")" \
+    --argjson runtimeIdentityMatched "$(jq -c '.runtimeIdentityMatched' <<<"$process_provenance")" \
+    --argjson processStartTicks "$(jq -c '.processStartTicks' <<<"$process_provenance")" \
+    --argjson clockTicksPerSecond "$(jq -c '.clockTicksPerSecond' <<<"$process_provenance")" \
+    --argjson gatewayModuleCtimeNs "$(jq -c '.gatewayModuleCtimeNs' <<<"$process_provenance")" \
+    --arg gatewayModule "$PACKED_GATEWAY_MODULE" \
+    --arg gatewayModuleSha256 "$module_sha" \
+    '{
+      pid: $pid,
+      url: $url,
+      discoveryPath: $discoveryPath,
+      discoverySha256: $discoverySha256,
+      discoveryInode: $discoveryInode,
+      discoverySize: $discoverySize,
+      discoveryModified: $discoveryModified,
+      processExecutable: $processExecutable,
+      processCommand: $processCommand,
+      processArgv: $processArgv,
+      candidateLauncher: $candidateLauncher,
+      candidateLauncherMatched: true,
+      listenerOwned: $listenerOwned,
+      listenerAddress: $listenerAddress,
+      listenerFamily: $listenerFamily,
+      healthUrl: $healthUrl,
+      healthSha256: $healthSha256,
+      runtimeIdentityReported: $runtimeIdentityReported,
+      runtimeIdentityMatched: $runtimeIdentityMatched,
+      gatewayModule: $gatewayModule,
+      gatewayModuleSha256: $gatewayModuleSha256,
+      gatewayModuleCtimeNs: $gatewayModuleCtimeNs,
+      processStartTicks: $processStartTicks,
+      clockTicksPerSecond: $clockTicksPerSecond,
+      candidateModuleOnDiskMatched: true,
+      candidateModulePredatesProcess: true
+    }' >"$path"
+}
+
+BASELINE_GATEWAY="$WORK/gateway-baseline.snapshot"
+capture_gateway_signature "$BASELINE_GATEWAY"
+jq -cn --slurpfile gateway "$BASELINE_GATEWAY" --slurpfile readiness "$BASELINE_READINESS" '
+  {"label":"gateway-baseline", command:[], exitCode:0, expectedExitCode:0,
+   stdout:null, stderr:null, gateway:($gateway[0] + {matchesBaseline:true}),
+   candidateReadiness:($readiness[0] + {matchesBaseline:true})}
+' >>"$TRANSCRIPT"
+jq -cn \
+  --slurpfile gateway "$BASELINE_GATEWAY" \
+  --slurpfile readiness "$BASELINE_READINESS" \
+  --slurpfile topology "$WORK/packed-topology.snapshot" '
+  {"label":"packed-topology", command:[], exitCode:0, expectedExitCode:0,
+   stdout:null, stderr:null, topology:$topology[0],
+   gateway:($gateway[0] + {matchesBaseline:true}),
+   candidateReadiness:($readiness[0] + {matchesBaseline:true})}
+' >>"$TRANSCRIPT"
+
+refresh_cleanup_owner_snapshot() {
+  local label=$1 staged="$WORK/cleanup-owner.$$.tmp" destination="$WORK/cleanup-owner.snapshot"
+  capture_validated_cleanup_targets "$staged" \
+    || die "could not capture the discovery-selected Webconsole owner after $label"
+  jq -e '
+    .schemaVersion == 1 and
+    .stopAllowed == true and
+    (.discovery | type == "object") and
+    (.targets | length == 1) and
+    .targets[0].pid == .discovery.pid
+  ' "$staged" >/dev/null \
+    || die "Webconsole cleanup owner is not uniquely discovery-selected after $label"
+  mv "$staged" "$destination"
+  CLEANUP_TARGET_SNAPSHOT=$destination
+}
+
+capture_command() {
+  local label=$1 expected=$2
+  shift 2
+  local stdout="$OUT/$label.stdout" stderr="$OUT/$label.stderr" current="$WORK/gateway-$label.snapshot"
+  local gateway_before="$WORK/gateway-$label-before.snapshot"
+  local readiness_before="$WORK/readiness-$label-before.snapshot" readiness_after="$WORK/readiness-$label-after.snapshot"
+  local status matches stdout_relative stderr_relative stdout_sha stderr_sha stdout_size stderr_size
+  assert_candidate_readiness_unchanged "$readiness_before" "before $label"
+  capture_gateway_signature "$gateway_before"
+  cmp -s "$BASELINE_GATEWAY" "$gateway_before" \
+    || die "Gateway identity or discovery changed before $label"
+  if "$@" >"$stdout" 2>"$stderr"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "$status" -eq 0 ]; then
+    case "$label" in
+      start-first|start-second|launch-no-open|start-adopt|restart|start-force)
+        # Preserve the discovery-selected owner before later assertions or
+        # same-shaped replacement processes can mutate cleanup authority.
+        refresh_cleanup_owner_snapshot "$label"
+        ;;
+    esac
+  fi
+  assert_candidate_readiness_unchanged "$readiness_after" "after $label"
+  capture_gateway_signature "$current"
+  if cmp -s "$BASELINE_GATEWAY" "$current"; then matches=true; else matches=false; fi
+  stdout_relative="${stdout#"$RUN_ROOT/"}"
+  stderr_relative="${stderr#"$RUN_ROOT/"}"
+  stdout_sha=$(sha256sum "$stdout" | cut -d' ' -f1)
+  stderr_sha=$(sha256sum "$stderr" | cut -d' ' -f1)
+  stdout_size=$(stat -c %s "$stdout")
+  stderr_size=$(stat -c %s "$stderr")
+  jq -cn \
+    --arg opLabel "$label" \
+    --argjson exitCode "$status" \
+    --argjson expectedExitCode "$expected" \
+    --arg stdout "$stdout_relative" \
+    --arg stderr "$stderr_relative" \
+    --arg stdoutSha256 "$stdout_sha" \
+    --arg stderrSha256 "$stderr_sha" \
+    --argjson stdoutSize "$stdout_size" \
+    --argjson stderrSize "$stderr_size" \
+    --argjson matchesBaseline "$matches" \
+    --slurpfile gateway "$current" \
+    --slurpfile readiness "$readiness_after" \
+    --args '
+      {
+        "label": $opLabel,
+        command: $ARGS.positional,
+        exitCode: $exitCode,
+        expectedExitCode: $expectedExitCode,
+        stdout: $stdout,
+        stderr: $stderr,
+        stdoutSha256: $stdoutSha256,
+        stdoutSize: $stdoutSize,
+        stderrSha256: $stderrSha256,
+        stderrSize: $stderrSize,
+        gateway: ($gateway[0] + {matchesBaseline:$matchesBaseline}),
+        candidateReadiness: ($readiness[0] + {matchesBaseline:true})
+      }
+    ' -- "$@" >>"$TRANSCRIPT"
+  [ "$matches" = true ] || die "Gateway identity or discovery changed after $label"
+  if [ "$status" -ne "$expected" ]; then
+    detail=$(tr '\n' ' ' <"$stderr")
+    [ -n "$detail" ] || detail=$(tr '\n' ' ' <"$stdout")
+    die "$label returned $status instead of $expected: $detail"
+  fi
 }
 
 assert_live_status() {
@@ -110,84 +2312,711 @@ assert_live_status() {
     ' "$path" >/dev/null
 }
 
-run_capture help-webconsole "$NEXUS_BIN" webconsole --help
+wait_port_closed() {
+  local port=$1 deadline
+  deadline=$((SECONDS + 5))
+  while port_is_open "$port"; do
+    [ "$SECONDS" -lt "$deadline" ] || die "listener on port $port did not close"
+    sleep 0.05
+  done
+}
+
+assert_discovery_converged() {
+  local expected_pid=$1 label=$2 health gateway_url
+  health="$OUT/discovery-$label.health"
+  gateway_url=$(jq -er '.url' "$BASELINE_GATEWAY")
+  [ -f "$DISCOVERY" ] || die "$label did not materialize Webconsole discovery"
+  curl --noproxy '*' -g -fsS --max-time 2 "$WEBCONSOLE_URL/health" >"$health"
+  jq -e \
+    --argjson pid "$expected_pid" \
+    --arg host "$HOST" \
+    --argjson port "$PORT" \
+    --arg url "$WEBCONSOLE_URL" \
+    --arg gatewayUrl "$gateway_url" \
+    --arg executable "$WEBCONSOLE_EXE" '
+      .pid == $pid and
+      .host == $host and
+      .port == $port and
+      .url == $url and
+      .gatewayUrl == $gatewayUrl and
+      .executable == $executable
+    ' "$DISCOVERY" >/dev/null || die "$label discovery does not converge with CLI argv"
+  jq -e \
+    --argjson pid "$expected_pid" \
+    --arg host "$HOST" \
+    --argjson port "$PORT" \
+    --arg url "$WEBCONSOLE_URL" \
+    --arg gatewayUrl "$gateway_url" \
+    --arg executable "$WEBCONSOLE_EXE" '
+      .ok == true and
+      .service == "nexus-webui" and
+      .pid == $pid and
+      .host == $host and
+      .port == $port and
+      .url == $url and
+      .gateway == $gatewayUrl and
+      .executable == $executable
+    ' "$health" >/dev/null || die "$label health does not converge with CLI argv"
+}
+
+capture_command preflight-status 2 "$NEXUS_BIN" --json webconsole status
+jq -e '.runtime.state == "down"' "$OUT/preflight-status.stdout" >/dev/null \
+  || die "D2 requires a stopped Webconsole at entry"
+[ "$(matching_webconsole_pids)" = '[]' ] || die "packed Webconsole is already running in the isolated lab"
+
+capture_command version 0 "$NEXUS_BIN" --version
+VERSION_OUTPUT=$(python3 - "$OUT/version.stdout" <<'PY'
+import sys
+from pathlib import Path
+
+sys.stdout.write(Path(sys.argv[1]).read_text(encoding="utf-8").strip())
+PY
+)
+[ "$VERSION_OUTPUT" = 'nexus 0.1.5' ] \
+  || die "packed Nexus CLI version must be exactly nexus 0.1.5"
+capture_command help-webconsole 0 "$NEXUS_BIN" webconsole --help
 for action in launch start stop restart status logs url; do
-  run_capture "help-$action" "$NEXUS_BIN" webconsole "$action" --help
+  capture_command "help-$action" 0 "$NEXUS_BIN" webconsole "$action" --help
 done
 
-run_capture start-first "$NEXUS_BIN" webconsole start --host "$HOST" --port "$PORT"
-run_capture status-first "$NEXUS_BIN" --json webconsole status
+LIFECYCLE_TOUCHED=1
+capture_command start-first 0 "$NEXUS_BIN" webconsole start --host "$HOST" --port "$PORT"
+capture_command status-plain 0 "$NEXUS_BIN" webconsole status
+grep -Fq "$WEBCONSOLE_URL" "$OUT/status-plain.stdout" \
+  || die "plain Webconsole status omitted the configured URL"
+capture_command status-first 0 "$NEXUS_BIN" --json webconsole status
 assert_live_status "$OUT/status-first.stdout"
 INITIAL_PID=$(jq -r '.runtime.pid' "$OUT/status-first.stdout")
+ACTIVE_WEBCONSOLE_PID=$INITIAL_PID
+assert_discovery_converged "$INITIAL_PID" start-first
 
-run_capture start-second "$NEXUS_BIN" webconsole start --host "$HOST" --port "$PORT"
-run_capture status-second "$NEXUS_BIN" --json webconsole status
+capture_command start-second 0 "$NEXUS_BIN" webconsole start --host "$HOST" --port "$PORT"
+capture_command status-second 0 "$NEXUS_BIN" --json webconsole status
 assert_live_status "$OUT/status-second.stdout"
 [ "$(jq -r '.runtime.pid' "$OUT/status-second.stdout")" = "$INITIAL_PID" ] \
   || die "repeat start replaced the live Webconsole"
+assert_discovery_converged "$INITIAL_PID" start-second
 
-run_capture url "$NEXUS_BIN" webconsole url
-[ "$(tr -d '\r\n' <"$OUT/url.stdout")" = "http://$HOST:$PORT" ] \
+capture_command url 0 "$NEXUS_BIN" webconsole url
+[ "$(tr -d '\r\n' <"$OUT/url.stdout")" = "$WEBCONSOLE_URL" ] \
   || die "webconsole url did not report the configured endpoint"
-run_capture launch-no-open "$NEXUS_BIN" webconsole launch --no-open --host "$HOST" --port "$PORT"
-run_capture logs-lines "$NEXUS_BIN" webconsole logs --lines 5
+NO_OPEN_SENTINEL="$WORK/browser-opener-was-invoked"
+NO_OPEN_BIN="$WORK/no-open-bin"
+mkdir -p "$NO_OPEN_BIN"
+for opener in xdg-open open sensible-browser; do
+  cat >"$NO_OPEN_BIN/$opener" <<EOF
+#!/bin/sh
+touch '$NO_OPEN_SENTINEL'
+exit 97
+EOF
+  chmod +x "$NO_OPEN_BIN/$opener"
+done
+capture_command launch-no-open 0 \
+  env "PATH=$NO_OPEN_BIN:$PATH" "BROWSER=$NO_OPEN_BIN/xdg-open" \
+  "$NEXUS_BIN" webconsole launch --no-open --host "$HOST" --port "$PORT"
+[ ! -e "$NO_OPEN_SENTINEL" ] \
+  || die "webconsole launch --no-open invoked a browser opener"
+assert_discovery_converged "$INITIAL_PID" launch-no-open
+LOG_PATH=$(jq -er '.logPath' "$OUT/status-first.stdout")
+LOG_TAIL_EXPECTED="$WORK/log-tail.expected"
+python3 - "$NEXUS_HOME" "$LOG_PATH" "$RUN_ID" "$LOG_TAIL_EXPECTED" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
 
-set +e
-timeout 1s "$NEXUS_BIN" webconsole logs --follow --lines 1 \
-  >"$OUT/logs-follow.stdout" 2>"$OUT/logs-follow.stderr"
-FOLLOW_STATUS=$?
-set -e
-[ "$FOLLOW_STATUS" -eq 124 ] || die "webconsole logs --follow was not cancellable (status $FOLLOW_STATUS)"
+home = Path(os.path.abspath(sys.argv[1]))
+path = Path(os.path.abspath(sys.argv[2]))
+run_id = sys.argv[3]
+expected = Path(sys.argv[4])
+try:
+    path.relative_to(home)
+except ValueError as error:
+    raise SystemExit("Webconsole log path escapes NEXUS_HOME") from error
+cursor = Path(path.anchor)
+for component in path.parts[1:-1]:
+    cursor /= component
+    info = os.lstat(cursor)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise SystemExit(f"Webconsole log ancestry is unsafe: {cursor}")
+flags = (
+    os.O_WRONLY
+    | os.O_APPEND
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+descriptor = os.open(path, flags)
+try:
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise SystemExit("Webconsole log is not a single regular file")
+    markers = [f"D2-LOG-{index:02d}:{run_id}" for index in range(1, 9)]
+    raw = ("\n".join(markers) + "\n").encode("utf-8")
+    view = memoryview(raw)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short write while seeding Webconsole log")
+        view = view[written:]
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+expected.write_text("\n".join(markers[-5:]) + "\n", encoding="utf-8")
+PY
+capture_command logs-lines 0 "$NEXUS_BIN" webconsole logs --lines 5
+cmp -s "$LOG_TAIL_EXPECTED" "$OUT/logs-lines.stdout" \
+  || die "webconsole logs --lines did not return the exact final five ordered lines"
+FOLLOW_MARKER="D2-FOLLOW:$RUN_ID"
+capture_command logs-follow 124 \
+  timeout 2s sh -c '
+    (sleep 0.25; printf "%s\n" "$3" >>"$1") &
+    exec "$2" webconsole logs --follow --lines 1
+  ' sh "$LOG_PATH" "$NEXUS_BIN" "$FOLLOW_MARKER"
+printf '%s\n%s\n' "D2-LOG-08:$RUN_ID" "$FOLLOW_MARKER" >"$WORK/log-follow.expected"
+cmp -s "$WORK/log-follow.expected" "$OUT/logs-follow.stdout" \
+  || die "webconsole logs --follow did not stream the unique appended line exactly once"
 
-DISCOVERY="$NEXUS_HOME/webconsole.json"
 [ -f "$DISCOVERY" ] || die "Webconsole discovery is missing before adoption test"
-mv "$DISCOVERY" "$OUT/discovery-before-adoption.json"
-run_capture start-adopt "$NEXUS_BIN" webconsole start --host "$HOST" --port "$PORT"
+cp "$DISCOVERY" "$OUT/discovery-before-adoption.snapshot"
+rm "$DISCOVERY"
+kill -0 "$INITIAL_PID" 2>/dev/null || die "Webconsole died before discovery recovery"
+port_is_open "$PORT" || die "Webconsole listener disappeared before discovery recovery"
+capture_command start-adopt 0 "$NEXUS_BIN" webconsole start --host "$HOST" --port "$PORT"
 [ -f "$DISCOVERY" ] || die "Webconsole start did not restore missing discovery"
 ADOPTED_PID=$(jq -r '.pid' "$DISCOVERY")
 [ "$ADOPTED_PID" = "$INITIAL_PID" ] || die "missing-discovery recovery adopted the wrong process"
+assert_discovery_converged "$ADOPTED_PID" start-adopt
 
-run_capture restart "$NEXUS_BIN" --json webconsole restart --host "$HOST" --port "$PORT"
+capture_command restart 0 "$NEXUS_BIN" --json webconsole restart --host "$HOST" --port "$PORT"
 assert_live_status "$OUT/restart.stdout"
 RESTARTED_PID=$(jq -r '.runtime.pid' "$OUT/restart.stdout")
+ACTIVE_WEBCONSOLE_PID=$RESTARTED_PID
 [ "$RESTARTED_PID" != "$ADOPTED_PID" ] || die "webconsole restart did not replace the process"
-curl -fsS --max-time 2 "http://$HOST:$PORT/health" >"$OUT/health-after-restart.json"
+assert_discovery_converged "$RESTARTED_PID" restart
+curl --noproxy '*' -g -fsS --max-time 2 \
+  "$WEBCONSOLE_URL/health" >"$OUT/health-after-restart.stdout"
 
-run_capture stop "$NEXUS_BIN" webconsole stop
-set +e
-"$NEXUS_BIN" --json webconsole status >"$OUT/status-down.stdout" 2>"$OUT/status-down.stderr"
-DOWN_STATUS=$?
-set -e
-[ "$DOWN_STATUS" -eq 2 ] || die "stopped Webconsole status returned $DOWN_STATUS instead of 2"
-jq -e '.runtime.state == "down"' "$OUT/status-down.stdout" >/dev/null
-if curl -fsS --max-time 1 "http://$HOST:$PORT/health" >"$OUT/health-after-stop.stdout" 2>"$OUT/health-after-stop.stderr"; then
-  die "Webconsole port remained healthy after stop"
-fi
-run_capture stop-force "$NEXUS_BIN" webconsole stop --force
+capture_command stop-first 0 "$NEXUS_BIN" webconsole stop
+ACTIVE_WEBCONSOLE_PID=""
+capture_command status-down-normal 2 "$NEXUS_BIN" --json webconsole status
+jq -e '.runtime.state == "down"' "$OUT/status-down-normal.stdout" >/dev/null
+wait_port_closed "$PORT"
+capture_command stop-second 0 "$NEXUS_BIN" webconsole stop
 
-run_capture start-final "$NEXUS_BIN" webconsole start --host "$HOST" --port "$PORT"
-run_capture launch-final "$NEXUS_BIN" webconsole launch --no-open --host "$HOST" --port "$PORT"
-run_capture status-final "$NEXUS_BIN" --json webconsole status
-assert_live_status "$OUT/status-final.stdout"
-curl -fsS --max-time 2 "http://$HOST:$PORT/health" >"$OUT/health-final.json"
+capture_command start-force 0 "$NEXUS_BIN" --json webconsole start --host "$HOST" --port "$PORT"
+assert_live_status "$OUT/start-force.stdout"
+FORCE_PID=$(jq -r '.runtime.pid' "$OUT/start-force.stdout")
+ACTIVE_WEBCONSOLE_PID=$FORCE_PID
+assert_discovery_converged "$FORCE_PID" start-force
+capture_command stop-force-first 0 "$NEXUS_BIN" webconsole stop --force
+ACTIVE_WEBCONSOLE_PID=""
+wait_port_closed "$PORT"
+capture_command stop-force-second 0 "$NEXUS_BIN" webconsole stop --force
+
+OCCUPIED_PORT=$(allocate_closed_port)
+while [ "$OCCUPIED_PORT" = "$PORT" ]; do OCCUPIED_PORT=$(allocate_closed_port); done
+OCCUPIED_URL=$(http_url "$HOST" "$OCCUPIED_PORT")
+WEBCONSOLE_PIDS_BEFORE=$(matching_webconsole_pids)
+[ "$WEBCONSOLE_PIDS_BEFORE" = '[]' ] || die "Webconsole process remained before occupied-port check"
+python3 -m http.server "$OCCUPIED_PORT" --bind "$HOST" \
+  >"$OUT/foreign-listener.stdout" 2>"$OUT/foreign-listener.stderr" &
+FOREIGN_PID=$!
+deadline=$((SECONDS + 5))
+until curl --noproxy '*' -g -sS --max-time 1 -o /dev/null \
+  "$OCCUPIED_URL/health" 2>/dev/null; do
+  [ "$SECONDS" -lt "$deadline" ] || die "foreign occupied-port fixture did not become ready"
+  sleep 0.05
+done
+FOREIGN_PID_BEFORE=$FOREIGN_PID
+FOREIGN_EXE_BEFORE=$(readlink -f "/proc/$FOREIGN_PID/exe")
+OCCUPIED_WEBUI_AUDIT="$WORK/nexus-webui-exec-audit"
+OCCUPIED_WEBUI_INVOCATIONS="$WORK/nexus-webui-exec-invocations"
+cat >"$OCCUPIED_WEBUI_AUDIT" <<'SH'
+#!/bin/sh
+printf '%s\n' "$$" >>"$NEXUS_V015_WEBUI_EXEC_AUDIT"
+exec "$NEXUS_V015_WEBUI_EXEC_TARGET" "$@"
+SH
+chmod 0500 "$OCCUPIED_WEBUI_AUDIT"
+OCCUPIED_STARTED=$(python3 -c 'import time; print(time.monotonic())')
+capture_command occupied-start 1 \
+  env \
+    "NEXUS_WEBUI_BIN=$OCCUPIED_WEBUI_AUDIT" \
+    "NEXUS_V015_WEBUI_EXEC_AUDIT=$OCCUPIED_WEBUI_INVOCATIONS" \
+    "NEXUS_V015_WEBUI_EXEC_TARGET=$WEBCONSOLE_EXE" \
+  "$NEXUS_BIN" --json webconsole start --host "$HOST" --port "$OCCUPIED_PORT"
+OCCUPIED_ENDED=$(python3 -c 'import time; print(time.monotonic())')
+OCCUPIED_ELAPSED=$(python3 - "$OCCUPIED_STARTED" "$OCCUPIED_ENDED" <<'PY'
+import sys
+print(float(sys.argv[2]) - float(sys.argv[1]))
+PY
+)
+OCCUPIED_ERROR_CODE=$(jq -er '.error.code' "$OUT/occupied-start.stdout")
+OCCUPIED_MESSAGE=$(jq -er '.error.message' "$OUT/occupied-start.stdout")
+OCCUPIED_ERROR_HOST=$(jq -er '.error.data.host' "$OUT/occupied-start.stdout")
+OCCUPIED_ERROR_PORT=$(jq -er '.error.data.port' "$OUT/occupied-start.stdout")
+[ "$OCCUPIED_ERROR_CODE" = "WEBCONSOLE_PORT_OCCUPIED" ] \
+  || die "occupied-port refusal did not use WEBCONSOLE_PORT_OCCUPIED"
+[ "$OCCUPIED_ERROR_HOST" = "$HOST" ] && [ "$OCCUPIED_ERROR_PORT" = "$OCCUPIED_PORT" ] \
+  || die "occupied-port refusal did not report the rejected endpoint"
+grep -Eqi 'occupied' <<<"$OCCUPIED_MESSAGE" || die "occupied-port refusal was not typed as occupied"
+[ ! -s "$OCCUPIED_WEBUI_INVOCATIONS" ] \
+  || die "occupied-port refusal invoked the packed WebUI executable"
+kill -0 "$FOREIGN_PID" 2>/dev/null || die "occupied-port refusal killed the unrelated listener"
+FOREIGN_PID_AFTER=$FOREIGN_PID
+FOREIGN_EXE_AFTER=$(readlink -f "/proc/$FOREIGN_PID/exe")
+[ "$FOREIGN_EXE_AFTER" = "$FOREIGN_EXE_BEFORE" ] \
+  || die "occupied-port refusal replaced the unrelated listener"
+curl --noproxy '*' -g -sS --max-time 1 -o /dev/null "$OCCUPIED_URL/health" \
+  || die "unrelated occupied-port listener stopped responding"
+[ ! -e "$DISCOVERY" ] || die "occupied-port refusal created Webconsole discovery"
+WEBCONSOLE_PIDS_AFTER=$(matching_webconsole_pids)
+[ "$WEBCONSOLE_PIDS_AFTER" = '[]' ] || die "occupied-port refusal spawned a Webconsole child"
 
 jq -n \
-  --arg runId "$RUN_ID" \
-  --arg status passed \
   --argjson initialPid "$INITIAL_PID" \
   --argjson adoptedPid "$ADOPTED_PID" \
   --argjson restartedPid "$RESTARTED_PID" \
-  --arg finalState "$(jq -r '.runtime.state' "$OUT/status-final.stdout")" \
-  --argjson followExit "$FOLLOW_STATUS" \
+  --argjson forcePid "$FORCE_PID" \
+  --argjson argvDiscoveryConverged true \
+  --argjson discoveryRestored true \
+  --argjson normalStopClosed true \
+  --argjson forcedStopClosed true \
+  --argjson finalListenerClosed true \
   '{
     schemaVersion: 1,
-    runId: $runId,
-    status: $status,
     initialPid: $initialPid,
     adoptedPid: $adoptedPid,
     restartedPid: $restartedPid,
-    finalState: $finalState,
-    boundedFollowExit: $followExit
-  }' >"$OUT/result.json"
+    forcePid: $forcePid,
+    argvDiscoveryConverged: $argvDiscoveryConverged,
+    discoveryRestored: $discoveryRestored,
+    normalStopClosed: $normalStopClosed,
+    forcedStopClosed: $forcedStopClosed,
+    finalListenerClosed: $finalListenerClosed
+  }' >"$RECOVERY"
 
+jq -n \
+  --argjson port "$OCCUPIED_PORT" \
+  --arg errorCode "$OCCUPIED_ERROR_CODE" \
+  --arg message "$OCCUPIED_MESSAGE" \
+  --arg errorHost "$OCCUPIED_ERROR_HOST" \
+  --argjson errorPort "$OCCUPIED_ERROR_PORT" \
+  --argjson foreignPidBefore "$FOREIGN_PID_BEFORE" \
+  --argjson foreignPidAfter "$FOREIGN_PID_AFTER" \
+  --arg foreignExecutableBefore "$FOREIGN_EXE_BEFORE" \
+  --arg foreignExecutableAfter "$FOREIGN_EXE_AFTER" \
+  --argjson foreignListenerPreserved true \
+  --argjson webconsolePidsBefore "$WEBCONSOLE_PIDS_BEFORE" \
+  --argjson webconsolePidsAfter "$WEBCONSOLE_PIDS_AFTER" \
+  --argjson elapsedSeconds "$OCCUPIED_ELAPSED" \
+  '{
+    schemaVersion: 1,
+    port: $port,
+    errorCode: $errorCode,
+    message: $message,
+    errorData: {host:$errorHost, port:$errorPort},
+    foreignPidBefore: $foreignPidBefore,
+    foreignPidAfter: $foreignPidAfter,
+    foreignExecutableBefore: $foreignExecutableBefore,
+    foreignExecutableAfter: $foreignExecutableAfter,
+    foreignListenerPreserved: $foreignListenerPreserved,
+    webconsolePidsBefore: $webconsolePidsBefore,
+    webconsolePidsAfter: $webconsolePidsAfter,
+    elapsedSeconds: $elapsedSeconds
+  }' >"$OCCUPIED"
+
+kill "$FOREIGN_PID"
+wait "$FOREIGN_PID" 2>/dev/null || true
+FOREIGN_PID=""
+wait_port_closed "$OCCUPIED_PORT"
+capture_command status-final 2 "$NEXUS_BIN" --json webconsole status
+jq -e '.runtime.state == "down"' "$OUT/status-final.stdout" >/dev/null
+wait_port_closed "$PORT"
+[ ! -e "$DISCOVERY" ] || die "Webconsole discovery remained after final stop"
+
+relative_artifact() {
+  printf '%s' "${1#"$RUN_ROOT/"}"
+}
+artifact_record() {
+  local path=$1
+  jq -n \
+    --arg path "$(relative_artifact "$path")" \
+    --arg sha256 "$(sha256sum "$path" | cut -d' ' -f1)" \
+    '{path:$path, sha256:$sha256}'
+}
+
+CLI_ARTIFACT=$(artifact_record "$TRANSCRIPT")
+RECOVERY_ARTIFACT=$(artifact_record "$RECOVERY")
+OCCUPIED_ARTIFACT=$(artifact_record "$OCCUPIED")
+EVIDENCE_INVENTORY=$(python3 - "$RUN_ROOT" "$OUT" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+out = Path(sys.argv[2])
+records = []
+for directory, directory_names, filenames in os.walk(out, followlinks=False):
+    current = Path(directory)
+    for name in sorted(directory_names):
+        path = current / name
+        info = os.lstat(path)
+        if stat.S_ISLNK(info.st_mode):
+            raise SystemExit(f"D2 evidence directory contains a symlink: {path}")
+        if not stat.S_ISDIR(info.st_mode):
+            raise SystemExit(f"D2 evidence directory contains a non-directory: {path}")
+    for name in sorted(filenames):
+        path = current / name
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise SystemExit(f"D2 evidence path is not a single regular file: {path}")
+        raw = path.read_bytes()
+        records.append({
+            "path": path.relative_to(root).as_posix(),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "size": len(raw),
+        })
+print(json.dumps(sorted(records, key=lambda record: record["path"]), separators=(",", ":")))
+PY
+)
+jq -n \
+  --arg runId "$RUN_ID" \
+  --arg candidateDigest "$CANDIDATE_DIGEST" \
+  --argjson primaryPort "$PORT" \
+  --argjson occupiedPort "$OCCUPIED_PORT" \
+  --argjson cliTranscript "$CLI_ARTIFACT" \
+  --argjson discoveryRecovery "$RECOVERY_ARTIFACT" \
+  --argjson occupiedPortArtifact "$OCCUPIED_ARTIFACT" \
+  --argjson evidenceInventory "$EVIDENCE_INVENTORY" '
+  {
+    schemaVersion: 1,
+    runId: $runId,
+    candidateDigest: $candidateDigest,
+    gate: "D2",
+    status: "PASS",
+    error: null,
+    partial: false,
+    flaky: false,
+    skipped: false,
+    refused: false,
+    failureCount: 0,
+    finalState: "down",
+    primaryPort: $primaryPort,
+    occupiedPort: $occupiedPort,
+    evidenceInventory: $evidenceInventory,
+    requiredArtifacts: ["cliTranscript", "discoveryRecovery", "occupiedPort"],
+    artifacts: {
+      cliTranscript: $cliTranscript,
+      discoveryRecovery: $discoveryRecovery,
+      occupiedPort: $occupiedPortArtifact
+    }
+  }
+' >"$OUT/result.json.tmp"
+mv "$OUT/result.json.tmp" "$OUT/result.json"
+find "$OUT" -maxdepth 1 -type f -exec chmod 0400 {} +
+"$SCRIPT_DIR/nexus-v015-webconsole-evidence-verify" "$RUN_ROOT" >/dev/null
+
+FINAL_READINESS="$WORK/readiness-final.snapshot"
+assert_candidate_readiness_unchanged "$FINAL_READINESS" "at D2 completion"
+FINAL_GATEWAY="$WORK/gateway-final.snapshot"
+capture_gateway_signature "$FINAL_GATEWAY"
+cmp -s "$BASELINE_GATEWAY" "$FINAL_GATEWAY" \
+  || die "Gateway identity or discovery changed at D2 completion"
+
+RESULT_SEAL_SNAPSHOT="$WORK/result-seal-owned.snapshot"
+RESULT_SEAL_OWNED=1
+python3 - \
+  "$RUN_ROOT" "$RUN_ID" "$CANDIDATE_DIGEST" "$RESULT_SEAL_SNAPSHOT" \
+  "${NEXUS_V015_FIXTURE_FAIL_SELF_VERIFY:-0}" \
+  "${NEXUS_V015_FIXTURE_FAIL_SEAL_PARENT_FSYNC:-0}" \
+  "${NEXUS_V015_FIXTURE_FAIL_POST_PUBLISH_VERIFY:-0}" \
+  "${NEXUS_V015_FIXTURE_SWAP_SEAL_BEFORE_PUBLISH_ROLLBACK:-}" \
+  "${NEXUS_V015_FIXTURE_FAIL_SEAL_RESTORE_PARENT_FSYNC:-0}" \
+  "${NEXUS_V015_FIXTURE_KILL_AFTER_SEAL_RESTORE_FSYNC:-0}" \
+  "${NEXUS_V015_FIXTURE_FAIL_RESULT_FSYNC:-0}" \
+  "${NEXUS_V015_FIXTURE_KILL_PARENT_AFTER_SEAL_COMMIT:-0}" \
+  "${NEXUS_V015_FIXTURE_FAIL_AFTER_SEAL_PUBLISH:-0}" <<'PY'
+import hashlib
+import json
+import os
+import secrets
+import signal
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+run_id = sys.argv[2]
+candidate_digest = sys.argv[3]
+snapshot_path = Path(sys.argv[4])
+fail_self_verify = sys.argv[5] == "1"
+fail_parent_fsync = sys.argv[6] == "1"
+fail_post_publish_verify = sys.argv[7] == "1"
+swap_before_publish_rollback = sys.argv[8]
+fail_restore_parent_fsync = sys.argv[9] == "1"
+kill_after_restore_fsync = sys.argv[10] == "1"
+fail_result_fsync = sys.argv[11] == "1"
+kill_parent_after_seal_commit = sys.argv[12] == "1"
+fail_after_seal_publish = sys.argv[13] == "1"
+result_relative = Path("results/D2-webconsole-cli/result.json")
+seal_relative = Path("results/D2-webconsole-cli.result.sha256")
+result_path = root / result_relative
+seal_path = root / seal_relative
+temporary = seal_path.with_name(f".{seal_path.name}.tmp-{os.getpid()}")
+flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(result_path, flags)
+try:
+    info = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_IMODE(info.st_mode) != 0o400
+        or info.st_nlink != 1
+    ):
+        raise SystemExit("D2 result is not a single 0400 regular file")
+    chunks = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    result_raw = b"".join(chunks)
+    if fail_result_fsync:
+        raise OSError("fixture forced D2 result fsync failure")
+    os.fsync(descriptor)
+    visible = os.stat(result_path, follow_symlinks=False)
+    if (
+        visible.st_dev != info.st_dev
+        or visible.st_ino != info.st_ino
+        or visible.st_size != info.st_size
+        or stat.S_IMODE(visible.st_mode) != 0o400
+        or visible.st_nlink != 1
+    ):
+        raise SystemExit("D2 result changed while establishing durability")
+finally:
+    os.close(descriptor)
+directory_flags = (
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+result_directory = os.open(result_path.parent, directory_flags)
+try:
+    os.fsync(result_directory)
+finally:
+    os.close(result_directory)
+document = {
+    "schemaVersion": 1,
+    "runId": run_id,
+    "candidateDigest": candidate_digest,
+    "gate": "D2",
+    "resultPath": result_relative.as_posix(),
+    "resultSha256": hashlib.sha256(result_raw).hexdigest(),
+    "resultSize": len(result_raw),
+}
+raw = (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode()
+create_flags = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+descriptor = os.open(temporary, create_flags, 0o400)
+try:
+    os.fchmod(descriptor, 0o400)
+    view = memoryview(raw)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short write while publishing D2 result seal")
+        view = view[written:]
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+
+read_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+staged_descriptor = os.open(temporary, read_flags)
+committed = False
+try:
+    staged_info = os.fstat(staged_descriptor)
+    staged_raw = b""
+    while True:
+        chunk = os.read(staged_descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        staged_raw += chunk
+    if (
+        not stat.S_ISREG(staged_info.st_mode)
+        or stat.S_IMODE(staged_info.st_mode) != 0o400
+        or staged_info.st_nlink != 1
+        or staged_raw != raw
+    ):
+        raise SystemExit("staged D2 result seal failed self-verification")
+
+    staged_record = {
+        "device": staged_info.st_dev,
+        "inode": staged_info.st_ino,
+        "size": staged_info.st_size,
+        "sha256": hashlib.sha256(staged_raw).hexdigest(),
+    }
+    snapshot_path.write_text(json.dumps(staged_record, sort_keys=True), encoding="utf-8")
+    if fail_self_verify:
+        os.unlink(temporary)
+        raise SystemExit("fixture forced D2 result self-verification failure")
+    if fail_post_publish_verify:
+        os.unlink(temporary)
+        raise SystemExit("fixture forced D2 post-publication verification failure")
+    if fail_after_seal_publish:
+        os.unlink(temporary)
+        raise SystemExit("fixture forced failure after D2 result seal publication")
+
+    linked = False
+    directory = os.open(
+        seal_path.parent,
+        directory_flags | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        try:
+            os.link(
+                temporary.name,
+                seal_path.name,
+                src_dir_fd=directory,
+                dst_dir_fd=directory,
+                follow_symlinks=False,
+            )
+            linked = True
+            os.unlink(temporary.name, dir_fd=directory)
+            if fail_parent_fsync:
+                raise OSError("fixture forced D2 result seal parent fsync failure")
+            os.fsync(directory)
+            committed = True
+            if kill_parent_after_seal_commit:
+                os.kill(os.getppid(), signal.SIGKILL)
+        except BaseException:
+            if linked:
+                if swap_before_publish_rollback:
+                    os.replace(swap_before_publish_rollback, seal_path)
+                quarantine_name = (
+                    f".{seal_path.name}.rollback-{os.getpid()}-{secrets.token_hex(6)}"
+                )
+                try:
+                    os.replace(
+                        seal_path.name,
+                        quarantine_name,
+                        src_dir_fd=directory,
+                        dst_dir_fd=directory,
+                    )
+                except FileNotFoundError:
+                    quarantine_name = ""
+                if quarantine_name:
+                    quarantine = os.open(quarantine_name, read_flags, dir_fd=directory)
+                    try:
+                        quarantine_info = os.fstat(quarantine)
+                        quarantine_raw = b""
+                        while True:
+                            chunk = os.read(quarantine, 1024 * 1024)
+                            if not chunk:
+                                break
+                            quarantine_raw += chunk
+                        quarantine_record = {
+                            "device": quarantine_info.st_dev,
+                            "inode": quarantine_info.st_ino,
+                            "size": quarantine_info.st_size,
+                            "sha256": hashlib.sha256(quarantine_raw).hexdigest(),
+                        }
+                        if quarantine_record != staged_record:
+                            replacement_record = quarantine_record
+                            # Make the quarantined replacement a durable
+                            # recovery point before restoring its canonical
+                            # name. A crash cannot make it disappear together
+                            # with the invocation-owned seal.
+                            os.fsync(directory)
+                            try:
+                                os.stat(
+                                    seal_path.name,
+                                    dir_fd=directory,
+                                    follow_symlinks=False,
+                                )
+                            except FileNotFoundError:
+                                os.rename(
+                                    quarantine_name,
+                                    seal_path.name,
+                                    src_dir_fd=directory,
+                                    dst_dir_fd=directory,
+                                )
+                            try:
+                                if fail_restore_parent_fsync:
+                                    raise OSError(
+                                        "fixture forced D2 replacement restore parent fsync failure"
+                                    )
+                                os.fsync(directory)
+                            except OSError:
+                                # A one-shot fsync error is recoverable only if
+                                # the visible canonical name still identifies
+                                # the exact replacement. Revalidate it, then
+                                # establish the durable restore boundary.
+                                restored = os.open(
+                                    seal_path.name,
+                                    read_flags,
+                                    dir_fd=directory,
+                                )
+                                try:
+                                    restored_info = os.fstat(restored)
+                                    restored_raw = b""
+                                    while True:
+                                        chunk = os.read(restored, 1024 * 1024)
+                                        if not chunk:
+                                            break
+                                        restored_raw += chunk
+                                    restored_record = {
+                                        "device": restored_info.st_dev,
+                                        "inode": restored_info.st_ino,
+                                        "size": restored_info.st_size,
+                                        "sha256": hashlib.sha256(restored_raw).hexdigest(),
+                                    }
+                                finally:
+                                    os.close(restored)
+                                if restored_record != replacement_record:
+                                    raise SystemExit(
+                                        "replacement D2 result seal changed during rollback restore"
+                                    )
+                                os.fsync(directory)
+                            if kill_after_restore_fsync:
+                                os.kill(os.getpid(), signal.SIGKILL)
+                            raise SystemExit(
+                                "refusing to roll back a replacement D2 result seal"
+                            )
+                        # If rollback itself cannot be made durable, any surviving
+                        # owned inode must still be verifier-invalid.
+                        os.fchmod(staged_descriptor, 0)
+                        os.fsync(staged_descriptor)
+                    finally:
+                        os.close(quarantine)
+            try:
+                os.unlink(temporary.name, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+            try:
+                os.fsync(directory)
+            except OSError:
+                pass
+            raise
+    finally:
+        try:
+            os.close(directory)
+        except OSError:
+            if not committed:
+                raise
+finally:
+    try:
+        os.close(staged_descriptor)
+    except OSError:
+        if not committed:
+            raise
+PY
+SUCCESS=1
 printf 'v0.1.5 Webconsole acceptance passed: %s\n' "$OUT"

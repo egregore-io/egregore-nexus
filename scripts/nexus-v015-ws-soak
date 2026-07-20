@@ -1,0 +1,2995 @@
+#!/usr/bin/env python3
+"""Produce the v0.1.5 dual-WebSocket restart-soak evidence gate.
+
+This runner is intentionally container-only and candidate-bound. It reads the
+canonical packed manifest, derives the candidate digest itself, exercises both
+authenticated WebSocket lanes against live Codex and Claude sessions, and
+publishes F3 evidence only after the whole gate has finished.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import base64
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass
+import errno
+from http.cookies import SimpleCookie
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import runpy
+import shutil
+import stat
+import subprocess
+import sys
+import time
+from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
+
+
+VERSION = "0.1.5"
+RELEASE_DURATION_SECONDS = 1800
+LAB_ROOT_PREFIX = Path("/tmp/nexus-lens-home")
+PACKED_PREFIX_PATTERN = re.compile(r"/tmp/nexus-lab-install\.[A-Za-z0-9]+")
+NEXUS_LAUNCHER = Path("/tmp/nexus-lab-bin/nexus")
+GATEWAY_LAUNCHER = Path("/tmp/nexus-lab-bin/nexus-gateway")
+LAB_PROCESS = Path("/tmp/nexus-lab-bin/lab-process")
+WS_ACCEPTANCE = Path("/tmp/nexus-lab-bin/nexus-v015-ws-acceptance")
+GATEWAY_URL = "http://127.0.0.1:4100"
+WEBCONSOLE_URL = "http://127.0.0.1:4200"
+LENS_CDP_URL = "http://127.0.0.1:9222"
+WEBUI_CDP_URL = "http://127.0.0.1:9224"
+CGROUP_ROOT = Path("/sys/fs/cgroup")
+PROC_ROOT = Path("/proc")
+MEMORY_LIMIT_BYTES = 8 * 1024 * 1024 * 1024
+DISK_LIMIT_BYTES = 10 * 1024 * 1024 * 1024
+FRAME_HISTORY_LIMIT = 16_384
+FINGERPRINT_HISTORY_LIMIT = 16_384
+MEMORY_TREND_MIN_GROWTH = 512 * 1024 * 1024
+DISK_TREND_MIN_GROWTH = 512 * 1024 * 1024
+PACKAGE_NAMES = ("@egregore/nexus", "@egregore/nexus-cli", "@egregore/nexus-gateway")
+FAILURE_COUNTERS = (
+    "deadLetters",
+    "lostAcceptedMessages",
+    "duplicateAcceptedMessages",
+    "crossRouteDeliveries",
+    "silentSubscriptionFailures",
+    "offlineRestoredParticipants",
+    "identityDrift",
+    "queueWedges",
+    "crashLoops",
+)
+ARTIFACT_NAMES = (
+    "metrics",
+    "dualWebsocketFrames",
+    "reconnectCheckpoints",
+    "memory",
+    "disk",
+    "finalProcesses",
+    "finalListeners",
+    "logs",
+)
+SAFE_ID = re.compile(r"[^a-zA-Z0-9_.-]+")
+RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+ONLINE_STATES = frozenset({"online", "live", "ready", "active"})
+SEMVER_LINE = re.compile(r"(?:^|\s)v?\d+\.\d+\.\d+")
+
+
+class SoakFailure(RuntimeError):
+    pass
+
+
+def canonical_digest(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def absolute_without_resolving(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def open_no_symlink(path: Path, *, directory: bool = False) -> int:
+    """Open an absolute path without following any symlink in its ancestry."""
+
+    absolute = absolute_without_resolving(path)
+    if not absolute.is_absolute():
+        raise SoakFailure(f"path is not absolute: {path}")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    fd = os.open("/", flags | os.O_DIRECTORY)
+    try:
+        for index, part in enumerate(absolute.parts[1:]):
+            final = index == len(absolute.parts[1:]) - 1
+            child_flags = flags | os.O_NOFOLLOW
+            if not final or directory:
+                child_flags |= os.O_DIRECTORY
+            child = os.open(part, child_flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        info = os.fstat(fd)
+        expected = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+        if not expected:
+            kind = "directory" if directory else "regular file"
+            raise SoakFailure(f"path is not a real {kind}: {absolute}")
+        if not directory and info.st_nlink != 1:
+            raise SoakFailure(f"refusing multiply-linked file: {absolute}")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_bytes_no_symlink(path: Path, label: str) -> bytes:
+    try:
+        fd = open_no_symlink(path)
+        with os.fdopen(fd, "rb", closefd=True) as handle:
+            before = os.fstat(handle.fileno())
+            value = handle.read()
+            after = os.fstat(handle.fileno())
+    except (OSError, SoakFailure) as error:
+        raise SoakFailure(f"cannot read {label} {path}: {error}") from error
+    identity_before = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    identity_after = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    if identity_before != identity_after:
+        raise SoakFailure(f"{label} changed while it was read: {path}")
+    return value
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    digest.update(read_bytes_no_symlink(path, "artifact"))
+    return digest.hexdigest()
+
+
+def load_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        value = json.loads(read_bytes_no_symlink(path, label).decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SoakFailure(f"cannot read {label} {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise SoakFailure(f"{label} must be a JSON object: {path}")
+    return value
+
+
+def inside(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def checked_artifact(root: Path, record: object, label: str) -> Path:
+    if not isinstance(record, dict) or set(record) != {"path", "sha256"}:
+        raise SoakFailure(f"{label} must contain exactly path and sha256")
+    relative = record.get("path")
+    digest = record.get("sha256")
+    if not isinstance(relative, str) or not relative or "\\" in relative:
+        raise SoakFailure(f"{label}.path must be a non-empty POSIX path")
+    path = Path(relative)
+    if path.is_absolute() or ".." in path.parts:
+        raise SoakFailure(f"{label}.path escapes the evidence root")
+    absolute = root / path
+    try:
+        fd = open_no_symlink(absolute)
+    except (OSError, SoakFailure) as error:
+        raise SoakFailure(f"{label} is missing or unsafe: {absolute}: {error}") from error
+    else:
+        os.close(fd)
+    if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise SoakFailure(f"{label}.sha256 is invalid")
+    actual = sha256_file(absolute)
+    if actual != digest:
+        raise SoakFailure(f"{label} hash mismatch: expected {digest}, got {actual}")
+    return absolute
+
+
+@dataclass(frozen=True)
+class Candidate:
+    run_id: str
+    digest: str
+    manifest: dict[str, Any]
+    packed_prefix: Path
+    readiness_ledger: Path
+
+
+@dataclass(frozen=True)
+class AuthorityCheckpoint:
+    run_id: str
+    candidate_digest: str
+    install_root: Path
+    readiness_sha256: str
+    runner_sha256: str
+
+
+def parse_readiness(path: Path) -> dict[str, str]:
+    rows: dict[str, str] = {}
+    try:
+        raw = read_bytes_no_symlink(path, "candidate readiness ledger").decode("utf-8")
+    except UnicodeError as error:
+        raise SoakFailure("candidate readiness ledger is not UTF-8") from error
+    for line in raw.splitlines():
+        if not line or "=" not in line:
+            raise SoakFailure("candidate readiness ledger is malformed")
+        key, value = line.split("=", 1)
+        if not key or key in rows or not value:
+            raise SoakFailure("candidate readiness ledger is malformed")
+        rows[key] = value
+    return rows
+
+
+def require_bound_file(path: Path, expected_sha256: object, label: str) -> None:
+    if not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise SoakFailure(f"{label} binding hash is invalid")
+    actual = sha256_file(path)
+    if actual != expected_sha256:
+        raise SoakFailure(f"{label} binding hash mismatch: expected {expected_sha256}, got {actual}")
+
+
+def require_launcher_link(path: Path, target: Path, label: str) -> None:
+    try:
+        info = os.lstat(path)
+        actual = os.readlink(path)
+    except OSError as error:
+        raise SoakFailure(f"cannot inspect {label} launcher {path}: {error}") from error
+    if not stat.S_ISLNK(info.st_mode) or actual != str(target):
+        raise SoakFailure(f"{label} launcher is not bound to {target}")
+    parent_fd = open_no_symlink(path.parent, directory=True)
+    os.close(parent_fd)
+
+
+def derive_packed_prefix() -> Path:
+    try:
+        info = os.lstat(NEXUS_LAUNCHER)
+        target = os.readlink(NEXUS_LAUNCHER)
+    except OSError as error:
+        raise SoakFailure(f"cannot inspect canonical Nexus launcher: {error}") from error
+    if not stat.S_ISLNK(info.st_mode) or not target.endswith("/bin/nexus"):
+        raise SoakFailure("canonical Nexus launcher is not a packed-install symlink")
+    target_path = absolute_without_resolving(Path(target))
+    prefix = target_path.parent.parent
+    if not PACKED_PREFIX_PATTERN.fullmatch(str(prefix)):
+        raise SoakFailure("canonical Nexus launcher does not identify a nonce-scoped install")
+    prefix_fd = open_no_symlink(prefix, directory=True)
+    os.close(prefix_fd)
+    return prefix
+
+
+def validate_candidate(root: Path, lab_root: Path) -> Candidate:
+    try:
+        root_fd = open_no_symlink(root, directory=True)
+    except (OSError, SoakFailure) as error:
+        raise SoakFailure(f"cannot open packed candidate root {root}: {error}") from error
+    os.close(root_fd)
+    manifest = load_json(root / "manifest.json", "packed candidate manifest")
+    if manifest.get("schemaVersion") != 1:
+        raise SoakFailure("manifest schemaVersion must be 1")
+    run_id = manifest.get("runId")
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise SoakFailure("manifest runId must be a non-empty string")
+    if manifest.get("mode") != "packed":
+        raise SoakFailure("F3 requires a manifest with mode exactly 'packed'")
+    limits = manifest.get("container", {}).get("limits")
+    if limits != {"cpus": 6, "memoryBytes": MEMORY_LIMIT_BYTES, "pids": 1024}:
+        raise SoakFailure("F3 requires the exact 6 CPU / 8 GiB / 1024 PID container contract")
+    native = manifest.get("native")
+    checked_artifact(root, native, "manifest.native")
+    packages = manifest.get("packages")
+    if not isinstance(packages, list) or tuple(
+        row.get("name") if isinstance(row, dict) else None for row in packages
+    ) != PACKAGE_NAMES:
+        raise SoakFailure("manifest packages must be the three canonical Nexus packages in order")
+    packed_prefix = derive_packed_prefix()
+    readiness_ledger = lab_root / "lab" / "candidate-ready.v1"
+    umbrella = packed_prefix / "lib" / "node_modules" / "@egregore" / "nexus"
+    installed_paths = {
+        "@egregore/nexus": umbrella / "package.json",
+        "@egregore/nexus-cli": umbrella / "node_modules" / "@egregore" / "nexus-cli" / "package.json",
+        "@egregore/nexus-gateway": umbrella / "node_modules" / "@egregore" / "nexus-gateway" / "package.json",
+    }
+    for row in packages:
+        if row.get("version") != VERSION:
+            raise SoakFailure(f"manifest package {row.get('name')} is not version {VERSION}")
+        checked_artifact(root, row.get("tarball"), f"manifest package {row.get('name')}")
+        package_json = installed_paths[str(row["name"])]
+        installed = load_json(package_json, f"installed packed package {row['name']}")
+        if installed.get("name") != row["name"] or installed.get("version") != VERSION:
+            raise SoakFailure(f"installed packed package does not match {row['name']}@{VERSION}")
+    toolchains = manifest.get("toolchains")
+    if not isinstance(toolchains, dict) or VERSION not in str(toolchains.get("nexus", "")):
+        raise SoakFailure("manifest toolchains do not identify Nexus 0.1.5")
+    environment = manifest.get("environment")
+    if not isinstance(environment, dict):
+        raise SoakFailure("manifest environment is missing")
+    expected_bindings = {
+        "NEXUS_V015_RUN_ID": run_id,
+        "NEXUS_V015_PACKED_PREFIX": str(packed_prefix),
+        "NEXUS_V015_NEXUS_BIN": str(NEXUS_LAUNCHER),
+        "NEXUS_V015_GATEWAY_BIN": str(GATEWAY_LAUNCHER),
+        "NEXUS_V015_LAB_PROCESS": str(LAB_PROCESS),
+        "NEXUS_V015_READINESS_LEDGER": str(readiness_ledger),
+        "NEXUS_V015_GATEWAY_URL": GATEWAY_URL,
+    }
+    for key, expected in expected_bindings.items():
+        if environment.get(key) != expected:
+            raise SoakFailure(f"manifest binding {key} does not match the canonical lab")
+    require_launcher_link(NEXUS_LAUNCHER, packed_prefix / "bin" / "nexus", "Nexus")
+    require_launcher_link(
+        GATEWAY_LAUNCHER,
+        packed_prefix / "bin" / "nexus-gateway",
+        "Gateway",
+    )
+    webui_launcher = Path(str(environment.get("NEXUS_V015_WEBUI_BIN", "")))
+    if webui_launcher != Path("/tmp/nexus-lab-bin/nexus-webui"):
+        raise SoakFailure("manifest WebUI launcher does not match the canonical lab")
+    require_launcher_link(webui_launcher, packed_prefix / "bin" / "nexus-webui", "WebUI")
+    nexus_resolved = absolute_without_resolving(Path(os.path.realpath(NEXUS_LAUNCHER)))
+    gateway_resolved = absolute_without_resolving(Path(os.path.realpath(GATEWAY_LAUNCHER)))
+    webui_resolved = absolute_without_resolving(Path(os.path.realpath(webui_launcher)))
+    if (
+        not inside(nexus_resolved, packed_prefix)
+        or environment.get("NEXUS_V015_NEXUS_BIN_RESOLVED") != str(nexus_resolved)
+    ):
+        raise SoakFailure("resolved Nexus launcher escapes or disagrees with the packed manifest")
+    if (
+        not inside(gateway_resolved, packed_prefix)
+        or environment.get("NEXUS_V015_GATEWAY_BIN_RESOLVED") != str(gateway_resolved)
+    ):
+        raise SoakFailure("resolved Gateway launcher escapes or disagrees with the packed manifest")
+    require_bound_file(
+        nexus_resolved,
+        environment.get("NEXUS_V015_NEXUS_BIN_SHA256"),
+        "Nexus launcher",
+    )
+    require_bound_file(
+        gateway_resolved,
+        environment.get("NEXUS_V015_GATEWAY_BIN_SHA256"),
+        "Gateway launcher",
+    )
+    if (
+        not inside(webui_resolved, packed_prefix)
+        or environment.get("NEXUS_V015_WEBUI_BIN_RESOLVED") != str(webui_resolved)
+    ):
+        raise SoakFailure("resolved WebUI launcher escapes or disagrees with the packed manifest")
+    require_bound_file(
+        webui_resolved,
+        environment.get("NEXUS_V015_WEBUI_BIN_SHA256"),
+        "WebUI launcher",
+    )
+    gateway_module = packed_prefix / "lib" / "node_modules" / "@egregore" / "nexus" / "node_modules" / "@egregore" / "nexus-gateway" / "dist-gateway" / "headless.mjs"
+    if environment.get("NEXUS_V015_GATEWAY_MODULE") != str(gateway_module):
+        raise SoakFailure("manifest Gateway module path disagrees with the packed install")
+    require_bound_file(
+        gateway_module,
+        environment.get("NEXUS_V015_GATEWAY_MODULE_SHA256"),
+        "Gateway bundled module",
+    )
+    require_bound_file(
+        LAB_PROCESS,
+        environment.get("NEXUS_V015_LAB_PROCESS_SHA256"),
+        "lab-process hook",
+    )
+    native_path = environment.get("NEXUS_V015_NATIVE_BIN")
+    if not isinstance(native_path, str) or not native_path.startswith(str(packed_prefix) + "/"):
+        raise SoakFailure("manifest native binary binding escapes the packed prefix")
+    native_installed = Path(native_path)
+    require_bound_file(
+        native_installed,
+        environment.get("NEXUS_V015_NATIVE_BIN_SHA256"),
+        "installed native binary",
+    )
+    if environment.get("NEXUS_V015_NATIVE_BIN_SHA256") != native.get("sha256"):
+        raise SoakFailure("installed native binary does not match manifest.native")
+    readiness = parse_readiness(readiness_ledger)
+    required_readiness = {
+        "schema",
+        "containerId",
+        "mode",
+        "runId",
+        "installRoot",
+        "nexusLink",
+        "nexusResolved",
+        "nexusSha256",
+        "gatewayLink",
+        "gatewayResolved",
+        "gatewaySha256",
+        "webuiLink",
+        "webuiResolved",
+        "webuiSha256",
+    }
+    # This local preflight needs only the fields it dereferences. The complete
+    # exact-field contract (including sealed tarballs, support scripts, Lens,
+    # and install-tree closure) is enforced immediately afterward by the
+    # readiness-bound canonical WS acceptance authority.
+    if not required_readiness.issubset(readiness):
+        raise SoakFailure("candidate readiness ledger is missing F3 preflight fields")
+    if readiness.get("schema") != "1" or readiness.get("installRoot") != str(packed_prefix):
+        raise SoakFailure("candidate readiness ledger has the wrong schema or install root")
+    if readiness.get("runId") != run_id or readiness.get("mode") != "packed":
+        raise SoakFailure("candidate readiness ledger does not belong to this packed run")
+    if readiness.get("containerId") != environment.get("NEXUS_V015_CONTAINER_ID"):
+        raise SoakFailure("candidate readiness container ID does not match the manifest")
+    expected_readiness = {
+        "nexusLink": str(packed_prefix / "bin" / "nexus"),
+        "nexusResolved": str(nexus_resolved),
+        "nexusSha256": str(environment.get("NEXUS_V015_NEXUS_BIN_SHA256")),
+        "gatewayLink": str(packed_prefix / "bin" / "nexus-gateway"),
+        "gatewayResolved": str(gateway_resolved),
+        "gatewaySha256": str(environment.get("NEXUS_V015_GATEWAY_BIN_SHA256")),
+        "webuiLink": str(packed_prefix / "bin" / "nexus-webui"),
+        "webuiResolved": str(webui_resolved),
+        "webuiSha256": str(environment.get("NEXUS_V015_WEBUI_BIN_SHA256")),
+    }
+    for key, expected in expected_readiness.items():
+        if readiness.get(key) != expected:
+            raise SoakFailure(f"candidate readiness {key} disagrees with the packed manifest")
+    require_bound_file(
+        readiness_ledger,
+        environment.get("NEXUS_V015_READINESS_LEDGER_SHA256"),
+        "candidate readiness ledger",
+    )
+    version = run_command([str(NEXUS_LAUNCHER), "--version"], timeout=15).stdout.strip()
+    if version != f"nexus {VERSION}":
+        raise SoakFailure(f"Nexus CLI under test is not {VERSION}: {version!r}")
+    ledger = {
+        "mode": manifest["mode"],
+        "sources": manifest["sources"],
+        "nativeSha256": native["sha256"],
+        "packages": [
+            {
+                "name": row["name"],
+                "version": row["version"],
+                "tarballSha256": row["tarball"]["sha256"],
+            }
+            for row in packages
+        ],
+        "imageDigest": manifest["image"]["digest"],
+        "limits": limits,
+        "toolchains": toolchains,
+        "environment": environment,
+    }
+    return Candidate(
+        run_id=run_id,
+        digest=canonical_digest(ledger),
+        manifest=manifest,
+        packed_prefix=packed_prefix,
+        readiness_ledger=readiness_ledger,
+    )
+
+
+def validate_canonical_candidate_authority(
+    candidate: Candidate,
+    lab_root: Path,
+) -> AuthorityCheckpoint:
+    environment = candidate.manifest.get("environment")
+    if not isinstance(environment, dict):
+        raise SoakFailure("packed manifest environment is missing")
+    if environment.get("NEXUS_V015_WS_ACCEPTANCE") != str(WS_ACCEPTANCE):
+        raise SoakFailure("canonical WebSocket acceptance authority path mismatch")
+
+    parent_fd = open_no_symlink(WS_ACCEPTANCE.parent, directory=True)
+    try:
+        parent_info = os.fstat(parent_fd)
+    finally:
+        os.close(parent_fd)
+    if parent_info.st_uid != 0 or stat.S_IMODE(parent_info.st_mode) != 0o555:
+        raise SoakFailure("canonical lab support directory is not root-owned 0555")
+    runner_fd = open_no_symlink(WS_ACCEPTANCE)
+    try:
+        runner_info = os.fstat(runner_fd)
+    finally:
+        os.close(runner_fd)
+    if runner_info.st_uid != 0 or stat.S_IMODE(runner_info.st_mode) != 0o555:
+        raise SoakFailure("canonical WebSocket acceptance authority is not root-owned 0555")
+    require_bound_file(
+        WS_ACCEPTANCE,
+        environment.get("NEXUS_V015_WS_ACCEPTANCE_SHA256"),
+        "canonical WebSocket acceptance authority",
+    )
+    try:
+        namespace = runpy.run_path(str(WS_ACCEPTANCE))
+        validator = namespace["validate_candidate"]
+        validated = validator(lab_root, lab_root / "evidence", candidate.run_id)
+    except (KeyError, OSError) as error:
+        raise SoakFailure(f"cannot load canonical WebSocket candidate authority: {error}") from error
+    except BaseException as error:
+        raise SoakFailure(f"canonical WebSocket candidate authority rejected the run: {error}") from error
+    expected = (
+        candidate.run_id,
+        candidate.digest,
+        absolute_without_resolving(candidate.packed_prefix),
+        absolute_without_resolving(candidate.readiness_ledger),
+    )
+    observed = (
+        getattr(validated, "run_id", None),
+        getattr(validated, "digest", None),
+        absolute_without_resolving(Path(getattr(validated, "install_root", ""))),
+        absolute_without_resolving(
+            Path(getattr(validated, "manifest", {}).get("environment", {}).get(
+                "NEXUS_V015_READINESS_LEDGER", ""
+            ))
+        ),
+    )
+    if observed != expected:
+        raise SoakFailure("canonical WebSocket candidate authority disagrees with F3")
+    return AuthorityCheckpoint(
+        run_id=candidate.run_id,
+        candidate_digest=candidate.digest,
+        install_root=absolute_without_resolving(candidate.packed_prefix),
+        readiness_sha256=sha256_file(candidate.readiness_ledger),
+        runner_sha256=sha256_file(WS_ACCEPTANCE),
+    )
+
+
+def run_command(
+    command: list[str],
+    *,
+    timeout: float,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise SoakFailure(f"command failed to execute: {' '.join(command)}: {error}") from error
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise SoakFailure(f"command failed rc={result.returncode}: {' '.join(command)}: {detail}")
+    return result
+
+
+def recursive_string(value: object, keys: tuple[str, ...]) -> str | None:
+    if isinstance(value, dict):
+        for key in keys:
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate:
+                return candidate
+            if isinstance(candidate, dict):
+                nested = candidate.get("0")
+                if isinstance(nested, str) and nested:
+                    return nested
+        for candidate in value.values():
+            found = recursive_string(candidate, keys)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for candidate in value:
+            found = recursive_string(candidate, keys)
+            if found:
+                return found
+    return None
+
+
+@dataclass(frozen=True)
+class Agent:
+    kind: str
+    name: str
+    agent_id: str
+    session_id: str
+    executable: Path
+    executable_sha256: str
+    version: str
+    workspace: Path
+
+
+def load_agents(
+    lab_root: Path,
+    run_id: str,
+    readiness_sha256: str,
+) -> tuple[Agent, Agent]:
+    manifest = load_json(lab_root / "lab" / "agents.json", "live-agent manifest")
+    if (
+        manifest.get("version") != 1
+        or manifest.get("runId") != run_id
+        or manifest.get("readinessSha256") != readiness_sha256
+        or manifest.get("candidate") != {
+            "runId": run_id,
+            "readinessSha256": readiness_sha256,
+        }
+    ):
+        raise SoakFailure(
+            "live-agent manifest run/readiness binding does not belong to this evidence run"
+        )
+    rows = manifest.get("agents")
+    if not isinstance(rows, dict):
+        raise SoakFailure("live-agent manifest has no agents object")
+    agents: list[Agent] = []
+    for kind in ("codex", "claude"):
+        row = rows.get(kind)
+        if not isinstance(row, dict):
+            raise SoakFailure(f"live-agent manifest is missing {kind}")
+        if set(row) != {
+            "name",
+            "agentId",
+            "sessionId",
+            "executable",
+            "sha256",
+            "version",
+            "workspace",
+        }:
+            raise SoakFailure(f"live-agent manifest has unexpected {kind} fields")
+        values = [
+            row.get("name"),
+            row.get("agentId"),
+            row.get("sessionId"),
+            row.get("executable"),
+            row.get("sha256"),
+            row.get("version"),
+            row.get("workspace"),
+        ]
+        if any(not isinstance(value, str) or not value for value in values):
+            raise SoakFailure(f"live-agent manifest has an incomplete {kind} identity")
+        executable = absolute_without_resolving(Path(values[3]))
+        workspace = absolute_without_resolving(Path(values[6]))
+        expected_workspace = lab_root / "harness-workspaces" / kind
+        if workspace != expected_workspace:
+            raise SoakFailure(f"{kind} workspace is not the canonical lab workspace")
+        workspace_fd = open_no_symlink(workspace, directory=True)
+        os.close(workspace_fd)
+        if not re.fullmatch(r"[0-9a-f]{64}", values[4]):
+            raise SoakFailure(f"{kind} executable hash is invalid")
+        require_bound_file(executable, values[4], f"{kind} executable")
+        if not os.access(executable, os.X_OK):
+            raise SoakFailure(f"{kind} executable is not executable: {executable}")
+        version_output = run_command([str(executable), "--version"], timeout=15).stdout
+        version_lines = [
+            line.rstrip("\r")
+            for line in version_output.splitlines()
+            if SEMVER_LINE.search(line)
+        ]
+        observed_version = version_lines[-1] if version_lines else ""
+        if observed_version != values[5]:
+            raise SoakFailure(
+                f"{kind} executable version changed: expected {values[5]!r}, "
+                f"got {observed_version!r}"
+            )
+        agents.append(
+            Agent(
+                kind,
+                values[0],
+                values[1],
+                values[2],
+                executable,
+                values[4],
+                values[5],
+                workspace,
+            )
+        )
+    return agents[0], agents[1]
+
+
+class Evidence:
+    def __init__(self, root: Path, candidate: Candidate) -> None:
+        self.root = root
+        self.final = root / "results" / "F3-restart-soak"
+        self.root_fd = open_no_symlink(root, directory=True)
+        self.results_fd = self._open_or_create_dir(self.root_fd, "results")
+        self.final_name = "F3-restart-soak"
+        try:
+            os.stat(self.final_name, dir_fd=self.results_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise SoakFailure(f"refusing to replace existing F3 evidence: {self.final}")
+        self.stage_name = f".F3-restart-soak.tmp-{os.getpid()}-{time.time_ns()}"
+        os.mkdir(self.stage_name, mode=0o700, dir_fd=self.results_fd)
+        self.stage_fd = os.open(
+            self.stage_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=self.results_fd,
+        )
+        self.stage = self.final.parent / self.stage_name
+        os.mkdir("artifacts", mode=0o700, dir_fd=self.stage_fd)
+        self.artifact_fd = os.open(
+            "artifacts",
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=self.stage_fd,
+        )
+        self.artifact_dir = self.stage / "artifacts"
+        self.candidate = candidate
+        self.paths = {
+            "metrics": self.artifact_dir / "metrics.jsonl",
+            "dualWebsocketFrames": self.artifact_dir / "dual-websocket-frames.jsonl",
+            "reconnectCheckpoints": self.artifact_dir / "reconnect-checkpoints.jsonl",
+            "memory": self.artifact_dir / "memory-samples.jsonl",
+            "disk": self.artifact_dir / "disk-samples.jsonl",
+            "finalProcesses": self.artifact_dir / "final-processes.txt",
+            "finalListeners": self.artifact_dir / "final-listeners.txt",
+            "logs": self.artifact_dir / "run.log",
+        }
+        self.log("soak.stage", runId=candidate.run_id, candidateDigest=candidate.digest)
+
+    @staticmethod
+    def _open_or_create_dir(parent_fd: int, name: str) -> int:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            return os.open(name, flags, dir_fd=parent_fd)
+        except OSError as error:
+            if error.errno != errno.ENOENT:
+                raise SoakFailure(f"unsafe evidence directory {name}: {error}") from error
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except OSError as error:
+            raise SoakFailure(f"cannot create evidence directory {name}: {error}") from error
+        os.fsync(parent_fd)
+        return os.open(name, flags, dir_fd=parent_fd)
+
+    @staticmethod
+    def _write_all(fd: int, value: bytes) -> None:
+        view = memoryview(value)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise SoakFailure("short write while producing F3 evidence")
+            view = view[written:]
+
+    def jsonl(self, name: str, value: object) -> None:
+        leaf = self.paths[name].name
+        encoded = (
+            json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            + "\n"
+        ).encode("utf-8")
+        fd = os.open(
+            leaf,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=self.artifact_fd,
+        )
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise SoakFailure(f"unsafe F3 artifact path: {leaf}")
+            self._write_all(fd, encoded)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def log(self, event: str, **fields: object) -> None:
+        self.jsonl("logs", {"at": time.time(), "event": event, **fields})
+
+    def write_text(self, name: str, value: str) -> None:
+        if not value:
+            value = "<empty capture>\n"
+        leaf = self.paths[name].name
+        temporary = f".{leaf}.tmp-{time.time_ns()}"
+        encoded = (value if value.endswith("\n") else value + "\n").encode("utf-8")
+        fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=self.artifact_fd,
+        )
+        try:
+            self._write_all(fd, encoded)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(
+            temporary,
+            leaf,
+            src_dir_fd=self.artifact_fd,
+            dst_dir_fd=self.artifact_fd,
+        )
+        os.fsync(self.artifact_fd)
+
+    def publish(self, result: dict[str, Any]) -> Path:
+        for name in ARTIFACT_NAMES:
+            path = self.paths[name]
+            try:
+                info = os.stat(path.name, dir_fd=self.artifact_fd, follow_symlinks=False)
+            except OSError as error:
+                raise SoakFailure(f"F3 artifact was not produced: {name}: {error}") from error
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size <= 0:
+                raise SoakFailure(f"F3 artifact was not produced: {name}")
+        artifacts = {}
+        for name in ARTIFACT_NAMES:
+            final_relative = Path("results") / "F3-restart-soak" / "artifacts" / self.paths[name].name
+            artifacts[name] = {
+                "path": final_relative.as_posix(),
+                "sha256": sha256_file(self.paths[name]),
+            }
+        result["requiredArtifacts"] = list(ARTIFACT_NAMES)
+        result["artifacts"] = artifacts
+        encoded = (json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n").encode(
+            "utf-8"
+        )
+        temporary = f".result.json.tmp-{time.time_ns()}"
+        fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=self.stage_fd,
+        )
+        try:
+            self._write_all(fd, encoded)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(temporary, "result.json", src_dir_fd=self.stage_fd, dst_dir_fd=self.stage_fd)
+        os.fsync(self.stage_fd)
+        os.rename(
+            self.stage_name,
+            self.final_name,
+            src_dir_fd=self.results_fd,
+            dst_dir_fd=self.results_fd,
+        )
+        os.fsync(self.results_fd)
+        self._close_fds()
+        return self.final / "result.json"
+
+    def discard(self) -> None:
+        self._close_fds()
+        shutil.rmtree(self.stage, ignore_errors=True)
+
+    def _close_fds(self) -> None:
+        for name in ("artifact_fd", "stage_fd", "results_fd", "root_fd"):
+            fd = getattr(self, name, -1)
+            if isinstance(fd, int) and fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                setattr(self, name, -1)
+
+
+class HttpClient:
+    def __init__(self, base_url: str, evidence: Evidence) -> None:
+        parsed = urlsplit(base_url)
+        if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
+            "127.0.0.1",
+            "localhost",
+            "::1",
+        }:
+            raise SoakFailure("Gateway URL must use a loopback HTTP endpoint inside the lab")
+        self.base_url = base_url.rstrip("/")
+        self.evidence = evidence
+        self.cookie = ""
+        self.csrf = ""
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        body: object | None = None,
+        *,
+        authenticated: bool = True,
+        timeout: float = 30,
+    ) -> dict[str, Any]:
+        headers = {"accept": "application/json"}
+        data = None
+        if body is not None:
+            data = json.dumps(body, separators=(",", ":")).encode("utf-8")
+            headers["content-type"] = "application/json"
+        if authenticated:
+            if not self.cookie or not self.csrf:
+                raise SoakFailure("authenticated request attempted before login")
+            headers["cookie"] = self.cookie
+            if method not in {"GET", "HEAD", "OPTIONS"}:
+                headers["x-nexus-csrf"] = self.csrf
+        request = Request(self.base_url + path, data=data, method=method, headers=headers)
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                raw = response.read()
+                status = response.status
+                response_headers = response.headers
+        except HTTPError as error:
+            raw = error.read()
+            status = error.code
+            response_headers = error.headers
+        except (OSError, URLError) as error:
+            raise SoakFailure(f"Gateway request failed: {method} {path}: {error}") from error
+        try:
+            value = json.loads(raw.decode("utf-8")) if raw else {}
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise SoakFailure(f"Gateway returned invalid JSON for {method} {path}") from error
+        if status < 200 or status >= 300:
+            raise SoakFailure(f"Gateway returned HTTP {status} for {method} {path}: {value!r}")
+        if not isinstance(value, dict):
+            raise SoakFailure(f"Gateway returned a non-object for {method} {path}")
+        value["_headers"] = response_headers
+        return value
+
+    def login(self, name: str, password: str) -> None:
+        response = self.request(
+            "POST",
+            "/api/login",
+            {"name": name, "password": password},
+            authenticated=False,
+        )
+        cookies = SimpleCookie()
+        headers = response.pop("_headers")
+        for value in headers.get_all("set-cookie", []):
+            cookies.load(value)
+        human = cookies.get("nexus_human")
+        csrf = cookies.get("nexus_csrf")
+        csrf_body = response.get("csrfToken")
+        if human is None or csrf is None or not isinstance(csrf_body, str) or csrf.value != csrf_body:
+            raise SoakFailure("Gateway login did not issue the human/CSRF cookie pair")
+        self.csrf = csrf.value
+        self.cookie = f"nexus_human={human.value}; nexus_csrf={csrf.value}"
+        self.evidence.log("auth.login", name=name)
+
+    def health(self) -> None:
+        self.request("GET", "/api/v1/health")
+
+    def ws_url(self, path: str) -> str:
+        parsed = urlsplit(self.base_url)
+        scheme = "wss" if parsed.scheme == "https" else "ws"
+        return urlunsplit((scheme, parsed.netloc, path, "", ""))
+
+
+class Ledger:
+    def __init__(self) -> None:
+        self.failure = {name: 0 for name in FAILURE_COUNTERS}
+        self.expected_messages: dict[str, str] = {}
+        self.received_messages: dict[str, list[str]] = defaultdict(list)
+        self.session_accepted: set[str] = set()
+        self.session_completed: set[str] = set()
+        self.session_frame_fingerprints: set[str] = set()
+        self.session_frame_fingerprint_order: deque[str] = deque()
+
+    def observe_session_frame(self, fingerprint: str) -> bool:
+        if fingerprint in self.session_frame_fingerprints:
+            return False
+        self.session_frame_fingerprints.add(fingerprint)
+        self.session_frame_fingerprint_order.append(fingerprint)
+        while len(self.session_frame_fingerprint_order) > FINGERPRINT_HISTORY_LIMIT:
+            expired = self.session_frame_fingerprint_order.popleft()
+            self.session_frame_fingerprints.discard(expired)
+        return True
+
+    def accept_message(self, message_id: str, topic: str) -> None:
+        self.expected_messages[message_id] = topic
+
+    def receive_message(self, message_id: str, topic: str) -> None:
+        self.received_messages[message_id].append(topic)
+        expected = self.expected_messages.get(message_id)
+        if expected is not None and expected != topic:
+            self.failure["crossRouteDeliveries"] += 1
+
+    def finalize_delivery_counts(self) -> None:
+        for message_id, expected in self.expected_messages.items():
+            topics = self.received_messages.get(message_id, [])
+            matching = sum(topic == expected for topic in topics)
+            if matching == 0:
+                self.failure["lostAcceptedMessages"] += 1
+            elif matching > 1:
+                self.failure["duplicateAcceptedMessages"] += matching - 1
+        missing_sessions = self.session_accepted - self.session_completed
+        self.failure["lostAcceptedMessages"] += len(missing_sessions)
+
+
+class FrameLane:
+    def __init__(self, name: str, evidence: Evidence, ledger: Ledger) -> None:
+        self.name = name
+        self.evidence = evidence
+        self.ledger = ledger
+        self.socket: Any = None
+        self.reader: asyncio.Task[None] | None = None
+        self.frames: list[dict[str, Any]] = []
+        self.changed = asyncio.Event()
+        self.error: BaseException | None = None
+        self.reconnects = 0
+
+    async def _open(self, url: str, cookie: str, csrf: str) -> Any:
+        try:
+            import websockets
+        except ImportError as error:
+            raise SoakFailure("Python package 'websockets' is required in the validator image") from error
+        options = {
+            "subprotocols": ["nexus-v1", f"nexus-csrf.{csrf}"],
+            "open_timeout": 30,
+            "close_timeout": 5,
+            "ping_interval": 20,
+            "ping_timeout": 20,
+            "max_queue": 64,
+        }
+        try:
+            return await websockets.connect(url, additional_headers={"Cookie": cookie}, **options)
+        except TypeError:
+            return await websockets.connect(url, extra_headers={"Cookie": cookie}, **options)
+
+    async def _read(self) -> None:
+        try:
+            async for raw in self.socket:
+                try:
+                    frame = json.loads(str(raw))
+                except json.JSONDecodeError:
+                    self.ledger.failure["silentSubscriptionFailures"] += 1
+                    continue
+                if not isinstance(frame, dict):
+                    self.ledger.failure["silentSubscriptionFailures"] += 1
+                    continue
+                self.frames.append(frame)
+                if len(self.frames) > FRAME_HISTORY_LIMIT:
+                    raise SoakFailure(
+                        f"{self.name} frame history exceeded the bounded soak limit"
+                    )
+                self.consume(frame)
+                self.evidence.jsonl("dualWebsocketFrames", {
+                    "at": time.time(),
+                    "lane": self.name,
+                    "direction": "received",
+                    "frame": frame,
+                })
+                self.changed.set()
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            self.error = error
+            self.changed.set()
+
+    def consume(self, frame: dict[str, Any]) -> None:
+        raise NotImplementedError
+
+    async def send(self, frame: dict[str, Any]) -> None:
+        if self.socket is None:
+            raise SoakFailure(f"{self.name} socket is not connected")
+        self.evidence.jsonl("dualWebsocketFrames", {
+            "at": time.time(),
+            "lane": self.name,
+            "direction": "sent",
+            "frame": frame,
+        })
+        await self.socket.send(json.dumps(frame, separators=(",", ":")))
+
+    async def wait_for(
+        self,
+        predicate: Callable[[dict[str, Any]], bool],
+        *,
+        after: int,
+        timeout: float,
+        label: str,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while True:
+            for frame in self.frames[after:]:
+                if predicate(frame):
+                    return frame
+            if self.reader is not None and self.reader.done() and self.error is not None:
+                raise SoakFailure(f"{label}: {self.name} socket closed: {self.error}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SoakFailure(f"{label}: timed out; recent={self.frames[-5:]!r}")
+            self.changed.clear()
+            try:
+                await asyncio.wait_for(self.changed.wait(), remaining)
+            except asyncio.TimeoutError as error:
+                raise SoakFailure(f"{label}: timed out; recent={self.frames[-5:]!r}") from error
+
+    async def close(self) -> None:
+        if self.socket is not None:
+            try:
+                await self.socket.close()
+            except BaseException:
+                pass
+        if self.reader is not None:
+            self.reader.cancel()
+            await asyncio.gather(self.reader, return_exceptions=True)
+        self.socket = None
+        self.reader = None
+
+    async def pause_reader(self) -> None:
+        if self.reader is None:
+            return
+        self.reader.cancel()
+        await asyncio.gather(self.reader, return_exceptions=True)
+        self.reader = None
+
+
+class DeveloperLane(FrameLane):
+    def __init__(self, evidence: Evidence, ledger: Ledger, http: HttpClient, topics: tuple[str, ...]) -> None:
+        super().__init__("developer", evidence, ledger)
+        self.http = http
+        self.topics = topics
+        self.cursors = {topic: 0 for topic in topics}
+
+    def consume(self, frame: dict[str, Any]) -> None:
+        if frame.get("t") in {"subscribe.err", "subscribe.gap"}:
+            self.ledger.failure["silentSubscriptionFailures"] += 1
+            return
+        if frame.get("type") != "developer.event" or not isinstance(frame.get("event"), dict):
+            return
+        event = frame["event"]
+        topic = event.get("topic")
+        seq = event.get("seq")
+        if topic not in self.cursors or isinstance(seq, bool) or not isinstance(seq, int):
+            self.ledger.failure["crossRouteDeliveries"] += 1
+            return
+        if seq <= self.cursors[topic]:
+            message_id = event.get("messageId")
+            if isinstance(message_id, str) and message_id in self.ledger.expected_messages:
+                self.ledger.failure["duplicateAcceptedMessages"] += 1
+            return
+        self.cursors[topic] = seq
+        message_id = event.get("messageId")
+        if isinstance(message_id, str):
+            self.ledger.receive_message(message_id, topic)
+
+    async def connect(self, *, reconnect: bool = False) -> None:
+        await self.close()
+        self.error = None
+        self.socket = await self._open(
+            self.http.ws_url("/api/agui/ws"),
+            self.http.cookie,
+            self.http.csrf,
+        )
+        self.reader = asyncio.create_task(self._read(), name="v015-soak:developer")
+        starts = {}
+        for topic in self.topics:
+            starts[topic] = len(self.frames)
+            await self.send({"t": "subscribe", "topic": topic, "afterSeq": self.cursors[topic]})
+        for topic in self.topics:
+            await self.wait_for(
+                lambda frame, topic=topic: frame.get("t") == "subscribe.ack" and frame.get("topic") == topic,
+                after=starts[topic],
+                timeout=30,
+                label=f"developer subscribe {topic}",
+            )
+        if reconnect:
+            self.reconnects += 1
+
+    async def wait_message(self, message_id: str, topic: str, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        while True:
+            if topic in self.ledger.received_messages.get(message_id, []):
+                return
+            if self.reader is not None and self.reader.done() and self.error is not None:
+                raise SoakFailure(f"developer delivery {message_id}: socket closed: {self.error}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SoakFailure(f"developer delivery {message_id} to {topic} timed out")
+            self.changed.clear()
+            await asyncio.wait_for(self.changed.wait(), remaining)
+
+    @property
+    def last_cursor(self) -> int:
+        return max(self.cursors.values(), default=0)
+
+
+def numeric_cursor(frame: dict[str, Any]) -> int | None:
+    event = frame.get("event") if isinstance(frame.get("event"), dict) else frame
+    candidates = [
+        event.get("streamEventId"),
+        event.get("id"),
+        event.get("data", {}).get("streamEventId") if isinstance(event.get("data"), dict) else None,
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
+            return candidate
+    cursor = frame.get("cursor")
+    if not isinstance(cursor, str) or not cursor:
+        return None
+    match = re.fullmatch(r"(?:cursor-|epoch:)?(\d+)", cursor)
+    if match:
+        return int(match.group(1))
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+    except (ValueError, UnicodeError, json.JSONDecodeError):
+        return None
+    if isinstance(decoded, dict):
+        value = decoded.get("id")
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+    return None
+
+
+def session_event(frame: dict[str, Any]) -> dict[str, Any]:
+    event = frame.get("event")
+    return event if isinstance(event, dict) else frame
+
+
+@dataclass(frozen=True)
+class PromptAttempt:
+    marker: str
+    client_message_id: str
+    command_id: str
+    start_index: int
+    before_cursor: int
+
+
+class AgentSessionLane(FrameLane):
+    def __init__(self, evidence: Evidence, ledger: Ledger, http: HttpClient, agent: Agent) -> None:
+        super().__init__(f"agent-session:{agent.kind}", evidence, ledger)
+        self.http = http
+        self.agent = agent
+        self.opaque_cursor: str | None = None
+        self.last_numeric_cursor = 0
+
+    def consume(self, frame: dict[str, Any]) -> None:
+        if frame.get("t") == "input.err":
+            self.ledger.failure["queueWedges"] += 1
+        event = frame.get("event") if isinstance(frame.get("event"), dict) else frame
+        event_session = event.get("sessionId")
+        if isinstance(event_session, str) and event_session != self.agent.session_id:
+            self.ledger.failure["crossRouteDeliveries"] += 1
+        cursor = frame.get("cursor")
+        if isinstance(cursor, str) and cursor:
+            fingerprint = hashlib.sha256(
+                json.dumps(frame, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            if not self.ledger.observe_session_frame(fingerprint):
+                self.ledger.failure["duplicateAcceptedMessages"] += 1
+            self.opaque_cursor = cursor
+        number = numeric_cursor(frame)
+        if number is not None:
+            self.last_numeric_cursor = max(self.last_numeric_cursor, number)
+
+    async def connect(self, *, reconnect: bool = False) -> None:
+        await self.close()
+        self.error = None
+        path = f"/api/v1/agent-sessions/{quote(self.agent.session_id, safe='')}/events?view=agui"
+        if self.opaque_cursor:
+            path += "&" + urlencode({"after": self.opaque_cursor})
+        self.socket = await self._open(self.http.ws_url(path), self.http.cookie, self.http.csrf)
+        self.reader = asyncio.create_task(self._read(), name="v015-soak:agent-session")
+        if reconnect:
+            self.reconnects += 1
+
+    async def begin_prompt(self, marker: str, timeout: float) -> PromptAttempt:
+        client_message_id = f"cm-{marker}"
+        start_index = len(self.frames)
+        before_cursor = self.last_numeric_cursor
+        await self.send({
+            "t": "input",
+            "mode": "session",
+            "target": {"name": self.agent.name, "agentId": self.agent.agent_id},
+            "text": f"Reply briefly with this exact soak marker: {marker}",
+            "clientMessageId": client_message_id,
+        })
+        ack = await self.wait_for(
+            lambda frame: frame.get("t") == "input.ack" and frame.get("clientMessageId") == client_message_id,
+            after=start_index,
+            timeout=timeout,
+            label=f"session input ack {client_message_id}",
+        )
+        command_id = ack.get("commandId")
+        if not isinstance(command_id, str) or not command_id:
+            raise SoakFailure(f"session input ack has no commandId: {ack!r}")
+        self.ledger.session_accepted.add(client_message_id)
+        return PromptAttempt(
+            marker=marker,
+            client_message_id=client_message_id,
+            command_id=command_id,
+            start_index=start_index,
+            before_cursor=before_cursor,
+        )
+
+    async def finish_prompt(
+        self,
+        attempt: PromptAttempt,
+        timeout: float,
+    ) -> dict[str, object]:
+        marker = attempt.marker
+        client_message_id = attempt.client_message_id
+        command_id = attempt.command_id
+        start_index = attempt.start_index
+        before_cursor = attempt.before_cursor
+        await self.wait_for(
+            lambda frame: (
+                session_event(frame).get("type") == "TEXT_MESSAGE_END"
+                and session_event(frame).get("messageId") == client_message_id
+            ),
+            after=start_index,
+            timeout=timeout,
+            label=f"session user echo {client_message_id}",
+        )
+        echo_index = next(
+            index
+            for index in range(start_index, len(self.frames))
+            if session_event(self.frames[index]).get("type") == "TEXT_MESSAGE_END"
+            and session_event(self.frames[index]).get("messageId") == client_message_id
+        )
+        started = await self.wait_for(
+            lambda frame: (
+                session_event(frame).get("type") == "RUN_STARTED"
+                and isinstance(session_event(frame).get("runId"), str)
+                and bool(session_event(frame).get("runId"))
+            ),
+            after=start_index,
+            timeout=timeout,
+            label=f"session run start {client_message_id}",
+        )
+        run_id = session_event(started)["runId"]
+        assistant_start = await self.wait_for(
+            lambda frame: (
+                session_event(frame).get("type") == "TEXT_MESSAGE_START"
+                and session_event(frame).get("role") == "assistant"
+                and isinstance(session_event(frame).get("messageId"), str)
+                and bool(session_event(frame).get("messageId"))
+            ),
+            after=echo_index + 1,
+            timeout=timeout,
+            label=f"session assistant start {client_message_id}",
+        )
+        assistant_message_id = session_event(assistant_start)["messageId"]
+        assistant_start_index = next(
+            index
+            for index in range(echo_index + 1, len(self.frames))
+            if self.frames[index] is assistant_start
+        )
+        assistant_end = await self.wait_for(
+            lambda frame: (
+                session_event(frame).get("type") == "TEXT_MESSAGE_END"
+                and session_event(frame).get("messageId") == assistant_message_id
+            ),
+            after=assistant_start_index + 1,
+            timeout=timeout,
+            label=f"session assistant end {client_message_id}",
+        )
+        assistant_end_index = next(
+            index
+            for index in range(assistant_start_index + 1, len(self.frames))
+            if self.frames[index] is assistant_end
+        )
+        assistant_deltas = [
+            str(session_event(frame).get("delta"))
+            for frame in self.frames[assistant_start_index + 1 : assistant_end_index]
+            if session_event(frame).get("type") == "TEXT_MESSAGE_CONTENT"
+            and session_event(frame).get("messageId") == assistant_message_id
+            and isinstance(session_event(frame).get("delta"), str)
+            and bool(session_event(frame).get("delta"))
+        ]
+        if len(assistant_deltas) < 2:
+            raise SoakFailure(
+                f"{self.agent.kind} assistant output was not progressive for "
+                f"{client_message_id}: contentFrames={len(assistant_deltas)}"
+            )
+        assistant_text = "".join(assistant_deltas)
+        if assistant_text.strip() != marker:
+            raise SoakFailure(
+                f"{self.agent.kind} assistant marker mismatch for {client_message_id}: "
+                f"expected {marker!r}, got {assistant_text!r}"
+            )
+        await self.wait_for(
+            lambda frame: (
+                session_event(frame).get("type") == "RUN_FINISHED"
+                and session_event(frame).get("runId") == run_id
+                and (numeric_cursor(frame) or -1) > before_cursor
+            ),
+            after=assistant_end_index + 1,
+            timeout=timeout,
+            label=f"session terminal event {client_message_id}",
+        )
+        completion_count = sum(
+            session_event(frame).get("type") == "RUN_FINISHED"
+            and session_event(frame).get("runId") == run_id
+            for frame in self.frames[assistant_end_index + 1 :]
+        )
+        if completion_count != 1:
+            raise SoakFailure(
+                f"{self.agent.kind} session terminal was not exact-once for "
+                f"{client_message_id}: count={completion_count}"
+            )
+        self.ledger.session_completed.add(client_message_id)
+        self.evidence.jsonl(
+            "metrics",
+            {
+                "at": time.time(),
+                "event": "agent-session.correlation",
+                "kind": self.agent.kind,
+                "clientMessageId": client_message_id,
+                "commandId": command_id,
+                "runId": run_id,
+                "assistantMessageId": assistant_message_id,
+                "marker": marker,
+                "lastAcceptedCursor": self.last_numeric_cursor,
+            },
+        )
+        return {
+            "clientMessageId": client_message_id,
+            "cursorBefore": before_cursor,
+            "cursorAfter": self.last_numeric_cursor,
+            "completionCount": completion_count,
+        }
+
+    async def prompt(self, marker: str, timeout: float) -> dict[str, object]:
+        attempt = await self.begin_prompt(marker, timeout)
+        return await self.finish_prompt(attempt, timeout)
+
+
+def cgroup_text(name: str) -> str:
+    try:
+        return read_bytes_no_symlink(CGROUP_ROOT / name, f"cgroup {name}").decode(
+            "utf-8"
+        ).strip()
+    except UnicodeError as error:
+        raise SoakFailure(f"cgroup {name} is not UTF-8") from error
+
+
+def cgroup_integer(name: str, *, allow_max: bool = False) -> int | str:
+    raw = cgroup_text(name)
+    if allow_max and raw == "max":
+        return raw
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise SoakFailure(f"cgroup {name} is not an integer") from error
+    if value < 0:
+        raise SoakFailure(f"cgroup {name} is negative")
+    return value
+
+
+def cgroup_key_values(name: str) -> dict[str, int]:
+    values: dict[str, int] = {}
+    for line in cgroup_text(name).splitlines():
+        fields = line.split()
+        if len(fields) != 2 or fields[0] in values:
+            raise SoakFailure(f"cgroup {name} has a malformed row")
+        try:
+            value = int(fields[1])
+        except ValueError as error:
+            raise SoakFailure(f"cgroup {name} has a non-integer value") from error
+        if value < 0:
+            raise SoakFailure(f"cgroup {name} has a negative value")
+        values[fields[0]] = value
+    if not values:
+        raise SoakFailure(f"cgroup {name} is empty")
+    return values
+
+
+def cgroup_sample() -> dict[str, object]:
+    memory = cgroup_integer("memory.current")
+    memory_limit = cgroup_integer("memory.max", allow_max=True)
+    pids = cgroup_integer("pids.current")
+    pids_limit = cgroup_integer("pids.max", allow_max=True)
+    if memory_limit != MEMORY_LIMIT_BYTES:
+        raise SoakFailure(
+            f"container memory limit changed during soak: {memory_limit!r}"
+        )
+    if pids_limit != 1024:
+        raise SoakFailure(f"container PID limit changed during soak: {pids_limit!r}")
+    cpu_max = cgroup_text("cpu.max").split()
+    if len(cpu_max) != 2 or cpu_max[0] == "max":
+        raise SoakFailure("container CPU limit is missing; expected exactly 6 CPUs")
+    try:
+        quota, period = (int(value) for value in cpu_max)
+    except ValueError as error:
+        raise SoakFailure("cgroup cpu.max is malformed") from error
+    if period <= 0 or quota != period * 6:
+        raise SoakFailure(
+            f"container CPU limit changed during soak: quota={quota} period={period}"
+        )
+    assert isinstance(memory, int)
+    assert isinstance(pids, int)
+    return {
+        "memoryCurrent": memory,
+        "memoryMax": memory_limit,
+        "memoryEvents": cgroup_key_values("memory.events"),
+        "cpu": cgroup_key_values("cpu.stat"),
+        "cpuMax": {"quota": quota, "period": period, "cpus": 6},
+        "pidsCurrent": pids,
+        "pidsMax": pids_limit,
+        "pidsEvents": cgroup_key_values("pids.events"),
+    }
+
+
+def proc_integer(path: Path, label: str) -> int:
+    try:
+        value = int(read_bytes_no_symlink(path, label).strip())
+    except ValueError as error:
+        raise SoakFailure(f"{label} is not an integer") from error
+    if value < 0:
+        raise SoakFailure(f"{label} is negative")
+    return value
+
+
+def process_sample(pid: int, label: str) -> dict[str, object]:
+    root = PROC_ROOT / str(pid)
+    start_ticks = process_start_ticks(pid, label)
+    try:
+        statm = read_bytes_no_symlink(root / "statm", f"{label} proc statm").split()
+        if len(statm) < 2:
+            raise ValueError("short statm")
+        rss = int(statm[1]) * os.sysconf("SC_PAGE_SIZE")
+        status = read_bytes_no_symlink(root / "status", f"{label} proc status").decode(
+            "utf-8"
+        )
+        threads_row = next(
+            line for line in status.splitlines() if line.startswith("Threads:")
+        )
+        threads = int(threads_row.split(":", 1)[1].strip())
+        fd_entries = os.listdir(root / "fd")
+        task_entries = os.listdir(root / "task")
+        sockets = 0
+        for leaf in fd_entries:
+            try:
+                target = os.readlink(root / "fd" / leaf)
+            except OSError:
+                continue
+            if target.startswith("socket:["):
+                sockets += 1
+    except (OSError, UnicodeError, ValueError, StopIteration) as error:
+        raise SoakFailure(f"cannot sample {label} process {pid}: {error}") from error
+    if rss < 0 or threads <= 0 or len(task_entries) < threads:
+        raise SoakFailure(f"{label} process sample is internally inconsistent")
+    return {
+        "pid": pid,
+        "startTimeTicks": start_ticks,
+        "rssBytes": rss,
+        "fds": len(fd_entries),
+        "threads": threads,
+        "tasks": len(task_entries),
+        "sockets": sockets,
+        "exeSha256": process_executable_sha256(pid, label),
+    }
+
+
+def trend_is_unhealthy(samples: list[int], minimum_growth: int) -> bool:
+    if len(samples) < 10:
+        return False
+    positive_steps = sum(right > left for left, right in zip(samples, samples[1:]))
+    growth = samples[-1] - samples[0]
+    relative_floor = max(1, samples[0] // 4)
+    return positive_steps >= 6 and growth >= max(minimum_growth, relative_floor)
+
+
+def plain_http_probe(url: str, label: str) -> dict[str, object]:
+    started = time.monotonic()
+    try:
+        with urlopen(url, timeout=5) as response:
+            response.read(64 * 1024)
+            status = response.status
+    except (OSError, URLError) as error:
+        raise SoakFailure(f"{label} probe failed: {error}") from error
+    if status < 200 or status >= 300:
+        raise SoakFailure(f"{label} probe returned HTTP {status}")
+    return {"status": status, "latencyMs": (time.monotonic() - started) * 1000}
+
+
+async def cdp_runtime_probe(base_url: str, expected_url: str, label: str) -> dict[str, object]:
+    def targets() -> list[object]:
+        try:
+            with urlopen(base_url.rstrip("/") + "/json/list", timeout=5) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (OSError, URLError, UnicodeError, json.JSONDecodeError) as error:
+            raise SoakFailure(f"{label} CDP target discovery failed: {error}") from error
+
+    rows = await asyncio.to_thread(targets)
+    if not isinstance(rows, list):
+        raise SoakFailure(f"{label} CDP target discovery returned a non-list")
+    page = next(
+        (
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and row.get("type") == "page"
+            and expected_url in str(row.get("url", ""))
+            and isinstance(row.get("webSocketDebuggerUrl"), str)
+        ),
+        None,
+    )
+    if not isinstance(page, dict):
+        raise SoakFailure(f"{label} CDP has no page target for {expected_url}")
+    try:
+        import websockets
+    except ImportError as error:
+        raise SoakFailure("Python package 'websockets' is required in the validator image") from error
+    request_id = int(time.time_ns() % 2_000_000_000) + 1
+    started = time.monotonic()
+    try:
+        async with websockets.connect(
+            str(page["webSocketDebuggerUrl"]),
+            open_timeout=5,
+            close_timeout=2,
+            ping_interval=None,
+            max_queue=8,
+        ) as socket:
+            await socket.send(
+                json.dumps(
+                    {
+                        "id": request_id,
+                        "method": "Runtime.evaluate",
+                        "params": {
+                            "expression": "({ready:document.readyState,url:location.href})",
+                            "returnByValue": True,
+                        },
+                    },
+                    separators=(",", ":"),
+                )
+            )
+            deadline = time.monotonic() + 5
+            while True:
+                raw = await asyncio.wait_for(socket.recv(), deadline - time.monotonic())
+                frame = json.loads(str(raw))
+                if isinstance(frame, dict) and frame.get("id") == request_id:
+                    break
+    except (OSError, ValueError, json.JSONDecodeError, asyncio.TimeoutError) as error:
+        raise SoakFailure(f"{label} CDP Runtime.evaluate failed: {error}") from error
+    result = frame.get("result") if isinstance(frame, dict) else None
+    value = result.get("result", {}).get("value") if isinstance(result, dict) else None
+    if not isinstance(value, dict) or value.get("ready") not in {"interactive", "complete"}:
+        raise SoakFailure(f"{label} renderer is not responsive")
+    return {
+        "url": value.get("url"),
+        "readyState": value.get("ready"),
+        "latencyMs": (time.monotonic() - started) * 1000,
+    }
+
+
+def directory_bytes(root: Path) -> int:
+    total = 0
+    for directory, names, files in os.walk(root, followlinks=False):
+        base = Path(directory)
+        names[:] = [name for name in names if not (base / name).is_symlink()]
+        for name in files:
+            path = base / name
+            try:
+                if not path.is_symlink():
+                    total += path.stat().st_size
+            except FileNotFoundError:
+                continue
+    return total
+
+
+def json_command(command: list[str], *, timeout: float) -> dict[str, Any]:
+    result = run_command(command, timeout=timeout)
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise SoakFailure(f"command returned invalid JSON: {' '.join(command)}") from error
+    if not isinstance(value, dict):
+        raise SoakFailure(f"command returned a non-object: {' '.join(command)}")
+    return value
+
+
+def dlq_total(nexus_bin: str) -> int:
+    value = json_command([nexus_bin, "admin", "dlq", "list", "--json"], timeout=30)
+    total = value.get("total")
+    if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+        return total
+    rows = value.get("rows")
+    if isinstance(rows, list):
+        return len(rows)
+    raise SoakFailure("DLQ response has neither an integer total nor rows")
+
+
+def identity_rows(nexus_bin: str) -> list[dict[str, Any]]:
+    value = json_command([nexus_bin, "members", "--json", "--include-offline"], timeout=30)
+    rows = value.get("members")
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise SoakFailure("members response has no members array")
+    return rows
+
+
+def check_identities(rows: list[dict[str, Any]], agents: tuple[Agent, Agent], ledger: Ledger) -> None:
+    by_id = {
+        row.get("agentId") or row.get("agent_id"): row
+        for row in rows
+        if isinstance(row.get("agentId") or row.get("agent_id"), str)
+    }
+    for agent in agents:
+        row = by_id.get(agent.agent_id)
+        if row is None:
+            ledger.failure["offlineRestoredParticipants"] += 1
+            continue
+        if row.get("name") != agent.name or (row.get("sessionId") or row.get("session_id")) != agent.session_id:
+            ledger.failure["identityDrift"] += 1
+        state = str(row.get("status") or row.get("presence") or "").strip().lower()
+        if state not in ONLINE_STATES:
+            ledger.failure["offlineRestoredParticipants"] += 1
+
+
+def queue_clear(http: HttpClient, agent: Agent) -> bool:
+    query = urlencode({"agentId": agent.agent_id})
+    value = http.request("GET", f"/api/conversation/prompt?{query}")
+    value.pop("_headers", None)
+    commands = value.get("commands")
+    return value.get("turnActive") is not True and isinstance(commands, list) and len(commands) == 0
+
+
+def wait_health(http: HttpClient, timeout: float = 90) -> None:
+    deadline = time.monotonic() + timeout
+    last = "not attempted"
+    while time.monotonic() < deadline:
+        try:
+            http.health()
+            return
+        except SoakFailure as error:
+            last = str(error)
+        time.sleep(0.25)
+    raise SoakFailure(f"Gateway did not recover: {last}")
+
+
+@dataclass(frozen=True)
+class LifecycleState:
+    daemon_pid: int
+    daemon_start_ticks: int
+    daemon_boot_id: str
+    daemon_created_at: int
+    daemon_exe_sha256: str
+    daemon_ipc_path: str
+    daemon_ipc_inode: int
+    stream_boot_id: str
+    stream_created_at: int
+    gateway_pid: int
+    gateway_start_ticks: int
+    gateway_instance_id: str
+    gateway_bound_at: int
+    gateway_url: str
+    gateway_port: int
+    gateway_auth_mode: str
+    gateway_exe_sha256: str
+    gateway_discovery_inode: int
+    gateway_discovery_sha256: str
+    proxy_pid: int
+    proxy_start_ticks: int
+
+    def document(self) -> dict[str, object]:
+        return {
+            "daemon": {
+                "pid": self.daemon_pid,
+                "startTimeTicks": self.daemon_start_ticks,
+                "bootId": self.daemon_boot_id,
+                "createdAt": self.daemon_created_at,
+                "exeSha256": self.daemon_exe_sha256,
+                "ipcPath": self.daemon_ipc_path,
+                "ipcInode": self.daemon_ipc_inode,
+                "streamBootId": self.stream_boot_id,
+                "streamCreatedAt": self.stream_created_at,
+            },
+            "gateway": {
+                "pid": self.gateway_pid,
+                "startTimeTicks": self.gateway_start_ticks,
+                "instanceId": self.gateway_instance_id,
+                "boundAt": self.gateway_bound_at,
+                "url": self.gateway_url,
+                "port": self.gateway_port,
+                "authMode": self.gateway_auth_mode,
+                "exeSha256": self.gateway_exe_sha256,
+                "discoveryInode": self.gateway_discovery_inode,
+                "discoverySha256": self.gateway_discovery_sha256,
+            },
+            "proxy": {"pid": self.proxy_pid, "startTimeTicks": self.proxy_start_ticks},
+        }
+
+
+def positive_pid(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise SoakFailure(f"{label} is not a positive process ID")
+    try:
+        os.kill(value, 0)
+    except OSError as error:
+        raise SoakFailure(f"{label} process {value} is not live: {error}") from error
+    return value
+
+
+def process_start_ticks(pid: int, label: str) -> int:
+    raw = read_bytes_no_symlink(PROC_ROOT / str(pid) / "stat", f"{label} proc stat")
+    try:
+        text = raw.decode("utf-8")
+        tail = text[text.rindex(")") + 2 :].split()
+        value = int(tail[19])
+    except (UnicodeError, ValueError, IndexError) as error:
+        raise SoakFailure(f"cannot parse {label} process start time") from error
+    if value <= 0:
+        raise SoakFailure(f"{label} process start time is invalid")
+    return value
+
+
+def process_executable_sha256(pid: int, label: str) -> str:
+    try:
+        target = Path(os.readlink(PROC_ROOT / str(pid) / "exe"))
+    except OSError as error:
+        raise SoakFailure(f"cannot read {label} process executable: {error}") from error
+    if not target.is_absolute():
+        raise SoakFailure(f"{label} process executable is not absolute")
+    return sha256_file(target)
+
+
+def typed_int(value: object, label: str, *, positive: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or (positive and value <= 0):
+        raise SoakFailure(f"{label} is not a valid integer")
+    return value
+
+
+def nonempty(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise SoakFailure(f"{label} is missing")
+    return value
+
+
+def lifecycle_state(nexus_home: Path) -> LifecycleState:
+    try:
+        daemon_pid = int(read_bytes_no_symlink(nexus_home / "daemon.pid", "daemon pid").strip())
+    except ValueError as error:
+        raise SoakFailure("daemon.pid is not a positive integer") from error
+    ipc = load_json(nexus_home / "daemon-ipc-endpoint.json", "daemon IPC discovery")
+    boot_id = ipc.get("daemonBootId", ipc.get("daemon_boot_id"))
+    if not isinstance(boot_id, str) or not boot_id:
+        raise SoakFailure("daemon IPC discovery has no boot ID")
+    daemon_pid = positive_pid(daemon_pid, "daemon pid")
+    created_at = typed_int(ipc.get("createdAt", ipc.get("created_at")), "daemon createdAt")
+    ipc_path = Path(nonempty(ipc.get("path"), "daemon IPC path"))
+    if not ipc_path.is_absolute():
+        ipc_path = nexus_home / ipc_path
+    try:
+        ipc_info = os.stat(ipc_path, follow_symlinks=False)
+    except OSError as error:
+        raise SoakFailure(f"cannot inspect daemon IPC socket: {error}") from error
+    if not stat.S_ISSOCK(ipc_info.st_mode):
+        raise SoakFailure("daemon IPC endpoint is not a socket")
+    stream = load_json(
+        nexus_home / "gateway-stream-endpoint.json",
+        "Gateway stream endpoint",
+    )
+    stream_boot = nonempty(
+        stream.get("daemonBootId", stream.get("daemon_boot_id")),
+        "Gateway stream daemon boot ID",
+    )
+    stream_created = typed_int(
+        stream.get("createdAt", stream.get("created_at")),
+        "Gateway stream createdAt",
+    )
+    if stream_boot != boot_id:
+        raise SoakFailure("daemon IPC and Gateway stream boot IDs disagree")
+    gateway_path = nexus_home / "gateway.json"
+    gateway = load_json(gateway_path, "Gateway discovery")
+    gateway_pid = positive_pid(gateway.get("pid"), "Gateway discovery pid")
+    gateway_info = os.stat(gateway_path, follow_symlinks=False)
+    if not stat.S_ISREG(gateway_info.st_mode):
+        raise SoakFailure("Gateway discovery is not a regular file")
+    proxy_raw = read_bytes_no_symlink(
+        LAB_ROOT_PREFIX / "lab" / "gateway-proxy.pid",
+        "Gateway proxy pid",
+    )
+    try:
+        proxy_pid = positive_pid(int(proxy_raw.strip()), "Gateway proxy pid")
+    except ValueError as error:
+        raise SoakFailure("Gateway proxy pid is not an integer") from error
+    return LifecycleState(
+        daemon_pid=daemon_pid,
+        daemon_start_ticks=process_start_ticks(daemon_pid, "daemon"),
+        daemon_boot_id=boot_id,
+        daemon_created_at=created_at,
+        daemon_exe_sha256=process_executable_sha256(daemon_pid, "daemon"),
+        daemon_ipc_path=str(ipc_path),
+        daemon_ipc_inode=ipc_info.st_ino,
+        stream_boot_id=stream_boot,
+        stream_created_at=stream_created,
+        gateway_pid=gateway_pid,
+        gateway_start_ticks=process_start_ticks(gateway_pid, "Gateway"),
+        gateway_instance_id=nonempty(
+            gateway.get("instanceId", gateway.get("instance_id")),
+            "Gateway instanceId",
+        ),
+        gateway_bound_at=typed_int(
+            gateway.get("boundAt", gateway.get("bound_at")),
+            "Gateway boundAt",
+        ),
+        gateway_url=nonempty(gateway.get("url"), "Gateway URL"),
+        gateway_port=typed_int(gateway.get("port"), "Gateway port", positive=True),
+        gateway_auth_mode=nonempty(
+            gateway.get("authMode", gateway.get("auth_mode")),
+            "Gateway auth mode",
+        ),
+        gateway_exe_sha256=process_executable_sha256(gateway_pid, "Gateway"),
+        gateway_discovery_inode=gateway_info.st_ino,
+        gateway_discovery_sha256=sha256_file(gateway_path),
+        proxy_pid=proxy_pid,
+        proxy_start_ticks=process_start_ticks(proxy_pid, "Gateway proxy"),
+    )
+
+
+def validate_restart_transition(
+    target: str,
+    before: LifecycleState,
+    after: LifecycleState,
+) -> None:
+    if target not in {"daemon", "gateway"}:
+        raise SoakFailure(f"unsupported lifecycle restart target: {target}")
+    if not isinstance(before, LifecycleState) or not isinstance(after, LifecycleState):
+        raise SoakFailure("lifecycle state must be a complete typed observation")
+    for label, state in (("before", before), ("after", after)):
+        numeric = (
+            state.daemon_pid,
+            state.daemon_start_ticks,
+            state.daemon_created_at,
+            state.daemon_ipc_inode,
+            state.stream_created_at,
+            state.gateway_pid,
+            state.gateway_start_ticks,
+            state.gateway_bound_at,
+            state.gateway_port,
+            state.gateway_discovery_inode,
+            state.proxy_pid,
+            state.proxy_start_ticks,
+        )
+        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in numeric):
+            raise SoakFailure(f"{label} lifecycle state has a missing or non-positive field")
+        strings = (
+            state.daemon_boot_id,
+            state.daemon_exe_sha256,
+            state.daemon_ipc_path,
+            state.stream_boot_id,
+            state.gateway_instance_id,
+            state.gateway_url,
+            state.gateway_auth_mode,
+            state.gateway_exe_sha256,
+            state.gateway_discovery_sha256,
+        )
+        if any(not isinstance(value, str) or not value for value in strings):
+            raise SoakFailure(f"{label} lifecycle state has a missing identity field")
+        if state.stream_boot_id != state.daemon_boot_id:
+            raise SoakFailure(f"{label} daemon IPC and Gateway stream boot IDs disagree")
+        if state.daemon_pid in {state.gateway_pid, state.proxy_pid} or state.gateway_pid == state.proxy_pid:
+            raise SoakFailure(f"{label} lifecycle state reuses a process ID across roles")
+        for digest in (
+            state.daemon_exe_sha256,
+            state.gateway_exe_sha256,
+            state.gateway_discovery_sha256,
+        ):
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise SoakFailure(f"{label} lifecycle state has an invalid digest")
+    if target == "daemon":
+        if (
+            before.daemon_pid == after.daemon_pid
+            or before.daemon_start_ticks == after.daemon_start_ticks
+            or before.daemon_boot_id == after.daemon_boot_id
+            or before.daemon_created_at == after.daemon_created_at
+            or before.daemon_ipc_inode == after.daemon_ipc_inode
+            or before.stream_boot_id == after.stream_boot_id
+            or before.stream_created_at == after.stream_created_at
+        ):
+            raise SoakFailure("daemon restart did not change PID/start/boot/discovery identity")
+        if (
+            before.daemon_exe_sha256 != after.daemon_exe_sha256
+            or before.daemon_ipc_path != after.daemon_ipc_path
+            or before.gateway_pid != after.gateway_pid
+            or before.gateway_start_ticks != after.gateway_start_ticks
+            or before.gateway_instance_id != after.gateway_instance_id
+            or before.gateway_bound_at != after.gateway_bound_at
+            or before.gateway_discovery_sha256 != after.gateway_discovery_sha256
+            or before.proxy_pid != after.proxy_pid
+            or before.proxy_start_ticks != after.proxy_start_ticks
+        ):
+            raise SoakFailure("daemon restart unexpectedly replaced the Gateway")
+        return
+    if target == "gateway":
+        if (
+            before.gateway_pid == after.gateway_pid
+            or before.gateway_start_ticks == after.gateway_start_ticks
+            or before.gateway_bound_at == after.gateway_bound_at
+            or before.gateway_discovery_inode == after.gateway_discovery_inode
+            or before.gateway_discovery_sha256 == after.gateway_discovery_sha256
+        ):
+            raise SoakFailure("Gateway restart did not change PID, generation, and discovery")
+        if (
+            before.gateway_instance_id != after.gateway_instance_id
+            or before.gateway_url != after.gateway_url
+            or before.gateway_port != after.gateway_port
+            or before.gateway_auth_mode != after.gateway_auth_mode
+            or before.gateway_exe_sha256 != after.gateway_exe_sha256
+        ):
+            raise SoakFailure("Gateway restart changed stable discovery identity")
+        if (
+            before.daemon_pid != after.daemon_pid
+            or before.daemon_start_ticks != after.daemon_start_ticks
+            or before.daemon_boot_id != after.daemon_boot_id
+            or before.daemon_ipc_inode != after.daemon_ipc_inode
+            or before.daemon_created_at != after.daemon_created_at
+            or before.daemon_exe_sha256 != after.daemon_exe_sha256
+            or before.daemon_ipc_path != after.daemon_ipc_path
+            or before.stream_boot_id != after.stream_boot_id
+            or before.stream_created_at != after.stream_created_at
+            or before.proxy_pid != after.proxy_pid
+            or before.proxy_start_ticks != after.proxy_start_ticks
+        ):
+            raise SoakFailure("Gateway restart unexpectedly replaced the daemon")
+        return
+    raise SoakFailure(f"unsupported restart target: {target}")
+
+
+@dataclass
+class ResourceBounds:
+    memory: list[int]
+    disk: list[int]
+
+    def document(self) -> dict[str, dict[str, int]]:
+        return {
+            "memoryBytes": {
+                "start": self.memory[0],
+                "end": self.memory[-1],
+                "peak": max(self.memory),
+                "limit": MEMORY_LIMIT_BYTES,
+            },
+            "diskBytes": {
+                "start": self.disk[0],
+                "end": self.disk[-1],
+                "peak": max(self.disk),
+                "limit": DISK_LIMIT_BYTES,
+            },
+        }
+
+
+@dataclass(frozen=True)
+class DeveloperAttempt:
+    message_id: str
+    topic: str
+    cursor_before: int
+
+
+class Soak:
+    def __init__(
+        self,
+        candidate: Candidate,
+        evidence: Evidence,
+        http: HttpClient,
+        nexus_bin: str,
+        lab_process: str,
+        lab_root: Path,
+        agents: tuple[Agent, Agent],
+    ) -> None:
+        self.candidate = candidate
+        self.evidence = evidence
+        self.http = http
+        self.nexus_bin = nexus_bin
+        self.lab_process = lab_process
+        self.lab_root = lab_root
+        self.agents = agents
+        self.ledger = Ledger()
+        suffix = SAFE_ID.sub("-", candidate.run_id).strip("-")[-40:] or "run"
+        self.thread = f"v015-soak-{suffix}"
+        self.thread_topic = f"sys.message.thread.{self.thread}"
+        self.dm_topics = {
+            agent.agent_id: f"sys.dm.{agent.name}"
+            for agent in agents
+        }
+        self.developer = DeveloperLane(
+            evidence,
+            self.ledger,
+            http,
+            (self.thread_topic, *(self.dm_topics[agent.agent_id] for agent in agents)),
+        )
+        self.sessions = {
+            agent.kind: AgentSessionLane(evidence, self.ledger, http, agent)
+            for agent in agents
+        }
+        self.restarts = Counter()
+        self.restart_proofs: list[dict[str, object]] = []
+        self.replay_counts: Counter[str] = Counter()
+        self.resync_counts: Counter[str] = Counter()
+        self.memory: list[int] = []
+        self.disk: list[int] = []
+        self.traffic_rounds = 0
+        self.session_rounds = 0
+        self.baseline_dlq = 0
+        self.resource_samples: list[dict[str, object]] = []
+        self.process_rss_totals: list[int] = []
+        self.cgroup_event_baseline: dict[str, dict[str, int]] | None = None
+        self.resource_health: dict[str, object] = {
+            "status": "PENDING",
+            "withinBounds": False,
+            "trendHealthy": False,
+            "sampleCount": 0,
+        }
+        self.topology: dict[str, object] = {"status": "PENDING", "healthy": False}
+        self.diagnostics_healthy = False
+
+    async def setup(self, password: str) -> None:
+        run_command(
+            [
+                self.nexus_bin,
+                "thread",
+                "new",
+                self.thread,
+                "--project",
+                "v015-lab",
+                "--member",
+                self.agents[0].name,
+                "--member",
+                self.agents[1].name,
+                "--json",
+            ],
+            timeout=60,
+        )
+        human_name = f"v015-soak-{hashlib.sha256(self.candidate.run_id.encode()).hexdigest()[:12]}"
+        await asyncio.to_thread(self.http.login, human_name, password)
+        await asyncio.to_thread(wait_health, self.http)
+        self.baseline_dlq = await asyncio.to_thread(dlq_total, self.nexus_bin)
+        self.ledger.failure["deadLetters"] = self.baseline_dlq
+        rows = await asyncio.to_thread(identity_rows, self.nexus_bin)
+        check_identities(rows, self.agents, self.ledger)
+        await asyncio.gather(
+            self.developer.connect(),
+            *(session.connect() for session in self.sessions.values()),
+        )
+        await self.sample_resources("start")
+
+    async def sample_resources(self, phase: str) -> None:
+        cgroup = cgroup_sample()
+        memory = int(cgroup["memoryCurrent"])
+        memory_limit = int(cgroup["memoryMax"])
+        disk = directory_bytes(self.lab_root)
+        lifecycle = lifecycle_state(self.lab_root / "nexus")
+        process_ids = {
+            "daemon": lifecycle.daemon_pid,
+            "gateway": lifecycle.gateway_pid,
+            "gatewayProxy": lifecycle.proxy_pid,
+        }
+        for leaf, label in (
+            ("xvfb.pid", "xvfb"),
+            ("lens.pid", "lens"),
+            ("lens-cdp-proxy.pid", "lensCdpProxy"),
+            ("webui-browser.pid", "webuiBrowser"),
+            ("webui-cdp-proxy.pid", "webuiCdpProxy"),
+        ):
+            raw = read_bytes_no_symlink(self.lab_root / "lab" / leaf, f"{label} pid")
+            try:
+                process_ids[label] = positive_pid(int(raw.strip()), f"{label} pid")
+            except ValueError as error:
+                raise SoakFailure(f"{label} pid is not an integer") from error
+        process_rows = {
+            label: process_sample(pid, label)
+            for label, pid in process_ids.items()
+        }
+        total_rss = sum(int(row["rssBytes"]) for row in process_rows.values())
+        self.process_rss_totals.append(total_rss)
+        gateway_probe, webconsole_probe, lens_probe, webui_probe = await asyncio.gather(
+            asyncio.to_thread(plain_http_probe, GATEWAY_URL + "/api/v1/health", "Gateway"),
+            asyncio.to_thread(plain_http_probe, WEBCONSOLE_URL + "/health", "Webconsole"),
+            cdp_runtime_probe(LENS_CDP_URL, "file://", "Lens"),
+            cdp_runtime_probe(WEBUI_CDP_URL, "127.0.0.1:4200", "WebUI"),
+        )
+        queue_rows: dict[str, object] = {}
+        for agent in self.agents:
+            query = urlencode({"agentId": agent.agent_id})
+            snapshot = await asyncio.to_thread(
+                self.http.request,
+                "GET",
+                f"/api/conversation/prompt?{query}",
+            )
+            snapshot.pop("_headers", None)
+            if not isinstance(snapshot.get("commands"), list):
+                raise SoakFailure(f"{agent.kind} queue snapshot has no commands array")
+            seq = snapshot.get("seq")
+            if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+                raise SoakFailure(f"{agent.kind} queue snapshot has no non-negative seq")
+            queue_rows[agent.kind] = {
+                "agentId": agent.agent_id,
+                "sessionId": snapshot.get("sessionId"),
+                "turnActive": snapshot.get("turnActive") is True,
+                "depth": len(snapshot["commands"]),
+                "seq": seq,
+            }
+        event_now = {
+            "memory": dict(cgroup["memoryEvents"]),
+            "pids": dict(cgroup["pidsEvents"]),
+        }
+        if self.cgroup_event_baseline is None:
+            self.cgroup_event_baseline = event_now
+        else:
+            baseline = self.cgroup_event_baseline
+            assert baseline is not None
+            for key in ("oom", "oom_kill"):
+                if event_now["memory"].get(key, 0) > baseline["memory"].get(key, 0):
+                    raise SoakFailure(f"container cgroup memory.events {key} incremented")
+            if event_now["pids"].get("max", 0) > baseline["pids"].get("max", 0):
+                raise SoakFailure("container cgroup pids.events max incremented")
+        websocket = {
+            "developer": {
+                "readerLive": self.developer.reader is not None
+                and not self.developer.reader.done(),
+                "cursors": dict(self.developer.cursors),
+                "reconnects": self.developer.reconnects,
+                "replayCount": self.replay_counts["developer"],
+                "resyncCount": self.resync_counts["developer"],
+                "error": None if self.developer.error is None else str(self.developer.error),
+            },
+            "agentSessions": {
+                kind: {
+                    "readerLive": session.reader is not None and not session.reader.done(),
+                    "cursor": session.opaque_cursor,
+                    "numericCursor": session.last_numeric_cursor,
+                    "reconnects": session.reconnects,
+                    "replayCount": self.replay_counts[kind],
+                    "resyncCount": self.resync_counts[kind],
+                    "error": None if session.error is None else str(session.error),
+                }
+                for kind, session in self.sessions.items()
+            },
+        }
+        if not websocket["developer"]["readerLive"] or any(
+            not row["readerLive"]
+            for row in websocket["agentSessions"].values()
+        ):
+            raise SoakFailure("one or more WebSocket reader tasks are not live")
+        self.memory.append(memory)
+        self.disk.append(disk)
+        at = time.time()
+        self.evidence.jsonl("memory", {
+            "at": at,
+            "phase": phase,
+            "bytes": memory,
+            "limit": memory_limit,
+        })
+        self.evidence.jsonl("disk", {
+            "at": at,
+            "phase": phase,
+            "bytes": disk,
+            "limit": DISK_LIMIT_BYTES,
+        })
+        resource = {
+            "at": at,
+            "phase": phase,
+            "cgroup": cgroup,
+            "processes": process_rows,
+            "processRssTotal": total_rss,
+            "diskBytes": disk,
+            "queues": queue_rows,
+            "websockets": websocket,
+            "probes": {
+                "gateway": gateway_probe,
+                "webconsole": webconsole_probe,
+                "lens": lens_probe,
+                "webui": webui_probe,
+            },
+        }
+        self.resource_samples.append(resource)
+        self.evidence.jsonl("metrics", {"event": "resource.sample", **resource})
+        if memory > MEMORY_LIMIT_BYTES or disk > DISK_LIMIT_BYTES:
+            raise SoakFailure(f"resource bound exceeded: memory={memory}, disk={disk}")
+        memory_bad = trend_is_unhealthy(self.memory, MEMORY_TREND_MIN_GROWTH)
+        rss_bad = trend_is_unhealthy(self.process_rss_totals, MEMORY_TREND_MIN_GROWTH)
+        disk_bad = trend_is_unhealthy(self.disk, DISK_TREND_MIN_GROWTH)
+        if memory_bad or rss_bad or disk_bad:
+            raise SoakFailure(
+                "sustained resource growth exceeded the leak-trend threshold: "
+                f"memory={memory_bad} rss={rss_bad} disk={disk_bad}"
+            )
+        self.resource_health = {
+            "status": "PASS",
+            "withinBounds": True,
+            "trendHealthy": True,
+            "sampleCount": len(self.resource_samples),
+            "processRssPeak": max(self.process_rss_totals),
+            "memoryEventDeltas": {
+                key: event_now["memory"].get(key, 0)
+                - self.cgroup_event_baseline["memory"].get(key, 0)
+                for key in ("oom", "oom_kill", "max")
+            },
+            "pidsMaxDelta": event_now["pids"].get("max", 0)
+            - self.cgroup_event_baseline["pids"].get("max", 0),
+        }
+
+    async def begin_message(
+        self,
+        target: dict[str, Any],
+        topic: str,
+        marker: str,
+    ) -> DeveloperAttempt:
+        cursor_before = self.developer.cursors.get(topic)
+        if isinstance(cursor_before, bool) or not isinstance(cursor_before, int) or cursor_before < 0:
+            raise SoakFailure(f"developer topic has no valid accepted cursor: {topic}")
+        response = await asyncio.to_thread(
+            self.http.request,
+            "POST",
+            "/api/v1/messages",
+            {"to": target, "body": marker, "idempotencyKey": f"idem-{marker}"},
+        )
+        response.pop("_headers", None)
+        message_id = recursive_string(response, ("messageId", "message_id"))
+        if not message_id:
+            raise SoakFailure(f"accepted message has no messageId: {response!r}")
+        self.ledger.accept_message(message_id, topic)
+        return DeveloperAttempt(message_id, topic, cursor_before)
+
+    async def finish_message(
+        self,
+        attempt: DeveloperAttempt,
+        timeout: float,
+    ) -> dict[str, object]:
+        await self.developer.wait_message(attempt.message_id, attempt.topic, timeout=timeout)
+        received_count = sum(
+            topic == attempt.topic
+            for topic in self.ledger.received_messages.get(attempt.message_id, [])
+        )
+        cursor_after = self.developer.cursors.get(attempt.topic)
+        if (
+            received_count != 1
+            or isinstance(cursor_after, bool)
+            or not isinstance(cursor_after, int)
+            or cursor_after <= attempt.cursor_before
+        ):
+            raise SoakFailure(
+                f"developer delivery was not exact-once with cursor advancement for "
+                f"{attempt.message_id}: count={received_count} "
+                f"before={attempt.cursor_before} after={cursor_after!r}"
+            )
+        return {
+            "messageId": attempt.message_id,
+            "cursorBefore": attempt.cursor_before,
+            "cursorAfter": cursor_after,
+            "receivedCount": received_count,
+        }
+
+    async def send_message(
+        self,
+        target: dict[str, Any],
+        topic: str,
+        marker: str,
+    ) -> dict[str, object]:
+        attempt = await self.begin_message(target, topic, marker)
+        return await self.finish_message(attempt, timeout=60)
+
+    async def traffic(self, allow_session: bool) -> None:
+        self.traffic_rounds += 1
+        nonce = f"{self.candidate.run_id}-{self.traffic_rounds}-{time.time_ns()}"
+        await self.send_message(
+            {"verb": "post", "thread": self.thread},
+            self.thread_topic,
+            f"V015_SOAK_THREAD_{nonce}",
+        )
+        for agent in self.agents:
+            await self.send_message(
+                {"verb": "dm", "name": agent.name, "agentId": agent.agent_id},
+                self.dm_topics[agent.agent_id],
+                f"V015_SOAK_DM_{agent.kind}_{nonce}",
+            )
+        if allow_session and (self.traffic_rounds == 1 or self.traffic_rounds % 8 == 0):
+            self.session_rounds += 1
+            await asyncio.gather(*(
+                session.prompt(
+                    f"V015_SOAK_SESSION_{session.agent.kind}_{nonce}",
+                    timeout=120,
+                )
+                for session in self.sessions.values()
+            ))
+
+    async def planned_restart(self, target: str) -> None:
+        started = time.time()
+        before = await asyncio.to_thread(lifecycle_state, self.lab_root / "nexus")
+        before_developer_cursors = dict(self.developer.cursors)
+        before_session_cursors = {
+            kind: session.last_numeric_cursor
+            for kind, session in self.sessions.items()
+        }
+        before_developer_reconnects = self.developer.reconnects
+        before_session_reconnects = {
+            kind: session.reconnects
+            for kind, session in self.sessions.items()
+        }
+        self.evidence.log("restart.begin", target=target, before=before.document())
+
+        nonce = f"{self.candidate.run_id}-{target}-{self.restarts[target] + 1}-{time.time_ns()}"
+        await self.developer.pause_reader()
+        developer_attempt = await self.begin_message(
+            {"verb": "post", "thread": self.thread},
+            self.thread_topic,
+            f"V015_SOAK_RESTART_THREAD_{nonce}",
+        )
+
+        async def begin_session_boundary(
+            session: AgentSessionLane,
+        ) -> tuple[AgentSessionLane, PromptAttempt]:
+            attempt = await session.begin_prompt(
+                f"V015_SOAK_RESTART_SESSION_{session.agent.kind}_{nonce}",
+                timeout=120,
+            )
+            await session.pause_reader()
+            return session, attempt
+
+        session_boundaries = await asyncio.gather(*(
+            begin_session_boundary(session)
+            for session in self.sessions.values()
+        ))
+        if self.thread_topic in self.ledger.received_messages.get(
+            developer_attempt.message_id,
+            [],
+        ):
+            raise SoakFailure("developer restart-boundary message arrived before the restart")
+        for session, attempt in session_boundaries:
+            if any(
+                session_event(frame).get("type") == "RUN_FINISHED"
+                for frame in session.frames[attempt.start_index :]
+            ):
+                raise SoakFailure(
+                    f"{session.agent.kind} restart-boundary input completed before the restart"
+                )
+
+        await asyncio.to_thread(
+            run_command,
+            [self.lab_process, "restart", target],
+            timeout=120,
+        )
+        await asyncio.to_thread(wait_health, self.http)
+        after = await asyncio.to_thread(lifecycle_state, self.lab_root / "nexus")
+        validate_restart_transition(target, before, after)
+        await asyncio.gather(
+            self.developer.connect(reconnect=True),
+            *(session.connect(reconnect=True) for session in self.sessions.values()),
+        )
+        if self.developer.reconnects != before_developer_reconnects + 1:
+            raise SoakFailure("developer WebSocket did not reconnect exactly once")
+        for kind, session in self.sessions.items():
+            if session.reconnects != before_session_reconnects[kind] + 1:
+                raise SoakFailure(f"{kind} agent-session WebSocket did not reconnect exactly once")
+            if session.last_numeric_cursor < before_session_cursors[kind]:
+                raise SoakFailure(f"{kind} agent-session cursor regressed across {target} restart")
+        for topic, cursor in before_developer_cursors.items():
+            if self.developer.cursors.get(topic, -1) < cursor:
+                raise SoakFailure(f"developer cursor regressed for {topic} across {target} restart")
+
+        completed = await asyncio.gather(
+            self.finish_message(developer_attempt, timeout=120),
+            *(
+                session.finish_prompt(attempt, timeout=120)
+                for session, attempt in session_boundaries
+            ),
+        )
+        developer_proof = completed[0]
+        session_proofs = {
+            session.agent.kind: proof
+            for (session, _attempt), proof in zip(session_boundaries, completed[1:])
+        }
+        restart_proof: dict[str, object] = {
+            "status": "PASS",
+            "target": target,
+            "transportRecoveryObserved": True,
+            "developer": developer_proof,
+            "agentSessions": session_proofs,
+        }
+        if not restart_proof_is_complete(restart_proof):
+            raise SoakFailure(f"{target} restart proof is incomplete")
+        self.restart_proofs.append(restart_proof)
+        self.replay_counts["developer"] += 1
+        for kind in session_proofs:
+            self.replay_counts[kind] += 1
+        self.restarts[target] += 1
+        rows = await asyncio.to_thread(identity_rows, self.nexus_bin)
+        check_identities(rows, self.agents, self.ledger)
+        dlq = await asyncio.to_thread(dlq_total, self.nexus_bin)
+        self.ledger.failure["deadLetters"] = max(
+            self.ledger.failure["deadLetters"],
+            max(0, dlq - self.baseline_dlq),
+        )
+        checkpoint = {
+            "at": time.time(),
+            "target": target,
+            "durationSeconds": time.time() - started,
+            "targetChanged": True,
+            "nonTargetStable": True,
+            "healthRecovered": True,
+            "before": before.document(),
+            "after": after.document(),
+            "daemonReconnects": self.restarts["daemon"],
+            "gatewayReconnects": self.restarts["gateway"],
+            "developerReconnects": self.developer.reconnects,
+            "agentSessionReconnects": {
+                kind: session.reconnects
+                for kind, session in self.sessions.items()
+            },
+            "developerCursor": self.developer.last_cursor,
+            "agentSessionCursors": {
+                kind: session.last_numeric_cursor
+                for kind, session in self.sessions.items()
+            },
+            "replayCounts": dict(self.replay_counts),
+            "resyncCounts": dict(self.resync_counts),
+            "acceptedTrafficProof": restart_proof,
+        }
+        self.evidence.jsonl("reconnectCheckpoints", checkpoint)
+        self.evidence.log("restart.end", **checkpoint)
+        await self.sample_resources(f"restart-{target}-{self.restarts[target]}")
+        await self.traffic(allow_session=True)
+
+    async def run(self) -> tuple[float, float, ResourceBounds]:
+        started_at = time.time()
+        started_monotonic = time.monotonic()
+        duration = RELEASE_DURATION_SECONDS
+        end_monotonic = started_monotonic + duration
+        restart_plan = [
+            (started_monotonic + duration * 0.15, "gateway"),
+            (started_monotonic + duration * 0.35, "daemon"),
+            (started_monotonic + duration * 0.60, "gateway"),
+            (started_monotonic + duration * 0.80, "daemon"),
+        ]
+        restart_index = 0
+        traffic_interval = max(0.25, min(15.0, duration / 60))
+        resource_interval = max(0.25, min(30.0, duration / 30))
+        drain_window = max(1.0, min(120.0, duration / 5))
+        next_traffic = started_monotonic
+        next_resource = started_monotonic
+        while time.monotonic() < end_monotonic or restart_index < len(restart_plan):
+            now = time.monotonic()
+            if restart_index < len(restart_plan) and now >= restart_plan[restart_index][0]:
+                await self.planned_restart(restart_plan[restart_index][1])
+                restart_index += 1
+                next_traffic = time.monotonic() + traffic_interval
+                continue
+            if now >= next_resource:
+                await self.sample_resources("soak")
+                next_resource = now + resource_interval
+            if now >= next_traffic and now < end_monotonic:
+                if self.developer.reader is not None and self.developer.reader.done():
+                    self.ledger.failure["crashLoops"] += 1
+                    await self.developer.connect(reconnect=True)
+                for session in self.sessions.values():
+                    if session.reader is not None and session.reader.done():
+                        self.ledger.failure["crashLoops"] += 1
+                        await session.connect(reconnect=True)
+                await self.traffic(allow_session=(end_monotonic - now) > drain_window)
+                next_traffic = time.monotonic() + traffic_interval
+                continue
+            deadlines = [end_monotonic, next_traffic, next_resource]
+            if restart_index < len(restart_plan):
+                deadlines.append(restart_plan[restart_index][0])
+            await asyncio.sleep(max(0.01, min(0.25, min(deadlines) - time.monotonic())))
+
+        queue_deadline = time.monotonic() + max(2.0, min(120.0, duration / 3))
+        while time.monotonic() < queue_deadline:
+            queues_clear = await asyncio.gather(*(
+                asyncio.to_thread(queue_clear, self.http, agent)
+                for agent in self.agents
+            ))
+            if all(queues_clear):
+                break
+            await asyncio.sleep(0.25)
+        else:
+            self.ledger.failure["queueWedges"] += 1
+
+        final_dlq = await asyncio.to_thread(dlq_total, self.nexus_bin)
+        self.ledger.failure["deadLetters"] = max(
+            self.ledger.failure["deadLetters"],
+            max(0, final_dlq - self.baseline_dlq),
+        )
+        rows = await asyncio.to_thread(identity_rows, self.nexus_bin)
+        check_identities(rows, self.agents, self.ledger)
+        self.ledger.finalize_delivery_counts()
+        await self.sample_resources("end")
+        ended_at = time.time()
+        return started_at, ended_at, ResourceBounds(self.memory, self.disk)
+
+    async def close(self) -> None:
+        await asyncio.gather(
+            self.developer.close(),
+            *(session.close() for session in self.sessions.values()),
+        )
+
+
+def capture_final_artifacts(
+    evidence: Evidence,
+    nexus_bin: str,
+    lab_root: Path,
+) -> dict[str, object]:
+    processes = run_command(
+        ["ps", "-eo", "pid=,ppid=,rss=,stat=,comm=,args="], timeout=15, check=False
+    )
+    tcp_listeners = run_command(["ss", "-ltnp"], timeout=15, check=False)
+    unix_listeners = run_command(["ss", "-lxnp"], timeout=15, check=False)
+    evidence.write_text(
+        "finalProcesses",
+        f"rc={processes.returncode}\n{processes.stdout}\n{processes.stderr}",
+    )
+    evidence.write_text(
+        "finalListeners",
+        "tcp.rc="
+        f"{tcp_listeners.returncode}\n{tcp_listeners.stdout}\n{tcp_listeners.stderr}\n"
+        "unix.rc="
+        f"{unix_listeners.returncode}\n{unix_listeners.stdout}\n{unix_listeners.stderr}",
+    )
+    for surface in ("daemon", "gateway"):
+        result = run_command(
+            [nexus_bin, surface, "logs", "--lines", "200"],
+            timeout=30,
+            check=False,
+        )
+        evidence.log(
+            "process.logs",
+            surface=surface,
+            returncode=result.returncode,
+            stdout=result.stdout[-20000:],
+            stderr=result.stderr[-10000:],
+        )
+        if result.returncode != 0:
+            raise SoakFailure(f"{surface} log capture failed with rc={result.returncode}")
+    if processes.returncode != 0:
+        raise SoakFailure(f"final ps diagnostic failed with rc={processes.returncode}")
+    if tcp_listeners.returncode != 0 or unix_listeners.returncode != 0:
+        raise SoakFailure(
+            "final ss diagnostic failed: "
+            f"tcp={tcp_listeners.returncode} unix={unix_listeners.returncode}"
+        )
+
+    lifecycle = lifecycle_state(lab_root / "nexus")
+    expected_pids = {
+        "daemon": lifecycle.daemon_pid,
+        "gateway": lifecycle.gateway_pid,
+        "gatewayProxy": lifecycle.proxy_pid,
+    }
+    for leaf, label in (
+        ("xvfb.pid", "xvfb"),
+        ("lens.pid", "lens"),
+        ("lens-cdp-proxy.pid", "lensCdpProxy"),
+        ("webui-browser.pid", "webuiBrowser"),
+        ("webui-cdp-proxy.pid", "webuiCdpProxy"),
+    ):
+        raw = read_bytes_no_symlink(lab_root / "lab" / leaf, f"{label} pid")
+        try:
+            expected_pids[label] = positive_pid(int(raw.strip()), f"{label} pid")
+        except ValueError as error:
+            raise SoakFailure(f"{label} pid is not an integer") from error
+    observed_states: dict[int, str] = {}
+    for line in processes.stdout.splitlines():
+        fields = line.split(None, 5)
+        if len(fields) < 5:
+            continue
+        try:
+            pid = int(fields[0])
+        except ValueError:
+            continue
+        observed_states[pid] = fields[3]
+    for label, pid in expected_pids.items():
+        state = observed_states.get(pid)
+        if not state:
+            raise SoakFailure(f"final process inventory omits {label} pid {pid}")
+        if "Z" in state:
+            raise SoakFailure(f"final process inventory reports zombie {label} pid {pid}")
+    required_tcp_ports = (4100, 4101, 4200, 9222, 9224)
+    for port in required_tcp_ports:
+        if not re.search(rf"(?:\[?::\]?|\b\d{{1,3}}(?:\.\d{{1,3}}){{3}}):{port}\b", tcp_listeners.stdout):
+            raise SoakFailure(f"final listener inventory omits TCP port {port}")
+    stream = load_json(
+        lab_root / "nexus" / "gateway-stream-endpoint.json",
+        "Gateway stream endpoint",
+    )
+    stream_path = nonempty(stream.get("path"), "Gateway stream socket path")
+    for label, socket_path in (
+        ("daemon IPC", lifecycle.daemon_ipc_path),
+        ("Gateway stream", stream_path),
+    ):
+        if socket_path not in unix_listeners.stdout:
+            raise SoakFailure(f"final listener inventory omits {label} socket")
+    return {
+        "status": "PASS",
+        "healthy": True,
+        "processes": expected_pids,
+        "tcpPorts": list(required_tcp_ports),
+        "unixSockets": [lifecycle.daemon_ipc_path, stream_path],
+    }
+
+
+def restart_proof_is_complete(proof: object) -> bool:
+    if not isinstance(proof, dict) or proof.get("status") != "PASS":
+        return False
+    if proof.get("target") not in {"daemon", "gateway"}:
+        return False
+    if proof.get("transportRecoveryObserved") is not True:
+        return False
+    developer = proof.get("developer")
+    if not isinstance(developer, dict):
+        return False
+    message_id = developer.get("messageId")
+    before = developer.get("cursorBefore")
+    after = developer.get("cursorAfter")
+    if (
+        not isinstance(message_id, str)
+        or not message_id
+        or isinstance(before, bool)
+        or not isinstance(before, int)
+        or before < 0
+        or isinstance(after, bool)
+        or not isinstance(after, int)
+        or after <= before
+        or developer.get("receivedCount") != 1
+    ):
+        return False
+    sessions = proof.get("agentSessions")
+    if not isinstance(sessions, dict) or set(sessions) != {"codex", "claude"}:
+        return False
+    for row in sessions.values():
+        if not isinstance(row, dict):
+            return False
+        client_message_id = row.get("clientMessageId")
+        session_before = row.get("cursorBefore")
+        session_after = row.get("cursorAfter")
+        if (
+            not isinstance(client_message_id, str)
+            or not client_message_id
+            or isinstance(session_before, bool)
+            or not isinstance(session_before, int)
+            or session_before < 0
+            or isinstance(session_after, bool)
+            or not isinstance(session_after, int)
+            or session_after <= session_before
+            or row.get("completionCount") != 1
+        ):
+            return False
+    return True
+
+
+def restart_straddle_is_complete(proofs: object) -> bool:
+    if not isinstance(proofs, list) or len(proofs) != 4:
+        return False
+    if not all(restart_proof_is_complete(proof) for proof in proofs):
+        return False
+    return Counter(str(proof["target"]) for proof in proofs) == Counter(
+        {"daemon": 2, "gateway": 2}
+    )
+
+
+def result_document(
+    candidate: Candidate,
+    soak: Soak,
+    started_at: float,
+    ended_at: float,
+    bounds: ResourceBounds,
+    error: str | None,
+) -> dict[str, Any]:
+    elapsed = ended_at - started_at
+    failures = soak.ledger.failure
+    failure_count = sum(failures.values()) + (1 if error else 0)
+    session_reconnects = min(
+        (session.reconnects for session in soak.sessions.values()),
+        default=0,
+    )
+    session_cursor = min(
+        (session.last_numeric_cursor for session in soak.sessions.values()),
+        default=0,
+    )
+    checkpoints = {
+        "developerWebSocket": {
+            "status": "PASS"
+            if soak.developer.reconnects >= 4
+            and soak.developer.last_cursor > 0
+            and soak.developer.cursors
+            and all(cursor > 0 for cursor in soak.developer.cursors.values())
+            and soak.replay_counts["developer"] >= 4
+            else "FAIL",
+            "reconnects": soak.developer.reconnects,
+            "lastAcceptedCursor": soak.developer.last_cursor,
+            "topicCursors": dict(soak.developer.cursors),
+            "replayCount": soak.replay_counts["developer"],
+            "resyncCount": soak.resync_counts["developer"],
+        },
+        "agentSessionWebSocket": {
+            "status": "PASS"
+            if session_reconnects >= 4
+            and session_cursor > 0
+            and all(soak.replay_counts[kind] >= 4 for kind in soak.sessions)
+            else "FAIL",
+            "reconnects": session_reconnects,
+            "lastAcceptedCursor": session_cursor,
+            "agentCursors": {
+                kind: session.last_numeric_cursor
+                for kind, session in soak.sessions.items()
+            },
+            "replayCounts": {
+                kind: soak.replay_counts[kind]
+                for kind in soak.sessions
+            },
+            "resyncCounts": {
+                kind: soak.resync_counts[kind]
+                for kind in soak.sessions
+            },
+        },
+        "daemonReconnects": soak.restarts["daemon"],
+        "gatewayReconnects": soak.restarts["gateway"],
+    }
+    invariants = {
+        "duration": elapsed >= RELEASE_DURATION_SECONDS,
+        "restartCount": soak.restarts["daemon"] == 2
+        and soak.restarts["gateway"] == 2,
+        "restartStraddle": restart_straddle_is_complete(soak.restart_proofs),
+        "traffic": soak.traffic_rounds > 0 and bool(soak.ledger.expected_messages),
+        "sessionCorrelation": soak.session_rounds > 0
+        and bool(soak.ledger.session_accepted)
+        and soak.ledger.session_accepted == soak.ledger.session_completed,
+        "delivery": bool(soak.ledger.expected_messages)
+        and all(value == 0 for value in failures.values()),
+        "websocketReconnect": soak.developer.reconnects >= 4
+        and session_reconnects >= 4
+        and soak.developer.last_cursor > 0
+        and session_cursor > 0,
+        "resources": soak.resource_health.get("status") == "PASS"
+        and soak.resource_health.get("withinBounds") is True
+        and soak.resource_health.get("trendHealthy") is True
+        and isinstance(soak.resource_health.get("sampleCount"), int)
+        and soak.resource_health["sampleCount"] >= 60,
+        "topology": soak.topology.get("status") == "PASS"
+        and soak.topology.get("healthy") is True,
+        "diagnostics": soak.diagnostics_healthy is True,
+    }
+    passed = error is None and failure_count == 0 and all(invariants.values())
+    invariant_failures = sum(value is not True for value in invariants.values())
+    if not passed:
+        failure_count += invariant_failures
+    return {
+        "schemaVersion": 1,
+        "runId": candidate.run_id,
+        "candidateDigest": candidate.digest,
+        "gate": "F3",
+        "status": "PASS" if passed else "FAIL",
+        "error": None
+        if passed
+        else (error or "one or more mandatory soak invariants did not pass"),
+        "partial": False,
+        "flaky": False,
+        "skipped": False,
+        "refused": False,
+        "failureCount": failure_count,
+        "startedAt": started_at,
+        "endedAt": ended_at,
+        "elapsedSeconds": elapsed,
+        "failureCounters": failures,
+        "checkpoints": checkpoints,
+        "restartProofs": soak.restart_proofs,
+        "bounds": bounds.document(),
+        "resourceHealth": soak.resource_health,
+        "topology": soak.topology,
+        "invariants": invariants,
+    }
+
+
+def parse_args(arguments: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the non-bypassable 30-minute v0.1.5 dual-WebSocket restart soak.",
+    )
+    return parser.parse_args(arguments)
+
+
+async def run_gate(args: argparse.Namespace) -> tuple[Path, bool]:
+    if os.environ.get("OCULAR_LAB") != "1":
+        raise SoakFailure("refusing to run outside the isolated ocular lab")
+    lab_root_raw = os.environ.get("NEXUS_LAB_ROOT")
+    nexus_home_raw = os.environ.get("NEXUS_HOME")
+    run_id = os.environ.get("NEXUS_V015_RUN_ID")
+    password = os.environ.get("NEXUS_V015_SOAK_PASSWORD")
+    if not all((lab_root_raw, nexus_home_raw, run_id, password)):
+        raise SoakFailure(
+            "NEXUS_LAB_ROOT, NEXUS_HOME, NEXUS_V015_RUN_ID, and "
+            "NEXUS_V015_SOAK_PASSWORD are required"
+        )
+    if not RUN_ID.fullmatch(str(run_id)):
+        raise SoakFailure("NEXUS_V015_RUN_ID is not a safe canonical run ID")
+    lab_root = absolute_without_resolving(Path(str(lab_root_raw)))
+    nexus_home = absolute_without_resolving(Path(str(nexus_home_raw)))
+    allowed = absolute_without_resolving(LAB_ROOT_PREFIX)
+    if lab_root != allowed:
+        raise SoakFailure(f"refusing non-lab NEXUS_LAB_ROOT: {lab_root}")
+    if nexus_home != lab_root / "nexus":
+        raise SoakFailure("NEXUS_HOME must be the canonical lab Nexus home")
+    root_fd = open_no_symlink(lab_root, directory=True)
+    os.close(root_fd)
+    home_fd = open_no_symlink(nexus_home, directory=True)
+    os.close(home_fd)
+    if not os.access(LAB_PROCESS, os.X_OK):
+        raise SoakFailure(f"approved lab-process hook is not executable: {LAB_PROCESS}")
+    for command in ("ps", "ss"):
+        if shutil.which(command) is None:
+            raise SoakFailure(f"required diagnostic command is unavailable: {command}")
+
+    evidence_root = lab_root / "evidence" / str(run_id)
+    candidate = validate_candidate(evidence_root, lab_root)
+    if candidate.run_id != run_id:
+        raise SoakFailure("packed candidate run ID does not match NEXUS_V015_RUN_ID")
+    authority_checkpoint = validate_canonical_candidate_authority(candidate, lab_root)
+    override_contract = {
+        "NEXUS_V015_PACKED_PREFIX": str(candidate.packed_prefix),
+        "NEXUS_V015_NEXUS_BIN": str(NEXUS_LAUNCHER),
+        "NEXUS_V015_LAB_PROCESS": str(LAB_PROCESS),
+        "NEXUS_V015_GATEWAY_URL": GATEWAY_URL,
+    }
+    for key, expected in override_contract.items():
+        observed = os.environ.get(key)
+        if observed is not None and observed != expected:
+            raise SoakFailure(f"refusing non-canonical release override {key}={observed!r}")
+    agents = load_agents(
+        lab_root,
+        candidate.run_id,
+        sha256_file(candidate.readiness_ledger),
+    )
+    evidence = Evidence(evidence_root, candidate)
+    http = HttpClient(GATEWAY_URL, evidence)
+    soak = Soak(
+        candidate,
+        evidence,
+        http,
+        str(NEXUS_LAUNCHER),
+        str(LAB_PROCESS),
+        lab_root,
+        agents,
+    )
+    started_at = time.time()
+    ended_at = started_at
+    bounds = ResourceBounds([0], [0])
+    error: str | None = None
+    try:
+        await soak.setup(password)
+        started_at, ended_at, bounds = await soak.run()
+    except BaseException as failure:
+        error = str(failure)
+        ended_at = time.time()
+        evidence.log("soak.failure", error=error)
+        if not soak.memory:
+            soak.memory.append(0)
+        if not soak.disk:
+            soak.disk.append(0)
+        bounds = ResourceBounds(soak.memory, soak.disk)
+    finally:
+        await soak.close()
+    try:
+        soak.topology = capture_final_artifacts(
+            evidence,
+            str(NEXUS_LAUNCHER),
+            lab_root,
+        )
+        soak.diagnostics_healthy = True
+    except BaseException as failure:
+        diagnostic_error = str(failure)
+        error = f"{error}; {diagnostic_error}" if error else diagnostic_error
+        ended_at = time.time()
+        evidence.log("soak.diagnostics.failure", error=diagnostic_error)
+    try:
+        final_authority_checkpoint = validate_canonical_candidate_authority(candidate, lab_root)
+        if final_authority_checkpoint != authority_checkpoint:
+            raise SoakFailure("canonical candidate authority changed during F3")
+        evidence.log(
+            "soak.candidate.final",
+            runId=final_authority_checkpoint.run_id,
+            candidateDigest=final_authority_checkpoint.candidate_digest,
+            readinessSha256=final_authority_checkpoint.readiness_sha256,
+            runnerSha256=final_authority_checkpoint.runner_sha256,
+        )
+    except BaseException as failure:
+        authority_error = str(failure)
+        error = f"{error}; {authority_error}" if error else authority_error
+        ended_at = time.time()
+        evidence.log("soak.candidate.failure", error=authority_error)
+    evidence.jsonl("metrics", {
+        "runId": candidate.run_id,
+        "candidateDigest": candidate.digest,
+        "trafficRounds": soak.traffic_rounds,
+        "sessionRounds": soak.session_rounds,
+        "acceptedMessages": len(soak.ledger.expected_messages),
+        "acceptedSessionInputs": len(soak.ledger.session_accepted),
+        "developerReconnects": soak.developer.reconnects,
+        "agentSessionReconnects": {
+            kind: session.reconnects
+            for kind, session in soak.sessions.items()
+        },
+        "agentSessionCursors": {
+            kind: session.last_numeric_cursor
+            for kind, session in soak.sessions.items()
+        },
+        "daemonReconnects": soak.restarts["daemon"],
+        "gatewayReconnects": soak.restarts["gateway"],
+        "failureCounters": soak.ledger.failure,
+    })
+    document = result_document(candidate, soak, started_at, ended_at, bounds, error)
+    result = evidence.publish(document)
+    return result, document["status"] == "PASS"
+
+
+def main(arguments: list[str]) -> int:
+    args = parse_args(arguments)
+    try:
+        result, passed = asyncio.run(run_gate(args))
+    except SoakFailure as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print(result)
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

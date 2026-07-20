@@ -1,0 +1,4496 @@
+#!/usr/bin/env python3
+"""Run the packed v0.1.5 real-network WebSocket acceptance matrix.
+
+This is a release-evidence producer, not a unit-test fixture.  It refuses to
+run outside the isolated ocular lab, binds itself to the canonical packed
+manifest/readiness/live-agent ledgers, drives the shipped Gateway over loopback
+HTTP/WebSocket endpoints, and publishes validator-compatible results without
+replacing prior evidence.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+from collections import defaultdict
+import ctypes
+from dataclasses import dataclass, field
+import errno
+import hashlib
+import json
+import os
+from pathlib import Path
+from pathlib import PurePosixPath
+import re
+import runpy
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from typing import Any, Iterable
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlencode, urlparse
+from urllib.request import Request, urlopen
+
+
+VERSION = "0.1.5"
+SCRIPT_DIR = Path(__file__).resolve().parent
+WS_ACCEPTANCE_BIN = Path("/tmp/nexus-lab-bin/nexus-v015-ws-acceptance")
+SOAK_CORE = Path("/tmp/nexus-lab-bin/nexus-v015-ws-soak")
+WEBCONSOLE_ACCEPTANCE_BIN = Path(
+    "/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance"
+)
+WEBCONSOLE_EVIDENCE_VERIFIER_BIN = Path(
+    "/tmp/nexus-lab-bin/nexus-v015-webconsole-evidence-verify"
+)
+EVIDENCE_VALIDATOR_BIN = Path("/tmp/nexus-lab-bin/nexus-v015-evidence-validate")
+NEXUS_BIN = Path("/tmp/nexus-lab-bin/nexus")
+GATEWAY_BIN = Path("/tmp/nexus-lab-bin/nexus-gateway")
+WEBUI_BIN = Path("/tmp/nexus-lab-bin/nexus-webui")
+LAB_PROCESS = Path("/tmp/nexus-lab-bin/lab-process")
+LAB_AGENT = Path("/tmp/nexus-lab-bin/lab-agent")
+LENS_APP_LINK = Path("/tmp/nexus-lab-bin/lens-app")
+GATEWAY_URL = "http://127.0.0.1:4100"
+GATEWAY_DISCOVERY_URL = "http://127.0.0.1:4101"
+SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+SHA256 = re.compile(r"[0-9a-f]{64}")
+PACKED_PREFIX = re.compile(r"/tmp/nexus-lab-install\.[A-Za-z0-9]+")
+SEMVER_LINE = re.compile(r"(?:^|\s)[vV]?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?(?:\s|$)")
+PACKAGE_NAMES = (
+    "@egregore/nexus",
+    "@egregore/nexus-cli",
+    "@egregore/nexus-gateway",
+)
+RESULT_SPECS = {
+    "B1": ("identityMatrix", "renameRegression", "agentIdResolution"),
+    "B2": ("restartTimeline", "rosterComparison", "humanRebind"),
+    "C1": ("csrfMatrix", "packedHttp", "packedWebsocket"),
+    "C2": ("upgrades", "frames", "cursorCheckpoints", "backpressure", "noPolling"),
+    "C3": ("sessionFrames", "correlation", "reconnect", "backpressure", "laneIsolation"),
+    "C4": ("restSnapshot", "websocketDeltas", "recovery"),
+    "D1": ("packedInventory", "installLog", "foreignCwd", "shutdown"),
+    "F1": ("codex", "claude", "deliveryMatrix"),
+}
+RESULT_DIRECTORIES = {
+    "B1": "B1-stable-identity",
+    "B2": "B2-restart-reconciliation",
+    "C1": "C1-browser-mutation-security",
+    "C2": "C2-developer-event-websocket",
+    "C3": "C3-agent-session-websocket",
+    "C4": "C4-rest-websocket-agreement",
+    "D1": "D1-clean-packed-install",
+    "F1": "F1-live-codex-claude",
+}
+RESTART_PLAN = ("gateway", "gateway", "daemon", "daemon")
+READINESS_BINDING_HASHES = {
+    "nexusResolved": "nexusSha256",
+    "gatewayResolved": "gatewaySha256",
+    "webuiResolved": "webuiSha256",
+    "labProcess": "labProcessSha256",
+    "labAgent": "labAgentSha256",
+    "labFixture": "labFixtureSha256",
+    "nexusTarball": "nexusTarballSha256",
+    "cliTarball": "cliTarballSha256",
+    "gatewayTarball": "gatewayTarballSha256",
+}
+
+
+class AcceptanceFailure(RuntimeError):
+    pass
+
+
+def canonical_json(value: object) -> bytes:
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise AcceptanceFailure(f"evidence is not canonical JSON: {error}") from error
+
+
+def pretty_json(value: object) -> bytes:
+    return canonical_json(value) + b"\n"
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(128 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        raise AcceptanceFailure(f"cannot hash {path}: {error}") from error
+    return digest.hexdigest()
+
+
+def absolute(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def inside(path: Path, root: Path) -> bool:
+    try:
+        return os.path.commonpath((str(absolute(path)), str(absolute(root)))) == str(absolute(root))
+    except ValueError:
+        return False
+
+
+def reject_symlink_ancestry(path: Path, stop: Path) -> None:
+    path = absolute(path)
+    stop = absolute(stop)
+    if not inside(path, stop):
+        raise AcceptanceFailure(f"path escapes NEXUS_LAB_ROOT: {path}")
+    current = path
+    pending: list[Path] = []
+    while True:
+        pending.append(current)
+        if current == stop:
+            break
+        if current.parent == current:
+            raise AcceptanceFailure(f"path escapes NEXUS_LAB_ROOT: {path}")
+        current = current.parent
+    for item in reversed(pending):
+        try:
+            info = os.lstat(item)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise AcceptanceFailure(f"cannot inspect evidence ancestry {item}: {error}") from error
+        if stat.S_ISLNK(info.st_mode):
+            raise AcceptanceFailure(f"symlink ancestry is forbidden: {item}")
+        if item != path and not stat.S_ISDIR(info.st_mode):
+            raise AcceptanceFailure(f"evidence ancestor is not a directory: {item}")
+
+
+def checked_directory(path: Path, lab_root: Path, *, create: bool) -> Path:
+    path = absolute(path)
+    lab_root = absolute(lab_root)
+    reject_symlink_ancestry(path, lab_root)
+    if create:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise AcceptanceFailure(f"cannot create evidence directory {path}: {error}") from error
+        reject_symlink_ancestry(path, lab_root)
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        raise AcceptanceFailure(f"cannot inspect evidence directory {path}: {error}") from error
+    if not stat.S_ISDIR(info.st_mode) or info.st_nlink < 2:
+        raise AcceptanceFailure(f"evidence path is not a directory: {path}")
+    return path
+
+
+def require_canonical_evidence_root(evidence_dir: Path, lab_root: Path) -> Path:
+    """Require the one release-evidence root shared by every lab producer."""
+    evidence_dir = absolute(evidence_dir)
+    lab_root = absolute(lab_root)
+    expected = lab_root / "evidence"
+    if evidence_dir != expected:
+        raise AcceptanceFailure(
+            f"release evidence root must be exactly {expected}, got {evidence_dir}"
+        )
+    return checked_directory(evidence_dir, lab_root, create=False)
+
+
+def checked_file(
+    path: Path,
+    root: Path,
+    label: str,
+    *,
+    expected_uid: int | None = None,
+    expected_mode: int | None = None,
+    include_info: bool = False,
+) -> bytes | tuple[bytes, os.stat_result]:
+    path = absolute(path)
+    root = absolute(root)
+    reject_symlink_ancestry(path, root)
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(path, flags)
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise AcceptanceFailure(f"{label} must be one regular single-link file: {path}")
+        owner = os.geteuid() if expected_uid is None else expected_uid
+        if info.st_uid != owner:
+            raise AcceptanceFailure(
+                f"{label} owner mismatch: expected uid {owner}, got {info.st_uid}"
+            )
+        if expected_mode is not None and stat.S_IMODE(info.st_mode) != expected_mode:
+            raise AcceptanceFailure(
+                f"{label} mode mismatch: expected {expected_mode:04o}, "
+                f"got {stat.S_IMODE(info.st_mode):04o}"
+            )
+        if stat.S_IMODE(info.st_mode) & 0o022:
+            raise AcceptanceFailure(
+                f"{label} mode is mutable by group or other users: "
+                f"{stat.S_IMODE(info.st_mode):04o}"
+            )
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 128 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        after = os.fstat(fd)
+    except OSError as error:
+        raise AcceptanceFailure(f"cannot read {label} {path}: {error}") from error
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if (
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        raise AcceptanceFailure(f"{label} changed while being read: {path}")
+    if not data:
+        raise AcceptanceFailure(f"{label} is empty: {path}")
+    if include_info:
+        return data, after
+    return data
+
+
+def load_json(path: Path, root: Path, label: str) -> dict[str, Any]:
+    raw = checked_file(path, root, label)
+    try:
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonfinite,
+        )
+    except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise AcceptanceFailure(f"{label} is not strict JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise AcceptanceFailure(f"{label} must be a JSON object")
+    return value
+
+
+def validate_candidate_commit_seal(
+    run_root: Path,
+    manifest: dict[str, Any],
+    run_id: str,
+) -> None:
+    run_root = absolute(run_root)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        root_fd = os.open(run_root, flags)
+    except OSError as error:
+        raise AcceptanceFailure(f"cannot open sealed candidate root: {error}") from error
+    try:
+        root_info = os.fstat(root_fd)
+    finally:
+        os.close(root_fd)
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != os.geteuid()
+        or stat.S_IMODE(root_info.st_mode) != 0o700
+    ):
+        raise AcceptanceFailure("sealed candidate root ownership or mode is invalid")
+
+    native = manifest.get("native")
+    packages = manifest.get("packages")
+    expected_package_paths = (
+        "candidate/npm/nexus.tgz",
+        "candidate/npm/nexus-cli.tgz",
+        "candidate/npm/nexus-gateway.tgz",
+    )
+    if not isinstance(native, dict) or native.get("path") != "candidate/native/nexus":
+        raise AcceptanceFailure("sealed candidate native path is not canonical")
+    if not isinstance(packages, list) or len(packages) != 3:
+        raise AcceptanceFailure("sealed candidate package inventory is invalid")
+    if tuple(
+        row.get("tarball", {}).get("path") if isinstance(row, dict) else None
+        for row in packages
+    ) != expected_package_paths:
+        raise AcceptanceFailure("sealed candidate package paths are not canonical")
+
+    payload_paths = (
+        Path("manifest.json"),
+        Path("candidate/native/nexus"),
+        *(Path(value) for value in expected_package_paths),
+    )
+    payload: dict[Path, tuple[bytes, os.stat_result]] = {}
+    for relative in payload_paths:
+        result = checked_file(
+            run_root / relative,
+            run_root,
+            f"sealed candidate payload {relative.as_posix()}",
+            expected_mode=0o400 if relative == Path("manifest.json") else None,
+            include_info=True,
+        )
+        assert isinstance(result, tuple)
+        payload[relative] = result
+
+    seal_result = checked_file(
+        run_root / ".candidate-committed",
+        run_root,
+        "candidate commit seal",
+        expected_mode=0o400,
+        include_info=True,
+    )
+    assert isinstance(seal_result, tuple)
+    seal_raw, _seal_info = seal_result
+    try:
+        seal = json.loads(
+            seal_raw.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonfinite,
+        )
+    except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+        raise AcceptanceFailure(f"candidate commit seal is not strict JSON: {error}") from error
+
+    tree = hashlib.sha256()
+    for relative in sorted(payload_paths, key=lambda item: item.as_posix()):
+        raw, info = payload[relative]
+        tree.update(
+            relative.as_posix().encode("utf-8")
+            + b"\0"
+            + str(stat.S_IMODE(info.st_mode)).encode("ascii")
+            + b"\0"
+            + sha256_bytes(raw).encode("ascii")
+            + b"\0"
+        )
+    expected = {
+        "schemaVersion": 1,
+        "runId": run_id,
+        "device": root_info.st_dev,
+        "inode": root_info.st_ino,
+        "manifestSha256": sha256_bytes(payload[Path("manifest.json")][0]),
+        "treeSha256": tree.hexdigest(),
+    }
+    if seal != expected:
+        raise AcceptanceFailure("candidate commit seal does not match the immutable candidate tree")
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def _reject_nonfinite(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def candidate_digest(manifest: dict[str, Any]) -> str:
+    try:
+        ledger = {
+            "mode": manifest["mode"],
+            "sources": manifest["sources"],
+            "nativeSha256": manifest["native"]["sha256"],
+            "packages": [
+                {
+                    "name": row["name"],
+                    "version": row["version"],
+                    "tarballSha256": row["tarball"]["sha256"],
+                }
+                for row in manifest["packages"]
+            ],
+            "imageDigest": manifest["image"]["digest"],
+            "limits": manifest["container"]["limits"],
+            "toolchains": manifest["toolchains"],
+            "environment": manifest["environment"],
+        }
+    except (KeyError, TypeError) as error:
+        raise AcceptanceFailure(f"packed manifest cannot derive candidate identity: {error}") from error
+    return "sha256:" + sha256_bytes(canonical_json(ledger))
+
+
+def validate_manifest_contract(manifest: dict[str, Any], run_id: str) -> None:
+    """Validate the exact canonical v0.1.5 candidate-ledger schema."""
+    expected_fields = {
+        "schemaVersion",
+        "runId",
+        "mode",
+        "sources",
+        "native",
+        "packages",
+        "image",
+        "container",
+        "toolchains",
+        "environment",
+    }
+    if set(manifest) != expected_fields:
+        raise AcceptanceFailure("packed manifest fields do not match the canonical contract")
+    if manifest.get("schemaVersion") != 1 or manifest.get("runId") != run_id:
+        raise AcceptanceFailure("packed manifest schema/runId mismatch")
+    if manifest.get("mode") != "packed":
+        raise AcceptanceFailure("packed manifest mode must be exactly packed")
+
+    source_names = (
+        "nexus",
+        "lens",
+        "egregore",
+        "pactree",
+        "pactreePython",
+        "pactreeFs",
+    )
+    sources = manifest.get("sources")
+    if not isinstance(sources, dict) or set(sources) != set(source_names):
+        raise AcceptanceFailure("packed manifest source set is invalid")
+    revision_pattern = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+    for name in source_names:
+        source = sources[name]
+        if not isinstance(source, dict) or set(source) != {
+            "revision",
+            "dirty",
+            "dirtyPaths",
+        }:
+            raise AcceptanceFailure(f"source {name!r} dirty ledger fields are invalid")
+        revision = source.get("revision")
+        dirty = source.get("dirty")
+        dirty_paths = source.get("dirtyPaths")
+        if not isinstance(revision, str) or revision_pattern.fullmatch(revision) is None:
+            raise AcceptanceFailure(f"source {name!r} revision is invalid")
+        if not isinstance(dirty, bool) or not isinstance(dirty_paths, list):
+            raise AcceptanceFailure(f"source {name!r} dirty ledger is invalid")
+        observed_paths: list[str] = []
+        for entry in dirty_paths:
+            if not isinstance(entry, dict) or set(entry) != {"path", "state", "sha256"}:
+                raise AcceptanceFailure(f"source {name!r} dirty entry is invalid")
+            path = entry.get("path")
+            if not isinstance(path, str) or not path or "\\" in path:
+                raise AcceptanceFailure(f"source {name!r} dirty path is invalid")
+            posix_path = PurePosixPath(path)
+            if posix_path.is_absolute() or any(part in {"", ".", ".."} for part in posix_path.parts):
+                raise AcceptanceFailure(f"source {name!r} dirty path is unsafe")
+            observed_paths.append(path)
+            state_value = entry.get("state")
+            digest_value = entry.get("sha256")
+            if state_value == "present":
+                if not isinstance(digest_value, str) or SHA256.fullmatch(digest_value) is None:
+                    raise AcceptanceFailure(f"source {name!r} dirty path hash is invalid")
+            elif state_value == "deleted":
+                if digest_value is not None:
+                    raise AcceptanceFailure(f"source {name!r} deleted dirty path has a hash")
+            else:
+                raise AcceptanceFailure(f"source {name!r} dirty path state is invalid")
+        if observed_paths != sorted(set(observed_paths)) or dirty is not bool(dirty_paths):
+            raise AcceptanceFailure(f"source {name!r} dirty ledger is not canonical")
+
+    def artifact_record(value: object, label: str) -> None:
+        if not isinstance(value, dict) or set(value) != {"path", "sha256"}:
+            raise AcceptanceFailure(f"{label} artifact record is invalid")
+        relative = value.get("path")
+        digest_value = value.get("sha256")
+        if not isinstance(relative, str) or not relative:
+            raise AcceptanceFailure(f"{label} artifact path is invalid")
+        relative_path = PurePosixPath(relative)
+        if relative_path.is_absolute() or any(
+            part in {"", ".", ".."} for part in relative_path.parts
+        ):
+            raise AcceptanceFailure(f"{label} artifact path is unsafe")
+        if not isinstance(digest_value, str) or SHA256.fullmatch(digest_value) is None:
+            raise AcceptanceFailure(f"{label} artifact hash is invalid")
+
+    artifact_record(manifest.get("native"), "native")
+    packages = manifest.get("packages")
+    if not isinstance(packages, list) or tuple(
+        package.get("name") if isinstance(package, dict) else None for package in packages
+    ) != PACKAGE_NAMES:
+        raise AcceptanceFailure("packed manifest package set/order is invalid")
+    for package in packages:
+        if set(package) != {"name", "version", "tarball"} or package.get("version") != VERSION:
+            raise AcceptanceFailure("packed manifest package record is invalid")
+        artifact_record(package.get("tarball"), f"package {package['name']}")
+
+    validate_image_and_limits(manifest)
+    toolchains = manifest.get("toolchains")
+    if (
+        not isinstance(toolchains, dict)
+        or set(toolchains) != {"nexus", "node", "rustc"}
+        or any(not isinstance(value, str) or not value.strip() for value in toolchains.values())
+        or toolchains.get("nexus") != f"nexus {VERSION}"
+    ):
+        raise AcceptanceFailure("packed manifest toolchain ledger is invalid")
+    environment = manifest.get("environment")
+    if not isinstance(environment, dict) or not environment:
+        raise AcceptanceFailure("packed manifest environment ledger is invalid")
+    sensitive = re.compile(r"(?:TOKEN|KEY|SECRET|PASSWORD|COOKIE|AUTH)", re.IGNORECASE)
+    for key, value in environment.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise AcceptanceFailure("packed manifest environment must be a string map")
+        if sensitive.search(key) and value != "<redacted>":
+            raise AcceptanceFailure(f"packed manifest environment must redact {key!r}")
+
+
+def parse_developer_backpressure(code: int, reason: str) -> int:
+    if code != 1013:
+        raise AcceptanceFailure(f"developer backpressure must close with 1013, got {code}")
+    match = re.fullmatch(r"developer\.backpressure:(\d+)", reason)
+    if match is None:
+        raise AcceptanceFailure(f"developer backpressure cursor is invalid: {reason!r}")
+    return int(match.group(1))
+
+
+def parse_session_backpressure(code: int, reason: str) -> str:
+    if code != 1013:
+        raise AcceptanceFailure(f"session backpressure must close with 1013, got {code}")
+    prefix = "session.bp:"
+    if not reason.startswith(prefix) or not reason[len(prefix):] or len(reason.encode("utf-8")) > 123:
+        raise AcceptanceFailure(f"session backpressure resume cursor is invalid: {reason!r}")
+    return reason[len(prefix):]
+
+
+def harness_version_line(output: str) -> str:
+    rows = [line.rstrip("\r") for line in output.splitlines() if SEMVER_LINE.search(line)]
+    if not rows:
+        raise AcceptanceFailure("harness --version output has no semantic version line")
+    return rows[-1]
+
+
+def retired_polling_occurrences(module_bytes: bytes) -> int:
+    return sum(
+        module_bytes.count(marker)
+        for marker in (
+            b"DEFAULT_DEVELOPER_EVENT_POLL_MS",
+            b"developerEventsSource.since",
+        )
+    )
+
+
+def exact_marker_row(rows: object, sender: str, marker: str) -> dict[str, Any]:
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise AcceptanceFailure("canonical history is not an array of rows")
+    matching = [
+        row
+        for row in rows
+        if row.get("from") == sender and row.get("body") == marker
+    ]
+    if len(matching) != 1:
+        raise AcceptanceFailure(
+            f"canonical history must contain marker exactly once from {sender!r}; got {len(matching)}"
+        )
+    message_id = matching[0].get("messageId")
+    if not isinstance(message_id, str) or not message_id:
+        raise AcceptanceFailure("canonical marker row has no messageId")
+    return matching[0]
+
+
+def require_queue_snapshot(frame: dict[str, Any], session_id: str) -> None:
+    if frame.get("t") != "queue.snapshot":
+        raise AcceptanceFailure("initial agent-session frame is not queue.snapshot")
+    if frame.get("sessionId") != session_id:
+        raise AcceptanceFailure(
+            f"queue.snapshot sessionId mismatch: expected {session_id!r}, "
+            f"got {frame.get('sessionId')!r}"
+        )
+    seq = frame.get("seq")
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+        raise AcceptanceFailure("queue.snapshot has no valid global reconnect seq")
+
+
+def require_exact_roster(rows: object, agents: Iterable[object]) -> None:
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise AcceptanceFailure("exact roster is not an array of member rows")
+    expected = {
+        str(getattr(agent, "agent_id")): agent
+        for agent in agents
+    }
+    by_id: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        agent_id = row.get("agentId", row.get("agent_id"))
+        if not isinstance(agent_id, str) or not agent_id:
+            raise AcceptanceFailure("exact roster row has no stable agentId")
+        if agent_id in by_id:
+            raise AcceptanceFailure(f"exact roster has duplicate agentId {agent_id}")
+        by_id[agent_id] = row
+    if set(by_id) != set(expected):
+        raise AcceptanceFailure(
+            "exact roster differs from live-agent truth: "
+            f"expected={sorted(expected)} observed={sorted(by_id)}"
+        )
+    online_states = {"online", "active", "ready", "idle", "busy", "streaming"}
+    for agent_id, agent in expected.items():
+        row = by_id[agent_id]
+        name = row.get("name")
+        session_id = row.get("sessionId", row.get("session_id"))
+        state = str(row.get("status", row.get("presence", ""))).strip().lower()
+        if name != getattr(agent, "name") or session_id != getattr(agent, "session_id"):
+            raise AcceptanceFailure(f"exact roster identity mismatch for {agent_id}")
+        if state not in online_states:
+            raise AcceptanceFailure(f"exact roster member {agent_id} is not online")
+
+
+def require_queue_agreement(
+    rest_snapshot: dict[str, Any],
+    websocket_snapshot: dict[str, Any],
+    session_id: str,
+) -> None:
+    require_queue_snapshot(websocket_snapshot, session_id)
+    if rest_snapshot.get("sessionId") != session_id:
+        raise AcceptanceFailure("REST queue snapshot sessionId mismatch")
+    websocket_value = {
+        key: value for key, value in websocket_snapshot.items() if key != "t"
+    }
+    if websocket_value != rest_snapshot:
+        raise AcceptanceFailure(
+            "REST and WebSocket queue snapshot disagree: "
+            f"rest={rest_snapshot!r} websocket={websocket_value!r}"
+        )
+
+
+def fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_all(fd: int, data: bytes, label: str) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise AcceptanceFailure(f"short write for {label}")
+        view = view[written:]
+
+
+def rename_noreplace(source: Path, destination: Path) -> None:
+    if source.parent != destination.parent:
+        raise AcceptanceFailure("evidence rename must stay within one directory")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    parent_fd = os.open(source.parent, flags)
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise AcceptanceFailure("renameat2(RENAME_NOREPLACE) is unavailable")
+        result = renameat2(
+            parent_fd,
+            os.fsencode(source.name),
+            parent_fd,
+            os.fsencode(destination.name),
+            1,
+        )
+        if result != 0:
+            code = ctypes.get_errno()
+            if code == errno.EEXIST:
+                raise AcceptanceFailure(
+                    f"refusing to replace existing evidence: {destination}"
+                )
+            raise AcceptanceFailure(
+                f"atomic evidence publication failed for {destination}: {os.strerror(code)}"
+            )
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+class EvidencePublisher:
+    def __init__(self, run_root: Path, run_id: str, digest: str) -> None:
+        self.run_root = absolute(run_root)
+        self.run_id = run_id
+        self.digest = digest
+        self.results = self.run_root / "results"
+        checked_directory(self.run_root, self.run_root, create=False)
+        checked_directory(self.results, self.run_root, create=True)
+
+    def assert_targets_absent(self) -> None:
+        for gate, leaf in RESULT_DIRECTORIES.items():
+            path = self.results / leaf
+            if os.path.lexists(path):
+                raise AcceptanceFailure(f"refusing to replace existing {gate} evidence: {path}")
+
+    def publish(self, gate: str, payloads: dict[str, bytes]) -> Path:
+        names = RESULT_SPECS.get(gate)
+        if names is None:
+            raise AcceptanceFailure(f"unknown acceptance gate: {gate}")
+        if set(payloads) != set(names):
+            raise AcceptanceFailure(f"{gate} artifacts must be exactly {', '.join(names)}")
+        leaf = RESULT_DIRECTORIES[gate]
+        final = self.results / leaf
+        if os.path.lexists(final):
+            raise AcceptanceFailure(f"refusing to replace existing {gate} evidence: {final}")
+        stage = self.results / f".{leaf}.tmp-{os.getpid()}-{time.time_ns()}"
+        try:
+            stage.mkdir(mode=0o700)
+            artifacts: dict[str, dict[str, str]] = {}
+            for name in names:
+                data = payloads[name]
+                if not isinstance(data, bytes) or not data:
+                    raise AcceptanceFailure(f"{gate} artifact {name} is empty")
+                # The canonical validator reserves every ``*.json`` below
+                # ``results/`` for one of its exact result documents.  Evidence
+                # payloads use JSON Lines even when they contain a single row.
+                filename = f"{name}.jsonl"
+                path = stage / filename
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+                try:
+                    write_all(fd, data, f"{gate}:{name}")
+                    os.fchmod(fd, 0o400)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                relative = (Path("results") / leaf / filename).as_posix()
+                artifacts[name] = {"path": relative, "sha256": sha256_bytes(data)}
+            document = {
+                "schemaVersion": 1,
+                "gate": gate,
+                "runId": self.run_id,
+                "candidateDigest": self.digest,
+                "status": "PASS",
+                "error": None,
+                "partial": False,
+                "flaky": False,
+                "skipped": False,
+                "refused": False,
+                "failureCount": 0,
+                "requiredArtifacts": list(names),
+                "artifacts": artifacts,
+            }
+            result_data = pretty_json(document)
+            result_path = stage / "result.json"
+            fd = os.open(result_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
+            try:
+                write_all(fd, result_data, f"{gate}:result")
+                os.fchmod(fd, 0o400)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            stage_fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                os.fchmod(stage_fd, 0o555)
+                os.fsync(stage_fd)
+            finally:
+                os.close(stage_fd)
+            fsync_directory(stage)
+            rename_noreplace(stage, final)
+            return final / "result.json"
+        except BaseException:
+            if stage.exists() and not stage.is_symlink():
+                try:
+                    os.chmod(stage, 0o700)
+                except OSError:
+                    pass
+                shutil.rmtree(stage, ignore_errors=True)
+            raise
+
+
+@dataclass(frozen=True)
+class Candidate:
+    run_id: str
+    digest: str
+    manifest: dict[str, Any]
+    run_root: Path
+    lab_root: Path
+    install_root: Path
+    readiness: dict[str, str] = field(default_factory=dict)
+    d1_evidence: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RuntimeObservation:
+    container_id: str
+    image_digest: str
+    cpu_max: str
+    memory_max: str
+    memory_swap_max: str
+    pids_max: str
+    home: str
+    nexus_home: str
+    install_tree_sha256: str
+    daemon_pid: int
+    daemon_executable: str
+    daemon_executable_sha256: str
+    gateway_pid: int
+    gateway_url: str
+    gateway_listener_owned: bool
+    gateway_argv: tuple[str, ...]
+    gateway_entrypoint: str
+    gateway_entrypoint_sha256: str
+    lens_pid: int
+    lens_renderer_mode: str
+    lens_app: str
+    lens_main: str
+    lens_tree_sha256: str
+    lens_argv: tuple[str, ...]
+    lens_main_argument_bound: bool
+    lens_cwd: str
+    lens_node_env: str
+    lens_vite_dev_server_url_present: bool
+
+
+@dataclass(frozen=True)
+class LiveAgent:
+    kind: str
+    name: str
+    agent_id: str
+    session_id: str
+    executable: Path
+    executable_sha256: str
+    version: str
+    workspace: Path
+
+
+def parse_readiness(path: Path, lab_root: Path) -> dict[str, str]:
+    raw = checked_file(path, lab_root, "candidate readiness ledger")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError as error:
+        raise AcceptanceFailure("candidate readiness ledger is not UTF-8") from error
+    rows: dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or not key or not value or key in rows:
+            raise AcceptanceFailure("candidate readiness ledger is malformed")
+        rows[key] = value
+    return rows
+
+
+def validate_lens_ledger(
+    readiness: dict[str, str],
+    environment: dict[str, Any],
+) -> None:
+    lens_app = readiness.get("lensApp")
+    lens_main = readiness.get("lensMain")
+    lens_tree = readiness.get("lensTreeSha256")
+    if readiness.get("lensRendererMode") != "production":
+        raise AcceptanceFailure("Lens renderer mode is not production")
+    if (
+        not isinstance(lens_app, str)
+        or re.fullmatch(r"/tmp/nexus-lens-app\.[A-Za-z0-9]+", lens_app) is None
+    ):
+        raise AcceptanceFailure("Lens app path is not nonce-scoped")
+    if lens_main != f"{lens_app}/electron/main.cjs":
+        raise AcceptanceFailure("Lens main entrypoint is not app-bound")
+    if not isinstance(lens_tree, str) or SHA256.fullmatch(lens_tree) is None:
+        raise AcceptanceFailure("Lens app tree digest is invalid")
+    expected = {
+        "NEXUS_V015_LENS_RENDERER_MODE": "production",
+        "NEXUS_V015_LENS_APP": lens_app,
+        "NEXUS_V015_LENS_MAIN": lens_main,
+        "NEXUS_V015_LENS_TREE_SHA256": lens_tree,
+    }
+    for key, value in expected.items():
+        if environment.get(key) != value:
+            raise AcceptanceFailure(f"Lens manifest binding {key} mismatch")
+
+
+def validate_runtime_observation(
+    candidate: Candidate,
+    observation: RuntimeObservation,
+) -> None:
+    readiness = candidate.readiness
+    expected_container = readiness.get("containerId")
+    if (
+        not isinstance(expected_container, str)
+        or SHA256.fullmatch(expected_container) is None
+        or not re.fullmatch(r"[0-9a-f]{12,64}", observation.container_id)
+        or not expected_container.startswith(observation.container_id)
+    ):
+        raise AcceptanceFailure("actual container identity disagrees with candidate readiness")
+    expected_image = candidate.manifest.get("image", {}).get("digest")
+    if (
+        observation.image_digest != expected_image
+        or readiness.get("imageDigest") != expected_image
+    ):
+        raise AcceptanceFailure("actual container image binding disagrees with candidate")
+
+    cpu_parts = observation.cpu_max.split()
+    try:
+        quota, period = (int(value) for value in cpu_parts)
+    except (TypeError, ValueError) as error:
+        raise AcceptanceFailure("actual cgroup cpu.max is invalid") from error
+    if len(cpu_parts) != 2 or quota <= 0 or period <= 0 or quota != 6 * period:
+        raise AcceptanceFailure("actual cgroup CPU limit is not exactly 6 CPUs")
+    try:
+        memory_max = int(observation.memory_max)
+        memory_swap_max = int(observation.memory_swap_max)
+        pids_max = int(observation.pids_max)
+    except ValueError as error:
+        raise AcceptanceFailure("actual cgroup memory/PID limits are invalid") from error
+    if memory_max != 8589934592 or memory_swap_max != 0 or pids_max != 1024:
+        raise AcceptanceFailure(
+            "actual cgroup limits are not 8 GiB, zero extra swap, and 1024 PIDs"
+        )
+
+    expected_home = str(candidate.lab_root)
+    expected_nexus_home = str(candidate.lab_root / "nexus")
+    if observation.home != expected_home or observation.nexus_home != expected_nexus_home:
+        raise AcceptanceFailure(
+            "actual HOME/NEXUS_HOME do not point at the isolated lab state"
+        )
+    environment = candidate.manifest.get("environment", {})
+    if environment.get("HOME") not in {None, expected_home}:
+        raise AcceptanceFailure("manifest HOME disagrees with the isolated lab")
+    if environment.get("NEXUS_HOME") not in {None, expected_nexus_home}:
+        raise AcceptanceFailure("manifest NEXUS_HOME disagrees with the isolated lab")
+
+    expected_tree = readiness.get("installTreeSha256")
+    if (
+        not isinstance(expected_tree, str)
+        or SHA256.fullmatch(expected_tree) is None
+        or observation.install_tree_sha256 != expected_tree
+    ):
+        raise AcceptanceFailure("actual packed install dependency closure changed")
+    if observation.daemon_pid <= 0 or observation.gateway_pid <= 0:
+        raise AcceptanceFailure("actual daemon/Gateway process IDs are invalid")
+    if observation.daemon_pid == observation.gateway_pid:
+        raise AcceptanceFailure("actual daemon and Gateway unexpectedly share a process ID")
+    native_hash = candidate.manifest.get("native", {}).get("sha256")
+    readiness_native = readiness.get("nativeResolved")
+    readiness_native_hash = readiness.get("nativeSha256")
+    if (
+        not isinstance(readiness_native, str)
+        or not isinstance(readiness_native_hash, str)
+        or readiness_native_hash != native_hash
+        or observation.daemon_executable_sha256 != readiness_native_hash
+    ):
+        raise AcceptanceFailure("actual daemon executable is not the candidate native binary")
+    if (
+        environment.get("NEXUS_V015_NATIVE_BIN") != readiness_native
+        or environment.get("NEXUS_V015_NATIVE_BIN_SHA256") != readiness_native_hash
+        or observation.daemon_executable != readiness_native
+    ):
+        raise AcceptanceFailure("actual daemon executable path is not candidate-bound")
+
+    if observation.gateway_url != GATEWAY_DISCOVERY_URL:
+        raise AcceptanceFailure("actual Gateway discovery URL is not the isolated listener")
+    if observation.gateway_listener_owned is not True:
+        raise AcceptanceFailure("actual Gateway process does not own its discovery listener")
+    expected_gateway = readiness.get("gatewayResolved")
+    expected_gateway_hash = readiness.get("gatewaySha256")
+    if (
+        observation.gateway_entrypoint != expected_gateway
+        or observation.gateway_entrypoint_sha256 != expected_gateway_hash
+        or expected_gateway not in observation.gateway_argv
+    ):
+        raise AcceptanceFailure("actual Gateway process is not the packed candidate entrypoint")
+    validate_lens_ledger(readiness, environment)
+    if observation.lens_pid <= 0 or observation.lens_pid in {
+        observation.daemon_pid,
+        observation.gateway_pid,
+    }:
+        raise AcceptanceFailure("actual Lens process identity is invalid")
+    if (
+        observation.lens_renderer_mode != readiness.get("lensRendererMode")
+        or observation.lens_app != readiness.get("lensApp")
+        or observation.lens_main != readiness.get("lensMain")
+        or observation.lens_tree_sha256 != readiness.get("lensTreeSha256")
+    ):
+        raise AcceptanceFailure("actual Lens runtime is not the sealed candidate app")
+    if (
+        not observation.lens_argv
+        or observation.lens_main_argument_bound is not True
+        or observation.lens_cwd != observation.lens_app
+        or observation.lens_node_env != "production"
+        or observation.lens_vite_dev_server_url_present is not False
+    ):
+        raise AcceptanceFailure("actual Lens process is not using the production renderer")
+
+
+def _checked_text(path: Path, root: Path, label: str) -> str:
+    raw = checked_file(path, root, label)
+    try:
+        return raw.decode("utf-8").strip()
+    except UnicodeError as error:
+        raise AcceptanceFailure(f"{label} is not UTF-8") from error
+
+
+def _positive_pid(value: object, label: str) -> int:
+    if isinstance(value, bool):
+        raise AcceptanceFailure(f"{label} is not a positive process ID")
+    try:
+        pid = int(value)
+    except (TypeError, ValueError) as error:
+        raise AcceptanceFailure(f"{label} is not a positive process ID") from error
+    if pid <= 0:
+        raise AcceptanceFailure(f"{label} is not a positive process ID")
+    try:
+        os.kill(pid, 0)
+    except OSError as error:
+        raise AcceptanceFailure(f"{label} process is not live: {error}") from error
+    return pid
+
+
+def _process_executable(pid: int, label: str) -> Path:
+    try:
+        target = os.readlink(Path("/proc") / str(pid) / "exe")
+    except OSError as error:
+        raise AcceptanceFailure(f"cannot inspect actual {label} executable: {error}") from error
+    if target.endswith(" (deleted)"):
+        raise AcceptanceFailure(f"actual {label} executable has been deleted")
+    path = absolute(Path(target))
+    if not path.is_absolute():
+        raise AcceptanceFailure(f"actual {label} executable is not absolute")
+    return path
+
+
+def _process_argv(pid: int, label: str) -> tuple[str, ...]:
+    raw = checked_file(
+        Path("/proc") / str(pid) / "cmdline",
+        Path("/"),
+        f"actual {label} command line",
+    )
+    try:
+        rows = tuple(part.decode("utf-8") for part in raw.split(b"\0") if part)
+    except UnicodeError as error:
+        raise AcceptanceFailure(f"actual {label} command line is not UTF-8") from error
+    if not rows:
+        raise AcceptanceFailure(f"actual {label} command line is empty")
+    return rows
+
+
+def _process_cwd(pid: int, label: str) -> Path:
+    try:
+        target = os.readlink(Path("/proc") / str(pid) / "cwd")
+    except OSError as error:
+        raise AcceptanceFailure(f"cannot inspect actual {label} cwd: {error}") from error
+    if target.endswith(" (deleted)"):
+        raise AcceptanceFailure(f"actual {label} cwd has been deleted")
+    return absolute(Path(target))
+
+
+def _process_environment(pid: int, label: str) -> dict[str, str]:
+    raw = checked_file(
+        Path("/proc") / str(pid) / "environ",
+        Path("/"),
+        f"actual {label} environment",
+    )
+    result: dict[str, str] = {}
+    try:
+        rows = [part.decode("utf-8") for part in raw.split(b"\0") if part]
+    except UnicodeError as error:
+        raise AcceptanceFailure(f"actual {label} environment is not UTF-8") from error
+    for row in rows:
+        key, separator, value = row.partition("=")
+        if not separator or not key or key in result:
+            raise AcceptanceFailure(f"actual {label} environment is malformed")
+        result[key] = value
+    return result
+
+
+def _listener_inodes(port: int) -> set[str]:
+    result: set[str] = set()
+    for path in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+        text = _checked_text(path, Path("/"), f"kernel TCP listener table {path.name}")
+        for line in text.splitlines()[1:]:
+            fields = line.split()
+            if len(fields) < 10 or fields[3] != "0A":
+                continue
+            _address, separator, port_hex = fields[1].rpartition(":")
+            if not separator:
+                continue
+            try:
+                observed_port = int(port_hex, 16)
+            except ValueError:
+                continue
+            if observed_port == port:
+                result.add(fields[9])
+    return result
+
+
+def _process_owns_listener(pid: int, port: int) -> bool:
+    inodes = _listener_inodes(port)
+    if not inodes:
+        return False
+    fd_root = Path("/proc") / str(pid) / "fd"
+    try:
+        entries = list(os.scandir(fd_root))
+    except OSError as error:
+        raise AcceptanceFailure(f"cannot inspect Gateway listener ownership: {error}") from error
+    for entry in entries:
+        try:
+            target = os.readlink(entry.path)
+        except OSError:
+            continue
+        match = re.fullmatch(r"socket:\[(\d+)\]", target)
+        if match is not None and match.group(1) in inodes:
+            return True
+    return False
+
+
+def observe_runtime(candidate: Candidate) -> RuntimeObservation:
+    """Capture actual container and process authority without mutating runtime."""
+    lab_root = candidate.lab_root
+    nexus_home = lab_root / "nexus"
+    container_id = _checked_text(Path("/etc/hostname"), Path("/"), "container hostname")
+    cpu_max = _checked_text(Path("/sys/fs/cgroup/cpu.max"), Path("/"), "cgroup cpu.max")
+    memory_max = _checked_text(
+        Path("/sys/fs/cgroup/memory.max"), Path("/"), "cgroup memory.max"
+    )
+    memory_swap_max = _checked_text(
+        Path("/sys/fs/cgroup/memory.swap.max"),
+        Path("/"),
+        "cgroup memory.swap.max",
+    )
+    pids_max = _checked_text(Path("/sys/fs/cgroup/pids.max"), Path("/"), "cgroup pids.max")
+    daemon_pid = _positive_pid(
+        _checked_text(nexus_home / "daemon.pid", lab_root, "daemon pid"),
+        "daemon",
+    )
+    gateway = load_json(nexus_home / "gateway.json", lab_root, "Gateway discovery")
+    gateway_pid = _positive_pid(gateway.get("pid"), "Gateway")
+    lens_pid = _positive_pid(
+        _checked_text(lab_root / "lab" / "lens.pid", lab_root, "Lens pid"),
+        "Lens",
+    )
+    gateway_url = gateway.get("url")
+    if not isinstance(gateway_url, str):
+        raise AcceptanceFailure("Gateway discovery has no URL")
+    parsed_gateway = urlparse(gateway_url)
+    if parsed_gateway.scheme != "http" or parsed_gateway.hostname != "127.0.0.1":
+        raise AcceptanceFailure("Gateway discovery URL is not loopback HTTP")
+    gateway_port = parsed_gateway.port
+    if gateway_port is None:
+        raise AcceptanceFailure("Gateway discovery URL has no port")
+    daemon_executable = _process_executable(daemon_pid, "daemon")
+    daemon_bytes = checked_file(
+        daemon_executable,
+        candidate.install_root,
+        "actual daemon executable",
+    )
+    gateway_argv = _process_argv(gateway_pid, "Gateway")
+    expected_gateway = Path(candidate.readiness.get("gatewayResolved", ""))
+    if str(expected_gateway) not in gateway_argv:
+        raise AcceptanceFailure("actual Gateway command line omits the packed entrypoint")
+    gateway_bytes = checked_file(
+        expected_gateway,
+        candidate.install_root,
+        "actual Gateway entrypoint",
+    )
+    lens_app = absolute(Path(candidate.readiness.get("lensApp", "")))
+    lens_main = absolute(Path(candidate.readiness.get("lensMain", "")))
+    lens_argv = _process_argv(lens_pid, "Lens")
+    lens_main_argument_bound = False
+    for argument in lens_argv:
+        path = Path(argument)
+        if not path.is_absolute():
+            continue
+        try:
+            if absolute(path.resolve(strict=True)) == lens_main:
+                lens_main_argument_bound = True
+                break
+        except OSError:
+            continue
+    lens_environment = _process_environment(lens_pid, "Lens")
+    observation = RuntimeObservation(
+        container_id=container_id,
+        image_digest=candidate.readiness.get("imageDigest", ""),
+        cpu_max=cpu_max,
+        memory_max=memory_max,
+        memory_swap_max=memory_swap_max,
+        pids_max=pids_max,
+        home=os.environ.get("HOME", ""),
+        nexus_home=os.environ.get("NEXUS_HOME", ""),
+        install_tree_sha256=install_tree_digest(candidate.install_root),
+        daemon_pid=daemon_pid,
+        daemon_executable=str(daemon_executable),
+        daemon_executable_sha256=sha256_bytes(daemon_bytes),
+        gateway_pid=gateway_pid,
+        gateway_url=gateway_url,
+        gateway_listener_owned=_process_owns_listener(gateway_pid, gateway_port),
+        gateway_argv=gateway_argv,
+        gateway_entrypoint=str(expected_gateway),
+        gateway_entrypoint_sha256=sha256_bytes(gateway_bytes),
+        lens_pid=lens_pid,
+        lens_renderer_mode=candidate.readiness.get("lensRendererMode", ""),
+        lens_app=str(lens_app),
+        lens_main=str(lens_main),
+        lens_tree_sha256=lens_tree_digest(lens_app),
+        lens_argv=lens_argv,
+        lens_main_argument_bound=lens_main_argument_bound,
+        lens_cwd=str(_process_cwd(lens_pid, "Lens")),
+        lens_node_env=lens_environment.get("NODE_ENV", ""),
+        lens_vite_dev_server_url_present="VITE_DEV_SERVER_URL" in lens_environment,
+    )
+    validate_runtime_observation(candidate, observation)
+    return observation
+
+
+def require_bound_file(path: Path, expected: object, label: str, root: Path) -> None:
+    if not isinstance(expected, str) or SHA256.fullmatch(expected) is None:
+        raise AcceptanceFailure(f"{label} expected hash is invalid")
+    raw = checked_file(path, root, label)
+    actual = sha256_bytes(raw)
+    if actual != expected:
+        raise AcceptanceFailure(f"{label} hash mismatch: expected {expected}, got {actual}")
+
+
+def validate_image_and_limits(manifest: dict[str, Any]) -> None:
+    image = manifest.get("image")
+    if (
+        not isinstance(image, dict)
+        or set(image) != {"digest"}
+        or not isinstance(image.get("digest"), str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", image["digest"]) is None
+    ):
+        raise AcceptanceFailure("packed manifest image digest is invalid")
+    if manifest.get("container", {}).get("limits") != {
+        "cpus": 6,
+        "memoryBytes": 8589934592,
+        "pids": 1024,
+    }:
+        raise AcceptanceFailure("packed manifest has the wrong 6 CPU / 8 GiB / 1024 PID limits")
+
+
+def packed_install_nonce(install_root: Path) -> str:
+    prefix = "nexus-lab-install."
+    if install_root.parent != Path("/tmp") or not install_root.name.startswith(prefix):
+        raise AcceptanceFailure("packed install prefix has no canonical nonce")
+    nonce = install_root.name[len(prefix):]
+    if not nonce or not nonce.isalnum():
+        raise AcceptanceFailure("packed install nonce is invalid")
+    return nonce
+
+
+def validate_launcher_binding(
+    link: Path,
+    expected_target: str,
+    expected_resolved: str,
+    expected_sha256: str,
+    install_root: Path,
+    label: str,
+) -> None:
+    try:
+        info = os.lstat(link)
+        if not stat.S_ISLNK(info.st_mode):
+            raise AcceptanceFailure(f"{label} is not a symlink")
+        observed_target = os.readlink(link)
+    except OSError as error:
+        raise AcceptanceFailure(f"cannot inspect {label}: {error}") from error
+    if observed_target != expected_target:
+        raise AcceptanceFailure(
+            f"{label} target mismatch: expected {expected_target!r}, got {observed_target!r}"
+        )
+    try:
+        observed_resolved = Path(link).resolve(strict=True)
+        expected_resolved_path = Path(expected_resolved).resolve(strict=True)
+    except OSError as error:
+        raise AcceptanceFailure(f"cannot resolve {label}: {error}") from error
+    if observed_resolved != expected_resolved_path:
+        raise AcceptanceFailure(f"{label} resolved target mismatch")
+    if not inside(observed_resolved, install_root):
+        raise AcceptanceFailure(f"{label} resolves outside the packed install")
+    require_bound_file(observed_resolved, expected_sha256, label, install_root)
+
+
+def safe_package_link(relative: PurePosixPath, target: str, label: str) -> None:
+    target_path = PurePosixPath(target)
+    if target_path.is_absolute():
+        raise AcceptanceFailure(f"{label} symlink target is absolute")
+    parts = list(relative.parent.parts)
+    for component in target_path.parts:
+        if component in {"", "."}:
+            continue
+        if component == "..":
+            if not parts:
+                raise AcceptanceFailure(f"{label} symlink target escapes its package")
+            parts.pop()
+        else:
+            parts.append(component)
+
+
+def tar_package_inventory(tarball: Path, label: str) -> dict[str, dict[str, object]]:
+    inventory: dict[str, dict[str, object]] = {}
+    try:
+        with tarfile.open(tarball, "r:gz") as archive:
+            for member in archive.getmembers():
+                path = PurePosixPath(member.name)
+                if path.is_absolute() or ".." in path.parts or not path.parts:
+                    raise AcceptanceFailure(f"{label} tarball contains an unsafe path")
+                if path.parts[0] != "package":
+                    raise AcceptanceFailure(f"{label} tarball contains a file outside package/")
+                relative = PurePosixPath(*path.parts[1:])
+                if not relative.parts or member.isdir():
+                    continue
+                key = relative.as_posix()
+                if key in inventory:
+                    raise AcceptanceFailure(f"{label} tarball contains duplicate entry: {key}")
+                if member.isfile():
+                    stream = archive.extractfile(member)
+                    if stream is None:
+                        raise AcceptanceFailure(f"{label} tarball entry cannot be read: {key}")
+                    inventory[key] = {
+                        "kind": "file",
+                        "sha256": sha256_bytes(stream.read()),
+                        "executable": bool(member.mode & 0o111),
+                    }
+                elif member.issym():
+                    safe_package_link(relative, member.linkname, f"{label}:{key}")
+                    inventory[key] = {"kind": "symlink", "target": member.linkname}
+                else:
+                    raise AcceptanceFailure(
+                        f"{label} tarball contains unsupported runtime entry: {key}"
+                    )
+    except (OSError, tarfile.TarError) as error:
+        raise AcceptanceFailure(f"cannot inspect {label} tarball: {error}") from error
+    return inventory
+
+
+def installed_package_inventory(root: Path, label: str) -> dict[str, dict[str, object]]:
+    inventory: dict[str, dict[str, object]] = {}
+
+    def visit(directory: Path, relative: PurePosixPath) -> None:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as error:
+            raise AcceptanceFailure(f"cannot inspect installed {label}: {error}") from error
+        for entry in entries:
+            child_relative = relative / entry.name
+            if not relative.parts and entry.name == "node_modules":
+                if entry.is_symlink():
+                    raise AcceptanceFailure(f"installed {label} node_modules is a symlink")
+                continue
+            key = child_relative.as_posix()
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise AcceptanceFailure(f"cannot stat installed {label}:{key}: {error}") from error
+            if stat.S_ISLNK(info.st_mode):
+                try:
+                    target = os.readlink(entry.path)
+                except OSError as error:
+                    raise AcceptanceFailure(
+                        f"cannot read installed {label}:{key} symlink: {error}"
+                    ) from error
+                safe_package_link(child_relative, target, f"installed {label}:{key}")
+                inventory[key] = {"kind": "symlink", "target": target}
+            elif stat.S_ISREG(info.st_mode):
+                if info.st_nlink != 1:
+                    raise AcceptanceFailure(f"installed {label}:{key} is hardlinked")
+                try:
+                    raw = Path(entry.path).read_bytes()
+                except OSError as error:
+                    raise AcceptanceFailure(f"cannot read installed {label}:{key}: {error}") from error
+                inventory[key] = {
+                    "kind": "file",
+                    "sha256": sha256_bytes(raw),
+                    "executable": bool(info.st_mode & 0o111),
+                }
+            elif stat.S_ISDIR(info.st_mode):
+                visit(Path(entry.path), child_relative)
+            else:
+                raise AcceptanceFailure(f"installed {label} has unsupported entry: {key}")
+
+    try:
+        root_info = os.lstat(root)
+    except OSError as error:
+        raise AcceptanceFailure(f"installed {label} root is unavailable: {error}") from error
+    if not stat.S_ISDIR(root_info.st_mode):
+        raise AcceptanceFailure(f"installed {label} root is not a directory")
+    visit(root, PurePosixPath())
+    return inventory
+
+
+def full_install_inventory(root: Path) -> dict[str, dict[str, object]]:
+    """Inventory the complete packed prefix, including dependency closure."""
+    root = absolute(root)
+    try:
+        root_info = os.lstat(root)
+    except OSError as error:
+        raise AcceptanceFailure(f"packed install root is unavailable: {error}") from error
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        raise AcceptanceFailure("packed install root is not a real directory")
+
+    inventory: dict[str, dict[str, object]] = {}
+
+    def visit(directory: Path, relative: PurePosixPath) -> None:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as error:
+            raise AcceptanceFailure(f"cannot inspect packed install closure: {error}") from error
+        for entry in entries:
+            child_relative = relative / entry.name
+            key = child_relative.as_posix()
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise AcceptanceFailure(f"cannot inspect packed install entry {key}: {error}") from error
+            if stat.S_ISLNK(info.st_mode):
+                try:
+                    target = os.readlink(entry.path)
+                except OSError as error:
+                    raise AcceptanceFailure(
+                        f"cannot read packed install symlink {key}: {error}"
+                    ) from error
+                target_path = Path(target)
+                if target_path.is_absolute():
+                    resolved = absolute(target_path)
+                else:
+                    resolved = absolute(Path(entry.path).parent / target_path)
+                if not inside(resolved, root):
+                    raise AcceptanceFailure(f"packed install symlink escapes prefix: {key}")
+                inventory[key] = {
+                    "kind": "symlink",
+                    "target": target,
+                    "mode": stat.S_IMODE(info.st_mode),
+                }
+            elif stat.S_ISDIR(info.st_mode):
+                inventory[key] = {
+                    "kind": "directory",
+                    "mode": stat.S_IMODE(info.st_mode),
+                }
+                visit(Path(entry.path), child_relative)
+            elif stat.S_ISREG(info.st_mode):
+                raw = checked_file(Path(entry.path), root, f"packed install entry {key}")
+                inventory[key] = {
+                    "kind": "file",
+                    "sha256": sha256_bytes(raw),
+                    "size": len(raw),
+                    "mode": stat.S_IMODE(info.st_mode),
+                }
+            else:
+                raise AcceptanceFailure(f"packed install has unsupported entry: {key}")
+
+    visit(root, PurePosixPath())
+    if not inventory:
+        raise AcceptanceFailure("packed install inventory is empty")
+    return inventory
+
+
+def require_exact_cli_version(stdout: str) -> None:
+    rows = stdout.splitlines()
+    expected = f"nexus {VERSION}"
+    if rows != [expected]:
+        raise AcceptanceFailure(
+            f"packed Nexus CLI version must be exactly {expected!r}, got {stdout!r}"
+        )
+
+
+def validate_foreign_cwd_launchers(lab_root: Path) -> dict[str, object]:
+    """Execute every umbrella launcher from a fresh empty, source-independent cwd."""
+
+    environment = dict(os.environ)
+    for key in (
+        "NODE_PATH",
+        "TSX_TSCONFIG_PATH",
+        "NEXUS_NATIVE_BIN",
+        "NEXUS_GATEWAY_SOURCE_ROOT",
+        "NEXUS_GATEWAY_BIN",
+        "NEXUS_WEBUI_BIN",
+    ):
+        environment.pop(key, None)
+    environment["HOME"] = str(lab_root / "harness-home")
+    environment["NEXUS_HOME"] = str(lab_root / "nexus")
+    commands = (
+        ("nexus", NEXUS_BIN, ("--version",)),
+        ("gateway", GATEWAY_BIN, ("--help",)),
+        ("webui", WEBUI_BIN, ("--help",)),
+    )
+    observed: dict[str, object] = {}
+    with tempfile.TemporaryDirectory(prefix="nexus-v015-foreign-cwd-", dir="/tmp") as raw:
+        cwd = Path(raw)
+        if any(cwd.iterdir()):
+            raise AcceptanceFailure("foreign launcher cwd was not empty before execution")
+        for label, executable, arguments in commands:
+            try:
+                result = subprocess.run(
+                    [str(executable), *arguments],
+                    cwd=cwd,
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    timeout=15,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise AcceptanceFailure(
+                    f"packed {label} launcher failed from a foreign cwd: {error}"
+                ) from error
+            if result.returncode != 0:
+                raise AcceptanceFailure(
+                    f"packed {label} launcher failed from a foreign cwd with "
+                    f"{result.returncode}: {result.stderr!r}"
+                )
+            if label == "nexus":
+                require_exact_cli_version(result.stdout)
+            elif not (result.stdout.strip() or result.stderr.strip()):
+                raise AcceptanceFailure(
+                    f"packed {label} --help emitted no command-surface evidence"
+                )
+            observed[label] = {
+                "executable": str(executable),
+                "arguments": list(arguments),
+                "returncode": result.returncode,
+                "stdout": result.stdout.strip() if label == "nexus" else "nonempty-help",
+            }
+        if any(cwd.iterdir()):
+            raise AcceptanceFailure("packed launcher wrote into the foreign cwd")
+    return {
+        "cwd": "fresh-empty-mktemp",
+        "nodePathPresent": False,
+        "sourceFallbackEnvironmentPresent": False,
+        "commands": observed,
+        "cwdStayedEmpty": True,
+    }
+
+
+def validate_support_script_bindings(
+    runner: Path,
+    soak: Path,
+    readiness: dict[str, str],
+    environment: dict[str, Any],
+    root: Path,
+) -> None:
+    runner = absolute(runner)
+    soak = absolute(soak)
+    expected = {
+        "wsAcceptance": str(runner),
+        "wsAcceptanceSha256": readiness.get("wsAcceptanceSha256"),
+        "wsSoak": str(soak),
+        "wsSoakSha256": readiness.get("wsSoakSha256"),
+    }
+    if readiness.get("wsAcceptance") != expected["wsAcceptance"]:
+        raise AcceptanceFailure("WebSocket acceptance runner readiness path mismatch")
+    if readiness.get("wsSoak") != expected["wsSoak"]:
+        raise AcceptanceFailure("WebSocket soak readiness path mismatch")
+    environment_expected = {
+        "NEXUS_V015_WS_ACCEPTANCE": str(runner),
+        "NEXUS_V015_WS_ACCEPTANCE_SHA256": readiness.get("wsAcceptanceSha256"),
+        "NEXUS_V015_WS_SOAK": str(soak),
+        "NEXUS_V015_WS_SOAK_SHA256": readiness.get("wsSoakSha256"),
+    }
+    for key, value in environment_expected.items():
+        if environment.get(key) != value:
+            label = "soak" if "SOAK" in key else "acceptance runner"
+            raise AcceptanceFailure(f"WebSocket {label} manifest binding {key} mismatch")
+    for path, digest_value, label in (
+        (runner, readiness.get("wsAcceptanceSha256"), "WebSocket acceptance runner"),
+        (soak, readiness.get("wsSoakSha256"), "WebSocket soak core"),
+    ):
+        raw = checked_file(
+            path,
+            root,
+            label,
+            expected_uid=0,
+            expected_mode=0o555,
+        )
+        if not isinstance(digest_value, str) or SHA256.fullmatch(digest_value) is None:
+            raise AcceptanceFailure(f"{label} readiness hash is invalid")
+        if sha256_bytes(raw) != digest_value:
+            raise AcceptanceFailure(f"{label} hash mismatch")
+        if not raw.startswith(b"#!/usr/bin/env python3\n"):
+            raise AcceptanceFailure(f"{label} has an unexpected interpreter")
+
+
+def validate_final_support_script_bindings(
+    readiness: dict[str, str],
+    environment: dict[str, Any],
+) -> None:
+    bindings = (
+        (
+            "webconsoleAcceptance",
+            "webconsoleAcceptanceSha256",
+            "NEXUS_V015_WEBCONSOLE_ACCEPTANCE",
+            "NEXUS_V015_WEBCONSOLE_ACCEPTANCE_SHA256",
+            WEBCONSOLE_ACCEPTANCE_BIN,
+            "Webconsole acceptance",
+        ),
+        (
+            "webconsoleEvidenceVerifier",
+            "webconsoleEvidenceVerifierSha256",
+            "NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER",
+            "NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER_SHA256",
+            WEBCONSOLE_EVIDENCE_VERIFIER_BIN,
+            "Webconsole evidence verifier",
+        ),
+        (
+            "evidenceValidator",
+            "evidenceValidatorSha256",
+            "NEXUS_V015_EVIDENCE_VALIDATOR",
+            "NEXUS_V015_EVIDENCE_VALIDATOR_SHA256",
+            EVIDENCE_VALIDATOR_BIN,
+            "evidence validator",
+        ),
+    )
+    for path_key, hash_key, environment_path, environment_hash, path, label in bindings:
+        digest_value = readiness.get(hash_key)
+        if (
+            readiness.get(path_key) != str(path)
+            or not isinstance(digest_value, str)
+            or SHA256.fullmatch(digest_value) is None
+            or environment.get(environment_path) != str(path)
+            or environment.get(environment_hash) != digest_value
+        ):
+            raise AcceptanceFailure(f"final release tool {label} binding mismatch")
+        raw = checked_file(
+            path,
+            Path("/"),
+            f"final release tool {label}",
+            expected_uid=0,
+            expected_mode=0o555,
+        )
+        if sha256_bytes(raw) != digest_value:
+            raise AcceptanceFailure(f"final release tool {label} hash mismatch")
+
+
+def validate_native_binding(
+    install_root: Path,
+    nested_cli: Path,
+    readiness: dict[str, str],
+    environment: dict[str, Any],
+    manifest_native: dict[str, Any],
+) -> Path:
+    """Bind the running native to the sole executable in the packed CLI facet."""
+    install_root = absolute(install_root)
+    nested_cli = absolute(nested_cli)
+    native_root = nested_cli / "native"
+    native_text = readiness.get("nativeResolved")
+    native_hash = readiness.get("nativeSha256")
+    if (
+        not isinstance(native_text, str)
+        or not Path(native_text).is_absolute()
+        or not isinstance(native_hash, str)
+        or SHA256.fullmatch(native_hash) is None
+    ):
+        raise AcceptanceFailure("candidate readiness native binding is invalid")
+    native_path = absolute(Path(native_text))
+    if not inside(native_root, install_root) or not inside(native_path, native_root):
+        raise AcceptanceFailure("candidate readiness native path escapes packed nexus-cli")
+    if (
+        not isinstance(manifest_native, dict)
+        or manifest_native.get("sha256") != native_hash
+    ):
+        raise AcceptanceFailure("candidate readiness native hash differs from manifest.native")
+    if (
+        environment.get("NEXUS_V015_NATIVE_BIN") != native_text
+        or environment.get("NEXUS_V015_NATIVE_BIN_SHA256") != native_hash
+    ):
+        raise AcceptanceFailure("packed manifest native environment binding mismatch")
+
+    try:
+        root_info = os.lstat(native_root)
+    except OSError as error:
+        raise AcceptanceFailure(f"packed nexus-cli native directory is unavailable: {error}") from error
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        raise AcceptanceFailure("packed nexus-cli native root is not a real directory")
+
+    executables: list[Path] = []
+
+    def visit(directory: Path) -> None:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as error:
+            raise AcceptanceFailure(f"cannot inspect packed nexus-cli native tree: {error}") from error
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise AcceptanceFailure(f"cannot inspect packed native entry {path}: {error}") from error
+            if stat.S_ISLNK(info.st_mode):
+                raise AcceptanceFailure(f"packed nexus-cli native tree contains a symlink: {path}")
+            if stat.S_ISDIR(info.st_mode):
+                visit(path)
+            elif stat.S_ISREG(info.st_mode):
+                if entry.name == "nexus" and stat.S_IMODE(info.st_mode) & 0o111:
+                    executables.append(absolute(path))
+            else:
+                raise AcceptanceFailure(f"packed nexus-cli native tree has unsupported entry: {path}")
+
+    visit(native_root)
+    if len(executables) != 1:
+        raise AcceptanceFailure(
+            "packed nexus-cli must contain a single native executable named nexus"
+        )
+    if executables[0] != native_path:
+        raise AcceptanceFailure("candidate readiness native path is not the packed executable")
+    require_bound_file(native_path, native_hash, "installed native binary", install_root)
+    return native_path
+
+
+def install_tree_digest(install_root: Path) -> str:
+    return sha256_bytes(canonical_json(full_install_inventory(install_root)))
+
+
+def lens_tree_digest(root: Path) -> str:
+    """Match the sealed Lens tree digest emitted by the packed lab topology."""
+    root = absolute(root)
+    try:
+        root_info = os.lstat(root)
+    except OSError as error:
+        raise AcceptanceFailure(f"packed Lens app is unavailable: {error}") from error
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or stat.S_ISLNK(root_info.st_mode)
+        or root_info.st_uid != os.geteuid()
+        or stat.S_IMODE(root_info.st_mode) != 0o555
+    ):
+        raise AcceptanceFailure("packed Lens app root ownership or mode is invalid")
+    files: list[tuple[str, Path, int]] = []
+
+    def visit(directory: Path, relative: PurePosixPath) -> None:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as error:
+            raise AcceptanceFailure(f"cannot inspect packed Lens app: {error}") from error
+        for entry in entries:
+            child_relative = relative / entry.name
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise AcceptanceFailure(
+                    f"cannot inspect packed Lens entry {child_relative}: {error}"
+                ) from error
+            if info.st_uid != os.geteuid():
+                raise AcceptanceFailure(
+                    f"packed Lens entry owner mismatch: {child_relative}"
+                )
+            mode = stat.S_IMODE(info.st_mode)
+            if stat.S_ISLNK(info.st_mode):
+                raise AcceptanceFailure(
+                    f"packed Lens app contains a symlink: {child_relative}"
+                )
+            if stat.S_ISDIR(info.st_mode):
+                if mode != 0o555:
+                    raise AcceptanceFailure(
+                        f"packed Lens directory mode mismatch: {child_relative}"
+                    )
+                visit(Path(entry.path), child_relative)
+            elif stat.S_ISREG(info.st_mode):
+                if mode != 0o444 or info.st_nlink != 1:
+                    raise AcceptanceFailure(
+                        f"packed Lens file mode/link mismatch: {child_relative}"
+                    )
+                files.append((child_relative.as_posix(), Path(entry.path), mode))
+            else:
+                raise AcceptanceFailure(
+                    f"packed Lens app has unsupported entry: {child_relative}"
+                )
+
+    visit(root, PurePosixPath())
+    if not files:
+        raise AcceptanceFailure("packed Lens app tree is empty")
+    digest = hashlib.sha256()
+    for relative, path, mode in sorted(files, key=lambda row: row[0]):
+        raw = checked_file(path, root, f"packed Lens file {relative}")
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(f"{mode:o}".encode("ascii"))
+        digest.update(b"\0")
+        digest.update(sha256_bytes(raw).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def validate_candidate(lab_root: Path, evidence_dir: Path, run_id: str) -> Candidate:
+    run_root = checked_directory(evidence_dir / run_id, lab_root, create=False)
+    manifest = load_json(run_root / "manifest.json", run_root, "packed candidate manifest")
+    validate_manifest_contract(manifest, run_id)
+    validate_candidate_commit_seal(run_root, manifest, run_id)
+    packages = manifest.get("packages")
+    if not isinstance(packages, list) or tuple(
+        row.get("name") if isinstance(row, dict) else None for row in packages
+    ) != PACKAGE_NAMES:
+        raise AcceptanceFailure("packed manifest package set/order is invalid")
+    tarballs: dict[str, Path] = {}
+    for row in packages:
+        if row.get("version") != VERSION:
+            raise AcceptanceFailure(f"packed package {row.get('name')} is not {VERSION}")
+        record = row.get("tarball")
+        if not isinstance(record, dict) or set(record) != {"path", "sha256"}:
+            raise AcceptanceFailure(f"packed package {row.get('name')} tarball record is invalid")
+        relative = Path(str(record["path"]))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise AcceptanceFailure("packed tarball path escapes the evidence run")
+        tarball = run_root / relative
+        require_bound_file(tarball, record["sha256"], f"{row['name']} tarball", run_root)
+        tarballs[row["name"]] = tarball
+    native = manifest.get("native")
+    if not isinstance(native, dict) or set(native) != {"path", "sha256"}:
+        raise AcceptanceFailure("packed manifest native record is invalid")
+    native_relative = Path(str(native["path"]))
+    if native_relative.is_absolute() or ".." in native_relative.parts:
+        raise AcceptanceFailure("packed native path escapes the evidence run")
+    require_bound_file(run_root / native_relative, native["sha256"], "packed native", run_root)
+    try:
+        launcher_target = Path(os.readlink(NEXUS_BIN))
+    except OSError as error:
+        raise AcceptanceFailure(f"canonical Nexus launcher is not a symlink: {error}") from error
+    install_root = launcher_target.parent.parent
+    if PACKED_PREFIX.fullmatch(str(install_root)) is None:
+        raise AcceptanceFailure("canonical Nexus launcher does not use a nonce-scoped packed prefix")
+    install_nonce = packed_install_nonce(install_root)
+    umbrella_root = install_root / "lib" / "node_modules" / "@egregore" / "nexus"
+    nested_cli = umbrella_root / "node_modules" / "@egregore" / "nexus-cli"
+    nested_gateway = umbrella_root / "node_modules" / "@egregore" / "nexus-gateway"
+    readiness_path = lab_root / "lab" / "candidate-ready.v1"
+    readiness = parse_readiness(readiness_path, lab_root)
+    required = {
+        "schema", "containerId", "mode", "runId", "installRoot", "installNonce",
+        "nexusLink", "nexusResolved", "nexusSha256", "gatewayLink", "gatewayResolved",
+        "gatewaySha256", "webuiLink", "webuiResolved", "webuiSha256", "labProcess",
+        "labProcessSha256", "labAgent", "labAgentSha256", "labFixture", "labFixtureSha256",
+        "nexusTarball", "nexusTarballSha256", "cliTarball", "cliTarballSha256",
+        "gatewayTarball", "gatewayTarballSha256",
+        "imageDigest", "installTreeSha256", "wsAcceptance", "wsAcceptanceSha256",
+        "wsSoak", "wsSoakSha256", "lensRendererMode", "lensApp", "lensMain",
+        "lensTreeSha256", "nativeResolved", "nativeSha256",
+        "webconsoleAcceptance", "webconsoleAcceptanceSha256",
+        "webconsoleEvidenceVerifier", "webconsoleEvidenceVerifierSha256",
+        "evidenceValidator", "evidenceValidatorSha256",
+    }
+    if set(readiness) != required:
+        raise AcceptanceFailure("candidate readiness ledger has unexpected or missing fields")
+    if readiness["schema"] != "1" or readiness["mode"] != "packed" or readiness["runId"] != run_id:
+        raise AcceptanceFailure("candidate readiness ledger is not bound to this packed run")
+    if SHA256.fullmatch(readiness["containerId"]) is None:
+        raise AcceptanceFailure("candidate readiness containerId is invalid")
+    if readiness["installRoot"] != str(install_root):
+        raise AcceptanceFailure("candidate readiness install root mismatch")
+    if readiness["installNonce"] != install_nonce:
+        raise AcceptanceFailure("candidate readiness install nonce mismatch")
+    if readiness["imageDigest"] != manifest["image"]["digest"]:
+        raise AcceptanceFailure("candidate readiness image digest mismatch")
+    if SHA256.fullmatch(readiness["installTreeSha256"]) is None:
+        raise AcceptanceFailure("candidate readiness install-tree hash is invalid")
+    expected_launchers = {
+        "nexus": (NEXUS_BIN, install_root / "bin" / "nexus", umbrella_root / "bin" / "nexus.mjs"),
+        "gateway": (
+            GATEWAY_BIN,
+            install_root / "bin" / "nexus-gateway",
+            umbrella_root / "bin" / "nexus-gateway.mjs",
+        ),
+        "webui": (
+            WEBUI_BIN,
+            install_root / "bin" / "nexus-webui",
+            umbrella_root / "bin" / "nexus-webui.mjs",
+        ),
+    }
+    for key, (_link, expected_target, expected_resolved) in expected_launchers.items():
+        if readiness[f"{key}Link"] != str(expected_target):
+            raise AcceptanceFailure(f"candidate readiness {key} launcher target mismatch")
+        try:
+            resolved = expected_resolved.resolve(strict=True)
+        except OSError as error:
+            raise AcceptanceFailure(f"candidate {key} launcher is unavailable: {error}") from error
+        if readiness[f"{key}Resolved"] != str(resolved):
+            raise AcceptanceFailure(f"candidate readiness {key} resolved launcher mismatch")
+    for key, expected in {
+        "labProcess": LAB_PROCESS,
+        "labAgent": LAB_AGENT,
+        "labFixture": Path("/tmp/nexus-lab-bin/lab-fixture"),
+    }.items():
+        if Path(readiness[key]) != expected:
+            raise AcceptanceFailure(f"candidate readiness {key} path is not canonical")
+    tarball_paths = {
+        key: absolute(Path(readiness[key]))
+        for key in ("nexusTarball", "cliTarball", "gatewayTarball")
+    }
+    if any(path.parent != Path("/tmp/nexus-lab-packs") or path.suffix != ".tgz" for path in tarball_paths.values()):
+        raise AcceptanceFailure("candidate readiness tarball path is not canonical")
+    if len(set(tarball_paths.values())) != 3:
+        raise AcceptanceFailure("candidate readiness tarball paths are not unique")
+    packages_by_name = {
+        row.get("name"): row for row in packages if isinstance(row, dict)
+    }
+    for name, hash_key in {
+        "@egregore/nexus": "nexusTarballSha256",
+        "@egregore/nexus-cli": "cliTarballSha256",
+        "@egregore/nexus-gateway": "gatewayTarballSha256",
+    }.items():
+        row = packages_by_name.get(name)
+        if not isinstance(row, dict) or not isinstance(row.get("tarball"), dict) or row["tarball"].get("sha256") != readiness[hash_key]:
+            raise AcceptanceFailure(f"candidate manifest/readiness tarball mismatch: {name}")
+    validate_launcher_binding(
+        NEXUS_BIN,
+        readiness["nexusLink"],
+        readiness["nexusResolved"],
+        readiness["nexusSha256"],
+        install_root,
+        "Nexus launcher",
+    )
+    validate_launcher_binding(
+        GATEWAY_BIN,
+        readiness["gatewayLink"],
+        readiness["gatewayResolved"],
+        readiness["gatewaySha256"],
+        install_root,
+        "Gateway launcher",
+    )
+    validate_launcher_binding(
+        WEBUI_BIN,
+        readiness["webuiLink"],
+        readiness["webuiResolved"],
+        readiness["webuiSha256"],
+        install_root,
+        "WebUI launcher",
+    )
+    environment = manifest.get("environment")
+    if not isinstance(environment, dict):
+        raise AcceptanceFailure("packed manifest environment is missing")
+    validate_lens_ledger(readiness, environment)
+    lens_app = absolute(Path(readiness["lensApp"]))
+    lens_main = absolute(Path(readiness["lensMain"]))
+    try:
+        lens_link_target = os.readlink(LENS_APP_LINK)
+    except OSError as error:
+        raise AcceptanceFailure(f"canonical Lens app link is unavailable: {error}") from error
+    if lens_link_target != str(lens_app):
+        raise AcceptanceFailure("canonical Lens app link target mismatch")
+    try:
+        resolved_lens_link = absolute(LENS_APP_LINK.resolve(strict=True))
+    except OSError as error:
+        raise AcceptanceFailure(f"canonical Lens app link cannot resolve: {error}") from error
+    if resolved_lens_link != lens_app or lens_main != lens_app / "electron" / "main.cjs":
+        raise AcceptanceFailure("canonical Lens app/main topology mismatch")
+    checked_file(lens_main, lens_app, "packed Lens Electron main")
+    if lens_tree_digest(lens_app) != readiness["lensTreeSha256"]:
+        raise AcceptanceFailure("packed Lens app tree differs from readiness")
+    expected_environment = {
+        "NEXUS_V015_RUN_ID": run_id,
+        "NEXUS_V015_CONTAINER_ID": readiness["containerId"],
+        "NEXUS_V015_PACKED_PREFIX": str(install_root),
+        "NEXUS_V015_INSTALL_NONCE": readiness["installNonce"],
+        "NEXUS_V015_NEXUS_BIN": str(NEXUS_BIN),
+        "NEXUS_V015_NEXUS_BIN_RESOLVED": readiness["nexusResolved"],
+        "NEXUS_V015_NEXUS_BIN_SHA256": readiness["nexusSha256"],
+        "NEXUS_V015_GATEWAY_BIN": "/tmp/nexus-lab-bin/nexus-gateway",
+        "NEXUS_V015_GATEWAY_BIN_RESOLVED": readiness["gatewayResolved"],
+        "NEXUS_V015_GATEWAY_BIN_SHA256": readiness["gatewaySha256"],
+        "NEXUS_V015_WEBUI_BIN": "/tmp/nexus-lab-bin/nexus-webui",
+        "NEXUS_V015_WEBUI_BIN_RESOLVED": readiness["webuiResolved"],
+        "NEXUS_V015_WEBUI_BIN_SHA256": readiness["webuiSha256"],
+        "NEXUS_V015_LAB_PROCESS": str(LAB_PROCESS),
+        "NEXUS_V015_LAB_PROCESS_SHA256": readiness["labProcessSha256"],
+        "NEXUS_V015_LAB_AGENT": readiness["labAgent"],
+        "NEXUS_V015_LAB_AGENT_SHA256": readiness["labAgentSha256"],
+        "NEXUS_V015_LAB_FIXTURE": readiness["labFixture"],
+        "NEXUS_V015_LAB_FIXTURE_SHA256": readiness["labFixtureSha256"],
+        "NEXUS_V015_NEXUS_TARBALL": readiness["nexusTarball"],
+        "NEXUS_V015_NEXUS_TARBALL_SHA256": readiness["nexusTarballSha256"],
+        "NEXUS_V015_CLI_TARBALL": readiness["cliTarball"],
+        "NEXUS_V015_CLI_TARBALL_SHA256": readiness["cliTarballSha256"],
+        "NEXUS_V015_GATEWAY_TARBALL": readiness["gatewayTarball"],
+        "NEXUS_V015_GATEWAY_TARBALL_SHA256": readiness["gatewayTarballSha256"],
+        "NEXUS_V015_READINESS_LEDGER": str(readiness_path),
+        "NEXUS_V015_GATEWAY_URL": GATEWAY_URL,
+        "NEXUS_V015_IMAGE_DIGEST": readiness["imageDigest"],
+        "NEXUS_V015_INSTALL_TREE_SHA256": readiness["installTreeSha256"],
+        "NEXUS_V015_WS_ACCEPTANCE": readiness["wsAcceptance"],
+        "NEXUS_V015_WS_ACCEPTANCE_SHA256": readiness["wsAcceptanceSha256"],
+        "NEXUS_V015_WS_SOAK": readiness["wsSoak"],
+        "NEXUS_V015_WS_SOAK_SHA256": readiness["wsSoakSha256"],
+        "NEXUS_V015_LENS_RENDERER_MODE": readiness["lensRendererMode"],
+        "NEXUS_V015_LENS_APP": readiness["lensApp"],
+        "NEXUS_V015_LENS_MAIN": readiness["lensMain"],
+        "NEXUS_V015_LENS_TREE_SHA256": readiness["lensTreeSha256"],
+        "NEXUS_V015_NATIVE_BIN": readiness["nativeResolved"],
+        "NEXUS_V015_NATIVE_BIN_SHA256": readiness["nativeSha256"],
+        "NEXUS_V015_WEBCONSOLE_ACCEPTANCE": readiness["webconsoleAcceptance"],
+        "NEXUS_V015_WEBCONSOLE_ACCEPTANCE_SHA256": readiness[
+            "webconsoleAcceptanceSha256"
+        ],
+        "NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER": readiness[
+            "webconsoleEvidenceVerifier"
+        ],
+        "NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER_SHA256": readiness[
+            "webconsoleEvidenceVerifierSha256"
+        ],
+        "NEXUS_V015_EVIDENCE_VALIDATOR": readiness["evidenceValidator"],
+        "NEXUS_V015_EVIDENCE_VALIDATOR_SHA256": readiness[
+            "evidenceValidatorSha256"
+        ],
+    }
+    for key, expected in expected_environment.items():
+        if environment.get(key) != expected:
+            raise AcceptanceFailure(f"packed manifest binding {key} mismatch")
+    bindings = {
+        "nexusResolved": Path(readiness["nexusResolved"]),
+        "gatewayResolved": Path(readiness["gatewayResolved"]),
+        "webuiResolved": Path(readiness["webuiResolved"]),
+        "labProcess": Path(readiness["labProcess"]),
+        "labAgent": Path(readiness["labAgent"]),
+        "labFixture": Path(readiness["labFixture"]),
+        "nexusTarball": Path(readiness["nexusTarball"]),
+        "cliTarball": Path(readiness["cliTarball"]),
+        "gatewayTarball": Path(readiness["gatewayTarball"]),
+    }
+    for key, path in bindings.items():
+        hash_key = READINESS_BINDING_HASHES[key]
+        binding_root = lab_root if inside(path, lab_root) else Path("/")
+        require_bound_file(path, readiness[hash_key], f"readiness {key}", binding_root)
+    try:
+        observed_tarballs = set(Path("/tmp/nexus-lab-packs").iterdir())
+    except OSError as error:
+        raise AcceptanceFailure(f"candidate tarball inventory is unavailable: {error}") from error
+    if observed_tarballs != set(tarball_paths.values()):
+        raise AcceptanceFailure("candidate tarball directory has extra or missing entries")
+    readiness_expected = environment.get("NEXUS_V015_READINESS_LEDGER_SHA256")
+    require_bound_file(readiness_path, readiness_expected, "candidate readiness ledger", lab_root)
+    native_path = validate_native_binding(
+        install_root,
+        nested_cli,
+        readiness,
+        environment,
+        native,
+    )
+    gateway_module = absolute(Path(str(environment.get("NEXUS_V015_GATEWAY_MODULE", ""))))
+    if gateway_module != nested_gateway / "dist-gateway" / "headless.mjs":
+        raise AcceptanceFailure("Gateway bundled module is not the nested packed module")
+    require_bound_file(
+        gateway_module,
+        environment.get("NEXUS_V015_GATEWAY_MODULE_SHA256"),
+        "Gateway bundled module",
+        install_root,
+    )
+    current_runner = absolute(Path(__file__))
+    if current_runner != WS_ACCEPTANCE_BIN:
+        raise AcceptanceFailure(
+            f"release acceptance must execute the readiness-bound runner at {WS_ACCEPTANCE_BIN}"
+        )
+    if Path(readiness["wsAcceptance"]) != WS_ACCEPTANCE_BIN or Path(readiness["wsSoak"]) != SOAK_CORE:
+        raise AcceptanceFailure("candidate readiness support-script paths are not canonical")
+    validate_support_script_bindings(
+        current_runner,
+        SOAK_CORE,
+        readiness,
+        environment,
+        Path("/"),
+    )
+    validate_final_support_script_bindings(readiness, environment)
+    installed = {
+        "@egregore/nexus": umbrella_root / "package.json",
+        "@egregore/nexus-cli": nested_cli / "package.json",
+        "@egregore/nexus-gateway": nested_gateway / "package.json",
+    }
+    package_evidence: dict[str, dict[str, object]] = {}
+    for name, package_json in installed.items():
+        package_root = package_json.parent
+        packed_inventory = tar_package_inventory(tarballs[name], name)
+        observed_inventory = installed_package_inventory(package_root, name)
+        if observed_inventory != packed_inventory:
+            missing = sorted(set(packed_inventory) - set(observed_inventory))
+            extra = sorted(set(observed_inventory) - set(packed_inventory))
+            changed = sorted(
+                key
+                for key in set(observed_inventory) & set(packed_inventory)
+                if observed_inventory[key] != packed_inventory[key]
+            )
+            raise AcceptanceFailure(
+                "installed package inventory differs from candidate tarball: "
+                f"{name}; missing={missing}; extra={extra}; changed={changed}"
+            )
+        row = load_json(package_json, install_root, f"installed {name} package")
+        if row.get("name") != name or row.get("version") != VERSION:
+            raise AcceptanceFailure(f"installed packed package is not {name}@{VERSION}")
+        package_evidence[name] = {
+            "version": VERSION,
+            "root": str(package_root),
+            "entryCount": len(observed_inventory),
+            "inventorySha256": sha256_bytes(canonical_json(observed_inventory)),
+            "tarballSha256": readiness[
+                {
+                    "@egregore/nexus": "nexusTarballSha256",
+                    "@egregore/nexus-cli": "cliTarballSha256",
+                    "@egregore/nexus-gateway": "gatewayTarballSha256",
+                }[name]
+            ],
+        }
+    observed_install_tree = install_tree_digest(install_root)
+    if observed_install_tree != readiness["installTreeSha256"]:
+        raise AcceptanceFailure(
+            "packed install dependency closure differs from the readiness ledger"
+        )
+    try:
+        cli_version = subprocess.run(
+            [str(NEXUS_BIN), "--version"],
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise AcceptanceFailure(f"cannot execute packed Nexus CLI: {error}") from error
+    if cli_version.returncode != 0:
+        raise AcceptanceFailure(
+            f"packed Nexus CLI --version failed with {cli_version.returncode}: "
+            f"{cli_version.stderr!r}"
+        )
+    require_exact_cli_version(cli_version.stdout)
+    foreign_cwd = validate_foreign_cwd_launchers(lab_root)
+    d1_evidence = {
+        "packedInventory": {
+            "installRoot": str(install_root),
+            "installNonce": install_nonce,
+            "installTreeSha256": observed_install_tree,
+            "topLevelPackages": ["@egregore/nexus"],
+            "nestedPackages": ["@egregore/nexus-cli", "@egregore/nexus-gateway"],
+            "packages": package_evidence,
+            "native": {
+                "path": str(native_path),
+                "sha256": readiness["nativeSha256"],
+            },
+            "gatewayModule": {
+                "path": str(gateway_module),
+                "sha256": environment["NEXUS_V015_GATEWAY_MODULE_SHA256"],
+            },
+        },
+        "installLog": {
+            "operation": "clean-prefix umbrella-only install",
+            "requested": "@egregore/nexus@0.1.5",
+            "prefixKind": "nonce-scoped-empty-prefix",
+            "registryKind": "candidate-scoped-exact-three-package-registry",
+            "tarballs": {
+                name: {
+                    "path": str(tarballs[name]),
+                    "sha256": package_evidence[name]["tarballSha256"],
+                }
+                for name in PACKAGE_NAMES
+            },
+            "validation": [
+                "umbrella-only-top-level",
+                "exact-nested-facets",
+                "tarball-installed-inventory-equality",
+                "complete-install-tree-readiness-equality",
+                "single-packed-native",
+                "bundled-gateway-module",
+            ],
+        },
+        "foreignCwd": foreign_cwd,
+    }
+    return Candidate(
+        run_id,
+        candidate_digest(manifest),
+        manifest,
+        run_root,
+        lab_root,
+        install_root,
+        readiness,
+        d1_evidence,
+    )
+
+
+def load_agents(candidate: Candidate) -> tuple[LiveAgent, LiveAgent]:
+    manifest = load_json(candidate.lab_root / "lab" / "agents.json", candidate.lab_root, "live-agent manifest")
+    environment = candidate.manifest.get("environment")
+    if not isinstance(environment, dict):
+        raise AcceptanceFailure("packed candidate has no environment binding")
+    readiness_path = candidate.lab_root / "lab" / "candidate-ready.v1"
+    if environment.get("NEXUS_V015_READINESS_LEDGER") != str(readiness_path):
+        raise AcceptanceFailure("candidate readiness path is not canonical")
+    readiness_sha256 = environment.get("NEXUS_V015_READINESS_LEDGER_SHA256")
+    if (
+        not isinstance(readiness_sha256, str)
+        or not SHA256.fullmatch(readiness_sha256)
+        or sha256_file(readiness_path) != readiness_sha256
+    ):
+        raise AcceptanceFailure("candidate readiness hash is invalid or stale")
+    if (
+        manifest.get("version") != 1
+        or manifest.get("runId") != candidate.run_id
+        or manifest.get("readinessSha256") != readiness_sha256
+        or manifest.get("candidate") != {
+            "runId": candidate.run_id,
+            "readinessSha256": readiness_sha256,
+        }
+    ):
+        raise AcceptanceFailure(
+            "live-agent manifest run/readiness binding is stale or belongs to another run"
+        )
+    rows = manifest.get("agents")
+    if not isinstance(rows, dict):
+        raise AcceptanceFailure("live-agent manifest has no agents object")
+    result: list[LiveAgent] = []
+    for kind in ("codex", "claude"):
+        row = rows.get(kind)
+        expected = {"name", "agentId", "sessionId", "executable", "sha256", "version", "workspace"}
+        if not isinstance(row, dict) or set(row) != expected:
+            raise AcceptanceFailure(f"live-agent manifest has invalid {kind} fields")
+        if any(not isinstance(row[key], str) or not row[key] for key in expected):
+            raise AcceptanceFailure(f"live-agent manifest has incomplete {kind} values")
+        executable = absolute(Path(row["executable"]))
+        workspace = absolute(Path(row["workspace"]))
+        expected_workspace = candidate.lab_root / "harness-workspaces" / kind
+        if workspace != expected_workspace:
+            raise AcceptanceFailure(f"{kind} workspace is not isolated under NEXUS_LAB_ROOT")
+        checked_directory(workspace, candidate.lab_root, create=False)
+        require_bound_file(executable, row["sha256"], f"{kind} executable", Path("/"))
+        try:
+            version_process = subprocess.run(
+                [str(executable), "--version"],
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise AcceptanceFailure(f"cannot execute {kind} --version: {error}") from error
+        if version_process.returncode != 0:
+            raise AcceptanceFailure(f"{kind} --version failed with {version_process.returncode}")
+        observed_version = harness_version_line(version_process.stdout)
+        if observed_version != row["version"]:
+            raise AcceptanceFailure(
+                f"{kind} executable version changed: expected {row['version']!r}, got {observed_version!r}"
+            )
+        result.append(LiveAgent(
+            kind,
+            row["name"],
+            row["agentId"],
+            row["sessionId"],
+            executable,
+            row["sha256"],
+            row["version"],
+            workspace,
+        ))
+    return result[0], result[1]
+
+
+def launch_live_agents(
+    candidate: Candidate,
+    *,
+    runner: Any = subprocess.run,
+) -> None:
+    environment = candidate.manifest.get("environment")
+    if not isinstance(environment, dict):
+        raise AcceptanceFailure("packed manifest environment is missing")
+    hook = absolute(Path(str(environment.get("NEXUS_V015_LAB_AGENT", ""))))
+    if hook != LAB_AGENT:
+        raise AcceptanceFailure("live-agent hook is not the canonical isolated-lab hook")
+    hook_hash = environment.get("NEXUS_V015_LAB_AGENT_SHA256")
+    require_bound_file(hook, hook_hash, "live-agent hook", Path("/"))
+    nexus_bin = environment.get("NEXUS_V015_NEXUS_BIN")
+    readiness_hash = environment.get("NEXUS_V015_READINESS_LEDGER_SHA256")
+    if nexus_bin != str(NEXUS_BIN) or not isinstance(readiness_hash, str):
+        raise AcceptanceFailure("live-agent hook bindings are incomplete")
+    child_environment = dict(os.environ)
+    child_environment.update({
+        "OCULAR_LAB": "1",
+        "NEXUS_LAB_ROOT": str(candidate.lab_root),
+        "NEXUS_HOME": str(candidate.lab_root / "nexus"),
+        "NEXUS_PROJECT": "v015-lab",
+        "NEXUS_V015_RUN_ID": candidate.run_id,
+        "NEXUS_V015_NEXUS_BIN": str(NEXUS_BIN),
+        "NEXUS_V015_READINESS_LEDGER_SHA256": readiness_hash,
+    })
+    for kind in ("codex", "claude"):
+        try:
+            result = runner(
+                [str(hook), "launch", kind],
+                text=True,
+                capture_output=True,
+                timeout=240,
+                check=False,
+                env=child_environment,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise AcceptanceFailure(f"cannot launch genuine {kind} harness: {error}") from error
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()[:1024]
+            raise AcceptanceFailure(
+                f"genuine {kind} harness launch failed with {result.returncode}: {detail}"
+            )
+    require_bound_file(hook, hook_hash, "live-agent hook after launches", Path("/"))
+
+
+def load_soak_core(candidate: Candidate) -> dict[str, Any]:
+    environment = candidate.manifest.get("environment", {})
+    validate_support_script_bindings(
+        WS_ACCEPTANCE_BIN,
+        SOAK_CORE,
+        candidate.readiness,
+        environment,
+        Path("/"),
+    )
+    raw = checked_file(SOAK_CORE, Path("/"), "WebSocket soak core")
+    if not raw.startswith(b"#!/usr/bin/env python3"):
+        raise AcceptanceFailure("WebSocket soak core has an unexpected interpreter")
+    return runpy.run_path(str(SOAK_CORE))
+
+
+def candidate_verification_document(
+    candidate: Candidate,
+    runtime: RuntimeObservation | None = None,
+) -> dict[str, Any]:
+    environment = candidate.manifest.get("environment")
+    if not isinstance(environment, dict):
+        raise AcceptanceFailure("packed manifest environment is missing")
+    readiness_path = absolute(
+        Path(str(environment.get("NEXUS_V015_READINESS_LEDGER", "")))
+    )
+    expected_readiness = candidate.lab_root / "lab" / "candidate-ready.v1"
+    if readiness_path != expected_readiness:
+        raise AcceptanceFailure("candidate readiness path is not canonical")
+    readiness = checked_file(readiness_path, candidate.lab_root, "candidate readiness ledger")
+    document: dict[str, Any] = {
+        "schemaVersion": 1,
+        "status": "PASS",
+        "mode": "packed",
+        "runId": candidate.run_id,
+        "candidateDigest": candidate.digest,
+        "readinessPath": str(readiness_path),
+        "readinessSha256": sha256_bytes(readiness),
+        "installRoot": str(candidate.install_root),
+        "lens": {
+            "rendererMode": candidate.readiness.get("lensRendererMode"),
+            "app": candidate.readiness.get("lensApp"),
+            "main": candidate.readiness.get("lensMain"),
+            "treeSha256": candidate.readiness.get("lensTreeSha256"),
+        },
+        "imageDigest": candidate.manifest["image"]["digest"],
+        "limits": candidate.manifest["container"]["limits"],
+    }
+    if runtime is not None:
+        document["runtime"] = {
+            "containerId": runtime.container_id,
+            "imageDigest": runtime.image_digest,
+            "cpuMax": runtime.cpu_max,
+            "memoryMax": runtime.memory_max,
+            "memorySwapMax": runtime.memory_swap_max,
+            "pidsMax": runtime.pids_max,
+            "daemonPid": runtime.daemon_pid,
+            "daemonExecutable": runtime.daemon_executable,
+            "daemonExecutableSha256": runtime.daemon_executable_sha256,
+            "gatewayPid": runtime.gateway_pid,
+            "gatewayUrl": runtime.gateway_url,
+            "gatewayEntrypoint": runtime.gateway_entrypoint,
+            "gatewayEntrypointSha256": runtime.gateway_entrypoint_sha256,
+            "installTreeSha256": runtime.install_tree_sha256,
+            "lensPid": runtime.lens_pid,
+            "lensRendererMode": runtime.lens_renderer_mode,
+            "lensApp": runtime.lens_app,
+            "lensMain": runtime.lens_main,
+            "lensTreeSha256": runtime.lens_tree_sha256,
+            "lensMainArgumentBound": runtime.lens_main_argument_bound,
+        }
+    return document
+
+
+class CaptureEvidence:
+    def __init__(self) -> None:
+        self.rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    def jsonl(self, name: str, value: object) -> None:
+        if not isinstance(value, dict):
+            raise AcceptanceFailure(f"captured {name} row is not an object")
+        self.rows[name].append(value)
+
+    def log(self, event: str, **fields: object) -> None:
+        self.rows["log"].append({"at": time.time(), "event": event, **fields})
+
+    def jsonl_bytes(self, name: str, rows: Iterable[object] | None = None) -> bytes:
+        values = list(self.rows.get(name, []) if rows is None else rows)
+        if not values:
+            raise AcceptanceFailure(f"required {name} evidence capture is empty")
+        return b"".join(canonical_json(value) + b"\n" for value in values)
+
+
+class GateObservations:
+    """Exact, observation-backed payload ledger for canonical B1-F1 gates."""
+
+    def __init__(self) -> None:
+        self.values: dict[str, dict[str, object]] = {
+            gate: {} for gate in RESULT_SPECS
+        }
+
+    def record(self, gate: str, name: str, value: object) -> None:
+        expected = RESULT_SPECS.get(gate)
+        if expected is None or name not in expected:
+            raise AcceptanceFailure(f"unknown release observation {gate}:{name}")
+        if name in self.values[gate]:
+            raise AcceptanceFailure(f"duplicate release observation {gate}:{name}")
+        if value is None or value == {} or value == [] or value == "":
+            raise AcceptanceFailure(f"release observation {gate}:{name} is empty")
+        # Canonicalize immediately so non-finite and non-serializable state can
+        # never survive until the publisher boundary.
+        canonical_json(value)
+        self.values[gate][name] = value
+
+    def payloads(self) -> dict[str, dict[str, bytes]]:
+        payloads: dict[str, dict[str, bytes]] = {}
+        for gate, names in RESULT_SPECS.items():
+            missing = [name for name in names if name not in self.values[gate]]
+            if missing:
+                raise AcceptanceFailure(
+                    f"release observations are missing {gate}: {', '.join(missing)}"
+                )
+            payloads[gate] = {
+                name: pretty_json(self.values[gate][name]) for name in names
+            }
+        return payloads
+
+
+class BackendAcceptance:
+    def __init__(
+        self,
+        core: dict[str, Any],
+        candidate: Candidate,
+        agents: tuple[LiveAgent, LiveAgent],
+        *,
+        failure_seam: Any | None = None,
+    ) -> None:
+        self.core = core
+        self.candidate = candidate
+        self.live_agents = agents
+        self.capture = CaptureEvidence()
+        self.http = core["HttpClient"](GATEWAY_URL, self.capture)
+        core_agents = tuple(
+            core["Agent"](
+                agent.kind,
+                agent.name,
+                agent.agent_id,
+                agent.session_id,
+                agent.executable,
+                agent.executable_sha256,
+                agent.version,
+                agent.workspace,
+            )
+            for agent in agents
+        )
+        self.soak = core["Soak"](
+            core["Candidate"](
+                candidate.run_id,
+                candidate.digest,
+                candidate.manifest,
+                candidate.install_root,
+                candidate.lab_root / "lab" / "candidate-ready.v1",
+            ),
+            self.capture,
+            self.http,
+            str(NEXUS_BIN),
+            str(LAB_PROCESS),
+            candidate.lab_root,
+            core_agents,
+        )
+        self.restart_timeline: list[dict[str, Any]] = []
+        self.rosters: list[dict[str, Any]] = []
+        self.rest_snapshots: list[dict[str, Any]] = []
+        self.identity_evidence: dict[str, Any] = {}
+        self.backpressure: dict[str, Any] = {}
+        self.session_backpressure: dict[str, Any] = {}
+        self.reverse_delivery: list[dict[str, Any]] = []
+        self.human_rebind: list[dict[str, Any]] = []
+        self.unknown_cookie: dict[str, Any] = {}
+        self.browser_security: dict[str, dict[str, Any]] = {}
+        self.queue_agreements: list[dict[str, Any]] = []
+        self.concurrent_delivery: dict[str, Any] = {}
+        self.straddled_replay: list[dict[str, Any]] = []
+        self.queue_control_evidence: dict[str, Any] = {}
+        self.queue_recovery: dict[str, Any] = {}
+        self.fleet_frames: list[dict[str, Any]] = []
+        self.fleet_socket: Any = None
+        self.fleet_cursor = 0
+        self.history_reads = 0
+        self.human_name = ""
+        self.human_cookie_sha256 = ""
+        self.human_dm: Any = None
+        self.failure_seam = failure_seam
+        self.observations = GateObservations()
+
+    async def _checkpoint(self, name: str) -> None:
+        if self.failure_seam is None:
+            return
+        result = self.failure_seam(name, self)
+        if asyncio.iscoroutine(result):
+            await result
+
+    async def setup(self) -> None:
+        self.core["run_command"](
+            [
+                str(NEXUS_BIN), "thread", "new", self.soak.thread, "--project", "v015-lab",
+                "--member", self.live_agents[0].name, "--member", self.live_agents[1].name, "--json",
+            ],
+            timeout=60,
+        )
+        password = "v015-ws-" + hashlib.sha256(self.candidate.run_id.encode()).hexdigest()[:24]
+        self.human_name = f"v015-ws-{hashlib.sha256(self.candidate.run_id.encode()).hexdigest()[:12]}"
+        await asyncio.to_thread(
+            self.http.login,
+            self.human_name,
+            password,
+        )
+        self.human_cookie_sha256 = sha256_bytes(self.http.cookie.encode("utf-8"))
+        await asyncio.to_thread(self.core["wait_health"], self.http)
+        rows = await asyncio.to_thread(self.core["identity_rows"], str(NEXUS_BIN))
+        self.core["check_identities"](rows, self.soak.agents, self.soak.ledger)
+        require_exact_roster(rows, self.live_agents)
+        self.rosters.append({"phase": "initial", "rows": rows})
+        baseline_dlq = await asyncio.to_thread(self.core["dlq_total"], str(NEXUS_BIN))
+        self.soak.baseline_dlq = baseline_dlq
+        self.soak.ledger.failure["deadLetters"] = baseline_dlq
+        self.human_dm = self.core["DeveloperLane"](
+            self.capture,
+            self.soak.ledger,
+            self.http,
+            (f"sys.dm.{self.human_name}",),
+        )
+        snapshot_starts = {
+            kind: len(lane.frames) for kind, lane in self.soak.sessions.items()
+        }
+        await asyncio.gather(
+            self.soak.developer.connect(),
+            self.human_dm.connect(),
+            *(session.connect() for session in self.soak.sessions.values()),
+        )
+        for agent in self.live_agents:
+            lane = self.soak.sessions[agent.kind]
+            snapshot = await lane.wait_for(
+                lambda frame: frame.get("t") == "queue.snapshot",
+                after=snapshot_starts[agent.kind],
+                timeout=30,
+                label=f"{agent.kind} initial queue snapshot",
+            )
+            require_queue_snapshot(snapshot, agent.session_id)
+            rest = await asyncio.to_thread(self.queue_snapshot, agent)
+            require_queue_agreement(rest, snapshot, agent.session_id)
+            self.queue_agreements.append({
+                "phase": "initial",
+                "kind": agent.kind,
+                "rest": rest,
+                "websocket": snapshot,
+            })
+            self.capture.jsonl("metrics", {
+                "event": "agent-session.materialized",
+                "kind": agent.kind,
+                "sessionId": agent.session_id,
+                "seq": snapshot["seq"],
+            })
+        self.unknown_cookie = await self.reject_unknown_cookie()
+        await self.human_write("initial")
+        await self.open_fleet(0)
+        await self.wait_fleet_event("initial restored-roster replay")
+
+    def history(self, path: str) -> list[dict[str, Any]]:
+        self.history_reads += 1
+        request = Request(
+            GATEWAY_URL + path,
+            method="GET",
+            headers={"accept": "application/json", "cookie": self.http.cookie},
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                raw = response.read()
+                status = response.status
+        except HTTPError as error:
+            raw = error.read()
+            status = error.code
+        except (OSError, URLError) as error:
+            raise AcceptanceFailure(f"canonical history request failed: {path}: {error}") from error
+        if status < 200 or status >= 300:
+            raise AcceptanceFailure(f"canonical history returned HTTP {status}: {path}: {raw[:512]!r}")
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise AcceptanceFailure(f"canonical history returned invalid JSON: {path}") from error
+        if isinstance(value, dict):
+            for key in ("rows", "data", "messages"):
+                if isinstance(value.get(key), list):
+                    value = value[key]
+                    break
+        if not isinstance(value, list) or any(not isinstance(row, dict) for row in value):
+            raise AcceptanceFailure(f"canonical history returned a non-array: {path}")
+        return value
+
+    def queue_snapshot(self, agent: LiveAgent) -> dict[str, Any]:
+        value = self.http.request(
+            "GET",
+            "/api/conversation/prompt?" + urlencode({"agentId": agent.agent_id}),
+        )
+        value.pop("_headers", None)
+        if not isinstance(value.get("commands"), list):
+            raise AcceptanceFailure(f"{agent.kind} REST queue snapshot has no commands array")
+        return value
+
+    async def wait_history_marker(
+        self,
+        path: str,
+        sender: str,
+        marker: str,
+        label: str,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            rows = await asyncio.to_thread(self.history, path)
+            matches = [
+                row for row in rows
+                if row.get("from") == sender and row.get("body") == marker
+            ]
+            if len(matches) > 1:
+                raise AcceptanceFailure(f"{label} marker was persisted more than once")
+            if len(matches) == 1:
+                return exact_marker_row(rows, sender, marker)
+            await asyncio.sleep(0.1)
+        raise AcceptanceFailure(f"{label} marker did not reach canonical history")
+
+    async def reject_unknown_cookie(self) -> dict[str, Any]:
+        marker = f"V015_UNKNOWN_COOKIE_{self.candidate.run_id}_{time.time_ns()}"
+        path = f"/api/v1/threads/{quote(self.soak.thread, safe='')}/history?limit=100"
+        before = await asyncio.to_thread(self.history, path)
+        payload = canonical_json({
+            "to": {"verb": "post", "thread": self.soak.thread},
+            "body": marker,
+            "idempotencyKey": f"unknown-{marker}",
+        })
+
+        def attempt() -> tuple[int, bytes]:
+            request = Request(
+                GATEWAY_URL + "/api/v1/messages",
+                data=payload,
+                method="POST",
+                headers={
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "cookie": "nexus_human=unknown-cookie; nexus_csrf=unknown-proof",
+                    "x-nexus-csrf": "unknown-proof",
+                },
+            )
+            try:
+                with urlopen(request, timeout=30) as response:
+                    return response.status, response.read()
+            except HTTPError as error:
+                return error.code, error.read()
+            except (OSError, URLError) as error:
+                raise AcceptanceFailure(f"unknown-cookie mutation probe failed: {error}") from error
+
+        status, raw = await asyncio.to_thread(attempt)
+        if status not in {401, 403}:
+            raise AcceptanceFailure(
+                f"unknown cookie mutation was not rejected before ingress: HTTP {status}"
+            )
+        after = await asyncio.to_thread(self.history, path)
+        accepted_rows = sum(row.get("body") == marker for row in after)
+        if any(row.get("body") == marker for row in before) or accepted_rows != 0:
+            raise AcceptanceFailure("unknown cookie created a durable accepted message")
+        return {
+            "status": status,
+            "marker": marker,
+            "acceptedRows": accepted_rows,
+            "responseSha256": sha256_bytes(raw),
+        }
+
+    @staticmethod
+    def _human_cookie_only(cookie: str) -> str:
+        parts = [part.strip() for part in cookie.split(";") if part.strip()]
+        human = [part for part in parts if part.startswith("nexus_human=")]
+        csrf = [part for part in parts if part.startswith("nexus_csrf=")]
+        if len(human) != 1 or len(csrf) != 1:
+            raise AcceptanceFailure("login cookie is not one exact human/CSRF pair")
+        return human[0]
+
+    @staticmethod
+    def _response_message_id(value: object) -> str | None:
+        if isinstance(value, dict):
+            for key in ("messageId", "message_id"):
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate:
+                    return candidate
+            for candidate in value.values():
+                found = BackendAcceptance._response_message_id(candidate)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for candidate in value:
+                found = BackendAcceptance._response_message_id(candidate)
+                if found:
+                    return found
+        return None
+
+    def _http_mutation_attempt(
+        self,
+        case: str,
+        marker: str,
+        cookie: str,
+        csrf_header: str | None,
+    ) -> dict[str, object]:
+        payload = canonical_json({
+            "to": {"verb": "post", "thread": self.soak.thread},
+            "body": marker,
+            "idempotencyKey": f"csrf-{case}-{marker}",
+        })
+        headers = {
+            "accept": "application/json",
+            "content-type": "application/json",
+            "cookie": cookie,
+        }
+        if csrf_header is not None:
+            headers["x-nexus-csrf"] = csrf_header
+        request = Request(
+            GATEWAY_URL + "/api/v1/messages",
+            data=payload,
+            method="POST",
+            headers=headers,
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                status = response.status
+                raw = response.read()
+        except HTTPError as error:
+            status = error.code
+            raw = error.read()
+        except (OSError, URLError) as error:
+            raise AcceptanceFailure(f"C1 HTTP {case} probe failed: {error}") from error
+        try:
+            body = json.loads(raw.decode("utf-8")) if raw else {}
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise AcceptanceFailure(f"C1 HTTP {case} returned invalid JSON") from error
+        if not isinstance(body, dict):
+            raise AcceptanceFailure(f"C1 HTTP {case} returned a non-object")
+        error_value = body.get("error")
+        error_code = error_value.get("code") if isinstance(error_value, dict) else None
+        return {
+            "status": status,
+            "bodySha256": sha256_bytes(raw),
+            "messageId": self._response_message_id(body),
+            "errorCode": error_code,
+        }
+
+    async def _rejected_ws_mutation(
+        self,
+        case: str,
+        agent: LiveAgent,
+        *,
+        protocols: list[str],
+        cookie: str,
+        query: str = "",
+        extra_headers: dict[str, str] | None = None,
+        frame_fields: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        try:
+            import websockets
+        except ImportError as error:
+            raise AcceptanceFailure(
+                "Python package 'websockets' is required for the C1 matrix"
+            ) from error
+        before = await asyncio.to_thread(self.queue_snapshot, agent)
+        client_message_id = (
+            f"cm-csrf-{case}-{hashlib.sha256((self.candidate.run_id + case).encode()).hexdigest()[:12]}"
+        )
+        path = (
+            f"/api/v1/agent-sessions/{quote(agent.session_id, safe='')}/events?view=agui"
+            + ("&" + query if query else "")
+        )
+        headers = {"Cookie": cookie, **(extra_headers or {})}
+        options = {
+            "subprotocols": protocols,
+            "open_timeout": 30,
+            "close_timeout": 5,
+            "ping_interval": 20,
+            "ping_timeout": 20,
+            "max_queue": 16,
+        }
+        try:
+            try:
+                socket = await websockets.connect(
+                    self.http.ws_url(path), additional_headers=headers, **options
+                )
+            except TypeError:
+                socket = await websockets.connect(
+                    self.http.ws_url(path), extra_headers=headers, **options
+                )
+        except BaseException as error:
+            raise AcceptanceFailure(f"C1 WebSocket {case} upgrade failed: {error}") from error
+        try:
+            frame = {
+                "t": "input",
+                "mode": "session",
+                "target": {"name": agent.name, "agentId": agent.agent_id},
+                "text": f"C1 rejected mutation marker {client_message_id}",
+                "clientMessageId": client_message_id,
+                **(frame_fields or {}),
+            }
+            await socket.send(canonical_json(frame).decode("utf-8"))
+            deadline = time.monotonic() + 30
+            observed: dict[str, Any] | None = None
+            while time.monotonic() < deadline:
+                raw = await asyncio.wait_for(socket.recv(), deadline - time.monotonic())
+                try:
+                    candidate = json.loads(str(raw))
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(candidate, dict):
+                    continue
+                if candidate.get("clientMessageId") != client_message_id:
+                    continue
+                if candidate.get("t") in {"input.ack", "input.err"}:
+                    observed = candidate
+                    break
+            if observed is None:
+                raise AcceptanceFailure(f"C1 WebSocket {case} emitted no correlated result")
+            if observed.get("t") != "input.err" or observed.get("status") != 403:
+                raise AcceptanceFailure(
+                    f"C1 WebSocket {case} was not rejected before enqueue: {observed!r}"
+                )
+        finally:
+            try:
+                await socket.close()
+            except BaseException:
+                pass
+        after = await asyncio.to_thread(self.queue_snapshot, agent)
+        if canonical_json(after) != canonical_json(before):
+            raise AcceptanceFailure(f"C1 WebSocket {case} changed the command queue")
+        return {
+            "case": case,
+            "status": 403,
+            "clientMessageId": client_message_id,
+            "accepted": False,
+            "queueUnchanged": True,
+            "responseType": "input.err",
+        }
+
+    async def browser_mutation_security(self) -> dict[str, dict[str, Any]]:
+        if (
+            self.unknown_cookie.get("acceptedRows") != 0
+            or self.unknown_cookie.get("status") not in {401, 403}
+        ):
+            raise AcceptanceFailure("C1 unknown-cookie rejection is missing")
+        history_path = (
+            f"/api/v1/threads/{quote(self.soak.thread, safe='')}/history?limit=100"
+        )
+        human_cookie = self._human_cookie_only(self.http.cookie)
+        suffix = f"{self.candidate.run_id}-{time.time_ns()}"
+        http_cases = (
+            ("missing-header", self.http.cookie, None, 403),
+            ("mismatched-header", self.http.cookie, f"wrong-{suffix}", 403),
+            ("missing-cookie-proof", human_cookie, self.http.csrf, 403),
+            ("valid-pair", self.http.cookie, self.http.csrf, 201),
+        )
+        before = await asyncio.to_thread(self.history, history_path)
+        http_records: list[dict[str, object]] = []
+        markers: dict[str, str] = {}
+        positive_response: dict[str, object] | None = None
+        for case, cookie, csrf_header, expected_status in http_cases:
+            marker = f"V015_C1_HTTP_{case}_{suffix}"
+            markers[case] = marker
+            result = await asyncio.to_thread(
+                self._http_mutation_attempt,
+                case,
+                marker,
+                cookie,
+                csrf_header,
+            )
+            if result.get("status") != expected_status:
+                raise AcceptanceFailure(
+                    f"C1 HTTP {case} expected {expected_status}, got {result.get('status')!r}"
+                )
+            if expected_status == 403 and result.get("messageId") is not None:
+                raise AcceptanceFailure(f"C1 HTTP {case} returned an accepted message ID")
+            if case == "valid-pair":
+                positive_response = result
+            http_records.append({
+                "case": case,
+                "status": result.get("status"),
+                "bodySha256": result.get("bodySha256"),
+                "errorCode": result.get("errorCode"),
+                "accepted": case == "valid-pair",
+            })
+        after = await asyncio.to_thread(self.history, history_path)
+        if any(row.get("body") in markers.values() for row in before):
+            raise AcceptanceFailure("C1 marker existed before the security matrix")
+        for case in ("missing-header", "mismatched-header", "missing-cookie-proof"):
+            if any(row.get("body") == markers[case] for row in after):
+                raise AcceptanceFailure(f"C1 HTTP {case} reached durable history")
+        positive_rows = [
+            row
+            for row in after
+            if row.get("body") == markers["valid-pair"]
+            and row.get("from") == self.human_name
+        ]
+        if len(positive_rows) != 1:
+            row = await self.wait_history_marker(
+                history_path,
+                self.human_name,
+                markers["valid-pair"],
+                "C1 valid HTTP pair",
+            )
+            positive_rows = [row]
+        accepted_message_id = positive_response.get("messageId") if positive_response else None
+        if (
+            not isinstance(accepted_message_id, str)
+            or positive_rows[0].get("messageId") != accepted_message_id
+        ):
+            raise AcceptanceFailure("C1 valid HTTP pair did not preserve the accepted message ID")
+
+        agent = self.live_agents[0]
+        correct_protocol = f"nexus-csrf.{self.http.csrf}"
+        ws_records = [
+            await self._rejected_ws_mutation(
+                "query-frame-header-forgery",
+                agent,
+                protocols=["nexus-v1"],
+                cookie=self.http.cookie,
+                query=urlencode({"nexus_csrf": self.http.csrf}),
+                extra_headers={"x-nexus-csrf": self.http.csrf},
+                frame_fields={"csrf": self.http.csrf, "x-nexus-csrf": self.http.csrf},
+            ),
+            await self._rejected_ws_mutation(
+                "mismatched-protocol",
+                agent,
+                protocols=["nexus-v1", f"nexus-csrf.wrong-{suffix}"],
+                cookie=self.http.cookie,
+                extra_headers={"x-nexus-csrf": self.http.csrf},
+            ),
+            await self._rejected_ws_mutation(
+                "duplicate-protocol",
+                agent,
+                protocols=["nexus-v1", correct_protocol, "nexus-csrf.second-proof"],
+                cookie=self.http.cookie,
+            ),
+            await self._rejected_ws_mutation(
+                "missing-cookie-proof",
+                agent,
+                protocols=["nexus-v1", correct_protocol],
+                cookie=human_cookie,
+            ),
+        ]
+        lane = self.soak.sessions[agent.kind]
+        marker = f"V015_C1_WS_VALID_{suffix}"
+        attempt = await lane.begin_prompt(marker, 120)
+        positive_ws = await lane.finish_prompt(attempt, 120)
+        positive_ws = {
+            **positive_ws,
+            "commandId": attempt.command_id,
+            "assistantMarkerMatched": True,
+            "sessionId": agent.session_id,
+        }
+        evidence = {
+            "csrfMatrix": {
+                "unknownCookie": self.unknown_cookie,
+                "httpCases": http_records,
+                "websocketCases": ws_records,
+                "rejectedBeforeIngress": True,
+            },
+            "packedHttp": {
+                "mode": "remote-human",
+                "endpoint": "/api/v1/messages",
+                "cases": http_records,
+                "acceptedMessageId": accepted_message_id,
+                "acceptedRows": len(positive_rows),
+                "caller": self.human_name,
+            },
+            "packedWebsocket": {
+                "endpoint": "/api/v1/agent-sessions/:sessionId/events?view=agui",
+                "rejections": ws_records,
+                "positive": positive_ws,
+                "proofSource": "one exact nexus_csrf cookie/subprotocol pair",
+            },
+        }
+        canonical_json(evidence)
+        self.browser_security = evidence
+        return evidence
+
+    async def human_write(self, phase: str) -> dict[str, Any]:
+        cookie_sha256 = sha256_bytes(self.http.cookie.encode("utf-8"))
+        if cookie_sha256 != self.human_cookie_sha256:
+            raise AcceptanceFailure("persistent human cookie changed during daemon rebind matrix")
+        marker = f"V015_HUMAN_{phase}_{self.candidate.run_id}_{time.time_ns()}"
+        attempt = await self.soak.begin_message(
+            {"verb": "post", "thread": self.soak.thread},
+            self.soak.thread_topic,
+            marker,
+        )
+        delivery = await self.soak.finish_message(attempt, timeout=60)
+        row = await self.wait_history_marker(
+            f"/api/v1/threads/{quote(self.soak.thread, safe='')}/history?limit=100",
+            self.human_name,
+            marker,
+            f"human attribution {phase}",
+        )
+        if row.get("messageId") != attempt.message_id:
+            raise AcceptanceFailure(f"human attribution disagrees with accepted ID at {phase}")
+        record = {
+            "phase": phase,
+            "human": self.human_name,
+            "messageId": attempt.message_id,
+            "marker": marker,
+            "delivery": delivery,
+            "cookieSha256": cookie_sha256,
+            "attributedExactlyOnce": True,
+        }
+        self.human_rebind.append(record)
+        return record
+
+    async def open_fleet(self, after_seq: int) -> dict[str, Any]:
+        if self.fleet_socket is not None:
+            try:
+                await self.fleet_socket.close()
+            except BaseException:
+                pass
+        self.fleet_socket = await self.soak.developer._open(
+            self.http.ws_url("/api/agui/ws"),
+            self.http.cookie,
+            self.http.csrf,
+        )
+        await self.fleet_socket.send(canonical_json({
+            "t": "subscribe",
+            "topic": "sys.fleet.status",
+            "afterSeq": after_seq,
+        }).decode("utf-8"))
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            frame = json.loads(str(await asyncio.wait_for(
+                self.fleet_socket.recv(), deadline - time.monotonic()
+            )))
+            if not isinstance(frame, dict):
+                continue
+            self.fleet_frames.append(frame)
+            if frame.get("t") == "subscribe.ack" and frame.get("topic") == "sys.fleet.status":
+                return frame
+            if frame.get("t") in {"subscribe.err", "subscribe.gap"}:
+                raise AcceptanceFailure(f"fleet subscription failed before ack: {frame!r}")
+        raise AcceptanceFailure("fleet subscription did not acknowledge")
+
+    async def wait_fleet_event(self, label: str, *, timeout: float = 60) -> dict[str, Any]:
+        if self.fleet_socket is None:
+            raise AcceptanceFailure("fleet socket is not mounted")
+        starting_cursor = self.fleet_cursor
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            frame = json.loads(str(await asyncio.wait_for(
+                self.fleet_socket.recv(), deadline - time.monotonic()
+            )))
+            if not isinstance(frame, dict):
+                continue
+            self.fleet_frames.append(frame)
+            if frame.get("t") in {"subscribe.err", "queue.err"}:
+                raise AcceptanceFailure(f"{label} emitted an error frame: {frame!r}")
+            if frame.get("t") == "subscribe.gap":
+                return frame
+            if frame.get("type") == "developer.event" and isinstance(frame.get("event"), dict):
+                seq = frame["event"].get("seq")
+                if (
+                    isinstance(seq, int)
+                    and not isinstance(seq, bool)
+                    and seq > starting_cursor
+                    and seq > self.fleet_cursor
+                ):
+                    self.fleet_cursor = seq
+                    return frame
+        raise AcceptanceFailure(f"{label} did not produce a fleet event")
+
+    async def wait_fleet_gap(self, label: str, *, timeout: float = 60) -> dict[str, Any]:
+        if self.fleet_socket is None:
+            raise AcceptanceFailure("fleet socket is not mounted")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            frame = json.loads(str(await asyncio.wait_for(
+                self.fleet_socket.recv(), deadline - time.monotonic()
+            )))
+            if not isinstance(frame, dict):
+                continue
+            self.fleet_frames.append(frame)
+            if frame.get("t") == "subscribe.gap":
+                return frame
+            if frame.get("t") == "subscribe.err":
+                raise AcceptanceFailure(f"{label} emitted subscribe.err instead of gap: {frame!r}")
+        raise AcceptanceFailure(f"{label} did not signal a boot-aware gap")
+
+    async def concurrent_thread_subscribers(self) -> dict[str, Any]:
+        socket = await self.soak.developer._open(
+            self.http.ws_url("/api/agui/ws"), self.http.cookie, self.http.csrf
+        )
+        start_cursor = self.soak.developer.cursors[self.soak.thread_topic]
+        try:
+            await socket.send(canonical_json({
+                "t": "subscribe",
+                "topic": self.soak.thread_topic,
+                "afterSeq": start_cursor,
+            }).decode("utf-8"))
+            ack = json.loads(str(await asyncio.wait_for(socket.recv(), 30)))
+            if ack.get("t") != "subscribe.ack":
+                raise AcceptanceFailure(f"second thread subscriber was not acknowledged: {ack!r}")
+            history_before = self.history_reads
+            marker = f"V015_CONCURRENT_{self.candidate.run_id}_{time.time_ns()}"
+            attempt = await self.soak.begin_message(
+                {"verb": "post", "thread": self.soak.thread},
+                self.soak.thread_topic,
+                marker,
+            )
+            primary = await self.soak.finish_message(attempt, timeout=60)
+            deadline = time.monotonic() + 60
+            secondary_events: list[dict[str, Any]] = []
+            while time.monotonic() < deadline:
+                frame = json.loads(str(await asyncio.wait_for(
+                    socket.recv(), deadline - time.monotonic()
+                )))
+                if (
+                    isinstance(frame, dict)
+                    and frame.get("type") == "developer.event"
+                    and isinstance(frame.get("event"), dict)
+                    and frame["event"].get("messageId") == attempt.message_id
+                ):
+                    secondary_events.append(frame)
+                    break
+            if len(secondary_events) != 1:
+                raise AcceptanceFailure("concurrent subscriber missed or duplicated the committed event")
+            history_delta = self.history_reads - history_before
+            if history_delta != 0:
+                raise AcceptanceFailure("thread live delivery used REST history polling")
+            return {
+                "messageId": attempt.message_id,
+                "primary": primary,
+                "secondaryCount": len(secondary_events),
+                "historyReadsDuringDelivery": history_delta,
+            }
+        finally:
+            await socket.close()
+
+    async def straddle_restart(self, target: str) -> dict[str, Any]:
+        if target not in {"gateway", "daemon"}:
+            raise AcceptanceFailure(f"unsupported straddled restart target: {target}")
+        developer_marker = (
+            f"V015_STRADDLE_THREAD_{target}_{self.candidate.run_id}_{time.time_ns()}"
+        )
+        session_marker = (
+            f"V015_STRADDLE_SESSION_codex_{target}_{self.candidate.run_id}_{time.time_ns()}"
+        )
+        await self.soak.developer.close()
+        developer_attempt = await self.soak.begin_message(
+            {"verb": "post", "thread": self.soak.thread},
+            self.soak.thread_topic,
+            developer_marker,
+        )
+        codex = self.soak.sessions["codex"]
+        session_attempt = await codex.begin_prompt(session_marker, timeout=120)
+        await codex.close()
+        await self.restart(target)
+        developer_result, session_result = await asyncio.gather(
+            self.soak.finish_message(developer_attempt, timeout=120),
+            codex.finish_prompt(session_attempt, timeout=240),
+        )
+        record = {
+            "target": target,
+            "developer": {
+                "messageId": developer_attempt.message_id,
+                "marker": developer_marker,
+                **developer_result,
+            },
+            "session": {
+                "clientMessageId": session_attempt.client_message_id,
+                "marker": session_marker,
+                **session_result,
+            },
+            "acceptedBeforeDisconnect": True,
+            "completedAfterReconnect": True,
+        }
+        self.straddled_replay.append(record)
+        return record
+
+    async def straddle_gateway_restart(self) -> dict[str, Any]:
+        return await self.straddle_restart("gateway")
+
+    async def straddle_daemon_restart(self) -> dict[str, Any]:
+        return await self.straddle_restart("daemon")
+
+    async def prompt_agent_bus_actions(self, agent: LiveAgent) -> None:
+        lane = self.soak.sessions[agent.kind]
+        dm_marker = f"V015_AGENT_DM_{agent.kind}_{self.candidate.run_id}_{time.time_ns()}"
+        thread_marker = f"V015_AGENT_THREAD_{agent.kind}_{self.candidate.run_id}_{time.time_ns()}"
+        assistant_marker = f"V015_AGENT_DONE_{agent.kind}_{self.candidate.run_id}_{time.time_ns()}"
+        client_message_id = f"cm-{assistant_marker}"
+        instruction = (
+            f"Use your Nexus dm tool exactly once to send {dm_marker!r} to {self.human_name!r}. "
+            f"Use your Nexus thread post tool exactly once to post {thread_marker!r} to "
+            f"thread {self.soak.thread!r}. After both tools succeed, reply in this session with "
+            f"exactly {assistant_marker!r} and no other text."
+        )
+        session_start = len(lane.frames)
+        dm_start = len(self.human_dm.frames)
+        thread_start = len(self.soak.developer.frames)
+        before_cursor = lane.last_numeric_cursor
+        await lane.send({
+            "t": "input",
+            "mode": "session",
+            "target": {"name": agent.name, "agentId": agent.agent_id},
+            "text": instruction,
+            "clientMessageId": client_message_id,
+        })
+        ack = await lane.wait_for(
+            lambda frame: frame.get("t") == "input.ack" and frame.get("clientMessageId") == client_message_id,
+            after=session_start,
+            timeout=60,
+            label=f"{agent.kind} bus-action input ack",
+        )
+        command_id = ack.get("commandId")
+        if not isinstance(command_id, str) or not command_id:
+            raise AcceptanceFailure(f"{agent.kind} bus-action ack has no commandId")
+        self.soak.ledger.session_accepted.add(client_message_id)
+        started = await lane.wait_for(
+            lambda frame: (
+                self.core["session_event"](frame).get("type") == "RUN_STARTED"
+                and isinstance(self.core["session_event"](frame).get("runId"), str)
+            ),
+            after=session_start,
+            timeout=180,
+            label=f"{agent.kind} bus-action RUN_STARTED",
+        )
+        run_id = self.core["session_event"](started)["runId"]
+        assistant_start = await lane.wait_for(
+            lambda frame: (
+                self.core["session_event"](frame).get("type") == "TEXT_MESSAGE_START"
+                and self.core["session_event"](frame).get("role") == "assistant"
+            ),
+            after=session_start,
+            timeout=240,
+            label=f"{agent.kind} bus-action assistant start",
+        )
+        assistant_id = self.core["session_event"](assistant_start).get("messageId")
+        if not isinstance(assistant_id, str) or not assistant_id:
+            raise AcceptanceFailure(f"{agent.kind} bus-action assistant has no messageId")
+        assistant_start_index = next(
+            index
+            for index in range(session_start, len(lane.frames))
+            if lane.frames[index] is assistant_start
+        )
+        assistant_end = await lane.wait_for(
+            lambda frame: (
+                self.core["session_event"](frame).get("type") == "TEXT_MESSAGE_END"
+                and self.core["session_event"](frame).get("messageId") == assistant_id
+            ),
+            after=assistant_start_index + 1,
+            timeout=240,
+            label=f"{agent.kind} bus-action assistant end",
+        )
+        assistant_end_index = next(
+            index
+            for index in range(assistant_start_index + 1, len(lane.frames))
+            if lane.frames[index] is assistant_end
+        )
+        assistant_text = "".join(
+            str(self.core["session_event"](frame).get("delta"))
+            for frame in lane.frames[assistant_start_index + 1 : assistant_end_index]
+            if self.core["session_event"](frame).get("type") == "TEXT_MESSAGE_CONTENT"
+            and self.core["session_event"](frame).get("messageId") == assistant_id
+            and isinstance(self.core["session_event"](frame).get("delta"), str)
+        )
+        if assistant_text.strip() != assistant_marker:
+            raise AcceptanceFailure(
+                f"{agent.kind} bus-action assistant marker mismatch: {assistant_text!r}"
+            )
+        await lane.wait_for(
+            lambda frame: (
+                self.core["session_event"](frame).get("type") == "RUN_FINISHED"
+                and self.core["session_event"](frame).get("runId") == run_id
+                and (self.core["numeric_cursor"](frame) or -1) > before_cursor
+            ),
+            after=assistant_end_index + 1,
+            timeout=240,
+            label=f"{agent.kind} bus-action RUN_FINISHED",
+        )
+        self.soak.ledger.session_completed.add(client_message_id)
+        dm_topic = f"sys.dm.{self.human_name}"
+        dm_path = f"/api/v1/dms/{quote(agent.name, safe='')}/history?limit=100"
+        thread_path = f"/api/v1/threads/{quote(self.soak.thread, safe='')}/history?limit=100"
+        dm_row, thread_row = await asyncio.gather(
+            self.wait_history_marker(dm_path, agent.name, dm_marker, f"{agent.kind} DM"),
+            self.wait_history_marker(
+                thread_path,
+                agent.name,
+                thread_marker,
+                f"{agent.kind} thread post",
+            ),
+        )
+        dm_event_frame = await self.human_dm.wait_for(
+            lambda frame: (
+                frame.get("type") == "developer.event"
+                and isinstance(frame.get("event"), dict)
+                and frame["event"].get("topic") == dm_topic
+                and frame["event"].get("messageId") == dm_row["messageId"]
+            ),
+            after=dm_start,
+            timeout=120,
+            label=f"{agent.kind} agent-to-human DM event",
+        )
+        thread_event_frame = await self.soak.developer.wait_for(
+            lambda frame: (
+                frame.get("type") == "developer.event"
+                and isinstance(frame.get("event"), dict)
+                and frame["event"].get("topic") == self.soak.thread_topic
+                and frame["event"].get("messageId") == thread_row["messageId"]
+            ),
+            after=thread_start,
+            timeout=120,
+            label=f"{agent.kind} agent thread event",
+        )
+        dm_event = dm_event_frame["event"]
+        thread_event = thread_event_frame["event"]
+        if dm_event.get("messageId") != dm_row["messageId"] or thread_event.get("messageId") != thread_row["messageId"]:
+            raise AcceptanceFailure(f"{agent.kind} live event disagrees with canonical history")
+        record = {
+            "kind": agent.kind,
+            "agentId": agent.agent_id,
+            "sessionId": agent.session_id,
+            "clientMessageId": client_message_id,
+            "commandId": command_id,
+            "runId": run_id,
+            "assistantMarker": assistant_marker,
+            "dm": {"marker": dm_marker, "messageId": dm_row["messageId"], "topic": dm_topic},
+            "thread": {"marker": thread_marker, "messageId": thread_row["messageId"], "topic": self.soak.thread_topic},
+        }
+        self.reverse_delivery.append(record)
+        self.capture.jsonl("metrics", {"event": "agent-bus.correlation", **record})
+
+    async def stable_identity(self) -> None:
+        target = self.live_agents[0]
+        occupied = self.live_agents[1]
+        renamed = f"{target.name[:38]}-v015"
+        before = await asyncio.to_thread(self.core["identity_rows"], str(NEXUS_BIN))
+        renamed_active = False
+        rename = None
+        collision = None
+        renamed_rows: list[dict[str, Any]] = []
+        renamed_fleet: dict[str, Any] = {}
+        restored_fleet: dict[str, Any] = {}
+        id_first: dict[str, Any] = {}
+        marker = f"V015_ID_FIRST_{self.candidate.run_id}_{time.time_ns()}"
+        try:
+            rename = await asyncio.to_thread(
+                self.core["run_command"],
+                [str(NEXUS_BIN), "admin", "rename", target.agent_id, renamed, "--json"],
+                timeout=30,
+            )
+            renamed_active = True
+            renamed_rows = await asyncio.to_thread(
+                self.core["identity_rows"], str(NEXUS_BIN)
+            )
+            renamed_agents = (
+                LiveAgent(
+                    target.kind,
+                    renamed,
+                    target.agent_id,
+                    target.session_id,
+                    target.executable,
+                    target.executable_sha256,
+                    target.version,
+                    target.workspace,
+                ),
+                occupied,
+            )
+            require_exact_roster(renamed_rows, renamed_agents)
+            renamed_fleet = await self.wait_fleet_event(
+                "fleet live rename projection"
+            )
+            id_first = await asyncio.to_thread(
+                self.http.request,
+                "GET",
+                "/api/conversation/prompt?" + urlencode({
+                    "agentId": target.agent_id,
+                    "name": target.name,
+                    "project": "stale-project-metadata",
+                }),
+            )
+            id_first.pop("_headers", None)
+            if id_first.get("sessionId") != target.session_id:
+                raise AcceptanceFailure("stable agentId lost to stale display/project metadata")
+            await self.soak.sessions[target.kind].prompt(marker, timeout=180)
+            collision = await asyncio.to_thread(
+                self.core["run_command"],
+                [str(NEXUS_BIN), "admin", "rename", target.agent_id, occupied.name, "--json"],
+                timeout=30,
+                check=False,
+            )
+            if collision.returncode == 0:
+                raise AcceptanceFailure("renaming to an occupied agent name unexpectedly succeeded")
+        finally:
+            if renamed_active:
+                await asyncio.to_thread(
+                    self.core["run_command"],
+                    [str(NEXUS_BIN), "admin", "rename", target.agent_id, target.name, "--json"],
+                    timeout=30,
+                )
+        if rename is None or collision is None:
+            raise AcceptanceFailure("stable-identity rename matrix did not finish")
+        after = await asyncio.to_thread(self.core["identity_rows"], str(NEXUS_BIN))
+        self.core["check_identities"](after, self.soak.agents, self.soak.ledger)
+        require_exact_roster(after, self.live_agents)
+        restored_fleet = await self.wait_fleet_event(
+            "fleet live rename restoration projection"
+        )
+        self.identity_evidence = {
+            "target": {"agentId": target.agent_id, "staleName": target.name, "renamedTo": renamed},
+            "before": before,
+            "renameStdout": rename.stdout.strip(),
+            "renamedRoster": renamed_rows,
+            "renamedFleetEvent": renamed_fleet,
+            "idFirstRest": id_first,
+            "occupiedRename": {"returncode": collision.returncode, "stderr": collision.stderr.strip()},
+            "after": after,
+            "restoredFleetEvent": restored_fleet,
+            "sessionMarker": marker,
+        }
+
+    async def record_rest_agreement(self, phase: str) -> None:
+        for agent in self.live_agents:
+            by_id = await asyncio.to_thread(
+                self.http.request,
+                "GET",
+                "/api/conversation/prompt?" + urlencode({"agentId": agent.agent_id}),
+            )
+            by_name = await asyncio.to_thread(
+                self.http.request,
+                "GET",
+                "/api/conversation/prompt?" + urlencode({"name": agent.name}),
+            )
+            id_first = await asyncio.to_thread(
+                self.http.request,
+                "GET",
+                "/api/conversation/prompt?" + urlencode({
+                    "agentId": agent.agent_id,
+                    "name": f"stale-{agent.kind}-display",
+                    "project": "intentionally-wrong-project-metadata",
+                }),
+            )
+            by_id.pop("_headers", None)
+            by_name.pop("_headers", None)
+            id_first.pop("_headers", None)
+            if (
+                by_id.get("sessionId") != agent.session_id
+                or by_name.get("sessionId") != agent.session_id
+                or id_first.get("sessionId") != agent.session_id
+            ):
+                raise AcceptanceFailure(f"REST name/agentId disagreement for {agent.kind}")
+            self.rest_snapshots.append({
+                "phase": phase,
+                "kind": agent.kind,
+                "byId": by_id,
+                "byName": by_name,
+                "idWithStaleNameAndProjectMetadata": id_first,
+            })
+
+    async def restart(self, target: str) -> None:
+        before = await asyncio.to_thread(self.core["lifecycle_state"], self.candidate.lab_root / "nexus")
+        fleet_cursor_before = self.fleet_cursor
+        cursors = {
+            "developer": dict(self.soak.developer.cursors),
+            "humanDm": dict(self.human_dm.cursors),
+            "sessions": {kind: lane.last_numeric_cursor for kind, lane in self.soak.sessions.items()},
+        }
+        session_frame_starts = {
+            kind: len(lane.frames) for kind, lane in self.soak.sessions.items()
+        }
+        if target == "gateway" and self.fleet_socket is not None:
+            await self.fleet_socket.close()
+            self.fleet_socket = None
+        await asyncio.to_thread(
+            self.core["run_command"],
+            [str(LAB_PROCESS), "restart", target],
+            timeout=120,
+        )
+        await asyncio.to_thread(self.core["wait_health"], self.http)
+        after = await asyncio.to_thread(self.core["lifecycle_state"], self.candidate.lab_root / "nexus")
+        self.core["validate_restart_transition"](target, before, after)
+        await asyncio.gather(
+            self.soak.developer.connect(reconnect=True),
+            self.human_dm.connect(reconnect=True),
+            *(lane.connect(reconnect=True) for lane in self.soak.sessions.values()),
+        )
+        for topic, cursor in cursors["developer"].items():
+            if self.soak.developer.cursors.get(topic, -1) < cursor:
+                raise AcceptanceFailure(f"developer cursor regressed across {target} restart")
+        for kind, cursor in cursors["sessions"].items():
+            if self.soak.sessions[kind].last_numeric_cursor < cursor:
+                raise AcceptanceFailure(f"{kind} session cursor regressed across {target} restart")
+        for agent in self.live_agents:
+            lane = self.soak.sessions[agent.kind]
+            snapshot = await lane.wait_for(
+                lambda frame: frame.get("t") == "queue.snapshot",
+                after=session_frame_starts[agent.kind],
+                timeout=30,
+                label=f"{agent.kind} queue snapshot after {target} restart",
+            )
+            require_queue_snapshot(snapshot, agent.session_id)
+            rest = await asyncio.to_thread(self.queue_snapshot, agent)
+            require_queue_agreement(rest, snapshot, agent.session_id)
+            self.queue_agreements.append({
+                "phase": f"after-{target}-{len(self.restart_timeline) + 1}",
+                "kind": agent.kind,
+                "rest": rest,
+                "websocket": snapshot,
+            })
+        for topic, cursor in cursors["humanDm"].items():
+            if self.human_dm.cursors.get(topic, -1) < cursor:
+                raise AcceptanceFailure(f"human DM cursor regressed across {target} restart")
+        rows = await asyncio.to_thread(self.core["identity_rows"], str(NEXUS_BIN))
+        self.core["check_identities"](rows, self.soak.agents, self.soak.ledger)
+        require_exact_roster(rows, self.live_agents)
+        dlq = await asyncio.to_thread(self.core["dlq_total"], str(NEXUS_BIN))
+        self.soak.ledger.failure["deadLetters"] = max(
+            self.soak.ledger.failure["deadLetters"],
+            max(0, dlq - self.soak.baseline_dlq),
+        )
+        self.rosters.append({"phase": f"after-{target}", "rows": rows})
+        fleet_recovery: dict[str, Any]
+        if target == "gateway":
+            ack = await self.open_fleet(fleet_cursor_before)
+            fleet_recovery = {
+                "mode": "resume",
+                "afterSeq": fleet_cursor_before,
+                "ack": ack,
+            }
+        else:
+            gap = await self.wait_fleet_gap(f"fleet after {target} restart")
+            self.fleet_cursor = 0
+            ack = await self.open_fleet(0)
+            event = await self.wait_fleet_event(f"fleet resync after {target} restart")
+            fleet_recovery = {
+                "mode": "boot-gap-resync",
+                "previousCursor": fleet_cursor_before,
+                "gap": gap,
+                "ack": ack,
+                "event": event,
+            }
+        human = await self.human_write(f"after-{target}-{len(self.restart_timeline) + 1}")
+        checkpoint = {
+            "target": target,
+            "before": before.document(),
+            "after": after.document(),
+            "developerCursorsBefore": cursors["developer"],
+            "developerCursorsAfter": dict(self.soak.developer.cursors),
+            "humanDmCursorsBefore": cursors["humanDm"],
+            "humanDmCursorsAfter": dict(self.human_dm.cursors),
+            "sessionCursorsBefore": cursors["sessions"],
+            "sessionCursorsAfter": {kind: lane.last_numeric_cursor for kind, lane in self.soak.sessions.items()},
+            "fleet": fleet_recovery,
+            "humanWrite": human,
+        }
+        self.restart_timeline.append(checkpoint)
+        self.capture.jsonl("reconnect", checkpoint)
+
+    async def final_invariants(self) -> None:
+        dlq = await asyncio.to_thread(self.core["dlq_total"], str(NEXUS_BIN))
+        self.soak.ledger.failure["deadLetters"] = max(
+            self.soak.ledger.failure["deadLetters"],
+            max(0, dlq - self.soak.baseline_dlq),
+        )
+        queues_clear = await asyncio.gather(*(
+            asyncio.to_thread(self.core["queue_clear"], self.http, agent)
+            for agent in self.soak.agents
+        ))
+        if not all(queues_clear):
+            self.soak.ledger.failure["queueWedges"] += 1
+        lanes = [self.soak.developer, self.human_dm, *self.soak.sessions.values()]
+        if any(lane.reader is None or lane.reader.done() for lane in lanes):
+            self.soak.ledger.failure["crashLoops"] += 1
+        rows = await asyncio.to_thread(self.core["identity_rows"], str(NEXUS_BIN))
+        self.core["check_identities"](rows, self.soak.agents, self.soak.ledger)
+        require_exact_roster(rows, self.live_agents)
+
+    async def lane_isolation(self) -> dict[str, Any]:
+        probe_ledger = self.core["Ledger"]()
+        codex = self.core["AgentSessionLane"](
+            self.capture,
+            probe_ledger,
+            self.http,
+            self.soak.agents[0],
+        )
+        claude = self.live_agents[1]
+        try:
+            start = len(codex.frames)
+            await codex.connect()
+            await codex.wait_for(
+                lambda row: row.get("t") == "queue.snapshot",
+                after=start,
+                timeout=30,
+                label="isolated cross-lane probe materialization",
+            )
+            client_id = f"cm-cross-{time.time_ns()}"
+            send_start = len(codex.frames)
+            await codex.send({
+                "t": "input",
+                "mode": "session",
+                "target": {"name": claude.name, "agentId": claude.agent_id},
+                "text": "this must be rejected before ingress",
+                "clientMessageId": client_id,
+            })
+            frame = await codex.wait_for(
+                lambda row: row.get("t") == "input.err"
+                and row.get("clientMessageId") == client_id,
+                after=send_start,
+                timeout=30,
+                label="cross-lane input rejection",
+            )
+            if any(
+                row.get("t") == "input.ack"
+                and row.get("clientMessageId") == client_id
+                for row in codex.frames[send_start:]
+            ):
+                raise AcceptanceFailure("cross-lane input was acknowledged")
+            if probe_ledger.failure["queueWedges"] != 1:
+                raise AcceptanceFailure("cross-lane rejection was not one typed input.err")
+            return {
+                "clientMessageId": client_id,
+                "error": frame,
+                "isolatedProbeFailureCounters": probe_ledger.failure,
+            }
+        finally:
+            await codex.close()
+
+    async def queue_steer_compact_controls(self) -> dict[str, Any]:
+        lane = self.soak.sessions["codex"]
+        start = len(lane.frames)
+        active_id = f"cm-active-{time.time_ns()}"
+        await lane.send({
+            "t": "input",
+            "mode": "session",
+            "target": {
+                "name": self.live_agents[0].name,
+                "agentId": self.live_agents[0].agent_id,
+            },
+            "text": (
+                "Count slowly from 1 to 200, emitting each number separately. "
+                "Do not use tools."
+            ),
+            "clientMessageId": active_id,
+        })
+        active_ack = await lane.wait_for(
+            lambda frame: frame.get("t") == "input.ack"
+            and frame.get("clientMessageId") == active_id,
+            after=start,
+            timeout=60,
+            label="active control turn input ack",
+        )
+        started = await lane.wait_for(
+            lambda frame: self.core["session_event"](frame).get("type") == "RUN_STARTED",
+            after=start,
+            timeout=120,
+            label="active control turn RUN_STARTED",
+        )
+        run_id = self.core["session_event"](started).get("runId")
+        if not isinstance(run_id, str) or not run_id:
+            raise AcceptanceFailure("active control turn has no runId")
+
+        queued_id = f"cm-queued-{time.time_ns()}"
+        await lane.send({
+            "t": "input",
+            "mode": "session",
+            "text": "This queued input must be cancelled before execution.",
+            "clientMessageId": queued_id,
+        })
+        queued_ack = await lane.wait_for(
+            lambda frame: frame.get("t") == "input.ack"
+            and frame.get("clientMessageId") == queued_id,
+            after=start,
+            timeout=60,
+            label="queued control input ack",
+        )
+        if queued_ack.get("state") != "queued":
+            raise AcceptanceFailure(f"second in-flight input was not queued: {queued_ack!r}")
+        command_id = queued_ack.get("commandId")
+        revision = queued_ack.get("revision")
+        if (
+            not isinstance(command_id, str)
+            or not command_id
+            or isinstance(revision, bool)
+            or not isinstance(revision, int)
+        ):
+            raise AcceptanceFailure("queued input acknowledgement is incomplete")
+
+        steer_id = f"cm-steer-{time.time_ns()}"
+        await lane.send({
+            "t": "steer",
+            "text": "Stop counting now and finish this turn with exactly STEERED.",
+            "clientMessageId": steer_id,
+        })
+        steer_ack = await lane.wait_for(
+            lambda frame: frame.get("t") == "steer.ack"
+            and frame.get("clientMessageId") == steer_id,
+            after=start,
+            timeout=60,
+            label="steer acknowledgement",
+        )
+
+        compact_id = f"cc-compact-{time.time_ns()}"
+        await lane.send({
+            "t": "command",
+            "name": "compact",
+            "clientCommandId": compact_id,
+        })
+        compact_ack = await lane.wait_for(
+            lambda frame: frame.get("t") == "command.ack"
+            and frame.get("clientCommandId") == compact_id,
+            after=start,
+            timeout=60,
+            label="compact acknowledgement",
+        )
+        compact_done = await lane.wait_for(
+            lambda frame: frame.get("t") == "command.done"
+            and frame.get("clientCommandId") == compact_id,
+            after=start,
+            timeout=120,
+            label="compact completion",
+        )
+        if compact_done.get("ok") is not True:
+            raise AcceptanceFailure(f"compact command failed: {compact_done!r}")
+
+        mutation_id = f"mut-cancel-{time.time_ns()}"
+        await lane.send({
+            "t": "queue.cancel",
+            "clientMutationId": mutation_id,
+            "commandId": command_id,
+            "expectedRevision": revision,
+        })
+        cancel_ack = await lane.wait_for(
+            lambda frame: frame.get("t") == "queue.mutation.ack"
+            and frame.get("clientMutationId") == mutation_id,
+            after=start,
+            timeout=60,
+            label="queue cancellation acknowledgement",
+        )
+        if cancel_ack.get("state") != "cancelled":
+            raise AcceptanceFailure(f"queued command was not cancelled: {cancel_ack!r}")
+        finished = await lane.wait_for(
+            lambda frame: self.core["session_event"](frame).get("type") == "RUN_FINISHED"
+            and self.core["session_event"](frame).get("runId") == run_id,
+            after=start,
+            timeout=240,
+            label="steered active turn terminal",
+        )
+        queued_event_count = sum(
+            self.core["session_event"](frame).get("messageId") == queued_id
+            for frame in lane.frames[start:]
+        )
+        if queued_event_count != 0:
+            raise AcceptanceFailure("cancelled queued input reached the session event stream")
+        return {
+            "activeInput": active_ack,
+            "runId": run_id,
+            "queuedInput": queued_ack,
+            "steer": steer_ack,
+            "compact": {"ack": compact_ack, "done": compact_done},
+            "cancel": cancel_ack,
+            "terminal": finished,
+            "queuedEventCount": queued_event_count,
+        }
+
+    async def queue_authority_outage_recovery(self) -> dict[str, Any]:
+        lane = self.soak.sessions["codex"]
+        start = len(lane.frames)
+        before = await asyncio.to_thread(
+            self.core["lifecycle_state"], self.candidate.lab_root / "nexus"
+        )
+        await asyncio.to_thread(
+            self.core["run_command"],
+            [str(LAB_PROCESS), "stop", "daemon"],
+            timeout=120,
+        )
+        queue_error = await lane.wait_for(
+            lambda frame: frame.get("t") == "queue.err"
+            and frame.get("fatal") is False
+            and frame.get("phase") in {"refresh", "events"},
+            after=start,
+            timeout=60,
+            label="recoverable queue authority outage",
+        )
+        await asyncio.to_thread(
+            self.core["run_command"],
+            [str(LAB_PROCESS), "start", "daemon"],
+            timeout=120,
+        )
+        await asyncio.to_thread(self.core["wait_health"], self.http)
+        after = await asyncio.to_thread(
+            self.core["lifecycle_state"], self.candidate.lab_root / "nexus"
+        )
+        self.core["validate_restart_transition"]("daemon", before, after)
+        queue_restored = await lane.wait_for(
+            lambda frame: frame.get("t") == "queue.restored"
+            and isinstance(frame.get("seq"), int),
+            after=start,
+            timeout=90,
+            label="queue authority restoration",
+        )
+        snapshot_start = len(lane.frames)
+        await asyncio.gather(
+            self.soak.developer.connect(reconnect=True),
+            self.human_dm.connect(reconnect=True),
+            *(session.connect(reconnect=True) for session in self.soak.sessions.values()),
+        )
+        self.fleet_cursor = 0
+        await self.open_fleet(0)
+        await self.wait_fleet_event("fleet resync after queue-authority outage")
+        snapshot = await lane.wait_for(
+            lambda frame: frame.get("t") == "queue.snapshot",
+            after=snapshot_start,
+            timeout=30,
+            label="queue snapshot after authority recovery",
+        )
+        rest = await asyncio.to_thread(self.queue_snapshot, self.live_agents[0])
+        require_queue_agreement(rest, snapshot, self.live_agents[0].session_id)
+        self.queue_agreements.append({
+            "phase": "queue-authority-recovered",
+            "kind": "codex",
+            "rest": rest,
+            "websocket": snapshot,
+        })
+        human = await self.human_write("after-queue-authority-outage")
+        return {
+            "before": before.document(),
+            "error": queue_error,
+            "restored": queue_restored,
+            "after": after.document(),
+            "sameSocketUntilRestore": True,
+            "postRecoveryAgreement": self.queue_agreements[-1],
+            "humanWrite": human,
+        }
+
+    async def developer_backpressure(self) -> dict[str, Any]:
+        try:
+            from websockets.exceptions import ConnectionClosed
+        except ImportError as error:
+            raise AcceptanceFailure("Python package websockets is required") from error
+        thread = f"v015-bp-{hashlib.sha256((self.candidate.run_id + str(time.time_ns())).encode()).hexdigest()[:12]}"
+        self.core["run_command"](
+            [
+                str(NEXUS_BIN),
+                "thread",
+                "new",
+                thread,
+                "--project",
+                "v015-lab",
+                "--json",
+            ],
+            timeout=60,
+        )
+        topic = f"sys.message.thread.{thread}"
+        socket = await self.soak.developer._open(self.http.ws_url("/api/agui/ws"), self.http.cookie, self.http.csrf)
+        await socket.send(json.dumps({"t": "subscribe", "topic": topic, "afterSeq": 0}, separators=(",", ":")))
+        ack = json.loads(str(await asyncio.wait_for(socket.recv(), 30)))
+        if ack.get("t") != "subscribe.ack" or ack.get("topic") != topic:
+            raise AcceptanceFailure(f"backpressure subscriber did not receive subscribe.ack: {ack!r}")
+        accepted: list[str] = []
+        body = "B" * 16384
+        for index in range(768):
+            response = await asyncio.to_thread(
+                self.http.request,
+                "POST",
+                "/api/v1/messages",
+                {
+                    "to": {"verb": "post", "thread": thread},
+                    "body": f"{index:04d}:{body}",
+                    "idempotencyKey": f"{thread}-{index}",
+                },
+            )
+            response.pop("_headers", None)
+            message_id = self.core["recursive_string"](response, ("messageId", "message_id"))
+            if not message_id:
+                raise AcceptanceFailure("backpressure post returned no messageId")
+            accepted.append(message_id)
+            if socket.close_code is not None:
+                break
+        if socket.close_code is None:
+            try:
+                await asyncio.wait_for(socket.wait_closed(), 10)
+            except asyncio.TimeoutError as error:
+                await socket.close()
+                raise AcceptanceFailure(
+                    "developer slow-reader load did not reach the bounded 1013 backpressure path"
+                ) from error
+        first: list[str] = []
+        try:
+            while True:
+                raw = await asyncio.wait_for(socket.recv(), 30)
+                frame = json.loads(str(raw))
+                event = frame.get("event") if isinstance(frame, dict) else None
+                if isinstance(event, dict) and isinstance(event.get("messageId"), str):
+                    first.append(event["messageId"])
+        except ConnectionClosed:
+            pass
+        except asyncio.TimeoutError as error:
+            await socket.close()
+            raise AcceptanceFailure("developer backpressure socket did not close within 30 seconds") from error
+        code = socket.close_code or 0
+        reason = socket.close_reason or ""
+        cursor = parse_developer_backpressure(code, reason)
+        await socket.close()
+        resumed = self.core["DeveloperLane"](self.capture, self.soak.ledger, self.http, (topic,))
+        resumed.cursors[topic] = cursor
+        await resumed.connect(reconnect=True)
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            observed = first + [
+                row.get("event", {}).get("messageId")
+                for row in resumed.frames
+                if row.get("type") == "developer.event" and isinstance(row.get("event"), dict)
+            ]
+            if all(observed.count(message_id) == 1 for message_id in accepted):
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise AcceptanceFailure("developer 1013 replay did not recover every accepted message exactly once")
+        await resumed.close()
+        return {
+            "topic": topic,
+            "accepted": len(accepted),
+            "closeCode": code,
+            "closeReason": reason,
+            "resumeAfter": cursor,
+            "beforeClose": len(first),
+            "replayed": len(accepted) - len(first),
+            "exactOnce": True,
+        }
+
+    async def agent_session_backpressure_and_queue_full(self) -> dict[str, Any]:
+        try:
+            import websockets
+        except ImportError as error:
+            raise AcceptanceFailure("Python package websockets is required") from error
+        probe_ledger = self.core["Ledger"]()
+        lane = self.core["AgentSessionLane"](
+            self.capture,
+            probe_ledger,
+            self.http,
+            self.soak.agents[1],
+        )
+        path = (
+            f"/api/v1/agent-sessions/{quote(self.live_agents[1].session_id, safe='')}"
+            "/events?view=agui"
+        )
+        slow: Any = None
+        resumed: Any = None
+
+        async def open_raw(raw_path: str, max_queue: int) -> Any:
+            options = {
+                "subprotocols": ["nexus-v1", f"nexus-csrf.{self.http.csrf}"],
+                "open_timeout": 30,
+                "close_timeout": 5,
+                "ping_interval": None,
+                "max_queue": max_queue,
+            }
+            try:
+                return await websockets.connect(
+                    self.http.ws_url(raw_path),
+                    additional_headers={"Cookie": self.http.cookie},
+                    **options,
+                )
+            except TypeError:
+                return await websockets.connect(
+                    self.http.ws_url(raw_path),
+                    extra_headers={"Cookie": self.http.cookie},
+                    **options,
+                )
+
+        try:
+            snapshot_start = len(lane.frames)
+            await lane.connect()
+            initial_snapshot = await lane.wait_for(
+                lambda frame: frame.get("t") == "queue.snapshot",
+                after=0,
+                timeout=30,
+                label="isolated capacity-probe queue snapshot",
+            )
+            require_queue_snapshot(initial_snapshot, self.live_agents[1].session_id)
+            active_id = f"cm-bp-active-{time.time_ns()}"
+            await lane.send({
+                "t": "input",
+                "mode": "session",
+                "text": "Count slowly from 1 to 500 and emit every number separately.",
+                "clientMessageId": active_id,
+            })
+            active_ack = await lane.wait_for(
+                lambda frame: frame.get("t") == "input.ack"
+                and frame.get("clientMessageId") == active_id,
+                after=snapshot_start,
+                timeout=60,
+                label="session backpressure active input ack",
+            )
+            started = await lane.wait_for(
+                lambda frame: self.core["session_event"](frame).get("type") == "RUN_STARTED",
+                after=snapshot_start,
+                timeout=120,
+                label="session backpressure active run",
+            )
+            run_id = self.core["session_event"](started).get("runId")
+            if not isinstance(run_id, str) or not run_id:
+                raise AcceptanceFailure("session backpressure run has no runId")
+
+            slow = await open_raw(path, 1)
+            first = json.loads(str(await asyncio.wait_for(slow.recv(), 30)))
+            require_queue_snapshot(first, self.live_agents[1].session_id)
+
+            accepted: list[dict[str, Any]] = []
+            rejected: list[dict[str, Any]] = []
+            payload = "Q" * 32768
+            for index in range(128):
+                client_id = f"cm-bp-{index:03d}-{time.time_ns()}"
+                frame_start = len(lane.frames)
+                await lane.send({
+                    "t": "input",
+                    "mode": "session",
+                    "text": f"{index:03d}:{payload}",
+                    "clientMessageId": client_id,
+                })
+                result = await lane.wait_for(
+                    lambda frame, client_id=client_id: (
+                        frame.get("clientMessageId") == client_id
+                        and frame.get("t") in {"input.ack", "input.err"}
+                    ),
+                    after=frame_start,
+                    timeout=30,
+                    label=f"queue capacity response {index}",
+                )
+                if result.get("t") == "input.ack":
+                    if result.get("state") != "queued" or not isinstance(
+                        result.get("commandId"), str
+                    ):
+                        raise AcceptanceFailure(
+                            f"capacity probe escaped the bounded queue: {result!r}"
+                        )
+                    accepted.append(result)
+                else:
+                    if not result.get("error") and not result.get("code"):
+                        raise AcceptanceFailure(
+                            f"queue capacity rejection was not typed: {result!r}"
+                        )
+                    rejected.append(result)
+                if slow.close_code == 1013:
+                    break
+            try:
+                await asyncio.wait_for(slow.wait_closed(), 30)
+            except asyncio.TimeoutError as error:
+                raise AcceptanceFailure(
+                    "agent-session slow reader did not close with backpressure"
+                ) from error
+            code = slow.close_code or 0
+            reason = slow.close_reason or ""
+            resume_cursor = parse_session_backpressure(code, reason)
+
+            cancelled: list[str] = []
+            for ack in accepted:
+                command_id = ack["commandId"]
+                rest = await asyncio.to_thread(self.queue_snapshot, self.live_agents[1])
+                revision = rest.get("revision")
+                if isinstance(revision, bool) or not isinstance(revision, int):
+                    raise AcceptanceFailure("capacity cleanup snapshot has no revision")
+                if not any(
+                    row.get("commandId") == command_id for row in rest["commands"]
+                ):
+                    raise AcceptanceFailure(
+                        f"accepted queued command vanished before cancellation: {command_id}"
+                    )
+                mutation_id = f"mut-bp-{command_id}"
+                mutation_start = len(lane.frames)
+                await lane.send({
+                    "t": "queue.cancel",
+                    "clientMutationId": mutation_id,
+                    "commandId": command_id,
+                    "expectedRevision": revision,
+                })
+                mutation = await lane.wait_for(
+                    lambda frame, mutation_id=mutation_id: (
+                        frame.get("clientMutationId") == mutation_id
+                        and frame.get("t") in {"queue.mutation.ack", "queue.mutation.err"}
+                    ),
+                    after=mutation_start,
+                    timeout=30,
+                    label=f"backpressure cleanup {command_id}",
+                )
+                if (
+                    mutation.get("t") != "queue.mutation.ack"
+                    or mutation.get("state") != "cancelled"
+                ):
+                    raise AcceptanceFailure(
+                        f"backpressure queue cleanup failed: {mutation!r}"
+                    )
+                cancelled.append(command_id)
+            if len(cancelled) != len(accepted):
+                raise AcceptanceFailure("capacity probe did not cancel every accepted queue row")
+
+            steer_id = f"cm-bp-stop-{time.time_ns()}"
+            steer_start = len(lane.frames)
+            await lane.send({
+                "t": "steer",
+                "text": "Stop immediately and finish.",
+                "clientMessageId": steer_id,
+            })
+            await lane.wait_for(
+                lambda frame: frame.get("t") == "steer.ack"
+                and frame.get("clientMessageId") == steer_id,
+                after=steer_start,
+                timeout=60,
+                label="backpressure active-turn interrupt",
+            )
+            await lane.wait_for(
+                lambda frame: self.core["session_event"](frame).get("type") == "RUN_FINISHED"
+                and self.core["session_event"](frame).get("runId") == run_id,
+                after=steer_start,
+                timeout=240,
+                label="backpressure active-turn terminal",
+            )
+
+            resume_path = path + "&" + urlencode({"after": resume_cursor})
+            resumed = await open_raw(resume_path, 512)
+            replay_frames: list[dict[str, Any]] = []
+            replay_snapshot: dict[str, Any] | None = None
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                frame = json.loads(str(await asyncio.wait_for(
+                    resumed.recv(), deadline - time.monotonic()
+                )))
+                if not isinstance(frame, dict):
+                    raise AcceptanceFailure("session replay emitted a non-object frame")
+                replay_frames.append(frame)
+                if frame.get("t") == "queue.snapshot":
+                    replay_snapshot = frame
+                    break
+            if replay_snapshot is None:
+                raise AcceptanceFailure("session 1013 resume produced no queue snapshot")
+            rest = await asyncio.to_thread(self.queue_snapshot, self.live_agents[1])
+            require_queue_agreement(rest, replay_snapshot, self.live_agents[1].session_id)
+            cursor_frames = [
+                frame for frame in replay_frames if isinstance(frame.get("cursor"), str)
+            ]
+            fingerprints = [sha256_bytes(canonical_json(frame)) for frame in cursor_frames]
+            if len(fingerprints) != len(set(fingerprints)):
+                raise AcceptanceFailure("session 1013 resume duplicated a replay frame")
+            if not cursor_frames:
+                raise AcceptanceFailure("session 1013 resume emitted no cursor-bearing replay")
+            return {
+                "activeInput": active_ack,
+                "runId": run_id,
+                "closeCode": code,
+                "closeReason": reason,
+                "resumeCursor": resume_cursor,
+                "acceptedQueued": len(accepted),
+                "capacityErrors": len(rejected),
+                "cancelled": len(cancelled),
+                "replayFrames": len(replay_frames),
+                "postReplayQueue": replay_snapshot,
+                "outboundQueueFullRecovery": "typed-1013-resume",
+            }
+        finally:
+            await lane.close()
+            for socket in (slow, resumed):
+                if socket is not None:
+                    try:
+                        await socket.close()
+                    except BaseException:
+                        pass
+
+    async def run(self) -> dict[str, dict[str, bytes]]:
+        try:
+            await self.setup()
+            await self._checkpoint("setup")
+            await self.browser_mutation_security()
+            await self._checkpoint("browser-mutation-security")
+            await self.stable_identity()
+            await self._checkpoint("stable-identity")
+            await self.record_rest_agreement("initial")
+            self.concurrent_delivery = await self.concurrent_thread_subscribers()
+            await self._checkpoint("concurrent-thread-subscribers")
+            await self.soak.traffic(allow_session=True)
+            await self._checkpoint("initial-live-agent-traffic")
+            await self.straddle_gateway_restart()
+            await self._checkpoint("straddled-gateway-restart")
+            await self.restart(RESTART_PLAN[1])
+            await self._checkpoint("second-gateway-restart")
+            await self.straddle_daemon_restart()
+            await self._checkpoint("straddled-daemon-restart")
+            await self.restart(RESTART_PLAN[3])
+            await self._checkpoint("second-daemon-restart")
+            if [row.get("target") for row in self.restart_timeline] != list(RESTART_PLAN):
+                raise AcceptanceFailure(
+                    "restart evidence is not two consecutive Gateway then daemon restarts"
+                )
+            await self.record_rest_agreement("after-restarts")
+            await self.soak.traffic(allow_session=True)
+            for agent in self.live_agents:
+                await self.prompt_agent_bus_actions(agent)
+            await self._checkpoint("bidirectional-live-agent-traffic")
+            self.queue_control_evidence = await self.queue_steer_compact_controls()
+            await self._checkpoint("queue-steer-compact-controls")
+            isolation = await self.lane_isolation()
+            self.session_backpressure = (
+                await self.agent_session_backpressure_and_queue_full()
+            )
+            await self._checkpoint("agent-session-backpressure")
+            self.backpressure = await self.developer_backpressure()
+            await self._checkpoint("developer-backpressure")
+            self.queue_recovery = await self.queue_authority_outage_recovery()
+            await self._checkpoint("queue-authority-recovery")
+            await self.final_invariants()
+            self.soak.ledger.finalize_delivery_counts()
+            failures = {key: value for key, value in self.soak.ledger.failure.items() if value != 0}
+            if failures:
+                raise AcceptanceFailure(f"backend acceptance failure counters are nonzero: {failures}")
+            return self.record_observations(isolation)
+        finally:
+            closers = [self.soak.close()]
+            if self.human_dm is not None:
+                closers.append(self.human_dm.close())
+            if self.fleet_socket is not None:
+                closers.append(self.fleet_socket.close())
+            await asyncio.gather(*closers, return_exceptions=True)
+
+    def record_observations(
+        self,
+        isolation: dict[str, Any],
+    ) -> dict[str, dict[str, bytes]]:
+        developer_frames = [
+            row
+            for row in self.capture.rows["dualWebsocketFrames"]
+            if row.get("lane") == "developer"
+        ]
+        session_frames = [
+            row
+            for row in self.capture.rows["dualWebsocketFrames"]
+            if str(row.get("lane", "")).startswith("agent-session:")
+        ]
+        correlations = [
+            row
+            for row in self.capture.rows["metrics"]
+            if row.get("event") == "agent-session.correlation"
+        ]
+        if not developer_frames or not self.fleet_frames or not session_frames:
+            raise AcceptanceFailure("one or more required real WebSocket frame captures are empty")
+        delivery = {
+            "expected": self.soak.ledger.expected_messages,
+            "received": dict(self.soak.ledger.received_messages),
+            "sessionAccepted": sorted(self.soak.ledger.session_accepted),
+            "sessionCompleted": sorted(self.soak.ledger.session_completed),
+            "agentToHumanAndThread": self.reverse_delivery,
+            "failureCounters": self.soak.ledger.failure,
+        }
+        by_agent = {
+            kind: {
+                "sessionCorrelations": [row for row in correlations if row.get("kind") == kind],
+                "busCorrelations": [row for row in self.reverse_delivery if row.get("kind") == kind],
+            }
+            for kind in ("codex", "claude")
+        }
+        if any(
+            not row["sessionCorrelations"] or not row["busCorrelations"]
+            for row in by_agent.values()
+        ):
+            raise AcceptanceFailure(
+                "Codex and Claude must each have progressive session and bus correlations"
+            )
+        restart_targets = [row.get("target") for row in self.restart_timeline]
+        if restart_targets != list(RESTART_PLAN):
+            raise AcceptanceFailure("restart timeline is incomplete or out of order")
+        if len(self.human_rebind) < 1 + len(RESTART_PLAN):
+            raise AcceptanceFailure("persistent human was not durably attributed after every restart")
+        cookie_hashes = {row.get("cookieSha256") for row in self.human_rebind}
+        if cookie_hashes != {self.human_cookie_sha256}:
+            raise AcceptanceFailure("persistent human evidence used more than one cookie")
+        if (
+            self.unknown_cookie.get("acceptedRows") != 0
+            or self.unknown_cookie.get("status") not in {401, 403}
+        ):
+            raise AcceptanceFailure("unknown-cookie zero-ingress evidence is missing")
+        gateway_module = absolute(
+            Path(str(self.candidate.manifest["environment"]["NEXUS_V015_GATEWAY_MODULE"]))
+        )
+        gateway_module_bytes = checked_file(
+            gateway_module,
+            self.candidate.install_root,
+            "packed Gateway module",
+        )
+        polling_occurrences = retired_polling_occurrences(gateway_module_bytes)
+        if polling_occurrences != 0:
+            raise AcceptanceFailure(
+                "packed Gateway still contains the retired developer-event polling source"
+            )
+        if self.concurrent_delivery.get("historyReadsDuringDelivery") != 0:
+            raise AcceptanceFailure("concurrent thread delivery was not push-only")
+        no_polling = {
+            "observedConcurrentDelivery": self.concurrent_delivery,
+            "totalExplicitHistoryReadsForAttribution": self.history_reads,
+            "developerFrameCount": len(developer_frames),
+            "gatewayModule": str(gateway_module),
+            "gatewayModuleSha256": sha256_bytes(gateway_module_bytes),
+            "retiredPollingSourceOccurrences": polling_occurrences,
+        }
+        upgrades = {
+            "gatewayUrl": GATEWAY_URL,
+            "humanCookieSha256": self.human_cookie_sha256,
+            "developerReconnects": self.soak.developer.reconnects,
+            "sessionReconnects": {
+                kind: lane.reconnects for kind, lane in self.soak.sessions.items()
+            },
+            "fleetFrames": len(self.fleet_frames),
+        }
+        self.observations.record("B1", "identityMatrix", {"rosters": self.rosters})
+        self.observations.record("B1", "renameRegression", self.identity_evidence)
+        self.observations.record("B1", "agentIdResolution", {
+            "rest": self.rest_snapshots,
+            "queueAgreements": self.queue_agreements,
+            "sessionMarkers": correlations,
+        })
+        self.observations.record("B2", "restartTimeline", {
+            "expectedOrder": list(RESTART_PLAN),
+            "observed": self.restart_timeline,
+        })
+        self.observations.record("B2", "rosterComparison", {"snapshots": self.rosters})
+        self.observations.record("B2", "humanRebind", {
+            "cookieSha256": self.human_cookie_sha256,
+            "unknownCookie": self.unknown_cookie,
+            "durableWrites": self.human_rebind,
+        })
+        if set(self.browser_security) != set(RESULT_SPECS["C1"]):
+            raise AcceptanceFailure("C1 browser mutation evidence is incomplete")
+        for name in RESULT_SPECS["C1"]:
+            self.observations.record("C1", name, self.browser_security[name])
+        self.observations.record("C2", "upgrades", upgrades)
+        self.observations.record("C2", "frames", {
+            "developer": developer_frames,
+            "fleet": self.fleet_frames,
+        })
+        self.observations.record("C2", "cursorCheckpoints", {
+            "restarts": self.restart_timeline,
+            "straddledReplay": self.straddled_replay,
+            "concurrentSubscribers": self.concurrent_delivery,
+            "finalDeveloper": dict(self.soak.developer.cursors),
+            "finalFleet": self.fleet_cursor,
+        })
+        self.observations.record("C2", "backpressure", self.backpressure)
+        self.observations.record("C2", "noPolling", no_polling)
+        self.observations.record("C3", "sessionFrames", {"rows": session_frames})
+        self.observations.record("C3", "correlation", {"rows": correlations})
+        self.observations.record("C3", "reconnect", {
+            "timeline": self.restart_timeline,
+            "straddledReplay": self.straddled_replay,
+            "cursors": {
+                kind: lane.last_numeric_cursor
+                for kind, lane in self.soak.sessions.items()
+            },
+        })
+        self.observations.record("C3", "backpressure", self.session_backpressure)
+        self.observations.record("C3", "laneIsolation", {
+            "crossLane": isolation,
+            "queueSteerCompact": self.queue_control_evidence,
+        })
+        self.observations.record("C4", "restSnapshot", {
+            "routing": self.rest_snapshots,
+            "queueAgreements": self.queue_agreements,
+        })
+        self.observations.record("C4", "websocketDeltas", delivery)
+        self.observations.record("C4", "recovery", self.queue_recovery)
+        d1 = self.candidate.d1_evidence
+        if set(d1) != {"packedInventory", "installLog", "foreignCwd"}:
+            raise AcceptanceFailure("clean packed-install evidence is incomplete")
+        self.observations.record("D1", "packedInventory", d1["packedInventory"])
+        self.observations.record("D1", "installLog", d1["installLog"])
+        self.observations.record("D1", "foreignCwd", d1["foreignCwd"])
+        self.observations.record("D1", "shutdown", {
+            "restartPlan": list(RESTART_PLAN),
+            "restartTimeline": self.restart_timeline,
+            "observedRestartCount": len(self.restart_timeline),
+            "developerBackpressure": self.backpressure,
+            "agentSessionBackpressure": self.session_backpressure,
+        })
+        for index, kind in enumerate(("codex", "claude")):
+            agent = self.live_agents[index]
+            self.observations.record("F1", kind, {
+                "identity": agent.__dict__ | {
+                    "executable": str(agent.executable),
+                    "workspace": str(agent.workspace),
+                },
+                "correlations": by_agent[kind],
+            })
+        self.observations.record("F1", "deliveryMatrix", {
+            **delivery,
+            "concurrentThreadSubscribers": self.concurrent_delivery,
+            "queueSteerCompact": self.queue_control_evidence,
+        })
+        return self.observations.payloads()
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="scripts/nexus-v015-ws-acceptance",
+        description="Run packed/authenticated v0.1.5 developer-event and agent-session WebSocket acceptance.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("source", "packed"),
+        metavar="packed",
+        required=True,
+        help="candidate mode; release evidence requires --mode packed",
+    )
+    parser.add_argument("--evidence-dir", required=True, type=Path, help="canonical NEXUS_LAB_ROOT evidence directory")
+    parser.add_argument("--run-id", help="must equal NEXUS_V015_RUN_ID (defaults to that environment value)")
+    parser.add_argument(
+        "--verify-candidate-only",
+        action="store_true",
+        help=(
+            "validate packed candidate/readiness bindings and print their canonical "
+            "digest without network or agent work"
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def revalidate_after_acceptance(candidate: Candidate) -> RuntimeObservation:
+    """Rebind the immutable candidate and live topology after all mutations.
+
+    Agent launches, process restarts, and accepted traffic are deliberately
+    mutating acceptance work.  No result may be published from the preflight
+    snapshot alone: the sealed payloads, readiness ledger, complete installed
+    dependency/Lens trees, and current daemon/Gateway/Lens processes must all
+    still describe the same candidate immediately before publication.
+    """
+
+    observed = validate_candidate(
+        candidate.lab_root,
+        candidate.run_root.parent,
+        candidate.run_id,
+    )
+    if observed != candidate:
+        raise AcceptanceFailure("packed candidate changed during acceptance")
+    return observe_runtime(observed)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    if os.environ.get("OCULAR_LAB") != "1":
+        raise AcceptanceFailure("OCULAR_LAB=1 is required; refusing host runtime access")
+    lab_raw = os.environ.get("NEXUS_LAB_ROOT")
+    if not lab_raw:
+        raise AcceptanceFailure("NEXUS_LAB_ROOT is required")
+    lab_root = absolute(Path(lab_raw))
+    checked_directory(lab_root, lab_root, create=False)
+    if args.mode != "packed":
+        raise AcceptanceFailure("canonical v0.1.5 WebSocket evidence requires --mode packed")
+    env_run_id = os.environ.get("NEXUS_V015_RUN_ID", "")
+    run_id = args.run_id or env_run_id
+    if SAFE_ID.fullmatch(run_id) is None or run_id != env_run_id:
+        raise AcceptanceFailure("run ID must be safe and exactly match NEXUS_V015_RUN_ID")
+    evidence_dir = require_canonical_evidence_root(args.evidence_dir, lab_root)
+    candidate = validate_candidate(lab_root, evidence_dir, run_id)
+    runtime = observe_runtime(candidate)
+    if args.verify_candidate_only:
+        sys.stdout.buffer.write(pretty_json(candidate_verification_document(candidate, runtime)))
+        return 0
+    publisher = EvidencePublisher(candidate.run_root, candidate.run_id, candidate.digest)
+    publisher.assert_targets_absent()
+    launch_live_agents(candidate)
+    agents = load_agents(candidate)
+    core = load_soak_core(candidate)
+    payloads = asyncio.run(BackendAcceptance(core, candidate, agents).run())
+    if set(payloads) != set(RESULT_SPECS):
+        raise AcceptanceFailure("backend acceptance did not produce every canonical result")
+    revalidate_after_acceptance(candidate)
+    for gate in RESULT_SPECS:
+        publisher.publish(gate, payloads[gate])
+    print(f"v0.1.5 WebSocket acceptance: PASS run={candidate.run_id} candidate={candidate.digest}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except AcceptanceFailure as error:
+        print(f"error: {error}", file=sys.stderr)
+        raise SystemExit(1)

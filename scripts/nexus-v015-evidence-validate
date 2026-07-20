@@ -1,0 +1,2670 @@
+#!/usr/bin/env python3
+"""Fail closed unless one v0.1.5 release evidence ledger is complete."""
+
+from __future__ import annotations
+
+import errno
+from dataclasses import dataclass
+import ctypes
+import hashlib
+import json
+import math
+import os
+from pathlib import Path, PurePosixPath
+import re
+import stat
+import sys
+import time
+from typing import Any, NoReturn
+
+
+VERSION = "0.1.5"
+SOURCE_NAMES = ("nexus", "lens", "egregore", "pactree", "pactreePython", "pactreeFs")
+PACKAGE_NAMES = ("@egregore/nexus", "@egregore/nexus-cli", "@egregore/nexus-gateway")
+OCULAR_CASES = tuple(f"O{index}" for index in range(1, 19))
+WEBUI_CASES = tuple(f"W{index}" for index in range(1, 9))
+EXPECTED_CASES = OCULAR_CASES + WEBUI_CASES
+EXPECTED_CASE_SET = frozenset(EXPECTED_CASES)
+OCULAR_ARTIFACTS = (
+    "preScreenshot",
+    "postScreenshot",
+    "dom",
+    "console",
+    "network",
+    "websocket",
+    "processLogs",
+    "health",
+    "pactbin2",
+)
+WEBUI_ARTIFACTS = OCULAR_ARTIFACTS[:-1]
+MECHANISM_CASES = frozenset({"O3", "O4"})
+SOAK_COUNTERS = (
+    "deadLetters",
+    "lostAcceptedMessages",
+    "duplicateAcceptedMessages",
+    "crossRouteDeliveries",
+    "silentSubscriptionFailures",
+    "offlineRestoredParticipants",
+    "identityDrift",
+    "queueWedges",
+    "crashLoops",
+)
+SOAK_INVARIANTS = (
+    "duration",
+    "restartCount",
+    "restartStraddle",
+    "traffic",
+    "sessionCorrelation",
+    "delivery",
+    "websocketReconnect",
+    "resources",
+    "topology",
+    "diagnostics",
+)
+SOAK_PROCESS_ROLES = (
+    "daemon",
+    "gateway",
+    "gatewayProxy",
+    "xvfb",
+    "lens",
+    "lensCdpProxy",
+    "webuiBrowser",
+    "webuiCdpProxy",
+)
+RESULT_SPECS: dict[str, tuple[Path, tuple[str, ...]]] = {
+    "A1": (
+        Path("results/A1-candidate-identity/result.json"),
+        ("versionReport", "cargoVersions", "packedInventory"),
+    ),
+    "A2": (
+        Path("results/A2-host-isolation/result.json"),
+        ("beforeSnapshot", "afterSnapshot", "comparison"),
+    ),
+    "B1": (
+        Path("results/B1-stable-identity/result.json"),
+        ("identityMatrix", "renameRegression", "agentIdResolution"),
+    ),
+    "B2": (
+        Path("results/B2-restart-reconciliation/result.json"),
+        ("restartTimeline", "rosterComparison", "humanRebind"),
+    ),
+    "B3": (
+        Path("results/B3-human-webconsole-attribution/result.json"),
+        ("attributionRows", "renderedAttribution", "principalTransitions"),
+    ),
+    "C1": (
+        Path("results/C1-browser-mutation-security/result.json"),
+        ("csrfMatrix", "packedHttp", "packedWebsocket"),
+    ),
+    "C2": (
+        Path("results/C2-developer-event-websocket/result.json"),
+        ("upgrades", "frames", "cursorCheckpoints", "backpressure", "noPolling"),
+    ),
+    "C3": (
+        Path("results/C3-agent-session-websocket/result.json"),
+        ("sessionFrames", "correlation", "reconnect", "backpressure", "laneIsolation"),
+    ),
+    "C4": (
+        Path("results/C4-rest-websocket-agreement/result.json"),
+        ("restSnapshot", "websocketDeltas", "recovery"),
+    ),
+    "D1": (
+        Path("results/D1-clean-packed-install/result.json"),
+        ("packedInventory", "installLog", "foreignCwd", "shutdown"),
+    ),
+    "D2": (
+        Path("results/D2-webconsole-cli/result.json"),
+        ("cliTranscript", "discoveryRecovery", "occupiedPort"),
+    ),
+    "D3": (
+        Path("results/D3-webui-browser/result.json"),
+        ("browserTranscript", "attribution", "reconnect"),
+    ),
+    "E1": (
+        Path("results/E1-pactbin2-session-store/result.json"),
+        ("revisions", "roundTrip", "damageFixtures"),
+    ),
+    "E2": (
+        Path("results/E2-lens-ocular/result.json"),
+        ("ocularSummary", "affordanceCoverage", "artifactsIndex"),
+    ),
+    "F1": (
+        Path("results/F1-live-codex-claude/result.json"),
+        ("codex", "claude", "deliveryMatrix"),
+    ),
+    "F2": (
+        Path("results/F2-message-hooks/result.json"),
+        ("shell", "javascript", "python", "timing"),
+    ),
+    "F3": (
+        Path("results/F3-restart-soak/result.json"),
+        (
+            "metrics",
+            "dualWebsocketFrames",
+            "reconnectCheckpoints",
+            "memory",
+            "disk",
+            "finalProcesses",
+            "finalListeners",
+            "logs",
+        ),
+    ),
+    "DIFF": (
+        Path("release/diff-disposition.json"),
+        ("trackedDiff", "untrackedInventory", "intendedChanges"),
+    ),
+    "REVIEW": (
+        Path("release/review-disposition.json"),
+        ("reviewReport", "blockerDisposition"),
+    ),
+}
+EXPECTED_RESULT_PATHS = frozenset(path.as_posix() for path, _ in RESULT_SPECS.values())
+D2_RESULT_PATH = RESULT_SPECS["D2"][0]
+D2_SEAL_PATH = Path("results/D2-webconsole-cli.result.sha256")
+CANDIDATE_SEAL_PATH = Path(".candidate-committed")
+CANONICAL_LAB_ROOT = Path("/tmp/nexus-lens-home")
+CANONICAL_RUN_SEAL_ROOT = Path("/tmp/nexus-v015-evidence")
+SAFE_RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+CANDIDATE_PAYLOAD_PATHS = (
+    Path("manifest.json"),
+    Path("candidate/native/nexus"),
+    Path("candidate/npm/nexus.tgz"),
+    Path("candidate/npm/nexus-cli.tgz"),
+    Path("candidate/npm/nexus-gateway.tgz"),
+)
+MANIFEST_FIELDS = frozenset(
+    {
+        "schemaVersion",
+        "runId",
+        "mode",
+        "sources",
+        "native",
+        "packages",
+        "image",
+        "container",
+        "toolchains",
+        "environment",
+    }
+)
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+REVISION_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+SENSITIVE_ENV_PATTERN = re.compile(r"(?:TOKEN|KEY|SECRET|PASSWORD|COOKIE|AUTH)", re.IGNORECASE)
+USAGE = """Usage: scripts/nexus-v015-evidence-validate [--seal] RUN_DIR
+
+Validate one immutable v0.1.5 evidence ledger containing:
+  manifest.json (packed candidate, six sources, three npm tarballs, native hash)
+  all canonical A1-F3 results plus clean diff and review dispositions
+  exactly O1-O18 and W1-W8 ocular-evidence/2 human-path case manifests
+  a finite, correlated, zero-failure soak of at least 1800 seconds
+
+Documents and artifacts must be regular in-tree files, may not traverse
+symlinks, may not reuse hardlinks across owners, and must match SHA-256.
+"""
+
+
+class EvidenceError(Exception):
+    def __init__(self, code: str, path: Path | str, detail: str) -> None:
+        super().__init__(detail)
+        self.code = code
+        self.path = str(path)
+        self.detail = detail
+
+
+class DuplicateJsonKey(ValueError):
+    pass
+
+
+class NonfiniteJson(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class RunAuthority:
+    lab_root: Path
+    run_root: Path
+    run_id: str
+    container_id: str
+    readiness_path: Path
+    readiness_sha256: str
+    readiness_rows: dict[str, str]
+    seal_root: Path
+    fixture: bool
+
+
+def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise DuplicateJsonKey(key)
+        value[key] = item
+    return value
+
+
+def reject_nonfinite_constant(value: str) -> NoReturn:
+    raise NonfiniteJson(value)
+
+
+def contains_nonfinite(value: Any) -> bool:
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, dict):
+        return any(contains_nonfinite(item) for item in value.values())
+    if isinstance(value, list):
+        return any(contains_nonfinite(item) for item in value)
+    return False
+
+
+def is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def is_finite_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def canonical_digest(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def absolute_without_resolving(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def assert_run_dir_ancestry(path: Path) -> None:
+    absolute = absolute_without_resolving(path)
+    cursor = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        cursor /= component
+        try:
+            info = os.lstat(cursor)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise EvidenceError("RUN_DIR", cursor, f"cannot inspect run directory: {exc}") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise EvidenceError("RUN_DIR_SYMLINK", cursor, "run directory ancestry cannot contain a symlink")
+
+
+def open_absolute_directory_chain(path: Path, code: str) -> list[int]:
+    if not path.is_absolute():
+        raise EvidenceError(code, path, "authority path must be absolute")
+    descriptors = [os.open("/", os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))]
+    try:
+        for component in path.parts[1:]:
+            next_descriptor = os.open(
+                component,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=descriptors[-1],
+            )
+            descriptors.append(next_descriptor)
+        result = descriptors
+        descriptors = []
+        return result
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+            raise EvidenceError(code, path, "authority ancestry cannot contain a symlink") from exc
+        raise EvidenceError(code, path, f"cannot open authority directory: {exc}") from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def open_absolute_directory(path: Path, code: str) -> int:
+    descriptors = open_absolute_directory_chain(path, code)
+    result = descriptors.pop()
+    for descriptor in reversed(descriptors):
+        os.close(descriptor)
+    return result
+
+
+def read_readiness_authority(path: Path) -> tuple[bytes, os.stat_result, dict[str, str]]:
+    parent_fd = open_absolute_directory(path.parent, "READINESS_AUTHORITY")
+    try:
+        parent = os.fstat(parent_fd)
+        if (
+            (parent.st_uid, parent.st_gid) != (0, 0)
+            or stat.S_IMODE(parent.st_mode) != 0o1777
+        ):
+            raise EvidenceError(
+                "READINESS_AUTHORITY",
+                path.parent,
+                "readiness parent must be root-owned mode 1777",
+            )
+        try:
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise EvidenceError(
+                "READINESS_AUTHORITY", path, f"cannot open canonical readiness ledger: {exc}"
+            ) from exc
+        try:
+            before = os.fstat(descriptor)
+            visible_before = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            identity_fields = (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_uid",
+                "st_gid",
+                "st_nlink",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+            if any(getattr(before, field) != getattr(visible_before, field) for field in identity_fields):
+                raise EvidenceError("READINESS_AUTHORITY", path, "readiness changed before open")
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or (before.st_uid, before.st_gid) != (0, 0)
+                or stat.S_IMODE(before.st_mode) != 0o444
+                or before.st_nlink != 1
+            ):
+                raise EvidenceError(
+                    "READINESS_AUTHORITY",
+                    path,
+                    "readiness must be a root-owned single-link 0444 file",
+                )
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            after = os.fstat(descriptor)
+            visible_after = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if any(
+                getattr(before, field) != getattr(after, field)
+                or getattr(after, field) != getattr(visible_after, field)
+                for field in identity_fields
+            ):
+                raise EvidenceError("READINESS_AUTHORITY", path, "readiness changed while read")
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_fd)
+    raw = b"".join(chunks)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError as exc:
+        raise EvidenceError("READINESS_AUTHORITY", path, "readiness is not UTF-8") from exc
+    rows: dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if (
+            not separator
+            or re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", key) is None
+            or not value
+            or key in rows
+        ):
+            raise EvidenceError(
+                "READINESS_AUTHORITY", path, "readiness has an invalid or duplicate key"
+            )
+        rows[key] = value
+    if not rows or not raw.endswith(b"\n"):
+        raise EvidenceError("READINESS_AUTHORITY", path, "readiness is empty or unterminated")
+    return raw, before, rows
+
+
+def resolve_run_authority(root: Path) -> RunAuthority:
+    raw_lab_root = os.environ.get("NEXUS_LAB_ROOT", "")
+    run_id = os.environ.get("NEXUS_V015_RUN_ID", "")
+    container_id = os.environ.get("NEXUS_V015_CONTAINER_ID", "")
+    expected_readiness = os.environ.get("NEXUS_V015_READINESS_LEDGER_SHA256", "")
+    if not raw_lab_root or not Path(raw_lab_root).is_absolute():
+        raise EvidenceError("RUN_AUTHORITY", root, "NEXUS_LAB_ROOT must be an absolute path")
+    if SAFE_RUN_ID.fullmatch(run_id) is None:
+        raise EvidenceError("RUN_AUTHORITY", root, "NEXUS_V015_RUN_ID is missing or unsafe")
+    if SHA256_PATTERN.fullmatch(container_id) is None:
+        raise EvidenceError("RUN_AUTHORITY", root, "NEXUS_V015_CONTAINER_ID is missing or invalid")
+    if SHA256_PATTERN.fullmatch(expected_readiness) is None:
+        raise EvidenceError(
+            "READINESS_AUTHORITY", root, "NEXUS_V015_READINESS_LEDGER_SHA256 is missing or invalid"
+        )
+    lab_root = absolute_without_resolving(Path(raw_lab_root))
+    fixture = lab_root != CANONICAL_LAB_ROOT
+    if fixture and os.environ.get("NEXUS_V015_ALLOW_FIXTURE_HOME") != "1":
+        raise EvidenceError(
+            "RUN_AUTHORITY", lab_root, f"release authority must use {CANONICAL_LAB_ROOT}"
+        )
+    expected_root = lab_root / "evidence" / run_id
+    if absolute_without_resolving(root) != expected_root:
+        raise EvidenceError(
+            "RUN_AUTHORITY", root, f"run directory must be exactly {expected_root}"
+        )
+    readiness_path = lab_root / "lab/candidate-ready.v1"
+    readiness_raw, _, rows = read_readiness_authority(readiness_path)
+    actual_readiness = hashlib.sha256(readiness_raw).hexdigest()
+    if actual_readiness != expected_readiness:
+        raise EvidenceError(
+            "READINESS_AUTHORITY", readiness_path, "readiness digest does not match the invocation"
+        )
+    expected_rows = {
+        "schema": "1",
+        "mode": "packed",
+        "runId": run_id,
+        "containerId": container_id,
+    }
+    if any(rows.get(key) != value for key, value in expected_rows.items()):
+        raise EvidenceError(
+            "READINESS_AUTHORITY", readiness_path, "readiness does not match this packed run"
+        )
+    if fixture:
+        raw_seal_root = os.environ.get("NEXUS_V015_EVIDENCE_AUTHORITY_ROOT", "")
+        if not raw_seal_root or not Path(raw_seal_root).is_absolute():
+            raise EvidenceError(
+                "RUN_AUTHORITY", root, "fixture evidence authority root is missing"
+            )
+        seal_root = absolute_without_resolving(Path(raw_seal_root))
+        try:
+            seal_root.relative_to(lab_root)
+        except ValueError:
+            pass
+        else:
+            raise EvidenceError(
+                "RUN_AUTHORITY", seal_root, "evidence seal authority must be outside the lab-owned root"
+            )
+    else:
+        seal_root = CANONICAL_RUN_SEAL_ROOT
+    return RunAuthority(
+        lab_root=lab_root,
+        run_root=expected_root,
+        run_id=run_id,
+        container_id=container_id,
+        readiness_path=readiness_path,
+        readiness_sha256=actual_readiness,
+        readiness_rows=rows,
+        seal_root=seal_root,
+        fixture=fixture,
+    )
+
+
+def rename_noreplace_at(parent_fd: int, source: str, destination: str) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise EvidenceError(
+            "RUN_SEAL_PUBLISH", destination, "renameat2(RENAME_NOREPLACE) is unavailable"
+        )
+    result = renameat2(
+        parent_fd,
+        os.fsencode(source),
+        parent_fd,
+        os.fsencode(destination),
+        1,
+    )
+    if result == 0:
+        return
+    code = ctypes.get_errno()
+    if code == errno.EEXIST:
+        raise EvidenceError("RUN_SEAL_EXISTS", destination, "run seal already exists")
+    raise EvidenceError(
+        "RUN_SEAL_PUBLISH", destination, f"cannot publish run seal: {os.strerror(code)}"
+    )
+
+
+class Validator:
+    def __init__(self, root: Path, authority: RunAuthority) -> None:
+        self.root = root
+        self.authority = authority
+        self.root_ancestry_fds = open_absolute_directory_chain(root, "RUN_DIR_SYMLINK")
+        self.root_fd = self.root_ancestry_fds[-1]
+        self.run_id = ""
+        self.candidate_digest = ""
+        self.artifact_inodes: dict[tuple[int, int], str] = {}
+        self.declared_files: set[Path] = set()
+
+    def close(self) -> None:
+        for descriptor in reversed(self.root_ancestry_fds):
+            os.close(descriptor)
+        self.root_ancestry_fds = []
+
+    def display(self, path: Path) -> str:
+        if not path.is_absolute():
+            return path.as_posix()
+        try:
+            return path.relative_to(self.root).as_posix()
+        except ValueError:
+            return str(path)
+
+    def error(self, code: str, path: Path | str, detail: str) -> NoReturn:
+        if isinstance(path, Path):
+            path = self.display(path)
+        raise EvidenceError(code, path, detail)
+
+    def relative_path(self, path: Path) -> Path:
+        if not path.is_absolute():
+            relative = path
+        else:
+            try:
+                relative = path.relative_to(self.root)
+            except ValueError:
+                self.error("ARTIFACT_PATH", path, "path is outside the evidence root")
+        if relative.is_absolute() or ".." in relative.parts:
+            self.error("ARTIFACT_PATH", path, "path escapes the evidence root")
+        return relative
+
+    def open_parent_relative(
+        self, relative: Path, symlink_code: str, missing_code: str
+    ) -> tuple[int, str]:
+        directory_fd = os.dup(self.root_fd)
+        try:
+            for component in relative.parts[:-1]:
+                try:
+                    next_fd = os.open(
+                        component,
+                        os.O_RDONLY
+                        | getattr(os, "O_DIRECTORY", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=directory_fd,
+                    )
+                except FileNotFoundError:
+                    self.error(missing_code, relative, "required path is missing")
+                except OSError as exc:
+                    if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                        self.error(symlink_code, relative, "path ancestry is not a real directory")
+                    self.error("FILE_IO", relative, f"cannot open path ancestry: {exc}")
+                os.close(directory_fd)
+                directory_fd = next_fd
+            if not relative.parts:
+                self.error("ARTIFACT_PATH", relative, "file path cannot be empty")
+            result = directory_fd
+            directory_fd = -1
+            return result, relative.parts[-1]
+        finally:
+            if directory_fd >= 0:
+                os.close(directory_fd)
+
+    def open_relative(self, relative: Path, symlink_code: str, missing_code: str) -> int:
+        directory_fd, leaf = self.open_parent_relative(relative, symlink_code, missing_code)
+        try:
+            try:
+                return os.open(
+                    leaf,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                self.error(missing_code, relative, "required file is missing")
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    self.error(symlink_code, relative, "file cannot be a symlink")
+                self.error("FILE_IO", relative, f"cannot open file: {exc}")
+        finally:
+            os.close(directory_fd)
+
+    def open_directory_relative(self, relative: Path, symlink_code: str, missing_code: str) -> int:
+        directory_fd = os.dup(self.root_fd)
+        try:
+            for component in relative.parts:
+                try:
+                    next_fd = os.open(
+                        component,
+                        os.O_RDONLY
+                        | getattr(os, "O_DIRECTORY", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=directory_fd,
+                    )
+                except FileNotFoundError:
+                    self.error(missing_code, relative, "required directory is missing")
+                except OSError as exc:
+                    if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                        self.error(symlink_code, relative, "directory ancestry is not a real directory")
+                    self.error("FILE_IO", relative, f"cannot open directory ancestry: {exc}")
+                os.close(directory_fd)
+                directory_fd = next_fd
+            result = directory_fd
+            directory_fd = -1
+            return result
+        finally:
+            if directory_fd >= 0:
+                os.close(directory_fd)
+
+    def read_same_fd(
+        self,
+        relative: Path,
+        *,
+        symlink_code: str,
+        missing_code: str,
+        empty_code: str | None = None,
+        owner: str | None = None,
+    ) -> tuple[bytes, os.stat_result]:
+        parent_fd, leaf = self.open_parent_relative(relative, symlink_code, missing_code)
+        try:
+            try:
+                descriptor = os.open(
+                    leaf,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_fd,
+                )
+            except FileNotFoundError:
+                self.error(missing_code, relative, "required file is missing")
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    self.error(symlink_code, relative, "file cannot be a symlink")
+                self.error("FILE_IO", relative, f"cannot open file: {exc}")
+            try:
+                before = os.fstat(descriptor)
+                visible_before = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+                if self.metadata_identity(before) != self.metadata_identity(visible_before):
+                    self.error("FILE_CHANGED", relative, "file changed before it was read")
+                if not stat.S_ISREG(before.st_mode):
+                    self.error(
+                        "ARTIFACT_TYPE" if owner else "DOCUMENT_TYPE",
+                        relative,
+                        "file must be regular",
+                    )
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(descriptor, 64 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                after = os.fstat(descriptor)
+                visible_after = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+                if (
+                    self.metadata_identity(before) != self.metadata_identity(after)
+                    or self.metadata_identity(after) != self.metadata_identity(visible_after)
+                ):
+                    self.error("FILE_CHANGED", relative, "file changed while it was being read")
+                value = b"".join(chunks)
+                if empty_code is not None and not value:
+                    self.error(empty_code, relative, "artifact cannot be empty")
+                if owner is not None:
+                    inode = (before.st_dev, before.st_ino)
+                    previous = self.artifact_inodes.get(inode)
+                    if previous is not None and previous != owner:
+                        self.error(
+                            "HARDLINK_REUSE",
+                            relative,
+                            f"artifact inode is already owned by {previous!r}, not {owner!r}",
+                        )
+                    self.artifact_inodes[inode] = owner
+                return value, before
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(parent_fd)
+
+    @staticmethod
+    def metadata_identity(info: os.stat_result) -> tuple[int, ...]:
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_uid,
+            info.st_gid,
+            info.st_nlink,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
+
+    @staticmethod
+    def expected_evidence_mode(relative: Path, directory: bool) -> int:
+        if directory:
+            if relative in {
+                Path("candidate"),
+                Path("candidate/native"),
+                Path("candidate/npm"),
+            }:
+                return 0o755
+            return 0o555
+        if relative == Path("candidate/native/nexus"):
+            return 0o555
+        if relative in {
+            Path("candidate/npm/nexus.tgz"),
+            Path("candidate/npm/nexus-cli.tgz"),
+            Path("candidate/npm/nexus-gateway.tgz"),
+        }:
+            return 0o444
+        return 0o400
+
+    def inventory_from_root_fd(self) -> list[dict[str, object]]:
+        root_info = os.fstat(self.root_fd)
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or (root_info.st_uid, root_info.st_gid) != (0, 0)
+            or stat.S_IMODE(root_info.st_mode) != 0o700
+        ):
+            self.error(
+                "RUN_SEAL_MODE",
+                Path("."),
+                "sealed run root must be root-owned mode 0700",
+            )
+        evidence_owner = (0, 0)
+        seen_files: set[tuple[int, int]] = set()
+        rows: list[dict[str, object]] = []
+
+        def walk(directory_fd: int, base: Path) -> None:
+            try:
+                with os.scandir(directory_fd) as iterator:
+                    entries = sorted(iterator, key=lambda entry: entry.name)
+            except OSError as exc:
+                self.error("RUN_SEAL_INVENTORY", base, f"cannot list evidence directory: {exc}")
+            for entry in entries:
+                relative = base / entry.name
+                try:
+                    visible_before = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    self.error("RUN_SEAL_INVENTORY", relative, f"cannot inspect evidence: {exc}")
+                if stat.S_ISLNK(visible_before.st_mode):
+                    self.error("RUN_SEAL_INVENTORY", relative, "sealed evidence cannot contain symlinks")
+                if stat.S_ISDIR(visible_before.st_mode):
+                    try:
+                        child_fd = os.open(
+                            entry.name,
+                            os.O_RDONLY
+                            | getattr(os, "O_DIRECTORY", 0)
+                            | getattr(os, "O_NOFOLLOW", 0),
+                            dir_fd=directory_fd,
+                        )
+                    except OSError as exc:
+                        self.error(
+                            "RUN_SEAL_INVENTORY", relative, f"cannot open evidence directory: {exc}"
+                        )
+                    try:
+                        opened = os.fstat(child_fd)
+                        if self.metadata_identity(opened) != self.metadata_identity(visible_before):
+                            self.error(
+                                "RUN_SEAL_CHANGED", relative, "evidence directory changed before open"
+                            )
+                        expected_mode = self.expected_evidence_mode(relative, True)
+                        if (
+                            (opened.st_uid, opened.st_gid) != evidence_owner
+                            or stat.S_IMODE(opened.st_mode) != expected_mode
+                        ):
+                            self.error(
+                                "RUN_SEAL_MODE",
+                                relative,
+                                f"evidence directory must be owned by the run and mode {expected_mode:04o}",
+                            )
+                        rows.append(
+                            {
+                                "path": relative.as_posix(),
+                                "kind": "directory",
+                                "device": opened.st_dev,
+                                "inode": opened.st_ino,
+                                "uid": opened.st_uid,
+                                "gid": opened.st_gid,
+                                "mode": stat.S_IMODE(opened.st_mode),
+                                "nlink": opened.st_nlink,
+                                "mtimeNs": opened.st_mtime_ns,
+                                "ctimeNs": opened.st_ctime_ns,
+                            }
+                        )
+                        walk(child_fd, relative)
+                        after = os.fstat(child_fd)
+                        visible_after = os.stat(
+                            entry.name, dir_fd=directory_fd, follow_symlinks=False
+                        )
+                        if (
+                            self.metadata_identity(opened) != self.metadata_identity(after)
+                            or self.metadata_identity(after) != self.metadata_identity(visible_after)
+                        ):
+                            self.error(
+                                "RUN_SEAL_CHANGED", relative, "evidence directory changed while scanned"
+                            )
+                    finally:
+                        os.close(child_fd)
+                    continue
+                if not stat.S_ISREG(visible_before.st_mode):
+                    self.error(
+                        "RUN_SEAL_INVENTORY", relative, "sealed evidence must contain regular files only"
+                    )
+                try:
+                    descriptor = os.open(
+                        entry.name,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=directory_fd,
+                    )
+                except OSError as exc:
+                    self.error("RUN_SEAL_INVENTORY", relative, f"cannot open evidence file: {exc}")
+                try:
+                    opened = os.fstat(descriptor)
+                    if self.metadata_identity(opened) != self.metadata_identity(visible_before):
+                        self.error("RUN_SEAL_CHANGED", relative, "evidence file changed before open")
+                    expected_mode = self.expected_evidence_mode(relative, False)
+                    inode = (opened.st_dev, opened.st_ino)
+                    if (
+                        (opened.st_uid, opened.st_gid) != evidence_owner
+                        or stat.S_IMODE(opened.st_mode) != expected_mode
+                        or opened.st_nlink != 1
+                        or inode in seen_files
+                    ):
+                        self.error(
+                            "RUN_SEAL_MODE",
+                            relative,
+                            f"evidence file must be run-owned, single-linked, and mode {expected_mode:04o}",
+                        )
+                    seen_files.add(inode)
+                    digest = hashlib.sha256()
+                    size = 0
+                    while True:
+                        chunk = os.read(descriptor, 64 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        digest.update(chunk)
+                    after = os.fstat(descriptor)
+                    visible_after = os.stat(
+                        entry.name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (
+                        self.metadata_identity(opened) != self.metadata_identity(after)
+                        or self.metadata_identity(after) != self.metadata_identity(visible_after)
+                        or size != opened.st_size
+                    ):
+                        self.error("RUN_SEAL_CHANGED", relative, "evidence file changed while read")
+                    rows.append(
+                        {
+                            "path": relative.as_posix(),
+                            "kind": "file",
+                            "device": opened.st_dev,
+                            "inode": opened.st_ino,
+                            "uid": opened.st_uid,
+                            "gid": opened.st_gid,
+                            "mode": stat.S_IMODE(opened.st_mode),
+                            "nlink": opened.st_nlink,
+                            "size": opened.st_size,
+                            "mtimeNs": opened.st_mtime_ns,
+                            "ctimeNs": opened.st_ctime_ns,
+                            "sha256": digest.hexdigest(),
+                        }
+                    )
+                finally:
+                    os.close(descriptor)
+
+        walk(self.root_fd, Path())
+        rows.sort(key=lambda row: str(row["path"]))
+        return rows
+
+    def reject_run_seal_residue(self, seal_root_fd: int) -> None:
+        prefix = f".{self.authority.run_id}.run-committed.json.tmp-"
+        try:
+            with os.scandir(seal_root_fd) as entries:
+                residue = sorted(entry.name for entry in entries if entry.name.startswith(prefix))
+        except OSError as exc:
+            self.error(
+                "RUN_SEAL_AUTHORITY",
+                self.authority.seal_root,
+                f"cannot inspect run-seal authority: {exc}",
+            )
+        if residue:
+            self.error(
+                "RUN_SEAL_RESIDUE",
+                self.authority.seal_root / residue[0],
+                "an incomplete seal publication for this run remains",
+            )
+
+    def read_run_seal(self) -> dict[str, Any]:
+        seal_root_fd = open_absolute_directory(self.authority.seal_root, "RUN_SEAL_AUTHORITY")
+        try:
+            root_info = os.fstat(seal_root_fd)
+            if (
+                (root_info.st_uid, root_info.st_gid) != (0, 0)
+                or stat.S_IMODE(root_info.st_mode) != 0o700
+            ):
+                self.error(
+                    "RUN_SEAL_AUTHORITY",
+                    self.authority.seal_root,
+                    "run-seal authority must be root-owned mode 0700",
+                )
+            self.reject_run_seal_residue(seal_root_fd)
+            leaf = f"{self.run_id}.run-committed.json"
+            try:
+                descriptor = os.open(
+                    leaf,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=seal_root_fd,
+                )
+            except FileNotFoundError:
+                self.error("RUN_SEAL_MISSING", self.authority.seal_root / leaf, "run seal is missing")
+            except OSError as exc:
+                self.error(
+                    "RUN_SEAL_AUTHORITY",
+                    self.authority.seal_root / leaf,
+                    f"cannot open run seal: {exc}",
+                )
+            try:
+                before = os.fstat(descriptor)
+                visible_before = os.stat(leaf, dir_fd=seal_root_fd, follow_symlinks=False)
+                if (
+                    self.metadata_identity(before) != self.metadata_identity(visible_before)
+                    or not stat.S_ISREG(before.st_mode)
+                    or (before.st_uid, before.st_gid) != (0, 0)
+                    or stat.S_IMODE(before.st_mode) != 0o400
+                    or before.st_nlink != 1
+                ):
+                    self.error(
+                        "RUN_SEAL_AUTHORITY",
+                        self.authority.seal_root / leaf,
+                        "run seal must be a root-owned single-link 0400 file",
+                    )
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(descriptor, 64 * 1024)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                after = os.fstat(descriptor)
+                visible_after = os.stat(leaf, dir_fd=seal_root_fd, follow_symlinks=False)
+                if (
+                    self.metadata_identity(before) != self.metadata_identity(after)
+                    or self.metadata_identity(after) != self.metadata_identity(visible_after)
+                ):
+                    self.error(
+                        "RUN_SEAL_CHANGED",
+                        self.authority.seal_root / leaf,
+                        "run seal changed while read",
+                    )
+                self.reject_run_seal_residue(seal_root_fd)
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(seal_root_fd)
+        try:
+            document = json.loads(
+                b"".join(chunks).decode("utf-8"),
+                object_pairs_hook=reject_duplicate_keys,
+                parse_constant=reject_nonfinite_constant,
+            )
+        except (DuplicateJsonKey, NonfiniteJson, UnicodeError, json.JSONDecodeError) as exc:
+            self.error("RUN_SEAL_INVALID", self.authority.seal_root / leaf, f"invalid run seal: {exc}")
+        if not isinstance(document, dict) or contains_nonfinite(document):
+            self.error("RUN_SEAL_INVALID", self.authority.seal_root / leaf, "run seal is invalid")
+        return document
+
+    def validate_run_seal(self) -> None:
+        inventory = self.inventory_from_root_fd()
+        expected = self.run_seal_document(inventory)
+        if self.read_run_seal() != expected:
+            self.error(
+                "RUN_SEAL_MISMATCH",
+                self.authority.seal_root / f"{self.run_id}.run-committed.json",
+                "run seal does not match the canonical authority and exact evidence inventory",
+            )
+        if self.inventory_from_root_fd() != inventory:
+            self.error("RUN_SEAL_CHANGED", self.root, "evidence changed during final validation")
+        self.revalidate_visible_root()
+
+    def run_seal_document(self, inventory: list[dict[str, object]]) -> dict[str, object]:
+        root_info = os.fstat(self.root_fd)
+        return {
+            "schemaVersion": 1,
+            "runId": self.run_id,
+            "candidateDigest": self.candidate_digest,
+            "containerId": self.authority.container_id,
+            "labRoot": str(self.authority.lab_root),
+            "runRoot": str(self.root),
+            "runDevice": root_info.st_dev,
+            "runInode": root_info.st_ino,
+            "evidenceUid": root_info.st_uid,
+            "evidenceGid": root_info.st_gid,
+            "readinessPath": str(self.authority.readiness_path),
+            "readinessSha256": self.authority.readiness_sha256,
+            "inventory": inventory,
+        }
+
+    def revalidate_visible_root(self) -> None:
+        try:
+            visible_fds = open_absolute_directory_chain(self.root, "RUN_SEAL_CHANGED")
+        except (EvidenceError, OSError) as exc:
+            self.error("RUN_SEAL_CHANGED", self.root, f"cannot revalidate run root: {exc}")
+        try:
+            if len(visible_fds) != len(self.root_ancestry_fds):
+                self.error("RUN_SEAL_CHANGED", self.root, "run root ancestry changed during validation")
+            for held_fd, visible_fd in zip(self.root_ancestry_fds, visible_fds, strict=True):
+                if self.metadata_identity(os.fstat(held_fd)) != self.metadata_identity(
+                    os.fstat(visible_fd)
+                ):
+                    self.error(
+                        "RUN_SEAL_CHANGED", self.root, "run root ancestry changed during validation"
+                    )
+        finally:
+            for descriptor in reversed(visible_fds):
+                os.close(descriptor)
+
+    def revalidate_run_authority(self) -> None:
+        current = resolve_run_authority(self.root)
+        if current != self.authority:
+            self.error("READINESS_AUTHORITY", self.root, "run authority changed during validation")
+
+    def seal_root_fd(self) -> int:
+        descriptor = open_absolute_directory(self.authority.seal_root, "RUN_SEAL_AUTHORITY")
+        info = os.fstat(descriptor)
+        if (
+            (info.st_uid, info.st_gid) != (0, 0)
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            os.close(descriptor)
+            self.error(
+                "RUN_SEAL_AUTHORITY",
+                self.authority.seal_root,
+                "run-seal authority must be root-owned mode 0700",
+            )
+        return descriptor
+
+    def harden_evidence(self) -> None:
+        root_info = os.fstat(self.root_fd)
+        evidence_owner = (root_info.st_uid, root_info.st_gid)
+
+        def harden(directory_fd: int, base: Path) -> None:
+            with os.scandir(directory_fd) as iterator:
+                entries = sorted(iterator, key=lambda entry: entry.name)
+            for entry in entries:
+                relative = base / entry.name
+                visible = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(visible.st_mode):
+                    self.error("RUN_SEAL_INVENTORY", relative, "evidence cannot contain symlinks")
+                if stat.S_ISDIR(visible.st_mode):
+                    descriptor = os.open(
+                        entry.name,
+                        os.O_RDONLY
+                        | getattr(os, "O_DIRECTORY", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        opened = os.fstat(descriptor)
+                        if (
+                            self.metadata_identity(opened) != self.metadata_identity(visible)
+                            or (opened.st_uid, opened.st_gid) != evidence_owner
+                        ):
+                            self.error(
+                                "RUN_SEAL_CHANGED", relative, "evidence directory changed before hardening"
+                            )
+                        harden(descriptor, relative)
+                        os.fchown(descriptor, 0, 0)
+                        os.fchmod(descriptor, self.expected_evidence_mode(relative, True))
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                    continue
+                if not stat.S_ISREG(visible.st_mode):
+                    self.error(
+                        "RUN_SEAL_INVENTORY", relative, "evidence must contain regular files only"
+                    )
+                descriptor = os.open(
+                    entry.name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+                try:
+                    opened = os.fstat(descriptor)
+                    if (
+                        self.metadata_identity(opened) != self.metadata_identity(visible)
+                        or (opened.st_uid, opened.st_gid) != evidence_owner
+                        or opened.st_nlink != 1
+                    ):
+                        self.error(
+                            "RUN_SEAL_CHANGED", relative, "evidence file changed before hardening"
+                        )
+                    os.fchown(descriptor, 0, 0)
+                    os.fchmod(descriptor, self.expected_evidence_mode(relative, False))
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+
+        harden(self.root_fd, Path())
+        os.fchown(self.root_fd, 0, 0)
+        os.fchmod(self.root_fd, 0o700)
+        os.fsync(self.root_fd)
+
+    def publish_run_seal(self, document: dict[str, object]) -> None:
+        parent_fd = self.seal_root_fd()
+        leaf = f"{self.run_id}.run-committed.json"
+        temporary = f".{leaf}.tmp-{os.getpid()}-{time.time_ns()}"
+        try:
+            try:
+                os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                self.error(
+                    "RUN_SEAL_EXISTS", self.authority.seal_root / leaf, "run seal already exists"
+                )
+            data = (
+                json.dumps(
+                    document,
+                    indent=2,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("utf-8")
+            descriptor = os.open(
+                temporary,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            published = False
+            try:
+                offset = 0
+                while offset < len(data):
+                    written = os.write(descriptor, data[offset:])
+                    if written <= 0:
+                        self.error("RUN_SEAL_PUBLISH", temporary, "short write while staging run seal")
+                    offset += written
+                os.fchmod(descriptor, 0o400)
+                os.fsync(descriptor)
+                rename_noreplace_at(parent_fd, temporary, leaf)
+                published = True
+                try:
+                    os.fsync(parent_fd)
+                except OSError as exc:
+                    try:
+                        os.fchmod(descriptor, 0)
+                        os.fsync(descriptor)
+                        os.fsync(parent_fd)
+                    except OSError:
+                        pass
+                    self.error(
+                        "RUN_SEAL_PUBLISH",
+                        self.authority.seal_root / leaf,
+                        f"run seal publication durability is indeterminate: {exc}",
+                    )
+            finally:
+                os.close(descriptor)
+                if not published:
+                    try:
+                        os.unlink(temporary, dir_fd=parent_fd)
+                        os.fsync(parent_fd)
+                    except FileNotFoundError:
+                        pass
+            if not published:
+                self.error("RUN_SEAL_PUBLISH", self.authority.seal_root / leaf, "seal not published")
+        finally:
+            os.close(parent_fd)
+
+    def seal(self) -> None:
+        if os.geteuid() != 0:
+            self.error("RUN_SEAL_AUTHORITY", self.root, "--seal must run as root")
+        parent_fd = self.seal_root_fd()
+        try:
+            self.reject_run_seal_residue(parent_fd)
+            leaf = f"{self.authority.run_id}.run-committed.json"
+            try:
+                os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                self.error(
+                    "RUN_SEAL_EXISTS", self.authority.seal_root / leaf, "run seal already exists"
+                )
+        finally:
+            os.close(parent_fd)
+        self.validate(require_run_seal=False)
+        self.harden_evidence()
+        inventory_before = self.inventory_from_root_fd()
+        self.validate(require_run_seal=False)
+        inventory_after = self.inventory_from_root_fd()
+        if inventory_before != inventory_after:
+            self.error("RUN_SEAL_CHANGED", self.root, "evidence changed during seal validation")
+        current_authority = resolve_run_authority(self.root)
+        if current_authority != self.authority:
+            self.error("READINESS_AUTHORITY", self.root, "run authority changed before seal")
+        self.revalidate_visible_root()
+        self.publish_run_seal(self.run_seal_document(inventory_after))
+        self.validate()
+
+    def load_document(self, path: Path, missing_code: str) -> dict[str, Any]:
+        relative = self.relative_path(path)
+        raw, _ = self.read_same_fd(
+            relative,
+            symlink_code="DOCUMENT_SYMLINK",
+            missing_code=missing_code,
+        )
+        try:
+            value = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=reject_duplicate_keys,
+                parse_constant=reject_nonfinite_constant,
+            )
+        except DuplicateJsonKey as exc:
+            self.error("JSON_DUPLICATE_KEY", relative, f"duplicate JSON key: {exc}")
+        except NonfiniteJson as exc:
+            self.error("JSON_NONFINITE", relative, f"nonfinite JSON number: {exc}")
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            self.error("JSON_INVALID", relative, f"cannot read valid UTF-8 JSON: {exc}")
+        if contains_nonfinite(value):
+            self.error("JSON_NONFINITE", relative, "JSON contains a nonfinite number")
+        if not isinstance(value, dict):
+            self.error("DOCUMENT_TYPE", relative, "JSON document must be an object")
+        if not is_int(value.get("schemaVersion")) or value.get("schemaVersion") != 1:
+            self.error("SCHEMA_VERSION", relative, "schemaVersion must be exactly 1")
+        return value
+
+    @staticmethod
+    def valid_sha256(value: object) -> bool:
+        return isinstance(value, str) and SHA256_PATTERN.fullmatch(value) is not None
+
+    def validate_posix_ledger_path(self, value: object, path: Path) -> None:
+        if not isinstance(value, str) or not value or "\\" in value:
+            self.error("SOURCE_PATH", path, "dirty path must be a non-empty POSIX path")
+        relative = PurePosixPath(value)
+        if relative.is_absolute() or ".." in relative.parts:
+            self.error("SOURCE_PATH", path, "dirty path must remain relative")
+
+    def artifact_relative(self, value: object, metadata_path: Path) -> Path:
+        if not isinstance(value, str) or not value or "\\" in value:
+            self.error("ARTIFACT_PATH", metadata_path, "artifact path must be a non-empty POSIX path")
+        parsed = PurePosixPath(value)
+        if parsed.is_absolute() or not parsed.parts or ".." in parsed.parts:
+            self.error("ARTIFACT_PATH", metadata_path, "artifact path must remain inside the run directory")
+        return Path(*parsed.parts)
+
+    def validate_artifact_record(
+        self,
+        record: object,
+        metadata_path: Path,
+        owner: str,
+        artifact_parent: Path | None = None,
+        required_prefix: bytes | None = None,
+    ) -> tuple[str, bytes]:
+        if not isinstance(record, dict) or set(record) != {"path", "sha256"}:
+            self.error("ARTIFACTS_INVALID", metadata_path, "artifact record must contain path and sha256")
+        expected = record.get("sha256")
+        if not self.valid_sha256(expected):
+            self.error("SHA256_FORMAT", metadata_path, "artifact sha256 must be 64 lowercase hex characters")
+        relative = self.artifact_relative(record.get("path"), metadata_path)
+        if artifact_parent is not None and relative.parent != artifact_parent:
+            self.error(
+                "ARTIFACT_PATH",
+                metadata_path,
+                "case artifacts must remain in the canonical case directory",
+            )
+        raw, _ = self.read_same_fd(
+            relative,
+            symlink_code="ARTIFACT_SYMLINK",
+            missing_code="ARTIFACT_MISSING",
+            empty_code="ARTIFACT_EMPTY",
+            owner=owner,
+        )
+        actual = hashlib.sha256(raw).hexdigest()
+        if actual != expected:
+            self.error(
+                "ARTIFACT_HASH",
+                metadata_path,
+                f"artifact SHA-256 mismatch for {relative.as_posix()}: expected {expected}, got {actual}",
+            )
+        if required_prefix is not None and not raw.startswith(required_prefix):
+            self.error(
+                "PACTBIN2_EVIDENCE",
+                metadata_path,
+                f"{relative.as_posix()} is not a PACTBIN2 store artifact",
+            )
+        self.declared_files.add(relative)
+        return relative.as_posix(), raw
+
+    def validate_artifacts(
+        self,
+        document: dict[str, Any],
+        metadata_path: Path,
+        owner: str,
+        expected_names: tuple[str, ...],
+        artifact_parent: Path | None = None,
+    ) -> dict[str, bytes]:
+        required = document.get("requiredArtifacts")
+        artifacts = document.get("artifacts")
+        expected = set(expected_names)
+        if (
+            not isinstance(required, list)
+            or any(not isinstance(item, str) for item in required)
+            or len(required) != len(set(required))
+            or set(required) != expected
+            or not isinstance(artifacts, dict)
+            or set(artifacts) != expected
+        ):
+            self.error(
+                "ARTIFACT_REQUIRED",
+                metadata_path,
+                f"requiredArtifacts and artifacts must be exactly: {', '.join(expected_names)}",
+            )
+        seen_paths: set[str] = set()
+        payloads: dict[str, bytes] = {}
+        for name in expected_names:
+            relative, raw = self.validate_artifact_record(
+                artifacts[name],
+                metadata_path,
+                f"{owner}:{name}",
+                artifact_parent,
+                b"PACTBIN2" if name == "pactbin2" else None,
+            )
+            if relative in seen_paths:
+                self.error("ARTIFACT_PATH_DUPLICATE", metadata_path, f"duplicate artifact path: {relative}")
+            seen_paths.add(relative)
+            payloads[name] = raw
+        return payloads
+
+    def validate_d2_inventory(
+        self,
+        document: dict[str, Any],
+        metadata_path: Path,
+    ) -> None:
+        inventory = document.get("evidenceInventory")
+        if not isinstance(inventory, list) or not inventory:
+            self.error("D2_INVENTORY", metadata_path, "D2 exact evidence inventory is required")
+        expected: dict[str, tuple[str, int]] = {}
+        for record in inventory:
+            if not isinstance(record, dict) or set(record) != {"path", "sha256", "size"}:
+                self.error("D2_INVENTORY", metadata_path, "D2 inventory records have an invalid schema")
+            relative = self.artifact_relative(record.get("path"), metadata_path)
+            relative_raw = relative.as_posix()
+            expected_sha = record.get("sha256")
+            expected_size = record.get("size")
+            if (
+                relative.parent != metadata_path.parent
+                or relative == metadata_path
+                or relative_raw in expected
+                or not self.valid_sha256(expected_sha)
+                or not is_int(expected_size)
+                or expected_size < 0
+            ):
+                self.error("D2_INVENTORY", metadata_path, "D2 inventory is not canonical")
+            expected[relative_raw] = (expected_sha, expected_size)
+
+        directory_fd = self.open_directory_relative(
+            metadata_path.parent,
+            "D2_INVENTORY_TYPE",
+            "D2_INVENTORY_MISSING",
+        )
+        actual: set[str] = set()
+        try:
+            with os.scandir(directory_fd) as entries:
+                for entry in entries:
+                    relative = (metadata_path.parent / entry.name).as_posix()
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        self.error("FILE_IO", relative, f"cannot inspect D2 evidence: {exc}")
+                    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                        self.error(
+                            "D2_INVENTORY_TYPE",
+                            relative,
+                            "D2 evidence must be a single regular file",
+                        )
+                    actual.add(relative)
+        finally:
+            os.close(directory_fd)
+
+        expected_paths = set(expected) | {metadata_path.as_posix()}
+        unexpected = sorted(actual - expected_paths)
+        missing = sorted(expected_paths - actual)
+        if unexpected:
+            self.error(
+                "D2_INVENTORY_UNEXPECTED",
+                unexpected[0],
+                "D2 evidence directory contains an unlisted path",
+            )
+        if missing:
+            self.error(
+                "D2_INVENTORY_MISSING",
+                missing[0],
+                "D2 evidence inventory lists a missing path",
+            )
+
+        for relative_raw, (expected_sha, expected_size) in expected.items():
+            self.declared_files.add(Path(relative_raw))
+            raw, info = self.read_same_fd(
+                Path(relative_raw),
+                symlink_code="D2_INVENTORY_TYPE",
+                missing_code="D2_INVENTORY_MISSING",
+            )
+            if info.st_nlink != 1:
+                self.error(
+                    "D2_INVENTORY_TYPE",
+                    relative_raw,
+                    "D2 evidence must not reuse hardlinks",
+                )
+            if len(raw) != expected_size or hashlib.sha256(raw).hexdigest() != expected_sha:
+                self.error(
+                    "D2_INVENTORY_HASH",
+                    relative_raw,
+                    "D2 inventoried evidence changed after PASS",
+                )
+
+    def validate_d2_seal(self) -> None:
+        seal_raw, seal_info = self.read_same_fd(
+            D2_SEAL_PATH,
+            symlink_code="D2_SEAL_TYPE",
+            missing_code="D2_SEAL_MISSING",
+        )
+        if seal_info.st_nlink != 1:
+            self.error(
+                "D2_SEAL_TYPE",
+                D2_SEAL_PATH,
+                "D2 result seal must be a single regular file",
+            )
+        if stat.S_IMODE(seal_info.st_mode) != 0o400:
+            self.error("D2_SEAL_MODE", D2_SEAL_PATH, "D2 result seal mode must be exactly 0400")
+        try:
+            seal = json.loads(
+                seal_raw.decode("utf-8"),
+                object_pairs_hook=reject_duplicate_keys,
+                parse_constant=reject_nonfinite_constant,
+            )
+        except (DuplicateJsonKey, NonfiniteJson, UnicodeError, json.JSONDecodeError) as exc:
+            self.error("D2_SEAL_INVALID", D2_SEAL_PATH, f"D2 result seal is invalid JSON: {exc}")
+        if not isinstance(seal, dict) or contains_nonfinite(seal):
+            self.error("D2_SEAL_INVALID", D2_SEAL_PATH, "D2 result seal must be a finite JSON object")
+
+        result_raw, result_info = self.read_same_fd(
+            D2_RESULT_PATH,
+            symlink_code="D2_SEAL_TYPE",
+            missing_code="D2_SEAL_MISSING",
+        )
+        if result_info.st_nlink != 1:
+            self.error(
+                "D2_SEAL_TYPE",
+                D2_RESULT_PATH,
+                "sealed D2 result must be a single regular file",
+            )
+        if stat.S_IMODE(result_info.st_mode) != 0o400:
+            self.error("D2_SEAL_MODE", D2_RESULT_PATH, "sealed D2 result mode must be exactly 0400")
+        expected = {
+            "schemaVersion": 1,
+            "runId": self.run_id,
+            "candidateDigest": self.candidate_digest,
+            "gate": "D2",
+            "resultPath": D2_RESULT_PATH.as_posix(),
+            "resultSha256": hashlib.sha256(result_raw).hexdigest(),
+            "resultSize": len(result_raw),
+        }
+        if seal != expected:
+            self.error(
+                "D2_SEAL_MISMATCH",
+                D2_SEAL_PATH,
+                "D2 result seal does not match the current candidate and result bytes",
+            )
+
+    def validate_candidate_commit_seal(self, run_id: str) -> None:
+        root_info = os.fstat(self.root_fd)
+        if stat.S_IMODE(root_info.st_mode) != 0o700:
+            self.error(
+                "CANDIDATE_SEAL_MODE",
+                Path("."),
+                "sealed candidate evidence root mode must be exactly 0700",
+            )
+
+        for relative in (
+            Path("candidate"),
+            Path("candidate/native"),
+            Path("candidate/npm"),
+        ):
+            descriptor = self.open_directory_relative(
+                relative,
+                "CANDIDATE_SEAL_TYPE",
+                "CANDIDATE_SEAL_MISSING",
+            )
+            try:
+                info = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            if (
+                (info.st_uid, info.st_gid) != (root_info.st_uid, root_info.st_gid)
+                or stat.S_IMODE(info.st_mode) != 0o755
+            ):
+                self.error(
+                    "CANDIDATE_SEAL_MODE",
+                    relative,
+                    "candidate payload directory must be owned by the run and mode 0755",
+                )
+
+        payload: dict[Path, tuple[bytes, os.stat_result]] = {}
+        for relative in CANDIDATE_PAYLOAD_PATHS:
+            raw, info = self.read_same_fd(
+                relative,
+                symlink_code="CANDIDATE_SEAL_TYPE",
+                missing_code="CANDIDATE_SEAL_MISSING",
+            )
+            if (
+                info.st_nlink != 1
+                or (info.st_uid, info.st_gid) != (root_info.st_uid, root_info.st_gid)
+                or stat.S_IMODE(info.st_mode) & 0o022
+            ):
+                self.error(
+                    "CANDIDATE_SEAL_TYPE",
+                    relative,
+                    "sealed candidate payload must be single-linked, owned by the run, and immutable",
+                )
+            payload[relative] = (raw, info)
+        if stat.S_IMODE(payload[Path("manifest.json")][1].st_mode) != 0o400:
+            self.error(
+                "CANDIDATE_SEAL_MODE",
+                Path("manifest.json"),
+                "sealed manifest mode must be exactly 0400",
+            )
+        expected_payload_modes = {
+            Path("candidate/native/nexus"): 0o555,
+            Path("candidate/npm/nexus.tgz"): 0o444,
+            Path("candidate/npm/nexus-cli.tgz"): 0o444,
+            Path("candidate/npm/nexus-gateway.tgz"): 0o444,
+        }
+        for relative, expected_mode in expected_payload_modes.items():
+            if stat.S_IMODE(payload[relative][1].st_mode) != expected_mode:
+                self.error(
+                    "CANDIDATE_SEAL_MODE",
+                    relative,
+                    f"candidate payload mode must be exactly {expected_mode:04o}",
+                )
+
+        seal_raw, seal_info = self.read_same_fd(
+            CANDIDATE_SEAL_PATH,
+            symlink_code="CANDIDATE_SEAL_TYPE",
+            missing_code="CANDIDATE_SEAL_MISSING",
+        )
+        if (
+            seal_info.st_nlink != 1
+            or (seal_info.st_uid, seal_info.st_gid) != (root_info.st_uid, root_info.st_gid)
+            or stat.S_IMODE(seal_info.st_mode) != 0o400
+        ):
+            self.error(
+                "CANDIDATE_SEAL_MODE",
+                CANDIDATE_SEAL_PATH,
+                "candidate commit seal must be a single 0400 file owned by the run",
+            )
+        try:
+            seal = json.loads(
+                seal_raw.decode("utf-8"),
+                object_pairs_hook=reject_duplicate_keys,
+                parse_constant=reject_nonfinite_constant,
+            )
+        except (DuplicateJsonKey, NonfiniteJson, UnicodeError, json.JSONDecodeError) as exc:
+            self.error(
+                "CANDIDATE_SEAL_INVALID",
+                CANDIDATE_SEAL_PATH,
+                f"candidate commit seal is invalid JSON: {exc}",
+            )
+        if not isinstance(seal, dict) or contains_nonfinite(seal):
+            self.error(
+                "CANDIDATE_SEAL_INVALID",
+                CANDIDATE_SEAL_PATH,
+                "candidate commit seal must be a finite JSON object",
+            )
+
+        tree = hashlib.sha256()
+        for relative in sorted(CANDIDATE_PAYLOAD_PATHS, key=lambda item: item.as_posix()):
+            raw, info = payload[relative]
+            tree.update(
+                relative.as_posix().encode("utf-8")
+                + b"\0"
+                + str(stat.S_IMODE(info.st_mode)).encode("ascii")
+                + b"\0"
+                + hashlib.sha256(raw).hexdigest().encode("ascii")
+                + b"\0"
+            )
+        expected = {
+            "schemaVersion": 1,
+            "runId": run_id,
+            "device": root_info.st_dev,
+            "inode": root_info.st_ino,
+            "manifestSha256": hashlib.sha256(payload[Path("manifest.json")][0]).hexdigest(),
+            "treeSha256": tree.hexdigest(),
+        }
+        if seal != expected:
+            self.error(
+                "CANDIDATE_SEAL_MISMATCH",
+                CANDIDATE_SEAL_PATH,
+                "candidate commit seal does not match the immutable candidate payload",
+            )
+
+    def validate_sources(self, sources: object, path: Path) -> None:
+        if not isinstance(sources, dict) or set(sources) != set(SOURCE_NAMES):
+            self.error("SOURCE_SET", path, f"sources must be exactly: {', '.join(SOURCE_NAMES)}")
+        for name in SOURCE_NAMES:
+            source = sources[name]
+            if not isinstance(source, dict) or set(source) != {"revision", "dirty", "dirtyPaths"}:
+                self.error("SOURCE_FIELDS", path, f"source {name!r} has an invalid schema")
+            revision = source.get("revision")
+            if not isinstance(revision, str) or REVISION_PATTERN.fullmatch(revision) is None:
+                self.error("SOURCE_REVISION", path, f"source {name!r} revision must be 40 or 64 lowercase hex")
+            dirty = source.get("dirty")
+            dirty_paths = source.get("dirtyPaths")
+            if not isinstance(dirty, bool) or not isinstance(dirty_paths, list):
+                self.error("SOURCE_DIRTY", path, f"source {name!r} dirty ledger is invalid")
+            ledger_paths: list[str] = []
+            for entry in dirty_paths:
+                if not isinstance(entry, dict) or set(entry) != {"path", "state", "sha256"}:
+                    self.error("SOURCE_DIRTY", path, f"source {name!r} dirty entry is invalid")
+                self.validate_posix_ledger_path(entry.get("path"), path)
+                ledger_path = entry["path"]
+                ledger_paths.append(ledger_path)
+                state_value = entry.get("state")
+                digest_value = entry.get("sha256")
+                if state_value == "present":
+                    if not self.valid_sha256(digest_value):
+                        self.error("SHA256_FORMAT", path, f"dirty path {ledger_path!r} needs a sha256")
+                elif state_value == "deleted":
+                    if digest_value is not None:
+                        self.error("SOURCE_DIRTY", path, f"deleted path {ledger_path!r} sha256 must be null")
+                else:
+                    self.error("SOURCE_DIRTY", path, f"dirty path {ledger_path!r} has invalid state")
+            if ledger_paths != sorted(set(ledger_paths)) or dirty is not bool(dirty_paths):
+                self.error("SOURCE_DIRTY", path, f"source {name!r} dirty ledger is not canonical")
+
+    def validate_manifest(self) -> None:
+        manifests = self.find_named("manifest.json")
+        if Path("manifest.json") not in manifests:
+            self.error("MANIFEST_MISSING", Path("manifest.json"), "root manifest.json is missing")
+        path = Path("manifest.json")
+        manifest = self.load_document(path, "MANIFEST_MISSING")
+        if set(manifest) != MANIFEST_FIELDS:
+            self.error("MANIFEST_FIELDS", path, "manifest fields do not match the v0.1.5 ledger schema")
+        run_id = manifest.get("runId")
+        if not isinstance(run_id, str) or not run_id.strip():
+            self.error("RUN_ID_INVALID", path, "runId must be a non-empty string")
+        if manifest.get("mode") != "packed":
+            self.error("MANIFEST_MODE", path, "mode must be exactly 'packed'")
+        self.validate_sources(manifest.get("sources"), path)
+        self.validate_artifact_record(manifest.get("native"), path, "manifest:native")
+        if not isinstance(manifest.get("native"), dict) or manifest["native"].get("path") != "candidate/native/nexus":
+            self.error("PACKED_RUNTIME_BINDING", path, "native artifact path is not canonical")
+
+        packages = manifest.get("packages")
+        if not isinstance(packages, list) or tuple(
+            package.get("name") if isinstance(package, dict) else None for package in packages
+        ) != PACKAGE_NAMES:
+            self.error("PACKAGE_SET", path, f"packages must be exactly: {', '.join(PACKAGE_NAMES)}")
+        package_paths = (
+            "candidate/npm/nexus.tgz",
+            "candidate/npm/nexus-cli.tgz",
+            "candidate/npm/nexus-gateway.tgz",
+        )
+        for package, expected_path in zip(packages, package_paths, strict=True):
+            if not isinstance(package, dict) or set(package) != {"name", "version", "tarball"}:
+                self.error("PACKAGE_SET", path, "package records must contain name, version, and tarball")
+            if package.get("version") != VERSION:
+                self.error("PACKAGE_VERSION", path, f"all packages must be version {VERSION}")
+            self.validate_artifact_record(
+                package.get("tarball"),
+                path,
+                f"manifest:package:{package['name']}",
+            )
+            if package["tarball"].get("path") != expected_path:
+                self.error("PACKED_RUNTIME_BINDING", path, "package artifact path is not canonical")
+
+        image = manifest.get("image")
+        if (
+            not isinstance(image, dict)
+            or set(image) != {"digest"}
+            or not isinstance(image.get("digest"), str)
+            or not image["digest"].startswith("sha256:")
+            or not self.valid_sha256(image["digest"][7:])
+        ):
+            self.error("IMAGE_DIGEST", path, "image.digest must be sha256:<64 lowercase hex>")
+
+        container = manifest.get("container")
+        expected_limits = {"cpus": 6, "memoryBytes": 8589934592, "pids": 1024}
+        if not isinstance(container, dict) or set(container) != {"limits"} or container.get("limits") != expected_limits:
+            self.error("RESOURCE_LIMITS", path, "container limits must be exactly 6 CPU, 8 GiB, and 1024 PIDs")
+        if any(not is_int(value) for value in container["limits"].values()):
+            self.error("RESOURCE_LIMITS", path, "container limits must be typed integers")
+
+        toolchains = manifest.get("toolchains")
+        if (
+            not isinstance(toolchains, dict)
+            or set(toolchains) != {"nexus", "node", "rustc"}
+            or any(not isinstance(value, str) or not value.strip() for value in toolchains.values())
+            or toolchains["nexus"] != f"nexus {VERSION}"
+        ):
+            self.error(
+                "TOOLCHAINS",
+                path,
+                "toolchains must record exact nexus 0.1.5 output plus node and rustc",
+            )
+
+        environment = manifest.get("environment")
+        if not isinstance(environment, dict) or not environment:
+            self.error("ENVIRONMENT", path, "environment must be a non-empty string map")
+        for key, value in environment.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                self.error("ENVIRONMENT", path, "environment must contain only string keys and values")
+            if SENSITIVE_ENV_PATTERN.search(key) and value != "<redacted>":
+                self.error("ENV_REDACTION", path, f"sensitive environment value {key!r} is not redacted")
+        packed_prefix = environment.get("NEXUS_V015_PACKED_PREFIX")
+        install_nonce = environment.get("NEXUS_V015_INSTALL_NONCE")
+        exact_runtime = {
+            "OCULAR_LAB": "1",
+            "NEXUS_HOME": str(self.authority.lab_root / "nexus"),
+            "NEXUS_V015_RUN_ID": run_id,
+            "NEXUS_V015_CONTAINER_ID": self.authority.container_id,
+            "NEXUS_V015_NEXUS_BIN": "/tmp/nexus-lab-bin/nexus",
+            "NEXUS_V015_GATEWAY_BIN": "/tmp/nexus-lab-bin/nexus-gateway",
+            "NEXUS_V015_WEBUI_BIN": "/tmp/nexus-lab-bin/nexus-webui",
+            "NEXUS_V015_LAB_PROCESS": "/tmp/nexus-lab-bin/lab-process",
+            "NEXUS_V015_LAB_AGENT": "/tmp/nexus-lab-bin/lab-agent",
+            "NEXUS_V015_LAB_FIXTURE": "/tmp/nexus-lab-bin/lab-fixture",
+            "NEXUS_V015_NEXUS_TARBALL": "/tmp/nexus-lab-packs/nexus.tgz",
+            "NEXUS_V015_CLI_TARBALL": "/tmp/nexus-lab-packs/nexus-cli.tgz",
+            "NEXUS_V015_GATEWAY_TARBALL": "/tmp/nexus-lab-packs/nexus-gateway.tgz",
+            "NEXUS_V015_READINESS_LEDGER": str(self.authority.readiness_path),
+            "NEXUS_V015_READINESS_LEDGER_SHA256": self.authority.readiness_sha256,
+            "NEXUS_V015_GATEWAY_URL": "http://127.0.0.1:4100",
+            "NEXUS_V015_WS_ACCEPTANCE": "/tmp/nexus-lab-bin/nexus-v015-ws-acceptance",
+            "NEXUS_V015_WS_SOAK": "/tmp/nexus-lab-bin/nexus-v015-ws-soak",
+            "NEXUS_V015_WEBCONSOLE_ACCEPTANCE": "/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance",
+            "NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER": "/tmp/nexus-lab-bin/nexus-v015-webconsole-evidence-verify",
+            "NEXUS_V015_EVIDENCE_VALIDATOR": "/tmp/nexus-lab-bin/nexus-v015-evidence-validate",
+            "NEXUS_V015_RELEASE_ASSEMBLER": "/tmp/nexus-lab-bin/nexus-v015-release-assemble",
+            "NEXUS_V015_IMAGE_DIGEST": image["digest"],
+        }
+        hash_fields = (
+            "NEXUS_V015_NEXUS_BIN_SHA256",
+            "NEXUS_V015_GATEWAY_BIN_SHA256",
+            "NEXUS_V015_WEBUI_BIN_SHA256",
+            "NEXUS_V015_GATEWAY_MODULE_SHA256",
+            "NEXUS_V015_NATIVE_BIN_SHA256",
+            "NEXUS_V015_LAB_PROCESS_SHA256",
+            "NEXUS_V015_LAB_AGENT_SHA256",
+            "NEXUS_V015_LAB_FIXTURE_SHA256",
+            "NEXUS_V015_NEXUS_TARBALL_SHA256",
+            "NEXUS_V015_CLI_TARBALL_SHA256",
+            "NEXUS_V015_GATEWAY_TARBALL_SHA256",
+            "NEXUS_V015_READINESS_LEDGER_SHA256",
+            "NEXUS_V015_INSTALL_TREE_SHA256",
+            "NEXUS_V015_WS_ACCEPTANCE_SHA256",
+            "NEXUS_V015_WS_SOAK_SHA256",
+            "NEXUS_V015_WEBCONSOLE_ACCEPTANCE_SHA256",
+            "NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER_SHA256",
+            "NEXUS_V015_EVIDENCE_VALIDATOR_SHA256",
+            "NEXUS_V015_RELEASE_ASSEMBLER_SHA256",
+        )
+        packed_paths = (
+            "NEXUS_V015_NEXUS_BIN_RESOLVED",
+            "NEXUS_V015_GATEWAY_BIN_RESOLVED",
+            "NEXUS_V015_WEBUI_BIN_RESOLVED",
+            "NEXUS_V015_GATEWAY_MODULE",
+            "NEXUS_V015_NATIVE_BIN",
+        )
+        runtime_binding_valid = (
+            isinstance(packed_prefix, str)
+            and re.fullmatch(r"/tmp/nexus-lab-install\.[A-Za-z0-9]+", packed_prefix) is not None
+            and isinstance(install_nonce, str)
+            and install_nonce == packed_prefix.rsplit(".", 1)[-1]
+            and all(environment.get(key) == value for key, value in exact_runtime.items())
+            and all(self.valid_sha256(environment.get(key)) for key in hash_fields)
+            and all(
+                isinstance(environment.get(key), str)
+                and environment[key].startswith(f"{packed_prefix}/")
+                for key in packed_paths
+            )
+            and environment.get("NEXUS_V015_NATIVE_BIN_SHA256") == manifest["native"]["sha256"]
+            and environment.get("NEXUS_V015_NEXUS_TARBALL_SHA256") == packages[0]["tarball"]["sha256"]
+            and environment.get("NEXUS_V015_CLI_TARBALL_SHA256") == packages[1]["tarball"]["sha256"]
+            and environment.get("NEXUS_V015_GATEWAY_TARBALL_SHA256") == packages[2]["tarball"]["sha256"]
+            and "VITE_DEV_SERVER_URL" not in environment
+        )
+        if not runtime_binding_valid:
+            self.error(
+                "PACKED_RUNTIME_BINDING",
+                path,
+                "manifest environment must bind the complete immutable packed runtime",
+            )
+        lens_renderer_mode = environment.get("NEXUS_V015_LENS_RENDERER_MODE")
+        lens_app = environment.get("NEXUS_V015_LENS_APP")
+        lens_main = environment.get("NEXUS_V015_LENS_MAIN")
+        lens_tree_sha = environment.get("NEXUS_V015_LENS_TREE_SHA256")
+        if (
+            lens_renderer_mode != "production"
+            or not isinstance(lens_app, str)
+            or re.fullmatch(r"/tmp/nexus-lens-app\.[A-Za-z0-9]+", lens_app) is None
+            or lens_main != f"{lens_app}/electron/main.cjs"
+            or not self.valid_sha256(lens_tree_sha)
+        ):
+            self.error(
+                "LENS_RENDERER_BINDING",
+                path,
+                "packed evidence must bind the production Lens renderer tree",
+            )
+
+        self.validate_candidate_commit_seal(run_id)
+
+        ledger = {
+            "mode": manifest["mode"],
+            "sources": manifest["sources"],
+            "nativeSha256": manifest["native"]["sha256"],
+            "packages": [
+                {
+                    "name": package["name"],
+                    "version": package["version"],
+                    "tarballSha256": package["tarball"]["sha256"],
+                }
+                for package in packages
+            ],
+            "imageDigest": image["digest"],
+            "limits": container["limits"],
+            "toolchains": toolchains,
+            "environment": environment,
+        }
+        self.run_id = run_id
+        self.candidate_digest = canonical_digest(ledger)
+
+    def validate_identity(self, document: dict[str, Any], path: Path) -> None:
+        if document.get("runId") != self.run_id:
+            self.error("RUN_ID_MISMATCH", path, f"runId must match {self.run_id!r}")
+        if document.get("candidateDigest") != self.candidate_digest:
+            self.error("CANDIDATE_MISMATCH", path, "candidateDigest must be derived from manifest.json")
+
+    def validate_case_identity(self, document: dict[str, Any], path: Path) -> None:
+        if document.get("runId") != self.run_id:
+            self.error("RUN_ID_MISMATCH", path, f"runId must match {self.run_id!r}")
+        if document.get("readinessSha256") != self.authority.readiness_sha256:
+            self.error(
+                "READINESS_AUTHORITY",
+                path,
+                "case readinessSha256 must match the canonical packed readiness ledger",
+            )
+
+    def validate_outcome(self, document: dict[str, Any], path: Path) -> None:
+        if document.get("status") != "PASS":
+            self.error("OUTCOME_STATUS", path, "status must be exactly PASS")
+        if document.get("error") is not None:
+            self.error("OUTCOME_ERROR", path, "error must be null")
+        for field in ("partial", "flaky", "skipped", "refused"):
+            if document.get(field) is not False:
+                self.error("OUTCOME_FLAGS", path, f"{field} must be exactly false")
+        if not is_int(document.get("failureCount")) or document.get("failureCount") != 0:
+            self.error("FAILURE_COUNT", path, "failureCount must be integer zero")
+
+    def walk_relative_files(self) -> list[Path]:
+        found: list[Path] = []
+
+        def walk(directory_fd: int, base: Path) -> None:
+            try:
+                with os.scandir(directory_fd) as iterator:
+                    entries = sorted(iterator, key=lambda entry: entry.name)
+            except OSError as exc:
+                self.error("FILE_IO", base, f"cannot enumerate evidence directory: {exc}")
+            for entry in entries:
+                relative = base / entry.name
+                try:
+                    visible = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    self.error("FILE_IO", relative, f"cannot inspect evidence entry: {exc}")
+                if stat.S_ISLNK(visible.st_mode):
+                    # Keep the lexical name in discovery so the owning
+                    # document/artifact/D2 validator reports its typed
+                    # symlink error.  The final run inventory independently
+                    # rejects every unowned symlink that is not referenced.
+                    found.append(relative)
+                    continue
+                if stat.S_ISDIR(visible.st_mode):
+                    try:
+                        child_fd = os.open(
+                            entry.name,
+                            os.O_RDONLY
+                            | getattr(os, "O_DIRECTORY", 0)
+                            | getattr(os, "O_NOFOLLOW", 0),
+                            dir_fd=directory_fd,
+                        )
+                    except OSError as exc:
+                        self.error("FILE_IO", relative, f"cannot open evidence directory: {exc}")
+                    try:
+                        opened = os.fstat(child_fd)
+                        if self.metadata_identity(opened) != self.metadata_identity(visible):
+                            self.error("FILE_CHANGED", relative, "evidence directory changed before open")
+                        walk(child_fd, relative)
+                    finally:
+                        os.close(child_fd)
+                elif stat.S_ISREG(visible.st_mode):
+                    found.append(relative)
+                else:
+                    self.error("DOCUMENT_TYPE", relative, "evidence entry must be regular")
+
+        descriptor = os.dup(self.root_fd)
+        try:
+            walk(descriptor, Path())
+        finally:
+            os.close(descriptor)
+        return found
+
+    def inventory_path_sets(self) -> tuple[set[Path], set[Path]]:
+        files: set[Path] = set()
+        directories: set[Path] = set()
+
+        def walk(directory_fd: int, base: Path) -> None:
+            before_directory = os.fstat(directory_fd)
+            try:
+                with os.scandir(directory_fd) as iterator:
+                    entries = sorted(iterator, key=lambda entry: entry.name)
+            except OSError as exc:
+                self.error("RUN_SEAL_INVENTORY", base, f"cannot enumerate evidence: {exc}")
+            for entry in entries:
+                relative = base / entry.name
+                try:
+                    visible = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    self.error("RUN_SEAL_INVENTORY", relative, f"cannot inspect evidence: {exc}")
+                if stat.S_ISLNK(visible.st_mode):
+                    self.error("RUN_SEAL_INVENTORY", relative, "evidence cannot contain symlinks")
+                if stat.S_ISDIR(visible.st_mode):
+                    try:
+                        child_fd = os.open(
+                            entry.name,
+                            os.O_RDONLY
+                            | getattr(os, "O_DIRECTORY", 0)
+                            | getattr(os, "O_NOFOLLOW", 0),
+                            dir_fd=directory_fd,
+                        )
+                    except OSError as exc:
+                        self.error(
+                            "RUN_SEAL_INVENTORY",
+                            relative,
+                            f"cannot open evidence directory: {exc}",
+                        )
+                    try:
+                        opened = os.fstat(child_fd)
+                        if self.metadata_identity(opened) != self.metadata_identity(visible):
+                            self.error(
+                                "RUN_SEAL_CHANGED",
+                                relative,
+                                "evidence directory changed before inventory",
+                            )
+                        directories.add(relative)
+                        walk(child_fd, relative)
+                        after = os.fstat(child_fd)
+                        visible_after = os.stat(
+                            entry.name, dir_fd=directory_fd, follow_symlinks=False
+                        )
+                        if (
+                            self.metadata_identity(opened) != self.metadata_identity(after)
+                            or self.metadata_identity(after) != self.metadata_identity(visible_after)
+                        ):
+                            self.error(
+                                "RUN_SEAL_CHANGED",
+                                relative,
+                                "evidence directory changed during inventory",
+                            )
+                    finally:
+                        os.close(child_fd)
+                    continue
+                if not stat.S_ISREG(visible.st_mode):
+                    self.error(
+                        "RUN_SEAL_INVENTORY", relative, "evidence must contain regular files only"
+                    )
+                try:
+                    descriptor = os.open(
+                        entry.name,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=directory_fd,
+                    )
+                except OSError as exc:
+                    self.error("RUN_SEAL_INVENTORY", relative, f"cannot open evidence file: {exc}")
+                try:
+                    opened = os.fstat(descriptor)
+                    visible_after = os.stat(
+                        entry.name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    if (
+                        self.metadata_identity(opened) != self.metadata_identity(visible)
+                        or self.metadata_identity(opened) != self.metadata_identity(visible_after)
+                    ):
+                        self.error(
+                            "RUN_SEAL_CHANGED", relative, "evidence file changed during inventory"
+                        )
+                    files.add(relative)
+                finally:
+                    os.close(descriptor)
+            after_directory = os.fstat(directory_fd)
+            if self.metadata_identity(before_directory) != self.metadata_identity(after_directory):
+                self.error("RUN_SEAL_CHANGED", base, "evidence directory changed during inventory")
+
+        walk(self.root_fd, Path())
+        return files, directories
+
+    def validate_declared_inventory(self) -> None:
+        expected_files = set(self.declared_files)
+        expected_directories: set[Path] = set()
+        for relative in expected_files:
+            parent = relative.parent
+            while parent.parts:
+                expected_directories.add(parent)
+                parent = parent.parent
+        actual_files, actual_directories = self.inventory_path_sets()
+        unexpected_files = sorted(actual_files - expected_files, key=lambda path: path.as_posix())
+        unexpected_directories = sorted(
+            actual_directories - expected_directories, key=lambda path: path.as_posix()
+        )
+        if unexpected_files or unexpected_directories:
+            unexpected = min(
+                (*unexpected_files, *unexpected_directories), key=lambda path: path.as_posix()
+            )
+            self.error(
+                "INVENTORY_UNDECLARED",
+                unexpected,
+                "evidence path is not a canonical document or declared artifact",
+            )
+        missing_files = sorted(expected_files - actual_files, key=lambda path: path.as_posix())
+        missing_directories = sorted(
+            expected_directories - actual_directories, key=lambda path: path.as_posix()
+        )
+        if missing_files or missing_directories:
+            missing = min((*missing_files, *missing_directories), key=lambda path: path.as_posix())
+            self.error("INVENTORY_MISSING", missing, "canonical evidence path is missing")
+
+    def find_named(self, filename: str) -> list[Path]:
+        return [path for path in self.walk_relative_files() if path.name == filename]
+
+    def discover_cases(self) -> dict[str, tuple[Path, dict[str, Any]]]:
+        found: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
+        for path in self.find_named("manifest.json"):
+            if path == Path("manifest.json"):
+                continue
+            document = self.load_document(path, "CASE_MISSING")
+            case_id = document.get("case")
+            if not isinstance(case_id, str) or case_id not in EXPECTED_CASE_SET:
+                self.error("CASE_UNEXPECTED", path, f"case must be one of {', '.join(EXPECTED_CASES)}")
+            self.declared_files.add(path)
+            found.setdefault(case_id, []).append((path, document))
+        for case_id, records in found.items():
+            if len(records) != 1:
+                self.error("CASE_DUPLICATE", records[0][0], f"duplicate metadata for {case_id}")
+        missing = [case_id for case_id in EXPECTED_CASES if case_id not in found]
+        if missing:
+            self.error("CASE_MISSING", self.root, f"missing case metadata: {', '.join(missing)}")
+        return {case_id: found[case_id][0] for case_id in EXPECTED_CASES}
+
+    def case_artifact_json(
+        self,
+        raw: bytes,
+        path: Path,
+        code: str,
+    ) -> object:
+        try:
+            value = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=reject_duplicate_keys,
+                parse_constant=reject_nonfinite_constant,
+            )
+        except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            self.error(code, path, f"case artifact is not strict JSON: {exc}")
+        if contains_nonfinite(value):
+            self.error(code, path, "case artifact contains a nonfinite number")
+        return value
+
+    def validate_case_artifact_redaction(
+        self,
+        raw: bytes,
+        path: Path,
+    ) -> None:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeError:
+            self.error("EVIDENCE_REDACTION", path, "textual case evidence is not UTF-8")
+        leaks = (
+            re.compile(r"nexus_ck_[0-9a-f]{8,}", re.IGNORECASE),
+            re.compile(
+                r"nexus_(?:human|csrf)(?:\\?\"\s*:\s*\\?\"|=)(?!\[REDACTED\])[^\s;\"\\]{4,}",
+                re.IGNORECASE,
+            ),
+            re.compile(r"authorization\s*:\s*(?!\[REDACTED\])\S+", re.IGNORECASE),
+            re.compile(r"\bbearer\s+(?!\[REDACTED\])[A-Za-z0-9._-]{4,}", re.IGNORECASE),
+        )
+        if any(pattern.search(text) for pattern in leaks):
+            self.error(
+                "EVIDENCE_REDACTION",
+                path,
+                "textual case evidence contains an unredacted credential-shaped value",
+            )
+
+    def validate_case_artifact_payloads(
+        self,
+        case_id: str,
+        document: dict[str, Any],
+        path: Path,
+        payloads: dict[str, bytes],
+    ) -> None:
+        for name in ("preScreenshot", "postScreenshot"):
+            if not payloads[name].startswith(b"\xff\xd8\xff"):
+                self.error("SCREENSHOT_EVIDENCE", path, f"{name} must contain JPEG bytes")
+
+        textual_names = ("dom", "console", "network", "websocket", "processLogs", "health")
+        for name in textual_names:
+            self.validate_case_artifact_redaction(payloads[name], path)
+
+        try:
+            dom = payloads["dom"].decode("utf-8")
+        except UnicodeError:
+            self.error("DOM_EVIDENCE", path, "DOM evidence must be UTF-8")
+        if "<" not in dom:
+            self.error("DOM_EVIDENCE", path, "DOM evidence must contain rendered markup")
+
+        console = self.case_artifact_json(payloads["console"], path, "CONSOLE_EVIDENCE")
+        if (
+            not isinstance(console, dict)
+            or not isinstance(console.get("messages"), list)
+            or not isinstance(console.get("violations"), list)
+            or console["violations"]
+        ):
+            self.error(
+                "CONSOLE_EVIDENCE",
+                path,
+                "PASS case console evidence requires messages and zero violations",
+            )
+
+        network = self.case_artifact_json(payloads["network"], path, "NETWORK_EVIDENCE")
+        if not isinstance(network, list):
+            self.error("NETWORK_EVIDENCE", path, "network evidence must be a JSON array")
+        websocket = self.case_artifact_json(
+            payloads["websocket"], path, "WEBSOCKET_EVIDENCE"
+        )
+        if not isinstance(websocket, list):
+            self.error("WEBSOCKET_EVIDENCE", path, "WebSocket evidence must be a JSON array")
+
+        process_logs = self.case_artifact_json(
+            payloads["processLogs"], path, "PROCESS_LOG_EVIDENCE"
+        )
+        logs = process_logs.get("logs") if isinstance(process_logs, dict) else None
+        renderer_target = (
+            process_logs.get("rendererTarget") if isinstance(process_logs, dict) else None
+        )
+        if (
+            not isinstance(process_logs, dict)
+            or not isinstance(process_logs.get("capturedAt"), str)
+            or not process_logs["capturedAt"]
+            or not is_int(process_logs.get("runnerPid"))
+            or process_logs["runnerPid"] <= 0
+            or not isinstance(renderer_target, dict)
+            or not isinstance(renderer_target.get("id"), str)
+            or not renderer_target["id"]
+            or not isinstance(renderer_target.get("url"), str)
+            or not renderer_target["url"]
+            or not isinstance(logs, dict)
+            or set(logs) != {"daemon", "gateway", "lens"}
+        ):
+            self.error(
+                "PROCESS_LOG_EVIDENCE",
+                path,
+                "process log evidence is missing its runner, renderer, or exact service logs",
+            )
+        expected_log_paths = {
+            "daemon": str(self.authority.lab_root / "nexus/daemon.log"),
+            "gateway": str(self.authority.lab_root / "lab/gateway-start.log"),
+            "lens": str(self.authority.lab_root / "lab/lens.log"),
+        }
+        for role in ("daemon", "gateway", "lens"):
+            entry = logs[role]
+            if (
+                not isinstance(entry, dict)
+                or entry.get("path") != expected_log_paths[role]
+                or not isinstance(entry.get("tail"), str)
+                or not entry["tail"]
+                or len(entry["tail"].encode("utf-8")) > 16_384
+                or entry.get("absent") is True
+            ):
+                self.error(
+                    "PROCESS_LOG_EVIDENCE",
+                    path,
+                    f"{role} log evidence must be present, readable, and non-empty",
+                )
+
+        health = self.case_artifact_json(payloads["health"], path, "HEALTH_EVIDENCE")
+        if (
+            not isinstance(health, dict)
+            or not isinstance(health.get("capturedAt"), str)
+            or not health["capturedAt"]
+            or health.get("url") != "http://127.0.0.1:4100/api/v1/health"
+            or health.get("status") != 200
+            or "body" not in health
+            or health["body"] in (None, "")
+        ):
+            self.error(
+                "HEALTH_EVIDENCE",
+                path,
+                "health evidence must record a timestamped HTTP 200 response",
+            )
+
+        if case_id in MECHANISM_CASES:
+            mechanism = self.case_artifact_json(
+                payloads["mechanism"], path, "MECHANISM_EVIDENCE"
+            )
+            if (
+                mechanism != document.get("mechanism")
+                or len(websocket) < document["mechanism"]["pushFrames"]
+            ):
+                self.error(
+                    "MECHANISM_EVIDENCE",
+                    path,
+                    "mechanism artifact must match its summary and observed pushed frames",
+                )
+
+    def validate_cases(self) -> None:
+        for case_id, (path, document) in self.discover_cases().items():
+            expected_fields = {
+                "schemaVersion",
+                "schema",
+                "runId",
+                "readinessSha256",
+                "case",
+                "surface",
+                "status",
+                "error",
+                "partial",
+                "flaky",
+                "skipped",
+                "refused",
+                "failureCount",
+                "requiredArtifacts",
+                "artifacts",
+            }
+            if case_id in MECHANISM_CASES:
+                expected_fields.add("mechanism")
+            if set(document) != expected_fields or document.get("schema") != "ocular-evidence/2":
+                self.error(
+                    "CASE_SCHEMA",
+                    path,
+                    "case manifest must match ocular-evidence/2 exactly",
+                )
+            self.validate_case_identity(document, path)
+            self.validate_outcome(document, path)
+            expected_surface = "ocular" if case_id.startswith("O") else "webui"
+            if document.get("surface") != expected_surface:
+                self.error("CASE_SURFACE", path, f"{case_id} surface must be {expected_surface!r}")
+            expected_artifacts = OCULAR_ARTIFACTS if expected_surface == "ocular" else WEBUI_ARTIFACTS
+            if case_id in MECHANISM_CASES:
+                expected_artifacts = expected_artifacts + ("mechanism",)
+                mechanism = document.get("mechanism")
+                if (
+                    not isinstance(mechanism, dict)
+                    or set(mechanism) != {"pushFrames", "postCommitWakes", "timerReads"}
+                    or not is_int(mechanism.get("pushFrames"))
+                    or mechanism["pushFrames"] < 1
+                    or not is_int(mechanism.get("postCommitWakes"))
+                    or mechanism["postCommitWakes"] < 1
+                    or not is_int(mechanism.get("timerReads"))
+                    or mechanism["timerReads"] != 0
+                ):
+                    self.error("MECHANISM_EVIDENCE", path, "push must be observed with zero timer reads")
+            payloads = self.validate_artifacts(
+                document,
+                path,
+                f"case:{case_id}",
+                expected_artifacts,
+                path.parent,
+            )
+            self.validate_case_artifact_payloads(case_id, document, path, payloads)
+
+    def result_json_paths(self) -> set[str]:
+        return {
+            path.as_posix()
+            for path in self.walk_relative_files()
+            if path.parts
+            and path.parts[0] in {"results", "release"}
+            and path.name.endswith(".json")
+        }
+
+    def validate_results(self) -> None:
+        # Open every canonical document before inventory comparison. Besides
+        # producing the most useful missing-file error, this ensures a
+        # symlinked canonical parent cannot be hidden by the real target being
+        # discovered as an "unexpected" sibling.
+        documents: dict[str, dict[str, Any]] = {}
+        for gate, (path, _) in RESULT_SPECS.items():
+            documents[gate] = self.load_document(path, "RESULT_MISSING")
+        actual = self.result_json_paths()
+        unexpected = sorted(actual - EXPECTED_RESULT_PATHS)
+        if unexpected:
+            self.error("RESULT_UNEXPECTED", Path(unexpected[0]), "unexpected result document")
+        missing = sorted(EXPECTED_RESULT_PATHS - actual)
+        if missing:
+            self.error("RESULT_MISSING", Path(missing[0]), "required result document is missing")
+        for gate, (path, artifacts) in RESULT_SPECS.items():
+            document = documents[gate]
+            if document.get("gate") != gate:
+                self.error("GATE_ID", path, f"gate must be exactly {gate!r}")
+            self.validate_identity(document, path)
+            self.validate_outcome(document, path)
+            if gate == "DIFF":
+                if not is_int(document.get("unexpectedChanges")) or document["unexpectedChanges"] != 0:
+                    self.error("DIFF_DISPOSITION", path, "unexpectedChanges must be integer zero")
+            elif gate == "REVIEW":
+                if not is_int(document.get("unresolvedBlockers")) or document["unresolvedBlockers"] != 0:
+                    self.error("REVIEW_DISPOSITION", path, "unresolvedBlockers must be integer zero")
+            elif gate == "F3":
+                self.validate_soak(document, path)
+            if gate == "D2":
+                self.validate_d2_inventory(document, path)
+                self.validate_d2_seal()
+            self.validate_artifacts(document, path, f"result:{gate}", artifacts)
+
+    def validate_soak(self, document: dict[str, Any], path: Path) -> None:
+        started = document.get("startedAt")
+        ended = document.get("endedAt")
+        elapsed = document.get("elapsedSeconds")
+        if not all(is_finite_number(value) for value in (started, ended, elapsed)):
+            self.error("SOAK_DURATION", path, "soak timestamps and elapsedSeconds must be finite numbers")
+        observed = float(ended) - float(started)
+        if observed < 1800 or float(elapsed) < 1800:
+            self.error("SOAK_DURATION", path, "soak must run for at least 1800 seconds")
+        if abs(observed - float(elapsed)) > 1e-6:
+            self.error("SOAK_TIMESTAMPS", path, "elapsedSeconds must equal endedAt - startedAt")
+
+        counters = document.get("failureCounters")
+        if not isinstance(counters, dict) or set(counters) != set(SOAK_COUNTERS):
+            self.error("SOAK_FAILURE_COUNTER", path, "failureCounters do not match the required typed set")
+        if any(not is_int(value) or value != 0 for value in counters.values()):
+            self.error("SOAK_FAILURE_COUNTER", path, "every soak failure counter must be integer zero")
+
+        checkpoints = document.get("checkpoints")
+        checkpoint_names = {
+            "developerWebSocket",
+            "agentSessionWebSocket",
+            "daemonReconnects",
+            "gatewayReconnects",
+        }
+        if not isinstance(checkpoints, dict) or set(checkpoints) != checkpoint_names:
+            self.error("SOAK_CHECKPOINT", path, "dual-WebSocket and reconnect checkpoints are required")
+        developer = checkpoints.get("developerWebSocket")
+        developer_fields = {
+            "status",
+            "reconnects",
+            "lastAcceptedCursor",
+            "topicCursors",
+            "replayCount",
+            "resyncCount",
+        }
+        topic_cursors = developer.get("topicCursors") if isinstance(developer, dict) else None
+        if (
+            not isinstance(developer, dict)
+            or set(developer) != developer_fields
+            or developer.get("status") != "PASS"
+            or not is_int(developer.get("reconnects"))
+            or developer["reconnects"] < 4
+            or not is_int(developer.get("lastAcceptedCursor"))
+            or developer["lastAcceptedCursor"] <= 0
+            or not isinstance(topic_cursors, dict)
+            or len(topic_cursors) != 3
+            or any(
+                not isinstance(topic, str)
+                or not topic
+                or not is_int(cursor)
+                or cursor <= 0
+                for topic, cursor in topic_cursors.items()
+            )
+            or developer["lastAcceptedCursor"] != max(topic_cursors.values(), default=0)
+            or not is_int(developer.get("replayCount"))
+            or developer["replayCount"] < 4
+            or not is_int(developer.get("resyncCount"))
+            or developer["resyncCount"] < 0
+        ):
+            self.error("SOAK_CHECKPOINT", path, "developerWebSocket checkpoint is incomplete")
+
+        session = checkpoints.get("agentSessionWebSocket")
+        session_fields = {
+            "status",
+            "reconnects",
+            "lastAcceptedCursor",
+            "agentCursors",
+            "replayCounts",
+            "resyncCounts",
+        }
+        agent_cursors = session.get("agentCursors") if isinstance(session, dict) else None
+        replay_counts = session.get("replayCounts") if isinstance(session, dict) else None
+        resync_counts = session.get("resyncCounts") if isinstance(session, dict) else None
+        expected_agents = {"codex", "claude"}
+        if (
+            not isinstance(session, dict)
+            or set(session) != session_fields
+            or session.get("status") != "PASS"
+            or not is_int(session.get("reconnects"))
+            or session["reconnects"] < 4
+            or not is_int(session.get("lastAcceptedCursor"))
+            or session["lastAcceptedCursor"] <= 0
+            or not isinstance(agent_cursors, dict)
+            or set(agent_cursors) != expected_agents
+            or any(not is_int(value) or value <= 0 for value in agent_cursors.values())
+            or session["lastAcceptedCursor"] != min(agent_cursors.values(), default=0)
+            or not isinstance(replay_counts, dict)
+            or set(replay_counts) != expected_agents
+            or any(not is_int(value) or value < 4 for value in replay_counts.values())
+            or not isinstance(resync_counts, dict)
+            or set(resync_counts) != expected_agents
+            or any(not is_int(value) or value < 0 for value in resync_counts.values())
+        ):
+            self.error("SOAK_CHECKPOINT", path, "agentSessionWebSocket checkpoint is incomplete")
+        for name in ("daemonReconnects", "gatewayReconnects"):
+            if not is_int(checkpoints.get(name)) or checkpoints[name] != 2:
+                self.error("SOAK_CHECKPOINT", path, f"{name} must be exactly two")
+
+        restart_proofs = document.get("restartProofs")
+        if not isinstance(restart_proofs, list) or len(restart_proofs) != 4:
+            self.error("SOAK_RESTART_STRADDLE", path, "exactly four restart proofs are required")
+        targets: list[str] = []
+        developer_ids: set[str] = set()
+        session_ids: set[str] = set()
+        for proof in restart_proofs:
+            if not isinstance(proof, dict) or set(proof) != {
+                "status",
+                "target",
+                "transportRecoveryObserved",
+                "developer",
+                "agentSessions",
+            }:
+                self.error("SOAK_RESTART_STRADDLE", path, "restart proof has the wrong schema")
+            target = proof.get("target")
+            if (
+                proof.get("status") != "PASS"
+                or target not in {"daemon", "gateway"}
+                or proof.get("transportRecoveryObserved") is not True
+            ):
+                self.error("SOAK_RESTART_STRADDLE", path, "restart transport recovery is unproven")
+            targets.append(str(target))
+            developer_proof = proof.get("developer")
+            if not isinstance(developer_proof, dict) or set(developer_proof) != {
+                "messageId",
+                "cursorBefore",
+                "cursorAfter",
+                "receivedCount",
+            }:
+                self.error("SOAK_RESTART_STRADDLE", path, "developer restart proof is malformed")
+            message_id = developer_proof.get("messageId")
+            before = developer_proof.get("cursorBefore")
+            after = developer_proof.get("cursorAfter")
+            if (
+                not isinstance(message_id, str)
+                or not message_id
+                or message_id in developer_ids
+                or not is_int(before)
+                or before < 0
+                or not is_int(after)
+                or after <= before
+                or developer_proof.get("receivedCount") != 1
+            ):
+                self.error("SOAK_RESTART_STRADDLE", path, "developer traffic did not replay exactly once")
+            developer_ids.add(message_id)
+            session_proofs = proof.get("agentSessions")
+            if not isinstance(session_proofs, dict) or set(session_proofs) != expected_agents:
+                self.error("SOAK_RESTART_STRADDLE", path, "both real-agent restart proofs are required")
+            for kind, row in session_proofs.items():
+                if not isinstance(row, dict) or set(row) != {
+                    "clientMessageId",
+                    "cursorBefore",
+                    "cursorAfter",
+                    "completionCount",
+                }:
+                    self.error("SOAK_RESTART_STRADDLE", path, f"{kind} restart proof is malformed")
+                client_message_id = row.get("clientMessageId")
+                before = row.get("cursorBefore")
+                after = row.get("cursorAfter")
+                if (
+                    not isinstance(client_message_id, str)
+                    or not client_message_id
+                    or client_message_id in session_ids
+                    or not is_int(before)
+                    or before < 0
+                    or not is_int(after)
+                    or after <= before
+                    or row.get("completionCount") != 1
+                ):
+                    self.error("SOAK_RESTART_STRADDLE", path, f"{kind} input did not replay exactly once")
+                session_ids.add(client_message_id)
+        if sorted(targets) != ["daemon", "daemon", "gateway", "gateway"]:
+            self.error("SOAK_RESTART_STRADDLE", path, "restart proofs must cover each authority twice")
+
+        bounds = document.get("bounds")
+        if not isinstance(bounds, dict) or set(bounds) != {"memoryBytes", "diskBytes"}:
+            self.error("SOAK_BOUNDS", path, "memory and disk bounds are required")
+        for name in ("memoryBytes", "diskBytes"):
+            bound = bounds.get(name)
+            if (
+                not isinstance(bound, dict)
+                or set(bound) != {"start", "end", "peak", "limit"}
+                or any(not is_int(bound.get(field)) or bound[field] < 0 for field in bound)
+                or bound["limit"] <= 0
+                or bound["start"] > bound["peak"]
+                or bound["end"] > bound["peak"]
+                or bound["peak"] > bound["limit"]
+                or (name == "memoryBytes" and bound["limit"] != 8589934592)
+                or (name == "diskBytes" and bound["limit"] != 10 * 1024 * 1024 * 1024)
+            ):
+                self.error("SOAK_BOUNDS", path, f"{name} is not bounded")
+
+        resource = document.get("resourceHealth")
+        resource_fields = {
+            "status",
+            "withinBounds",
+            "trendHealthy",
+            "sampleCount",
+            "processRssPeak",
+            "memoryEventDeltas",
+            "pidsMaxDelta",
+        }
+        if not isinstance(resource, dict) or set(resource) != resource_fields:
+            self.error("SOAK_RESOURCE_HEALTH", path, "resourceHealth has the wrong schema")
+        deltas = resource.get("memoryEventDeltas")
+        if (
+            resource.get("status") != "PASS"
+            or resource.get("withinBounds") is not True
+            or resource.get("trendHealthy") is not True
+            or not is_int(resource.get("sampleCount"))
+            or resource["sampleCount"] < 60
+            or not is_int(resource.get("processRssPeak"))
+            or resource["processRssPeak"] <= 0
+            or not isinstance(deltas, dict)
+            or set(deltas) != {"oom", "oom_kill", "max"}
+            or any(not is_int(value) or value != 0 for value in deltas.values())
+            or not is_int(resource.get("pidsMaxDelta"))
+            or resource["pidsMaxDelta"] != 0
+        ):
+            self.error("SOAK_RESOURCE_HEALTH", path, "resourceHealth did not remain healthy")
+
+        topology = document.get("topology")
+        topology_fields = {"status", "healthy", "processes", "tcpPorts", "unixSockets"}
+        if not isinstance(topology, dict) or set(topology) != topology_fields:
+            self.error("SOAK_TOPOLOGY", path, "topology has the wrong schema")
+        processes = topology.get("processes")
+        tcp_ports = topology.get("tcpPorts")
+        unix_sockets = topology.get("unixSockets")
+        if (
+            topology.get("status") != "PASS"
+            or topology.get("healthy") is not True
+            or not isinstance(processes, dict)
+            or set(processes) != set(SOAK_PROCESS_ROLES)
+            or any(not is_int(value) or value <= 0 for value in processes.values())
+            or len(set(processes.values())) != len(processes)
+            or tcp_ports != [4100, 4101, 4200, 9222, 9224]
+            or not isinstance(unix_sockets, list)
+            or len(unix_sockets) != 2
+            or any(not isinstance(value, str) or not value.startswith("/") for value in unix_sockets)
+        ):
+            self.error("SOAK_TOPOLOGY", path, "final process/listener topology is incomplete")
+
+        invariants = document.get("invariants")
+        if (
+            not isinstance(invariants, dict)
+            or set(invariants) != set(SOAK_INVARIANTS)
+            or any(value is not True for value in invariants.values())
+        ):
+            self.error("SOAK_INVARIANT", path, "every mandatory soak invariant must be true")
+
+    def validate(self, *, require_run_seal: bool = True) -> None:
+        self.artifact_inodes.clear()
+        self.declared_files = set(CANDIDATE_PAYLOAD_PATHS)
+        self.declared_files.update(path for path, _ in RESULT_SPECS.values())
+        self.declared_files.update({CANDIDATE_SEAL_PATH, D2_SEAL_PATH})
+        self.validate_manifest()
+        self.validate_results()
+        self.validate_cases()
+        self.validate_declared_inventory()
+        if require_run_seal:
+            self.validate_run_seal()
+        self.revalidate_visible_root()
+        self.revalidate_run_authority()
+
+
+def fail(code: str, path: Path | str, detail: str, exit_code: int = 1) -> int:
+    print(f"EVIDENCE_{code}: {path}: {detail}", file=sys.stderr)
+    return exit_code
+
+
+def main(arguments: list[str]) -> int:
+    if arguments in (["--help"], ["-h"]):
+        print(USAGE, end="")
+        return 0
+    seal = False
+    if arguments and arguments[0] == "--seal":
+        seal = True
+        arguments = arguments[1:]
+    if len(arguments) != 1:
+        print(USAGE, file=sys.stderr, end="")
+        return fail("USAGE", "arguments", "exactly one RUN_DIR is required", 2)
+    supplied_root = Path(arguments[0]).expanduser()
+    try:
+        assert_run_dir_ancestry(supplied_root)
+    except EvidenceError as exc:
+        return fail(exc.code, exc.path, exc.detail, 2)
+    root = absolute_without_resolving(supplied_root)
+    try:
+        authority = resolve_run_authority(root)
+    except EvidenceError as exc:
+        return fail(exc.code, exc.path, exc.detail, 2)
+    try:
+        info = os.lstat(root)
+    except OSError:
+        return fail("RUN_DIR", root, "run directory does not exist or cannot be inspected", 2)
+    if not stat.S_ISDIR(info.st_mode):
+        return fail("RUN_DIR", root, "run directory is not a real directory", 2)
+    try:
+        validator = Validator(root, authority)
+    except EvidenceError as exc:
+        return fail(exc.code, exc.path, exc.detail, 2)
+    except OSError as exc:
+        return fail("RUN_DIR", root, f"cannot open run directory: {exc}", 2)
+    try:
+        if seal:
+            validator.seal()
+        else:
+            validator.validate()
+    except EvidenceError as exc:
+        return fail(exc.code, exc.path, exc.detail)
+    finally:
+        validator.close()
+    action = "sealed" if seal else "validated"
+    print(
+        f"v0.1.5 evidence {action}: "
+        f"validated {len(EXPECTED_CASES)} cases, {len(RESULT_SPECS)} canonical results, "
+        f"and 30 minute soak for run {validator.run_id!r} candidate {validator.candidate_digest}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

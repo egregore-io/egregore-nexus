@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Verify D2 command outputs remain byte-identical to the PASS transcript."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+
+def fail(message: str) -> None:
+    raise SystemExit(f"D2 evidence verification failed: {message}")
+
+
+def load_json(path: Path) -> object:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        fail(f"cannot read {path}: {error}")
+
+
+def reject_symlink_ancestry(path: Path) -> None:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    cursor = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        cursor /= component
+        try:
+            info = os.lstat(cursor)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            fail(f"cannot inspect path ancestry {cursor}: {error}")
+        if stat.S_ISLNK(info.st_mode):
+            fail(f"path ancestry contains a symlink: {cursor}")
+
+
+def regular_file(root: Path, relative_raw: object) -> tuple[Path, bytes]:
+    if not isinstance(relative_raw, str) or not relative_raw:
+        fail("artifact path is invalid")
+    relative = Path(relative_raw)
+    if relative.is_absolute() or ".." in relative.parts:
+        fail(f"artifact path escapes the run root: {relative_raw}")
+    path = root / relative
+    reject_symlink_ancestry(path)
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        fail(f"artifact is missing: {relative_raw}: {error}")
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        fail(f"artifact is not a single regular file: {relative_raw}")
+    try:
+        return path, path.read_bytes()
+    except OSError as error:
+        fail(f"cannot read artifact {relative_raw}: {error}")
+
+
+def digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def main() -> None:
+    if len(sys.argv) != 2:
+        raise SystemExit("usage: nexus-v015-webconsole-evidence-verify RUN_ROOT")
+    root = Path(os.path.abspath(sys.argv[1]))
+    reject_symlink_ancestry(root)
+    result_path = root / "results" / "D2-webconsole-cli" / "result.json"
+    _, result_raw = regular_file(root, result_path.relative_to(root).as_posix())
+    try:
+        result = json.loads(result_raw)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        fail(f"cannot read {result_path}: {error}")
+    if not isinstance(result, dict) or result.get("gate") != "D2" or result.get("status") != "PASS":
+        fail("D2 PASS result is missing")
+    artifacts = result.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != {
+        "cliTranscript", "discoveryRecovery", "occupiedPort"
+    }:
+        fail("D2 artifact ledger is invalid")
+
+    inventory = result.get("evidenceInventory")
+    if not isinstance(inventory, list) or not inventory:
+        fail("D2 exact evidence inventory is missing")
+    expected_inventory: dict[str, tuple[str, int]] = {}
+    out_relative = Path("results") / "D2-webconsole-cli"
+    for record in inventory:
+        if not isinstance(record, dict) or set(record) != {"path", "sha256", "size"}:
+            fail("D2 exact evidence inventory record is invalid")
+        relative_raw = record.get("path")
+        digest_raw = record.get("sha256")
+        size_raw = record.get("size")
+        if (
+            not isinstance(relative_raw, str)
+            or not relative_raw
+            or not isinstance(digest_raw, str)
+            or len(digest_raw) != 64
+            or any(character not in "0123456789abcdef" for character in digest_raw)
+            or not isinstance(size_raw, int)
+            or isinstance(size_raw, bool)
+            or size_raw < 0
+        ):
+            fail("D2 exact evidence inventory record has invalid values")
+        relative = Path(relative_raw)
+        if relative.is_absolute() or ".." in relative.parts or relative.parent != out_relative:
+            fail(f"D2 inventory path is outside its sealed directory: {relative_raw}")
+        if relative.name == "result.json" or relative_raw in expected_inventory:
+            fail(f"D2 inventory path is reserved or duplicated: {relative_raw}")
+        expected_inventory[relative_raw] = (digest_raw, size_raw)
+
+    actual_inventory: set[str] = set()
+    out = root / out_relative
+    reject_symlink_ancestry(out)
+    for entry in os.scandir(out):
+        info = entry.stat(follow_symlinks=False)
+        relative = (out_relative / entry.name).as_posix()
+        if stat.S_ISLNK(info.st_mode):
+            fail(f"D2 evidence directory contains a symlink: {relative}")
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            fail(f"D2 evidence directory contains an unsafe path: {relative}")
+        actual_inventory.add(relative)
+    expected_paths = set(expected_inventory) | {(out_relative / "result.json").as_posix()}
+    extras = sorted(actual_inventory - expected_paths)
+    missing = sorted(expected_paths - actual_inventory)
+    if extras:
+        fail(f"unexpected evidence path: {extras[0]}")
+    if missing:
+        fail(f"missing evidence path: {missing[0]}")
+    artifact_bytes: dict[str, bytes] = {}
+    for name, record in artifacts.items():
+        if not isinstance(record, dict) or set(record) != {"path", "sha256"}:
+            fail(f"D2 artifact record is invalid: {name}")
+        _, raw = regular_file(root, record["path"])
+        if digest(raw) != record["sha256"]:
+            fail(f"D2 artifact changed after PASS: {name}")
+        artifact_bytes[name] = raw
+
+    seen: set[str] = set()
+    for line_number, line in enumerate(artifact_bytes["cliTranscript"].splitlines(), 1):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            fail(f"invalid transcript row {line_number}: {error}")
+        if not isinstance(row, dict):
+            fail(f"invalid transcript row {line_number}")
+        for stream_name in ("stdout", "stderr"):
+            path_key = stream_name
+            sha_key = f"{stream_name}Sha256"
+            size_key = f"{stream_name}Size"
+            relative = row.get(path_key)
+            if relative is None:
+                if sha_key in row or size_key in row:
+                    fail(f"null {stream_name} has integrity fields at row {line_number}")
+                continue
+            if not isinstance(relative, str) or relative in seen:
+                fail(f"duplicate or invalid command output path: {relative}")
+            seen.add(relative)
+            if relative not in expected_inventory:
+                fail(f"command output is absent from the exact inventory: {relative}")
+            _, raw = regular_file(root, relative)
+            if row.get(size_key) != len(raw) or row.get(sha_key) != digest(raw):
+                fail(
+                    f"command output changed after PASS: "
+                    f"{row.get('label', line_number)} {stream_name}"
+                )
+
+    for relative, (expected_sha, expected_size) in expected_inventory.items():
+        _, raw = regular_file(root, relative)
+        if len(raw) != expected_size or digest(raw) != expected_sha:
+            fail(f"D2 inventoried evidence changed after PASS: {relative}")
+
+    print(f"D2 evidence verified: {result_path}")
+
+
+if __name__ == "__main__":
+    main()

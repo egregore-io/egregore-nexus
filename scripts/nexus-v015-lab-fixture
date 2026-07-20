@@ -1,0 +1,1297 @@
+#!/usr/bin/env python3
+"""Install deterministic PACTBIN2 damage fixtures inside the v0.1.5 lab."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+USAGE = """Usage: lab-fixture install pactbin2-truncated|pactbin2-bitflip --session <fixture-id>
+
+Derive one deterministic damaged PACTBIN2 session from a validated donor that
+already belongs to the isolated v0.1.5 Lens lab. The donor is never modified.
+The hook atomically maintains /tmp/nexus-lens-home/lab/fixtures.json.
+"""
+
+KINDS = ("pactbin2-truncated", "pactbin2-bitflip")
+SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
+SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+HEADER_BYTES = 4096
+TRUNCATED_BYTES = HEADER_BYTES - 1
+BITFLIP_OFFSET = 10
+BITFLIP_MASK = 0x01
+MAX_LEDGER_BYTES = 64 * 1024
+MAX_MANIFEST_BYTES = 1024 * 1024
+MAX_SESSION_META_BYTES = 256 * 1024
+
+EXIT_CODES = {
+    "LAB_FIXTURE_USAGE": 2,
+    "LAB_FIXTURE_LAB_ONLY": 3,
+    "LAB_FIXTURE_PATH_UNSAFE": 4,
+    "LAB_FIXTURE_CANDIDATE_INVALID": 5,
+    "LAB_FIXTURE_SOURCE_NOT_FOUND": 6,
+    "LAB_FIXTURE_SOURCE_INVALID": 7,
+    "LAB_FIXTURE_TARGET_EXISTS": 8,
+    "LAB_FIXTURE_MANIFEST_INVALID": 9,
+    "LAB_FIXTURE_IO": 10,
+}
+
+VALIDATOR_CODE = """\
+import pactree
+import sys
+
+handle = pactree.open_handle(sys.argv[1])
+handle.close()
+"""
+
+
+class FixtureError(RuntimeError):
+    def __init__(self, kind: str, message: str):
+        self.kind = kind
+        super().__init__(message)
+
+
+class ManifestPublishError(OSError):
+    """Manifest persistence failed after the visible commit boundary.
+
+    Only a durably rolled-back result may remove fixture files.  `indeterminate`
+    retains both fixture files and any recovery material for operator repair.
+    """
+
+    def __init__(self, message: str, *, state: str):
+        if state not in {"committed", "rolled_back", "indeterminate"}:
+            raise ValueError(f"invalid manifest publication state: {state}")
+        self.state = state
+        super().__init__(message)
+
+
+@dataclass(frozen=True)
+class OwnedPath:
+    path: Path
+    device: int
+    inode: int
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class OwnedDirectory:
+    path: Path
+    device: int
+    inode: int
+
+
+def fail(kind: str, message: str) -> None:
+    raise FixtureError(kind, message)
+
+
+def parse_command(arguments: list[str]) -> tuple[str, str] | None:
+    if arguments in (["--help"], ["-h"]):
+        return None
+    if len(arguments) != 4:
+        fail(
+            "LAB_FIXTURE_USAGE",
+            "expected install, a fixture kind, and --session <fixture-id>",
+        )
+    action, kind, option, session_id = arguments
+    if action != "install":
+        fail("LAB_FIXTURE_USAGE", "action must be install")
+    if kind not in KINDS:
+        fail(
+            "LAB_FIXTURE_USAGE",
+            f"fixture kind must be {' or '.join(KINDS)}",
+        )
+    if option != "--session":
+        fail("LAB_FIXTURE_USAGE", "expected --session before the fixture id")
+    if not SAFE_ID.fullmatch(session_id):
+        fail(
+            "LAB_FIXTURE_USAGE",
+            "fixture id must use only ASCII letters, digits, '_' or '-'",
+        )
+    return kind, session_id
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def reject_symlink_chain(path: Path, label: str) -> None:
+    if not path.is_absolute():
+        fail("LAB_FIXTURE_PATH_UNSAFE", f"{label} must be an absolute path")
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            break
+        except OSError as error:
+            fail("LAB_FIXTURE_IO", f"cannot inspect {label} {current}: {error}")
+        if stat.S_ISLNK(metadata.st_mode):
+            fail("LAB_FIXTURE_PATH_UNSAFE", f"{label} contains a symlink: {current}")
+
+
+def existing_directory(path: Path, label: str) -> Path:
+    reject_symlink_chain(path, label)
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = path.stat()
+    except FileNotFoundError:
+        fail("LAB_FIXTURE_PATH_UNSAFE", f"{label} does not exist: {path}")
+    except OSError as error:
+        fail("LAB_FIXTURE_IO", f"cannot inspect {label} {path}: {error}")
+    if not stat.S_ISDIR(metadata.st_mode):
+        fail("LAB_FIXTURE_PATH_UNSAFE", f"{label} is not a directory: {path}")
+    return resolved
+
+
+def require_regular_file(path: Path, label: str, error_kind: str) -> None:
+    reject_symlink_chain(path, label)
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        fail(error_kind, f"{label} is missing: {path}")
+    except OSError as error:
+        fail("LAB_FIXTURE_IO", f"cannot inspect {label} {path}: {error}")
+    if not stat.S_ISREG(metadata.st_mode):
+        fail(error_kind, f"{label} is not a regular file: {path}")
+
+
+def read_regular_file(path: Path, label: str, error_kind: str, limit: int | None = None) -> bytes:
+    require_regular_file(path, label, error_kind)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        fail(error_kind, f"cannot open {label} {path}: {error}")
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            fail(error_kind, f"{label} is not a regular file: {path}")
+        if limit is not None and before.st_size > limit:
+            fail(error_kind, f"{label} exceeds {limit} bytes: {path}")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        fail(error_kind, f"cannot read {label} {path}: {error}")
+    finally:
+        os.close(descriptor)
+    data = b"".join(chunks)
+    if (
+        before.st_dev != after.st_dev
+        or before.st_ino != after.st_ino
+        or before.st_size != after.st_size
+        or before.st_mtime_ns != after.st_mtime_ns
+        or len(data) != before.st_size
+    ):
+        fail(error_kind, f"{label} changed while it was being read: {path}")
+    return data
+
+
+def mkdir_checked(path: Path, root: Path, created: list[OwnedDirectory]) -> None:
+    reject_symlink_chain(path, "fixture directory")
+    unresolved = path.resolve(strict=False)
+    if not is_relative_to(unresolved, root):
+        fail("LAB_FIXTURE_PATH_UNSAFE", f"fixture directory escapes the lab: {path}")
+    if path.exists():
+        if not path.is_dir():
+            fail("LAB_FIXTURE_PATH_UNSAFE", f"fixture directory is not a directory: {path}")
+        return
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        reject_symlink_chain(path, "fixture directory")
+        if not path.is_dir():
+            fail("LAB_FIXTURE_PATH_UNSAFE", f"fixture directory is not a directory: {path}")
+    except OSError as error:
+        fail("LAB_FIXTURE_IO", f"cannot create fixture directory {path}: {error}")
+    else:
+        created.append(owned_directory(path))
+        fsync_directory(path.parent)
+    reject_symlink_chain(path, "fixture directory")
+
+
+@dataclass(frozen=True)
+class LabPaths:
+    root: Path
+    lens: Path
+    sessions: Path
+    lab: Path
+    readiness: Path
+    manifest: Path
+    lock: Path
+    validator: Path
+
+
+def resolve_lab_paths(environment: dict[str, str]) -> LabPaths:
+    if environment.get("OCULAR_LAB") != "1":
+        fail(
+            "LAB_FIXTURE_LAB_ONLY",
+            "refusing to run outside the isolated ocular lab",
+        )
+    raw_root = environment.get("NEXUS_LAB_ROOT", "")
+    raw_lens = environment.get("LENS_DATA_HOME", "")
+    if not raw_root or not raw_lens:
+        fail(
+            "LAB_FIXTURE_LAB_ONLY",
+            "NEXUS_LAB_ROOT and LENS_DATA_HOME are required",
+        )
+    root = existing_directory(Path(raw_root), "NEXUS_LAB_ROOT")
+    lens = existing_directory(Path(raw_lens), "LENS_DATA_HOME")
+    if environment.get("NEXUS_V015_ALLOW_FIXTURE_HOME") != "1" and root != Path(
+        "/tmp/nexus-lens-home"
+    ):
+        fail(
+            "LAB_FIXTURE_LAB_ONLY",
+            f"refusing non-lab NEXUS_LAB_ROOT: {root}",
+        )
+    expected_lens = root / "lens-data"
+    if lens != expected_lens or not is_relative_to(lens, root):
+        fail(
+            "LAB_FIXTURE_PATH_UNSAFE",
+            f"LENS_DATA_HOME must be the lab-owned path {expected_lens}",
+        )
+    lab = existing_directory(root / "lab", "lab metadata directory")
+    sessions = lens / "sessions"
+    reject_symlink_chain(sessions, "Lens sessions directory")
+    if sessions.exists() and not sessions.is_dir():
+        fail("LAB_FIXTURE_PATH_UNSAFE", f"Lens sessions directory is not a directory: {sessions}")
+    return LabPaths(
+        root=root,
+        lens=lens,
+        sessions=sessions,
+        lab=lab,
+        readiness=lab / "candidate-ready.v1",
+        manifest=lab / "fixtures.json",
+        lock=lab / "fixtures.lock",
+        validator=root / "lens-venv" / "bin" / "python",
+    )
+
+
+def parse_ledger(data: bytes, path: Path) -> dict[str, str]:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        fail("LAB_FIXTURE_CANDIDATE_INVALID", f"candidate ledger is not UTF-8: {error}")
+    fields: dict[str, str] = {}
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if not line or "=" not in line:
+            fail(
+                "LAB_FIXTURE_CANDIDATE_INVALID",
+                f"candidate ledger has an invalid line {line_number}: {path}",
+            )
+        key, value = line.split("=", 1)
+        if not key or not value or key in fields:
+            fail(
+                "LAB_FIXTURE_CANDIDATE_INVALID",
+                f"candidate ledger has an invalid field {key!r}: {path}",
+            )
+        fields[key] = value
+    required = {
+        "schema",
+        "containerId",
+        "mode",
+        "runId",
+        "nexusSha256",
+        "gatewaySha256",
+        "webuiSha256",
+    }
+    missing = sorted(required - fields.keys())
+    if missing:
+        fail(
+            "LAB_FIXTURE_CANDIDATE_INVALID",
+            f"candidate ledger is missing fields: {', '.join(missing)}",
+        )
+    if fields["schema"] != "1" or fields["mode"] not in {"source", "packed"}:
+        fail(
+            "LAB_FIXTURE_CANDIDATE_INVALID",
+            "candidate ledger must use schema 1 and source|packed mode",
+        )
+    if not SAFE_ID.fullmatch(fields["runId"]):
+        fail("LAB_FIXTURE_CANDIDATE_INVALID", "candidate ledger runId is invalid")
+    for key in ("nexusSha256", "gatewaySha256", "webuiSha256"):
+        if not SHA256.fullmatch(fields[key]):
+            fail("LAB_FIXTURE_CANDIDATE_INVALID", f"candidate ledger {key} is invalid")
+    return fields
+
+
+def load_candidate(
+    paths: LabPaths,
+    environment: dict[str, str],
+    run_id: str,
+) -> dict[str, str]:
+    data = read_regular_file(
+        paths.readiness,
+        "candidate readiness ledger",
+        "LAB_FIXTURE_CANDIDATE_INVALID",
+        MAX_LEDGER_BYTES,
+    )
+    fields = parse_ledger(data, paths.readiness)
+    expected_mode = environment.get("NEXUS_LAB_MODE")
+    if expected_mode and fields["mode"] != expected_mode:
+        fail(
+            "LAB_FIXTURE_CANDIDATE_INVALID",
+            f"candidate mode {fields['mode']} does not match NEXUS_LAB_MODE {expected_mode}",
+        )
+    if fields["runId"] != run_id:
+        fail(
+            "LAB_FIXTURE_CANDIDATE_INVALID",
+            f"candidate runId {fields['runId']} does not match NEXUS_V015_RUN_ID {run_id}",
+        )
+    return {
+        "containerId": fields["containerId"],
+        "mode": fields["mode"],
+        "runId": fields["runId"],
+        "readinessSha256": sha256_bytes(data),
+        "nexusSha256": fields["nexusSha256"],
+        "gatewaySha256": fields["gatewaySha256"],
+        "webuiSha256": fields["webuiSha256"],
+    }
+
+
+def checked_run_id(environment: dict[str, str]) -> str:
+    run_id = environment.get("NEXUS_V015_RUN_ID", "")
+    if not SAFE_ID.fullmatch(run_id):
+        fail(
+            "LAB_FIXTURE_CANDIDATE_INVALID",
+            "NEXUS_V015_RUN_ID is required and must use only ASCII letters, digits, '_' or '-'",
+        )
+    return run_id
+
+
+def expected_target(paths: LabPaths, session_id: str) -> Path:
+    target = paths.sessions / session_id / "pact" / "session.pact"
+    reject_symlink_chain(target, "fixture target")
+    if not is_relative_to(target.resolve(strict=False), paths.lens):
+        fail("LAB_FIXTURE_PATH_UNSAFE", f"fixture target escapes Lens data: {target}")
+    return target
+
+
+def expected_meta(paths: LabPaths, session_id: str) -> Path:
+    meta = paths.sessions / session_id / "meta.json"
+    reject_symlink_chain(meta, "fixture session metadata")
+    if not is_relative_to(meta.resolve(strict=False), paths.lens):
+        fail("LAB_FIXTURE_PATH_UNSAFE", f"fixture metadata escapes Lens data: {meta}")
+    return meta
+
+
+def validate_manifest_entry(kind: str, entry: object, paths: LabPaths) -> dict[str, Any]:
+    if not isinstance(entry, dict):
+        fail("LAB_FIXTURE_MANIFEST_INVALID", f"fixtures.json {kind} entry must be an object")
+    for field in (
+        "sessionId",
+        "title",
+        "pactPath",
+        "metaPath",
+        "sourcePactPath",
+    ):
+        if not isinstance(entry.get(field), str) or not entry[field]:
+            fail(
+                "LAB_FIXTURE_MANIFEST_INVALID",
+                f"fixtures.json {kind}.{field} must be a non-empty string",
+            )
+    session_id = entry["sessionId"]
+    if not SAFE_ID.fullmatch(session_id):
+        fail("LAB_FIXTURE_MANIFEST_INVALID", f"fixtures.json {kind}.sessionId is unsafe")
+    target = expected_target(paths, session_id)
+    if entry["pactPath"] != str(target):
+        fail(
+            "LAB_FIXTURE_MANIFEST_INVALID",
+            f"fixtures.json {kind}.pactPath does not match its sessionId",
+        )
+    meta = expected_meta(paths, session_id)
+    if entry["metaPath"] != str(meta):
+        fail(
+            "LAB_FIXTURE_MANIFEST_INVALID",
+            f"fixtures.json {kind}.metaPath does not match its sessionId",
+        )
+    for field in ("sourceSha256", "fixtureSha256", "metaSha256"):
+        if not isinstance(entry.get(field), str) or not SHA256.fullmatch(entry[field]):
+            fail(
+                "LAB_FIXTURE_MANIFEST_INVALID",
+                f"fixtures.json {kind}.{field} is invalid",
+            )
+    target_data = read_regular_file(
+        target,
+        f"managed {kind} fixture",
+        "LAB_FIXTURE_MANIFEST_INVALID",
+    )
+    if sha256_bytes(target_data) != entry["fixtureSha256"]:
+        fail(
+            "LAB_FIXTURE_MANIFEST_INVALID",
+            f"managed {kind} fixture hash does not match fixtures.json",
+        )
+    meta_data = read_regular_file(
+        meta,
+        f"managed {kind} session metadata",
+        "LAB_FIXTURE_MANIFEST_INVALID",
+        MAX_SESSION_META_BYTES,
+    )
+    if sha256_bytes(meta_data) != entry["metaSha256"]:
+        fail(
+            "LAB_FIXTURE_MANIFEST_INVALID",
+            f"managed {kind} metadata hash does not match fixtures.json",
+        )
+    try:
+        metadata = json.loads(meta_data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(
+            "LAB_FIXTURE_MANIFEST_INVALID",
+            f"managed {kind} metadata is invalid JSON: {error}",
+        )
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("title") != entry["title"]
+        or not isinstance(metadata.get("provider"), str)
+        or not metadata["provider"]
+    ):
+        fail(
+            "LAB_FIXTURE_MANIFEST_INVALID",
+            f"managed {kind} metadata is not a sidebar-visible Lens session",
+        )
+    source = Path(entry["sourcePactPath"])
+    if not source.is_absolute():
+        fail(
+            "LAB_FIXTURE_MANIFEST_INVALID",
+            f"fixtures.json {kind}.sourcePactPath is not absolute",
+        )
+    reject_symlink_chain(source, f"fixtures.json {kind} source")
+    if not is_relative_to(source.resolve(strict=False), paths.sessions):
+        fail(
+            "LAB_FIXTURE_MANIFEST_INVALID",
+            f"fixtures.json {kind}.sourcePactPath escapes the Lens session space",
+        )
+    return entry
+
+
+def load_manifest(
+    paths: LabPaths, run_id: str, candidate: dict[str, str]
+) -> dict[str, Any]:
+    if not paths.manifest.exists():
+        reject_symlink_chain(paths.manifest, "fixture manifest")
+        return {
+            "version": 1,
+            "runId": run_id,
+            "candidate": candidate,
+            "sessions": {},
+        }
+    data = read_regular_file(
+        paths.manifest,
+        "fixture manifest",
+        "LAB_FIXTURE_MANIFEST_INVALID",
+        MAX_MANIFEST_BYTES,
+    )
+    try:
+        document = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail("LAB_FIXTURE_MANIFEST_INVALID", f"fixtures.json is invalid JSON: {error}")
+    if not isinstance(document, dict) or document.get("version") != 1:
+        fail("LAB_FIXTURE_MANIFEST_INVALID", "fixtures.json version must be 1")
+    if document.get("runId") != run_id:
+        fail("LAB_FIXTURE_MANIFEST_INVALID", "fixtures.json belongs to a different run")
+    if document.get("candidate") != candidate:
+        fail("LAB_FIXTURE_MANIFEST_INVALID", "fixtures.json belongs to a different candidate")
+    sessions = document.get("sessions")
+    if not isinstance(sessions, dict):
+        fail("LAB_FIXTURE_MANIFEST_INVALID", "fixtures.json sessions must be an object")
+    unknown = sorted(set(sessions) - set(KINDS))
+    if unknown:
+        fail(
+            "LAB_FIXTURE_MANIFEST_INVALID",
+            f"fixtures.json has unknown fixture kinds: {', '.join(unknown)}",
+        )
+    for kind, entry in sessions.items():
+        validate_manifest_entry(kind, entry, paths)
+    return document
+
+
+def acquire_lock(path: Path):
+    reject_symlink_chain(path, "fixture lock")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            os.close(descriptor)
+            fail("LAB_FIXTURE_PATH_UNSAFE", f"fixture lock is not a regular file: {path}")
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return os.fdopen(descriptor, "r+")
+    except FixtureError:
+        raise
+    except OSError as error:
+        fail("LAB_FIXTURE_IO", f"cannot lock fixture manifest {path}: {error}")
+
+
+def validator_accepts(paths: LabPaths, snapshot: Path) -> bool:
+    validator = paths.validator
+    try:
+        metadata = validator.stat()
+    except FileNotFoundError:
+        fail(
+            "LAB_FIXTURE_SOURCE_INVALID",
+            f"PACTBIN2 validator Python is missing: {validator}",
+        )
+    except OSError as error:
+        fail("LAB_FIXTURE_SOURCE_INVALID", f"cannot inspect PACTBIN2 validator: {error}")
+    if not stat.S_ISREG(metadata.st_mode) or not os.access(validator, os.X_OK):
+        fail(
+            "LAB_FIXTURE_SOURCE_INVALID",
+            f"PACTBIN2 validator Python is not executable: {validator}",
+        )
+    try:
+        result = subprocess.run(
+            [str(validator), "-I", "-c", VALIDATOR_CODE, str(snapshot)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        fail("LAB_FIXTURE_SOURCE_INVALID", f"PACTBIN2 validator failed to run: {error}")
+    return result.returncode == 0
+
+
+def snapshot_is_valid(paths: LabPaths, data: bytes) -> bool:
+    snapshot = write_temporary(paths.lab, ".pact-source.tmp-", data)
+    try:
+        return validator_accepts(paths, snapshot.path)
+    finally:
+        try:
+            unlink_owned(snapshot, sync_parent=True)
+        except OSError:
+            pass
+
+
+def source_candidates(paths: LabPaths, target_session: str) -> list[Path]:
+    if not paths.sessions.exists():
+        return []
+    reject_symlink_chain(paths.sessions, "Lens sessions directory")
+    try:
+        entries = sorted(paths.sessions.iterdir(), key=lambda path: path.name)
+    except OSError as error:
+        fail("LAB_FIXTURE_IO", f"cannot scan Lens sessions directory {paths.sessions}: {error}")
+    candidates: list[Path] = []
+    for session in entries:
+        try:
+            metadata = session.lstat()
+        except OSError as error:
+            fail("LAB_FIXTURE_IO", f"cannot inspect Lens session candidate {session}: {error}")
+        if stat.S_ISLNK(metadata.st_mode):
+            fail("LAB_FIXTURE_PATH_UNSAFE", f"Lens session candidate is a symlink: {session}")
+        if not stat.S_ISDIR(metadata.st_mode) or session.name == target_session:
+            continue
+        pact_dir = session / "pact"
+        if not pact_dir.exists():
+            continue
+        reject_symlink_chain(pact_dir, "PACTBIN2 donor directory")
+        if not pact_dir.is_dir():
+            fail("LAB_FIXTURE_PATH_UNSAFE", f"PACTBIN2 donor directory is invalid: {pact_dir}")
+        candidate = pact_dir / "session.pact"
+        if not candidate.exists():
+            continue
+        reject_symlink_chain(candidate, "PACTBIN2 donor")
+        try:
+            candidate_metadata = candidate.lstat()
+        except OSError as error:
+            fail("LAB_FIXTURE_IO", f"cannot inspect PACTBIN2 donor {candidate}: {error}")
+        if not stat.S_ISREG(candidate_metadata.st_mode):
+            fail("LAB_FIXTURE_PATH_UNSAFE", f"PACTBIN2 donor is not a regular file: {candidate}")
+        candidates.append(candidate)
+    return candidates
+
+
+def read_donor_meta(candidate: Path) -> dict[str, Any] | None:
+    meta_path = candidate.parent.parent / "meta.json"
+    if not meta_path.exists():
+        return None
+    data = read_regular_file(
+        meta_path,
+        "PACTBIN2 donor session metadata",
+        "LAB_FIXTURE_SOURCE_INVALID",
+        MAX_SESSION_META_BYTES,
+    )
+    try:
+        document = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(document, dict)
+        or not isinstance(document.get("provider"), str)
+        or not document["provider"]
+    ):
+        return None
+    return document
+
+
+def select_source(paths: LabPaths, target_session: str) -> tuple[Path, bytes, dict[str, Any]]:
+    candidates = source_candidates(paths, target_session)
+    if not candidates:
+        fail(
+            "LAB_FIXTURE_SOURCE_NOT_FOUND",
+            f"no session.pact donor exists beneath {paths.sessions}",
+        )
+    for candidate in candidates:
+        data = read_regular_file(
+            candidate,
+            "PACTBIN2 donor",
+            "LAB_FIXTURE_SOURCE_INVALID",
+        )
+        metadata = read_donor_meta(candidate)
+        if metadata is None:
+            continue
+        if len(data) <= HEADER_BYTES or data[:8] != b"PACTBIN2":
+            continue
+        if snapshot_is_valid(paths, data):
+            return candidate, data, metadata
+    fail(
+        "LAB_FIXTURE_SOURCE_INVALID",
+        "no lab-local session.pact donor passed the PACTBIN2 engine validator",
+    )
+
+
+def corruption(kind: str, source: bytes) -> tuple[bytes, dict[str, int | str]]:
+    if kind == "pactbin2-truncated":
+        return source[:TRUNCATED_BYTES], {
+            "kind": "truncate",
+            "keepBytes": TRUNCATED_BYTES,
+        }
+    damaged = bytearray(source)
+    damaged[BITFLIP_OFFSET] ^= BITFLIP_MASK
+    return bytes(damaged), {
+        "kind": "bitflip",
+        "byteOffset": BITFLIP_OFFSET,
+        "bitMask": BITFLIP_MASK,
+    }
+
+
+def fixture_metadata(kind: str, session_id: str, donor: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
+    labels = {
+        "pactbin2-truncated": "Truncated PACTBIN2 fixture",
+        "pactbin2-bitflip": "Bit-flipped PACTBIN2 fixture",
+    }
+    title = f"{labels[kind]} ({session_id})"
+    metadata: dict[str, Any] = {
+        "title": title,
+        "provider": donor["provider"],
+        "scaffolds": donor.get("scaffolds") if isinstance(donor.get("scaffolds"), list) else [],
+        "scaffold_configs": (
+            donor.get("scaffold_configs")
+            if isinstance(donor.get("scaffold_configs"), dict)
+            else {}
+        ),
+        "instructions": donor.get("instructions") if isinstance(donor.get("instructions"), str) else "",
+        "agent_settings": (
+            donor.get("agent_settings") if isinstance(donor.get("agent_settings"), dict) else {}
+        ),
+        "history_path": (
+            donor.get("history_path")
+            if isinstance(donor.get("history_path"), str) and donor["history_path"]
+            else "history.jsonl"
+        ),
+        "created_at": donor.get("created_at") if isinstance(donor.get("created_at"), int) else 0,
+        "updated_at": donor.get("updated_at") if isinstance(donor.get("updated_at"), int) else 0,
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
+        "total_tokens": 0,
+        "last_input_tokens": 0,
+        "last_output_tokens": 0,
+        "last_total_tokens": 0,
+        "provider_request_count": 0,
+        "provider_request_counts_by_turn": {},
+        "outbound_ai_request_count": 0,
+        "outbound_ai_request_counts_by_turn": {},
+        "outbound_ai_request_log": [],
+    }
+    if isinstance(donor.get("context_window"), int) and donor["context_window"] > 0:
+        metadata["context_window"] = donor["context_window"]
+    payload = (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode()
+    return metadata, payload
+
+
+def fsync_directory(path: Path) -> None:
+    try:
+        before = path.lstat()
+    except OSError as error:
+        raise OSError(f"cannot inspect directory before fsync {path}: {error}") from error
+    if not stat.S_ISDIR(before.st_mode):
+        raise OSError(f"refusing to fsync a non-directory path: {path}")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_dev != before.st_dev
+            or opened.st_ino != before.st_ino
+        ):
+            raise OSError(f"directory changed while opening it for fsync: {path}")
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        visible = path.lstat()
+        if (
+            after.st_dev != opened.st_dev
+            or after.st_ino != opened.st_ino
+            or not stat.S_ISDIR(visible.st_mode)
+            or visible.st_dev != opened.st_dev
+            or visible.st_ino != opened.st_ino
+        ):
+            raise OSError(f"directory changed while it was being fsynced: {path}")
+    finally:
+        os.close(descriptor)
+
+
+def owned_directory(path: Path) -> OwnedDirectory:
+    metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode):
+        fail("LAB_FIXTURE_PATH_UNSAFE", f"managed path is not a directory: {path}")
+    return OwnedDirectory(path=path, device=metadata.st_dev, inode=metadata.st_ino)
+
+
+def same_owned_directory(owned: OwnedDirectory) -> bool:
+    try:
+        metadata = owned.path.lstat()
+    except FileNotFoundError:
+        return False
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and metadata.st_dev == owned.device
+        and metadata.st_ino == owned.inode
+    )
+
+
+def owned_path(path: Path) -> OwnedPath:
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        fail("LAB_FIXTURE_PATH_UNSAFE", f"managed path is not a regular file: {path}")
+    return OwnedPath(
+        path=path,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        size=metadata.st_size,
+        sha256=sha256_bytes(
+            read_regular_file(path, "managed file", "LAB_FIXTURE_IO")
+        ),
+    )
+
+
+def same_owned_path(owned: OwnedPath) -> bool:
+    try:
+        metadata = owned.path.lstat()
+    except FileNotFoundError:
+        return False
+    if not (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_dev == owned.device
+        and metadata.st_ino == owned.inode
+        and metadata.st_size == owned.size
+    ):
+        return False
+    try:
+        digest = sha256_bytes(
+            read_regular_file(owned.path, "managed file", "LAB_FIXTURE_IO")
+        )
+    except FixtureError:
+        return False
+    return digest == owned.sha256
+
+
+def same_owned_identity(left: OwnedPath, right: OwnedPath) -> bool:
+    return (
+        left.device == right.device
+        and left.inode == right.inode
+        and left.size == right.size
+        and left.sha256 == right.sha256
+    )
+
+
+def refresh_owned(owned: OwnedPath) -> OwnedPath | None:
+    """Refresh mutable metadata only while the original inode is still linked."""
+
+    try:
+        metadata = owned.path.lstat()
+    except FileNotFoundError:
+        return None
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_dev != owned.device
+        or metadata.st_ino != owned.inode
+    ):
+        return None
+    return OwnedPath(
+        path=owned.path,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        size=metadata.st_size,
+        sha256=sha256_bytes(
+            read_regular_file(owned.path, "managed file", "LAB_FIXTURE_IO")
+        ),
+    )
+
+
+def unlink_owned(owned: OwnedPath, *, sync_parent: bool = False) -> bool:
+    # Supported fixture writers serialize on the lab lock. Move the current
+    # entry to a private quarantine name, then inspect the moved inode so a
+    # replacement that predates cleanup is restored instead of deleted. POSIX
+    # has no conditional unlink-by-inode operation; a same-UID process that
+    # deliberately mutates the private quarantine after this validation is
+    # outside the isolated-lab transaction contract.
+    descriptor, quarantine_path = tempfile.mkstemp(
+        prefix=f".{owned.path.name}.unlink-",
+        dir=owned.path.parent,
+    )
+    os.close(descriptor)
+    quarantine = Path(quarantine_path)
+    quarantine.unlink()
+    try:
+        os.replace(owned.path, quarantine)
+    except FileNotFoundError:
+        return False
+    moved = OwnedPath(
+        quarantine,
+        owned.device,
+        owned.inode,
+        owned.size,
+        owned.sha256,
+    )
+    if not same_owned_path(moved):
+        try:
+            owned.path.lstat()
+            destination_exists = True
+        except FileNotFoundError:
+            destination_exists = False
+        if not destination_exists:
+            os.replace(quarantine, owned.path)
+            if sync_parent:
+                fsync_directory(owned.path.parent)
+        return False
+    quarantine.unlink()
+    if sync_parent:
+        fsync_directory(owned.path.parent)
+    return True
+
+
+def write_temporary(parent: Path, prefix: str, data: bytes) -> OwnedPath:
+    descriptor, raw_path = tempfile.mkstemp(prefix=prefix, dir=parent)
+    temporary = Path(raw_path)
+    metadata = os.fstat(descriptor)
+    owned = OwnedPath(
+        temporary,
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        sha256_bytes(b""),
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        handle = os.fdopen(descriptor, "wb", closefd=True)
+        descriptor = -1
+        with handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        owned = owned_path(temporary)
+        return owned
+    except Exception:
+        try:
+            current = refresh_owned(owned)
+            if current is not None:
+                unlink_owned(current)
+        except OSError:
+            pass
+        raise
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def publish_fixture(
+    target: Path, data: bytes, paths: LabPaths, created: list[Path]
+) -> OwnedPath:
+    mkdir_checked(target.parent.parent, paths.lens, created)
+    mkdir_checked(target.parent, paths.lens, created)
+    reject_symlink_chain(target, "fixture target")
+    if target.exists():
+        fail("LAB_FIXTURE_TARGET_EXISTS", f"refusing to overwrite existing fixture: {target}")
+    temporary = write_temporary(target.parent, ".session.pact.tmp-", data)
+    linked: OwnedPath | None = None
+    link_completed = False
+    expected_link = OwnedPath(
+        target,
+        temporary.device,
+        temporary.inode,
+        temporary.size,
+        temporary.sha256,
+    )
+    try:
+        try:
+            os.link(temporary.path, target, follow_symlinks=False)
+        except FileExistsError:
+            fail("LAB_FIXTURE_TARGET_EXISTS", f"refusing to overwrite existing fixture: {target}")
+        link_completed = True
+        linked = owned_path(target)
+        fsync_directory(target.parent)
+    except Exception:
+        if link_completed:
+            try:
+                unlink_owned(linked or expected_link)
+            except OSError:
+                pass
+            try:
+                fsync_directory(target.parent)
+            except OSError:
+                pass
+        raise
+    finally:
+        try:
+            current = refresh_owned(temporary)
+            if current is not None:
+                unlink_owned(current, sync_parent=True)
+        except OSError:
+            pass
+    if linked is None:
+        raise OSError(f"fixture target was not published: {target}")
+    return linked
+
+
+def publish_session_meta(meta: Path, data: bytes) -> OwnedPath:
+    reject_symlink_chain(meta, "fixture session metadata")
+    if meta.exists():
+        fail("LAB_FIXTURE_TARGET_EXISTS", f"refusing to overwrite existing fixture metadata: {meta}")
+    temporary = write_temporary(meta.parent, ".meta.json.tmp-", data)
+    linked: OwnedPath | None = None
+    link_completed = False
+    expected_link = OwnedPath(
+        meta,
+        temporary.device,
+        temporary.inode,
+        temporary.size,
+        temporary.sha256,
+    )
+    try:
+        try:
+            os.link(temporary.path, meta, follow_symlinks=False)
+        except FileExistsError:
+            fail(
+                "LAB_FIXTURE_TARGET_EXISTS",
+                f"refusing to overwrite existing fixture metadata: {meta}",
+            )
+        link_completed = True
+        linked = owned_path(meta)
+        fsync_directory(meta.parent)
+    except Exception:
+        if link_completed:
+            try:
+                unlink_owned(linked or expected_link)
+            except OSError:
+                pass
+            try:
+                fsync_directory(meta.parent)
+            except OSError:
+                pass
+        raise
+    finally:
+        try:
+            current = refresh_owned(temporary)
+            if current is not None:
+                unlink_owned(current, sync_parent=True)
+        except OSError:
+            pass
+    if linked is None:
+        raise OSError(f"fixture metadata was not published: {meta}")
+    return linked
+
+
+def publish_manifest(path: Path, document: dict[str, Any]) -> None:
+    reject_symlink_chain(path, "fixture manifest")
+    previous = None
+    previous_owned: OwnedPath | None = None
+    if path.exists():
+        previous = read_regular_file(
+            path,
+            "fixture manifest",
+            "LAB_FIXTURE_MANIFEST_INVALID",
+            MAX_MANIFEST_BYTES,
+        )
+        previous_owned = owned_path(path)
+    payload = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
+    temporary = write_temporary(path.parent, ".fixtures.json.tmp-", payload)
+    backup: OwnedPath | None = None
+    preserve_backup = False
+    expected_new = OwnedPath(
+        path,
+        temporary.device,
+        temporary.inode,
+        temporary.size,
+        temporary.sha256,
+    )
+    try:
+        if previous_owned is not None:
+            backup_descriptor, backup_path = tempfile.mkstemp(
+                prefix=".fixtures.json.backup-",
+                dir=path.parent,
+            )
+            os.close(backup_descriptor)
+            reserved_backup = Path(backup_path)
+            reserved_backup.unlink()
+            os.link(path, reserved_backup, follow_symlinks=False)
+            expected_backup = OwnedPath(
+                reserved_backup,
+                previous_owned.device,
+                previous_owned.inode,
+                previous_owned.size,
+                previous_owned.sha256,
+            )
+            try:
+                captured_backup = owned_path(reserved_backup)
+                if not same_owned_identity(captured_backup, previous_owned):
+                    raise OSError("fixture manifest backup does not match the prior manifest")
+                backup = captured_backup
+            except Exception:
+                try:
+                    unlink_owned(expected_backup, sync_parent=True)
+                except OSError:
+                    pass
+                raise
+            # The exact old manifest must itself be crash-durable before the
+            # destructive replace.  A process-visible backup is insufficient.
+            fsync_directory(path.parent)
+        commit_error: Exception | None = None
+        try:
+            os.replace(temporary.path, path)
+        except Exception as error:
+            # rename(2) wrappers and filesystems may report an error after the
+            # directory entry changed. Only an exact prior/absent state is a
+            # proven pre-commit failure; every other visible outcome enters the
+            # same rollback/indeterminate state machine as an fsync failure.
+            probe_error: Exception | None = None
+            try:
+                prior_visible = previous_owned is not None and same_owned_path(previous_owned)
+                path.lstat()
+                path_missing = False
+            except FileNotFoundError:
+                path_missing = True
+            except Exception as error_during_probe:
+                probe_error = error_during_probe
+            if probe_error is not None:
+                commit_error = OSError(
+                    "fixture manifest state could not be classified after replace failed: "
+                    f"{probe_error}"
+                )
+            elif prior_visible or (previous_owned is None and path_missing):
+                raise
+            else:
+                commit_error = error
+
+        if commit_error is None:
+            try:
+                visible_new = owned_path(path)
+                if not same_owned_identity(visible_new, expected_new):
+                    raise OSError("fixture manifest changed at the commit boundary")
+                fsync_directory(path.parent)
+            except Exception as error:
+                commit_error = error
+
+        if commit_error is not None:
+            restored = False
+            recovery_error: Exception | None = None
+            try:
+                if backup is not None:
+                    if not same_owned_path(backup):
+                        raise OSError("fixture manifest recovery backup changed before rollback")
+                    restore_descriptor, restore_path = tempfile.mkstemp(
+                        prefix=".fixtures.json.restore-",
+                        dir=path.parent,
+                    )
+                    os.close(restore_descriptor)
+                    restore = Path(restore_path)
+                    restore.unlink()
+                    os.link(backup.path, restore, follow_symlinks=False)
+                    restore_owned = owned_path(restore)
+                    try:
+                        if not same_owned_identity(restore_owned, backup):
+                            raise OSError("fixture manifest restore link does not match its backup")
+                        os.replace(restore, path)
+                        visible_restore = owned_path(path)
+                        if not same_owned_identity(visible_restore, backup):
+                            raise OSError(
+                                "fixture manifest changed while installing its recovery backup"
+                            )
+                    finally:
+                        try:
+                            unlink_owned(restore_owned, sync_parent=True)
+                        except OSError:
+                            pass
+                else:
+                    if not unlink_owned(expected_new):
+                        raise OSError("fixture manifest changed before rollback")
+                fsync_directory(path.parent)
+                restored = True
+            except Exception as error:
+                recovery_error = error
+
+            if restored:
+                if backup is not None:
+                    try:
+                        current_backup = refresh_owned(backup)
+                        if current_backup is not None:
+                            unlink_owned(current_backup, sync_parent=True)
+                    except OSError:
+                        pass
+                raise commit_error
+
+            preserve_backup = backup is not None
+            detail = f"manifest commit fsync failed: {commit_error}"
+            if recovery_error is not None:
+                detail += f"; rollback failed: {recovery_error}"
+            raise ManifestPublishError(detail, state="indeterminate") from commit_error
+    finally:
+        try:
+            current_temporary = refresh_owned(temporary)
+            if current_temporary is not None:
+                unlink_owned(current_temporary, sync_parent=True)
+        except OSError:
+            pass
+        if backup is not None and not preserve_backup:
+            try:
+                if unlink_owned(backup):
+                    fsync_directory(path.parent)
+            except OSError:
+                pass
+
+
+def remove_created(files: list[OwnedPath], created: list[OwnedDirectory]) -> None:
+    for target in files:
+        try:
+            unlink_owned(target, sync_parent=True)
+        except OSError:
+            pass
+    for directory in reversed(created):
+        try:
+            if not same_owned_directory(directory):
+                continue
+            directory.path.rmdir()
+            fsync_directory(directory.path.parent)
+        except OSError:
+            pass
+
+
+def install(kind: str, session_id: str, environment: dict[str, str]) -> dict[str, Any]:
+    paths = resolve_lab_paths(environment)
+    run_id = checked_run_id(environment)
+    target = expected_target(paths, session_id)
+    meta = expected_meta(paths, session_id)
+    with acquire_lock(paths.lock):
+        candidate = load_candidate(paths, environment, run_id)
+        document = load_manifest(paths, run_id, candidate)
+        existing = document["sessions"].get(kind)
+        if existing is not None:
+            if existing["sessionId"] != session_id:
+                fail(
+                    "LAB_FIXTURE_TARGET_EXISTS",
+                    f"{kind} is already installed as session {existing['sessionId']}",
+                )
+            return {"status": "unchanged", "kind": kind, **existing}
+        if any(entry["sessionId"] == session_id for entry in document["sessions"].values()):
+            fail(
+                "LAB_FIXTURE_TARGET_EXISTS",
+                f"fixture session {session_id} is already assigned to another kind",
+            )
+        reject_symlink_chain(target, "fixture target")
+        reject_symlink_chain(meta, "fixture session metadata")
+        if target.exists() or meta.exists():
+            occupied = target if target.exists() else meta
+            fail("LAB_FIXTURE_TARGET_EXISTS", f"refusing to overwrite existing fixture: {occupied}")
+        source_path, source, donor_meta = select_source(paths, session_id)
+        damaged, damage = corruption(kind, source)
+        session_meta, meta_data = fixture_metadata(kind, session_id, donor_meta)
+        entry: dict[str, Any] = {
+            "sessionId": session_id,
+            "title": session_meta["title"],
+            "pactPath": str(target),
+            "metaPath": str(meta),
+            "sourcePactPath": str(source_path),
+            "sourceSha256": sha256_bytes(source),
+            "fixtureSha256": sha256_bytes(damaged),
+            "metaSha256": sha256_bytes(meta_data),
+            "sourceBytes": len(source),
+            "fixtureBytes": len(damaged),
+            "corruption": damage,
+        }
+        created: list[OwnedDirectory] = []
+        pact_published: OwnedPath | None = None
+        meta_published: OwnedPath | None = None
+        try:
+            pact_published = publish_fixture(target, damaged, paths, created)
+            meta_published = publish_session_meta(meta, meta_data)
+            document["sessions"][kind] = entry
+            publish_manifest(paths.manifest, document)
+        except Exception as error:
+            if isinstance(error, ManifestPublishError) and error.state != "rolled_back":
+                raise
+            owned_files: list[OwnedPath] = []
+            if meta_published is not None:
+                owned_files.append(meta_published)
+            if pact_published is not None:
+                owned_files.append(pact_published)
+            remove_created(owned_files, created)
+            raise
+        return {"status": "installed", "kind": kind, **entry}
+
+
+def main(arguments: list[str]) -> int:
+    try:
+        command = parse_command(arguments)
+        if command is None:
+            print(USAGE, end="")
+            return 0
+        result = install(command[0], command[1], dict(os.environ))
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        return 0
+    except FixtureError as error:
+        print(f"error[{error.kind}]: {error}", file=sys.stderr)
+        if error.kind == "LAB_FIXTURE_USAGE":
+            print(USAGE, file=sys.stderr, end="")
+        return EXIT_CODES[error.kind]
+    except (OSError, ValueError) as error:
+        print(f"error[LAB_FIXTURE_IO]: {error}", file=sys.stderr)
+        return EXIT_CODES["LAB_FIXTURE_IO"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

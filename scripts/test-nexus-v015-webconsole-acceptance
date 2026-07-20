@@ -1,77 +1,522 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# This deterministic fixture suite is a contract pre-gate only. The v0.1.5
+# release still requires the genuine clean-prefix packed lab run and the
+# execution-level Windows .cmd/.bat lifecycle gate; neither is waivable by a
+# passing fixture run here.
+
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 TARGET="$SCRIPT_DIR/nexus-v015-webconsole-acceptance"
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
-mkdir -p "$TMP/bin" "$TMP/home" "$TMP/evidence"
+GATEWAY_PID=""
+GATEWAY_AUX_PID=""
+INERT_WEBUI_PID=""
+CLEANUP_REPLACEMENT_PID=""
 
-cat >"$TMP/bin/nexus-fixture" <<'FIXTURE'
-#!/usr/bin/env bash
-set -euo pipefail
-echo "$*" >>"$FIXTURE_COMMANDS"
-json=0
-if [ "${1:-}" = "--json" ]; then json=1; shift; fi
-if [ "${1:-}" = "webconsole" ] && [ "${2:-}" = "--help" ]; then echo webconsole-help; exit 0; fi
-if [ "${1:-}" = "webconsole" ] && [ "${3:-}" = "--help" ]; then echo "$2-help"; exit 0; fi
-test "${1:-}" = webconsole
-action=${2:-}
-state="$FIXTURE_STATE"
-next_pid() {
-  current=$(cat "$FIXTURE_PID" 2>/dev/null || echo 4000)
-  current=$((current + 1))
-  echo "$current" >"$FIXTURE_PID"
-  printf '%s' "$current"
-}
-write_discovery() {
-  pid=$1
-  printf '{"pid":%s,"host":"127.0.0.1","port":4200,"url":"http://127.0.0.1:4200","gatewayUrl":"http://127.0.0.1:4100","executable":"/fixture/nexus-webui"}\n' "$pid" >"$NEXUS_HOME/webconsole.json"
-}
-report() {
-  if [ -f "$state" ]; then
-    pid=$(cat "$FIXTURE_PID")
-    printf '{"installed":true,"gatewayHealthy":true,"runtime":{"state":"live","pid":%s,"url":"http://127.0.0.1:4200","host":"127.0.0.1","port":4200,"gatewayUrl":"http://127.0.0.1:4100"},"logPath":"%s/webconsole.log"}\n' "$pid" "$NEXUS_HOME"
-  else
-    printf '{"installed":true,"gatewayHealthy":true,"runtime":{"state":"down"},"logPath":"%s/webconsole.log"}\n' "$NEXUS_HOME"
+cleanup() {
+  if [ -f "$TMP/home/webconsole.json" ]; then
+    pid=$(jq -r '.pid // empty' "$TMP/home/webconsole.json" 2>/dev/null || true)
+    if [ -n "$pid" ]; then kill -KILL "$pid" 2>/dev/null || true; fi
   fi
+  if [ -f "$TMP/webconsole.pid" ]; then
+    pid=$(cat "$TMP/webconsole.pid" 2>/dev/null || true)
+    if [ -n "$pid" ]; then kill -KILL "$pid" 2>/dev/null || true; fi
+  fi
+  if [ -n "$GATEWAY_PID" ]; then kill "$GATEWAY_PID" 2>/dev/null || true; fi
+  if [ -n "$GATEWAY_AUX_PID" ]; then kill "$GATEWAY_AUX_PID" 2>/dev/null || true; fi
+  if [ -n "$INERT_WEBUI_PID" ]; then kill -KILL "$INERT_WEBUI_PID" 2>/dev/null || true; fi
+  if [ -n "$CLEANUP_REPLACEMENT_PID" ]; then
+    kill -KILL "$CLEANUP_REPLACEMENT_PID" 2>/dev/null || true
+  fi
+  rm -rf "$TMP"
 }
-case "$action" in
-  start|launch)
-    if [ ! -f "$state" ]; then next_pid >/dev/null; touch "$state"; fi
-    write_discovery "$(cat "$FIXTURE_PID")"
-    report
-    ;;
-  restart)
-    next_pid >/dev/null; touch "$state"; write_discovery "$(cat "$FIXTURE_PID")"; report
-    ;;
-  stop)
-    rm -f "$state" "$NEXUS_HOME/webconsole.json"; report
-    ;;
-  status)
-    report
-    [ -f "$state" ] || exit 2
-    ;;
-  url)
-    echo http://127.0.0.1:4200
-    ;;
-  logs)
-    if [[ " $* " == *" --follow "* ]]; then sleep 30; else echo fixture-log; fi
-    ;;
-  *) exit 64 ;;
-esac
-FIXTURE
-chmod +x "$TMP/bin/nexus-fixture"
+trap cleanup EXIT
 
-cat >"$TMP/bin/curl" <<'FIXTURE'
-#!/usr/bin/env bash
-if [ -f "$FIXTURE_STATE" ]; then
-  printf '{"service":"nexus-webconsole"}\n'
-  exit 0
-fi
-exit 7
-FIXTURE
-chmod +x "$TMP/bin/curl"
+mkdir -p "$TMP/bin" "$TMP/home" "$TMP/evidence/fixture/artifacts" "$TMP/cgroup"
+printf '%s\n' '600000 100000' >"$TMP/cgroup/cpu.max"
+printf '%s\n' '8589934592' >"$TMP/cgroup/memory.max"
+printf '%s\n' '0' >"$TMP/cgroup/memory.swap.max"
+printf '%s\n' '1024' >"$TMP/cgroup/pids.max"
+export NEXUS_V015_FIXTURE_CGROUP_ROOT="$TMP/cgroup"
+
+cat >"$TMP/bin/nexus-webui-fixture" <<'PY'
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import signal
+import socket
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+if sys.argv[1:] == ["--transient-probe"]:
+    raise SystemExit(0)
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--host", required=True)
+parser.add_argument("--port", required=True, type=int)
+parser.add_argument("--gateway-url", required=True)
+parser.add_argument("--discovery", required=True)
+args = parser.parse_args()
+
+executable = str(Path(__file__).resolve())
+url_host = f"[{args.host}]" if ":" in args.host else args.host
+url = f"http://{url_host}:{args.port}"
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, _format, *_values):
+        return
+
+    def do_GET(self):
+        if self.path == "/health":
+            body = json.dumps({
+                "ok": True,
+                "service": "nexus-webui",
+                "pid": os.getpid(),
+                "host": args.host,
+                "port": args.port,
+                "url": url,
+                "gateway": args.gateway_url,
+                "executable": executable,
+            }).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        body = b"nexus-webui-fixture\n"
+        self.send_response(200)
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+discovery = {
+    "pid": os.getpid(),
+    "host": args.host,
+    "port": args.port,
+    "url": url,
+    "gatewayUrl": args.gateway_url,
+    "executable": executable,
+}
+path = Path(args.discovery)
+path.parent.mkdir(parents=True, exist_ok=True)
+temporary = path.with_suffix(".json.tmp")
+temporary.write_text(json.dumps(discovery), encoding="utf-8")
+temporary.replace(path)
+
+class Server(ThreadingHTTPServer):
+    address_family = socket.AF_INET6 if ":" in args.host else socket.AF_INET
+
+
+server = Server((args.host, args.port), Handler)
+
+
+def reexec_executable(_signum, _frame):
+    os.execv("/bin/sleep", ["/bin/sleep", "300"])
+
+
+def reexec_argv(_signum, _frame):
+    os.execv(
+        sys.executable,
+        [sys.executable, "-c", "import time; time.sleep(300)", "fixture-reexec-argv"],
+    )
+
+
+signal.signal(signal.SIGUSR1, reexec_executable)
+signal.signal(signal.SIGUSR2, reexec_argv)
+server.serve_forever()
+PY
+chmod +x "$TMP/bin/nexus-webui-fixture"
+
+cat >"$TMP/bin/nexus-fixture" <<'PY'
+#!/usr/bin/env python3
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+args = sys.argv[1:]
+with open(os.environ["FIXTURE_COMMANDS"], "a", encoding="utf-8") as stream:
+    stream.write(" ".join(args) + "\n")
+with open(os.environ["FIXTURE_ENVIRONMENTS"], "a", encoding="utf-8") as stream:
+    stream.write(json.dumps({
+        "args": args,
+        "native": os.environ.get("NEXUS_NATIVE_BIN"),
+    }) + "\n")
+if os.environ.get("NEXUS_NATIVE_BIN") == os.environ.get("FIXTURE_DECOY_NATIVE"):
+    Path(os.environ["FIXTURE_DECOY_NATIVE_MARKER"]).touch()
+
+json_mode = bool(args and args[0] == "--json")
+if json_mode:
+    args.pop(0)
+
+home = Path(os.environ["NEXUS_HOME"])
+discovery_path = home / "webconsole.json"
+log_path = home / "webconsole.log"
+gateway_path = home / "gateway.json"
+
+
+def process_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def read_discovery():
+    try:
+        return json.loads(discovery_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def probe(host, port):
+    try:
+        url_host = f"[{host}]" if ":" in host else host
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f"http://{url_host}:{port}/health", timeout=0.5) as response:
+            return "response", response.status, json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        return "response", error.code, None
+    except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError):
+        return "absent", None, None
+
+
+def runtime():
+    discovery = read_discovery()
+    if discovery and process_alive(int(discovery["pid"])):
+        kind, status, body = probe(discovery["host"], int(discovery["port"]))
+        if kind == "response" and status == 200 and body and body.get("service") == "nexus-webui":
+            return discovery
+    return None
+
+
+def report(discovery=None):
+    discovery = discovery or runtime()
+    if discovery:
+        value = {
+            "installed": True,
+            "gatewayHealthy": True,
+            "runtime": {
+                "state": "live",
+                "pid": int(discovery["pid"]),
+                "url": discovery["url"],
+                "host": discovery["host"],
+                "port": int(discovery["port"]),
+                "gatewayUrl": discovery["gatewayUrl"],
+            },
+            "logPath": str(log_path),
+        }
+    else:
+        value = {
+            "installed": True,
+            "gatewayHealthy": True,
+            "runtime": {"state": "down"},
+            "logPath": str(log_path),
+        }
+    if json_mode:
+        print(json.dumps(value))
+    elif discovery:
+        print(f"Nexus Webconsole live pid={discovery['pid']} url={discovery['url']}")
+    else:
+        print("Nexus Webconsole down")
+
+
+def fail(message, code="WEBCONSOLE_LIFECYCLE_FAILED", data=None):
+    if json_mode:
+        print(json.dumps({"error": {
+            "code": code,
+            "message": message,
+            "hint": None,
+            "data": data,
+        }}))
+    else:
+        print(f"error: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def option(name, default=None):
+    try:
+        return args[args.index(name) + 1]
+    except (ValueError, IndexError):
+        return default
+
+
+def stop(force):
+    discovery = read_discovery()
+    if discovery and process_alive(int(discovery["pid"])):
+        pid = int(discovery["pid"])
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.monotonic() + 2
+        while process_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if force and process_alive(pid):
+            os.kill(pid, signal.SIGKILL)
+    discovery_path.unlink(missing_ok=True)
+
+
+def start(host, port):
+    current = runtime()
+    if current:
+        return current
+    kind, status, health = probe(host, port)
+    if kind == "response":
+        if status == 200 and health and health.get("service") == "nexus-webui":
+            adopted = {
+                "pid": int(health["pid"]),
+                "host": health["host"],
+                "port": int(health["port"]),
+                "url": health["url"],
+                "gatewayUrl": health["gateway"],
+                "executable": health["executable"],
+            }
+            discovery_path.write_text(json.dumps(adopted), encoding="utf-8")
+            return adopted
+        if os.environ.get("FIXTURE_SPAWN_TRANSIENT_ON_OCCUPIED") == "1":
+            subprocess.run(
+                [os.environ["NEXUS_WEBUI_BIN"], "--transient-probe"],
+                check=False,
+                timeout=2,
+            )
+        fail(
+            f"Webconsole port {port} is occupied by an unverified process",
+            "WEBCONSOLE_PORT_OCCUPIED",
+            {"host": host, "port": port},
+        )
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log = open(log_path, "a", encoding="utf-8")
+    gateway_url = json.loads(gateway_path.read_text(encoding="utf-8"))["url"]
+    process = subprocess.Popen([
+        os.environ["NEXUS_WEBUI_BIN"],
+        "--host", host,
+        "--port", str(port),
+        "--gateway-url", gateway_url,
+        "--discovery", str(discovery_path),
+    ], stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    Path(os.environ["FIXTURE_PID"]).write_text(str(process.pid), encoding="utf-8")
+    Path(os.environ["FIXTURE_PID"] + ".port").write_text(str(port), encoding="utf-8")
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        current = runtime()
+        if current:
+            return current
+        time.sleep(0.05)
+    fail("Webconsole did not become healthy")
+
+
+if args == ["--version"]:
+    print(os.environ.get("FIXTURE_VERSION_OUTPUT", "nexus 0.1.5"))
+    raise SystemExit(0)
+
+if args[:2] == ["gateway", "status"]:
+    replacement_marker = os.environ.get("FIXTURE_REPLACE_WEBCONSOLE_MARKER")
+    if (
+        os.environ.get("FIXTURE_REPLACE_WEBCONSOLE_DURING_GATEWAY_STATUS") == "1"
+        and replacement_marker
+        and discovery_path.exists()
+        and not Path(replacement_marker).exists()
+    ):
+        previous = read_discovery()
+        if previous and process_alive(int(previous["pid"])):
+            os.kill(int(previous["pid"]), signal.SIGKILL)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                kind, _status, _body = probe(previous["host"], int(previous["port"]))
+                if kind == "absent":
+                    break
+                time.sleep(0.01)
+            replacement = subprocess.Popen(
+                [
+                    os.environ["NEXUS_WEBUI_BIN"],
+                    "--host", previous["host"],
+                    "--port", str(previous["port"]),
+                    "--gateway-url", previous["gatewayUrl"],
+                    "--discovery", str(discovery_path),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            Path(os.environ["FIXTURE_REPLACEMENT_PID"]).write_text(
+                str(replacement.pid), encoding="utf-8"
+            )
+            Path(replacement_marker).touch()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                current = runtime()
+                if current and int(current["pid"]) == replacement.pid:
+                    break
+                time.sleep(0.02)
+            fail("fixture replaced Webconsole with a same-shaped owner")
+    fail_when_result_exists = os.environ.get("FIXTURE_FAIL_GATEWAY_STATUS_WHEN_RESULT_EXISTS")
+    if fail_when_result_exists and Path(fail_when_result_exists).exists():
+        print("fixture forced final Gateway status failure", file=sys.stderr)
+        raise SystemExit(91)
+    gateway = json.loads(gateway_path.read_text(encoding="utf-8"))
+    value = {
+        "installed": True,
+        "daemonRunning": True,
+        "runtime": {"state": "live", "pid": gateway["pid"], "url": gateway["url"]},
+        "logPath": str(home / "gateway.log"),
+    }
+    print(json.dumps(value) if json_mode else f"gateway: live pid={gateway['pid']} url={gateway['url']}")
+    raise SystemExit(0)
+
+if args[:2] == ["webconsole", "--help"]:
+    print("Usage: nexus webconsole <COMMAND>")
+    raise SystemExit(0)
+if len(args) >= 3 and args[0] == "webconsole" and args[2] == "--help":
+    print(f"Usage: nexus webconsole {args[1]}")
+    raise SystemExit(0)
+if len(args) < 2 or args[0] != "webconsole":
+    raise SystemExit(64)
+
+action = args[1]
+host = option("--host", "127.0.0.1")
+port = int(option("--port", "4200"))
+
+if action in {"start", "launch"}:
+    started = start(host, port)
+    mutation_marker = os.environ.get("FIXTURE_MUTATION_MARKER")
+    if (
+        action == "start"
+        and os.environ.get("FIXTURE_MUTATE_GATEWAY_ON_START") == "1"
+        and mutation_marker
+        and not Path(mutation_marker).exists()
+    ):
+        gateway_path.write_text(gateway_path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+        Path(mutation_marker).touch()
+    entrypoint_marker = os.environ.get("FIXTURE_ENTRYPOINT_MUTATION_MARKER")
+    if (
+        action == "start"
+        and os.environ.get("FIXTURE_REPLACE_WEBUI_ENTRYPOINT_ON_START") == "1"
+        and entrypoint_marker
+        and not Path(entrypoint_marker).exists()
+    ):
+        entrypoint = Path(os.environ["NEXUS_WEBUI_BIN"])
+        replacement = entrypoint.with_name(entrypoint.name + ".replacement")
+        replacement.write_bytes(entrypoint.read_bytes() + b"\n# replaced after launch\n")
+        replacement.chmod(entrypoint.stat().st_mode & 0o777)
+        replacement.replace(entrypoint)
+        Path(entrypoint_marker).touch()
+    report(started)
+elif action == "restart":
+    stop(False)
+    restarted = start(host, port)
+    if os.environ.get("FIXTURE_MUTATE_GATEWAY_ON_RESTART") == "1":
+        gateway_path.write_text(gateway_path.read_text(encoding="utf-8") + " ", encoding="utf-8")
+    report(restarted)
+elif action == "stop":
+    if "--force" in args and os.environ.get("FIXTURE_REEXEC_WEBUI_ON_FORCE_STOP"):
+        discovery = read_discovery()
+        if discovery and process_alive(int(discovery["pid"])):
+            pid = int(discovery["pid"])
+            mode = os.environ["FIXTURE_REEXEC_WEBUI_ON_FORCE_STOP"]
+            os.kill(pid, signal.SIGUSR1 if mode == "executable" else signal.SIGUSR2)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                try:
+                    executable = os.path.realpath(f"/proc/{pid}/exe")
+                    argv = [
+                        raw.decode("utf-8", "surrogateescape")
+                        for raw in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+                        if raw
+                    ]
+                except OSError:
+                    break
+                if mode == "executable" and executable == os.path.realpath("/bin/sleep"):
+                    break
+                if mode == "argv" and "fixture-reexec-argv" in argv:
+                    break
+                time.sleep(0.01)
+            fail("fixture re-execed Webconsole before cleanup fallback")
+    if (
+        "--force" in args
+        and os.environ.get("FIXTURE_REMOVE_DISCOVERY_AND_FAIL_FORCE_STOP") == "1"
+    ):
+        discovery_path.unlink(missing_ok=True)
+        fail("fixture removed discovery before cleanup fallback")
+    if "--force" in args and os.environ.get("FIXTURE_REPLACE_DISCOVERY_ON_FORCE_STOP") == "1":
+        stop(True)
+        replacement = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(300)",
+                os.environ["NEXUS_WEBUI_BIN"],
+                "--discovery",
+                str(discovery_path),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        Path(os.environ["FIXTURE_REPLACEMENT_PID"]).write_text(
+            str(replacement.pid), encoding="utf-8"
+        )
+        discovery_path.write_text(
+            json.dumps(
+                {
+                    "pid": replacement.pid,
+                    "host": host,
+                    "port": port,
+                    "url": f"http://{host}:{port}",
+                    "gatewayUrl": json.loads(gateway_path.read_text(encoding="utf-8"))["url"],
+                    "executable": str(Path(os.environ["NEXUS_WEBUI_BIN"]).resolve()),
+                }
+            ),
+            encoding="utf-8",
+        )
+        fail("fixture replaced discovery before cleanup fallback")
+    if "--force" in args and os.environ.get("FIXTURE_FAIL_FORCE_STOP") == "1":
+        fail("fixture forced cleanup stop failure")
+    stop("--force" in args)
+    report()
+elif action == "status":
+    current = runtime()
+    report(current)
+    if current is None:
+        raise SystemExit(2)
+elif action == "url":
+    current = runtime()
+    if current is None:
+        fail("Webconsole is not running")
+    print(json.dumps({"url": current["url"]}) if json_mode else current["url"])
+elif action == "logs":
+    lines = int(option("--lines", option("-n", "80")))
+    content = log_path.read_text(encoding="utf-8").splitlines() if log_path.exists() else []
+    for line in content[-lines:]:
+        print(line, flush=True)
+    if "--follow" in args:
+        position = log_path.stat().st_size if log_path.exists() else 0
+        while True:
+            time.sleep(0.05)
+            if not log_path.exists():
+                continue
+            with log_path.open(encoding="utf-8") as stream:
+                stream.seek(position)
+                for line in stream:
+                    print(line.rstrip("\n"), flush=True)
+                position = stream.tell()
+else:
+    raise SystemExit(64)
+PY
+chmod +x "$TMP/bin/nexus-fixture"
 
 set +e
 "$TARGET" --help >"$TMP/help" 2>"$TMP/help.err"
@@ -80,39 +525,2131 @@ set -e
 test "$help_status" -eq 0
 grep -Fq -- "--nexus-bin" "$TMP/help"
 grep -Fq -- "--evidence-dir" "$TMP/help"
+grep -Fq -- "--port" "$TMP/help"
+grep -Fq -- "--packed-prefix" "$TMP/help"
+grep -Fq -- "--verify-result-seal" "$TMP/help"
 
-PATH="$TMP/bin:/usr/bin:/bin" \
+PREFIX="$TMP/nexus-lab-install.fixtureABC"
+UMBRELLA="$PREFIX/lib/node_modules/@egregore/nexus"
+CLI_PACKAGE="$UMBRELLA/node_modules/@egregore/nexus-cli"
+GATEWAY_PACKAGE="$UMBRELLA/node_modules/@egregore/nexus-gateway"
+mkdir -p \
+  "$PREFIX/bin" \
+  "$UMBRELLA/bin" \
+  "$CLI_PACKAGE/bin" \
+  "$CLI_PACKAGE/native/linux-x64-gnu" \
+  "$GATEWAY_PACKAGE/dist-gateway" \
+  "$GATEWAY_PACKAGE/webconsole/bin"
+cp "$TMP/bin/nexus-fixture" "$UMBRELLA/bin/nexus.mjs"
+cp "$TMP/bin/nexus-webui-fixture" "$UMBRELLA/bin/nexus-webui.mjs"
+cat >"$UMBRELLA/bin/nexus-gateway.mjs" <<'PY'
+#!/usr/bin/env python3
+import argparse
+import json
+import socket
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--fixture-runtime", action="store_true")
+parser.add_argument("--port", required=True, type=int)
+parser.add_argument("--module", required=True)
+parser.add_argument("--install-root", required=True)
+parser.add_argument("--no-listen", action="store_true")
+parser.add_argument("--inert")
+parser.add_argument("--bind-host", default="127.0.0.1")
+parser.add_argument("--expected-host-header")
+parser.add_argument(
+    "--runtime-identity",
+    choices=("full", "none", "partial", "malformed", "mismatch"),
+    default="full",
+)
+args = parser.parse_args()
+
+if args.no_listen:
+    time.sleep(300)
+    raise SystemExit(0)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, _format, *_values):
+        return
+
+    def do_GET(self):
+        if self.path != "/api/v1/health":
+            self.send_response(404)
+            self.end_headers()
+            return
+        if args.expected_host_header and self.headers.get("Host") != args.expected_host_header:
+            self.send_response(421)
+            self.end_headers()
+            return
+        document = {
+            "status": "ok",
+            "store": "gateway",
+        }
+        if args.runtime_identity == "full":
+            document["runtime"] = {
+                "entrypoint": str(Path(__file__).resolve()),
+                "loadedModule": str(Path(args.module).resolve()),
+                "installRoot": str(Path(args.install_root).resolve()),
+            }
+        elif args.runtime_identity == "partial":
+            document["runtime"] = {"entrypoint": str(Path(__file__).resolve())}
+        elif args.runtime_identity == "malformed":
+            document["runtime"] = "malformed"
+        elif args.runtime_identity == "mismatch":
+            document["runtime"] = {
+                "entrypoint": str(Path(__file__).resolve()),
+                "loadedModule": str(Path(args.module).resolve()) + ".other",
+                "installRoot": str(Path(args.install_root).resolve()),
+            }
+        body = json.dumps(document).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class Server(ThreadingHTTPServer):
+    address_family = socket.AF_INET6 if ":" in args.bind_host else socket.AF_INET
+
+    def server_bind(self):
+        if self.address_family == socket.AF_INET6:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        super().server_bind()
+
+
+Server((args.bind_host, args.port), Handler).serve_forever()
+PY
+chmod +x "$UMBRELLA/bin/"*.mjs
+cp "$UMBRELLA/bin/nexus.mjs" "$CLI_PACKAGE/bin/nexus.mjs"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$CLI_PACKAGE/native/linux-x64-gnu/nexus"
+chmod +x "$CLI_PACKAGE/bin/nexus.mjs" "$CLI_PACKAGE/native/linux-x64-gnu/nexus"
+printf '%s\n' 'export const fixtureGateway = true;' >"$GATEWAY_PACKAGE/dist-gateway/headless.mjs"
+cp "$TMP/bin/nexus-webui-fixture" "$GATEWAY_PACKAGE/webconsole/bin/nexus-webui.mjs"
+chmod +x "$GATEWAY_PACKAGE/webconsole/bin/nexus-webui.mjs"
+ln -s ../lib/node_modules/@egregore/nexus/bin/nexus.mjs "$PREFIX/bin/nexus"
+ln -s ../lib/node_modules/@egregore/nexus/bin/nexus-gateway.mjs "$PREFIX/bin/nexus-gateway"
+ln -s ../lib/node_modules/@egregore/nexus/bin/nexus-webui.mjs "$PREFIX/bin/nexus-webui"
+cat >"$UMBRELLA/package.json" <<'JSON'
+{
+  "name": "@egregore/nexus",
+  "version": "0.1.5",
+  "bin": {
+    "nexus": "bin/nexus.mjs",
+    "nexus-gateway": "bin/nexus-gateway.mjs",
+    "nexus-webui": "bin/nexus-webui.mjs"
+  },
+  "dependencies": {
+    "@egregore/nexus-cli": "0.1.5",
+    "@egregore/nexus-gateway": "0.1.5"
+  }
+}
+JSON
+printf '{"name":"@egregore/nexus-cli","version":"0.1.5"}\n' \
+  >"$CLI_PACKAGE/package.json"
+printf '{"name":"@egregore/nexus-gateway","version":"0.1.5"}\n' \
+  >"$GATEWAY_PACKAGE/package.json"
+mkdir -p "$GATEWAY_PACKAGE/node_modules/fixture-dependency"
+printf '{"name":"fixture-dependency","version":"1.0.0"}\n' \
+  >"$GATEWAY_PACKAGE/node_modules/fixture-dependency/package.json"
+printf '%s\n' 'export const fixtureDependency = true;' \
+  >"$GATEWAY_PACKAGE/node_modules/fixture-dependency/index.mjs"
+
+# A live, immutable Gateway is the D2 dependency and must survive every
+# Webconsole operation byte-for-byte. It is launched through the exact packed
+# Gateway entrypoint so the process provenance assertion is meaningful.
+GATEWAY_PORT=$(python3 - <<'PY'
+import socket
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+)
+"$PREFIX/bin/nexus-gateway" \
+  --fixture-runtime \
+  --port "$GATEWAY_PORT" \
+  --module "$GATEWAY_PACKAGE/dist-gateway/headless.mjs" \
+  --install-root "$PREFIX" \
+  --expected-host-header "127.0.0.1:$GATEWAY_PORT" &
+GATEWAY_PID=$!
+printf '{"pid":%s,"url":"http://127.0.0.1:%s"}\n' \
+  "$GATEWAY_PID" "$GATEWAY_PORT" >"$TMP/home/gateway.json"
+deadline=$((SECONDS + 5))
+until curl -fsS --max-time 1 "http://127.0.0.1:$GATEWAY_PORT/api/v1/health" >/dev/null 2>&1; do
+  [ "$SECONDS" -lt "$deadline" ] || {
+    echo "fixture Gateway did not become healthy" >&2
+    exit 1
+  }
+  sleep 0.05
+done
+GATEWAY_SHA_BEFORE=$(sha256sum "$TMP/home/gateway.json" | cut -d' ' -f1)
+GATEWAY_INODE_BEFORE=$(stat -c %i "$TMP/home/gateway.json")
+
+cp "$CLI_PACKAGE/native/linux-x64-gnu/nexus" "$TMP/evidence/fixture/artifacts/native"
+for package in nexus cli gateway; do
+  mkdir -p "$TMP/tar-$package/package"
+done
+cp -a "$UMBRELLA/package.json" "$UMBRELLA/bin" "$TMP/tar-nexus/package/"
+cp -a "$CLI_PACKAGE/package.json" "$CLI_PACKAGE/bin" "$CLI_PACKAGE/native" "$TMP/tar-cli/package/"
+cp -a "$GATEWAY_PACKAGE/package.json" "$GATEWAY_PACKAGE/dist-gateway" "$GATEWAY_PACKAGE/webconsole" \
+  "$TMP/tar-gateway/package/"
+tar -czf "$TMP/evidence/fixture/artifacts/nexus.tgz" -C "$TMP/tar-nexus" package
+tar -czf "$TMP/evidence/fixture/artifacts/cli.tgz" -C "$TMP/tar-cli" package
+tar -czf "$TMP/evidence/fixture/artifacts/gateway.tgz" -C "$TMP/tar-gateway" package
+READINESS="$TMP/lab/candidate-ready.v1"
+mkdir -p "$(dirname "$READINESS")"
+INSTALL_TREE_SHA256=$(python3 - "$PREFIX" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path, PurePosixPath
+
+root = Path(os.path.abspath(sys.argv[1]))
+inventory = {}
+
+
+def visit(directory, relative):
+    for entry in sorted(os.scandir(directory), key=lambda item: item.name):
+        child = relative / entry.name
+        key = child.as_posix()
+        info = entry.stat(follow_symlinks=False)
+        if stat.S_ISLNK(info.st_mode):
+            inventory[key] = {
+                "kind": "symlink",
+                "target": os.readlink(entry.path),
+                "mode": stat.S_IMODE(info.st_mode),
+            }
+        elif stat.S_ISDIR(info.st_mode):
+            inventory[key] = {"kind": "directory", "mode": stat.S_IMODE(info.st_mode)}
+            visit(Path(entry.path), child)
+        elif stat.S_ISREG(info.st_mode):
+            raw = Path(entry.path).read_bytes()
+            inventory[key] = {
+                "kind": "file",
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "size": len(raw),
+                "mode": stat.S_IMODE(info.st_mode),
+            }
+        else:
+            raise SystemExit(f"unsupported fixture install entry: {key}")
+
+
+visit(root, PurePosixPath())
+body = json.dumps(
+    inventory,
+    sort_keys=True,
+    separators=(",", ":"),
+    ensure_ascii=False,
+    allow_nan=False,
+).encode("utf-8")
+print(hashlib.sha256(body).hexdigest())
+PY
+)
+cat >"$READINESS" <<EOF
+schema=1
+containerId=$(printf 'c%.0s' {1..64})
+mode=packed
+runId=fixture
+installRoot=$PREFIX
+installNonce=fixtureABC
+nativeResolved=$CLI_PACKAGE/native/linux-x64-gnu/nexus
+nativeSha256=$(sha256sum "$CLI_PACKAGE/native/linux-x64-gnu/nexus" | cut -d' ' -f1)
+nexusLink=$PREFIX/bin/nexus
+nexusResolved=$UMBRELLA/bin/nexus.mjs
+nexusSha256=$(sha256sum "$UMBRELLA/bin/nexus.mjs" | cut -d' ' -f1)
+gatewayLink=$PREFIX/bin/nexus-gateway
+gatewayResolved=$UMBRELLA/bin/nexus-gateway.mjs
+gatewaySha256=$(sha256sum "$UMBRELLA/bin/nexus-gateway.mjs" | cut -d' ' -f1)
+webuiLink=$PREFIX/bin/nexus-webui
+webuiResolved=$UMBRELLA/bin/nexus-webui.mjs
+webuiSha256=$(sha256sum "$UMBRELLA/bin/nexus-webui.mjs" | cut -d' ' -f1)
+installTreeSha256=$INSTALL_TREE_SHA256
+imageDigest=sha256:$(printf 'a%.0s' {1..64})
+lensRendererMode=production
+EOF
+chmod 0444 "$READINESS"
+READINESS_TEMPLATE="$TMP/candidate-ready.template.v1"
+cp "$READINESS" "$READINESS_TEMPLATE"
+python3 - "$TMP/evidence/fixture" "$PREFIX" "$READINESS" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+prefix = Path(sys.argv[2])
+readiness = Path(sys.argv[3])
+umbrella = prefix / "lib/node_modules/@egregore/nexus"
+cli = umbrella / "node_modules/@egregore/nexus-cli"
+gateway = umbrella / "node_modules/@egregore/nexus-gateway"
+digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+artifact = lambda name: {
+    "path": f"artifacts/{name}",
+    "sha256": digest(root / "artifacts" / name),
+}
+sources = {}
+for index, name in enumerate(("nexus", "lens", "egregore", "pactree", "pactreePython", "pactreeFs"), 1):
+    sources[name] = {"revision": f"{index:x}" * 40, "dirty": False, "dirtyPaths": []}
+manifest = {
+    "schemaVersion": 1,
+    "runId": "fixture",
+    "mode": "packed",
+    "sources": sources,
+    "native": artifact("native"),
+    "packages": [
+        {"name": "@egregore/nexus", "version": "0.1.5", "tarball": artifact("nexus.tgz")},
+        {"name": "@egregore/nexus-cli", "version": "0.1.5", "tarball": artifact("cli.tgz")},
+        {"name": "@egregore/nexus-gateway", "version": "0.1.5", "tarball": artifact("gateway.tgz")},
+    ],
+    "image": {"digest": "sha256:" + "a" * 64},
+    "container": {"limits": {"cpus": 6, "memoryBytes": 8589934592, "pids": 1024}},
+    "toolchains": {"nexus": "nexus 0.1.5", "node": "v24.0.0", "rustc": "rustc 1.90.0"},
+    "environment": {
+        "OCULAR_LAB": "1",
+        "NEXUS_V015_RUN_ID": "fixture",
+        "NEXUS_V015_PACKED_PREFIX": str(prefix),
+        "NEXUS_V015_NEXUS_BIN": str(prefix / "bin/nexus"),
+        "NEXUS_V015_NEXUS_BIN_RESOLVED": str(umbrella / "bin/nexus.mjs"),
+        "NEXUS_V015_NEXUS_BIN_SHA256": digest(umbrella / "bin/nexus.mjs"),
+        "NEXUS_V015_GATEWAY_BIN": str(prefix / "bin/nexus-gateway"),
+        "NEXUS_V015_GATEWAY_BIN_RESOLVED": str(umbrella / "bin/nexus-gateway.mjs"),
+        "NEXUS_V015_GATEWAY_BIN_SHA256": digest(umbrella / "bin/nexus-gateway.mjs"),
+        "NEXUS_V015_WEBUI_BIN": str(prefix / "bin/nexus-webui"),
+        "NEXUS_V015_WEBUI_BIN_RESOLVED": str(umbrella / "bin/nexus-webui.mjs"),
+        "NEXUS_V015_WEBUI_BIN_SHA256": digest(umbrella / "bin/nexus-webui.mjs"),
+        "NEXUS_V015_GATEWAY_MODULE": str(gateway / "dist-gateway/headless.mjs"),
+        "NEXUS_V015_GATEWAY_MODULE_SHA256": digest(gateway / "dist-gateway/headless.mjs"),
+        "NEXUS_V015_NATIVE_BIN": str(cli / "native/linux-x64-gnu/nexus"),
+        "NEXUS_V015_NATIVE_BIN_SHA256": digest(cli / "native/linux-x64-gnu/nexus"),
+        "NEXUS_V015_CONTAINER_ID": "c" * 64,
+        "NEXUS_V015_INSTALL_NONCE": "fixtureABC",
+        "NEXUS_V015_READINESS_LEDGER": str(readiness),
+        "NEXUS_V015_READINESS_LEDGER_SHA256": digest(readiness),
+    },
+}
+(root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+PY
+
+CONTAINER_ID=$(printf 'c%.0s' {1..64})
+export NEXUS_LAB_ROOT="$TMP"
+export NEXUS_V015_CURRENT_CONTAINER_ID="$CONTAINER_ID"
+export NEXUS_V015_RUN_ID=fixture
+cat >"$TMP/bin/decoy-native" <<'SH'
+#!/usr/bin/env sh
+touch "$FIXTURE_DECOY_NATIVE_MARKER"
+exit 97
+SH
+chmod +x "$TMP/bin/decoy-native"
+
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
   OCULAR_LAB=1 \
   NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
   NEXUS_HOME="$TMP/home" \
+  NEXUS_NATIVE_BIN="$TMP/bin/decoy-native" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_DECOY_NATIVE="$TMP/bin/decoy-native" \
+  FIXTURE_DECOY_NATIVE_MARKER="$TMP/decoy-native-ran" \
   FIXTURE_COMMANDS="$TMP/commands" \
-  FIXTURE_STATE="$TMP/state" \
-  FIXTURE_PID="$TMP/pid" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
   "$TARGET" \
-    --nexus-bin "$TMP/bin/nexus-fixture" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
     --host 127.0.0.1 \
-    --port 4200 \
+    --port 0 \
     --run-id fixture \
     --evidence-dir "$TMP/evidence"
 
-test -f "$TMP/evidence/fixture/webconsole/result.json"
+RESULT="$TMP/evidence/fixture/results/D2-webconsole-cli/result.json"
+test -f "$RESULT"
+test ! -e "$TMP/decoy-native-ran"
+RESULT_SEAL="$TMP/evidence/fixture/results/D2-webconsole-cli.result.sha256"
+test -f "$RESULT_SEAL"
+test ! -L "$RESULT_SEAL"
+test "$(stat -c %h "$RESULT_SEAL")" -eq 1
+test "$(stat -c %a "$RESULT_SEAL")" = 400
+"$TARGET" --verify-result-seal "$TMP/evidence/fixture" >/dev/null
+
+EXPECTED_DIGEST=$(python3 - "$TMP/evidence/fixture/manifest.json" <<'PY'
+import hashlib
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+ledger = {
+    "mode": manifest["mode"],
+    "sources": manifest["sources"],
+    "nativeSha256": manifest["native"]["sha256"],
+    "packages": [{
+        "name": row["name"],
+        "version": row["version"],
+        "tarballSha256": row["tarball"]["sha256"],
+    } for row in manifest["packages"]],
+    "imageDigest": manifest["image"]["digest"],
+    "limits": manifest["container"]["limits"],
+    "toolchains": manifest["toolchains"],
+    "environment": manifest["environment"],
+}
+body = json.dumps(ledger, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+print("sha256:" + hashlib.sha256(body).hexdigest())
+PY
+)
+
+jq -e \
+  --arg digest "$EXPECTED_DIGEST" '
+    .schemaVersion == 1 and
+    .runId == "fixture" and
+    .candidateDigest == $digest and
+    .gate == "D2" and
+    .status == "PASS" and
+    .error == null and
+    .partial == false and
+    .flaky == false and
+    .skipped == false and
+    .refused == false and
+    .failureCount == 0 and
+    .finalState == "down" and
+    (.primaryPort | type == "number" and . > 0) and
+    (.occupiedPort | type == "number" and . > 0) and
+    .primaryPort != .occupiedPort and
+    .requiredArtifacts == ["cliTranscript", "discoveryRecovery", "occupiedPort"] and
+    (.artifacts | keys) == ["cliTranscript", "discoveryRecovery", "occupiedPort"]
+  ' "$RESULT" >/dev/null
+
+for name in cliTranscript discoveryRecovery occupiedPort; do
+  relative=$(jq -r --arg name "$name" '.artifacts[$name].path' "$RESULT")
+  expected=$(jq -r --arg name "$name" '.artifacts[$name].sha256' "$RESULT")
+  test -s "$TMP/evidence/fixture/$relative"
+  test "$(sha256sum "$TMP/evidence/fixture/$relative" | cut -d' ' -f1)" = "$expected"
+done
+
+TRANSCRIPT="$TMP/evidence/fixture/$(jq -r '.artifacts.cliTranscript.path' "$RESULT")"
+for label in \
+  packed-topology version help-webconsole help-launch help-start help-stop help-restart help-status help-logs help-url \
+  start-first status-plain status-first start-second status-second url launch-no-open logs-lines \
+  logs-follow start-adopt restart stop-first stop-second start-force stop-force-first stop-force-second \
+  occupied-start; do
+  jq -s -e --arg opLabel "$label" 'any(.[]; .label == $opLabel)' "$TRANSCRIPT" >/dev/null
+done
+jq -e -s 'length > 20 and all(.gateway.matchesBaseline == true)' "$TRANSCRIPT" >/dev/null
+jq -e -s '
+  any(.[];
+    .label == "launch-no-open" and
+    .command[0] == "env" and
+    any(.command[]; startswith("BROWSER=")) and
+    any(.command[]; startswith("PATH="))
+  )
+' "$TRANSCRIPT" >/dev/null
+jq -e -s '
+  any(.[];
+    .label == "packed-topology" and
+    .topology.provenance.tarballBound == true and
+    .topology.provenance.manifestBindingsBound == true and
+    .topology.provenance.completePackageInventory == true and
+    .topology.provenance.fullDependencyClosure == true and
+    .topology.provenance.readinessBound == true and
+    (.topology.provenance.installTreeSha256 | test("^[0-9a-f]{64}$")) and
+    .topology.provenance.installTreeSha256 == .topology.candidateReadiness.installTreeSha256 and
+    (.topology.provenance.nativeSha256 | test("^[0-9a-f]{64}$")) and
+    (.topology.provenance.gatewayModuleSha256 | test("^[0-9a-f]{64}$")) and
+    (.topology.packageInventories | keys | sort) ==
+      (["@egregore/nexus","@egregore/nexus-cli","@egregore/nexus-gateway"] | sort)
+  )
+' "$TRANSCRIPT" >/dev/null
+jq -e -s '
+  all(.[];
+    .gateway.candidateLauncherMatched == true and
+    .gateway.candidateModuleOnDiskMatched == true and
+    .gateway.candidateModulePredatesProcess == true and
+    .gateway.listenerOwned == true and
+    .gateway.runtimeIdentityReported == true and
+    .gateway.runtimeIdentityMatched == true and
+    .candidateReadiness.resourceAuthority == {
+      cpuMax:"600000 100000",
+      memoryMax:"8589934592",
+      memorySwapMax:"0",
+      pidsMax:"1024"
+    } and
+    .candidateReadiness.matchesBaseline == true
+  )
+' "$TRANSCRIPT" >/dev/null
+jq -e -s --arg native "$CLI_PACKAGE/native/linux-x64-gnu/nexus" '
+  length > 20 and all(.native == $native)
+' "$TMP/command-environments.jsonl" >/dev/null
+
+cat >"$TMP/expected-log-tail" <<'EOF'
+D2-LOG-04:fixture
+D2-LOG-05:fixture
+D2-LOG-06:fixture
+D2-LOG-07:fixture
+D2-LOG-08:fixture
+EOF
+BASELINE_OUT=$(dirname "$RESULT")
+cmp -s "$TMP/expected-log-tail" "$BASELINE_OUT/logs-lines.stdout"
+grep -Fxq 'D2-LOG-08:fixture' "$BASELINE_OUT/logs-follow.stdout"
+grep -Fxq 'D2-FOLLOW:fixture' "$BASELINE_OUT/logs-follow.stdout"
+test "$(grep -Fxc 'D2-FOLLOW:fixture' "$BASELINE_OUT/logs-follow.stdout")" -eq 1
+
+RECOVERY="$TMP/evidence/fixture/$(jq -r '.artifacts.discoveryRecovery.path' "$RESULT")"
 jq -e '
-  .schemaVersion == 1 and
-  .status == "passed" and
   .initialPid == .adoptedPid and
   .restartedPid != .adoptedPid and
-  .finalState == "live"
-' "$TMP/evidence/fixture/webconsole/result.json" >/dev/null
+  .argvDiscoveryConverged == true and
+  .discoveryRestored == true and
+  .normalStopClosed == true and
+  .forcedStopClosed == true and
+  .finalListenerClosed == true
+' "$RECOVERY" >/dev/null
 
-grep -Fq -- "webconsole start --host 127.0.0.1 --port 4200" "$TMP/commands"
-test "$(grep -Fc -- "webconsole start --host 127.0.0.1 --port 4200" "$TMP/commands")" -ge 4
+OCCUPIED="$TMP/evidence/fixture/$(jq -r '.artifacts.occupiedPort.path' "$RESULT")"
+jq -e '
+  .errorCode == "WEBCONSOLE_PORT_OCCUPIED" and
+  .errorData == {host:"127.0.0.1", port:.port} and
+  (.message | test("occupied"; "i")) and
+  .foreignPidBefore == .foreignPidAfter and
+  .foreignExecutableBefore == .foreignExecutableAfter and
+  .foreignListenerPreserved == true and
+  .webconsolePidsBefore == [] and
+  .webconsolePidsAfter == [] and
+  .elapsedSeconds < 10
+' "$OCCUPIED" >/dev/null
+
+test "$(sha256sum "$TMP/home/gateway.json" | cut -d' ' -f1)" = "$GATEWAY_SHA_BEFORE"
+test "$(stat -c %i "$TMP/home/gateway.json")" = "$GATEWAY_INODE_BEFORE"
+kill -0 "$GATEWAY_PID"
+test ! -e "$TMP/home/webconsole.json"
+
+"$SCRIPT_DIR/nexus-v015-webconsole-evidence-verify" \
+  "$TMP/evidence/fixture" >/dev/null
+COMMAND_OUTPUT="$TMP/evidence/fixture/results/D2-webconsole-cli/start-first.stdout"
+cp "$COMMAND_OUTPUT" "$TMP/start-first.stdout.before-mutation"
+chmod 0600 "$COMMAND_OUTPUT"
+printf 'post-pass mutation\n' >>"$COMMAND_OUTPUT"
+set +e
+"$SCRIPT_DIR/nexus-v015-webconsole-evidence-verify" \
+  "$TMP/evidence/fixture" >"$TMP/post-pass.stdout" 2>"$TMP/post-pass.stderr"
+post_pass_status=$?
+set -e
+test "$post_pass_status" -ne 0
+grep -Fq 'command output changed after PASS' "$TMP/post-pass.stderr"
+cp "$TMP/start-first.stdout.before-mutation" "$COMMAND_OUTPUT"
+
+# The verifier owns an exact no-follow inventory. An extra regular file or
+# symlink must invalidate the PASS evidence even if no artifact record points
+# at it.
+EVIDENCE_OUT="$TMP/evidence/fixture/results/D2-webconsole-cli"
+printf 'unlisted\n' >"$EVIDENCE_OUT/unlisted.txt"
+set +e
+"$SCRIPT_DIR/nexus-v015-webconsole-evidence-verify" \
+  "$TMP/evidence/fixture" >"$TMP/extra-evidence.stdout" 2>"$TMP/extra-evidence.stderr"
+extra_evidence_status=$?
+set -e
+test "$extra_evidence_status" -ne 0
+grep -Fq 'unexpected evidence path' "$TMP/extra-evidence.stderr"
+rm "$EVIDENCE_OUT/unlisted.txt"
+ln -s start-first.stdout "$EVIDENCE_OUT/unlisted-link"
+set +e
+"$SCRIPT_DIR/nexus-v015-webconsole-evidence-verify" \
+  "$TMP/evidence/fixture" >"$TMP/symlink-evidence.stdout" 2>"$TMP/symlink-evidence.stderr"
+symlink_evidence_status=$?
+set -e
+test "$symlink_evidence_status" -ne 0
+grep -Fq 'symlink' "$TMP/symlink-evidence.stderr"
+rm "$EVIDENCE_OUT/unlisted-link"
+
+# The detached candidate-bound result seal is the trust root for the otherwise
+# self-consistent D2 directory. Result symlinks and hardlinks are rejected.
+cp "$RESULT" "$TMP/result.before-link-attacks"
+chmod 0600 "$RESULT"
+rm "$RESULT"
+ln -s "$TMP/result.before-link-attacks" "$RESULT"
+set +e
+"$TARGET" --verify-result-seal "$TMP/evidence/fixture" \
+  >"$TMP/result-symlink.stdout" 2>"$TMP/result-symlink.stderr"
+result_symlink_status=$?
+set -e
+test "$result_symlink_status" -ne 0
+grep -Fq 'D2 result' "$TMP/result-symlink.stderr"
+rm "$RESULT"
+cp "$TMP/result.before-link-attacks" "$RESULT"
+chmod 0400 "$RESULT"
+ln "$RESULT" "$TMP/result.hardlink"
+set +e
+"$TARGET" --verify-result-seal "$TMP/evidence/fixture" \
+  >"$TMP/result-hardlink.stdout" 2>"$TMP/result-hardlink.stderr"
+result_hardlink_status=$?
+set -e
+test "$result_hardlink_status" -ne 0
+grep -Fq 'single regular file' "$TMP/result-hardlink.stderr"
+rm "$TMP/result.hardlink"
+
+# Rewriting an output, its transcript record, the exact inventory, and the
+# result document remains internally consistent. The external result seal must
+# still reject that coordinated rewrite.
+cp -a "$EVIDENCE_OUT" "$TMP/evidence-out.before-coordinated-rewrite"
+python3 - "$TMP/evidence/fixture" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+result_path = root / "results/D2-webconsole-cli/result.json"
+result = json.loads(result_path.read_text(encoding="utf-8"))
+transcript_path = root / result["artifacts"]["cliTranscript"]["path"]
+output_path = root / "results/D2-webconsole-cli/start-first.stdout"
+for path in (result_path, transcript_path, output_path):
+    path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+output_path.write_bytes(output_path.read_bytes() + b"coordinated rewrite\n")
+rows = [json.loads(line) for line in transcript_path.read_text(encoding="utf-8").splitlines()]
+output_relative = output_path.relative_to(root).as_posix()
+for row in rows:
+    if row.get("stdout") == output_relative:
+        raw = output_path.read_bytes()
+        row["stdoutSha256"] = hashlib.sha256(raw).hexdigest()
+        row["stdoutSize"] = len(raw)
+        break
+else:
+    raise SystemExit("start-first output is absent from the transcript")
+transcript_raw = b"".join(
+    json.dumps(row, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+    for row in rows
+)
+transcript_path.write_bytes(transcript_raw)
+result["artifacts"]["cliTranscript"]["sha256"] = hashlib.sha256(transcript_raw).hexdigest()
+for record in result["evidenceInventory"]:
+    path = root / record["path"]
+    raw = path.read_bytes()
+    record["sha256"] = hashlib.sha256(raw).hexdigest()
+    record["size"] = len(raw)
+result_path.write_text(
+    json.dumps(result, separators=(",", ":"), sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+for path in (result_path, transcript_path, output_path):
+    path.chmod(stat.S_IRUSR)
+PY
+"$SCRIPT_DIR/nexus-v015-webconsole-evidence-verify" \
+  "$TMP/evidence/fixture" >/dev/null
+set +e
+"$TARGET" --verify-result-seal "$TMP/evidence/fixture" \
+  >"$TMP/coordinated-rewrite.stdout" 2>"$TMP/coordinated-rewrite.stderr"
+coordinated_rewrite_status=$?
+set -e
+test "$coordinated_rewrite_status" -ne 0
+grep -Fq 'result hash mismatch' "$TMP/coordinated-rewrite.stderr"
+rm -rf "$EVIDENCE_OUT"
+cp -a "$TMP/evidence-out.before-coordinated-rewrite" "$EVIDENCE_OUT"
+RESULT="$EVIDENCE_OUT/result.json"
+"$TARGET" --verify-result-seal "$TMP/evidence/fixture" >/dev/null
+
+PRIMARY_PORT=$(jq -r '.primaryPort' "$RESULT")
+OCCUPIED_PORT=$(jq -r '.occupiedPort' "$RESULT")
+python3 - "$PRIMARY_PORT" "$OCCUPIED_PORT" <<'PY'
+import socket
+import sys
+for raw in sys.argv[1:]:
+    with socket.socket() as sock:
+        sock.settimeout(0.2)
+        assert sock.connect_ex(("127.0.0.1", int(raw))) != 0, f"listener remains on {raw}"
+PY
+
+grep -Fq -- "webconsole status" "$TMP/commands"
 grep -Fq -- "--json webconsole status" "$TMP/commands"
-grep -Fq -- "webconsole launch --no-open --host 127.0.0.1 --port 4200" "$TMP/commands"
-grep -Fq -- "webconsole logs --lines 5" "$TMP/commands"
+grep -Fq -- "webconsole launch --no-open --host 127.0.0.1 --port $PRIMARY_PORT" "$TMP/commands"
 grep -Fq -- "webconsole logs --follow --lines 1" "$TMP/commands"
-grep -Fq -- "webconsole restart --host 127.0.0.1 --port 4200" "$TMP/commands"
-grep -Fq -- "webconsole stop" "$TMP/commands"
+grep -Fq -- "webconsole restart --host 127.0.0.1 --port $PRIMARY_PORT" "$TMP/commands"
+test "$(grep -Fc -- "webconsole stop" "$TMP/commands")" -ge 4
 grep -Fq -- "webconsole stop --force" "$TMP/commands"
+
+prepare_run_fixture() {
+  run_id=$1
+  run_root="$TMP/evidence/$run_id"
+  run_readiness="$READINESS"
+  mkdir -p "$run_root"
+  cp -R "$TMP/evidence/fixture/artifacts" "$run_root/artifacts"
+  rm -f "$run_readiness"
+  cp "$READINESS_TEMPLATE" "$run_readiness"
+  chmod 0644 "$run_readiness"
+  sed -i "s/^runId=fixture$/runId=$run_id/" "$run_readiness"
+  chmod 0444 "$run_readiness"
+  export NEXUS_V015_RUN_ID=$run_id
+  python3 - \
+    "$TMP/evidence/fixture/manifest.json" \
+    "$run_root/manifest.json" \
+    "$run_id" \
+    "$run_readiness" <<'PY'
+import hashlib
+import json
+import sys
+
+source, destination, run_id, readiness = sys.argv[1:]
+manifest = json.load(open(source, encoding="utf-8"))
+manifest["runId"] = run_id
+manifest["environment"]["NEXUS_V015_RUN_ID"] = run_id
+manifest["environment"]["NEXUS_V015_READINESS_LEDGER"] = readiness
+manifest["environment"]["NEXUS_V015_READINESS_LEDGER_SHA256"] = hashlib.sha256(
+    open(readiness, "rb").read()
+).hexdigest()
+open(destination, "w", encoding="utf-8").write(json.dumps(manifest))
+PY
+}
+
+invoke_fixture_gate() {
+  local run_id=$1
+  shift
+  invoke_fixture_gate_host "$run_id" 127.0.0.1 "$@"
+}
+
+invoke_fixture_gate_host() {
+  local run_id=$1 host=$2
+  shift 2
+  env \
+    PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+    OCULAR_LAB=1 \
+    NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+    NEXUS_HOME="$TMP/home" \
+    NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+    NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+    FIXTURE_COMMANDS="$TMP/commands" \
+    FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+    FIXTURE_PID="$TMP/webconsole.pid" \
+    FIXTURE_REPLACEMENT_PID="$TMP/replacement.pid" \
+    "$@" \
+    "$TARGET" \
+      --nexus-bin "$PREFIX/bin/nexus" \
+      --packed-prefix "$PREFIX" \
+      --host "$host" \
+      --port 0 \
+      --run-id "$run_id" \
+      --evidence-dir "$TMP/evidence"
+}
+
+assert_fixture_webconsole_cleaned() {
+  local pid port deadline
+  pid=$(cat "$TMP/webconsole.pid")
+  port=$(cat "$TMP/webconsole.pid.port")
+  deadline=$((SECONDS + 5))
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ -r "/proc/$pid/stat" ] \
+      && [ "$(sed 's/^.*) //' "/proc/$pid/stat" | cut -d' ' -f1)" = Z ]; then
+      break
+    fi
+    [ "$SECONDS" -lt "$deadline" ] || {
+      echo "fixture Webconsole process $pid survived failed-gate cleanup" >&2
+      tr '\0' ' ' <"/proc/$pid/cmdline" >&2 || true
+      echo >&2
+      cat "/proc/$pid/stat" >&2 || true
+      return 1
+    }
+    sleep 0.05
+  done
+  python3 - "$port" <<'PY'
+import socket
+import sys
+
+with socket.socket() as sock:
+    sock.settimeout(0.2)
+    if sock.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0:
+        raise SystemExit("fixture Webconsole listener survived failed-gate cleanup")
+PY
+  test ! -e "$TMP/home/webconsole.json"
+}
+
+stop_fixture_gateways() {
+  if [ -n "$GATEWAY_AUX_PID" ]; then
+    kill "$GATEWAY_AUX_PID" 2>/dev/null || true
+    wait "$GATEWAY_AUX_PID" 2>/dev/null || true
+    GATEWAY_AUX_PID=""
+  fi
+  if [ -n "$GATEWAY_PID" ]; then
+    kill "$GATEWAY_PID" 2>/dev/null || true
+    wait "$GATEWAY_PID" 2>/dev/null || true
+    GATEWAY_PID=""
+  fi
+}
+
+allocate_gateway_port() {
+  python3 - "${1:-127.0.0.1}" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+family = socket.AF_INET6 if ":" in host else socket.AF_INET
+with socket.socket(family) as sock:
+    if family == socket.AF_INET6:
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    sock.bind((host, 0))
+    print(sock.getsockname()[1])
+PY
+}
+
+gateway_url() {
+  local host=$1 port=$2
+  if [[ "$host" == *:* ]]; then
+    printf 'http://[%s]:%s' "$host" "$port"
+  else
+    printf 'http://%s:%s' "$host" "$port"
+  fi
+}
+
+start_gateway_variant() {
+  local runtime_identity=$1 bind_host=${2:-127.0.0.1} advertised_host=${3:-127.0.0.1}
+  local expected_host_header=${4:-} advertised_url
+  local -a gateway_args
+  stop_fixture_gateways
+  GATEWAY_PORT=$(allocate_gateway_port "$bind_host")
+  advertised_url=$(gateway_url "$advertised_host" "$GATEWAY_PORT")
+  if [ "$expected_host_header" = auto ]; then
+    if [[ "$advertised_host" == *:* ]]; then
+      expected_host_header="[$advertised_host]:$GATEWAY_PORT"
+    else
+      expected_host_header="$advertised_host:$GATEWAY_PORT"
+    fi
+  fi
+  gateway_args=(
+    --fixture-runtime
+    --port "$GATEWAY_PORT"
+    --module "$GATEWAY_PACKAGE/dist-gateway/headless.mjs"
+    --install-root "$PREFIX"
+    --bind-host "$bind_host"
+    --runtime-identity "$runtime_identity"
+  )
+  if [ -n "$expected_host_header" ]; then
+    gateway_args+=(--expected-host-header "$expected_host_header")
+  fi
+  "$PREFIX/bin/nexus-gateway" "${gateway_args[@]}" &
+  GATEWAY_PID=$!
+  printf '{"pid":%s,"url":"%s"}\n' \
+    "$GATEWAY_PID" "$advertised_url" >"$TMP/home/gateway.json"
+  deadline=$((SECONDS + 5))
+  until curl --noproxy '*' -g -fsS --max-time 1 \
+    "$advertised_url/api/v1/health" >/dev/null 2>&1; do
+    [ "$SECONDS" -lt "$deadline" ] || {
+      echo "fixture Gateway variant did not become healthy" >&2
+      return 1
+    }
+    sleep 0.05
+  done
+}
+
+run_gateway_baseline_negative() {
+  local run_id=$1 expected_error=$2 host_mode=${3:-}
+  prepare_run_fixture "$run_id"
+  set +e
+  PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+    OCULAR_LAB=1 \
+    NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+    NEXUS_HOME="$TMP/home" \
+    NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+    NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+    FIXTURE_COMMANDS="$TMP/commands" \
+    FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+    FIXTURE_PID="$TMP/webconsole.pid" \
+    NEXUS_V015_FIXTURE_GATEWAY_HOST_MODE="$host_mode" \
+    "$TARGET" \
+      --nexus-bin "$PREFIX/bin/nexus" \
+      --packed-prefix "$PREFIX" \
+      --host 127.0.0.1 \
+      --port 0 \
+      --run-id "$run_id" \
+      --evidence-dir "$TMP/evidence" \
+      >"$TMP/$run_id.stdout" 2>"$TMP/$run_id.stderr"
+  status=$?
+  set -e
+  test "$status" -ne 0
+  grep -Fq "$expected_error" "$TMP/$run_id.stderr"
+  test ! -e "$TMP/evidence/$run_id/results/D2-webconsole-cli.result.sha256"
+}
+
+run_dependency_closure_negative() {
+  run_id=$1
+  prepare_run_fixture "$run_id"
+  command_count_before_closure=$(wc -l <"$TMP/commands")
+  set +e
+  PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+    OCULAR_LAB=1 \
+    NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+    NEXUS_HOME="$TMP/home" \
+    NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+    NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+    FIXTURE_COMMANDS="$TMP/commands" \
+    FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+    FIXTURE_PID="$TMP/webconsole.pid" \
+    "$TARGET" \
+      --nexus-bin "$PREFIX/bin/nexus" \
+      --packed-prefix "$PREFIX" \
+      --host 127.0.0.1 \
+      --port 0 \
+      --run-id "$run_id" \
+      --evidence-dir "$TMP/evidence" \
+      >"$TMP/$run_id.stdout" 2>"$TMP/$run_id.stderr"
+  closure_status=$?
+  set -e
+  test "$closure_status" -ne 0
+  grep -Fq 'packed install dependency closure differs from the candidate readiness ledger' \
+    "$TMP/$run_id.stderr"
+  test "$(wc -l <"$TMP/commands")" -eq "$command_count_before_closure"
+  test ! -e "$TMP/evidence/$run_id/results/D2-webconsole-cli.result.sha256"
+}
+
+run_readiness_contract_negative() {
+  run_id=$1
+  expected_error=$2
+  prepare_run_fixture "$run_id"
+  command_count_before_readiness=$(wc -l <"$TMP/commands")
+  set +e
+  PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+    OCULAR_LAB=1 \
+    NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+    NEXUS_HOME="$TMP/home" \
+    NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+    NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+    FIXTURE_COMMANDS="$TMP/commands" \
+    FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+    FIXTURE_PID="$TMP/webconsole.pid" \
+    "$TARGET" \
+      --nexus-bin "$PREFIX/bin/nexus" \
+      --packed-prefix "$PREFIX" \
+      --host 127.0.0.1 \
+      --port 0 \
+      --run-id "$run_id" \
+      --evidence-dir "$TMP/evidence" \
+      >"$TMP/$run_id.stdout" 2>"$TMP/$run_id.stderr"
+  readiness_contract_status=$?
+  set -e
+  test "$readiness_contract_status" -ne 0
+  grep -Fq "$expected_error" "$TMP/$run_id.stderr"
+  test "$(wc -l <"$TMP/commands")" -eq "$command_count_before_readiness"
+  test ! -e "$TMP/evidence/$run_id/results/D2-webconsole-cli.result.sha256"
+}
+
+# The full readiness file is manifest-hash-bound, while D2 validates a strict
+# required subset and permits additional canonical gate fields to coexist.
+cp "$READINESS_TEMPLATE" "$TMP/readiness.template.complete"
+chmod 0644 "$READINESS_TEMPLATE"
+sed -i '/^installTreeSha256=/d' "$READINESS_TEMPLATE"
+chmod 0444 "$READINESS_TEMPLATE"
+run_readiness_contract_negative \
+  readiness-required-missing \
+  'candidate readiness ledger is missing required D2 fields'
+rm -f "$READINESS_TEMPLATE"
+cp "$TMP/readiness.template.complete" "$READINESS_TEMPLATE"
+
+chmod 0644 "$READINESS_TEMPLATE"
+sed -i 's/^gatewaySha256=.*/gatewaySha256=0000000000000000000000000000000000000000000000000000000000000000/' \
+  "$READINESS_TEMPLATE"
+chmod 0444 "$READINESS_TEMPLATE"
+run_readiness_contract_negative \
+  readiness-required-mutated \
+  'candidate readiness ledger does not match container/run/install bindings'
+rm -f "$READINESS_TEMPLATE"
+cp "$TMP/readiness.template.complete" "$READINESS_TEMPLATE"
+
+run_resource_authority_negative() {
+  run_id=$1
+  resource_file=$2
+  invalid_value=$3
+  cp "$TMP/cgroup/$resource_file" "$TMP/$run_id.resource.before"
+  printf '%s\n' "$invalid_value" >"$TMP/cgroup/$resource_file"
+  prepare_run_fixture "$run_id"
+  command_count_before_resource=$(wc -l <"$TMP/commands")
+  set +e
+  PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+    OCULAR_LAB=1 \
+    NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+    NEXUS_HOME="$TMP/home" \
+    NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+    NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+    FIXTURE_COMMANDS="$TMP/commands" \
+    FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+    FIXTURE_PID="$TMP/webconsole.pid" \
+    "$TARGET" \
+      --nexus-bin "$PREFIX/bin/nexus" \
+      --packed-prefix "$PREFIX" \
+      --host 127.0.0.1 \
+      --port 0 \
+      --run-id "$run_id" \
+      --evidence-dir "$TMP/evidence" \
+      >"$TMP/$run_id.stdout" 2>"$TMP/$run_id.stderr"
+  resource_status=$?
+  set -e
+  test "$resource_status" -ne 0
+  grep -Fq 'live cgroup authority does not match the 6 CPU / 8 GiB / 1024 PID contract' \
+    "$TMP/$run_id.stderr"
+  test "$(wc -l <"$TMP/commands")" -eq "$command_count_before_resource"
+  test ! -e "$TMP/evidence/$run_id/results/D2-webconsole-cli.result.sha256"
+  cp "$TMP/$run_id.resource.before" "$TMP/cgroup/$resource_file"
+}
+
+run_resource_authority_negative resource-cpu cpu.max 'max 100000'
+run_resource_authority_negative resource-memory memory.max '8589934591'
+run_resource_authority_negative resource-swap memory.swap.max '1'
+run_resource_authority_negative resource-pids pids.max '1023'
+
+# A canonical seal is write-once evidence owned by the invocation that created
+# it. An earlier run's seal must survive a refused rerun byte-for-byte and with
+# the same inode/mode; the failure trap may never unlink it.
+prepare_run_fixture preexisting-seal
+PREEXISTING_SEAL_ROOT="$TMP/evidence/preexisting-seal"
+PREEXISTING_SEAL="$PREEXISTING_SEAL_ROOT/results/D2-webconsole-cli.result.sha256"
+mkdir -p "$(dirname "$PREEXISTING_SEAL")"
+printf '%s\n' 'pre-existing seal owned by another invocation' >"$PREEXISTING_SEAL"
+chmod 0400 "$PREEXISTING_SEAL"
+PREEXISTING_SEAL_SHA=$(sha256sum "$PREEXISTING_SEAL" | cut -d' ' -f1)
+PREEXISTING_SEAL_INODE=$(stat -c %i "$PREEXISTING_SEAL")
+PREEXISTING_SEAL_MODE=$(stat -c %a "$PREEXISTING_SEAL")
+set +e
+invoke_fixture_gate preexisting-seal \
+  >"$TMP/preexisting-seal.stdout" 2>"$TMP/preexisting-seal.stderr"
+preexisting_seal_status=$?
+set -e
+test "$preexisting_seal_status" -ne 0
+grep -Fq 'D2 result seal already exists' "$TMP/preexisting-seal.stderr"
+test "$(sha256sum "$PREEXISTING_SEAL" | cut -d' ' -f1)" = "$PREEXISTING_SEAL_SHA"
+test "$(stat -c %i "$PREEXISTING_SEAL")" = "$PREEXISTING_SEAL_INODE"
+test "$(stat -c %a "$PREEXISTING_SEAL")" = "$PREEXISTING_SEAL_MODE"
+
+# Seal publication is the final commit point. If the canonical-directory fsync
+# fails, no canonical seal may remain and the standalone verifier must reject.
+prepare_run_fixture seal-parent-fsync-failure
+SEAL_FSYNC_ROOT="$TMP/evidence/seal-parent-fsync-failure"
+set +e
+invoke_fixture_gate seal-parent-fsync-failure \
+  NEXUS_V015_FIXTURE_FAIL_SEAL_PARENT_FSYNC=1 \
+  >"$TMP/seal-parent-fsync-failure.stdout" 2>"$TMP/seal-parent-fsync-failure.stderr"
+seal_parent_fsync_status=$?
+set -e
+test "$seal_parent_fsync_status" -ne 0
+grep -Fq 'fixture forced D2 result seal parent fsync failure' \
+  "$TMP/seal-parent-fsync-failure.stderr"
+test ! -e "$SEAL_FSYNC_ROOT/results/D2-webconsole-cli.result.sha256"
+set +e
+"$TARGET" --verify-result-seal "$SEAL_FSYNC_ROOT" \
+  >"$TMP/seal-parent-fsync-verify.stdout" 2>"$TMP/seal-parent-fsync-verify.stderr"
+seal_parent_fsync_verify_status=$?
+set -e
+test "$seal_parent_fsync_verify_status" -ne 0
+
+# The detached PASS seal may not commit until the final result file itself is
+# durable and still matches the inode, bytes, and mode used to build the seal.
+prepare_run_fixture result-fsync-failure
+RESULT_FSYNC_ROOT="$TMP/evidence/result-fsync-failure"
+set +e
+invoke_fixture_gate result-fsync-failure \
+  NEXUS_V015_FIXTURE_FAIL_RESULT_FSYNC=1 \
+  >"$TMP/result-fsync-failure.stdout" 2>"$TMP/result-fsync-failure.stderr"
+result_fsync_status=$?
+set -e
+test "$result_fsync_status" -ne 0
+grep -Fq 'fixture forced D2 result fsync failure' \
+  "$TMP/result-fsync-failure.stderr"
+test ! -e "$RESULT_FSYNC_ROOT/results/D2-webconsole-cli.result.sha256"
+set +e
+"$TARGET" --verify-result-seal "$RESULT_FSYNC_ROOT" \
+  >"$TMP/result-fsync-verify.stdout" 2>"$TMP/result-fsync-verify.stderr"
+result_fsync_verify_status=$?
+set -e
+test "$result_fsync_verify_status" -ne 0
+
+# The canonical link plus its parent-directory fsync is the final commit. A
+# process death immediately afterward must leave a complete verifier-valid
+# result, never a premature or cleanup-dependent PASS.
+prepare_run_fixture seal-post-fsync-kill
+SEAL_POST_FSYNC_ROOT="$TMP/evidence/seal-post-fsync-kill"
+mkdir -p "$TMP/seal-post-fsync-kill-tmp"
+set +e
+invoke_fixture_gate seal-post-fsync-kill \
+  TMPDIR="$TMP/seal-post-fsync-kill-tmp" \
+  NEXUS_V015_FIXTURE_KILL_PARENT_AFTER_SEAL_COMMIT=1 \
+  >"$TMP/seal-post-fsync-kill.stdout" 2>"$TMP/seal-post-fsync-kill.stderr"
+seal_post_fsync_status=$?
+set -e
+test "$seal_post_fsync_status" -ne 0
+test -f "$SEAL_POST_FSYNC_ROOT/results/D2-webconsole-cli.result.sha256"
+test "$(stat -c %a "$SEAL_POST_FSYNC_ROOT/results/D2-webconsole-cli.result.sha256")" = 400
+"$TARGET" --verify-result-seal "$SEAL_POST_FSYNC_ROOT" \
+  >"$TMP/seal-post-fsync-verify.stdout" 2>"$TMP/seal-post-fsync-verify.stderr"
+
+# Publication rollback must never unlink a replacement swapped into the
+# canonical name. The replacement survives byte-for-byte at that name.
+run_id=seal-publish-swap
+prepare_run_fixture "$run_id"
+swap_root="$TMP/evidence/$run_id"
+swap_path="$swap_root/results/D2-webconsole-cli.result.sha256"
+replacement="$TMP/$run_id.replacement"
+printf 'replacement-publish\n' >"$replacement"
+replacement_sha=$(sha256sum "$replacement" | cut -d' ' -f1)
+set +e
+invoke_fixture_gate "$run_id" \
+  NEXUS_V015_FIXTURE_FAIL_SEAL_PARENT_FSYNC=1 \
+  NEXUS_V015_FIXTURE_SWAP_SEAL_BEFORE_PUBLISH_ROLLBACK="$replacement" \
+  >"$TMP/$run_id.stdout" 2>"$TMP/$run_id.stderr"
+swap_status=$?
+set -e
+test "$swap_status" -ne 0
+test -f "$swap_path"
+test "$(sha256sum "$swap_path" | cut -d' ' -f1)" = "$replacement_sha"
+
+# Replacement restoration is its own commit boundary.  A one-shot parent
+# fsync failure must converge through the recovery path, and a SIGKILL after
+# the successful restore fsync must still leave the replacement durable at the
+# canonical name rather than resurrecting the invocation-owned PASS seal.
+for restore_fault in fsync kill-after-fsync; do
+  run_id="seal-restore-$restore_fault"
+  prepare_run_fixture "$run_id"
+  replacement="$TMP/$run_id.replacement"
+  printf 'replacement-restore-%s\n' "$restore_fault" >"$replacement"
+  replacement_sha=$(sha256sum "$replacement" | cut -d' ' -f1)
+  case "$restore_fault" in
+    fsync) restore_hook=NEXUS_V015_FIXTURE_FAIL_SEAL_RESTORE_PARENT_FSYNC ;;
+    kill-after-fsync) restore_hook=NEXUS_V015_FIXTURE_KILL_AFTER_SEAL_RESTORE_FSYNC ;;
+  esac
+  set +e
+  invoke_fixture_gate "$run_id" \
+    NEXUS_V015_FIXTURE_FAIL_SEAL_PARENT_FSYNC=1 \
+    NEXUS_V015_FIXTURE_SWAP_SEAL_BEFORE_PUBLISH_ROLLBACK="$replacement" \
+    "$restore_hook=1" \
+    >"$TMP/$run_id.stdout" 2>"$TMP/$run_id.stderr"
+  restore_status=$?
+  set -e
+  test "$restore_status" -ne 0
+  restored_path="$TMP/evidence/$run_id/results/D2-webconsole-cli.result.sha256"
+  test -f "$restored_path"
+  test "$(sha256sum "$restored_path" | cut -d' ' -f1)" = "$replacement_sha"
+done
+
+# A version containing 0.1.5 is not sufficient. The executed candidate native
+# must emit the one exact canonical line and nothing else.
+for version_case in near suffix multiline; do
+  case "$version_case" in
+    near) version_output='nexus 0.1.50' ;;
+    suffix) version_output='nexus 0.1.5 extra' ;;
+    multiline) version_output=$'noise\nnexus 0.1.5' ;;
+  esac
+  run_id="version-$version_case"
+  prepare_run_fixture "$run_id"
+  set +e
+  PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+    OCULAR_LAB=1 \
+    NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+    NEXUS_HOME="$TMP/home" \
+    NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+    NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+    FIXTURE_VERSION_OUTPUT="$version_output" \
+    FIXTURE_COMMANDS="$TMP/commands" \
+    FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+    FIXTURE_PID="$TMP/webconsole.pid" \
+    "$TARGET" \
+      --nexus-bin "$PREFIX/bin/nexus" \
+      --packed-prefix "$PREFIX" \
+      --host 127.0.0.1 \
+      --port 0 \
+      --run-id "$run_id" \
+      --evidence-dir "$TMP/evidence" \
+      >"$TMP/$run_id.stdout" 2>"$TMP/$run_id.stderr"
+  version_status=$?
+  set -e
+  test "$version_status" -ne 0
+  grep -Fq 'packed Nexus CLI version must be exactly nexus 0.1.5' "$TMP/$run_id.stderr"
+  test ! -e "$TMP/evidence/$run_id/results/D2-webconsole-cli.result.sha256"
+done
+
+# PASS cannot be externally attestable until the final readiness and live
+# Gateway checks succeed. A failure after result publication must leave no
+# detached seal that the standalone verifier could accept.
+prepare_run_fixture final-check-failure
+FINAL_FAILURE_ROOT="$TMP/evidence/final-check-failure"
+set +e
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_HOME="$TMP/home" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_FAIL_GATEWAY_STATUS_WHEN_RESULT_EXISTS="$FINAL_FAILURE_ROOT/results/D2-webconsole-cli/result.json" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
+  "$TARGET" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --run-id final-check-failure \
+    --evidence-dir "$TMP/evidence" \
+    >"$TMP/final-check-failure.stdout" 2>"$TMP/final-check-failure.stderr"
+final_check_status=$?
+set -e
+test "$final_check_status" -ne 0
+grep -Fq 'Gateway must be live before and throughout D2' "$TMP/final-check-failure.stderr"
+test -f "$FINAL_FAILURE_ROOT/results/D2-webconsole-cli/result.json"
+test ! -e "$FINAL_FAILURE_ROOT/results/D2-webconsole-cli.result.sha256"
+set +e
+"$TARGET" --verify-result-seal "$FINAL_FAILURE_ROOT" \
+  >"$TMP/final-check-verify.stdout" 2>"$TMP/final-check-verify.stderr"
+final_verify_status=$?
+set -e
+test "$final_verify_status" -ne 0
+
+# Every fallible seal verification completes against the staged file before
+# canonical publication. A forced verification failure therefore leaves no
+# detached PASS seal for an external consumer.
+prepare_run_fixture post-seal-self-verification
+POST_SEAL_ROOT="$TMP/evidence/post-seal-self-verification"
+set +e
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_V015_FIXTURE_FAIL_POST_PUBLISH_VERIFY=1 \
+  NEXUS_HOME="$TMP/home" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
+  "$TARGET" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --run-id post-seal-self-verification \
+    --evidence-dir "$TMP/evidence" \
+    >"$TMP/post-seal-self-verification.stdout" \
+    2>"$TMP/post-seal-self-verification.stderr"
+post_seal_status=$?
+set -e
+test "$post_seal_status" -ne 0
+grep -Fq 'fixture forced D2 post-publication verification failure' \
+  "$TMP/post-seal-self-verification.stderr"
+test -f "$POST_SEAL_ROOT/results/D2-webconsole-cli/result.json"
+test ! -e "$POST_SEAL_ROOT/results/D2-webconsole-cli.result.sha256"
+set +e
+"$TARGET" --verify-result-seal "$POST_SEAL_ROOT" \
+  >"$TMP/post-seal-verify.stdout" 2>"$TMP/post-seal-verify.stderr"
+post_seal_verify_status=$?
+set -e
+test "$post_seal_verify_status" -ne 0
+assert_fixture_webconsole_cleaned
+
+# A process may mention both the candidate entrypoint and discovery path as
+# inert arguments. Only the supported interpreter + exact argv[1] launcher
+# shape is a Webconsole process; the inert process must neither block D2 nor be
+# killed by its cleanup path.
+prepare_run_fixture inert-webui-argv
+python3 -c 'import time; time.sleep(300)' \
+  "$PREFIX/bin/nexus-webui" \
+  --discovery "$TMP/home/webconsole.json" &
+INERT_WEBUI_PID=$!
+invoke_fixture_gate inert-webui-argv \
+  >"$TMP/inert-webui-argv.stdout" 2>"$TMP/inert-webui-argv.stderr"
+test -f "$TMP/evidence/inert-webui-argv/results/D2-webconsole-cli.result.sha256"
+kill -0 "$INERT_WEBUI_PID"
+kill -KILL "$INERT_WEBUI_PID"
+wait "$INERT_WEBUI_PID" 2>/dev/null || true
+INERT_WEBUI_PID=""
+
+# Before/after PID snapshots miss a short-lived WebUI exec. The occupied-port
+# gate must instrument the candidate entrypoint and fail if it was invoked at
+# all, even when the child exits before the next /proc scan.
+prepare_run_fixture occupied-transient-spawn
+set +e
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_HOME="$TMP/home" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_SPAWN_TRANSIENT_ON_OCCUPIED=1 \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
+  "$TARGET" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --run-id occupied-transient-spawn \
+    --evidence-dir "$TMP/evidence" \
+    >"$TMP/occupied-transient-spawn.stdout" 2>"$TMP/occupied-transient-spawn.stderr"
+occupied_transient_status=$?
+set -e
+test "$occupied_transient_status" -ne 0
+grep -Fq 'occupied-port refusal invoked the packed WebUI executable' \
+  "$TMP/occupied-transient-spawn.stderr"
+test ! -e "$TMP/evidence/occupied-transient-spawn/results/D2-webconsole-cli.result.sha256"
+
+# A clean prefix has only @egregore/nexus at the global top level. Installing
+# either implementation facet beside it must be rejected before lifecycle work.
+prepare_run_fixture topology
+mkdir -p "$PREFIX/lib/node_modules/@egregore/nexus-cli"
+printf '{"name":"@egregore/nexus-cli","version":"0.1.5"}\n' \
+  >"$PREFIX/lib/node_modules/@egregore/nexus-cli/package.json"
+set +e
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_HOME="$TMP/home" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
+  "$TARGET" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --run-id topology \
+    --evidence-dir "$TMP/evidence" \
+    >"$TMP/topology.stdout" 2>"$TMP/topology.stderr"
+topology_status=$?
+set -e
+test "$topology_status" -ne 0
+grep -Fq "umbrella-only packed prefix" "$TMP/topology.stderr"
+test ! -e "$TMP/evidence/topology/results/D2-webconsole-cli"
+rm -rf "$PREFIX/lib/node_modules/@egregore/nexus-cli"
+
+# A prefix that still claims 0.1.5 but differs from the candidate tarballs is
+# not the release candidate. Reject it before any Webconsole command executes.
+prepare_run_fixture forged
+cp "$GATEWAY_PACKAGE/dist-gateway/headless.mjs" "$TMP/headless.mjs.before-forgery"
+printf '%s\n' 'export const forgedSameVersionPrefix = true;' \
+  >>"$GATEWAY_PACKAGE/dist-gateway/headless.mjs"
+COMMAND_COUNT_BEFORE_FORGERY=$(wc -l <"$TMP/commands")
+set +e
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_HOME="$TMP/home" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
+  "$TARGET" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --run-id forged \
+    --evidence-dir "$TMP/evidence" \
+    >"$TMP/forged.stdout" 2>"$TMP/forged.stderr"
+forged_status=$?
+set -e
+test "$forged_status" -ne 0
+grep -Fq "candidate manifest binding NEXUS_V015_GATEWAY_MODULE_SHA256" "$TMP/forged.stderr"
+test "$(wc -l <"$TMP/commands")" -eq "$COMMAND_COUNT_BEFORE_FORGERY"
+test ! -e "$TMP/evidence/forged/results/D2-webconsole-cli"
+cp "$TMP/headless.mjs.before-forgery" "$GATEWAY_PACKAGE/dist-gateway/headless.mjs"
+kill "$GATEWAY_PID"
+wait "$GATEWAY_PID" 2>/dev/null || true
+"$PREFIX/bin/nexus-gateway" \
+  --fixture-runtime \
+  --port "$GATEWAY_PORT" \
+  --module "$GATEWAY_PACKAGE/dist-gateway/headless.mjs" \
+  --install-root "$PREFIX" &
+GATEWAY_PID=$!
+printf '{"pid":%s,"url":"http://127.0.0.1:%s"}\n' "$GATEWAY_PID" "$GATEWAY_PORT" \
+  >"$TMP/home/gateway.json"
+deadline=$((SECONDS + 5))
+until curl -fsS --max-time 1 "http://127.0.0.1:$GATEWAY_PORT/api/v1/health" >/dev/null 2>&1; do
+  [ "$SECONDS" -lt "$deadline" ] || exit 1
+  sleep 0.05
+done
+
+# Complete package inventory is authoritative, not a handpicked file subset.
+# An extra installed runtime file absent from the tarball must fail before any
+# lifecycle command executes.
+prepare_run_fixture inventory-extra
+printf 'not in candidate tarball\n' >"$GATEWAY_PACKAGE/unlisted-runtime.mjs"
+COMMAND_COUNT_BEFORE_INVENTORY=$(wc -l <"$TMP/commands")
+set +e
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_HOME="$TMP/home" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
+  "$TARGET" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --run-id inventory-extra \
+    --evidence-dir "$TMP/evidence" \
+    >"$TMP/inventory-extra.stdout" 2>"$TMP/inventory-extra.stderr"
+inventory_extra_status=$?
+set -e
+test "$inventory_extra_status" -ne 0
+grep -Fq 'installed package inventory differs from candidate tarball' "$TMP/inventory-extra.stderr"
+test "$(wc -l <"$TMP/commands")" -eq "$COMMAND_COUNT_BEFORE_INVENTORY"
+test ! -e "$TMP/evidence/inventory-extra/results/D2-webconsole-cli"
+rm "$GATEWAY_PACKAGE/unlisted-runtime.mjs"
+
+# The tarballs bind the three candidate facets, while the readiness ledger
+# separately binds npm's complete installed dependency closure. Package-local
+# node_modules must not be an unverified blind spot.
+DEPENDENCY_ROOT="$GATEWAY_PACKAGE/node_modules/fixture-dependency"
+cp "$DEPENDENCY_ROOT/index.mjs" "$TMP/fixture-dependency.index.mjs"
+printf '%s\n' 'export const modifiedAfterReadiness = true;' >>"$DEPENDENCY_ROOT/index.mjs"
+run_dependency_closure_negative dependency-closure-changed
+cp "$TMP/fixture-dependency.index.mjs" "$DEPENDENCY_ROOT/index.mjs"
+
+cp "$DEPENDENCY_ROOT/package.json" "$TMP/fixture-dependency.package.json"
+rm "$DEPENDENCY_ROOT/package.json"
+run_dependency_closure_negative dependency-closure-missing
+cp "$TMP/fixture-dependency.package.json" "$DEPENDENCY_ROOT/package.json"
+
+printf '%s\n' 'export const unboundExtra = true;' \
+  >"$GATEWAY_PACKAGE/node_modules/unbound-extra.mjs"
+run_dependency_closure_negative dependency-closure-extra
+rm "$GATEWAY_PACKAGE/node_modules/unbound-extra.mjs"
+
+# The live readiness ledger is checked before and after every operation. A
+# same-path ledger mutation must abort immediately and cannot produce PASS.
+prepare_run_fixture readiness-mutation
+READINESS_MUTATION="$READINESS"
+chmod 0644 "$READINESS_MUTATION"
+sed -i 's/^runId=readiness-mutation$/runId=other-run/' "$READINESS_MUTATION"
+chmod 0444 "$READINESS_MUTATION"
+set +e
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_HOME="$TMP/home" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
+  "$TARGET" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --run-id readiness-mutation \
+    --evidence-dir "$TMP/evidence" \
+    >"$TMP/readiness-mutation.stdout" 2>"$TMP/readiness-mutation.stderr"
+readiness_mutation_status=$?
+set -e
+test "$readiness_mutation_status" -ne 0
+grep -Fq 'candidate readiness' "$TMP/readiness-mutation.stderr"
+test ! -f "$TMP/evidence/readiness-mutation/results/D2-webconsole-cli/result.json"
+
+# The invariant is fail-closed, not just recorded: a byte change to Gateway
+# discovery during any Webconsole command must abort D2 immediately.
+prepare_run_fixture mutation
+set +e
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_HOME="$TMP/home" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
+  FIXTURE_FAIL_FORCE_STOP=1 \
+  FIXTURE_MUTATE_GATEWAY_ON_START=1 \
+  FIXTURE_MUTATION_MARKER="$TMP/mutated" \
+  "$TARGET" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --run-id mutation \
+    --evidence-dir "$TMP/evidence" \
+    >"$TMP/mutation.stdout" 2>"$TMP/mutation.stderr"
+mutation_status=$?
+set -e
+test "$mutation_status" -ne 0
+grep -Fq "Gateway identity or discovery changed after start-first" "$TMP/mutation.stderr"
+test ! -f "$TMP/evidence/mutation/results/D2-webconsole-cli/result.json"
+assert_fixture_webconsole_cleaned
+
+# Cleanup authority includes the candidate entrypoint identity captured before
+# launch. If that path is replaced after the child starts, the failure trap
+# must preserve the now-unverifiable process/discovery instead of killing it by
+# pathname coincidence.
+prepare_run_fixture cleanup-entrypoint-replaced
+cp -p "$UMBRELLA/bin/nexus-webui.mjs" "$TMP/nexus-webui.before-cleanup-replacement"
+set +e
+invoke_fixture_gate cleanup-entrypoint-replaced \
+  FIXTURE_REPLACE_WEBUI_ENTRYPOINT_ON_START=1 \
+  FIXTURE_ENTRYPOINT_MUTATION_MARKER="$TMP/entrypoint-mutated" \
+  >"$TMP/cleanup-entrypoint-replaced.stdout" \
+  2>"$TMP/cleanup-entrypoint-replaced.stderr"
+cleanup_entrypoint_status=$?
+set -e
+test "$cleanup_entrypoint_status" -ne 0
+grep -Fq 'Webconsole cleanup owner is not uniquely discovery-selected after start-first' \
+  "$TMP/cleanup-entrypoint-replaced.stderr"
+CLEANUP_REPLACEMENT_PID=$(cat "$TMP/webconsole.pid")
+kill -0 "$CLEANUP_REPLACEMENT_PID"
+test -f "$TMP/home/webconsole.json"
+test "$(jq -r '.pid' "$TMP/home/webconsole.json")" = "$CLEANUP_REPLACEMENT_PID"
+kill -KILL "$CLEANUP_REPLACEMENT_PID"
+wait "$CLEANUP_REPLACEMENT_PID" 2>/dev/null || true
+CLEANUP_REPLACEMENT_PID=""
+rm -f "$TMP/home/webconsole.json"
+cp -p "$TMP/nexus-webui.before-cleanup-replacement" "$UMBRELLA/bin/nexus-webui.mjs"
+
+# A validated child may disappear while the packed stop command runs and be
+# replaced by an unsupported process plus new discovery. Cleanup must recheck
+# the complete tuple and preserve both replacement process and discovery.
+prepare_run_fixture cleanup-discovery-replaced
+rm -f "$TMP/mutated" "$TMP/replacement.pid"
+set +e
+invoke_fixture_gate cleanup-discovery-replaced \
+  FIXTURE_MUTATE_GATEWAY_ON_START=1 \
+  FIXTURE_MUTATION_MARKER="$TMP/mutated" \
+  FIXTURE_REPLACE_DISCOVERY_ON_FORCE_STOP=1 \
+  >"$TMP/cleanup-discovery-replaced.stdout" \
+  2>"$TMP/cleanup-discovery-replaced.stderr"
+cleanup_discovery_status=$?
+set -e
+test "$cleanup_discovery_status" -ne 0
+grep -Fq 'Gateway identity or discovery changed after start-first' \
+  "$TMP/cleanup-discovery-replaced.stderr"
+CLEANUP_REPLACEMENT_PID=$(cat "$TMP/replacement.pid")
+kill -0 "$CLEANUP_REPLACEMENT_PID"
+test "$(jq -r '.pid' "$TMP/home/webconsole.json")" = "$CLEANUP_REPLACEMENT_PID"
+kill -KILL "$CLEANUP_REPLACEMENT_PID"
+wait "$CLEANUP_REPLACEMENT_PID" 2>/dev/null || true
+CLEANUP_REPLACEMENT_PID=""
+rm -f "$TMP/home/webconsole.json"
+
+# Cleanup authority is the discovery-selected process tuple captured before a
+# later failure.  If that owner A exits and an otherwise identical owner B
+# takes the same argv/discovery/port, cleanup must not recapture and kill B.
+prepare_run_fixture cleanup-same-shape-replacement
+rm -f "$TMP/replacement.pid" "$TMP/replaced-during-gateway-status"
+set +e
+invoke_fixture_gate cleanup-same-shape-replacement \
+  FIXTURE_REPLACE_WEBCONSOLE_DURING_GATEWAY_STATUS=1 \
+  FIXTURE_REPLACE_WEBCONSOLE_MARKER="$TMP/replaced-during-gateway-status" \
+  >"$TMP/cleanup-same-shape-replacement.stdout" \
+  2>"$TMP/cleanup-same-shape-replacement.stderr"
+cleanup_same_shape_status=$?
+set -e
+test "$cleanup_same_shape_status" -ne 0
+CLEANUP_REPLACEMENT_PID=$(cat "$TMP/replacement.pid")
+kill -0 "$CLEANUP_REPLACEMENT_PID"
+test "$(jq -r '.pid' "$TMP/home/webconsole.json")" = "$CLEANUP_REPLACEMENT_PID"
+tr '\0' '\n' <"/proc/$CLEANUP_REPLACEMENT_PID/cmdline" \
+  | grep -Fx "$(readlink -f "$PREFIX/bin/nexus-webui")" >/dev/null
+kill -KILL "$CLEANUP_REPLACEMENT_PID"
+wait "$CLEANUP_REPLACEMENT_PID" 2>/dev/null || true
+CLEANUP_REPLACEMENT_PID=""
+rm -f "$TMP/home/webconsole.json"
+
+# The fallback authority is the immutable process tuple captured before the
+# validated stop.  If that PID execs a different executable, or keeps the same
+# interpreter but replaces its complete argv, cleanup must preserve it.
+for exec_mode in executable argv; do
+  run_id="cleanup-process-$exec_mode-replaced"
+  prepare_run_fixture "$run_id"
+  rm -f "$TMP/mutated"
+  set +e
+  invoke_fixture_gate "$run_id" \
+    FIXTURE_MUTATE_GATEWAY_ON_START=1 \
+    FIXTURE_MUTATION_MARKER="$TMP/mutated" \
+    FIXTURE_REEXEC_WEBUI_ON_FORCE_STOP="$exec_mode" \
+    >"$TMP/$run_id.stdout" 2>"$TMP/$run_id.stderr"
+  exec_replacement_status=$?
+  set -e
+  test "$exec_replacement_status" -ne 0
+  CLEANUP_REPLACEMENT_PID=$(cat "$TMP/webconsole.pid")
+  kill -0 "$CLEANUP_REPLACEMENT_PID"
+  if [ "$exec_mode" = executable ]; then
+    test "$(readlink -f "/proc/$CLEANUP_REPLACEMENT_PID/exe")" = "$(readlink -f /bin/sleep)"
+  else
+    test "$(readlink -f "/proc/$CLEANUP_REPLACEMENT_PID/exe")" = "$(readlink -f "$(command -v python3)")"
+    tr '\0' '\n' <"/proc/$CLEANUP_REPLACEMENT_PID/cmdline" \
+      | grep -Fx 'fixture-reexec-argv' >/dev/null
+  fi
+  kill -KILL "$CLEANUP_REPLACEMENT_PID"
+  wait "$CLEANUP_REPLACEMENT_PID" 2>/dev/null || true
+  CLEANUP_REPLACEMENT_PID=""
+  rm -f "$TMP/home/webconsole.json"
+done
+
+# A validated stop may remove discovery and then fail without terminating its
+# exact child.  The fallback must still terminate the snapshotted PID from its
+# immutable exe/argv/start tuple; discovery is not required after stop begins.
+prepare_run_fixture cleanup-stop-removed-discovery
+rm -f "$TMP/mutated"
+set +e
+invoke_fixture_gate cleanup-stop-removed-discovery \
+  FIXTURE_MUTATE_GATEWAY_ON_START=1 \
+  FIXTURE_MUTATION_MARKER="$TMP/mutated" \
+  FIXTURE_REMOVE_DISCOVERY_AND_FAIL_FORCE_STOP=1 \
+  >"$TMP/cleanup-stop-removed-discovery.stdout" \
+  2>"$TMP/cleanup-stop-removed-discovery.stderr"
+cleanup_missing_discovery_status=$?
+set -e
+test "$cleanup_missing_discovery_status" -ne 0
+assert_fixture_webconsole_cleaned
+
+# A replacement process can be created by restart before the gate records its
+# PID. The failure trap must still stop it through the validated packed CLI;
+# cleanup may not depend on ACTIVE_WEBCONSOLE_PID having been assigned.
+prepare_run_fixture restart-before-active-assignment
+set +e
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_HOME="$TMP/home" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
+  FIXTURE_MUTATE_GATEWAY_ON_RESTART=1 \
+  "$TARGET" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --run-id restart-before-active-assignment \
+    --evidence-dir "$TMP/evidence" \
+    >"$TMP/restart-before-active-assignment.stdout" \
+    2>"$TMP/restart-before-active-assignment.stderr"
+restart_before_active_status=$?
+set -e
+test "$restart_before_active_status" -ne 0
+grep -Fq "Gateway identity or discovery changed after restart" \
+  "$TMP/restart-before-active-assignment.stderr"
+test ! -f "$TMP/evidence/restart-before-active-assignment/results/D2-webconsole-cli/result.json"
+assert_fixture_webconsole_cleaned
+
+# The manifest may attest only the one current lab readiness path. A copied,
+# self-consistent ledger elsewhere is stale even when every byte matches.
+prepare_run_fixture stale-readiness
+STALE_READINESS="$TMP/stale/candidate-ready.v1"
+mkdir -p "$(dirname "$STALE_READINESS")"
+cp "$READINESS" "$STALE_READINESS"
+python3 - "$TMP/evidence/stale-readiness/manifest.json" "$STALE_READINESS" <<'PY'
+import hashlib
+import json
+import sys
+
+manifest_path, readiness_path = sys.argv[1:]
+manifest = json.load(open(manifest_path, encoding="utf-8"))
+manifest["environment"]["NEXUS_V015_READINESS_LEDGER"] = readiness_path
+manifest["environment"]["NEXUS_V015_READINESS_LEDGER_SHA256"] = hashlib.sha256(
+    open(readiness_path, "rb").read()
+).hexdigest()
+open(manifest_path, "w", encoding="utf-8").write(json.dumps(manifest))
+PY
+set +e
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_HOME="$TMP/home" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
+  "$TARGET" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --run-id stale-readiness \
+    --evidence-dir "$TMP/evidence" \
+    >"$TMP/stale-readiness.stdout" 2>"$TMP/stale-readiness.stderr"
+stale_readiness_status=$?
+set -e
+test "$stale_readiness_status" -ne 0
+grep -Fq 'current lab readiness ledger' "$TMP/stale-readiness.stderr"
+test ! -f "$TMP/evidence/stale-readiness/results/D2-webconsole-cli/result.json"
+
+# Ambient lab identity is independent authority. CLI flags and copied manifest
+# fields cannot override the current run or container.
+prepare_run_fixture current-run
+set +e
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_V015_RUN_ID=other-run \
+  NEXUS_HOME="$TMP/home" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
+  "$TARGET" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --run-id current-run \
+    --evidence-dir "$TMP/evidence" \
+    >"$TMP/current-run.stdout" 2>"$TMP/current-run.stderr"
+current_run_status=$?
+set -e
+test "$current_run_status" -ne 0
+grep -Fq 'current lab run id' "$TMP/current-run.stderr"
+test ! -f "$TMP/evidence/current-run/results/D2-webconsole-cli/result.json"
+
+prepare_run_fixture current-container
+set +e
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_V015_CURRENT_CONTAINER_ID="$(printf 'd%.0s' {1..64})" \
+  NEXUS_HOME="$TMP/home" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
+  "$TARGET" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --run-id current-container \
+    --evidence-dir "$TMP/evidence" \
+    >"$TMP/current-container.stdout" 2>"$TMP/current-container.stderr"
+current_container_status=$?
+set -e
+test "$current_container_status" -ne 0
+grep -Fq 'current container identity' "$TMP/current-container.stderr"
+test ! -f "$TMP/evidence/current-container/results/D2-webconsole-cli/result.json"
+
+# Gateway status/discovery and a live PID are not sufficient: the exact PID
+# must own the advertised TCP listener and serve the canonical health route
+# before and after every Webconsole operation.
+prepare_run_fixture gateway-no-listener
+kill "$GATEWAY_PID"
+wait "$GATEWAY_PID" 2>/dev/null || true
+GATEWAY_PORT=$(python3 - <<'PY'
+import socket
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+)
+"$PREFIX/bin/nexus-gateway" \
+  --fixture-runtime \
+  --port "$GATEWAY_PORT" \
+  --module "$GATEWAY_PACKAGE/dist-gateway/headless.mjs" \
+  --install-root "$PREFIX" \
+  --no-listen &
+GATEWAY_PID=$!
+printf '{"pid":%s,"url":"http://127.0.0.1:%s"}\n' "$GATEWAY_PID" "$GATEWAY_PORT" \
+  >"$TMP/home/gateway.json"
+set +e
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_HOME="$TMP/home" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
+  "$TARGET" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --run-id gateway-no-listener \
+    --evidence-dir "$TMP/evidence" \
+    >"$TMP/gateway-no-listener.stdout" 2>"$TMP/gateway-no-listener.stderr"
+gateway_no_listener_status=$?
+set -e
+test "$gateway_no_listener_status" -ne 0
+grep -Fq 'Gateway listener or health endpoint is not owned by the live Gateway process' \
+  "$TMP/gateway-no-listener.stderr"
+test ! -e "$TMP/evidence/gateway-no-listener/results/D2-webconsole-cli.result.sha256"
+
+kill "$GATEWAY_PID"
+wait "$GATEWAY_PID" 2>/dev/null || true
+GATEWAY_PORT=$(python3 - <<'PY'
+import socket
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+)
+"$PREFIX/bin/nexus-gateway" \
+  --fixture-runtime \
+  --port "$GATEWAY_PORT" \
+  --module "$GATEWAY_PACKAGE/dist-gateway/headless.mjs" \
+  --install-root "$PREFIX" &
+GATEWAY_PID=$!
+printf '{"pid":%s,"url":"http://127.0.0.1:%s"}\n' "$GATEWAY_PID" "$GATEWAY_PORT" \
+  >"$TMP/home/gateway.json"
+deadline=$((SECONDS + 5))
+until curl -fsS --max-time 1 "http://127.0.0.1:$GATEWAY_PORT/api/v1/health" >/dev/null 2>&1; do
+  [ "$SECONDS" -lt "$deadline" ] || exit 1
+  sleep 0.05
+done
+
+# Merely mentioning the candidate launcher in an inert argument cannot bind a
+# different process to the packed entrypoint. The supported Node/Python shape
+# is interpreter argv[0], exact packed launcher argv[1].
+prepare_run_fixture inert-gateway-argv
+kill "$GATEWAY_PID"
+wait "$GATEWAY_PID" 2>/dev/null || true
+cp "$UMBRELLA/bin/nexus-gateway.mjs" "$TMP/bin/inert-gateway"
+chmod +x "$TMP/bin/inert-gateway"
+GATEWAY_PORT=$(python3 - <<'PY'
+import socket
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+)
+"$TMP/bin/inert-gateway" \
+  --fixture-runtime \
+  --port "$GATEWAY_PORT" \
+  --module "$GATEWAY_PACKAGE/dist-gateway/headless.mjs" \
+  --install-root "$PREFIX" \
+  --inert "$PREFIX/bin/nexus-gateway" &
+GATEWAY_PID=$!
+printf '{"pid":%s,"url":"http://127.0.0.1:%s"}\n' "$GATEWAY_PID" "$GATEWAY_PORT" \
+  >"$TMP/home/gateway.json"
+deadline=$((SECONDS + 5))
+until curl -fsS --max-time 1 "http://127.0.0.1:$GATEWAY_PORT/api/v1/health" >/dev/null 2>&1; do
+  [ "$SECONDS" -lt "$deadline" ] || exit 1
+  sleep 0.05
+done
+set +e
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_HOME="$TMP/home" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
+  "$TARGET" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --run-id inert-gateway-argv \
+    --evidence-dir "$TMP/evidence" \
+    >"$TMP/inert-gateway-argv.stdout" 2>"$TMP/inert-gateway-argv.stderr"
+inert_gateway_status=$?
+set -e
+test "$inert_gateway_status" -ne 0
+grep -Fq 'not launched through the validated packed Gateway entrypoint at argv[1]' \
+  "$TMP/inert-gateway-argv.stderr"
+test ! -e "$TMP/evidence/inert-gateway-argv/results/D2-webconsole-cli.result.sha256"
+
+kill "$GATEWAY_PID"
+wait "$GATEWAY_PID" 2>/dev/null || true
+GATEWAY_PORT=$(python3 - <<'PY'
+import socket
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+)
+"$PREFIX/bin/nexus-gateway" \
+  --fixture-runtime \
+  --port "$GATEWAY_PORT" \
+  --module "$GATEWAY_PACKAGE/dist-gateway/headless.mjs" \
+  --install-root "$PREFIX" &
+GATEWAY_PID=$!
+printf '{"pid":%s,"url":"http://127.0.0.1:%s"}\n' "$GATEWAY_PID" "$GATEWAY_PORT" \
+  >"$TMP/home/gateway.json"
+deadline=$((SECONDS + 5))
+until curl -fsS --max-time 1 "http://127.0.0.1:$GATEWAY_PORT/api/v1/health" >/dev/null 2>&1; do
+  [ "$SECONDS" -lt "$deadline" ] || exit 1
+  sleep 0.05
+done
+
+# The live process cannot be attested against candidate bytes changed after it
+# started: those bytes were not the module this process loaded.
+prepare_run_fixture stale-loaded-module
+touch "$GATEWAY_PACKAGE/dist-gateway/headless.mjs"
+set +e
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_HOME="$TMP/home" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
+  "$TARGET" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --run-id stale-loaded-module \
+    --evidence-dir "$TMP/evidence" \
+    >"$TMP/stale-loaded-module.stdout" 2>"$TMP/stale-loaded-module.stderr"
+stale_loaded_module_status=$?
+set -e
+test "$stale_loaded_module_status" -ne 0
+grep -Fq 'candidate Gateway module changed after the live process started' \
+  "$TMP/stale-loaded-module.stderr"
+test ! -e "$TMP/evidence/stale-loaded-module/results/D2-webconsole-cli.result.sha256"
+
+kill "$GATEWAY_PID"
+wait "$GATEWAY_PID" 2>/dev/null || true
+GATEWAY_PORT=$(python3 - <<'PY'
+import socket
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+)
+"$PREFIX/bin/nexus-gateway" \
+  --fixture-runtime \
+  --port "$GATEWAY_PORT" \
+  --module "$GATEWAY_PACKAGE/dist-gateway/headless.mjs" \
+  --install-root "$PREFIX" &
+GATEWAY_PID=$!
+printf '{"pid":%s,"url":"http://127.0.0.1:%s"}\n' "$GATEWAY_PID" "$GATEWAY_PORT" \
+  >"$TMP/home/gateway.json"
+deadline=$((SECONDS + 5))
+until curl -fsS --max-time 1 "http://127.0.0.1:$GATEWAY_PORT/api/v1/health" >/dev/null 2>&1; do
+  [ "$SECONDS" -lt "$deadline" ] || exit 1
+  sleep 0.05
+done
+
+# A healthy same-version Gateway process outside the packed candidate entrypoint
+# cannot establish the D2 baseline.
+prepare_run_fixture foreign-gateway
+kill "$GATEWAY_PID"
+wait "$GATEWAY_PID" 2>/dev/null || true
+cp "$UMBRELLA/bin/nexus-gateway.mjs" "$TMP/bin/foreign-gateway"
+chmod +x "$TMP/bin/foreign-gateway"
+"$TMP/bin/foreign-gateway" \
+  --fixture-runtime \
+  --port "$GATEWAY_PORT" \
+  --module "$GATEWAY_PACKAGE/dist-gateway/headless.mjs" \
+  --install-root "$PREFIX" &
+GATEWAY_PID=$!
+printf '{"pid":%s,"url":"http://127.0.0.1:%s"}\n' "$GATEWAY_PID" "$GATEWAY_PORT" \
+  >"$TMP/home/gateway.json"
+set +e
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_HOME="$TMP/home" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
+  "$TARGET" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --run-id foreign-gateway \
+    --evidence-dir "$TMP/evidence" \
+    >"$TMP/foreign-gateway.stdout" 2>"$TMP/foreign-gateway.stderr"
+foreign_gateway_status=$?
+set -e
+test "$foreign_gateway_status" -ne 0
+grep -Fq 'not launched through the validated packed Gateway entrypoint' \
+  "$TMP/foreign-gateway.stderr"
+test ! -f "$TMP/evidence/foreign-gateway/results/D2-webconsole-cli/result.json"
+
+# Runtime identity is optional only as a whole. A Gateway that reports none of
+# the three facets remains an honest false/null observation, while any partial,
+# malformed, or mismatched identity must fail before Webconsole lifecycle work.
+start_gateway_variant none
+prepare_run_fixture runtime-identity-none
+PATH="$PREFIX/bin:$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_HOME="$TMP/home" \
+  NEXUS_WEBUI_BIN="$PREFIX/bin/nexus-webui" \
+  NEXUS_GATEWAY_BIN="$PREFIX/bin/nexus-gateway" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_ENVIRONMENTS="$TMP/command-environments.jsonl" \
+  FIXTURE_PID="$TMP/webconsole.pid" \
+  "$TARGET" \
+    --nexus-bin "$PREFIX/bin/nexus" \
+    --packed-prefix "$PREFIX" \
+    --host 127.0.0.1 \
+    --port 0 \
+    --run-id runtime-identity-none \
+    --evidence-dir "$TMP/evidence" \
+    >"$TMP/runtime-identity-none.stdout" 2>"$TMP/runtime-identity-none.stderr"
+RUNTIME_NONE_RESULT="$TMP/evidence/runtime-identity-none/results/D2-webconsole-cli/result.json"
+RUNTIME_NONE_TRANSCRIPT="$TMP/evidence/runtime-identity-none/$(jq -r '.artifacts.cliTranscript.path' "$RUNTIME_NONE_RESULT")"
+jq -s -e '
+  length > 20 and all(.[];
+    .gateway.runtimeIdentityReported == false and
+    .gateway.runtimeIdentityMatched == null
+  )
+' "$RUNTIME_NONE_TRANSCRIPT" >/dev/null
+
+for runtime_case in partial malformed mismatch; do
+  start_gateway_variant "$runtime_case"
+  run_gateway_baseline_negative \
+    "runtime-identity-$runtime_case" \
+    'live Gateway health runtime identity'
+done
+
+# Port equality is insufficient ownership evidence. The owned socket must use
+# the same address family and exact loopback address advertised by Gateway.
+start_gateway_variant full 0.0.0.0 127.0.0.1
+run_gateway_baseline_negative \
+  gateway-wildcard-listener \
+  'Gateway listener or health endpoint is not owned by the live Gateway process'
+
+stop_fixture_gateways
+GATEWAY_PORT=$(allocate_gateway_port)
+"$PREFIX/bin/nexus-gateway" \
+  --fixture-runtime \
+  --port "$GATEWAY_PORT" \
+  --module "$GATEWAY_PACKAGE/dist-gateway/headless.mjs" \
+  --install-root "$PREFIX" \
+  --bind-host 127.0.0.2 &
+GATEWAY_PID=$!
+"$PREFIX/bin/nexus-gateway" \
+  --fixture-runtime \
+  --port "$GATEWAY_PORT" \
+  --module "$GATEWAY_PACKAGE/dist-gateway/headless.mjs" \
+  --install-root "$PREFIX" \
+  --bind-host 127.0.0.1 &
+GATEWAY_AUX_PID=$!
+printf '{"pid":%s,"url":"http://127.0.0.1:%s"}\n' \
+  "$GATEWAY_PID" "$GATEWAY_PORT" >"$TMP/home/gateway.json"
+deadline=$((SECONDS + 5))
+until curl -fsS --max-time 1 \
+  "http://127.0.0.1:$GATEWAY_PORT/api/v1/health" >/dev/null 2>&1; do
+  [ "$SECONDS" -lt "$deadline" ] || {
+    echo "wrong-address Gateway fixture did not become healthy" >&2
+    exit 1
+  }
+  sleep 0.05
+done
+run_gateway_baseline_negative \
+  gateway-wrong-address-listener \
+  'Gateway listener or health endpoint is not owned by the live Gateway process'
+
+# A release-attested discovery URL must name one numeric loopback endpoint.
+# `localhost` can select a different address family on another machine, so it
+# is rejected even when one of its resolutions happens to reach the owner.
+stop_fixture_gateways
+start_gateway_variant full 127.0.0.1 localhost
+run_gateway_baseline_negative \
+  gateway-localhost-ambiguous \
+  'Gateway listener or health endpoint is not owned by the live Gateway process'
+
+# The ownership probe emits one explicit RFC Host authority for IPv4.  The
+# positive is pinned by the fixture server itself; wrong and absent Host modes
+# must both fail the canonical health proof before lifecycle work begins.
+start_gateway_variant full 127.0.0.1 127.0.0.1 auto
+run_gateway_baseline_negative \
+  gateway-ipv4-host-wrong \
+  'Gateway listener or health endpoint is not owned by the live Gateway process' \
+  wrong
+run_gateway_baseline_negative \
+  gateway-ipv4-host-missing \
+  'Gateway listener or health endpoint is not owned by the live Gateway process' \
+  missing
+
+# IPv6 is a production contract, not an unconditional CI assumption. Skip only
+# when this kernel cannot bind ::1 at all; otherwise prove bracketed Webconsole
+# URLs, exact IPv6 Gateway ownership, wildcard rejection, and cross-family
+# health-decoy rejection.
+if python3 - <<'PY'
+import socket
+with socket.socket(socket.AF_INET6) as sock:
+    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    sock.bind(("::1", 0))
+PY
+then
+  start_gateway_variant full ::1 ::1 auto
+  prepare_run_fixture ipv6-positive
+  invoke_fixture_gate_host ipv6-positive ::1 \
+    >"$TMP/ipv6-positive.stdout" 2>"$TMP/ipv6-positive.stderr"
+  test -f "$TMP/evidence/ipv6-positive/results/D2-webconsole-cli.result.sha256"
+  jq -e '.primaryPort > 0 and .status == "PASS"' \
+    "$TMP/evidence/ipv6-positive/results/D2-webconsole-cli/result.json" >/dev/null
+  grep -Fq 'http://[::1]:' \
+    "$TMP/evidence/ipv6-positive/results/D2-webconsole-cli/status-plain.stdout"
+
+  start_gateway_variant full :: ::1 auto
+  run_gateway_baseline_negative \
+    gateway-ipv6-wildcard-listener \
+    'Gateway listener or health endpoint is not owned by the live Gateway process'
+
+  stop_fixture_gateways
+  GATEWAY_PORT=$(python3 - <<'PY'
+import socket
+for _ in range(100):
+    with socket.socket(socket.AF_INET) as ipv4:
+        ipv4.bind(("127.0.0.1", 0))
+        port = ipv4.getsockname()[1]
+        with socket.socket(socket.AF_INET6) as ipv6:
+            ipv6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            try:
+                ipv6.bind(("::1", port))
+            except OSError:
+                continue
+            print(port)
+            break
+else:
+    raise SystemExit("cannot allocate dual-family loopback fixture port")
+PY
+  )
+  "$PREFIX/bin/nexus-gateway" \
+    --fixture-runtime \
+    --port "$GATEWAY_PORT" \
+    --module "$GATEWAY_PACKAGE/dist-gateway/headless.mjs" \
+    --install-root "$PREFIX" \
+    --bind-host 127.0.0.1 \
+    --runtime-identity full &
+  GATEWAY_PID=$!
+  "$PREFIX/bin/nexus-gateway" \
+    --fixture-runtime \
+    --port "$GATEWAY_PORT" \
+    --module "$GATEWAY_PACKAGE/dist-gateway/headless.mjs" \
+    --install-root "$PREFIX" \
+    --bind-host ::1 \
+    --runtime-identity full &
+  GATEWAY_AUX_PID=$!
+  printf '{"pid":%s,"url":"http://localhost:%s"}\n' \
+    "$GATEWAY_PID" "$GATEWAY_PORT" >"$TMP/home/gateway.json"
+  deadline=$((SECONDS + 5))
+  until curl --noproxy '*' -g -fsS --max-time 1 \
+    "http://127.0.0.1:$GATEWAY_PORT/api/v1/health" >/dev/null 2>&1 \
+    && curl --noproxy '*' -g -fsS --max-time 1 \
+      "http://[::1]:$GATEWAY_PORT/api/v1/health" >/dev/null 2>&1; do
+    [ "$SECONDS" -lt "$deadline" ] || {
+      echo "cross-family Gateway fixture did not become healthy" >&2
+      exit 1
+    }
+    sleep 0.05
+  done
+  run_gateway_baseline_negative \
+    gateway-cross-family-health-decoy \
+    'Gateway listener or health endpoint is not owned by the live Gateway process'
+else
+  printf 'SKIP: kernel IPv6 loopback is unavailable; IPv6 production gate not exercised\n' >&2
+fi
 
 bash -n "$TARGET"
 printf 'v0.1.5 Webconsole acceptance contract: ok\n'

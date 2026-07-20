@@ -1,0 +1,719 @@
+#!/usr/bin/env python3
+"""External contract for the v0.1.5 cross-producer evidence assembler."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import runpy
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = ROOT / "scripts" / "nexus-v015-release-assemble"
+RUN_ID = "fixture-run"
+HOST_FILES = (
+    "daemon.pid", "daemon-ipc-endpoint.json", "gateway.json", "webconsole.json",
+    "nexus.db", "nexus.db-wal", "nexus.db-shm", "gateway.db", "gateway.db-wal", "gateway.db-shm",
+)
+LIVE_PLUGIN_SURFACES = (
+    ("LP1", "health-auth"),
+    ("LP2", "hydration"),
+    ("LP3", "thread-create"),
+    ("LP4", "thread-post"),
+    ("LP5", "thread-reply"),
+    ("LP6", "thread-agent-reply"),
+    ("LP7", "dm-two-way"),
+    ("LP8", "session-prompt-stream"),
+    ("LP9", "queued-send"),
+    ("LP10", "steer"),
+    ("LP11", "interrupt-cancel"),
+    ("LP12", "compact"),
+    ("LP13", "reload-hydration"),
+    ("LP14", "gateway-reconnect"),
+    ("LP15", "daemon-reconnect"),
+    ("LP16", "typed-failures"),
+)
+
+
+def canonical(value: object) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode()
+
+
+def digest(value: object) -> str:
+    return "sha256:" + hashlib.sha256(canonical(value)).hexdigest()
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+
+
+def result_doc(run_root: Path, gate: str, leaf: str, candidate: str, artifacts: dict[str, object]) -> None:
+    records: dict[str, dict[str, str]] = {}
+    for name, value in artifacts.items():
+        raw = canonical(value) + b"\n"
+        relative = Path("results") / leaf / f"{name}.jsonl"
+        target = run_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+        records[name] = {"path": relative.as_posix(), "sha256": sha(raw)}
+    write_json(
+        run_root / "results" / leaf / "result.json",
+        {
+            "schemaVersion": 1,
+            "gate": gate,
+            "runId": RUN_ID,
+            "candidateDigest": candidate,
+            "status": "PASS",
+            "error": None,
+            "partial": False,
+            "flaky": False,
+            "skipped": False,
+            "refused": False,
+            "failureCount": 0,
+            "requiredArtifacts": list(records),
+            "artifacts": records,
+        },
+    )
+
+
+def case_doc(run_root: Path, case_id: str, readiness: str) -> None:
+    raw = f"<main>{case_id} human</main>".encode()
+    relative = Path("cases") / case_id / "dom.html"
+    target = run_root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(raw)
+    write_json(
+        target.parent / "manifest.json",
+        {
+            "schemaVersion": 1,
+            "schema": "ocular-evidence/2",
+            "case": case_id,
+            "surface": "webui",
+            "runId": RUN_ID,
+            "readinessSha256": readiness,
+            "status": "PASS",
+            "error": None,
+            "partial": False,
+            "flaky": False,
+            "skipped": False,
+            "refused": False,
+            "failureCount": 0,
+            "requiredArtifacts": ["dom"],
+            "artifacts": {"dom": {"path": relative.as_posix(), "sha256": sha(raw)}},
+        },
+    )
+
+
+def live_plugin_doc(
+    run_id: str,
+    readiness: str,
+    candidate: str,
+    human_id: str = "h_fixture",
+    agent_id: str = "a_fixture",
+) -> dict[str, object]:
+    def human_evidence(surface: str) -> dict[str, object]:
+        if surface == "thread-create":
+            return {
+                "kind": "developer.action",
+                "topic": "sys.thread.lp3-fixture",
+                "seq": 1,
+                "action": "thread.create",
+                "callerId": human_id,
+                "callerKind": "human",
+            }
+        if surface in {"thread-post", "thread-reply", "dm-two-way"}:
+            return {
+                "kind": "message.history",
+                "messageId": f"m_{surface}",
+                "callerId": human_id,
+                "callerKind": "human",
+            }
+        return {
+            "kind": "command.receipt",
+            "commandId": f"cmd_{surface}",
+            "clientId": f"lens:{surface}",
+            "state": "completed",
+            "callerId": human_id,
+            "callerKind": "human",
+            "sessionId": "s_target",
+            "revision": 2,
+            "seq": 2,
+        }
+
+    return {
+        "schemaVersion": 1,
+        "runId": run_id,
+        "readinessSha256": readiness,
+        "candidateDigest": candidate,
+        "command": "OCULAR_LAB=1 node tests/ocular/live-plugin.mjs --release",
+        "candidateBound": True,
+        "hostStateRefused": True,
+        "manualGatewayConfigured": True,
+        "humanId": human_id,
+        "agentId": agent_id,
+        "surfaces": [
+            {"id": case_id, "surface": surface, "status": "PASS"}
+            for case_id, surface in LIVE_PLUGIN_SURFACES
+        ],
+        "attributionRows": [
+            {
+                "surface": surface,
+                "origin": "human",
+                "callerId": human_id,
+                "targetAgentId": agent_id,
+                "evidence": human_evidence(surface),
+            }
+            for surface in (
+                "thread-create", "thread-post", "thread-reply", "dm-two-way",
+                "session-prompt-stream", "queued-send", "steer",
+                "interrupt-cancel", "compact",
+            )
+        ] + [
+            {
+                "surface": "thread-agent-reply",
+                "origin": "agent",
+                "authorId": agent_id,
+                "targetHumanId": human_id,
+                "evidence": {
+                    "kind": "message.history",
+                    "messageId": "m_thread-agent-reply",
+                    "authorId": agent_id,
+                },
+            },
+            {
+                "surface": "dm-two-way",
+                "origin": "agent",
+                "authorId": agent_id,
+                "targetHumanId": human_id,
+                "evidence": {
+                    "kind": "message.history",
+                    "messageId": "m_dm-agent-reply",
+                    "authorId": agent_id,
+                },
+            },
+        ],
+    }
+
+
+class ReleaseAssemblerContract(unittest.TestCase):
+    def test_help_is_read_only_and_documents_required_inputs(self) -> None:
+        result = subprocess.run(
+            [str(SCRIPT), "--help"],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--run-root", result.stdout)
+        self.assertIn("--print-candidate-digest", result.stdout)
+        self.assertIn("--host-before", result.stdout)
+        self.assertIn("--diff-review", result.stdout)
+
+    def test_print_candidate_digest_reads_manifest_without_publishing(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="v015-release-digest-") as temporary:
+            run_root = Path(temporary) / "evidence" / RUN_ID
+            run_root.mkdir(parents=True)
+            manifest = {
+                "mode": "packed",
+                "sources": [{"name": "egregore-nexus", "revision": "1" * 40, "dirty": []}],
+                "native": {"sha256": "b" * 64},
+                "packages": [
+                    {"name": "@egregore/nexus", "version": "0.1.5", "tarball": {"sha256": "c" * 64}},
+                    {"name": "@egregore/nexus-cli", "version": "0.1.5", "tarball": {"sha256": "d" * 64}},
+                    {"name": "@egregore/nexus-gateway", "version": "0.1.5", "tarball": {"sha256": "e" * 64}},
+                ],
+                "image": {"digest": "sha256:" + "f" * 64},
+                "container": {"limits": {"cpus": 6, "memoryBytes": 8589934592, "pids": 1024}},
+                "toolchains": {"rustc": "rustc fixture", "cargo": "cargo fixture", "node": "v24"},
+                "environment": {"NEXUS_V015_READINESS_LEDGER_SHA256": "a" * 64},
+            }
+            write_json(run_root / "manifest.json", manifest)
+            ledger = {
+                "mode": manifest["mode"],
+                "sources": manifest["sources"],
+                "nativeSha256": manifest["native"]["sha256"],
+                "packages": [
+                    {
+                        "name": row["name"],
+                        "version": row["version"],
+                        "tarballSha256": row["tarball"]["sha256"],
+                    }
+                    for row in manifest["packages"]
+                ],
+                "imageDigest": manifest["image"]["digest"],
+                "limits": manifest["container"]["limits"],
+                "toolchains": manifest["toolchains"],
+                "environment": manifest["environment"],
+            }
+
+            result = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "--run-root",
+                    str(run_root),
+                    "--print-candidate-digest",
+                ],
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), digest(ledger))
+            self.assertEqual(
+                [path.relative_to(run_root).as_posix() for path in run_root.rglob("*")],
+                ["manifest.json"],
+            )
+
+    def test_assembles_only_from_bound_published_evidence(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="v015-release-assemble-") as temporary:
+            root = Path(temporary)
+            run_root = root / "evidence" / RUN_ID
+            run_root.mkdir(parents=True)
+            readiness = "a" * 64
+            manifest = {
+                "schemaVersion": 1,
+                "runId": RUN_ID,
+                "mode": "packed",
+                "sources": [{"name": "egregore-nexus", "revision": "1" * 40, "dirty": []}],
+                "native": {"sha256": "b" * 64},
+                "packages": [
+                    {"name": "@egregore/nexus", "version": "0.1.5", "tarball": {"sha256": "c" * 64}},
+                    {"name": "@egregore/nexus-cli", "version": "0.1.5", "tarball": {"sha256": "d" * 64}},
+                    {"name": "@egregore/nexus-gateway", "version": "0.1.5", "tarball": {"sha256": "e" * 64}},
+                ],
+                "image": {"digest": "sha256:" + "f" * 64},
+                "container": {"limits": {"cpus": 6, "memoryBytes": 8589934592, "pids": 1024}},
+                "toolchains": {"rustc": "rustc fixture", "cargo": "cargo fixture", "node": "v24"},
+                "environment": {"NEXUS_V015_READINESS_LEDGER_SHA256": readiness},
+            }
+            write_json(run_root / "manifest.json", manifest)
+            ledger = {
+                "mode": manifest["mode"],
+                "sources": manifest["sources"],
+                "nativeSha256": manifest["native"]["sha256"],
+                "packages": [
+                    {"name": row["name"], "version": row["version"], "tarballSha256": row["tarball"]["sha256"]}
+                    for row in manifest["packages"]
+                ],
+                "imageDigest": manifest["image"]["digest"],
+                "limits": manifest["container"]["limits"],
+                "toolchains": manifest["toolchains"],
+                "environment": manifest["environment"],
+            }
+            candidate = digest(ledger)
+            result_doc(
+                run_root,
+                "D1",
+                "D1-clean-packed-install",
+                candidate,
+                {
+                    "packedInventory": {"packages": [row["name"] for row in manifest["packages"]]},
+                    "installLog": {"status": "PASS"},
+                    "foreignCwd": {"status": "PASS"},
+                    "shutdown": {"status": "PASS"},
+                },
+            )
+            result_doc(
+                run_root,
+                "B1",
+                "B1-stable-identity",
+                candidate,
+                {
+                    "identityMatrix": {"status": "PASS"},
+                    "renameRegression": {"status": "PASS", "stableId": "a_fixture"},
+                    "agentIdResolution": {"status": "PASS"},
+                },
+            )
+            result_doc(
+                run_root,
+                "B2",
+                "B2-restart-reconciliation",
+                candidate,
+                {
+                    "restartTimeline": {"status": "PASS"},
+                    "rosterComparison": {"status": "PASS"},
+                    "humanRebind": {"status": "PASS", "human": "h_fixture"},
+                },
+            )
+            result_doc(
+                run_root,
+                "E2",
+                "E2-lens-ocular",
+                candidate,
+                {
+                    "ocularSummary": {"status": "PASS", "cases": [f"O{index}" for index in range(1, 19)]},
+                    "affordanceCoverage": {
+                        "status": "PASS",
+                        "livePlugin": live_plugin_doc(RUN_ID, readiness, candidate),
+                    },
+                    "artifactsIndex": {"status": "PASS", "cases": ["O1", "O18"]},
+                },
+            )
+            for case_id in ("W2", "W3", "W6", "W7", "W8"):
+                case_doc(run_root, case_id, readiness)
+
+            snapshot = {
+                "daemon": {"pid": 10, "bootId": "boot", "executable": "/host/nexus", "sha256": "1" * 64},
+                "gateway": {"pid": 11, "listener": "127.0.0.1:4100", "executable": "/host/node", "sha256": "2" * 64},
+                "webconsole": {"pid": 12, "listener": "127.0.0.1:4200", "executable": "/host/node", "sha256": "3" * 64},
+                "ipc": {"path": "/host/nexus.sock", "inode": 99},
+                "files": {
+                    name: {
+                        "kind": "missing", "device": 0, "inode": 0, "mode": 0,
+                        "uid": 0, "gid": 0, "nlink": 0, "size": 0,
+                        "mtimeNs": 0, "ctimeNs": 0,
+                    }
+                    for name in HOST_FILES
+                },
+                "capturedAt": 1,
+            }
+            before = root / "host-before.json"
+            after = root / "host-after.json"
+            write_json(before, snapshot)
+            write_json(after, {**snapshot, "capturedAt": 2})
+
+            metadata = root / "cargo-metadata.json"
+            write_json(
+                metadata,
+                {"packages": [{"name": "egregore-nexus", "version": "0.1.5"}]},
+            )
+            nexus = root / "nexus"
+            nexus.write_text("#!/bin/sh\nprintf 'nexus 0.1.5\\n'\n", encoding="utf-8")
+            nexus.chmod(0o755)
+            disposition = root / "diff-review.json"
+            write_json(
+                disposition,
+                {
+                    "schemaVersion": 1,
+                    "runId": RUN_ID,
+                    "candidateDigest": candidate,
+                    "diff": {
+                        "unexpectedChanges": 0,
+                        "trackedDiff": ["frozen"],
+                        "untrackedInventory": ["frozen"],
+                        "intendedChanges": ["v0.1.5"],
+                    },
+                    "review": {
+                        "unresolvedBlockers": 0,
+                        "reviewReport": ["B1", "D2", "Lens"],
+                        "blockerDisposition": ["closed"],
+                    },
+                },
+            )
+
+            command = [
+                str(SCRIPT),
+                "--run-root", str(run_root),
+                "--host-before", str(before),
+                "--host-after", str(after),
+                "--diff-review", str(disposition),
+                "--cargo-metadata", str(metadata),
+                "--nexus-bin", str(nexus),
+                "--readiness-sha256", readiness,
+            ]
+            result = subprocess.run(
+                command,
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            expected = {
+                "A1": run_root / "results/A1-candidate-identity/result.json",
+                "A2": run_root / "results/A2-host-isolation/result.json",
+                "B3": run_root / "results/B3-human-webconsole-attribution/result.json",
+                "DIFF": run_root / "release/diff-disposition.json",
+                "REVIEW": run_root / "release/review-disposition.json",
+            }
+            for gate, path in expected.items():
+                doc = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(doc["gate"], gate)
+                self.assertEqual(doc["runId"], RUN_ID)
+                self.assertEqual(doc["candidateDigest"], candidate)
+                self.assertEqual(doc["status"], "PASS")
+                self.assertTrue(all(not row["path"].endswith(".json") for row in doc["artifacts"].values()))
+                self.assertEqual(path.stat().st_mode & 0o777, 0o400)
+                for record in doc["artifacts"].values():
+                    artifact = run_root / record["path"]
+                    self.assertTrue(artifact.is_file(), record["path"])
+                    self.assertEqual(artifact.stat().st_mode & 0o777, 0o400)
+                    self.assertEqual(sha(artifact.read_bytes()), record["sha256"])
+            for directory in (
+                run_root / "results/A1-candidate-identity",
+                run_root / "results/A2-host-isolation",
+                run_root / "results/B3-human-webconsole-attribution",
+                run_root / "release",
+            ):
+                self.assertEqual(directory.stat().st_mode & 0o777, 0o555)
+
+            b3_result = json.loads(expected["B3"].read_text(encoding="utf-8"))
+            rendered_path = run_root / b3_result["artifacts"]["renderedAttribution"]["path"]
+            rendered = json.loads(rendered_path.read_text(encoding="utf-8"))
+            self.assertEqual(rendered["lensLivePlugin"]["surfaces"][3]["surface"], "thread-post")
+            self.assertTrue(rendered["lensLivePlugin"]["candidateBound"])
+
+            # A same-before/after document with an unrecognized field is not a
+            # host-isolation proof. Refusal must happen before any target is
+            # republished, so a malformed capture cannot leave partial PASS.
+            for target in (
+                run_root / "results/A1-candidate-identity",
+                run_root / "results/A2-host-isolation",
+                run_root / "results/B3-human-webconsole-attribution",
+                run_root / "release",
+            ):
+                if target.exists():
+                    import shutil
+
+                    os.chmod(target, 0o700)
+                    shutil.rmtree(target)
+
+            e2_result_path = run_root / "results/E2-lens-ocular/result.json"
+            e2_result = json.loads(e2_result_path.read_text(encoding="utf-8"))
+            coverage_path = run_root / e2_result["artifacts"]["affordanceCoverage"]["path"]
+
+            # A roster-derived caller id is not durable mutation evidence. A
+            # coordinated producer rewrite that leaves the expected human id
+            # but removes the canonical Gateway receipt/action/message row
+            # must fail before B3 or the final release inventory is written.
+            unbound_live = live_plugin_doc(RUN_ID, readiness, candidate)
+            session_row = next(
+                row
+                for row in unbound_live["attributionRows"]
+                if row["surface"] == "session-prompt-stream"
+            )
+            del session_row["evidence"]
+            write_json(coverage_path, {"status": "PASS", "livePlugin": unbound_live})
+            e2_result["artifacts"]["affordanceCoverage"]["sha256"] = sha(
+                coverage_path.read_bytes()
+            )
+            write_json(e2_result_path, e2_result)
+            missing_receipt = subprocess.run(
+                command,
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertNotEqual(missing_receipt.returncode, 0)
+            self.assertIn("canonical evidence", missing_receipt.stderr)
+            self.assertFalse((run_root / "results/B3-human-webconsole-attribution").exists())
+            self.assertFalse((run_root / "release").exists())
+
+            # B3 must not be synthesizable from WebUI cases alone. Even a
+            # coordinated E2 payload+hash rewrite that drops the live Lens
+            # surface proof must fail before publishing any cross-producer
+            # PASS document.
+            write_json(coverage_path, {"status": "PASS", "livePlugin": {"surfaces": []}})
+            e2_result["artifacts"]["affordanceCoverage"]["sha256"] = sha(coverage_path.read_bytes())
+            write_json(e2_result_path, e2_result)
+            missing_lens = subprocess.run(
+                command,
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertNotEqual(missing_lens.returncode, 0)
+            self.assertIn("live-plugin", missing_lens.stderr)
+            self.assertFalse((run_root / "results/A1-candidate-identity").exists())
+            self.assertFalse((run_root / "release").exists())
+
+            # Restore the bound E2 fixture before independently exercising the
+            # host-snapshot schema refusal below.
+            live_plugin = live_plugin_doc(RUN_ID, readiness, candidate)
+            write_json(coverage_path, {"status": "PASS", "livePlugin": live_plugin})
+            e2_result["artifacts"]["affordanceCoverage"]["sha256"] = sha(coverage_path.read_bytes())
+            write_json(e2_result_path, e2_result)
+            write_json(before, {**snapshot, "untrusted": True})
+            write_json(after, {**snapshot, "capturedAt": 2, "untrusted": True})
+            malformed = subprocess.run(
+                command,
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertNotEqual(malformed.returncode, 0)
+            self.assertIn("host-before snapshot", malformed.stderr)
+            self.assertFalse((run_root / "results/A1-candidate-identity").exists())
+            self.assertFalse((run_root / "release").exists())
+
+    def test_real_producer_output_passes_the_canonical_validator(self) -> None:
+        validator_contract = runpy.run_path(
+            str(ROOT / "scripts/test-nexus-v015-evidence-validate")
+        )
+        validator_module = runpy.run_path(
+            str(ROOT / "scripts/nexus-v015-evidence-validate")
+        )
+        with tempfile.TemporaryDirectory(prefix="v015-release-validator-") as temporary:
+            fixture = validator_contract["EvidenceFixture"](
+                Path(temporary)
+                / "lab-root"
+                / "evidence"
+                / validator_contract["RUN_ID"]
+            )
+            for directory in (
+                fixture.root,
+                fixture.root / "results",
+                fixture.root / "artifacts",
+                fixture.root / "artifacts/results",
+            ):
+                os.chmod(directory, 0o700)
+            fixture.run_seal_path.unlink()
+            for gate in ("A1", "A2", "B3"):
+                result_directory = fixture.result_paths[gate].parent
+                os.chmod(result_directory, 0o700)
+                shutil.rmtree(result_directory)
+            os.chmod(fixture.root / "release", 0o700)
+            shutil.rmtree(fixture.root / "release")
+            for gate in ("A1", "A2", "B3", "DIFF", "REVIEW"):
+                old_artifacts = fixture.root / "artifacts/results" / gate
+                if old_artifacts.exists():
+                    os.chmod(old_artifacts, 0o700)
+                    shutil.rmtree(old_artifacts)
+
+            file_row = {
+                "kind": "missing",
+                "device": 0,
+                "inode": 0,
+                "mode": 0,
+                "uid": 0,
+                "gid": 0,
+                "nlink": 0,
+                "size": 0,
+                "mtimeNs": 0,
+                "ctimeNs": 0,
+            }
+            snapshot = {
+                "daemon": {"pid": 0, "bootId": "", "executable": "", "sha256": ""},
+                "gateway": {"pid": 0, "listener": "", "executable": "", "sha256": ""},
+                "webconsole": {"pid": 0, "listener": "", "executable": "", "sha256": ""},
+                "ipc": {"path": "", "inode": 0},
+                "files": {name: dict(file_row) for name in HOST_FILES},
+                "capturedAt": 1,
+            }
+            before = Path(temporary) / "host-before.json"
+            after = Path(temporary) / "host-after.json"
+            write_json(before, snapshot)
+            write_json(after, {**snapshot, "capturedAt": 2})
+            metadata = Path(temporary) / "cargo-metadata.json"
+            write_json(metadata, {"packages": [{"name": "nexus", "version": "0.1.5"}]})
+            nexus = Path(temporary) / "nexus"
+            nexus.write_text("#!/bin/sh\nprintf 'nexus 0.1.5\\n'\n", encoding="utf-8")
+            nexus.chmod(0o755)
+            disposition = Path(temporary) / "diff-review.json"
+            write_json(
+                disposition,
+                {
+                    "schemaVersion": 1,
+                    "runId": validator_contract["RUN_ID"],
+                    "candidateDigest": fixture.candidate_digest,
+                    "diff": {
+                        "unexpectedChanges": 0,
+                        "trackedDiff": ["frozen"],
+                        "untrackedInventory": ["frozen"],
+                        "intendedChanges": ["v0.1.5"],
+                    },
+                    "review": {
+                        "unresolvedBlockers": 0,
+                        "reviewReport": ["independent"],
+                        "blockerDisposition": ["closed"],
+                    },
+                },
+            )
+            readiness_sha256 = fixture.manifest["environment"][
+                "NEXUS_V015_READINESS_LEDGER_SHA256"
+            ]
+            e2_result_path = fixture.result_paths["E2"]
+            e2_result = json.loads(e2_result_path.read_text(encoding="utf-8"))
+            coverage_path = fixture.root / e2_result["artifacts"]["affordanceCoverage"]["path"]
+            coverage = json.loads(coverage_path.read_text(encoding="utf-8"))
+            coverage["livePlugin"] = live_plugin_doc(
+                validator_contract["RUN_ID"],
+                readiness_sha256,
+                fixture.candidate_digest,
+            )
+            os.chmod(coverage_path, 0o600)
+            write_json(coverage_path, coverage)
+            os.chmod(coverage_path, 0o400)
+            e2_result["artifacts"]["affordanceCoverage"]["sha256"] = sha(
+                coverage_path.read_bytes()
+            )
+            os.chmod(e2_result_path, 0o600)
+            write_json(e2_result_path, e2_result)
+            os.chmod(e2_result_path, 0o400)
+            assembled = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "--run-root",
+                    str(fixture.root),
+                    "--host-before",
+                    str(before),
+                    "--host-after",
+                    str(after),
+                    "--diff-review",
+                    str(disposition),
+                    "--cargo-metadata",
+                    str(metadata),
+                    "--nexus-bin",
+                    str(nexus),
+                    "--readiness-sha256",
+                    readiness_sha256,
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(assembled.returncode, 0, assembled.stderr)
+
+            readiness_raw = fixture.readiness_path.read_bytes()
+            authority = validator_module["RunAuthority"](
+                lab_root=fixture.lab_root,
+                run_root=fixture.root,
+                run_id=validator_contract["RUN_ID"],
+                container_id=fixture.container_id,
+                readiness_path=fixture.readiness_path,
+                readiness_sha256=sha(readiness_raw),
+                readiness_rows=dict(
+                    line.split("=", 1)
+                    for line in readiness_raw.decode("utf-8").splitlines()
+                ),
+                seal_root=fixture.seal_root,
+                fixture=True,
+            )
+            validator = validator_module["Validator"](fixture.root, authority)
+            validator.revalidate_run_authority = lambda: None
+            try:
+                validator.validate(require_run_seal=False)
+            finally:
+                validator.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

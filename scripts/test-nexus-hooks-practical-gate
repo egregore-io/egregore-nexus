@@ -4,7 +4,11 @@
 from __future__ import annotations
 
 import json
+import os
+import runpy
+import stat
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -14,6 +18,7 @@ SCRIPT = ROOT / "scripts" / "nexus-hooks-practical-gate"
 BEFORE_SEND = ROOT / "core" / "tests" / "fixtures" / "hooks" / "before-send.py"
 AFTER_RECEIPT = ROOT / "core" / "tests" / "fixtures" / "hooks" / "after-receipt.mjs"
 CHECK = ROOT / "scripts" / "check"
+LAB_GATE = ROOT / "scripts" / "nexus-docker-test-env"
 
 
 class HooksPracticalGateContractTests(unittest.TestCase):
@@ -30,6 +35,8 @@ class HooksPracticalGateContractTests(unittest.TestCase):
         self.assertIn("gateway outage", help_text)
         self.assertIn("restart recovery", help_text)
         self.assertIn("token stream", help_text)
+        self.assertIn("--packed-v015", help_text)
+        self.assertIn("--evidence-dir", help_text)
 
     def test_scenario_inventory_covers_every_required_source_and_failure_mode(self) -> None:
         listed = subprocess.run(
@@ -94,7 +101,7 @@ class HooksPracticalGateContractTests(unittest.TestCase):
 
     def test_idempotent_retry_does_not_execute_hooks_twice(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("if (evaluations, executions) != (1, 1):", source)
+        self.assertIn("if (evaluations, executions) != (2, 6):", source)
 
     def test_host_wrapper_converts_child_failures_to_one_gate_error(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
@@ -178,6 +185,114 @@ class HooksPracticalGateContractTests(unittest.TestCase):
                 }
             },
         )
+
+    def test_embedded_shell_javascript_and_python_handlers_cover_both_events(self) -> None:
+        namespace = runpy.run_path(str(SCRIPT))
+        assets = namespace["hook_programs"]()
+        invocation = {
+            "protocol": "nexus.hooks/v1",
+            "invocationId": "hi_f2_contract",
+            "event": "before_send",
+            "message": {
+                "sender": {"name": "fixture"},
+                "target": {"verb": "post", "thread": "hooks-gate"},
+                "body": "GATE[gateway-rest|yield_turn] hello",
+                "mention": [],
+                "metadata": {},
+            },
+        }
+        receipt = {
+            **invocation,
+            "event": "after_receipt",
+            "receipt": {"messageId": "m_f2_contract"},
+        }
+        commands = {
+            "shell": ["sh", "hook-shell.sh"],
+            "javascript": ["node", "hook-javascript.mjs"],
+            "python": ["python3", "hook-python.py"],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, contents in assets.items():
+                (root / name).write_text(contents, encoding="utf-8")
+            for language, command in commands.items():
+                before = subprocess.run(
+                    [command[0], str(root / command[1])],
+                    input=json.dumps(invocation),
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                after = subprocess.run(
+                    [command[0], str(root / command[1])],
+                    input=json.dumps(receipt),
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                before_metadata = json.loads(before.stdout)["metadata"]
+                after_metadata = json.loads(after.stdout)["metadata"]
+                self.assertIs(before_metadata[f"f2{language.title()}"]["beforeSend"], True)
+                self.assertIs(after_metadata[f"f2{language.title()}"]["afterReceipt"], True)
+
+    def test_f2_result_publication_is_atomic_candidate_bound_and_no_clobber(self) -> None:
+        namespace = runpy.run_path(str(SCRIPT))
+        publish = namespace["publish_f2_result"]
+        candidate = {
+            "schemaVersion": 1,
+            "status": "PASS",
+            "mode": "packed",
+            "runId": "f2-contract",
+            "candidateDigest": "a" * 64,
+            "readinessPath": "/tmp/lab/lab/candidate-ready.v1",
+            "readinessSha256": "b" * 64,
+            "installRoot": "/tmp/nexus-lab-install.contract",
+            "imageDigest": "sha256:" + "c" * 64,
+            "limits": {"cpus": 6, "memoryBytes": 8589934592, "pids": 1024},
+            "runtime": {
+                "daemonExecutable": "/tmp/nexus-lab-install.contract/native/nexus",
+                "gatewayEntrypoint": "/tmp/nexus-lab-install.contract/bin/nexus-gateway.mjs",
+            },
+        }
+        artifact_documents = {
+            name: {"schemaVersion": 1, "kind": name, "observed": True}
+            for name in ("shell", "javascript", "python", "timing")
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            run_root = Path(temporary) / "evidence" / "f2-contract"
+            run_root.mkdir(parents=True)
+            result_path = publish(run_root, candidate, {"messages": {}}, artifact_documents)
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(result["gate"], "F2")
+            self.assertEqual(result["runId"], "f2-contract")
+            self.assertEqual(result["candidateDigest"], "a" * 64)
+            self.assertEqual(result["status"], "PASS")
+            self.assertEqual(result["requiredArtifacts"], [
+                "shell", "javascript", "python", "timing",
+            ])
+            for record in result["artifacts"].values():
+                artifact = run_root / record["path"]
+                self.assertTrue(artifact.is_file())
+                self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o400)
+            self.assertEqual(stat.S_IMODE(result_path.stat().st_mode), 0o400)
+            with self.assertRaises(namespace["GateFailure"]):
+                publish(run_root, candidate, {"messages": {}}, artifact_documents)
+
+    def test_packed_all_gate_runs_f2_before_final_seal(self) -> None:
+        source = LAB_GATE.read_text(encoding="utf-8")
+        install = (
+            "install -m 0555 /work/egregore-nexus/scripts/nexus-hooks-practical-gate "
+            "/tmp/nexus-lab-bin/nexus-hooks-practical-gate"
+        )
+        invoke = (
+            "/tmp/nexus-lab-bin/nexus-hooks-practical-gate --packed-v015 "
+            "--evidence-dir \"$NEXUS_LAB_ROOT/evidence\" --run-id \"$NEXUS_V015_RUN_ID\""
+        )
+        seal = '/tmp/nexus-lab-bin/nexus-v015-evidence-validate --seal "$run_root"'
+        self.assertIn(install, source)
+        self.assertIn(invoke, source)
+        self.assertIn(seal, source)
+        self.assertLess(source.index(invoke), source.index(seal))
 
 
 if __name__ == "__main__":

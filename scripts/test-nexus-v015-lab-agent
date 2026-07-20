@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TARGET="$SCRIPT_DIR/nexus-v015-lab-agent"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$TMP/bin" "$TMP/lab/nexus" "$TMP/lab/evidence" "$TMP/lab/lab" "$TMP/state"
+printf '%s\n' \
+  'schema=1' \
+  'mode=packed' \
+  'runId=fixture-run' \
+  'containerId=fixture-container' \
+  >"$TMP/lab/lab/candidate-ready.v1"
+chmod 0444 "$TMP/lab/lab/candidate-ready.v1"
+
+cat >"$TMP/bin/codex" <<'FIXTURE'
+#!/usr/bin/env bash
+echo 'WARNING: temporary CODEX_HOME helper aliases are disabled'
+echo 'codex-cli 1.2.3'
+FIXTURE
+cat >"$TMP/bin/claude" <<'FIXTURE'
+#!/usr/bin/env bash
+echo 'claude-code 4.5.6'
+FIXTURE
+chmod +x "$TMP/bin/codex" "$TMP/bin/claude"
+
+cat >"$TMP/bin/nexus-fixture" <<'FIXTURE'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$FIXTURE_COMMANDS"
+case "${1:-}" in
+  members)
+    if [ "${NEXUS_PROJECT:-}" != v015-lab ]; then
+      echo 'members must query with the validator project caller context' >&2
+      exit 65
+    fi
+    members=()
+    for kind in codex claude; do
+      if [ -f "$FIXTURE_STATE_DIR/$kind" ]; then
+        members+=("$(printf '{\"name\":\"v015-%s\",\"agentId\":\"a_%s\",\"sessionId\":\"s_%s\",\"harness\":\"%s\",\"presence\":\"%s\"}' "$kind" "$kind" "$kind" "$kind" "${FIXTURE_MEMBER_PRESENCE:-online}")")
+      fi
+    done
+    if [ -f "$FIXTURE_STATE_DIR/offline" ]; then
+      offline_presence=$(cat "$FIXTURE_STATE_DIR/offline")
+      members+=("$(printf '{\"name\":\"v015-offline\",\"agentId\":\"a_offline\",\"sessionId\":\"s_offline\",\"harness\":\"codex\",\"presence\":\"%s\"}' "$offline_presence")")
+    fi
+    joined=$(IFS=,; echo "${members[*]-}")
+    printf '{"members":[%s]}\n' "$joined"
+    ;;
+  launch)
+    if [ "${FIXTURE_LAUNCH_FAILURE:-}" = external ]; then
+      echo 'OAuth token expired or credits exhausted' >&2
+      exit 1
+    fi
+    if [ "${FIXTURE_LAUNCH_FAILURE:-}" = nexus ]; then
+      echo 'daemon routing failed' >&2
+      exit 1
+    fi
+    kind=${*: -1}
+    touch "$FIXTURE_STATE_DIR/$kind"
+    printf '{"sessionId":"s_%s","agentId":"a_%s"}\n' "$kind" "$kind"
+    ;;
+  register)
+    printf 'online\n' >"$FIXTURE_STATE_DIR/offline"
+    printf '{"sessionId":"s_offline","agentId":"a_offline","directive":"registered"}\n'
+    ;;
+  admin)
+    [ "${2:-}" = remove ] && [ "${3:-}" = v015-offline ] || exit 64
+    printf 'offline\n' >"$FIXTURE_STATE_DIR/offline"
+    printf '{"name":"v015-offline","status":"removed"}\n'
+    ;;
+  *) exit 64 ;;
+esac
+FIXTURE
+chmod +x "$TMP/bin/nexus-fixture"
+
+run_hook() {
+  PATH="$TMP/bin:/usr/bin:/bin" \
+    OCULAR_LAB=1 \
+    NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+    NEXUS_V015_NEXUS_BIN="$TMP/bin/nexus-fixture" \
+    NEXUS_V015_RUN_ID=fixture-run \
+    NEXUS_V015_READINESS_LEDGER_SHA256="${READINESS_OVERRIDE:-$(sha256sum "$TMP/lab/lab/candidate-ready.v1" | awk '{print $1}')}" \
+    NEXUS_LAB_ROOT="$TMP/lab" \
+    NEXUS_HOME="$TMP/lab/nexus" \
+    FIXTURE_COMMANDS="$TMP/commands" \
+    FIXTURE_STATE_DIR="$TMP/state" \
+    "$TARGET" "$@"
+}
+
+set +e
+"$TARGET" --help >"$TMP/help.stdout" 2>"$TMP/help.stderr"
+help_status=$?
+set -e
+[ "$help_status" -eq 0 ]
+grep -Fq 'lab-agent launch codex|claude|offline' "$TMP/help.stdout"
+[ ! -e "$TMP/commands" ]
+
+set +e
+PATH="$TMP/bin:/usr/bin:/bin" \
+  NEXUS_V015_NEXUS_BIN="$TMP/bin/nexus-fixture" \
+  NEXUS_LAB_ROOT="$TMP/lab" \
+  NEXUS_HOME="$TMP/lab/nexus" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_STATE_DIR="$TMP/state" \
+  "$TARGET" launch codex >"$TMP/outside.stdout" 2>"$TMP/outside.stderr"
+outside_status=$?
+set -e
+[ "$outside_status" -eq 1 ]
+grep -Fq 'refusing to run outside' "$TMP/outside.stderr"
+
+run_hook launch codex
+run_hook launch claude
+run_hook launch offline
+[ -f "$TMP/state/codex" ]
+[ -f "$TMP/state/claude" ]
+[ "$(cat "$TMP/state/offline")" = offline ]
+jq -e '
+  .version == 1 and .runId == "fixture-run" and
+  (.readinessSha256 | test("^[0-9a-f]{64}$")) and
+  .candidate.runId == "fixture-run" and
+  .candidate.readinessSha256 == .readinessSha256 and
+  .agents.codex.name == "v015-codex" and
+  .agents.codex.agentId == "a_codex" and
+  .agents.codex.sessionId == "s_codex" and
+  .agents.codex.executable != "" and
+  (.agents.codex.sha256 | test("^[0-9a-f]{64}$")) and
+  .agents.codex.version == "codex-cli 1.2.3" and
+  .agents.claude.name == "v015-claude" and
+  .agents.claude.version == "claude-code 4.5.6" and
+  .agents.offline.name == "v015-offline" and
+  .agents.offline.agentId == "a_offline" and
+  .agents.offline.sessionId == "s_offline" and
+  .agents.offline.fixture == "registered-never-connected"
+' "$TMP/lab/lab/agents.json" >/dev/null
+
+grep -Fq 'launch --json --name v015-codex --project v015-lab' "$TMP/commands"
+grep -Fq 'members --json --include-offline' "$TMP/commands"
+grep -Fq -- '--cwd ' "$TMP/commands"
+grep -Fq -- '--initial-prompt ' "$TMP/commands"
+grep -Fq -- '--headless --detach codex' "$TMP/commands"
+grep -Fq -- '--headless --detach claude' "$TMP/commands"
+grep -Fq 'register --json --name v015-offline --agent codex --kind agent --project v015-lab --client-key ' "$TMP/commands"
+grep -Fq 'admin remove v015-offline --json' "$TMP/commands"
+[ "$(grep -Fc 'register --json --name v015-offline ' "$TMP/commands")" -eq 1 ]
+run_hook launch offline
+[ "$(grep -Fc 'register --json --name v015-offline ' "$TMP/commands")" -eq 1 ]
+[ "$(grep -Fc 'admin remove v015-offline --json' "$TMP/commands")" -eq 1 ]
+[ "$(grep -Fc -- '--headless --detach codex' "$TMP/commands")" -eq 1 ]
+run_hook launch codex
+[ "$(grep -Fc -- '--headless --detach codex' "$TMP/commands")" -eq 1 ]
+! grep -Eq 'cargo|npm|compile|build' "$TMP/commands"
+
+# A same-name row is reusable only when it is currently online. An offline
+# fossil cannot satisfy the live-harness acceptance precondition.
+set +e
+FIXTURE_MEMBER_PRESENCE=offline run_hook launch codex \
+  >"$TMP/offline.stdout" 2>"$TMP/offline.stderr"
+offline_status=$?
+set -e
+[ "$offline_status" -eq 5 ]
+grep -Fq 'not online' "$TMP/offline.stderr"
+
+# The manifest is inseparable from the immutable readiness receipt. Missing
+# or stale binding fails before Nexus or a harness is invoked.
+commands_before=$(wc -l <"$TMP/commands")
+set +e
+OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_V015_NEXUS_BIN="$TMP/bin/nexus-fixture" \
+  NEXUS_V015_RUN_ID=fixture-run \
+  NEXUS_LAB_ROOT="$TMP/lab" \
+  NEXUS_HOME="$TMP/lab/nexus" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_STATE_DIR="$TMP/state" \
+  "$TARGET" launch codex >"$TMP/no-binding.stdout" 2>"$TMP/no-binding.stderr"
+no_binding_status=$?
+READINESS_OVERRIDE="$(printf 'f%.0s' {1..64})" \
+  run_hook launch codex >"$TMP/stale-binding.stdout" 2>"$TMP/stale-binding.stderr"
+stale_binding_status=$?
+set -e
+[ "$no_binding_status" -eq 1 ]
+[ "$stale_binding_status" -eq 1 ]
+grep -Fiq 'readiness' "$TMP/no-binding.stderr"
+grep -Fiq 'readiness' "$TMP/stale-binding.stderr"
+[ "$(wc -l <"$TMP/commands")" -eq "$commands_before" ]
+
+mkdir -p "$TMP/native"
+mv "$TMP/bin/codex" "$TMP/native/codex"
+rm -f "$TMP/state/codex"
+NEXUS_V015_CODEX_BIN="$TMP/native/codex" run_hook launch codex
+[ -f "$TMP/state/codex" ]
+grep -Fq "$TMP/native/codex" "$TMP/lab/lab/agents.json"
+mv "$TMP/native/codex" "$TMP/bin/codex"
+
+mv "$TMP/bin/codex" "$TMP/bin/codex.missing"
+set +e
+run_hook launch codex >"$TMP/missing.stdout" 2>"$TMP/missing.stderr"
+missing_status=$?
+set -e
+[ "$missing_status" -eq 3 ]
+grep -Fq 'LAB_AGENT_HARNESS_MISSING' "$TMP/missing.stderr"
+mv "$TMP/bin/codex.missing" "$TMP/bin/codex"
+
+rm -f "$TMP/state/codex"
+set +e
+FIXTURE_LAUNCH_FAILURE=external run_hook launch codex >"$TMP/external.stdout" 2>"$TMP/external.stderr"
+external_status=$?
+FIXTURE_LAUNCH_FAILURE=nexus run_hook launch codex >"$TMP/nexus.stdout" 2>"$TMP/nexus.stderr"
+nexus_status=$?
+set -e
+[ "$external_status" -eq 4 ]
+[ "$nexus_status" -eq 5 ]
+grep -Fq 'LAB_AGENT_EXTERNAL_UNAVAILABLE' "$TMP/external.stderr"
+grep -Fq 'LAB_AGENT_NEXUS_FAILURE' "$TMP/nexus.stderr"
+
+set +e
+run_hook launch opencode >"$TMP/bad-kind.stdout" 2>"$TMP/bad-kind.stderr"
+bad_kind_status=$?
+set -e
+[ "$bad_kind_status" -eq 2 ]
+grep -Fq 'kind must be codex, claude, or offline' "$TMP/bad-kind.stderr"
+
+bash -n "$TARGET"
+printf 'v0.1.5 live agent hook: ok\n'

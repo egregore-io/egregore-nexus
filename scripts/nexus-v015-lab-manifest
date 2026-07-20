@@ -4,11 +4,12 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$SCRIPT_DIR/.." && pwd)
 CONTAINER="${NEXUS_DOCKER_TEST_NAME:-nexus-v010-load51}"
-MODE="${NEXUS_V015_LAB_MODE:-source}"
+MODE="${NEXUS_V015_LAB_MODE:-packed}"
 RUN_ID="${NEXUS_V015_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUTPUT=""
 COPY_TO_CONTAINER=1
 LAB_ROOT="${NEXUS_V015_LAB_ROOT:-/tmp/nexus-lens-home}"
+VERSION=0.1.5
 
 usage() {
   cat <<'USAGE'
@@ -18,7 +19,7 @@ Capture a redacted, reproducible manifest for the isolated v0.1.5 validator.
 
 Options:
   --container NAME  Validator container name.
-  --mode MODE       Candidate mode: source or packed.
+  --mode MODE       Candidate mode; v0.1.5 release manifests require packed.
   --output PATH     Host output path for manifest.json.
   --run-id ID       Evidence run identifier.
   --no-copy         Do not copy the manifest into the validator evidence tree.
@@ -71,11 +72,15 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$MODE" in
-  source|packed) ;;
-  *) die "--mode must be source or packed" ;;
+  packed) ;;
+  *) die "the v0.1.5 release manifest requires --mode packed" ;;
 esac
+[[ "$RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$ ]] \
+  || die "run ID must match [A-Za-z0-9][A-Za-z0-9_-]{0,127}"
+[ "$LAB_ROOT" = /tmp/nexus-lens-home ] \
+  || die "candidate manifests require NEXUS_V015_LAB_ROOT=/tmp/nexus-lens-home"
 
-for command in docker git jq sha256sum; do
+for command in base64 docker git jq sha256sum tar; do
   command -v "$command" >/dev/null 2>&1 || die "required command is unavailable: $command"
 done
 
@@ -84,96 +89,1126 @@ if [ -z "$OUTPUT" ]; then
 fi
 
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+CONTAINER_COPY_STAGE=""
+CONTAINER_COPY_FINAL=""
+HOST_STAGE=""
+
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [ "$status" -ne 0 ] && [ -n "$CONTAINER_COPY_STAGE" ]; then
+    echo "error: incomplete container manifest stage retained for diagnosis: $CONTAINER_COPY_STAGE" >&2
+  fi
+  if [ "$status" -ne 0 ] && [ -n "$HOST_STAGE" ]; then
+    echo "error: incomplete host manifest stage retained for diagnosis: $HOST_STAGE" >&2
+  fi
+  rm -rf "$TMP"
+  exit "$status"
+}
+trap cleanup EXIT
+
+source_ledger_program() {
+  command cat <<'PY'
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import time
+
+O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def fail(message: str) -> "NoReturn":
+    raise SystemExit(message)
+
+
+def git(repo: Path, *arguments: str) -> bytes:
+    result = subprocess.run(
+        ["git", "-C", os.fspath(repo), *arguments],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        fail(f"source Git query failed for {repo}: {detail}")
+    return result.stdout
+
+
+def revision(repo: Path) -> str:
+    value = git(repo, "rev-parse", "HEAD").decode("ascii", "strict").strip()
+    if len(value) not in (40, 64) or any(character not in "0123456789abcdef" for character in value):
+        fail(f"source revision is invalid: {repo}")
+    return value
+
+
+def dirty_names(repo: Path) -> tuple[bytes, ...]:
+    payload = (
+        git(repo, "diff", "--name-only", "-z", "HEAD")
+        + git(repo, "ls-files", "--others", "--exclude-standard", "-z")
+    )
+    names = tuple(sorted(set(part for part in payload.split(b"\0") if part)))
+    for name in names:
+        if name.startswith(b"/") or any(part in (b"", b".", b"..") for part in name.split(b"/")):
+            fail(f"source dirty path is unsafe: {name!r}")
+    return names
+
+
+def open_directory(path: Path) -> int:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    fd = os.open("/", os.O_RDONLY | O_DIRECTORY)
+    try:
+        for component in absolute.parts[1:]:
+            child = os.open(
+                component,
+                os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW,
+                dir_fd=fd,
+            )
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_gid,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def parent_for(root_fd: int, components: list[str]) -> tuple[int, str]:
+    fd = os.dup(root_fd)
+    try:
+        for component in components[:-1]:
+            child = os.open(
+                component,
+                os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW,
+                dir_fd=fd,
+            )
+            os.close(fd)
+            fd = child
+        return fd, components[-1]
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def inspect_path(root_fd: int, raw_name: bytes) -> dict[str, object]:
+    text = os.fsdecode(raw_name)
+    components = [os.fsdecode(part) for part in raw_name.split(b"/")]
+    parent_fd, leaf = parent_for(root_fd, components)
+    try:
+        try:
+            before = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return {"path": text, "state": "deleted", "sha256": None}
+        if stat.S_ISLNK(before.st_mode):
+            target = os.readlink(leaf, dir_fd=parent_fd)
+            after = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            if identity(before) != identity(after):
+                fail(f"source symlink changed while captured: {text}")
+            digest = hashlib.sha256(os.fsencode(target)).hexdigest()
+        elif stat.S_ISREG(before.st_mode):
+            fd = os.open(leaf, os.O_RDONLY | O_NOFOLLOW, dir_fd=parent_fd)
+            try:
+                opened = os.fstat(fd)
+                if identity(opened) != identity(before):
+                    fail(f"source file changed before open: {text}")
+                digest_object = hashlib.sha256()
+                while True:
+                    block = os.read(fd, 1024 * 1024)
+                    if not block:
+                        break
+                    digest_object.update(block)
+                after = os.fstat(fd)
+            finally:
+                os.close(fd)
+            visible = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            if identity(before) != identity(after) or identity(after) != identity(visible):
+                fail(f"source file changed while captured: {text}")
+            digest = digest_object.hexdigest()
+        else:
+            fail(f"source dirty path is not a file/symlink: {text}")
+        return {"path": text, "state": "present", "sha256": digest}
+    finally:
+        os.close(parent_fd)
+
+
+def snapshot(repo: Path) -> dict[str, object]:
+    head = revision(repo)
+    names = dirty_names(repo)
+    root_fd = open_directory(repo)
+    try:
+        dirty = [inspect_path(root_fd, name) for name in names]
+    finally:
+        os.close(root_fd)
+    return {
+        "revision": head,
+        "dirty": bool(dirty),
+        "dirtyPaths": dirty,
+    }
+
+
+def maybe_pause(repo: Path) -> None:
+    expected = os.environ.get("NEXUS_V015_SOURCE_CAPTURE_PAUSE_REPO")
+    ready = os.environ.get("NEXUS_V015_SOURCE_CAPTURE_PAUSE_READY")
+    proceed = os.environ.get("NEXUS_V015_SOURCE_CAPTURE_PAUSE_CONTINUE")
+    if expected != os.fspath(repo) or not ready or not proceed:
+        return
+    Path(ready).touch(exist_ok=False)
+    deadline = time.monotonic() + 10
+    while not Path(proceed).exists():
+        if time.monotonic() >= deadline:
+            fail("source capture test pause timed out")
+        time.sleep(0.01)
+
+
+def capture(arguments: argparse.Namespace) -> None:
+    repo = Path(arguments.repo)
+    first = snapshot(repo)
+    maybe_pause(repo)
+    second = snapshot(repo)
+    if first != second:
+        fail(f"source changed while manifest snapshot was captured: {repo}")
+    token = Path(arguments.token)
+    token.write_text(json.dumps(first, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    print(json.dumps(first, sort_keys=True, separators=(",", ":")))
+
+
+def verify(arguments: argparse.Namespace) -> None:
+    repo = Path(arguments.repo)
+    expected = json.loads(Path(arguments.token).read_text(encoding="utf-8"))
+    observed = snapshot(repo)
+    if observed != expected:
+        fail(f"source changed after manifest snapshot was captured: {repo}")
+
+
+parser = argparse.ArgumentParser()
+sub = parser.add_subparsers(required=True)
+capture_parser = sub.add_parser("capture")
+capture_parser.add_argument("--repo", required=True)
+capture_parser.add_argument("--token", required=True)
+capture_parser.set_defaults(handler=capture)
+verify_parser = sub.add_parser("verify")
+verify_parser.add_argument("--repo", required=True)
+verify_parser.add_argument("--token", required=True)
+verify_parser.set_defaults(handler=verify)
+args = parser.parse_args()
+args.handler(args)
+PY
+}
 
 source_record() {
-  local path=$1
-  local dirty_json="$TMP/dirty-$(printf '%s' "$path" | sha256sum | cut -d' ' -f1).json"
-  local names="$TMP/names-$(printf '%s' "$path" | sha256sum | cut -d' ' -f1)"
-  local sha=""
-  local exists=false
+  local path=$1 token=$2
+  source_ledger_program | python3 - capture --repo "$path" --token "$token"
+}
 
-  printf '[]\n' >"$dirty_json"
-  if [ -d "$path/.git" ] || git -C "$path" rev-parse --git-dir >/dev/null 2>&1; then
-    exists=true
-    sha=$(git -C "$path" rev-parse HEAD)
-    {
-      git -C "$path" diff --name-only -z HEAD
-      git -C "$path" ls-files --others --exclude-standard -z
-    } | sort -zu >"$names"
+verify_source_record() {
+  local path=$1 token=$2
+  source_ledger_program | python3 - verify --repo "$path" --token "$token"
+}
 
-    while IFS= read -r -d '' relative; do
-      local absolute="$path/$relative"
-      local state=present
-      local digest=""
-      if [ -L "$absolute" ]; then
-        digest=$(readlink "$absolute" | sha256sum | cut -d' ' -f1)
-      elif [ -f "$absolute" ]; then
-        digest=$(sha256sum "$absolute" | cut -d' ' -f1)
-      else
-        state=deleted
-      fi
-      jq \
-        --arg path "$relative" \
-        --arg state "$state" \
-        --arg sha256 "$digest" \
-        '. + [{path: $path, state: $state, sha256: $sha256}]' \
-        "$dirty_json" >"$dirty_json.next"
-      mv "$dirty_json.next" "$dirty_json"
-    done <"$names"
-  fi
+readiness_snapshot_program() {
+  command cat <<'PY'
+from __future__ import annotations
 
-  jq -n \
-    --arg path "$path" \
-    --arg sha "$sha" \
-    --argjson exists "$exists" \
-    --slurpfile dirty "$dirty_json" \
-    '{path: $path, exists: $exists, sha: (if $sha == "" then null else $sha end),
-      dirty: ($dirty[0] | length > 0), dirtyPaths: $dirty[0]}'
+import argparse
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+
+O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def fail(message: str) -> "NoReturn":
+    raise SystemExit(message)
+
+
+def identity(info: os.stat_result) -> tuple[int, ...]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_gid,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def open_parent(path: Path) -> tuple[int, str]:
+    if not path.is_absolute():
+        fail("candidate readiness path must be absolute")
+    fd = os.open("/", os.O_RDONLY | O_DIRECTORY)
+    try:
+        for component in path.parts[1:-1]:
+            child = os.open(
+                component,
+                os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW,
+                dir_fd=fd,
+            )
+            os.close(fd)
+            fd = child
+        return fd, path.name
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def main(path: Path, expected_uid: int, expected_gid: int) -> None:
+    parent_fd, leaf = open_parent(path)
+    try:
+        parent = os.fstat(parent_fd)
+        if (
+            (parent.st_uid, parent.st_gid) != (expected_uid, expected_gid)
+            or stat.S_IMODE(parent.st_mode) != 0o1777
+        ):
+            fail("candidate readiness parent must be root-owned mode 1777")
+        visible_before = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        descriptor = os.open(leaf, os.O_RDONLY | O_NOFOLLOW, dir_fd=parent_fd)
+        try:
+            before = os.fstat(descriptor)
+            if identity(before) != identity(visible_before):
+                fail("candidate readiness changed before open")
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or (before.st_uid, before.st_gid) != (expected_uid, expected_gid)
+                or stat.S_IMODE(before.st_mode) != 0o444
+                or before.st_nlink != 1
+            ):
+                fail("candidate readiness must be a root-owned single-link 0444 file")
+            chunks: list[bytes] = []
+            while True:
+                block = os.read(descriptor, 64 * 1024)
+                if not block:
+                    break
+                chunks.append(block)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        visible_after = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        if identity(before) != identity(after) or identity(after) != identity(visible_after):
+            fail("candidate readiness changed while read")
+    finally:
+        os.close(parent_fd)
+
+    raw = b"".join(chunks)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError as error:
+        fail(f"candidate readiness is not UTF-8: {error}")
+    rows: dict[str, str] = {}
+    for line in text.splitlines():
+        key, separator, value = line.partition("=")
+        if (
+            not separator
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*", key)
+            or not value
+            or key in rows
+        ):
+            fail("candidate readiness has an invalid or duplicate key")
+        rows[key] = value
+    if not rows or not raw.endswith(b"\n"):
+        fail("candidate readiness is empty or lacks a final newline")
+    print(json.dumps({
+        "schemaVersion": 1,
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "uid": before.st_uid,
+        "gid": before.st_gid,
+        "mode": stat.S_IMODE(before.st_mode),
+        "nlink": before.st_nlink,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "bytesBase64": base64.b64encode(raw).decode("ascii"),
+        "rows": rows,
+    }, sort_keys=True, separators=(",", ":")))
+
+
+parser = argparse.ArgumentParser()
+parser.add_argument("path")
+parser.add_argument("--expected-uid", type=int, required=True)
+parser.add_argument("--expected-gid", type=int, required=True)
+arguments = parser.parse_args()
+main(Path(arguments.path), arguments.expected_uid, arguments.expected_gid)
+PY
+}
+
+# This exact program is used on both sides of docker cp.  It opens every
+# ancestry component and tree entry with O_NOFOLLOW, validates and hashes the
+# same fstat-backed inode it reads, fsyncs bottom-up, and publishes a directory
+# with Linux renameat2(RENAME_NOREPLACE).  A tree is candidate evidence only
+# after the final 0400 commit seal is durable.
+secure_tree_program() {
+  command cat <<'PY'
+from __future__ import annotations
+
+import argparse
+import ctypes
+import errno
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+RENAME_NOREPLACE = 1
+SEAL = ".candidate-committed"
+
+
+def fail(message: str) -> "NoReturn":
+    raise SystemExit(message)
+
+
+def canonical(value: object) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def strict_json(data: bytes) -> object:
+    def pairs(rows: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in rows:
+            if key in result:
+                fail(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    return json.loads(data.decode("utf-8"), object_pairs_hook=pairs, parse_constant=lambda v: fail(f"non-finite JSON: {v}"))
+
+
+def open_dir_no_follow(path: str) -> int:
+    if not os.path.isabs(path):
+        fail(f"path must be absolute: {path}")
+    fd = os.open("/", os.O_RDONLY | O_DIRECTORY)
+    try:
+        for component in [part for part in path.split("/") if part]:
+            child = os.open(component, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_regular(parent_fd: int, name: str, expected_uid: int, expected_gid: int) -> tuple[bytes, os.stat_result]:
+    before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        fail(f"unsafe evidence file: {name}")
+    fd = os.open(name, os.O_RDONLY | O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            fail(f"evidence file changed before open: {name}")
+        if (opened.st_uid, opened.st_gid) != (expected_uid, expected_gid):
+            fail(f"evidence file owner mismatch: {name}")
+        if stat.S_IMODE(opened.st_mode) & 0o022:
+            fail(f"evidence file is group/other writable: {name}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        os.fsync(fd)
+        after = os.fstat(fd)
+        identity = lambda row: (row.st_dev, row.st_ino, row.st_size, row.st_mode, row.st_uid, row.st_gid, row.st_nlink, row.st_mtime_ns)
+        if identity(opened) != identity(after):
+            fail(f"evidence file changed while read: {name}")
+        return b"".join(chunks), after
+    finally:
+        os.close(fd)
+
+
+def inspect_tree(root: str, run_id: str, uid: int, gid: int, expected_dev: int, expected_ino: int, require_seal: bool) -> dict[str, object]:
+    root_fd = open_dir_no_follow(root)
+    try:
+        root_stat = os.fstat(root_fd)
+        if (root_stat.st_dev, root_stat.st_ino) != (expected_dev, expected_ino):
+            fail("evidence stage identity changed")
+        if (root_stat.st_uid, root_stat.st_gid) != (uid, gid):
+            fail("evidence stage owner mismatch")
+        if stat.S_IMODE(root_stat.st_mode) != 0o700:
+            fail("evidence stage mode must be 0700")
+
+        files: dict[str, tuple[bytes, os.stat_result]] = {}
+        directories: set[str] = set()
+
+        def walk(directory_fd: int, prefix: str) -> None:
+            for name in sorted(os.listdir(directory_fd)):
+                if "/" in name or name in {".", ".."}:
+                    fail("unsafe evidence entry name")
+                relative = f"{prefix}/{name}" if prefix else name
+                entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if stat.S_ISDIR(entry.st_mode):
+                    if (entry.st_uid, entry.st_gid) != (uid, gid) or stat.S_IMODE(entry.st_mode) & 0o022:
+                        fail(f"unsafe evidence directory: {relative}")
+                    child = os.open(name, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW, dir_fd=directory_fd)
+                    try:
+                        opened = os.fstat(child)
+                        if (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino):
+                            fail(f"evidence directory changed before open: {relative}")
+                        directories.add(relative)
+                        walk(child, relative)
+                        os.fsync(child)
+                    finally:
+                        os.close(child)
+                elif stat.S_ISREG(entry.st_mode):
+                    files[relative] = read_regular(directory_fd, name, uid, gid)
+                else:
+                    fail(f"non-regular evidence entry: {relative}")
+
+        walk(root_fd, "")
+        os.fsync(root_fd)
+
+        expected_dirs = {"candidate", "candidate/native", "candidate/npm"}
+        if directories != expected_dirs:
+            fail(f"unexpected evidence directories: {sorted(directories ^ expected_dirs)}")
+        for path in expected_dirs:
+            # Every payload directory is created by this producer and has one
+            # canonical immutable-candidate mode.  Merely being non-writable
+            # is insufficient evidence of the intended topology.
+            current_fd = root_fd
+            opened_fds: list[int] = []
+            try:
+                for component in path.split("/"):
+                    current_fd = os.open(
+                        component,
+                        os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW,
+                        dir_fd=current_fd,
+                    )
+                    opened_fds.append(current_fd)
+                if stat.S_IMODE(os.fstat(current_fd).st_mode) != 0o755:
+                    fail(f"candidate payload directory mode must be 0755: {path}")
+            finally:
+                for opened_fd in reversed(opened_fds):
+                    os.close(opened_fd)
+        payload_paths = {
+            "manifest.json",
+            "candidate/native/nexus",
+            "candidate/npm/nexus.tgz",
+            "candidate/npm/nexus-cli.tgz",
+            "candidate/npm/nexus-gateway.tgz",
+        }
+        expected_files = payload_paths | ({SEAL} if require_seal else set())
+        if set(files) != expected_files:
+            fail(f"unexpected evidence files: {sorted(set(files) ^ expected_files)}")
+        if stat.S_IMODE(files["manifest.json"][1].st_mode) != 0o400:
+            fail("manifest mode must be 0400")
+        expected_payload_modes = {
+            "candidate/native/nexus": 0o555,
+            "candidate/npm/nexus.tgz": 0o444,
+            "candidate/npm/nexus-cli.tgz": 0o444,
+            "candidate/npm/nexus-gateway.tgz": 0o444,
+        }
+        for path, expected_mode in expected_payload_modes.items():
+            if stat.S_IMODE(files[path][1].st_mode) != expected_mode:
+                fail(f"candidate payload mode mismatch: {path}")
+
+        manifest_bytes = files["manifest.json"][0]
+        manifest = strict_json(manifest_bytes)
+        if not isinstance(manifest, dict) or manifest.get("schemaVersion") != 1 or manifest.get("runId") != run_id or manifest.get("mode") != "packed":
+            fail("manifest identity mismatch")
+        native = manifest.get("native")
+        packages = manifest.get("packages")
+        if not isinstance(native, dict) or native.get("path") != "candidate/native/nexus":
+            fail("manifest native path is invalid")
+        if not isinstance(packages, list) or len(packages) != 3:
+            fail("manifest package inventory is invalid")
+        expected_packages = (
+            ("@egregore/nexus", "candidate/npm/nexus.tgz"),
+            ("@egregore/nexus-cli", "candidate/npm/nexus-cli.tgz"),
+            ("@egregore/nexus-gateway", "candidate/npm/nexus-gateway.tgz"),
+        )
+        bindings = [(native.get("path"), native.get("sha256"))]
+        for row, (name, path) in zip(packages, expected_packages, strict=True):
+            if not isinstance(row, dict) or row.get("name") != name or row.get("version") != "0.1.5":
+                fail("manifest package identity mismatch")
+            tarball = row.get("tarball")
+            if not isinstance(tarball, dict) or tarball.get("path") != path:
+                fail("manifest package path mismatch")
+            bindings.append((tarball.get("path"), tarball.get("sha256")))
+        for path, digest in bindings:
+            if path not in payload_paths or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+                fail("manifest artifact binding is invalid")
+            actual = hashlib.sha256(files[path][0]).hexdigest()
+            if actual != digest:
+                fail(f"manifest artifact hash mismatch: {path}")
+
+        tree = hashlib.sha256()
+        for path in sorted(payload_paths):
+            mode = stat.S_IMODE(files[path][1].st_mode)
+            tree.update(path.encode() + b"\0" + str(mode).encode() + b"\0" + hashlib.sha256(files[path][0]).hexdigest().encode() + b"\0")
+        result: dict[str, object] = {
+            "runId": run_id,
+            "device": root_stat.st_dev,
+            "inode": root_stat.st_ino,
+            "manifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "treeSha256": tree.hexdigest(),
+        }
+        if require_seal:
+            seal_bytes, seal_stat = files[SEAL]
+            if stat.S_IMODE(seal_stat.st_mode) != 0o400:
+                fail("candidate commit seal mode must be 0400")
+            seal = strict_json(seal_bytes)
+            expected_seal = {"schemaVersion": 1, **result}
+            if seal != expected_seal:
+                fail("candidate commit seal binding mismatch")
+        return result
+    finally:
+        os.close(root_fd)
+
+
+def fault(name: str) -> None:
+    if os.environ.get("NEXUS_V015_EVIDENCE_TREE_TESTING") == "1" and os.environ.get("NEXUS_V015_EVIDENCE_TREE_FAULT") == name:
+        raise OSError(errno.EIO, f"injected {name} fault")
+
+
+def ensure_parent(args: argparse.Namespace) -> None:
+    if not os.path.isabs(args.path):
+        fail("evidence parent path must be absolute")
+    fd = os.open("/", os.O_RDONLY | O_DIRECTORY)
+    try:
+        for component in [part for part in args.path.split("/") if part]:
+            try:
+                child = os.open(component, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                os.mkdir(component, 0o700, dir_fd=fd)
+                os.fsync(fd)
+                child = os.open(component, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        row = os.fstat(fd)
+        if (row.st_uid, row.st_gid) != (args.uid, args.gid) or stat.S_IMODE(row.st_mode) & 0o022:
+            fail("evidence destination parent ownership or mode is unsafe")
+        print(canonical({"path": args.path, "device": row.st_dev, "inode": row.st_ino}).decode(), end="")
+    finally:
+        os.close(fd)
+
+
+def create_stage(args: argparse.Namespace) -> None:
+    parent_fd = open_dir_no_follow(args.parent)
+    try:
+        parent = os.fstat(parent_fd)
+        if (parent.st_uid, parent.st_gid) != (args.uid, args.gid) or stat.S_IMODE(parent.st_mode) & 0o022:
+            fail("evidence parent ownership or mode is unsafe")
+        name = f".{args.run_id}.{args.kind}-{args.nonce}"
+        if not re.fullmatch(r"\.[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.(?:host|copy)-[0-9a-f]{16}", name):
+            fail("evidence staging name is invalid")
+        for entry in os.listdir(parent_fd):
+            if entry.startswith(f".{args.run_id}.{args.kind}-"):
+                fail(f"stale evidence staging root exists: {entry}")
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        stage_fd = os.open(name, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW, dir_fd=parent_fd)
+        try:
+            row = os.fstat(stage_fd)
+            if (row.st_uid, row.st_gid) != (args.uid, args.gid) or stat.S_IMODE(row.st_mode) != 0o700:
+                fail("created evidence stage identity is invalid")
+            print(canonical({"path": os.path.join(args.parent, name), "device": row.st_dev, "inode": row.st_ino}).decode(), end="")
+        finally:
+            os.close(stage_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def rename_noreplace(parent_fd: int, source: str, destination: str) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        fail("renameat2(RENAME_NOREPLACE) is unavailable")
+    result = renameat2(parent_fd, os.fsencode(source), parent_fd, os.fsencode(destination), RENAME_NOREPLACE)
+    if result != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), destination)
+
+
+def publish(args: argparse.Namespace) -> None:
+    stage_parent, stage_name = os.path.split(args.stage)
+    final_parent, final_name = os.path.split(args.final)
+    if stage_parent != final_parent or final_name != args.run_id:
+        fail("evidence publication paths are not one run-bound parent")
+    evidence = inspect_tree(args.stage, args.run_id, args.uid, args.gid, args.dev, args.ino, False)
+    parent_fd = open_dir_no_follow(stage_parent)
+    try:
+        current = os.stat(stage_name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != (args.dev, args.ino):
+            fail("evidence stage changed before publication")
+        try:
+            os.stat(final_name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            fail("refusing to replace existing evidence run root")
+        fault("before-rename")
+        rename_noreplace(parent_fd, stage_name, final_name)
+        os.fsync(parent_fd)
+        fault("after-rename-parent-fsync")
+        final_fd = os.open(final_name, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW, dir_fd=parent_fd)
+        try:
+            visible = os.fstat(final_fd)
+            if (visible.st_dev, visible.st_ino) != (args.dev, args.ino):
+                fail("published evidence identity mismatch")
+            seal_payload = canonical({"schemaVersion": 1, **evidence})
+            temporary = f"{SEAL}.tmp-{os.getpid()}"
+            seal_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, 0o200, dir_fd=final_fd)
+            try:
+                offset = 0
+                while offset < len(seal_payload):
+                    offset += os.write(seal_fd, seal_payload[offset:])
+                os.fsync(seal_fd)
+            finally:
+                os.close(seal_fd)
+            os.rename(temporary, SEAL, src_dir_fd=final_fd, dst_dir_fd=final_fd)
+            os.fsync(final_fd)
+            fault("after-seal-publish")
+            seal_fd = os.open(SEAL, os.O_WRONLY | O_NOFOLLOW, dir_fd=final_fd)
+            try:
+                os.fchmod(seal_fd, 0o400)
+                os.fsync(seal_fd)
+                fault("after-seal-mode")
+            except BaseException:
+                try:
+                    os.fchmod(seal_fd, 0)
+                    os.fsync(seal_fd)
+                    os.fsync(final_fd)
+                finally:
+                    os.close(seal_fd)
+                raise
+            else:
+                os.close(seal_fd)
+            os.fsync(final_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(final_fd)
+    finally:
+        os.close(parent_fd)
+    verified = inspect_tree(args.final, args.run_id, args.uid, args.gid, args.dev, args.ino, True)
+    print(canonical(verified).decode(), end="")
+
+
+def verify(args: argparse.Namespace) -> None:
+    result = inspect_tree(args.root, args.run_id, args.uid, args.gid, args.dev, args.ino, True)
+    print(canonical(result).decode(), end="")
+
+
+def inspect(args: argparse.Namespace) -> None:
+    result = inspect_tree(args.root, args.run_id, args.uid, args.gid, args.dev, args.ino, False)
+    print(canonical(result).decode(), end="")
+
+
+parser = argparse.ArgumentParser()
+sub = parser.add_subparsers(dest="command", required=True)
+ensure = sub.add_parser("ensure-parent")
+ensure.add_argument("--path", required=True)
+ensure.add_argument("--uid", type=int, required=True)
+ensure.add_argument("--gid", type=int, required=True)
+ensure.set_defaults(handler=ensure_parent)
+create = sub.add_parser("create-stage")
+create.add_argument("--parent", required=True)
+create.add_argument("--run-id", required=True)
+create.add_argument("--kind", choices=("host", "copy"), required=True)
+create.add_argument("--nonce", required=True)
+create.add_argument("--uid", type=int, required=True)
+create.add_argument("--gid", type=int, required=True)
+create.set_defaults(handler=create_stage)
+for name in ("publish",):
+    command = sub.add_parser(name)
+    command.add_argument("--stage", required=True)
+    command.add_argument("--final", required=True)
+    command.add_argument("--run-id", required=True)
+    command.add_argument("--uid", type=int, required=True)
+    command.add_argument("--gid", type=int, required=True)
+    command.add_argument("--dev", type=int, required=True)
+    command.add_argument("--ino", type=int, required=True)
+    command.set_defaults(handler=publish)
+inspect_command = sub.add_parser("inspect")
+inspect_command.add_argument("--root", required=True)
+inspect_command.add_argument("--run-id", required=True)
+inspect_command.add_argument("--uid", type=int, required=True)
+inspect_command.add_argument("--gid", type=int, required=True)
+inspect_command.add_argument("--dev", type=int, required=True)
+inspect_command.add_argument("--ino", type=int, required=True)
+inspect_command.set_defaults(handler=inspect)
+check = sub.add_parser("verify")
+check.add_argument("--root", required=True)
+check.add_argument("--run-id", required=True)
+check.add_argument("--uid", type=int, required=True)
+check.add_argument("--gid", type=int, required=True)
+check.add_argument("--dev", type=int, required=True)
+check.add_argument("--ino", type=int, required=True)
+check.set_defaults(handler=verify)
+arguments = parser.parse_args()
+arguments.handler(arguments)
+PY
 }
 
 NEXUS_REPO="${NEXUS_V015_NEXUS_REPO:-$REPO}"
 LENS_REPO="${NEXUS_V015_LENS_REPO:-$HOME/Projects/egregore-lens}"
 EGREGORE_REPO="${NEXUS_V015_EGREGORE_REPO:-$HOME/Projects/egregore-v2}"
-PACTREE_REPO="${NEXUS_V015_PACTREE_REPO:-$HOME/.config/superpowers/worktrees/pactree/v01-one-spine}"
-PACTREE_PY_REPO="${NEXUS_V015_PACTREE_PY_REPO:-$HOME/.config/superpowers/worktrees/pactree-py/v01-read-handle-compat}"
+PACTREE_REPO="${NEXUS_V015_PACTREE_REPO:-}"
+PACTREE_PY_REPO="${NEXUS_V015_PACTREE_PY_REPO:-}"
 PACTREE_FS_REPO="${NEXUS_V015_PACTREE_FS_REPO:-$HOME/Projects/pactree-fs}"
 
-source_record "$NEXUS_REPO" >"$TMP/nexus.json"
-source_record "$LENS_REPO" >"$TMP/lens.json"
-source_record "$EGREGORE_REPO" >"$TMP/egregore.json"
-source_record "$PACTREE_REPO" >"$TMP/pactree.json"
-source_record "$PACTREE_PY_REPO" >"$TMP/pactree-py.json"
-source_record "$PACTREE_FS_REPO" >"$TMP/pactree-fs.json"
+source_record "$NEXUS_REPO" "$TMP/nexus.source" >"$TMP/nexus.json"
+source_record "$LENS_REPO" "$TMP/lens.source" >"$TMP/lens.json"
+source_record "$EGREGORE_REPO" "$TMP/egregore.source" >"$TMP/egregore.json"
+source_record "$PACTREE_REPO" "$TMP/pactree.source" >"$TMP/pactree.json"
+source_record "$PACTREE_PY_REPO" "$TMP/pactree-py.source" >"$TMP/pactree-py.json"
+source_record "$PACTREE_FS_REPO" "$TMP/pactree-fs.source" >"$TMP/pactree-fs.json"
 
 IMAGE_ID=$(docker container inspect -f '{{.Image}}' "$CONTAINER")
-REPO_DIGESTS=$(docker image inspect -f '{{json .RepoDigests}}' "$IMAGE_ID")
+CONTAINER_ID=$(docker container inspect -f '{{.Id}}' "$CONTAINER")
+CONTAINER_USER=$(docker container inspect -f '{{.Config.User}}' "$CONTAINER")
+[[ "$IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] \
+  || die "Docker image ID is not an immutable sha256 digest"
+[[ "$CONTAINER_ID" =~ ^[0-9a-f]{64}$ ]] \
+  || die "Docker container ID is not immutable"
+[[ "$CONTAINER_USER" =~ ^[0-9]+:[0-9]+$ ]] \
+  || die "validator Config.User must be an explicit numeric UID:GID"
+[ "$CONTAINER_USER" = "$(id -u):$(id -g)" ] \
+  || die "validator Config.User does not match the manifest producer UID:GID"
+MANIFEST_UID=${CONTAINER_USER%%:*}
+MANIFEST_GID=${CONTAINER_USER#*:}
 HOST_CONFIG=$(docker container inspect -f '{{json .HostConfig}}' "$CONTAINER")
-PORTS=$(docker container inspect -f '{{json .NetworkSettings.Ports}}' "$CONTAINER")
 ENVIRONMENT=$(docker container inspect -f '{{json .Config.Env}}' "$CONTAINER")
-
-for json_value in REPO_DIGESTS HOST_CONFIG PORTS ENVIRONMENT; do
+for json_value in HOST_CONFIG ENVIRONMENT; do
   jq -e . >/dev/null <<<"${!json_value}" \
     || die "Docker returned invalid JSON for $json_value"
 done
+jq -e '
+  .NanoCpus == 6000000000 and
+  .Memory == 8589934592 and
+  .MemorySwap == 8589934592 and
+  .PidsLimit == 1024
+' >/dev/null <<<"$HOST_CONFIG" \
+  || die "container does not match the exact 6 CPU / 8 GiB / 1024 PID packed contract"
 
-NEXUS_VERSION=$(docker exec "$CONTAINER" bash -lc 'nexus --version')
+READINESS_PATH="$LAB_ROOT/lab/candidate-ready.v1"
+READINESS_SNAPSHOT=$(readiness_snapshot_program | docker exec -i \
+  -e "NEXUS_EXPECTED_RUN_ID=$RUN_ID" "$CONTAINER" \
+  python3 - "$READINESS_PATH" --expected-uid 0 --expected-gid 0) \
+  || die "candidate readiness snapshot failed"
+jq -e '
+  .schemaVersion == 1 and .uid == 0 and .gid == 0 and
+  .mode == 292 and .nlink == 1 and
+  (.device | type == "number") and (.inode | type == "number") and
+  (.sha256 | strings | test("^[0-9a-f]{64}$")) and
+  (.bytesBase64 | strings | length > 0) and (.rows | type == "object")
+' >/dev/null <<<"$READINESS_SNAPSHOT" \
+  || die "candidate readiness snapshot contract failed"
+READINESS_ROWS_BASE64=$(jq -c '.rows' <<<"$READINESS_SNAPSHOT" | base64 | tr -d '\n')
+READINESS_SHA256=$(jq -er '.sha256' <<<"$READINESS_SNAPSHOT")
+
+BINDINGS=$(docker exec \
+  -e "NEXUS_EXPECTED_CONTAINER_ID=$CONTAINER_ID" \
+  -e "NEXUS_EXPECTED_IMAGE_DIGEST=$IMAGE_ID" \
+  -e "NEXUS_EXPECTED_RUN_ID=$RUN_ID" \
+  -e "NEXUS_EXPECTED_LAB_ROOT=$LAB_ROOT" \
+  -e "NEXUS_EXPECTED_READINESS_ROWS_BASE64=$READINESS_ROWS_BASE64" \
+  -e "NEXUS_EXPECTED_READINESS_SHA256=$READINESS_SHA256" \
+  "$CONTAINER" bash -lc 'set -euo pipefail
+  launcher=/tmp/nexus-lab-bin/nexus
+  gateway=/tmp/nexus-lab-bin/nexus-gateway
+  webui=/tmp/nexus-lab-bin/nexus-webui
+  lab_process=/tmp/nexus-lab-bin/lab-process
+  lab_agent=/tmp/nexus-lab-bin/lab-agent
+  lab_fixture=/tmp/nexus-lab-bin/lab-fixture
+  ws_acceptance=/tmp/nexus-lab-bin/nexus-v015-ws-acceptance
+  ws_soak=/tmp/nexus-lab-bin/nexus-v015-ws-soak
+  webconsole_acceptance=/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance
+  webconsole_evidence_verifier=/tmp/nexus-lab-bin/nexus-v015-webconsole-evidence-verify
+  evidence_validator=/tmp/nexus-lab-bin/nexus-v015-evidence-validate
+  release_assembler=/tmp/nexus-lab-bin/nexus-v015-release-assemble
+  readiness="$NEXUS_EXPECTED_LAB_ROOT/lab/candidate-ready.v1"
+  launcher_link=$(readlink "$launcher")
+  case "$launcher_link" in
+    /tmp/nexus-lab-install.*/bin/nexus) ;;
+    *) echo "packed Nexus launcher does not identify a nonce-scoped install" >&2; exit 42 ;;
+  esac
+  prefix=${launcher_link%/bin/nexus}
+  install_nonce=${prefix#/tmp/nexus-lab-install.}
+  [ -n "$install_nonce" ] && [[ "$install_nonce" =~ ^[A-Za-z0-9]+$ ]] \
+    || { echo "packed Nexus install nonce is invalid" >&2; exit 42; }
+  [ -d "$prefix" ] && [ ! -L "$prefix" ]
+  [ "$launcher_link" = "$prefix/bin/nexus" ]
+  [ "$(readlink "$gateway")" = "$prefix/bin/nexus-gateway" ]
+  [ "$(readlink "$webui")" = "$prefix/bin/nexus-webui" ]
+  readiness_json=$(printf "%s" "$NEXUS_EXPECTED_READINESS_ROWS_BASE64" | base64 -d)
+  jq -e "type == \"object\"" >/dev/null <<<"$readiness_json"
+  for hook in \
+    "$lab_process" "$lab_agent" "$lab_fixture" \
+    "$ws_acceptance" "$ws_soak" "$webconsole_acceptance" \
+    "$webconsole_evidence_verifier" "$evidence_validator" "$release_assembler"; do
+    [ -f "$hook" ] && [ ! -L "$hook" ] && [ -x "$hook" ]
+  done
+  ledger_value() {
+    local key=$1
+    jq -er --arg key "$key" ".[\$key] | select(type == \"string\" and length > 0)" \
+      <<<"$readiness_json" || {
+        echo "candidate readiness ledger has invalid ${key}" >&2
+        exit 43
+      }
+  }
+  [ "$(ledger_value schema)" = 1 ]
+  [ "$(ledger_value containerId)" = "$NEXUS_EXPECTED_CONTAINER_ID" ]
+  [ "$(ledger_value mode)" = packed ]
+  [ "$(ledger_value runId)" = "$NEXUS_EXPECTED_RUN_ID" ]
+  [ "$(ledger_value imageDigest)" = "$NEXUS_EXPECTED_IMAGE_DIGEST" ]
+  [ "$(ledger_value installRoot)" = "$prefix" ]
+  [ "$(ledger_value installNonce)" = "$install_nonce" ]
+  [ "$(ledger_value nexusLink)" = "$prefix/bin/nexus" ]
+  [ "$(ledger_value gatewayLink)" = "$prefix/bin/nexus-gateway" ]
+  [ "$(ledger_value webuiLink)" = "$prefix/bin/nexus-webui" ]
+  launcher_resolved=$(readlink -f "$launcher")
+  gateway_resolved=$(readlink -f "$gateway")
+  webui_resolved=$(readlink -f "$webui")
+  [ "$(ledger_value nexusResolved)" = "$launcher_resolved" ]
+  [ "$(ledger_value gatewayResolved)" = "$gateway_resolved" ]
+  [ "$(ledger_value webuiResolved)" = "$webui_resolved" ]
+  launcher_sha=$(sha256sum "$launcher_resolved" | cut -d" " -f1)
+  gateway_sha=$(sha256sum "$gateway_resolved" | cut -d" " -f1)
+  webui_sha=$(sha256sum "$webui_resolved" | cut -d" " -f1)
+  [ "$(ledger_value nexusSha256)" = "$launcher_sha" ]
+  [ "$(ledger_value gatewaySha256)" = "$gateway_sha" ]
+  [ "$(ledger_value webuiSha256)" = "$webui_sha" ]
+  [ "$(ledger_value labProcess)" = "$lab_process" ]
+  [ "$(ledger_value labProcessSha256)" = "$(sha256sum "$lab_process" | cut -d" " -f1)" ]
+  [ "$(ledger_value labAgent)" = "$lab_agent" ]
+  [ "$(ledger_value labAgentSha256)" = "$(sha256sum "$lab_agent" | cut -d" " -f1)" ]
+  [ "$(ledger_value labFixture)" = "$lab_fixture" ]
+  [ "$(ledger_value labFixtureSha256)" = "$(sha256sum "$lab_fixture" | cut -d" " -f1)" ]
+  [ "$(ledger_value wsAcceptance)" = "$ws_acceptance" ]
+  [ "$(ledger_value wsAcceptanceSha256)" = "$(sha256sum "$ws_acceptance" | cut -d" " -f1)" ]
+  [ "$(ledger_value wsSoak)" = "$ws_soak" ]
+  [ "$(ledger_value wsSoakSha256)" = "$(sha256sum "$ws_soak" | cut -d" " -f1)" ]
+  [ "$(ledger_value webconsoleAcceptance)" = "$webconsole_acceptance" ]
+  [ "$(ledger_value webconsoleAcceptanceSha256)" = "$(sha256sum "$webconsole_acceptance" | cut -d" " -f1)" ]
+  [ "$(ledger_value webconsoleEvidenceVerifier)" = "$webconsole_evidence_verifier" ]
+  [ "$(ledger_value webconsoleEvidenceVerifierSha256)" = "$(sha256sum "$webconsole_evidence_verifier" | cut -d" " -f1)" ]
+  [ "$(ledger_value evidenceValidator)" = "$evidence_validator" ]
+  [ "$(ledger_value evidenceValidatorSha256)" = "$(sha256sum "$evidence_validator" | cut -d" " -f1)" ]
+  [ "$(ledger_value releaseAssembler)" = "$release_assembler" ]
+  [ "$(ledger_value releaseAssemblerSha256)" = "$(sha256sum "$release_assembler" | cut -d" " -f1)" ]
+  nexus_tarball=$(ledger_value nexusTarball)
+  cli_tarball=$(ledger_value cliTarball)
+  gateway_tarball=$(ledger_value gatewayTarball)
+  for binding in \
+    "$nexus_tarball:$(ledger_value nexusTarballSha256)" \
+    "$cli_tarball:$(ledger_value cliTarballSha256)" \
+    "$gateway_tarball:$(ledger_value gatewayTarballSha256)"; do
+    tarball=${binding%%:*}
+    expected_sha=${binding#*:}
+    case "$tarball" in /tmp/nexus-lab-packs/*.tgz) ;; *) exit 42 ;; esac
+    [ -f "$tarball" ] && [ ! -L "$tarball" ] \
+      && [ "$(stat -c "%u:%g:%a:%h" "$tarball")" = "0:0:444:1" ]
+    [ "$(sha256sum "$tarball" | cut -d" " -f1)" = "$expected_sha" ]
+  done
+  mapfile -t actual_tarballs < <(find /tmp/nexus-lab-packs -mindepth 1 -maxdepth 1 -type f -name "*.tgz" -printf "%p\n" | LC_ALL=C sort)
+  mapfile -t expected_tarballs < <(printf "%s\n" "$nexus_tarball" "$cli_tarball" "$gateway_tarball" | LC_ALL=C sort)
+  [ "${actual_tarballs[*]}" = "${expected_tarballs[*]}" ]
+  lens_renderer_mode=$(ledger_value lensRendererMode)
+  lens_app=$(ledger_value lensApp)
+  lens_main=$(ledger_value lensMain)
+  lens_tree_sha=$(ledger_value lensTreeSha256)
+  [ "$lens_renderer_mode" = production ]
+  case "$lens_app" in /tmp/nexus-lens-app.*) ;; *) exit 42 ;; esac
+  [ "$(readlink /tmp/nexus-lab-bin/lens-app)" = "$lens_app" ]
+  [ "$(readlink -f /tmp/nexus-lab-bin/lens-app)" = "$lens_app" ]
+  [ "$lens_main" = "$lens_app/electron/main.cjs" ]
+  [ -f "$lens_main" ] && [ ! -L "$lens_main" ]
+  recomputed_lens_tree_sha=$(cd "$lens_app" &&
+    find . -type f -printf "%P\0" | LC_ALL=C sort -z |
+    while IFS= read -r -d "" relative; do
+      printf "%s\0%s\0" "$relative" "$(stat -c %a "$relative")"
+      sha256sum "$relative" | awk "{print \$1}"
+    done | sha256sum | awk "{print \$1}")
+  [ "$lens_tree_sha" = "$recomputed_lens_tree_sha" ]
+  gateway_module="$prefix/lib/node_modules/@egregore/nexus/node_modules/@egregore/nexus-gateway/dist-gateway/headless.mjs"
+  [ -f "$gateway_module" ] && [ ! -L "$gateway_module" ]
+  gateway_module_sha=$(sha256sum "$gateway_module" | cut -d" " -f1)
+  native_root="$prefix/lib/node_modules/@egregore/nexus/node_modules/@egregore/nexus-cli/native"
+  mapfile -t native_candidates < <(find "$native_root" -type f -name nexus -perm -u+x -print)
+  [ "${#native_candidates[@]}" -eq 1 ]
+  native=$(readlink -f "${native_candidates[0]}")
+  native_sha=$(sha256sum "$native" | cut -d" " -f1)
+  [ "$(ledger_value nativeResolved)" = "$native" ]
+  [ "$(ledger_value nativeSha256)" = "$native_sha" ]
+  install_tree_sha=$(python3 -c "import runpy,sys; from pathlib import Path; ns=runpy.run_path(sys.argv[2]); print(ns.get(\"install_tree_digest\")(Path(sys.argv[1])))" \
+    "$prefix" "$ws_acceptance")
+  [ "$(ledger_value installTreeSha256)" = "$install_tree_sha" ]
+  jq -n \
+    --arg containerId "$NEXUS_EXPECTED_CONTAINER_ID" \
+    --arg prefix "$prefix" \
+    --arg installNonce "$install_nonce" \
+    --arg launcher "$launcher" \
+    --arg launcherResolved "$launcher_resolved" \
+    --arg launcherSha256 "$launcher_sha" \
+    --arg gateway "$gateway" \
+    --arg gatewayResolved "$gateway_resolved" \
+    --arg gatewaySha256 "$gateway_sha" \
+    --arg webui "$webui" \
+    --arg webuiResolved "$webui_resolved" \
+    --arg webuiSha256 "$webui_sha" \
+    --arg gatewayModule "$gateway_module" \
+    --arg gatewayModuleSha256 "$gateway_module_sha" \
+    --arg lensRendererMode "$lens_renderer_mode" \
+    --arg lensApp "$lens_app" \
+    --arg lensMain "$lens_main" \
+    --arg lensTreeSha256 "$lens_tree_sha" \
+    --arg native "$native" \
+    --arg nativeSha256 "$native_sha" \
+    --arg imageDigest "$NEXUS_EXPECTED_IMAGE_DIGEST" \
+    --arg installTreeSha256 "$install_tree_sha" \
+    --arg wsAcceptance "$ws_acceptance" \
+    --arg wsAcceptanceSha256 "$(sha256sum "$ws_acceptance" | cut -d" " -f1)" \
+    --arg wsSoak "$ws_soak" \
+    --arg wsSoakSha256 "$(sha256sum "$ws_soak" | cut -d" " -f1)" \
+    --arg webconsoleAcceptance "$webconsole_acceptance" \
+    --arg webconsoleAcceptanceSha256 "$(sha256sum "$webconsole_acceptance" | cut -d" " -f1)" \
+    --arg webconsoleEvidenceVerifier "$webconsole_evidence_verifier" \
+    --arg webconsoleEvidenceVerifierSha256 "$(sha256sum "$webconsole_evidence_verifier" | cut -d" " -f1)" \
+    --arg evidenceValidator "$evidence_validator" \
+    --arg evidenceValidatorSha256 "$(sha256sum "$evidence_validator" | cut -d" " -f1)" \
+    --arg releaseAssembler "$release_assembler" \
+    --arg releaseAssemblerSha256 "$(sha256sum "$release_assembler" | cut -d" " -f1)" \
+    --arg labProcess "$lab_process" \
+    --arg labProcessSha256 "$(sha256sum "$lab_process" | cut -d" " -f1)" \
+    --arg labAgent "$lab_agent" \
+    --arg labAgentSha256 "$(sha256sum "$lab_agent" | cut -d" " -f1)" \
+    --arg labFixture "$lab_fixture" \
+    --arg labFixtureSha256 "$(sha256sum "$lab_fixture" | cut -d" " -f1)" \
+    --arg nexusTarball "$nexus_tarball" \
+    --arg nexusTarballSha256 "$(ledger_value nexusTarballSha256)" \
+    --arg cliTarball "$cli_tarball" \
+    --arg cliTarballSha256 "$(ledger_value cliTarballSha256)" \
+    --arg gatewayTarball "$gateway_tarball" \
+    --arg gatewayTarballSha256 "$(ledger_value gatewayTarballSha256)" \
+    --arg readiness "$readiness" \
+    --arg readinessSha256 "$NEXUS_EXPECTED_READINESS_SHA256" \
+    --arg gatewayUrl http://127.0.0.1:4100 \
+    "{containerId:\$containerId,prefix:\$prefix,installNonce:\$installNonce,launcher:\$launcher,
+      launcherResolved:\$launcherResolved,launcherSha256:\$launcherSha256,
+      gateway:\$gateway,gatewayResolved:\$gatewayResolved,gatewaySha256:\$gatewaySha256,
+      webui:\$webui,webuiResolved:\$webuiResolved,webuiSha256:\$webuiSha256,
+      gatewayModule:\$gatewayModule,gatewayModuleSha256:\$gatewayModuleSha256,
+      lensRendererMode:\$lensRendererMode,lensApp:\$lensApp,
+      lensMain:\$lensMain,lensTreeSha256:\$lensTreeSha256,
+      native:\$native,nativeSha256:\$nativeSha256,
+      imageDigest:\$imageDigest,installTreeSha256:\$installTreeSha256,
+      wsAcceptance:\$wsAcceptance,wsAcceptanceSha256:\$wsAcceptanceSha256,
+      wsSoak:\$wsSoak,wsSoakSha256:\$wsSoakSha256,
+      webconsoleAcceptance:\$webconsoleAcceptance,
+      webconsoleAcceptanceSha256:\$webconsoleAcceptanceSha256,
+      webconsoleEvidenceVerifier:\$webconsoleEvidenceVerifier,
+      webconsoleEvidenceVerifierSha256:\$webconsoleEvidenceVerifierSha256,
+      evidenceValidator:\$evidenceValidator,evidenceValidatorSha256:\$evidenceValidatorSha256,
+      releaseAssembler:\$releaseAssembler,releaseAssemblerSha256:\$releaseAssemblerSha256,
+      labProcess:\$labProcess,labProcessSha256:\$labProcessSha256,
+      labAgent:\$labAgent,labAgentSha256:\$labAgentSha256,
+      labFixture:\$labFixture,labFixtureSha256:\$labFixtureSha256,
+      nexusTarball:\$nexusTarball,nexusTarballSha256:\$nexusTarballSha256,
+      cliTarball:\$cliTarball,cliTarballSha256:\$cliTarballSha256,
+      gatewayTarball:\$gatewayTarball,gatewayTarballSha256:\$gatewayTarballSha256,
+      readiness:\$readiness,readinessSha256:\$readinessSha256,gatewayUrl:\$gatewayUrl}"')
+jq -e . >/dev/null <<<"$BINDINGS" || die "packed runtime binding capture failed"
+
+NEXUS_VERSION=$(docker exec "$CONTAINER" bash -lc '/tmp/nexus-lab-bin/nexus --version')
 NODE_VERSION=$(docker exec "$CONTAINER" bash -lc 'node --version')
 RUST_VERSION=$(docker exec "$CONTAINER" bash -lc 'rustc --version')
+[ "$NEXUS_VERSION" = "nexus $VERSION" ] \
+  || die "packed Nexus launcher does not report nexus $VERSION exactly"
+
+RUN_ROOT=$(dirname "$OUTPUT")
+[ "$(basename "$OUTPUT")" = manifest.json ] \
+  || die "--output must name manifest.json"
+[ "$(basename "$RUN_ROOT")" = "$RUN_ID" ] \
+  || die "--output run directory must equal the run ID"
+[ ! -e "$RUN_ROOT" ] || die "refusing to replace existing run root: $RUN_ROOT"
+RUN_PARENT=$(dirname "$RUN_ROOT")
+secure_tree_program | python3 - ensure-parent \
+  --path "$RUN_PARENT" --uid "$MANIFEST_UID" --gid "$MANIFEST_GID" >/dev/null
+HOST_NONCE=$(printf '%s:%s:%s:host' "$RUN_ID" "$$" "$(date +%s%N)" \
+  | sha256sum | cut -c1-16)
+HOST_STAGE_ROW=$(secure_tree_program | python3 - create-stage \
+  --parent "$RUN_PARENT" --run-id "$RUN_ID" --kind host --nonce "$HOST_NONCE" \
+  --uid "$MANIFEST_UID" --gid "$MANIFEST_GID")
+STAGE=$(jq -er '.path' <<<"$HOST_STAGE_ROW")
+HOST_STAGE=$STAGE
+HOST_STAGE_DEV=$(jq -er '.device' <<<"$HOST_STAGE_ROW")
+HOST_STAGE_INO=$(jq -er '.inode' <<<"$HOST_STAGE_ROW")
+mkdir -m 0755 "$STAGE/candidate" "$STAGE/candidate/native" "$STAGE/candidate/npm"
+
+NATIVE_PATH=$(jq -er '.native' <<<"$BINDINGS")
+docker cp "$CONTAINER:$NATIVE_PATH" "$STAGE/candidate/native/nexus"
+chmod 0555 "$STAGE/candidate/native/nexus"
+[ "$(sha256sum "$STAGE/candidate/native/nexus" | cut -d' ' -f1)" = \
+  "$(jq -er '.nativeSha256' <<<"$BINDINGS")" ] \
+  || die "installed native binary changed while capturing the candidate"
+
+PACKAGE_ROWS='[]'
+for binding in \
+  "@egregore/nexus:nexusTarball:nexusTarballSha256:nexus.tgz" \
+  "@egregore/nexus-cli:cliTarball:cliTarballSha256:nexus-cli.tgz" \
+  "@egregore/nexus-gateway:gatewayTarball:gatewayTarballSha256:nexus-gateway.tgz"; do
+  IFS=: read -r package path_key hash_key leaf <<<"$binding"
+  source_path=$(jq -er --arg key "$path_key" '.[$key]' <<<"$BINDINGS")
+  expected_digest=$(jq -er --arg key "$hash_key" '.[$key]' <<<"$BINDINGS")
+  match="$STAGE/candidate/npm/$leaf"
+  docker cp "$CONTAINER:$source_path" "$match"
+  chmod 0444 "$match"
+  [ "$(sha256sum "$match" | cut -d' ' -f1)" = "$expected_digest" ] \
+    || die "candidate tarball changed while capturing $package"
+  identity=$(tar -xOf "$match" package/package.json 2>/dev/null | jq -er '.name + "@" + .version') \
+    || die "cannot inspect packed tarball: $source_path"
+  [ "$identity" = "$package@$VERSION" ] \
+    || die "candidate tarball identity mismatch: $identity"
+  leaf=$(printf '%s' "$package" | sed 's#@egregore/##').tgz
+  digest=$(sha256sum "$match" | cut -d' ' -f1)
+  PACKAGE_ROWS=$(jq \
+    --arg name "$package" \
+    --arg version "$VERSION" \
+    --arg path "candidate/npm/$leaf" \
+    --arg sha256 "$digest" \
+    '. + [{name:$name,version:$version,tarball:{path:$path,sha256:$sha256}}]' \
+    <<<"$PACKAGE_ROWS")
+done
 
 jq -n \
-  --arg capturedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --arg runId "$RUN_ID" \
-  --arg mode "$MODE" \
-  --arg container "$CONTAINER" \
-  --arg imageId "$IMAGE_ID" \
   --arg nexusVersion "$NEXUS_VERSION" \
   --arg nodeVersion "$NODE_VERSION" \
   --arg rustVersion "$RUST_VERSION" \
-  --argjson repoDigests "$REPO_DIGESTS" \
-  --argjson hostConfig "$HOST_CONFIG" \
-  --argjson ports "$PORTS" \
+  --arg imageDigest "$IMAGE_ID" \
+  --arg nativeSha256 "$(sha256sum "$STAGE/candidate/native/nexus" | cut -d' ' -f1)" \
   --argjson rawEnvironment "$ENVIRONMENT" \
+  --argjson bindings "$BINDINGS" \
+  --argjson packages "$PACKAGE_ROWS" \
   --slurpfile nexus "$TMP/nexus.json" \
   --slurpfile lens "$TMP/lens.json" \
   --slurpfile egregore "$TMP/egregore.json" \
@@ -189,46 +1224,139 @@ jq -n \
                   then "<redacted>" else .value end)
         })
       | from_entries;
+    (redacted_environment + {
+      NEXUS_V015_RUN_ID: $runId,
+      NEXUS_V015_CONTAINER_ID: $bindings.containerId,
+      NEXUS_V015_PACKED_PREFIX: $bindings.prefix,
+      NEXUS_V015_INSTALL_NONCE: $bindings.installNonce,
+      NEXUS_V015_NEXUS_BIN: $bindings.launcher,
+      NEXUS_V015_NEXUS_BIN_RESOLVED: $bindings.launcherResolved,
+      NEXUS_V015_NEXUS_BIN_SHA256: $bindings.launcherSha256,
+      NEXUS_V015_GATEWAY_BIN: $bindings.gateway,
+      NEXUS_V015_GATEWAY_BIN_RESOLVED: $bindings.gatewayResolved,
+      NEXUS_V015_GATEWAY_BIN_SHA256: $bindings.gatewaySha256,
+      NEXUS_V015_WEBUI_BIN: $bindings.webui,
+      NEXUS_V015_WEBUI_BIN_RESOLVED: $bindings.webuiResolved,
+      NEXUS_V015_WEBUI_BIN_SHA256: $bindings.webuiSha256,
+      NEXUS_V015_GATEWAY_MODULE: $bindings.gatewayModule,
+      NEXUS_V015_GATEWAY_MODULE_SHA256: $bindings.gatewayModuleSha256,
+      NEXUS_V015_LENS_RENDERER_MODE: $bindings.lensRendererMode,
+      NEXUS_V015_LENS_APP: $bindings.lensApp,
+      NEXUS_V015_LENS_MAIN: $bindings.lensMain,
+      NEXUS_V015_LENS_TREE_SHA256: $bindings.lensTreeSha256,
+      NEXUS_V015_IMAGE_DIGEST: $bindings.imageDigest,
+      NEXUS_V015_INSTALL_TREE_SHA256: $bindings.installTreeSha256,
+      NEXUS_V015_NATIVE_BIN: $bindings.native,
+      NEXUS_V015_NATIVE_BIN_SHA256: $bindings.nativeSha256,
+      NEXUS_V015_LAB_PROCESS: $bindings.labProcess,
+      NEXUS_V015_LAB_PROCESS_SHA256: $bindings.labProcessSha256,
+      NEXUS_V015_LAB_AGENT: $bindings.labAgent,
+      NEXUS_V015_LAB_AGENT_SHA256: $bindings.labAgentSha256,
+      NEXUS_V015_LAB_FIXTURE: $bindings.labFixture,
+      NEXUS_V015_LAB_FIXTURE_SHA256: $bindings.labFixtureSha256,
+      NEXUS_V015_NEXUS_TARBALL: $bindings.nexusTarball,
+      NEXUS_V015_NEXUS_TARBALL_SHA256: $bindings.nexusTarballSha256,
+      NEXUS_V015_CLI_TARBALL: $bindings.cliTarball,
+      NEXUS_V015_CLI_TARBALL_SHA256: $bindings.cliTarballSha256,
+      NEXUS_V015_GATEWAY_TARBALL: $bindings.gatewayTarball,
+      NEXUS_V015_GATEWAY_TARBALL_SHA256: $bindings.gatewayTarballSha256,
+      NEXUS_V015_WS_ACCEPTANCE: $bindings.wsAcceptance,
+      NEXUS_V015_WS_ACCEPTANCE_SHA256: $bindings.wsAcceptanceSha256,
+      NEXUS_V015_WS_SOAK: $bindings.wsSoak,
+      NEXUS_V015_WS_SOAK_SHA256: $bindings.wsSoakSha256,
+      NEXUS_V015_WEBCONSOLE_ACCEPTANCE: $bindings.webconsoleAcceptance,
+      NEXUS_V015_WEBCONSOLE_ACCEPTANCE_SHA256: $bindings.webconsoleAcceptanceSha256,
+      NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER: $bindings.webconsoleEvidenceVerifier,
+      NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER_SHA256: $bindings.webconsoleEvidenceVerifierSha256,
+      NEXUS_V015_EVIDENCE_VALIDATOR: $bindings.evidenceValidator,
+      NEXUS_V015_EVIDENCE_VALIDATOR_SHA256: $bindings.evidenceValidatorSha256,
+      NEXUS_V015_RELEASE_ASSEMBLER: $bindings.releaseAssembler,
+      NEXUS_V015_RELEASE_ASSEMBLER_SHA256: $bindings.releaseAssemblerSha256,
+      NEXUS_V015_READINESS_LEDGER: $bindings.readiness,
+      NEXUS_V015_READINESS_LEDGER_SHA256: $bindings.readinessSha256,
+      NEXUS_V015_GATEWAY_URL: $bindings.gatewayUrl
+    }) as $environment |
     {
       schemaVersion: 1,
-      capturedAt: $capturedAt,
       runId: $runId,
-      mode: $mode,
-      container: {
-        name: $container,
-        limits: {
-          cpus: (($hostConfig.NanoCpus // 0) / 1000000000),
-          memoryBytes: ($hostConfig.Memory // 0),
-          pids: ($hostConfig.PidsLimit // 0)
-        },
-        ports: $ports
-      },
-      image: {id: $imageId, repoDigests: $repoDigests},
-      environment: redacted_environment,
+      mode: "packed",
       sources: {
-        nexus: $nexus[0],
-        lens: $lens[0],
-        egregore: $egregore[0],
-        pactree: $pactree[0],
-        pactreePython: $pactreePy[0],
-        pactreeFs: $pactreeFs[0]
+        nexus: $nexus[0], lens: $lens[0], egregore: $egregore[0],
+        pactree: $pactree[0], pactreePython: $pactreePy[0], pactreeFs: $pactreeFs[0]
       },
-      toolchains: {
-        nexus: $nexusVersion,
-        node: $nodeVersion,
-        rustc: $rustVersion
-      }
+      native: {path:"candidate/native/nexus",sha256:$nativeSha256},
+      packages: $packages,
+      image: {digest:$imageDigest},
+      container: {limits:{cpus:6,memoryBytes:8589934592,pids:1024}},
+      toolchains: {nexus:$nexusVersion,node:$nodeVersion,rustc:$rustVersion},
+      environment: $environment
     }
-  ' >"$TMP/manifest.json"
+  ' >"$STAGE/manifest.json"
 
-mkdir -p "$(dirname "$OUTPUT")"
-cp "$TMP/manifest.json" "$OUTPUT.tmp"
-mv "$OUTPUT.tmp" "$OUTPUT"
+# All six repositories must still be the exact fd-backed snapshots encoded in
+# the manifest.  This closes the otherwise mixed-time window created by the
+# Docker/package capture work between the first repository and publication.
+if [ -n "${NEXUS_V015_SOURCE_FINAL_PAUSE_READY:-}" ] \
+    && [ -n "${NEXUS_V015_SOURCE_FINAL_PAUSE_CONTINUE:-}" ]; then
+  : >"$NEXUS_V015_SOURCE_FINAL_PAUSE_READY"
+  for _ in $(seq 1 1000); do
+    [ -e "$NEXUS_V015_SOURCE_FINAL_PAUSE_CONTINUE" ] && break
+    sleep 0.01
+  done
+  [ -e "$NEXUS_V015_SOURCE_FINAL_PAUSE_CONTINUE" ] \
+    || die "source final-verification test pause timed out"
+fi
+READINESS_FINAL_SNAPSHOT=$(readiness_snapshot_program | docker exec -i \
+  -e "NEXUS_EXPECTED_RUN_ID=$RUN_ID" "$CONTAINER" \
+  python3 - "$READINESS_PATH" --expected-uid 0 --expected-gid 0) \
+  || die "final candidate readiness snapshot failed"
+[ "$READINESS_FINAL_SNAPSHOT" = "$READINESS_SNAPSHOT" ] \
+  || die "candidate readiness changed during manifest capture"
+verify_source_record "$NEXUS_REPO" "$TMP/nexus.source"
+verify_source_record "$LENS_REPO" "$TMP/lens.source"
+verify_source_record "$EGREGORE_REPO" "$TMP/egregore.source"
+verify_source_record "$PACTREE_REPO" "$TMP/pactree.source"
+verify_source_record "$PACTREE_PY_REPO" "$TMP/pactree-py.source"
+verify_source_record "$PACTREE_FS_REPO" "$TMP/pactree-fs.source"
+
+chmod 0400 "$STAGE/manifest.json"
+secure_tree_program | python3 - inspect \
+  --root "$STAGE" --run-id "$RUN_ID" --uid "$MANIFEST_UID" --gid "$MANIFEST_GID" \
+  --dev "$HOST_STAGE_DEV" --ino "$HOST_STAGE_INO" >/dev/null
 
 if [ "$COPY_TO_CONTAINER" -eq 1 ]; then
   CONTAINER_DIR="$LAB_ROOT/evidence/$RUN_ID"
-  docker exec "$CONTAINER" mkdir -p "$CONTAINER_DIR"
-  docker cp "$OUTPUT" "$CONTAINER:$CONTAINER_DIR/manifest.json"
+  COPY_NONCE=$(printf '%s:%s:%s' "$RUN_ID" "$$" "$(date +%s%N)" \
+    | sha256sum | cut -c1-16)
+  CONTAINER_STAGE="$LAB_ROOT/evidence/.${RUN_ID}.copy-${COPY_NONCE}"
+  CONTAINER_COPY_STAGE=$CONTAINER_STAGE
+  CONTAINER_COPY_FINAL=$CONTAINER_DIR
+  [ "$(stat -c %u:%g "$STAGE/manifest.json")" = "$CONTAINER_USER" ] \
+    || die "sealed manifest ownership does not match validator Config.User"
+  CONTAINER_STAGE_ROW=$(secure_tree_program | docker exec -i "$CONTAINER" python3 - create-stage \
+    --parent "$LAB_ROOT/evidence" --run-id "$RUN_ID" --kind copy --nonce "$COPY_NONCE" \
+    --uid "$MANIFEST_UID" --gid "$MANIFEST_GID")
+  [ "$(jq -er '.path' <<<"$CONTAINER_STAGE_ROW")" = "$CONTAINER_STAGE" ] \
+    || die "container manifest stage path mismatch"
+  CONTAINER_STAGE_DEV=$(jq -er '.device' <<<"$CONTAINER_STAGE_ROW")
+  CONTAINER_STAGE_INO=$(jq -er '.inode' <<<"$CONTAINER_STAGE_ROW")
+  docker cp -a "$STAGE/." "$CONTAINER:$CONTAINER_STAGE"
+  secure_tree_program | docker exec -i \
+    -e "NEXUS_V015_EVIDENCE_TREE_TESTING=${NEXUS_V015_EVIDENCE_TREE_TESTING:-0}" \
+    -e "NEXUS_V015_EVIDENCE_TREE_FAULT=${NEXUS_V015_EVIDENCE_TREE_FAULT:-}" \
+    "$CONTAINER" python3 - publish \
+      --stage "$CONTAINER_STAGE" --final "$CONTAINER_DIR" --run-id "$RUN_ID" \
+      --uid "$MANIFEST_UID" --gid "$MANIFEST_GID" \
+      --dev "$CONTAINER_STAGE_DEV" --ino "$CONTAINER_STAGE_INO" >/dev/null
+  CONTAINER_COPY_STAGE=""
+  CONTAINER_COPY_FINAL=""
 fi
+
+secure_tree_program | python3 - publish \
+  --stage "$STAGE" --final "$RUN_ROOT" --run-id "$RUN_ID" \
+  --uid "$MANIFEST_UID" --gid "$MANIFEST_GID" \
+  --dev "$HOST_STAGE_DEV" --ino "$HOST_STAGE_INO" >/dev/null
+HOST_STAGE=""
+OUTPUT="$RUN_ROOT/manifest.json"
 
 printf '%s\n' "$OUTPUT"

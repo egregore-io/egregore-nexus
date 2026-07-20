@@ -9,6 +9,7 @@ import ipaddress
 import json
 import os
 import re
+import stat
 import sys
 import time
 from pathlib import Path
@@ -20,6 +21,30 @@ EMPTY_DAEMON = {"pid": 0, "bootId": "", "executable": "", "sha256": ""}
 EMPTY_SERVICE = {"pid": 0, "listener": "", "executable": "", "sha256": ""}
 EMPTY_IPC = {"path": "", "inode": 0}
 SOCKET_LINK = re.compile(r"socket:\[(\d+)]\Z")
+TRACKED_FILES = (
+    "daemon.pid",
+    "daemon-ipc-endpoint.json",
+    "gateway.json",
+    "webconsole.json",
+    "nexus.db",
+    "nexus.db-wal",
+    "nexus.db-shm",
+    "gateway.db",
+    "gateway.db-wal",
+    "gateway.db-shm",
+)
+EMPTY_FILE = {
+    "kind": "missing",
+    "device": 0,
+    "inode": 0,
+    "mode": 0,
+    "uid": 0,
+    "gid": 0,
+    "nlink": 0,
+    "size": 0,
+    "mtimeNs": 0,
+    "ctimeNs": 0,
+}
 
 
 class SnapshotError(RuntimeError):
@@ -213,6 +238,39 @@ def socket_owners(proc_root: Path, inodes: set[int]) -> dict[int, set[int]]:
     return owners
 
 
+def process_parent_pid(proc_root: Path, pid: int) -> int | None:
+    status_path = proc_root / str(pid) / "status"
+    try:
+        lines = status_path.read_text(encoding="utf-8").splitlines()
+    except (FileNotFoundError, PermissionError):
+        return None
+    except OSError as error:
+        raise SnapshotError(f"cannot read process ancestry {status_path}: {error}") from error
+    for line in lines:
+        if not line.startswith("PPid:"):
+            continue
+        raw_parent = line.removeprefix("PPid:").strip()
+        try:
+            return int(raw_parent)
+        except ValueError as error:
+            raise SnapshotError(f"invalid process ancestry in {status_path}: {line!r}") from error
+    return None
+
+
+def is_same_or_descendant(proc_root: Path, pid: int, ancestor: int) -> bool:
+    current = pid
+    visited: set[int] = set()
+    while current > 0 and current not in visited:
+        if current == ancestor:
+            return True
+        visited.add(current)
+        parent = process_parent_pid(proc_root, current)
+        if parent is None:
+            return False
+        current = parent
+    return False
+
+
 def listener_identity(
     discovery: dict[str, Any], proc_root: Path, label: str, discovery_pid: int
 ) -> str:
@@ -224,7 +282,12 @@ def listener_identity(
             f"(discovery pid {discovery_pid})"
         )
     owners = socket_owners(proc_root, {listener[2] for listener in listeners})
-    owned = [listener for listener in listeners if discovery_pid in owners[listener[2]]]
+    owned = [
+        (listener, owner)
+        for listener in listeners
+        for owner in sorted(owners[listener[2]])
+        if is_same_or_descendant(proc_root, owner, discovery_pid)
+    ]
     if not owned:
         raise SnapshotError(
             f"{label} listener for port {port} is not owned by discovery pid "
@@ -232,10 +295,10 @@ def listener_identity(
         )
 
     identities = []
-    for protocol, address, inode in sorted(owned):
+    for (protocol, address, inode), owner in sorted(owned):
         display_address = f"[{address}]" if ":" in address else address
         identities.append(
-            f"{protocol}://{display_address}:{port} inode={inode} owner={discovery_pid}"
+            f"{protocol}://{display_address}:{port} inode={inode} owner={owner}"
         )
     return "; ".join(identities)
 
@@ -286,6 +349,41 @@ def service_snapshot(home: Path, proc_root: Path, name: str) -> dict[str, object
     return {"pid": pid, "listener": listener, "executable": executable, "sha256": digest}
 
 
+def file_identity(path: Path) -> dict[str, object]:
+    """Capture pathname/inode metadata without opening or hashing runtime data."""
+
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return dict(EMPTY_FILE)
+    except OSError as error:
+        raise SnapshotError(f"cannot inspect host runtime path {path}: {error}") from error
+    if stat.S_ISREG(info.st_mode):
+        kind = "regular"
+    elif stat.S_ISFIFO(info.st_mode):
+        kind = "fifo"
+    elif stat.S_ISLNK(info.st_mode):
+        kind = "symlink"
+    elif stat.S_ISSOCK(info.st_mode):
+        kind = "socket"
+    elif stat.S_ISDIR(info.st_mode):
+        kind = "directory"
+    else:
+        kind = "other"
+    return {
+        "kind": kind,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "mode": info.st_mode,
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "nlink": info.st_nlink,
+        "size": info.st_size,
+        "mtimeNs": info.st_mtime_ns,
+        "ctimeNs": info.st_ctime_ns,
+    }
+
+
 def capture(home: Path, proc_root: Path) -> dict[str, object]:
     daemon, ipc = daemon_snapshot(home, proc_root)
     return {
@@ -293,6 +391,7 @@ def capture(home: Path, proc_root: Path) -> dict[str, object]:
         "gateway": service_snapshot(home, proc_root, "gateway"),
         "webconsole": service_snapshot(home, proc_root, "webconsole"),
         "ipc": ipc,
+        "files": {name: file_identity(home / name) for name in TRACKED_FILES},
         "capturedAt": time.time_ns() // 1_000_000,
     }
 
@@ -317,7 +416,7 @@ def validate_snapshot(value: dict[str, object], label: str) -> None:
         "webconsole": {"pid": int, "listener": str, "executable": str, "sha256": str},
         "ipc": {"path": str, "inode": int},
     }
-    if set(value) != {*expected_fields, "capturedAt"}:
+    if set(value) != {*expected_fields, "files", "capturedAt"}:
         raise SnapshotError(f"invalid {label}: unexpected top-level fields")
     captured_at = value.get("capturedAt")
     if isinstance(captured_at, bool) or not isinstance(captured_at, int):
@@ -331,6 +430,32 @@ def validate_snapshot(value: dict[str, object], label: str) -> None:
             if isinstance(field_value, bool) or not isinstance(field_value, expected_type):
                 raise SnapshotError(
                     f"invalid {label}: {section}.{field} must be {expected_type.__name__}"
+                )
+    files = value.get("files")
+    file_fields = {
+        "kind": str,
+        "device": int,
+        "inode": int,
+        "mode": int,
+        "uid": int,
+        "gid": int,
+        "nlink": int,
+        "size": int,
+        "mtimeNs": int,
+        "ctimeNs": int,
+    }
+    if not isinstance(files, dict) or set(files) != set(TRACKED_FILES):
+        raise SnapshotError(f"invalid {label}: tracked file inventory does not match the contract")
+    for name, row in files.items():
+        if not isinstance(row, dict) or set(row) != set(file_fields):
+            raise SnapshotError(f"invalid {label}: files.{name} fields do not match the contract")
+        if row.get("kind") not in {"missing", "regular", "fifo", "symlink", "socket", "directory", "other"}:
+            raise SnapshotError(f"invalid {label}: files.{name}.kind is invalid")
+        for field, expected_type in file_fields.items():
+            actual = row[field]
+            if isinstance(actual, bool) or not isinstance(actual, expected_type):
+                raise SnapshotError(
+                    f"invalid {label}: files.{name}.{field} must be {expected_type.__name__}"
                 )
 
 

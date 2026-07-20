@@ -1,0 +1,1721 @@
+#!/usr/bin/env python3
+"""External contracts for the v0.1.5 real-network WebSocket gate."""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import unittest
+from unittest import mock
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+TARGET = SCRIPT_DIR / "nexus-v015-ws-acceptance"
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+class WsAcceptanceContracts(unittest.TestCase):
+    def run_target(
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(TARGET), *args],
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=10,
+            check=False,
+        )
+
+    def manifest_fixture(self, root: Path) -> dict[str, object]:
+        sources = {}
+        for name in ("nexus", "lens", "egregore", "pactree", "pactreePython", "pactreeFs"):
+            sources[name] = {
+                "revision": "a" * 40,
+                "dirty": False,
+                "dirtyPaths": [],
+            }
+        return {
+            "schemaVersion": 1,
+            "runId": "contract-run",
+            "mode": "packed",
+            "sources": sources,
+            "native": {"path": "candidate/native/nexus", "sha256": "b" * 64},
+            "packages": [
+                {
+                    "name": name,
+                    "version": "0.1.5",
+                    "tarball": {
+                        "path": f"candidate/npm/{filename}",
+                        "sha256": str(index) * 64,
+                    },
+                }
+                for index, (name, filename) in enumerate(
+                    zip(
+                        ("@egregore/nexus", "@egregore/nexus-cli", "@egregore/nexus-gateway"),
+                        ("nexus.tgz", "nexus-cli.tgz", "nexus-gateway.tgz"),
+                        strict=True,
+                    ),
+                    start=1,
+                )
+            ],
+            "image": {"digest": "sha256:" + "c" * 64},
+            "container": {
+                "limits": {"cpus": 6, "memoryBytes": 8589934592, "pids": 1024},
+            },
+            "toolchains": {
+                "nexus": "nexus 0.1.5",
+                "node": "v24.1.0",
+                "rustc": "rustc 1.90.0",
+            },
+            "environment": {
+                "HOME": str(root),
+                "NEXUS_HOME": str(root / "nexus"),
+                "API_TOKEN": "<redacted>",
+            },
+        }
+
+    def test_help_is_side_effect_free(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            before = sorted(path.relative_to(root) for path in root.rglob("*"))
+            result = self.run_target(
+                "--help",
+                env={
+                    **os.environ,
+                    "OCULAR_LAB": "1",
+                    "NEXUS_LAB_ROOT": str(root),
+                    "NEXUS_V015_RUN_ID": "help-must-not-write",
+                },
+            )
+            after = sorted(path.relative_to(root) for path in root.rglob("*"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--mode packed", result.stdout)
+        self.assertEqual(before, after)
+
+    def test_execution_refuses_outside_the_ocular_lab(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            result = self.run_target(
+                "--mode",
+                "packed",
+                "--evidence-dir",
+                raw,
+                env={
+                    key: value
+                    for key, value in os.environ.items()
+                    if key not in {"OCULAR_LAB", "NEXUS_LAB_ROOT", "NEXUS_V015_RUN_ID"}
+                },
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("OCULAR_LAB", result.stderr)
+
+    def test_source_mode_cannot_publish_release_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            result = self.run_target(
+                "--mode",
+                "source",
+                "--evidence-dir",
+                str(Path(raw) / "evidence"),
+                env={
+                    **os.environ,
+                    "OCULAR_LAB": "1",
+                    "NEXUS_LAB_ROOT": raw,
+                    "NEXUS_V015_RUN_ID": "source-refused",
+                },
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("packed", result.stderr)
+
+    def test_module_contracts_are_candidate_bound_and_fail_closed(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        expected_gates = {
+            "B1": ("identityMatrix", "renameRegression", "agentIdResolution"),
+            "B2": ("restartTimeline", "rosterComparison", "humanRebind"),
+            "C1": ("csrfMatrix", "packedHttp", "packedWebsocket"),
+            "C2": ("upgrades", "frames", "cursorCheckpoints", "backpressure", "noPolling"),
+            "C3": ("sessionFrames", "correlation", "reconnect", "backpressure", "laneIsolation"),
+            "C4": ("restSnapshot", "websocketDeltas", "recovery"),
+            "D1": ("packedInventory", "installLog", "foreignCwd", "shutdown"),
+            "F1": ("codex", "claude", "deliveryMatrix"),
+        }
+        self.assertEqual(module["RESULT_SPECS"], expected_gates)
+        self.assertEqual(
+            module["RESULT_DIRECTORIES"]["D1"],
+            "D1-clean-packed-install",
+        )
+        manifest = {
+            "mode": "packed",
+            "sources": {"nexus": {"revision": "a" * 40}},
+            "native": {"sha256": "b" * 64},
+            "packages": [
+                {"name": "@egregore/nexus", "version": "0.1.5", "tarball": {"sha256": "1" * 64}},
+                {"name": "@egregore/nexus-cli", "version": "0.1.5", "tarball": {"sha256": "2" * 64}},
+                {"name": "@egregore/nexus-gateway", "version": "0.1.5", "tarball": {"sha256": "3" * 64}},
+            ],
+            "image": {"digest": "sha256:" + "c" * 64},
+            "container": {"limits": {"cpus": 6, "memoryBytes": 8589934592, "pids": 1024}},
+            "toolchains": {"nexus": "0.1.5", "node": "v24", "rustc": "rustc 1.90"},
+            "environment": {"OCULAR_LAB": "1"},
+        }
+        canonical = {
+            "mode": manifest["mode"],
+            "sources": manifest["sources"],
+            "nativeSha256": manifest["native"]["sha256"],
+            "packages": [
+                {
+                    "name": row["name"],
+                    "version": row["version"],
+                    "tarballSha256": row["tarball"]["sha256"],
+                }
+                for row in manifest["packages"]
+            ],
+            "imageDigest": manifest["image"]["digest"],
+            "limits": manifest["container"]["limits"],
+            "toolchains": manifest["toolchains"],
+            "environment": manifest["environment"],
+        }
+        expected = "sha256:" + digest(
+            json.dumps(
+                canonical,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        self.assertEqual(module["candidate_digest"](manifest), expected)
+
+    def test_foreign_cwd_launcher_contract_removes_source_fallbacks(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        calls: list[tuple[list[str], Path, dict[str, str]]] = []
+
+        def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            cwd = Path(str(kwargs["cwd"]))
+            environment = dict(kwargs["env"])
+            self.assertEqual(list(cwd.iterdir()), [])
+            for key in (
+                "NODE_PATH",
+                "TSX_TSCONFIG_PATH",
+                "NEXUS_NATIVE_BIN",
+                "NEXUS_GATEWAY_SOURCE_ROOT",
+                "NEXUS_GATEWAY_BIN",
+                "NEXUS_WEBUI_BIN",
+            ):
+                self.assertNotIn(key, environment)
+            calls.append((command, cwd, environment))
+            stdout = "nexus 0.1.5\n" if command[-1] == "--version" else "help\n"
+            return subprocess.CompletedProcess(command, 0, stdout, "")
+
+        globals_ = module["validate_foreign_cwd_launchers"].__globals__
+        with tempfile.TemporaryDirectory() as raw, mock.patch.dict(
+            globals_, {"subprocess": mock.Mock(run=run)}
+        ):
+            evidence = module["validate_foreign_cwd_launchers"](Path(raw))
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(evidence["cwd"], "fresh-empty-mktemp")
+        self.assertTrue(evidence["cwdStayedEmpty"])
+        self.assertEqual(
+            set(evidence["commands"]),
+            {"nexus", "gateway", "webui"},
+        )
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "cursor"):
+            module["parse_developer_backpressure"](1013, "developer.backpressure:not-a-number")
+        self.assertEqual(module["parse_developer_backpressure"](1013, "developer.backpressure:41"), 41)
+        self.assertEqual(module["parse_session_backpressure"](1013, "session.bp:opaque-40"), "opaque-40")
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "1013"):
+            module["parse_session_backpressure"](1011, "session.bp:opaque-40")
+
+    def test_candidate_only_verification_reports_the_bound_readiness_digest(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            readiness = root / "lab" / "candidate-ready.v1"
+            readiness.parent.mkdir()
+            readiness.write_text("schema=1\nrunId=contract-run\n", encoding="utf-8")
+            readiness.chmod(0o644)
+            candidate = module["Candidate"](
+                "contract-run",
+                "sha256:" + "d" * 64,
+                {
+                    "image": {"digest": "sha256:" + "e" * 64},
+                    "container": {
+                        "limits": {
+                            "cpus": 6,
+                            "memoryBytes": 8589934592,
+                            "pids": 1024,
+                        }
+                    },
+                    "environment": {
+                        "NEXUS_V015_READINESS_LEDGER": str(readiness),
+                    },
+                },
+                root / "evidence" / "contract-run",
+                root,
+                root / "install",
+            )
+            document = module["candidate_verification_document"](candidate)
+
+        self.assertEqual(document["status"], "PASS")
+        self.assertEqual(document["runId"], "contract-run")
+        self.assertEqual(document["candidateDigest"], "sha256:" + "d" * 64)
+        self.assertEqual(document["readinessSha256"], digest(b"schema=1\nrunId=contract-run\n"))
+        self.assertEqual(document["imageDigest"], "sha256:" + "e" * 64)
+        self.assertEqual(document["limits"]["cpus"], 6)
+        parsed = module["parse_args"]([
+            "--mode", "packed",
+            "--evidence-dir", "/tmp/evidence",
+            "--verify-candidate-only",
+        ])
+        self.assertTrue(parsed.verify_candidate_only)
+
+    def test_post_acceptance_revalidates_candidate_and_runtime_before_publish(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        candidate = module["Candidate"](
+            "contract-run",
+            "sha256:" + "d" * 64,
+            {"environment": {"NEXUS_V015_READINESS_LEDGER": "/lab/ready"}},
+            Path("/lab/evidence/contract-run"),
+            Path("/lab"),
+            Path("/install"),
+            {"schema": "1", "runId": "contract-run"},
+        )
+        globals_ = module["revalidate_after_acceptance"].__globals__
+        original_validate = globals_["validate_candidate"]
+        original_observe = globals_["observe_runtime"]
+        calls: list[str] = []
+        globals_["validate_candidate"] = lambda *_args: calls.append("candidate") or candidate
+        globals_["observe_runtime"] = lambda value: calls.append("runtime") or {"candidate": value.digest}
+        try:
+            observation = module["revalidate_after_acceptance"](candidate)
+            self.assertEqual(calls, ["candidate", "runtime"])
+            self.assertEqual(observation, {"candidate": candidate.digest})
+
+            changed = module["Candidate"](
+                candidate.run_id,
+                "sha256:" + "e" * 64,
+                candidate.manifest,
+                candidate.run_root,
+                candidate.lab_root,
+                candidate.install_root,
+                candidate.readiness,
+            )
+            calls.clear()
+            globals_["validate_candidate"] = lambda *_args: calls.append("candidate") or changed
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "changed during acceptance"):
+                module["revalidate_after_acceptance"](candidate)
+            self.assertEqual(calls, ["candidate"])
+        finally:
+            globals_["validate_candidate"] = original_validate
+            globals_["observe_runtime"] = original_observe
+
+        source = TARGET.read_text(encoding="utf-8")
+        self.assertLess(
+            source.index("revalidate_after_acceptance(candidate)"),
+            source.index("publisher.publish(gate, payloads[gate])"),
+        )
+
+    def test_candidate_commit_seal_is_required_before_network_or_agent_work(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            run_root = Path(raw)
+            run_root.chmod(0o700)
+            manifest = self.manifest_fixture(run_root)
+            payloads = {
+                Path("candidate/native/nexus"): b"native\n",
+                Path("candidate/npm/nexus.tgz"): b"nexus\n",
+                Path("candidate/npm/nexus-cli.tgz"): b"cli\n",
+                Path("candidate/npm/nexus-gateway.tgz"): b"gateway\n",
+            }
+            for relative, content in payloads.items():
+                path = run_root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+                path.chmod(0o555 if relative == Path("candidate/native/nexus") else 0o444)
+            manifest["native"]["sha256"] = digest(payloads[Path("candidate/native/nexus")])
+            for row in manifest["packages"]:
+                relative = Path(row["tarball"]["path"])
+                row["tarball"]["sha256"] = digest(payloads[relative])
+            manifest_path = run_root / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+            manifest_path.chmod(0o400)
+
+            payload_paths = (Path("manifest.json"), *payloads)
+            tree = hashlib.sha256()
+            for relative in sorted(payload_paths, key=lambda item: item.as_posix()):
+                path = run_root / relative
+                tree.update(
+                    relative.as_posix().encode("utf-8")
+                    + b"\0"
+                    + str(path.stat().st_mode & 0o7777).encode("ascii")
+                    + b"\0"
+                    + digest(path.read_bytes()).encode("ascii")
+                    + b"\0"
+                )
+            root_info = run_root.stat()
+            seal_path = run_root / ".candidate-committed"
+            seal_path.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "runId": "contract-run",
+                        "device": root_info.st_dev,
+                        "inode": root_info.st_ino,
+                        "manifestSha256": digest(manifest_path.read_bytes()),
+                        "treeSha256": tree.hexdigest(),
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            seal_path.chmod(0o400)
+
+            module["validate_candidate_commit_seal"](run_root, manifest, "contract-run")
+            seal_path.unlink()
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "commit seal"):
+                module["validate_candidate_commit_seal"](run_root, manifest, "contract-run")
+
+    def test_candidate_only_main_returns_before_agent_or_network_work(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            evidence = root / "evidence"
+            evidence.mkdir()
+            candidate = module["Candidate"](
+                "contract-run",
+                "sha256:" + "d" * 64,
+                {},
+                evidence / "contract-run",
+                root,
+                root / "install",
+            )
+            globals_ = module["main"].__globals__
+            globals_["validate_candidate"] = lambda *_args: candidate
+            globals_["observe_runtime"] = lambda _candidate: object()
+            globals_["candidate_verification_document"] = lambda *_args: {
+                "status": "PASS",
+                "readinessSha256": "a" * 64,
+            }
+            globals_["launch_live_agents"] = mock.Mock(
+                side_effect=AssertionError("candidate-only mode launched agents")
+            )
+            output = type("BinaryStdout", (), {"buffer": io.BytesIO()})()
+            with (
+                mock.patch.dict(os.environ, {
+                    "OCULAR_LAB": "1",
+                    "NEXUS_LAB_ROOT": str(root),
+                    "NEXUS_V015_RUN_ID": "contract-run",
+                }, clear=False),
+                mock.patch.object(sys, "stdout", output),
+            ):
+                status = module["main"]([
+                    "--mode", "packed",
+                    "--evidence-dir", str(evidence),
+                    "--verify-candidate-only",
+                ])
+            self.assertEqual(status, 0)
+            self.assertIn(b'"readinessSha256"', output.buffer.getvalue())
+            globals_["launch_live_agents"].assert_not_called()
+
+    def test_live_launcher_and_package_inventory_bindings_are_exact(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            target = root / "install" / "bin" / "nexus"
+            target.parent.mkdir(parents=True)
+            target.write_text("#!/bin/sh\n", encoding="utf-8")
+            target.chmod(0o755)
+            link = root / "nexus"
+            link.symlink_to(target)
+            module["validate_launcher_binding"](
+                link,
+                str(target),
+                str(target.resolve()),
+                digest(target.read_bytes()),
+                root / "install",
+                "Nexus launcher",
+            )
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "target"):
+                module["validate_launcher_binding"](
+                    link,
+                    str(target) + "-other",
+                    str(target.resolve()),
+                    digest(target.read_bytes()),
+                    root / "install",
+                    "Nexus launcher",
+                )
+
+            package = root / "package"
+            package.mkdir()
+            (package / "index.mjs").write_text("export const ok = true;\n", encoding="utf-8")
+            tarball = root / "candidate.tgz"
+            with tarfile.open(tarball, "w:gz") as archive:
+                archive.add(package / "index.mjs", arcname="package/index.mjs")
+            packed = module["tar_package_inventory"](tarball, "candidate")
+            installed = module["installed_package_inventory"](package, "candidate")
+            self.assertEqual(installed, packed)
+            (package / "index.mjs").write_text("export const ok = false;\n", encoding="utf-8")
+            self.assertNotEqual(
+                module["installed_package_inventory"](package, "candidate"),
+                packed,
+            )
+
+    def test_image_and_resource_binding_requires_the_release_shape(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        manifest = {
+            "image": {"digest": "sha256:" + "a" * 64},
+            "container": {
+                "limits": {"cpus": 6, "memoryBytes": 8589934592, "pids": 1024},
+            },
+        }
+        module["validate_image_and_limits"](manifest)
+        manifest["image"]["digest"] = "latest"
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "image"):
+            module["validate_image_and_limits"](manifest)
+
+    def test_live_agent_manifest_is_bound_to_the_exact_readiness_receipt(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            readiness = root / "lab" / "candidate-ready.v1"
+            readiness.parent.mkdir(parents=True)
+            readiness.write_bytes(b"schema=1\nrunId=contract-run\n")
+            readiness_sha = digest(readiness.read_bytes())
+            rows: dict[str, dict[str, str]] = {}
+            for kind, version in (("codex", "codex 1.2.3"), ("claude", "claude 4.5.6")):
+                executable = root / "harness" / kind
+                executable.parent.mkdir(parents=True, exist_ok=True)
+                executable.write_text(f"#!/bin/sh\necho '{version}'\n", encoding="utf-8")
+                executable.chmod(0o755)
+                workspace = root / "harness-workspaces" / kind
+                workspace.mkdir(parents=True)
+                rows[kind] = {
+                    "name": f"v015-{kind}",
+                    "agentId": f"a_{kind}",
+                    "sessionId": f"s_{kind}",
+                    "executable": str(executable),
+                    "sha256": digest(executable.read_bytes()),
+                    "version": version,
+                    "workspace": str(workspace),
+                }
+            agent_manifest = {
+                "version": 1,
+                "runId": "contract-run",
+                "readinessSha256": readiness_sha,
+                "candidate": {
+                    "runId": "contract-run",
+                    "readinessSha256": readiness_sha,
+                },
+                "agents": rows,
+            }
+            agents_path = root / "lab" / "agents.json"
+            agents_path.write_text(json.dumps(agent_manifest), encoding="utf-8")
+            agents_path.chmod(0o600)
+            candidate = module["Candidate"](
+                "contract-run",
+                "sha256:" + "d" * 64,
+                {
+                    "environment": {
+                        "NEXUS_V015_READINESS_LEDGER": str(readiness),
+                        "NEXUS_V015_READINESS_LEDGER_SHA256": readiness_sha,
+                    }
+                },
+                root / "evidence" / "contract-run",
+                root,
+                root / "install",
+            )
+            agents = module["load_agents"](candidate)
+            self.assertEqual(tuple(agent.kind for agent in agents), ("codex", "claude"))
+
+            agent_manifest["readinessSha256"] = "f" * 64
+            agents_path.write_text(json.dumps(agent_manifest), encoding="utf-8")
+            agents_path.chmod(0o600)
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "readiness"):
+                module["load_agents"](candidate)
+
+    def test_packed_install_nonce_is_derived_from_the_nonce_scoped_prefix(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        self.assertEqual(
+            module["packed_install_nonce"](Path("/tmp/nexus-lab-install.Ab12")),
+            "Ab12",
+        )
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "nonce"):
+            module["packed_install_nonce"](Path("/tmp/nexus-lab-install"))
+
+    def test_atomic_publisher_emits_validator_compatible_results_once(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            run_root = Path(raw) / "run"
+            run_root.mkdir()
+            publisher = module["EvidencePublisher"](
+                run_root,
+                "contract-run",
+                "sha256:" + "d" * 64,
+            )
+            for gate, names in module["RESULT_SPECS"].items():
+                payloads = {
+                    name: json.dumps({"gate": gate, "artifact": name}).encode("utf-8") + b"\n"
+                    for name in names
+                }
+                path = publisher.publish(gate, payloads)
+                document = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(document["gate"], gate)
+                self.assertEqual(document["runId"], "contract-run")
+                self.assertEqual(document["candidateDigest"], "sha256:" + "d" * 64)
+                self.assertEqual(document["status"], "PASS")
+                self.assertEqual(document["failureCount"], 0)
+                self.assertEqual(set(document["artifacts"]), set(names))
+                self.assertEqual(path.stat().st_mode & 0o777, 0o400)
+                self.assertEqual(path.stat().st_nlink, 1)
+                self.assertEqual(path.parent.stat().st_mode & 0o777, 0o555)
+                for name, record in document["artifacts"].items():
+                    artifact = run_root / record["path"]
+                    self.assertEqual(artifact.suffix, ".jsonl", name)
+                    self.assertEqual(record["sha256"], digest(artifact.read_bytes()), name)
+                    self.assertEqual(artifact.stat().st_mode & 0o777, 0o400)
+                    self.assertEqual(artifact.stat().st_nlink, 1)
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "replace"):
+                publisher.publish("B1", {name: b"again\n" for name in module["RESULT_SPECS"]["B1"]})
+
+    def test_publisher_preserves_a_destination_created_in_the_rename_window(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            run_root = Path(raw) / "run"
+            run_root.mkdir()
+            publisher = module["EvidencePublisher"](
+                run_root,
+                "contract-run",
+                "sha256:" + "d" * 64,
+            )
+            original_rename = module["rename_noreplace"]
+            destination_bytes = b"foreign evidence\n"
+
+            def race_destination(source: Path, destination: Path) -> None:
+                destination.mkdir()
+                (destination / "foreign.txt").write_bytes(destination_bytes)
+                original_rename(source, destination)
+
+            publisher_globals = module["EvidencePublisher"].publish.__globals__
+            with mock.patch.dict(publisher_globals, {"rename_noreplace": race_destination}):
+                with self.assertRaisesRegex(module["AcceptanceFailure"], "replace"):
+                    publisher.publish(
+                        "B1",
+                        {
+                            name: b"candidate evidence\n"
+                            for name in module["RESULT_SPECS"]["B1"]
+                        },
+                    )
+
+            destination = publisher.results / module["RESULT_DIRECTORIES"]["B1"]
+            self.assertEqual((destination / "foreign.txt").read_bytes(), destination_bytes)
+            self.assertFalse((destination / "result.json").exists())
+            self.assertEqual(
+                [path.name for path in publisher.results.iterdir()],
+                [module["RESULT_DIRECTORIES"]["B1"]],
+            )
+
+    def test_published_results_pass_the_canonical_validator_schema(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        validator_contract = runpy.run_path(str(SCRIPT_DIR / "test-nexus-v015-evidence-validate"))
+        validator_module = runpy.run_path(str(SCRIPT_DIR / "nexus-v015-evidence-validate"))
+        with tempfile.TemporaryDirectory() as raw:
+            fixture = validator_contract["EvidenceFixture"](
+                Path(raw)
+                / "lab-root"
+                / "evidence"
+                / validator_contract["RUN_ID"]
+            )
+            fixture.run_seal_path.unlink()
+            os.chmod(fixture.root / "results", 0o700)
+            fixture_artifacts_root = fixture.root / "artifacts" / "results"
+            os.chmod(fixture_artifacts_root, 0o700)
+            for gate, leaf in module["RESULT_DIRECTORIES"].items():
+                result_directory = fixture.result_paths[gate].parent
+                for directory in sorted(
+                    (path for path in result_directory.rglob("*") if path.is_dir()),
+                    reverse=True,
+                ):
+                    os.chmod(directory, 0o700)
+                os.chmod(result_directory, 0o700)
+                shutil.rmtree(result_directory)
+                fixture_artifacts = fixture.root / "artifacts" / "results" / gate
+                if fixture_artifacts.exists():
+                    for directory in sorted(
+                        (path for path in fixture_artifacts.rglob("*") if path.is_dir()),
+                        reverse=True,
+                    ):
+                        os.chmod(directory, 0o700)
+                    os.chmod(fixture_artifacts, 0o700)
+                    shutil.rmtree(fixture_artifacts)
+            publisher = module["EvidencePublisher"](
+                fixture.root,
+                validator_contract["RUN_ID"],
+                fixture.candidate_digest,
+            )
+            for gate, names in module["RESULT_SPECS"].items():
+                publisher.publish(
+                    gate,
+                    {
+                        name: json.dumps({"gate": gate, "artifact": name}).encode("utf-8") + b"\n"
+                        for name in names
+                    },
+                )
+            os.chmod(fixture_artifacts_root, 0o555)
+            readiness_raw = fixture.readiness_path.read_bytes()
+            readiness_rows = dict(
+                line.split("=", 1)
+                for line in readiness_raw.decode("utf-8").splitlines()
+            )
+            authority = validator_module["RunAuthority"](
+                lab_root=fixture.lab_root,
+                run_root=fixture.root,
+                run_id=validator_contract["RUN_ID"],
+                container_id=fixture.container_id,
+                readiness_path=fixture.readiness_path,
+                readiness_sha256=digest(readiness_raw),
+                readiness_rows=readiness_rows,
+                seal_root=fixture.seal_root,
+                fixture=True,
+            )
+            validator = validator_module["Validator"](fixture.root, authority)
+            validator_globals = validator_module["Validator"].revalidate_run_authority.__globals__
+            try:
+                with mock.patch.dict(
+                    validator_globals,
+                    {"resolve_run_authority": lambda _root: authority},
+                ):
+                    validator.validate(require_run_seal=False)
+            finally:
+                validator.close()
+
+    def test_evidence_root_rejects_symlink_ancestry(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            base = Path(raw)
+            lab = base / "lab"
+            outside = base / "outside"
+            lab.mkdir()
+            outside.mkdir()
+            (lab / "evidence").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "symlink"):
+                module["checked_directory"](lab / "evidence", lab, create=False)
+
+    def test_release_evidence_root_must_be_the_exact_lab_evidence_directory(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            evidence = root / "evidence"
+            nested = evidence / "nested"
+            nested.mkdir(parents=True)
+            self.assertEqual(
+                module["require_canonical_evidence_root"](evidence, root),
+                evidence,
+            )
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "exact"):
+                module["require_canonical_evidence_root"](nested, root)
+
+    def test_candidate_files_are_fd_read_and_reject_mutable_modes(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            mutable = root / "manifest.json"
+            mutable.write_text("{}\n", encoding="utf-8")
+            mutable.chmod(0o666)
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "mode"):
+                module["checked_file"](mutable, root, "manifest")
+
+    def test_manifest_contract_validates_sources_toolchains_and_redaction(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            manifest = self.manifest_fixture(Path(raw))
+            module["validate_manifest_contract"](manifest, "contract-run")
+            manifest["toolchains"]["nexus"] = "nexus 0.1.5 extra"
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "toolchain"):
+                module["validate_manifest_contract"](manifest, "contract-run")
+            manifest = self.manifest_fixture(Path(raw))
+            manifest["environment"]["API_TOKEN"] = "secret"
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "redact"):
+                module["validate_manifest_contract"](manifest, "contract-run")
+            manifest = self.manifest_fixture(Path(raw))
+            manifest["sources"]["nexus"] = {
+                "revision": "a" * 40,
+                "dirty": False,
+                "dirtyPaths": [{"path": "changed", "state": "present", "sha256": "d" * 64}],
+            }
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "dirty"):
+                module["validate_manifest_contract"](manifest, "contract-run")
+
+    def test_full_install_inventory_includes_node_modules_closure(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            dependency = root / "lib" / "node_modules" / "dep" / "index.js"
+            dependency.parent.mkdir(parents=True)
+            dependency.write_text("module.exports = 1;\n", encoding="utf-8")
+            dependency.chmod(0o644)
+            inventory = module["full_install_inventory"](root)
+            self.assertIn("lib/node_modules/dep/index.js", inventory)
+
+    def test_cli_version_must_be_exactly_nexus_0_1_5(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        module["require_exact_cli_version"]("nexus 0.1.5\n")
+        for output in ("nexus 0.1.50\n", "nexus 0.1.5 extra\n", "noise\nnexus 0.1.5\n"):
+            with self.subTest(output=output):
+                with self.assertRaisesRegex(module["AcceptanceFailure"], "exact"):
+                    module["require_exact_cli_version"](output)
+
+    def test_empty_required_capture_fails_instead_of_fabricating_pass(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        capture = module["CaptureEvidence"]()
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "empty"):
+            capture.jsonl_bytes("missing")
+
+    def test_runtime_observation_rejects_host_env_wrong_listener_and_process_identity(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            install = root / "install"
+            readiness = {
+                "containerId": "a" * 64,
+                "imageDigest": "sha256:" + "b" * 64,
+                "installTreeSha256": "c" * 64,
+                "nexusResolved": str(install / "bin" / "nexus.mjs"),
+                "nativeResolved": str(install / "native" / "nexus"),
+                "nativeSha256": "f" * 64,
+                "gatewayResolved": str(install / "bin" / "nexus-gateway.mjs"),
+                "gatewaySha256": "d" * 64,
+                "lensRendererMode": "production",
+                "lensApp": "/tmp/nexus-lens-app.contract",
+                "lensMain": "/tmp/nexus-lens-app.contract/electron/main.cjs",
+                "lensTreeSha256": "9" * 64,
+            }
+            candidate = module["Candidate"](
+                "contract-run",
+                "sha256:" + "e" * 64,
+                {
+                    "native": {"path": "candidate/native/nexus", "sha256": "f" * 64},
+                    "image": {"digest": readiness["imageDigest"]},
+                    "container": {
+                        "limits": {"cpus": 6, "memoryBytes": 8589934592, "pids": 1024}
+                    },
+                    "environment": {
+                        "HOME": str(root),
+                        "NEXUS_HOME": str(root / "nexus"),
+                        "NEXUS_V015_NATIVE_BIN": readiness["nativeResolved"],
+                        "NEXUS_V015_NATIVE_BIN_SHA256": readiness["nativeSha256"],
+                        "NEXUS_V015_LENS_RENDERER_MODE": "production",
+                        "NEXUS_V015_LENS_APP": readiness["lensApp"],
+                        "NEXUS_V015_LENS_MAIN": readiness["lensMain"],
+                        "NEXUS_V015_LENS_TREE_SHA256": readiness["lensTreeSha256"],
+                    },
+                },
+                root / "evidence" / "contract-run",
+                root,
+                install,
+                readiness,
+            )
+            observation = module["RuntimeObservation"](
+                container_id="a" * 12,
+                image_digest=readiness["imageDigest"],
+                cpu_max="600000 100000",
+                memory_max="8589934592",
+                memory_swap_max="0",
+                pids_max="1024",
+                home=str(root),
+                nexus_home=str(root / "nexus"),
+                install_tree_sha256=readiness["installTreeSha256"],
+                daemon_pid=101,
+                daemon_executable=readiness["nativeResolved"],
+                daemon_executable_sha256="f" * 64,
+                gateway_pid=202,
+                gateway_url="http://127.0.0.1:4101",
+                gateway_listener_owned=True,
+                gateway_argv=("node", readiness["gatewayResolved"]),
+                gateway_entrypoint=readiness["gatewayResolved"],
+                gateway_entrypoint_sha256=readiness["gatewaySha256"],
+                lens_pid=303,
+                lens_renderer_mode="production",
+                lens_app=readiness["lensApp"],
+                lens_main=readiness["lensMain"],
+                lens_tree_sha256=readiness["lensTreeSha256"],
+                lens_argv=("electron", readiness["lensMain"]),
+                lens_main_argument_bound=True,
+                lens_cwd=readiness["lensApp"],
+                lens_node_env="production",
+                lens_vite_dev_server_url_present=False,
+            )
+            module["validate_runtime_observation"](candidate, observation)
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "HOME"):
+                module["validate_runtime_observation"](
+                    candidate,
+                    dataclasses.replace(observation, home="/home/host-user"),
+                )
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "listener"):
+                module["validate_runtime_observation"](
+                    candidate,
+                    dataclasses.replace(observation, gateway_listener_owned=False),
+                )
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "daemon"):
+                module["validate_runtime_observation"](
+                    candidate,
+                    dataclasses.replace(
+                        observation, daemon_executable_sha256="0" * 64
+                    ),
+                )
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "Lens"):
+                module["validate_runtime_observation"](
+                    candidate,
+                    dataclasses.replace(observation, lens_renderer_mode="development"),
+                )
+            for changes in (
+                {"lens_main": "/tmp/nexus-lens-app.contract/electron/other.cjs"},
+                {"lens_main_argument_bound": False},
+                {"lens_cwd": "/tmp"},
+                {"lens_vite_dev_server_url_present": True},
+                {"lens_tree_sha256": "8" * 64},
+            ):
+                with self.subTest(lens_runtime_change=changes):
+                    with self.assertRaisesRegex(module["AcceptanceFailure"], "Lens"):
+                        module["validate_runtime_observation"](
+                            candidate,
+                            dataclasses.replace(observation, **changes),
+                        )
+
+    def test_lens_readiness_and_manifest_binding_is_exact(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        readiness = {
+            "lensRendererMode": "production",
+            "lensApp": "/tmp/nexus-lens-app.Ab12",
+            "lensMain": "/tmp/nexus-lens-app.Ab12/electron/main.cjs",
+            "lensTreeSha256": "a" * 64,
+        }
+        environment = {
+            "NEXUS_V015_LENS_RENDERER_MODE": "production",
+            "NEXUS_V015_LENS_APP": readiness["lensApp"],
+            "NEXUS_V015_LENS_MAIN": readiness["lensMain"],
+            "NEXUS_V015_LENS_TREE_SHA256": readiness["lensTreeSha256"],
+        }
+        module["validate_lens_ledger"](readiness, environment)
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "Lens"):
+            module["validate_lens_ledger"](
+                {**readiness, "lensRendererMode": "development"},
+                environment,
+            )
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "Lens"):
+            module["validate_lens_ledger"](
+                readiness,
+                {**environment, "NEXUS_V015_LENS_TREE_SHA256": "b" * 64},
+            )
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "Lens"):
+            module["validate_lens_ledger"](
+                {**readiness, "lensMain": "/tmp/nexus-lens-app.Ab12/main.cjs"},
+                environment,
+            )
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "Lens"):
+            module["validate_lens_ledger"](
+                readiness,
+                {**environment, "NEXUS_V015_LENS_APP": "/tmp/nexus-lens-app.other"},
+            )
+
+    def test_lens_tree_digest_matches_the_shell_ledger_global_sort(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            app = Path(raw) / "app"
+            nested = app / "a"
+            nested.mkdir(parents=True)
+            rows = {
+                "a/file.txt": b"nested\n",
+                "a.txt": b"sibling\n",
+            }
+            for relative, payload in rows.items():
+                path = app / relative
+                path.write_bytes(payload)
+                path.chmod(0o444)
+            nested.chmod(0o555)
+            app.chmod(0o555)
+            expected = hashlib.sha256()
+            for relative in sorted(rows):
+                expected.update(relative.encode("utf-8"))
+                expected.update(b"\0" + b"444" + b"\0")
+                expected.update(digest(rows[relative]).encode("ascii") + b"\n")
+            try:
+                first = module["lens_tree_digest"](app)
+                self.assertEqual(first, expected.hexdigest())
+                changed = app / "a.txt"
+                changed.chmod(0o644)
+                changed.write_bytes(b"mutated\n")
+                changed.chmod(0o444)
+                self.assertNotEqual(module["lens_tree_digest"](app), first)
+            finally:
+                app.chmod(0o755)
+                nested.chmod(0o755)
+
+    def test_lens_tree_rejects_any_symlink(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            app = Path(raw) / "app"
+            app.mkdir()
+            target = app / "target.txt"
+            target.write_text("target\n", encoding="utf-8")
+            target.chmod(0o444)
+            (app / "alias.txt").symlink_to(target.name)
+            app.chmod(0o555)
+            try:
+                with self.assertRaisesRegex(module["AcceptanceFailure"], "symlink"):
+                    module["lens_tree_digest"](app)
+            finally:
+                app.chmod(0o755)
+
+    def test_support_scripts_are_readiness_and_manifest_bound_before_loading(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            runner = root / "nexus-v015-ws-acceptance"
+            soak = root / "nexus-v015-ws-soak"
+            runner.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            soak.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            runner.chmod(0o555)
+            soak.chmod(0o555)
+            readiness = {
+                "wsAcceptance": str(runner),
+                "wsAcceptanceSha256": digest(runner.read_bytes()),
+                "wsSoak": str(soak),
+                "wsSoakSha256": digest(soak.read_bytes()),
+            }
+            environment = {
+                "NEXUS_V015_WS_ACCEPTANCE": str(runner),
+                "NEXUS_V015_WS_ACCEPTANCE_SHA256": readiness["wsAcceptanceSha256"],
+                "NEXUS_V015_WS_SOAK": str(soak),
+                "NEXUS_V015_WS_SOAK_SHA256": readiness["wsSoakSha256"],
+            }
+            real_fstat = os.fstat
+
+            def root_owned_fstat(fd: int) -> os.stat_result:
+                values = list(real_fstat(fd))
+                values[4] = 0
+                return os.stat_result(values)
+
+            if os.geteuid() != 0:
+                with self.assertRaisesRegex(module["AcceptanceFailure"], "owner"):
+                    module["validate_support_script_bindings"](
+                        runner,
+                        soak,
+                        readiness,
+                        environment,
+                        root,
+                    )
+            with mock.patch.object(
+                module["os"], "fstat", side_effect=root_owned_fstat
+            ):
+                module["validate_support_script_bindings"](
+                    runner,
+                    soak,
+                    readiness,
+                    environment,
+                    root,
+                )
+            environment["NEXUS_V015_WS_SOAK_SHA256"] = "0" * 64
+            with mock.patch.object(
+                module["os"], "fstat", side_effect=root_owned_fstat
+            ):
+                with self.assertRaisesRegex(module["AcceptanceFailure"], "soak"):
+                    module["validate_support_script_bindings"](
+                        runner,
+                        soak,
+                        readiness,
+                        environment,
+                        root,
+                    )
+
+    def test_final_release_tools_are_root_owned_immutable_and_manifest_bound(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            webconsole = root / "nexus-v015-webconsole-acceptance"
+            webconsole_evidence = root / "nexus-v015-webconsole-evidence-verify"
+            validator = root / "nexus-v015-evidence-validate"
+            webconsole.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            webconsole_evidence.write_text(
+                "#!/usr/bin/env python3\n", encoding="utf-8"
+            )
+            validator.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            webconsole.chmod(0o555)
+            webconsole_evidence.chmod(0o555)
+            validator.chmod(0o555)
+            function_globals = module["validate_final_support_script_bindings"].__globals__
+            function_globals["WEBCONSOLE_ACCEPTANCE_BIN"] = webconsole
+            function_globals["WEBCONSOLE_EVIDENCE_VERIFIER_BIN"] = webconsole_evidence
+            function_globals["EVIDENCE_VALIDATOR_BIN"] = validator
+            readiness = {
+                "webconsoleAcceptance": str(webconsole),
+                "webconsoleAcceptanceSha256": digest(webconsole.read_bytes()),
+                "webconsoleEvidenceVerifier": str(webconsole_evidence),
+                "webconsoleEvidenceVerifierSha256": digest(
+                    webconsole_evidence.read_bytes()
+                ),
+                "evidenceValidator": str(validator),
+                "evidenceValidatorSha256": digest(validator.read_bytes()),
+            }
+            environment = {
+                "NEXUS_V015_WEBCONSOLE_ACCEPTANCE": str(webconsole),
+                "NEXUS_V015_WEBCONSOLE_ACCEPTANCE_SHA256": readiness[
+                    "webconsoleAcceptanceSha256"
+                ],
+                "NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER": str(
+                    webconsole_evidence
+                ),
+                "NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER_SHA256": readiness[
+                    "webconsoleEvidenceVerifierSha256"
+                ],
+                "NEXUS_V015_EVIDENCE_VALIDATOR": str(validator),
+                "NEXUS_V015_EVIDENCE_VALIDATOR_SHA256": readiness[
+                    "evidenceValidatorSha256"
+                ],
+            }
+            real_fstat = os.fstat
+
+            def root_owned_fstat(fd: int) -> os.stat_result:
+                values = list(real_fstat(fd))
+                values[4] = 0
+                return os.stat_result(values)
+
+            with mock.patch.object(
+                module["os"], "fstat", side_effect=root_owned_fstat
+            ):
+                module["validate_final_support_script_bindings"](
+                    readiness, environment
+                )
+                for missing_key in tuple(readiness):
+                    with self.subTest(missing_readiness=missing_key):
+                        with self.assertRaisesRegex(
+                            module["AcceptanceFailure"], "release tool"
+                        ):
+                            module["validate_final_support_script_bindings"](
+                                {
+                                    key: value
+                                    for key, value in readiness.items()
+                                    if key != missing_key
+                                },
+                                environment,
+                            )
+                for missing_key in tuple(environment):
+                    with self.subTest(missing_environment=missing_key):
+                        with self.assertRaisesRegex(
+                            module["AcceptanceFailure"], "release tool"
+                        ):
+                            module["validate_final_support_script_bindings"](
+                                readiness,
+                                {
+                                    key: value
+                                    for key, value in environment.items()
+                                    if key != missing_key
+                                },
+                            )
+                with self.assertRaisesRegex(
+                    module["AcceptanceFailure"], "release tool"
+                ):
+                    module["validate_final_support_script_bindings"](
+                        {
+                            **readiness,
+                            "evidenceValidator": (
+                                "/work/egregore-nexus/scripts/nexus-v015-evidence-validate"
+                            ),
+                        },
+                        environment,
+                    )
+                with self.assertRaisesRegex(
+                    module["AcceptanceFailure"], "release tool"
+                ):
+                    module["validate_final_support_script_bindings"](
+                        {
+                            **readiness,
+                            "webconsoleEvidenceVerifier": (
+                                "/work/egregore-nexus/scripts/"
+                                "nexus-v015-webconsole-evidence-verify"
+                            ),
+                        },
+                        environment,
+                    )
+
+            webconsole_evidence.chmod(0o755)
+            webconsole_evidence.write_text(
+                "#!/usr/bin/env python3\n# mutated\n", encoding="utf-8"
+            )
+            webconsole_evidence.chmod(0o555)
+            with mock.patch.object(
+                module["os"], "fstat", side_effect=root_owned_fstat
+            ):
+                with self.assertRaisesRegex(module["AcceptanceFailure"], "hash"):
+                    module["validate_final_support_script_bindings"](
+                        readiness, environment
+                    )
+            webconsole_evidence.chmod(0o755)
+            webconsole_evidence.write_text(
+                "#!/usr/bin/env python3\n", encoding="utf-8"
+            )
+            webconsole_evidence.chmod(0o555)
+            validator.chmod(0o755)
+            validator.write_text("#!/usr/bin/env python3\n# mutated\n", encoding="utf-8")
+            validator.chmod(0o555)
+            with mock.patch.object(
+                module["os"], "fstat", side_effect=root_owned_fstat
+            ):
+                with self.assertRaisesRegex(module["AcceptanceFailure"], "hash"):
+                    module["validate_final_support_script_bindings"](
+                        readiness, environment
+                    )
+            validator.chmod(0o755)
+            validator.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            validator.chmod(0o555)
+            if os.geteuid() != 0:
+                with self.assertRaisesRegex(module["AcceptanceFailure"], "owner"):
+                    module["validate_final_support_script_bindings"](
+                        readiness, environment
+                    )
+            validator.chmod(0o755)
+            with mock.patch.object(
+                module["os"], "fstat", side_effect=root_owned_fstat
+            ):
+                with self.assertRaisesRegex(module["AcceptanceFailure"], "mode"):
+                    module["validate_final_support_script_bindings"](
+                        readiness, environment
+                    )
+
+    def test_native_readiness_rejects_missing_mutated_and_decoy_binaries(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            install = Path(raw) / "install"
+            cli = install / "lib" / "node_modules" / "@egregore" / "nexus-cli"
+            native = cli / "native" / "linux-x64" / "nexus"
+            native.parent.mkdir(parents=True)
+            native.write_bytes(b"candidate-native\n")
+            native.chmod(0o555)
+            native_hash = digest(native.read_bytes())
+            readiness = {
+                "nativeResolved": str(native),
+                "nativeSha256": native_hash,
+            }
+            environment = {
+                "NEXUS_V015_NATIVE_BIN": str(native),
+                "NEXUS_V015_NATIVE_BIN_SHA256": native_hash,
+            }
+            manifest_native = {"path": "candidate/native/nexus", "sha256": native_hash}
+            module["validate_native_binding"](
+                install, cli, readiness, environment, manifest_native
+            )
+            for missing_key in ("nativeResolved", "nativeSha256"):
+                with self.subTest(missing_readiness=missing_key):
+                    with self.assertRaisesRegex(module["AcceptanceFailure"], "native"):
+                        module["validate_native_binding"](
+                            install,
+                            cli,
+                            {
+                                key: value
+                                for key, value in readiness.items()
+                                if key != missing_key
+                            },
+                            environment,
+                            manifest_native,
+                        )
+            for missing_key in (
+                "NEXUS_V015_NATIVE_BIN",
+                "NEXUS_V015_NATIVE_BIN_SHA256",
+            ):
+                with self.subTest(missing_environment=missing_key):
+                    with self.assertRaisesRegex(module["AcceptanceFailure"], "native"):
+                        module["validate_native_binding"](
+                            install,
+                            cli,
+                            readiness,
+                            {
+                                key: value
+                                for key, value in environment.items()
+                                if key != missing_key
+                            },
+                            manifest_native,
+                        )
+            native.chmod(0o755)
+            native.write_bytes(b"mutated-native\n")
+            native.chmod(0o555)
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "native"):
+                module["validate_native_binding"](
+                    install, cli, readiness, environment, manifest_native
+                )
+            native.chmod(0o755)
+            native.write_bytes(b"candidate-native\n")
+            native.chmod(0o555)
+            decoy = cli / "native" / "other" / "nexus"
+            decoy.parent.mkdir()
+            decoy.write_bytes(b"decoy\n")
+            decoy.chmod(0o555)
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "single"):
+                module["validate_native_binding"](
+                    install, cli, readiness, environment, manifest_native
+                )
+
+    def test_candidate_only_runs_runtime_preflight_before_reporting_pass(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            evidence = root / "evidence"
+            evidence.mkdir()
+            candidate = module["Candidate"](
+                "contract-run",
+                "sha256:" + "d" * 64,
+                {},
+                evidence / "contract-run",
+                root,
+                root / "install",
+            )
+            globals_ = module["main"].__globals__
+            globals_["validate_candidate"] = lambda *_args: candidate
+            globals_["observe_runtime"] = mock.Mock(
+                side_effect=module["AcceptanceFailure"]("wrong live listener")
+            )
+            globals_["candidate_verification_document"] = mock.Mock()
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "OCULAR_LAB": "1",
+                    "NEXUS_LAB_ROOT": str(root),
+                    "NEXUS_V015_RUN_ID": "contract-run",
+                },
+                clear=False,
+            ):
+                with self.assertRaisesRegex(module["AcceptanceFailure"], "listener"):
+                    module["main"]([
+                        "--mode", "packed",
+                        "--evidence-dir", str(evidence),
+                        "--verify-candidate-only",
+                    ])
+            globals_["candidate_verification_document"].assert_not_called()
+
+    def test_gate_observations_refuse_missing_or_empty_release_claims(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        observations = module["GateObservations"]()
+        observations.record("B1", "identityMatrix", {"rows": [{"agentId": "a_1"}]})
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "missing"):
+            observations.payloads()
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "empty"):
+            observations.record("B1", "renameRegression", [])
+
+    def test_browser_mutation_security_drives_exact_http_and_websocket_matrix(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        backend = module["BackendAcceptance"].__new__(module["BackendAcceptance"])
+        backend.candidate = type("Candidate", (), {"run_id": "contract-run"})()
+        backend.http = type(
+            "Http",
+            (),
+            {
+                "cookie": "nexus_human=human-cookie; nexus_csrf=csrf-issued",
+                "csrf": "csrf-issued",
+            },
+        )()
+        backend.human_name = "human-operator"
+        backend.unknown_cookie = {
+            "status": 403,
+            "marker": "unknown-marker",
+            "acceptedRows": 0,
+            "responseSha256": "a" * 64,
+        }
+        backend.soak = type("Soak", (), {"thread": "security-thread", "sessions": {}})()
+        agent = type(
+            "Agent",
+            (),
+            {"kind": "codex", "name": "v015-codex", "agent_id": "a_codex", "session_id": "s_codex"},
+        )()
+        backend.live_agents = (agent, object())
+
+        accepted_rows: list[dict[str, object]] = []
+        http_calls: list[dict[str, object]] = []
+
+        def history(_path: str) -> list[dict[str, object]]:
+            return list(accepted_rows)
+
+        def http_attempt(
+            case: str,
+            marker: str,
+            cookie: str,
+            csrf_header: str | None,
+        ) -> dict[str, object]:
+            http_calls.append(
+                {"case": case, "marker": marker, "cookie": cookie, "csrf": csrf_header}
+            )
+            accepted = cookie == backend.http.cookie and csrf_header == backend.http.csrf
+            if accepted:
+                accepted_rows.append(
+                    {
+                        "from": backend.human_name,
+                        "body": marker,
+                        "messageId": "m-http-positive",
+                    }
+                )
+            return {
+                "status": 201 if accepted else 403,
+                "bodySha256": ("b" if accepted else "c") * 64,
+                "messageId": "m-http-positive" if accepted else None,
+            }
+
+        ws_calls: list[str] = []
+
+        async def rejected_ws(case: str, *_args: object, **_kwargs: object) -> dict[str, object]:
+            ws_calls.append(case)
+            return {
+                "case": case,
+                "status": 403,
+                "accepted": False,
+                "queueUnchanged": True,
+            }
+
+        class Lane:
+            async def begin_prompt(self, marker: str, _timeout: float) -> object:
+                return type(
+                    "Attempt",
+                    (),
+                    {"marker": marker, "client_message_id": f"cm-{marker}", "command_id": "cmd-positive"},
+                )()
+
+            async def finish_prompt(self, attempt: object, _timeout: float) -> dict[str, object]:
+                return {
+                    "clientMessageId": attempt.client_message_id,
+                    "commandId": attempt.command_id,
+                    "assistantMarkerMatched": True,
+                }
+
+        backend.soak.sessions["codex"] = Lane()
+        backend.history = history
+        backend._http_mutation_attempt = http_attempt
+        backend._rejected_ws_mutation = rejected_ws
+
+        evidence = asyncio.run(backend.browser_mutation_security())
+
+        self.assertEqual(
+            [row["case"] for row in http_calls],
+            ["missing-header", "mismatched-header", "missing-cookie-proof", "valid-pair"],
+        )
+        self.assertEqual(
+            ws_calls,
+            ["query-frame-header-forgery", "mismatched-protocol", "duplicate-protocol", "missing-cookie-proof"],
+        )
+        self.assertEqual(evidence["packedHttp"]["acceptedRows"], 1)
+        self.assertTrue(evidence["packedWebsocket"]["positive"]["assistantMarkerMatched"])
+        self.assertEqual(evidence["csrfMatrix"]["unknownCookie"]["acceptedRows"], 0)
+
+    def test_browser_mutation_security_fails_on_negative_http_ingress(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        backend = module["BackendAcceptance"].__new__(module["BackendAcceptance"])
+        backend.candidate = type("Candidate", (), {"run_id": "contract-run"})()
+        backend.http = type(
+            "Http",
+            (),
+            {
+                "cookie": "nexus_human=human-cookie; nexus_csrf=csrf-issued",
+                "csrf": "csrf-issued",
+            },
+        )()
+        backend.human_name = "human-operator"
+        backend.unknown_cookie = {"status": 403, "acceptedRows": 0}
+        backend.soak = type("Soak", (), {"thread": "security-thread", "sessions": {}})()
+        backend.live_agents = (object(), object())
+        backend.history = lambda _path: []
+        backend._http_mutation_attempt = lambda *_args: {
+            "status": 201,
+            "bodySha256": "d" * 64,
+            "messageId": "m-should-not-exist",
+        }
+
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "missing-header"):
+            asyncio.run(backend.browser_mutation_security())
+
+    def test_backend_failure_seam_aborts_the_real_run_before_payload_generation(self) -> None:
+        module = runpy.run_path(str(TARGET))
+
+        class FakeSoak:
+            def __init__(self, *_args: object) -> None:
+                self.closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            candidate = module["Candidate"](
+                "contract-run",
+                "sha256:" + "d" * 64,
+                {},
+                root / "evidence" / "contract-run",
+                root,
+                root / "install",
+            )
+            agents = tuple(
+                module["LiveAgent"](
+                    kind,
+                    f"v015-{kind}",
+                    f"a_{kind}",
+                    f"s_{kind}",
+                    root / kind,
+                    "a" * 64,
+                    f"{kind} 1.0.0",
+                    root / f"workspace-{kind}",
+                )
+                for kind in ("codex", "claude")
+            )
+            core = {
+                "HttpClient": lambda *_args: object(),
+                "Agent": lambda *args: args,
+                "Candidate": lambda *args: args,
+                "Soak": FakeSoak,
+            }
+
+            def fail_after_setup(name: str, _backend: object) -> None:
+                if name == "setup":
+                    raise module["AcceptanceFailure"]("injected setup boundary failure")
+
+            backend = module["BackendAcceptance"](
+                core,
+                candidate,
+                agents,
+                failure_seam=fail_after_setup,
+            )
+            backend.setup = mock.AsyncMock()
+            backend.stable_identity = mock.AsyncMock()
+            backend.record_observations = mock.Mock(
+                side_effect=AssertionError("payloads generated after failure")
+            )
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "injected"):
+                asyncio.run(backend.run())
+            backend.setup.assert_awaited_once()
+            backend.stable_identity.assert_not_awaited()
+            backend.record_observations.assert_not_called()
+            self.assertTrue(backend.soak.closed)
+
+    def test_backend_run_drives_every_release_boundary_before_observation(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        source = TARGET.read_text(encoding="utf-8")
+        run_body = source.split("    async def run(self)", 1)[1].split(
+            "    def record_observations", 1
+        )[0]
+        for required in (
+            "browser_mutation_security",
+            "concurrent_thread_subscribers",
+            "straddle_gateway_restart",
+            "straddle_daemon_restart",
+            "RESTART_PLAN[1]",
+            "RESTART_PLAN[3]",
+            "queue_steer_compact_controls",
+            "agent_session_backpressure_and_queue_full",
+            "queue_authority_outage_recovery",
+            "developer_backpressure",
+            "record_observations",
+        ):
+            self.assertIn(required, run_body)
+        self.assertNotIn("def result_payloads", source)
+        self.assertNotIn('"cookieRetained": True', source)
+        self.assertNotIn('"timerReads": 0', source)
+        self.assertEqual(
+            module["RESTART_PLAN"],
+            ("gateway", "gateway", "daemon", "daemon"),
+        )
+
+    def test_exact_roster_rejects_stale_or_duplicate_rows(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        agents = (
+            type("Agent", (), {"agent_id": "a_codex", "name": "codex", "session_id": "s_c"})(),
+            type("Agent", (), {"agent_id": "a_claude", "name": "claude", "session_id": "s_h"})(),
+        )
+        rows = [
+            {"agentId": "a_codex", "name": "codex", "sessionId": "s_c", "status": "online"},
+            {"agentId": "a_claude", "name": "claude", "sessionId": "s_h", "status": "active"},
+        ]
+        module["require_exact_roster"](rows, agents)
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "exact"):
+            module["require_exact_roster"](
+                [*rows, {"agentId": "a_stale", "name": "earl", "sessionId": "s_old", "status": "online"}],
+                agents,
+            )
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "duplicate"):
+            module["require_exact_roster"]([rows[0], rows[0], rows[1]], agents)
+
+    def test_rest_and_websocket_queue_snapshots_must_match_exactly(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        rest = {
+            "sessionId": "s_codex",
+            "seq": 7,
+            "revision": 3,
+            "turnActive": True,
+            "commands": [{"commandId": "cmd_1", "state": "queued"}],
+        }
+        websocket = {"t": "queue.snapshot", **rest}
+        module["require_queue_agreement"](rest, websocket, "s_codex")
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "queue snapshot"):
+            module["require_queue_agreement"](
+                rest,
+                {**websocket, "seq": 8},
+                "s_codex",
+            )
+
+    def test_restart_plan_is_two_consecutive_restarts_per_authority(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        self.assertEqual(
+            module["RESTART_PLAN"],
+            ("gateway", "gateway", "daemon", "daemon"),
+        )
+
+    def test_publisher_rejects_a_symlinked_results_directory(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            run_root = root / "run"
+            outside = root / "outside"
+            run_root.mkdir()
+            outside.mkdir()
+            (run_root / "results").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(module["AcceptanceFailure"], "symlink"):
+                module["EvidencePublisher"](
+                    run_root,
+                    "contract-run",
+                    "sha256:" + "d" * 64,
+                )
+
+    def test_readiness_binding_hash_keys_match_the_canonical_ledger(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        self.assertEqual(
+            module["READINESS_BINDING_HASHES"],
+            {
+                "nexusResolved": "nexusSha256",
+                "gatewayResolved": "gatewaySha256",
+                "webuiResolved": "webuiSha256",
+                "labProcess": "labProcessSha256",
+                "labAgent": "labAgentSha256",
+                "labFixture": "labFixtureSha256",
+                "nexusTarball": "nexusTarballSha256",
+                "cliTarball": "cliTarballSha256",
+                "gatewayTarball": "gatewayTarballSha256",
+            },
+        )
+
+    def test_harness_version_requires_one_recorded_semver_line(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        self.assertEqual(
+            module["harness_version_line"]("noise\ncodex-cli 1.2.3\n"),
+            "codex-cli 1.2.3",
+        )
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "version"):
+            module["harness_version_line"]("no semantic version here\n")
+
+    def test_live_harnesses_launch_through_the_candidate_bound_hook(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        calls: list[tuple[list[str], dict[str, str]]] = []
+
+        def fake_run(
+            argv: list[str],
+            *,
+            text: bool,
+            capture_output: bool,
+            timeout: int,
+            check: bool,
+            env: dict[str, str],
+        ) -> subprocess.CompletedProcess[str]:
+            self.assertTrue(text)
+            self.assertTrue(capture_output)
+            self.assertEqual(timeout, 240)
+            self.assertFalse(check)
+            calls.append((argv, env))
+            return subprocess.CompletedProcess(argv, 0, stdout='{"agentId":"a_live"}\n', stderr="")
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            hook = root / "lab-agent"
+            hook.write_text("#!/bin/sh\n", encoding="utf-8")
+            hook.chmod(0o755)
+            hook_sha256 = digest(hook.read_bytes())
+            module["launch_live_agents"].__globals__["LAB_AGENT"] = hook
+            candidate = module["Candidate"](
+                "contract-run",
+                "sha256:" + "d" * 64,
+                {
+                    "environment": {
+                        "NEXUS_V015_LAB_AGENT": str(hook),
+                        "NEXUS_V015_LAB_AGENT_SHA256": hook_sha256,
+                        "NEXUS_V015_NEXUS_BIN": "/tmp/nexus-lab-bin/nexus",
+                        "NEXUS_V015_READINESS_LEDGER_SHA256": "a" * 64,
+                    }
+                },
+                root / "evidence" / "contract-run",
+                root,
+                root / "install",
+            )
+            module["launch_live_agents"](candidate, runner=fake_run)
+
+        self.assertEqual(
+            [argv for argv, _env in calls],
+            [[str(hook), "launch", "codex"], [str(hook), "launch", "claude"]],
+        )
+        for _argv, env in calls:
+            self.assertEqual(env["OCULAR_LAB"], "1")
+            self.assertEqual(env["NEXUS_V015_RUN_ID"], "contract-run")
+            self.assertEqual(env["NEXUS_V015_NEXUS_BIN"], "/tmp/nexus-lab-bin/nexus")
+            self.assertEqual(env["NEXUS_V015_READINESS_LEDGER_SHA256"], "a" * 64)
+
+    def test_retired_developer_polling_source_is_detected(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        self.assertEqual(module["retired_polling_occurrences"](b"event driven source\n"), 0)
+        self.assertEqual(
+            module["retired_polling_occurrences"](
+                b"DEFAULT_DEVELOPER_EVENT_POLL_MS developerEventsSource.since"
+            ),
+            2,
+        )
+
+    def test_marker_row_must_be_attributed_and_exactly_once(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        row = module["exact_marker_row"](
+            [
+                {"messageId": "m_other", "from": "codex", "body": "other"},
+                {"messageId": "m_marker", "from": "codex", "body": "V015_MARKER"},
+            ],
+            "codex",
+            "V015_MARKER",
+        )
+        self.assertEqual(row["messageId"], "m_marker")
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "exactly once"):
+            module["exact_marker_row"](
+                [
+                    {"messageId": "m_1", "from": "codex", "body": "V015_MARKER"},
+                    {"messageId": "m_2", "from": "codex", "body": "V015_MARKER"},
+                ],
+                "codex",
+                "V015_MARKER",
+            )
+
+    def test_initial_queue_snapshot_requires_the_canonical_session(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        module["require_queue_snapshot"](
+            {"t": "queue.snapshot", "sessionId": "s_expected", "seq": 0},
+            "s_expected",
+        )
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "sessionId"):
+            module["require_queue_snapshot"](
+                {"t": "queue.snapshot", "seq": 0},
+                "s_expected",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

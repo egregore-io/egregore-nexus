@@ -1,0 +1,1562 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TARGET="$SCRIPT_DIR/nexus-docker-test-env"
+REAL_DOCKER=$(command -v docker 2>/dev/null || true)
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+export NEXUS_V015_RUN_ID=v015-test
+
+mkdir -p "$TMP/bin"
+for command in docker cargo pnpm npm npx xdg-open; do
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    "touch '$TMP/unexpected-command'" \
+    'exit 97' >"$TMP/bin/$command"
+  chmod +x "$TMP/bin/$command"
+done
+
+PATH="$TMP/bin:/usr/bin:/bin" "$TARGET" --help >"$TMP/help"
+test ! -e "$TMP/unexpected-command"
+grep -Fq "lab-up" "$TMP/help"
+grep -Fq "lab-status" "$TMP/help"
+grep -Fq "lab-readiness" "$TMP/help"
+grep -Fq "lab-gate" "$TMP/help"
+grep -Fq "lab-gate --mode MODE" "$TMP/help"
+grep -Fq -- "--soak 1800" "$TMP/help"
+grep -Fq "lab-evidence" "$TMP/help"
+grep -Fq "lab-down" "$TMP/help"
+grep -Fq "default: 6" "$TMP/help"
+grep -Fq "default: 8g" "$TMP/help"
+grep -Fq "default: 1024" "$TMP/help"
+grep -Fq "default: 4551" "$TMP/help"
+grep -Fq "default: 4553" "$TMP/help"
+
+grep -Fq 'NEXUS_WEBUI_BIN=/tmp/nexus-lab-bin/nexus-webui' "$TARGET"
+grep -Fq 'pnpm webconsole:build' "$TARGET"
+grep -Fq 'webconsole start --host 127.0.0.1 --port 4200' "$TARGET"
+grep -Fq 'webconsole launch --no-open' "$TARGET"
+grep -Fq 'OCULAR_WEBUI_URL=http://127.0.0.1:4200' "$TARGET"
+grep -Fq 'http://127.0.0.1:4200/health' "$TARGET"
+grep -Fq '/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance --nexus-bin /tmp/nexus-lab-bin/nexus --run-id' "$TARGET"
+grep -Fq -- '--evidence-root "$NEXUS_LAB_ROOT/evidence/$NEXUS_V015_RUN_ID"' "$TARGET"
+grep -Fq '/tmp/nexus-lab-bin/nexus' "$TARGET"
+grep -Fq '/tmp/nexus-lab-bin/nexus --version | grep -Fx "nexus 0.1.5" >/dev/null' "$TARGET"
+if grep -Fq 'nexus 0.1.5 (revision ' "$TARGET"; then
+  echo 'packed lab version probe must match the synchronized public version exactly' >&2
+  exit 1
+fi
+grep -Fq 'nexus-pack-native-npm' "$TARGET"
+grep -Fq 'npm pack --pack-destination' "$TARGET"
+grep -Fq 'install_root=$(mktemp -d /tmp/nexus-lab-install.XXXXXX)' "$TARGET"
+if grep -Fq 'install_root=/tmp/nexus-lab-install' "$TARGET"; then
+  echo 'packed lab install prefix must be unique per candidate build' >&2
+  exit 1
+fi
+grep -Fq 'registry_root=$(mktemp -d /tmp/nexus-lab-registry.XXXXXX)' "$TARGET"
+grep -Fq 'foreign_cwd=$(mktemp -d /tmp/nexus-lab-install-cwd.XXXXXX)' "$TARGET"
+grep -Fq 'cd "$foreign_cwd"' "$TARGET"
+grep -Fq 'npm install --global --prefix "$install_root" --ignore-scripts --no-audit --no-fund \' "$TARGET"
+grep -Fq '"@egregore/nexus@0.1.5" >/dev/null' "$TARGET"
+grep -Fq 'test ! -e "$install_root/lib/node_modules/@egregore/nexus-cli"' "$TARGET"
+grep -Fq 'test ! -e "$install_root/lib/node_modules/@egregore/nexus-gateway"' "$TARGET"
+grep -Fq 'test -f "$install_root/lib/node_modules/@egregore/nexus/node_modules/@egregore/nexus-cli/package.json"' "$TARGET"
+grep -Fq 'test -f "$install_root/lib/node_modules/@egregore/nexus/node_modules/@egregore/nexus-gateway/package.json"' "$TARGET"
+if grep -Fq '        "$packs/$cli_tar" "$packs/$gateway_tar" "$packs/$nexus_tar" >/dev/null' "$TARGET"; then
+  echo 'packed lab must install only the umbrella package at top level' >&2
+  exit 1
+fi
+"$SCRIPT_DIR/test-nexus-v015-scoped-registry"
+
+# The ocular runners execute only immutable lab-local hook copies.  Their
+# hashes are part of candidate readiness so a source-tree edit after assembly
+# cannot change restart, live-agent, or PACTBIN2 fixture behavior mid-run.
+for hook in process agent fixture; do
+  grep -Fq "install -m 0555 /work/egregore-nexus/scripts/nexus-v015-lab-$hook /tmp/nexus-lab-bin/lab-$hook" "$TARGET"
+done
+for support in \
+  nexus-v015-ws-acceptance \
+  nexus-v015-ws-soak \
+  nexus-v015-webconsole-acceptance \
+  nexus-v015-webconsole-evidence-verify \
+  nexus-v015-evidence-validate \
+  nexus-v015-release-assemble \
+  nexus-hooks-practical-gate; do
+  grep -Fq "install -m 0555 /work/egregore-nexus/scripts/$support /tmp/nexus-lab-bin/$support" "$TARGET"
+done
+grep -Fq 'chown root:root /tmp/nexus-lab-bin' "$TARGET"
+grep -Fq 'chmod 0555 /tmp/nexus-lab-bin' "$TARGET"
+grep -Fq 'candidate lab hook ownership or mode mismatch' "$TARGET"
+for field in labProcessSha256 labAgentSha256 labFixtureSha256; do
+  grep -Fq "${field}=%s" "$TARGET"
+done
+for field in \
+  imageDigest installTreeSha256 nativeResolved nativeSha256 \
+  nexusTarball nexusTarballSha256 cliTarball cliTarballSha256 \
+  gatewayTarball gatewayTarballSha256 \
+  wsAcceptanceSha256 wsSoakSha256 webconsoleAcceptanceSha256 \
+  webconsoleEvidenceVerifierSha256 evidenceValidatorSha256 \
+  releaseAssemblerSha256; do
+  grep -Fq "${field}=%s" "$TARGET"
+done
+grep -Fq 'python3 -c "import runpy,sys; from pathlib import Path;' "$TARGET"
+grep -Fq 'NEXUS_V015_READINESS_LEDGER_SHA256' "$TARGET"
+grep -Fq 'if [ "$mode" = packed ] && [ -x "$REPO/scripts/nexus-v015-lab-manifest" ]; then' "$TARGET"
+grep -Fq 'PACTREE_REPO="${NEXUS_DOCKER_TEST_PACTREE_REPO:-}"' "$TARGET"
+grep -Fq 'PACTREE_PY_REPO="${NEXUS_DOCKER_TEST_PACTREE_PY_REPO:-}"' "$TARGET"
+
+# Source mode is the only lab shape allowed to depend on Vite.  The packed
+# candidate must build Lens once, stage the exact renderer outside the source
+# mount, and launch Electron in production mode without a dev-server URL.
+python3 - "$TARGET" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+
+def function_body(name: str, next_name: str) -> str:
+    start_marker = f"{name}() {{\n"
+    end_marker = f"\n}}\n\n{next_name}() {{\n"
+    start = source.find(start_marker)
+    if start < 0:
+        raise SystemExit(f"missing {name} function")
+    start += len(start_marker)
+    end = source.find(end_marker, start)
+    if end < 0:
+        raise SystemExit(f"unterminated {name} function")
+    return source[start:end]
+
+source_lens = function_body("start_source_lens", "start_packed_lens")
+packed_lens = function_body("start_packed_lens", "start_lab_stack")
+stack = function_body("start_lab_stack", "build_lab_candidate")
+build = function_body("build_lab_candidate", "cmd_lab_up")
+
+required_source = (
+    "node_modules/.bin/vite",
+    "VITE_DEV_SERVER_URL=http://127.0.0.1:1422",
+    "NODE_ENV=development",
+    "env -u LENS_NEXUS_GATEWAY_URL",
+)
+for needle in required_source:
+    if needle not in source_lens:
+        raise SystemExit(f"source Lens startup is missing {needle}")
+
+for forbidden in (
+    "node_modules/.bin/vite",
+    "VITE_DEV_SERVER_URL=http",
+    "127.0.0.1:1422",
+):
+    if forbidden in packed_lens:
+        raise SystemExit(f"packed Lens startup depends on dev server: {forbidden}")
+for needle in (
+    "NODE_ENV=production",
+    "env -u VITE_DEV_SERVER_URL",
+    "-u LENS_NEXUS_GATEWAY_URL",
+    "/tmp/nexus-lab-bin/lens-app/electron/main.cjs",
+):
+    if needle not in packed_lens:
+        raise SystemExit(f"packed Lens startup is missing {needle}")
+
+for needle in (
+    'local mode=$1',
+    'if [ "$mode" = source ]; then',
+    'start_source_lens',
+    'start_packed_lens',
+):
+    if needle not in stack:
+        raise SystemExit(f"mode-aware Lens startup is missing {needle}")
+
+for needle in (
+    "npm run build",
+    "mktemp -d /tmp/nexus-lens-app.XXXXXX",
+    'ln -sfn "$lens_app" /tmp/nexus-lab-bin/lens-app',
+):
+    if needle not in build:
+        raise SystemExit(f"packed Lens assembly is missing {needle}")
+if 'start_lab_stack "$mode"' not in source:
+    raise SystemExit("lab-up does not pass its verified mode to Lens startup")
+if '-e "LENS_NEXUS_GATEWAY_URL=' in source:
+    raise SystemExit(
+        "lab container injects a gateway override that defeats the visible Lens selector"
+    )
+
+status = function_body("cmd_lab_status", "cmd_lab_readiness")
+if 'if [ "$NEXUS_LAB_MODE" = source ]; then' not in status:
+    raise SystemExit("lab-status does not make the Vite process mode-aware")
+if '"$NEXUS_LAB_ROOT/lab/vite.pid:vite"' not in status:
+    raise SystemExit("source lab status lost its Vite process check")
+PY
+for field in lensRendererMode lensApp lensMain lensTreeSha256; do
+  grep -Fq "${field}=%s" "$TARGET"
+done
+grep -Fq 'packed Lens app ownership or mode mismatch' "$TARGET"
+grep -Fq 'packed Lens app contains a symlink' "$TARGET"
+
+# Both runners use no arguments for the complete catalog.  Passing an
+# invented --all flag exits before CDP and silently prevents the acceptance
+# matrix from running.
+if grep -Fq 'node tests/ocular/run.mjs --all' "$TARGET" \
+  || grep -Fq 'node tests/ocular/webui-run.mjs --all' "$TARGET"; then
+  echo 'ocular runners must use their no-argument complete-catalog contract' >&2
+  exit 1
+fi
+grep -Fq 'node tests/ocular/run.mjs' "$TARGET"
+grep -Fq 'node tests/ocular/webui-run.mjs' "$TARGET"
+
+grep -Fq '/work/egregore-v2/egregore/providers/claude-code' "$TARGET"
+grep -Fq '/work/egregore-v2/egregore/providers/codex' "$TARGET"
+grep -Fq '/work/egregore-v2/egregore/providers/gemini-cli' "$TARGET"
+if grep -Fq 'docker ps -aq' "$TARGET"; then
+  echo 'lab validator discovery must format names without Docker quiet IDs' >&2
+  exit 1
+fi
+grep -Fq 'binutils' "$SCRIPT_DIR/../tools/docker/nexus-test.Dockerfile"
+
+# The release soak is a canonical packed-only lab-gate. It must launch both
+# genuine harnesses, execute the fixed 1800-second producer, revalidate the
+# candidate, and publish the final immutable-ledger seal as root.
+grep -Fq 'lab-agent launch codex' "$TARGET"
+grep -Fq 'lab-agent launch claude' "$TARGET"
+if grep -Fq 'scripts/nexus-v015-lab-agent launch' "$TARGET"; then
+  echo 'release soak must execute the hashed lab-agent copy from PATH' >&2
+  exit 1
+fi
+grep -Fq '/tmp/nexus-lab-bin/nexus-v015-ws-soak' "$TARGET"
+grep -Fq '/tmp/nexus-lab-bin/nexus-hooks-practical-gate --packed-v015 --evidence-dir "$NEXUS_LAB_ROOT/evidence" --run-id "$NEXUS_V015_RUN_ID"' "$TARGET"
+grep -Fq -- '-e "NEXUS_WEB_AUTH_MODE=remote-human"' "$TARGET"
+grep -Fq '/tmp/nexus-lab-bin/nexus-v015-evidence-validate --seal' "$TARGET"
+grep -Fq '/tmp/nexus-lab-bin/nexus-v015-evidence-validate "$run_root"' "$TARGET"
+grep -Fq 'docker exec --user 0:0 -i' "$TARGET"
+grep -Fq 'install -d -o 0 -g 0 -m 0700 /tmp/nexus-v015-evidence' "$TARGET"
+grep -Fq 'final_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" packed)' "$TARGET"
+grep -Fq 'post_seal_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" packed)' "$TARGET"
+grep -Fq '[ "$post_seal_readiness_sha256" = "$final_readiness_sha256" ]' "$TARGET"
+grep -Fq 'ready="$NEXUS_LAB_ROOT/lab/candidate-ready.v1"' "$TARGET"
+grep -Fq 'ledger_value runId' "$TARGET"
+grep -Fq 'export NEXUS_V015_SOAK_PASSWORD="v015-soak-$NEXUS_V015_RUN_ID"' "$TARGET"
+if grep -Fq 'current-run.v1' "$TARGET"; then
+  echo 'release soak must use the immutable candidate readiness ledger' >&2
+  exit 1
+fi
+
+python3 - "$TARGET" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+tokens = (
+    '/tmp/nexus-lab-bin/nexus-hooks-practical-gate --packed-v015',
+    'final_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" packed)',
+    'docker exec --user 0:0 -i',
+    '/tmp/nexus-lab-bin/nexus-v015-evidence-validate --seal "$run_root"',
+    '/tmp/nexus-lab-bin/nexus-v015-evidence-validate "$run_root"',
+    'post_seal_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" packed)',
+    '[ "$post_seal_readiness_sha256" = "$final_readiness_sha256" ]',
+)
+cursor = 0
+for token in tokens:
+    position = source.find(token, cursor)
+    if position < 0:
+        raise SystemExit("final root seal, ordinary validation, and readiness recheck are not ordered")
+    cursor = position + len(token)
+PY
+
+# Execute the exact packed-soak handoff body with disposable hooks. This proves
+# ordering and identity propagation rather than only matching source text.
+python3 - "$TARGET" "$TMP/soak-handoff.sh" <<'PY'
+from pathlib import Path
+import sys
+import textwrap
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+needle = "    exec_interactive bash -lc '\n      set -euo pipefail\n      ready=\"$NEXUS_LAB_ROOT/lab/candidate-ready.v1\""
+start = source.find(needle)
+if start < 0:
+    raise SystemExit("packed soak handoff body is missing")
+start += len("    exec_interactive bash -lc '\n")
+end = source.find("\n    '\n", start)
+if end < 0:
+    raise SystemExit("packed soak handoff body is unterminated")
+body = textwrap.dedent(source[start:end]).replace(
+    "/tmp/nexus-lab-bin/nexus-v015-ws-soak",
+    "scripts/nexus-v015-ws-soak",
+)
+Path(sys.argv[2]).write_text(body + "\n", encoding="utf-8")
+PY
+bash -n "$TMP/soak-handoff.sh"
+mkdir -p "$TMP/soak-handoff/bin" "$TMP/soak-handoff/scripts" "$TMP/soak-root/lab"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  '[ "$1" = launch ]' \
+  '[[ "$NEXUS_V015_READINESS_LEDGER_SHA256" =~ ^[0-9a-f]{64}$ ]]' \
+  'printf "agent:%s:run=%s:readiness=%s:password=%s\n" "$2" "$NEXUS_V015_RUN_ID" "$NEXUS_V015_READINESS_LEDGER_SHA256" "$NEXUS_V015_SOAK_PASSWORD" >>"$HANDOFF_LOG"' \
+  >"$TMP/soak-handoff/bin/lab-agent"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  '[ "$#" -eq 0 ]' \
+  'printf "soak:run=%s:password=%s\n" "$NEXUS_V015_RUN_ID" "$NEXUS_V015_SOAK_PASSWORD" >>"$HANDOFF_LOG"' \
+  >"$TMP/soak-handoff/scripts/nexus-v015-ws-soak"
+chmod +x "$TMP/soak-handoff/bin/"* "$TMP/soak-handoff/scripts/"*
+write_soak_readiness() {
+  printf '%s\n' \
+    'schema=1' \
+    'containerId=container-contract' \
+    'mode=packed' \
+    "$@" \
+    'installRoot=/tmp/nexus-lab-install.contract' \
+    >"$TMP/soak-root/lab/candidate-ready.v1"
+}
+write_soak_readiness 'runId=soak-contract'
+SOAK_READY_SHA=$(sha256sum "$TMP/soak-root/lab/candidate-ready.v1" | awk '{print $1}')
+(
+  cd "$TMP/soak-handoff"
+  HANDOFF_LOG="$TMP/soak-handoff.log" \
+    PATH="$TMP/soak-handoff/bin:/usr/bin:/bin" \
+    NEXUS_LAB_ROOT="$TMP/soak-root" \
+    NEXUS_V015_RUN_ID=soak-contract \
+    bash "$TMP/soak-handoff.sh"
+)
+printf '%s\n' \
+  "agent:codex:run=soak-contract:readiness=$SOAK_READY_SHA:password=v015-soak-soak-contract" \
+  "agent:claude:run=soak-contract:readiness=$SOAK_READY_SHA:password=v015-soak-soak-contract" \
+  'soak:run=soak-contract:password=v015-soak-soak-contract' \
+  >"$TMP/soak-handoff.expected"
+cmp "$TMP/soak-handoff.expected" "$TMP/soak-handoff.log"
+
+for bad_rows in 'runId=other-run' $'runId=soak-contract\nrunId=soak-contract'; do
+  write_soak_readiness "$bad_rows"
+  : >"$TMP/soak-handoff.log"
+  set +e
+  (
+    cd "$TMP/soak-handoff"
+    HANDOFF_LOG="$TMP/soak-handoff.log" \
+      PATH="$TMP/soak-handoff/bin:/usr/bin:/bin" \
+      NEXUS_LAB_ROOT="$TMP/soak-root" \
+      NEXUS_V015_RUN_ID=soak-contract \
+      bash "$TMP/soak-handoff.sh"
+  ) >"$TMP/soak-handoff-bad.out" 2>"$TMP/soak-handoff-bad.err"
+  status=$?
+  set -e
+  test "$status" -ne 0
+  test ! -s "$TMP/soak-handoff.log"
+  grep -Eq 'runId mismatch|invalid runId field' "$TMP/soak-handoff-bad.err"
+done
+
+# Execute the exact packed manifest/readiness verifier outside Docker.  This
+# pins candidate binding semantically: the run/container, readiness digest,
+# and every immutable hook digest must agree before a packed gate can run.
+python3 - "$TARGET" "$TMP/manifest-binding.sh" <<'PY'
+from pathlib import Path
+import sys
+import textwrap
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+anchor = source.find("NEXUS_MANIFEST_BINDING_ACTION=verify")
+if anchor < 0:
+    raise SystemExit("packed manifest/readiness verifier marker is missing")
+needle = '''    "$id" bash -c 'set -euo pipefail
+      ready="$NEXUS_LAB_ROOT/lab/candidate-ready.v1"'''
+start = source.find(needle, anchor)
+if start < 0:
+    raise SystemExit("packed manifest/readiness verifier body is missing")
+start += len('    "$id" bash -c \'')
+end_marker = '''
+      printf "%s\\n" "$readiness_sha"'\n}'''
+end = source.find(end_marker, start)
+if end < 0:
+    raise SystemExit("packed manifest/readiness verifier body is unterminated")
+body = source[start:end] + '\n      printf "%s\\n" "$readiness_sha"\n'
+Path(sys.argv[2]).write_text(textwrap.dedent(body), encoding="utf-8")
+PY
+bash -n "$TMP/manifest-binding.sh"
+mkdir -p "$TMP/manifest-root/lab" "$TMP/manifest-root/evidence/manifest-contract"
+H1=$(printf '1%.0s' {1..64}); H2=$(printf '2%.0s' {1..64})
+H3=$(printf '3%.0s' {1..64}); H4=$(printf '4%.0s' {1..64})
+H5=$(printf '5%.0s' {1..64}); H6=$(printf '6%.0s' {1..64})
+H7=$(printf '7%.0s' {1..64}); H8=$(printf '8%.0s' {1..64})
+H9=$(printf '9%.0s' {1..64}); HA=$(printf 'a%.0s' {1..64})
+HB=$(printf 'b%.0s' {1..64}); HC=$(printf 'c%.0s' {1..64})
+HD=$(printf 'd%.0s' {1..64}); HE=$(printf 'e%.0s' {1..64})
+HF=$(printf 'f%.0s' {1..64})
+H0=$(printf '0%.0s' {1..64})
+printf '%s\n' \
+  schema=1 \
+  containerId=container-contract \
+  mode=packed \
+  runId=manifest-contract \
+  "imageDigest=sha256:$HA" \
+  "installTreeSha256=$HB" \
+  nexusResolved=/tmp/nexus-lab-install.contract/nexus.mjs \
+  "nexusSha256=$H4" \
+  nativeResolved=/tmp/nexus-lab-install.contract/native/nexus \
+  "nativeSha256=$H5" \
+  gatewayResolved=/tmp/nexus-lab-install.contract/gateway.mjs \
+  "gatewaySha256=$H6" \
+  webuiResolved=/tmp/nexus-lab-install.contract/webui.mjs \
+  "webuiSha256=$H7" \
+  lensRendererMode=production \
+  lensApp=/tmp/nexus-lens-app.contract \
+  lensMain=/tmp/nexus-lens-app.contract/electron/main.cjs \
+  "lensTreeSha256=$H8" \
+  labProcess=/tmp/nexus-lab-bin/lab-process \
+  "labProcessSha256=$H1" \
+  labAgent=/tmp/nexus-lab-bin/lab-agent \
+  "labAgentSha256=$H2" \
+  labFixture=/tmp/nexus-lab-bin/lab-fixture \
+  "labFixtureSha256=$H3" \
+  nexusTarball=/tmp/nexus-lab-packs/nexus.tgz \
+  "nexusTarballSha256=$H1" \
+  cliTarball=/tmp/nexus-lab-packs/nexus-cli.tgz \
+  "cliTarballSha256=$H2" \
+  gatewayTarball=/tmp/nexus-lab-packs/nexus-gateway.tgz \
+  "gatewayTarballSha256=$H3" \
+  wsAcceptance=/tmp/nexus-lab-bin/nexus-v015-ws-acceptance \
+  "wsAcceptanceSha256=$H9" \
+  wsSoak=/tmp/nexus-lab-bin/nexus-v015-ws-soak \
+  "wsSoakSha256=$HC" \
+  webconsoleAcceptance=/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance \
+  "webconsoleAcceptanceSha256=$HD" \
+  webconsoleEvidenceVerifier=/tmp/nexus-lab-bin/nexus-v015-webconsole-evidence-verify \
+  "webconsoleEvidenceVerifierSha256=$HF" \
+  evidenceValidator=/tmp/nexus-lab-bin/nexus-v015-evidence-validate \
+  "evidenceValidatorSha256=$HE" \
+  releaseAssembler=/tmp/nexus-lab-bin/nexus-v015-release-assemble \
+  "releaseAssemblerSha256=$H0" \
+  >"$TMP/manifest-root/lab/candidate-ready.v1"
+READINESS_SHA=$(sha256sum "$TMP/manifest-root/lab/candidate-ready.v1" | cut -d' ' -f1)
+write_binding_manifest() {
+  local digest=$1 include_agent=${2:-1}
+  jq -n \
+    --arg run manifest-contract \
+    --arg container container-contract \
+    --arg ready "$TMP/manifest-root/lab/candidate-ready.v1" \
+    --arg digest "$digest" \
+    --arg image "sha256:$HA" \
+    --arg tree "$HB" \
+    --arg nexusResolved /tmp/nexus-lab-install.contract/nexus.mjs \
+    --arg nexusSha "$H4" \
+    --arg native /tmp/nexus-lab-install.contract/native/nexus \
+    --arg nativeSha "$H5" \
+    --arg gatewayResolved /tmp/nexus-lab-install.contract/gateway.mjs \
+    --arg gatewaySha "$H6" \
+    --arg webuiResolved /tmp/nexus-lab-install.contract/webui.mjs \
+    --arg webuiSha "$H7" \
+    --arg lensTree "$H8" \
+    --arg process "$H1" \
+    --arg agent "$H2" \
+    --arg fixture "$H3" \
+    --arg nexusTar "$H1" \
+    --arg cliTar "$H2" \
+    --arg gatewayTar "$H3" \
+    --arg wsAcceptance "$H9" \
+    --arg wsSoak "$HC" \
+    --arg webconsoleAcceptance "$HD" \
+    --arg webconsoleEvidenceVerifier "$HF" \
+    --arg evidenceValidator "$HE" \
+    --arg releaseAssembler "$H0" \
+    --argjson includeAgent "$include_agent" \
+    '{schemaVersion:1,mode:"packed",runId:$run,environment:({
+      NEXUS_V015_RUN_ID:$run,
+      NEXUS_V015_CONTAINER_ID:$container,
+      NEXUS_V015_READINESS_LEDGER:$ready,
+      NEXUS_V015_READINESS_LEDGER_SHA256:$digest,
+      NEXUS_V015_IMAGE_DIGEST:$image,
+      NEXUS_V015_INSTALL_TREE_SHA256:$tree,
+      NEXUS_V015_NEXUS_BIN_RESOLVED:$nexusResolved,
+      NEXUS_V015_NEXUS_BIN_SHA256:$nexusSha,
+      NEXUS_V015_NATIVE_BIN:$native,
+      NEXUS_V015_NATIVE_BIN_SHA256:$nativeSha,
+      NEXUS_V015_GATEWAY_BIN_RESOLVED:$gatewayResolved,
+      NEXUS_V015_GATEWAY_BIN_SHA256:$gatewaySha,
+      NEXUS_V015_WEBUI_BIN_RESOLVED:$webuiResolved,
+      NEXUS_V015_WEBUI_BIN_SHA256:$webuiSha,
+      NEXUS_V015_LENS_RENDERER_MODE:"production",
+      NEXUS_V015_LENS_APP:"/tmp/nexus-lens-app.contract",
+      NEXUS_V015_LENS_MAIN:"/tmp/nexus-lens-app.contract/electron/main.cjs",
+      NEXUS_V015_LENS_TREE_SHA256:$lensTree,
+      NEXUS_V015_LAB_PROCESS:"/tmp/nexus-lab-bin/lab-process",
+      NEXUS_V015_LAB_PROCESS_SHA256:$process,
+      NEXUS_V015_LAB_AGENT:"/tmp/nexus-lab-bin/lab-agent",
+      NEXUS_V015_LAB_FIXTURE:"/tmp/nexus-lab-bin/lab-fixture",
+      NEXUS_V015_LAB_FIXTURE_SHA256:$fixture,
+      NEXUS_V015_NEXUS_TARBALL:"/tmp/nexus-lab-packs/nexus.tgz",
+      NEXUS_V015_NEXUS_TARBALL_SHA256:$nexusTar,
+      NEXUS_V015_CLI_TARBALL:"/tmp/nexus-lab-packs/nexus-cli.tgz",
+      NEXUS_V015_CLI_TARBALL_SHA256:$cliTar,
+      NEXUS_V015_GATEWAY_TARBALL:"/tmp/nexus-lab-packs/nexus-gateway.tgz",
+      NEXUS_V015_GATEWAY_TARBALL_SHA256:$gatewayTar
+    } + (if $includeAgent == 1 then {NEXUS_V015_LAB_AGENT_SHA256:$agent} else {} end)
+      + {
+        NEXUS_V015_WS_ACCEPTANCE:"/tmp/nexus-lab-bin/nexus-v015-ws-acceptance",
+        NEXUS_V015_WS_ACCEPTANCE_SHA256:$wsAcceptance,
+        NEXUS_V015_WS_SOAK:"/tmp/nexus-lab-bin/nexus-v015-ws-soak",
+        NEXUS_V015_WS_SOAK_SHA256:$wsSoak,
+        NEXUS_V015_WEBCONSOLE_ACCEPTANCE:"/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance",
+        NEXUS_V015_WEBCONSOLE_ACCEPTANCE_SHA256:$webconsoleAcceptance,
+        NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER:"/tmp/nexus-lab-bin/nexus-v015-webconsole-evidence-verify",
+        NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER_SHA256:$webconsoleEvidenceVerifier,
+        NEXUS_V015_EVIDENCE_VALIDATOR:"/tmp/nexus-lab-bin/nexus-v015-evidence-validate",
+        NEXUS_V015_EVIDENCE_VALIDATOR_SHA256:$evidenceValidator,
+        NEXUS_V015_RELEASE_ASSEMBLER:"/tmp/nexus-lab-bin/nexus-v015-release-assemble",
+        NEXUS_V015_RELEASE_ASSEMBLER_SHA256:$releaseAssembler
+      }),packages:[
+        {name:"@egregore/nexus",tarball:{sha256:$nexusTar}},
+        {name:"@egregore/nexus-cli",tarball:{sha256:$cliTar}},
+        {name:"@egregore/nexus-gateway",tarball:{sha256:$gatewayTar}}
+      ]}' \
+    >"$TMP/manifest-root/evidence/manifest-contract/manifest.json"
+}
+write_binding_manifest "$READINESS_SHA"
+NEXUS_LAB_ROOT="$TMP/manifest-root" \
+  NEXUS_EXPECTED_RUN_ID=manifest-contract \
+  NEXUS_EXPECTED_CONTAINER_ID=container-contract \
+  bash "$TMP/manifest-binding.sh" >"$TMP/manifest-binding.out"
+grep -Fxq "$READINESS_SHA" "$TMP/manifest-binding.out"
+for mutation in digest missing-agent; do
+  if [ "$mutation" = digest ]; then
+    write_binding_manifest "$(printf 'f%.0s' {1..64})"
+  else
+    write_binding_manifest "$READINESS_SHA" 0
+  fi
+  set +e
+  NEXUS_LAB_ROOT="$TMP/manifest-root" \
+    NEXUS_EXPECTED_RUN_ID=manifest-contract \
+    NEXUS_EXPECTED_CONTAINER_ID=container-contract \
+    bash "$TMP/manifest-binding.sh" \
+    >"$TMP/manifest-binding-$mutation.out" 2>"$TMP/manifest-binding-$mutation.err"
+  status=$?
+  set -e
+  test "$status" -ne 0
+  grep -Eq 'binding mismatch|missing NEXUS_V015_LAB_AGENT_SHA256' \
+    "$TMP/manifest-binding-$mutation.err"
+done
+write_binding_manifest "$READINESS_SHA"
+jq '.environment.NEXUS_V015_RELEASE_ASSEMBLER_SHA256 = "bad"' \
+  "$TMP/manifest-root/evidence/manifest-contract/manifest.json" \
+  >"$TMP/manifest-root/evidence/manifest-contract/manifest.bad"
+mv "$TMP/manifest-root/evidence/manifest-contract/manifest.bad" \
+  "$TMP/manifest-root/evidence/manifest-contract/manifest.json"
+set +e
+NEXUS_LAB_ROOT="$TMP/manifest-root" \
+  NEXUS_EXPECTED_RUN_ID=manifest-contract \
+  NEXUS_EXPECTED_CONTAINER_ID=container-contract \
+  bash "$TMP/manifest-binding.sh" \
+  >"$TMP/manifest-binding-release-assembler.out" \
+  2>"$TMP/manifest-binding-release-assembler.err"
+release_binding_status=$?
+set -e
+test "$release_binding_status" -ne 0
+grep -Fq 'candidate manifest binding mismatch: releaseAssemblerSha256' \
+  "$TMP/manifest-binding-release-assembler.err"
+
+set +e
+PATH="$TMP/bin:/usr/bin:/bin" "$TARGET" lab-gate --mode source --soak 1800 \
+  >"$TMP/source-soak.out" 2>"$TMP/source-soak.err"
+status=$?
+set -e
+test "$status" -ne 0
+test ! -e "$TMP/unexpected-command"
+grep -Fq 'v0.1.5 acceptance publication requires lab-gate --mode packed' "$TMP/source-soak.err"
+set +e
+PATH="$TMP/bin:/usr/bin:/bin" "$TARGET" lab-gate --mode source --backend-only \
+  >"$TMP/source-gate.out" 2>"$TMP/source-gate.err"
+status=$?
+set -e
+test "$status" -ne 0
+test ! -e "$TMP/unexpected-command"
+grep -Fq 'v0.1.5 acceptance publication requires lab-gate --mode packed' "$TMP/source-gate.err"
+set +e
+PATH="$TMP/bin:/usr/bin:/bin" "$TARGET" lab-gate --mode packed --soak 1799 \
+  >"$TMP/short-soak.out" 2>"$TMP/short-soak.err"
+status=$?
+set -e
+test "$status" -ne 0
+test ! -e "$TMP/unexpected-command"
+grep -Fq -- '--soak must be exactly 1800 seconds' "$TMP/short-soak.err"
+
+set +e
+PATH="$TMP/bin:/usr/bin:/bin" "$TARGET" lab-gate --mode packed --soak 1800 \
+  >"$TMP/unscoped-soak.out" 2>"$TMP/unscoped-soak.err"
+status=$?
+set -e
+test "$status" -ne 0
+test ! -e "$TMP/unexpected-command"
+grep -Fq 'release sealing requires lab-gate --mode packed --all --soak 1800' \
+  "$TMP/unscoped-soak.err"
+
+set +e
+PATH="$TMP/bin:/usr/bin:/bin" \
+  NEXUS_DOCKER_TEST_LENS_REPO="$HOME/.nexus" \
+  "$TARGET" lab-up --mode source >"$TMP/rejected.out" 2>"$TMP/rejected.err"
+status=$?
+set -e
+test "$status" -ne 0
+test ! -e "$TMP/unexpected-command"
+grep -Fq "refusing runtime-state mount" "$TMP/rejected.err"
+
+mkdir -p \
+  "$TMP/lab-home" \
+  "$TMP/lab-sources/lens" \
+  "$TMP/lab-sources/egregore" \
+  "$TMP/lab-sources/pactree" \
+  "$TMP/lab-sources/pactree-py" \
+  "$TMP/lab-sources/pactree-fs"
+LAB_ENV=(
+  "HOME=$TMP/lab-home"
+  "NEXUS_DOCKER_TEST_LENS_REPO=$TMP/lab-sources/lens"
+  "NEXUS_DOCKER_TEST_EGREGORE_REPO=$TMP/lab-sources/egregore"
+  "NEXUS_DOCKER_TEST_PACTREE_REPO=$TMP/lab-sources/pactree"
+  "NEXUS_DOCKER_TEST_PACTREE_PY_REPO=$TMP/lab-sources/pactree-py"
+  "NEXUS_DOCKER_TEST_PACTREE_FS_REPO=$TMP/lab-sources/pactree-fs"
+)
+
+# lab-gate must validate the requested mode against both immutable ownership
+# labels and the mode baked into the container instead of discarding --mode.
+mkdir -p "$TMP/mode-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$*" in' \
+  '  ps*"name=^/nexus-v010-load51$"*) printf "a%.0s" {1..64}; echo ;;' \
+  '  *"{{.Id}}"*) printf "a%.0s" {1..64}; echo " true true true source" ;;' \
+  '  *"{{range .Config.Env}}"*) echo NEXUS_LAB_MODE=source ;;' \
+  '  *) echo "unexpected mode docker call: $*" >&2; exit 97 ;;' \
+  'esac' >"$TMP/mode-bin/docker"
+chmod +x "$TMP/mode-bin/docker"
+set +e
+DOCKER_FAKE_LOG="$TMP/mode-docker.log" \
+  PATH="$TMP/mode-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" lab-gate --mode packed --backend-only \
+  >"$TMP/mode.out" 2>"$TMP/mode.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq "requested lab mode packed does not match container mode source" "$TMP/mode.err"
+if grep -Eq '(^| )exec( |$)' "$TMP/mode-docker.log"; then
+  echo 'mode mismatch must fail before executing a gate in the container' >&2
+  exit 1
+fi
+: >"$TMP/mode-docker.log"
+set +e
+DOCKER_FAKE_LOG="$TMP/mode-docker.log" \
+  PATH="$TMP/mode-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" lab-gate --backend-only \
+  >"$TMP/mode-required.out" 2>"$TMP/mode-required.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq "lab-gate requires --mode source or packed" "$TMP/mode-required.err"
+test ! -s "$TMP/mode-docker.log"
+
+# A colliding container name is not disposable unless both validator and Lens
+# lab ownership labels have the exact value true. This protects lab-up and
+# lab-down from deleting an unrelated container.
+mkdir -p "$TMP/foreign-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$*" in' \
+  '  ps*"label=egregore-nexus-test=true"*) exit 0 ;;' \
+  '  ps*"name=^/nexus-v010-load51$"*) printf "b%.0s" {1..64}; echo ;;' \
+  '  *"{{.Id}}"*) printf "b%.0s" {1..64}; echo " true true false source" ;;' \
+  '  *"{{range .Config.Env}}"*) echo NEXUS_LAB_MODE=source ;;' \
+  '  rm*|"container rm"*) touch "$DOCKER_FAKE_REMOVED"; exit 0 ;;' \
+  '  *) echo "unexpected foreign docker call: $*" >&2; exit 97 ;;' \
+  'esac' >"$TMP/foreign-bin/docker"
+chmod +x "$TMP/foreign-bin/docker"
+for lab_command in 'lab-up --mode source' 'lab-down --mode source'; do
+  rm -f "$TMP/foreign-removed"
+  set +e
+  env "${LAB_ENV[@]}" \
+    DOCKER_FAKE_LOG="$TMP/foreign-docker.log" \
+    DOCKER_FAKE_REMOVED="$TMP/foreign-removed" \
+    PATH="$TMP/foreign-bin:$TMP/bin:/usr/bin:/bin" \
+    "$TARGET" $lab_command \
+    >"$TMP/foreign.out" 2>"$TMP/foreign.err"
+  status=$?
+  set -e
+  test "$status" -ne 0
+  grep -Fq "exact validator/lens-lab ownership labels" "$TMP/foreign.err"
+  test ! -e "$TMP/foreign-removed"
+done
+
+# Packed/release topology may request no more than the committed host budget,
+# and oversized values must be rejected before Docker is touched.
+for limit in \
+  'NEXUS_DOCKER_TEST_CPUS=7|packed lab CPU limit must be exactly 6' \
+  'NEXUS_DOCKER_TEST_MEMORY=9g|packed lab memory limit must be exactly 8GiB' \
+  'NEXUS_DOCKER_TEST_PIDS_LIMIT=1025|packed lab PID limit must be exactly 1024'; do
+  assignment=${limit%%|*}
+  expected=${limit#*|}
+  rm -f "$TMP/unexpected-command"
+  set +e
+  env "${LAB_ENV[@]}" "$assignment" \
+    PATH="$TMP/bin:/usr/bin:/bin" \
+    "$TARGET" lab-up --mode packed \
+    >"$TMP/limit.out" 2>"$TMP/limit.err"
+  status=$?
+  set -e
+  test "$status" -ne 0
+  grep -Fq "$expected" "$TMP/limit.err"
+  test ! -e "$TMP/unexpected-command"
+done
+
+# Docker's applied HostConfig is the authority. Even an in-budget packed run
+# must stop immediately if Docker reports values different from the request.
+mkdir -p "$TMP/hostconfig-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$*" in' \
+  '  ps*"label=egregore-nexus-test=true"*) exit 0 ;;' \
+  '  ps*"name=^/nexus-v010-load51$"*) if [ -e "$DOCKER_FAKE_CREATED" ]; then printf "c%.0s" {1..64}; echo; fi ;;' \
+  '  build\ *) exit 0 ;;' \
+  '  run\ *) touch "$DOCKER_FAKE_CREATED"; printf "c%.0s" {1..64}; echo ;;' \
+  '  *"{{.Id}}"*) printf "c%.0s" {1..64}; echo " true true true packed" ;;' \
+  '  *"{{range .Config.Env}}"*) echo NEXUS_LAB_MODE=packed ;;' \
+  '  *"{{.HostConfig.NanoCpus}}"*) echo "5000000000 8589934592 8589934592 1024" ;;' \
+  '  rm\ *) rm -f "$DOCKER_FAKE_CREATED" ;;' \
+  '  *) echo "unexpected HostConfig docker call: $*" >&2; exit 97 ;;' \
+  'esac' >"$TMP/hostconfig-bin/docker"
+chmod +x "$TMP/hostconfig-bin/docker"
+set +e
+env "${LAB_ENV[@]}" \
+  DOCKER_FAKE_LOG="$TMP/hostconfig-docker.log" \
+  DOCKER_FAKE_CREATED="$TMP/hostconfig-created" \
+  PATH="$TMP/hostconfig-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" lab-up --mode packed \
+  >"$TMP/hostconfig.out" 2>"$TMP/hostconfig.err"
+status=$?
+set -e
+test "$status" -ne 0
+if ! grep -Fq "Docker applied unexpected packed lab HostConfig" "$TMP/hostconfig.err"; then
+  sed -n '1,120p' "$TMP/hostconfig.err" >&2
+  exit 1
+fi
+grep -Eq '^run ' "$TMP/hostconfig-docker.log"
+grep -Fq -- '--label egregore-nexus-lab-mode=packed' "$TMP/hostconfig-docker.log"
+grep -Fq -- '--cpus 6 --memory 8g --memory-swap 8g --pids-limit 1024' "$TMP/hostconfig-docker.log"
+if grep -Eq '(^| )exec( |$)' "$TMP/hostconfig-docker.log"; then
+  echo 'HostConfig mismatch must fail before container setup or candidate build' >&2
+  exit 1
+fi
+
+# Every mode-sensitive lab command must parse an explicit mode before its
+# first Docker call. A missing mode is a CLI error, not an implicit source run.
+for lab_command in lab-up lab-status lab-readiness lab-evidence lab-down; do
+  rm -f "$TMP/unexpected-command"
+  set +e
+  env "${LAB_ENV[@]}" PATH="$TMP/bin:/usr/bin:/bin" \
+    "$TARGET" "$lab_command" >"$TMP/required-mode.out" 2>"$TMP/required-mode.err"
+  status=$?
+  set -e
+  test "$status" -ne 0
+  grep -Fq "$lab_command requires --mode source or packed" "$TMP/required-mode.err"
+  test ! -e "$TMP/unexpected-command"
+done
+
+for run_id in missing '../escape' 'two words' '_leading'; do
+  rm -f "$TMP/unexpected-command"
+  set +e
+  if [ "$run_id" = missing ]; then
+    env -u NEXUS_V015_RUN_ID PATH="$TMP/bin:/usr/bin:/bin" \
+      "$TARGET" lab-readiness --mode source \
+      >"$TMP/run-id.out" 2>"$TMP/run-id.err"
+  else
+    NEXUS_V015_RUN_ID=$run_id PATH="$TMP/bin:/usr/bin:/bin" \
+      "$TARGET" lab-readiness --mode source \
+      >"$TMP/run-id.out" 2>"$TMP/run-id.err"
+  fi
+  status=$?
+  set -e
+  test "$status" -ne 0
+  grep -Fq 'NEXUS_V015_RUN_ID' "$TMP/run-id.err"
+  test ! -e "$TMP/unexpected-command"
+done
+
+# A pre-existing lab may only verify its create-once readiness receipt.  It
+# must never rebaseline edited hooks or topology after candidate assembly.
+mkdir -p "$TMP/readiness-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'mode=${DOCKER_FAKE_MODE:?}' \
+  'case "$*" in' \
+  '  ps*"name=^/nexus-v010-load51$"*) printf "r%.0s" {1..64}; echo ;;' \
+  '  *"{{.Image}}"*) printf "sha256:"; printf "a%.0s" {1..64}; echo ;;' \
+  '  *"{{.Id}}"*) printf "r%.0s" {1..64}; echo " true true true $mode" ;;' \
+  '  *"{{range .Config.Env}}"*) echo "NEXUS_LAB_MODE=$mode" ;;' \
+  '  *"{{.HostConfig.NanoCpus}}"*) echo "6000000000 8589934592 8589934592 1024" ;;' \
+  '  exec*"NEXUS_TOPOLOGY_ACTION=record"*) echo "topology-recorded-$mode" ;;' \
+  '  exec*"NEXUS_TOPOLOGY_ACTION=verify"*) echo "topology-verified-$mode" ;;' \
+  '  exec*"NEXUS_MANIFEST_BINDING_ACTION=verify"*) echo "manifest-verified-$mode" ;;' \
+  '  *) echo "unexpected readiness docker call: $*" >&2; exit 97 ;;' \
+  'esac' >"$TMP/readiness-bin/docker"
+chmod +x "$TMP/readiness-bin/docker"
+for mode in source packed; do
+  : >"$TMP/readiness.log"
+  if ! DOCKER_FAKE_MODE=$mode \
+    DOCKER_FAKE_LOG="$TMP/readiness.log" \
+    PATH="$TMP/readiness-bin:$TMP/bin:/usr/bin:/bin" \
+    "$TARGET" lab-readiness --mode "$mode" \
+    >"$TMP/readiness.out" 2>"$TMP/readiness.err"; then
+    cat "$TMP/readiness.err" >&2
+    exit 1
+  fi
+  grep -Fq "lab readiness verified" "$TMP/readiness.out"
+  verify_line=$(grep -n 'NEXUS_TOPOLOGY_ACTION=verify' "$TMP/readiness.log" | cut -d: -f1)
+  test -n "$verify_line"
+  if grep -Fq 'NEXUS_TOPOLOGY_ACTION=record' "$TMP/readiness.log"; then
+    echo 'lab-readiness must not re-record candidate topology' >&2
+    exit 1
+  fi
+  if grep -Eq '^(build|run|start|restart|stop|rm|kill)( |$)' "$TMP/readiness.log"; then
+    echo 'lab-readiness must never rebuild, restart, stop, or remove a container' >&2
+    exit 1
+  fi
+  if [ "$mode" = packed ]; then
+    grep -Fq '{{.HostConfig.NanoCpus}}' "$TMP/readiness.log"
+    grep -Fq 'NEXUS_MANIFEST_BINDING_ACTION=verify' "$TMP/readiness.log"
+  fi
+done
+grep -Fq '[ ! -e "$ready" ] || { echo "candidate readiness ledger already exists"' "$TARGET"
+grep -Fq 'seal_lab_readiness "$new_id"' "$TARGET"
+grep -Fq 'candidate readiness directory ownership or mode mismatch' "$TARGET"
+grep -Fq 'candidate readiness ledger ownership or mode mismatch' "$TARGET"
+record_line=$(grep -n 'record_lab_readiness "$new_id" "$mode"' "$TARGET" | cut -d: -f1)
+seal_line=$(grep -n 'seal_lab_readiness "$new_id"' "$TARGET" | cut -d: -f1)
+start_line=$(grep -n 'start_lab_stack' "$TARGET" | tail -n1 | cut -d: -f1)
+test -n "$record_line" && test -n "$seal_line" && test -n "$start_line"
+test "$record_line" -lt "$seal_line"
+test "$seal_line" -lt "$start_line"
+
+# A packed HostConfig mismatch refuses before recording any receipt.
+mkdir -p "$TMP/readiness-bad-host-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$*" in' \
+  '  ps*"name=^/nexus-v010-load51$"*) printf "s%.0s" {1..64}; echo ;;' \
+  '  *"{{.Id}}"*) printf "s%.0s" {1..64}; echo " true true true packed" ;;' \
+  '  *"{{range .Config.Env}}"*) echo NEXUS_LAB_MODE=packed ;;' \
+  '  *"{{.HostConfig.NanoCpus}}"*) echo "5000000000 8589934592 8589934592 1024" ;;' \
+  '  exec*) touch "$DOCKER_FAKE_EXECUTED" ;;' \
+  '  *) exit 97 ;;' \
+  'esac' >"$TMP/readiness-bad-host-bin/docker"
+chmod +x "$TMP/readiness-bad-host-bin/docker"
+set +e
+DOCKER_FAKE_LOG="$TMP/readiness-bad-host.log" \
+  DOCKER_FAKE_EXECUTED="$TMP/readiness-bad-host-executed" \
+  PATH="$TMP/readiness-bad-host-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" lab-readiness --mode packed \
+  >"$TMP/readiness-bad-host.out" 2>"$TMP/readiness-bad-host.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq "Docker applied unexpected packed lab HostConfig" "$TMP/readiness-bad-host.err"
+test ! -e "$TMP/readiness-bad-host-executed"
+
+# Docker discovery errors are not equivalent to an empty machine. In
+# particular, lab-up may not create a second validator after a failed ps.
+mkdir -p "$TMP/ps-error-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$1" in' \
+  '  ps) exit 55 ;;' \
+  '  *) touch "$DOCKER_FAKE_MUTATED"; exit 97 ;;' \
+  'esac' >"$TMP/ps-error-bin/docker"
+chmod +x "$TMP/ps-error-bin/docker"
+set +e
+env "${LAB_ENV[@]}" \
+  DOCKER_FAKE_LOG="$TMP/ps-error.log" \
+  DOCKER_FAKE_MUTATED="$TMP/ps-error-mutated" \
+  PATH="$TMP/ps-error-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" lab-up --mode source >"$TMP/ps-error.out" 2>"$TMP/ps-error.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq "Docker container listing failed" "$TMP/ps-error.err"
+test ! -e "$TMP/ps-error-mutated"
+
+# Normal up/down/clean must preserve a Lens lab. Ownership is established by
+# an immutable ID plus both validator/lab labels; removal by mutable name is
+# forbidden.
+mkdir -p "$TMP/lens-preserve-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$*" in' \
+  '  ps*"name=^/nexus-v010-load51$"*) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;' \
+  '  ps*"status=exited"*) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;' \
+  '  *"{{.Id}}"*aaaaaaaa*) echo "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa true true true source" ;;' \
+  '  *"{{range .Config.Env}}"*aaaaaaaa*) echo NEXUS_LAB_MODE=source ;;' \
+  '  "container inspect nexus-v010-load51") exit 0 ;;' \
+  '  *"egregore-nexus-real-harnesses"*) echo false ;;' \
+  '  *"egregore-nexus-test"*) echo true ;;' \
+  '  *"egregore-nexus-lens-lab"*) echo true ;;' \
+  '  rm*|"container rm"*) touch "$DOCKER_FAKE_REMOVED" ;;' \
+  '  *) exit 0 ;;' \
+  'esac' >"$TMP/lens-preserve-bin/docker"
+chmod +x "$TMP/lens-preserve-bin/docker"
+for command in up down clean; do
+  rm -f "$TMP/lens-preserve-removed"
+  set +e
+  DOCKER_FAKE_LOG="$TMP/lens-preserve.log" \
+    DOCKER_FAKE_REMOVED="$TMP/lens-preserve-removed" \
+    PATH="$TMP/lens-preserve-bin:$TMP/bin:/usr/bin:/bin" \
+    "$TARGET" "$command" >"$TMP/lens-preserve.out" 2>"$TMP/lens-preserve.err"
+  status=$?
+  set -e
+  test ! -e "$TMP/lens-preserve-removed"
+  if [ "$command" = up ]; then
+    test "$status" -ne 0
+    grep -Fq "preserving Lens lab" "$TMP/lens-preserve.err"
+  fi
+done
+
+# An ID swap between ownership validation and removal must fail closed. The
+# old and replacement IDs are both untouchable.
+mkdir -p "$TMP/id-swap-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'if [[ "$*" == ps*"name=^/nexus-v010-load51$"* ]]; then' \
+  '  count=$(cat "$DOCKER_FAKE_COUNT" 2>/dev/null || echo 0); count=$((count + 1)); echo "$count" >"$DOCKER_FAKE_COUNT"' \
+  '  if [ "$count" -eq 1 ]; then printf "%064d\n" 1; else printf "%064d\n" 2; fi' \
+  'elif [[ "$*" == *"{{.Id}}"* ]]; then' \
+  '  id=${@: -1}; echo "$id true true true source"' \
+  'elif [[ "$*" == *"{{range .Config.Env}}"* ]]; then' \
+  '  echo NEXUS_LAB_MODE=source' \
+  'elif [[ "$1" == rm || "$*" == "container rm"* ]]; then' \
+  '  touch "$DOCKER_FAKE_REMOVED"' \
+  'else exit 97; fi' >"$TMP/id-swap-bin/docker"
+chmod +x "$TMP/id-swap-bin/docker"
+set +e
+DOCKER_FAKE_LOG="$TMP/id-swap.log" \
+  DOCKER_FAKE_COUNT="$TMP/id-swap-count" \
+  DOCKER_FAKE_REMOVED="$TMP/id-swap-removed" \
+  PATH="$TMP/id-swap-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" lab-down --mode source >"$TMP/id-swap.out" 2>"$TMP/id-swap.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq "container ID changed" "$TMP/id-swap.err"
+test ! -e "$TMP/id-swap-removed"
+
+# A successful name lookup followed by an inspect failure is not absence and
+# cannot authorize removal.
+mkdir -p "$TMP/inspect-error-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$*" in' \
+  '  ps*"name=^/nexus-v010-load51$"*) printf "d%.0s" {1..64}; echo ;;' \
+  '  container\ inspect*) exit 56 ;;' \
+  '  rm*) touch "$DOCKER_FAKE_REMOVED" ;;' \
+  '  *) exit 97 ;;' \
+  'esac' >"$TMP/inspect-error-bin/docker"
+chmod +x "$TMP/inspect-error-bin/docker"
+set +e
+DOCKER_FAKE_LOG="$TMP/inspect-error.log" \
+  DOCKER_FAKE_REMOVED="$TMP/inspect-error-removed" \
+  PATH="$TMP/inspect-error-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" lab-down --mode source >"$TMP/inspect-error.out" 2>"$TMP/inspect-error.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq "Docker container inspect failed" "$TMP/inspect-error.err"
+test ! -e "$TMP/inspect-error-removed"
+
+# If setup fails after docker run, cleanup is authorized only for the exact
+# immutable ID just returned by that run and revalidated as the same Lens lab.
+mkdir -p "$TMP/new-cleanup-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$*" in' \
+  '  ps*"label=egregore-nexus-test=true"*) exit 0 ;;' \
+  '  ps*"name=^/nexus-v010-load51$"*) if [ -e "$DOCKER_FAKE_CREATED" ]; then printf "e%.0s" {1..64}; echo; fi ;;' \
+  '  build\ *) exit 0 ;;' \
+  '  run\ *) touch "$DOCKER_FAKE_CREATED"; printf "e%.0s" {1..64}; echo ;;' \
+  '  *"{{.Id}}"*) printf "e%.0s" {1..64}; echo " true true true source" ;;' \
+  '  *"{{range .Config.Env}}"*) echo NEXUS_LAB_MODE=source ;;' \
+  '  exec\ --user*) exit 66 ;;' \
+  '  rm\ -f*) echo "${@: -1}" >"$DOCKER_FAKE_REMOVED"; rm -f "$DOCKER_FAKE_CREATED" ;;' \
+  '  *) echo "unexpected cleanup docker call: $*" >&2; exit 97 ;;' \
+  'esac' >"$TMP/new-cleanup-bin/docker"
+chmod +x "$TMP/new-cleanup-bin/docker"
+set +e
+env "${LAB_ENV[@]}" \
+  DOCKER_FAKE_LOG="$TMP/new-cleanup.log" \
+  DOCKER_FAKE_CREATED="$TMP/new-cleanup-created" \
+  DOCKER_FAKE_REMOVED="$TMP/new-cleanup-removed" \
+  PATH="$TMP/new-cleanup-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" lab-up --mode source >"$TMP/new-cleanup.out" 2>"$TMP/new-cleanup.err"
+status=$?
+set -e
+test "$status" -eq 66
+test "$(cat "$TMP/new-cleanup-removed")" = eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+if grep -Eq '^rm -f nexus-v010-load51$' "$TMP/new-cleanup.log"; then
+  echo 'failed setup cleanup must never remove by mutable container name' >&2
+  exit 1
+fi
+
+# Packed gates and evidence reads revalidate the actual HostConfig and the
+# hashed installed topology on every invocation. A quota drift or readiness
+# hash mismatch must stop before any acceptance/evidence command executes.
+mkdir -p "$TMP/packed-revalidate-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$*" in' \
+  '  ps*"name=^/nexus-v010-load51$"*) printf "%064d\n" 3 ;;' \
+  '  *"{{.Id}}"*) printf "%064d true true true packed\n" 3 ;;' \
+  '  *"{{range .Config.Env}}"*) echo NEXUS_LAB_MODE=packed ;;' \
+  '  *"{{.HostConfig.NanoCpus}}"*) echo "5000000000 8589934592 8589934592 1024" ;;' \
+  '  exec*) touch "$DOCKER_FAKE_EXECUTED" ;;' \
+  '  *) exit 97 ;;' \
+  'esac' >"$TMP/packed-revalidate-bin/docker"
+chmod +x "$TMP/packed-revalidate-bin/docker"
+for command in 'lab-gate --mode packed --backend-only' 'lab-evidence --mode packed'; do
+  rm -f "$TMP/packed-revalidate-executed"
+  set +e
+  DOCKER_FAKE_LOG="$TMP/packed-revalidate.log" \
+    DOCKER_FAKE_EXECUTED="$TMP/packed-revalidate-executed" \
+    PATH="$TMP/packed-revalidate-bin:$TMP/bin:/usr/bin:/bin" \
+    "$TARGET" $command >"$TMP/packed-revalidate.out" 2>"$TMP/packed-revalidate.err"
+  status=$?
+  set -e
+  test "$status" -ne 0
+  grep -Fq "Docker applied unexpected packed lab HostConfig" "$TMP/packed-revalidate.err"
+  test ! -e "$TMP/packed-revalidate-executed"
+done
+
+# With correct quotas, a stale readiness hash/topology still blocks the gate.
+mkdir -p "$TMP/topology-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$*" in' \
+  '  ps*"name=^/nexus-v010-load51$"*) printf "%064d\n" 4 ;;' \
+  '  *"{{.Image}}"*) printf "sha256:"; printf "b%.0s" {1..64}; echo ;;' \
+  '  *"{{.Id}}"*) printf "%064d true true true packed\n" 4 ;;' \
+  '  *"{{range .Config.Env}}"*) echo NEXUS_LAB_MODE=packed ;;' \
+  '  *"{{.HostConfig.NanoCpus}}"*) echo "6000000000 8589934592 8589934592 1024" ;;' \
+  '  exec*) echo "candidate readiness hash mismatch" >&2; exit 44 ;;' \
+  '  *) exit 97 ;;' \
+  'esac' >"$TMP/topology-bin/docker"
+chmod +x "$TMP/topology-bin/docker"
+set +e
+DOCKER_FAKE_LOG="$TMP/topology.log" \
+  PATH="$TMP/topology-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" lab-gate --mode packed --backend-only >"$TMP/topology.out" 2>"$TMP/topology.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq "candidate readiness hash mismatch" "$TMP/topology.err"
+if grep -Fq '/tmp/nexus-lab-bin/nexus-v015-ws-acceptance --mode' "$TMP/topology.log"; then
+  echo 'topology mismatch must fail before a packed acceptance gate' >&2
+  exit 1
+fi
+
+# The packed release lab must pass the immutable readiness probe before the
+# acceptance command. The probe itself contains exact link topology and hashes
+# all three executable surfaces.
+grep -Fq 'expected_nexus=/tmp/nexus-target/debug/nexus' "$TARGET"
+grep -Fq '/tmp/nexus-lab-install.*/bin/nexus' "$TARGET"
+grep -Fq 'expected_nexus_resolved=$install_root/lib/node_modules/@egregore/nexus/bin/nexus.mjs' "$TARGET"
+grep -Fq 'packed candidate is not an umbrella-only install' "$TARGET"
+grep -Fq 'runId=%s' "$TARGET"
+grep -Fq 'installNonce=%s' "$TARGET"
+grep -Fq 'sha256sum "$nexus_resolved"' "$TARGET"
+grep -Fq 'sha256sum "$gateway_resolved"' "$TARGET"
+grep -Fq 'sha256sum "$webui_resolved"' "$TARGET"
+mkdir -p "$TMP/topology-ok-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'mode=${DOCKER_FAKE_MODE:?}' \
+  'case "$*" in' \
+  '  ps*"name=^/nexus-v010-load51$"*) printf "f%.0s" {1..64}; echo ;;' \
+  '  *"{{.Image}}"*) printf "sha256:"; printf "c%.0s" {1..64}; echo ;;' \
+  '  *"{{.Id}}"*) printf "f%.0s" {1..64}; echo " true true true $mode" ;;' \
+  '  *"{{range .Config.Env}}"*) echo "NEXUS_LAB_MODE=$mode" ;;' \
+  '  *"{{.HostConfig.NanoCpus}}"*) echo "6000000000 8589934592 8589934592 1024" ;;' \
+  '  exec*"NEXUS_TOPOLOGY_ACTION=verify"*) echo "topology-ready-$mode" ;;' \
+  '  exec*"NEXUS_MANIFEST_BINDING_ACTION=verify"*) echo "manifest-ready-$mode" ;;' \
+  '  exec*"nexus-v015-ws-acceptance"*) echo "acceptance-$mode" ;;' \
+  '  *) echo "unexpected topology-ok docker call: $*" >&2; exit 97 ;;' \
+  'esac' >"$TMP/topology-ok-bin/docker"
+chmod +x "$TMP/topology-ok-bin/docker"
+for mode in packed; do
+  : >"$TMP/topology-ok.log"
+  DOCKER_FAKE_MODE=$mode \
+    DOCKER_FAKE_LOG="$TMP/topology-ok.log" \
+    PATH="$TMP/topology-ok-bin:$TMP/bin:/usr/bin:/bin" \
+    "$TARGET" lab-gate --mode "$mode" --backend-only \
+    >"$TMP/topology-ok.out" 2>"$TMP/topology-ok.err"
+  topology_line=$(grep -n 'NEXUS_TOPOLOGY_ACTION=verify' "$TMP/topology-ok.log" | cut -d: -f1)
+  acceptance_line=$(grep -n '/tmp/nexus-lab-bin/nexus-v015-ws-acceptance --mode' "$TMP/topology-ok.log" | cut -d: -f1)
+  test -n "$topology_line" && test -n "$acceptance_line"
+  test "$topology_line" -lt "$acceptance_line"
+  if [ "$mode" = packed ]; then
+    manifest_line=$(grep -n 'NEXUS_MANIFEST_BINDING_ACTION=verify' "$TMP/topology-ok.log" | cut -d: -f1)
+    test -n "$manifest_line"
+    test "$topology_line" -lt "$manifest_line"
+    test "$manifest_line" -lt "$acceptance_line"
+  fi
+done
+grep -Fq 'NEXUS_MANIFEST_BINDING_ACTION=verify' "$TARGET"
+
+# The real ocular handoff uses the verified readiness digest and the runners'
+# no-argument complete-catalog contract.  Exercise the Docker argv rather than
+# accepting source tokens alone.
+mkdir -p "$TMP/ocular-handoff-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'mode=${DOCKER_FAKE_MODE:?}' \
+	  'case "$*" in' \
+	  '  ps*"name=^/nexus-v010-load51$"*) printf "9%.0s" {1..64}; echo ;;' \
+	  '  *"{{.Image}}"*) printf "sha256:"; printf "d%.0s" {1..64}; echo ;;' \
+	  '  *"{{.Id}}"*) printf "9%.0s" {1..64}; echo " true true true $mode" ;;' \
+  '  *"{{range .Config.Env}}"*) echo "NEXUS_LAB_MODE=$mode" ;;' \
+  '  *"{{.HostConfig.NanoCpus}}"*) echo "6000000000 8589934592 8589934592 1024" ;;' \
+  '  exec*"NEXUS_TOPOLOGY_ACTION=verify"*) echo "topology-ready-$mode" ;;' \
+  '  exec*"NEXUS_MANIFEST_BINDING_ACTION=verify"*) echo manifest-ready-packed ;;' \
+  '  exec*"candidate-ready.v1"*"sha256sum"*) printf "a%.0s" {1..64}; echo ;;' \
+  '  exec*"nexus-v015-release-assemble"*"--print-candidate-digest"*) printf "sha256:"; printf "d%.0s" {1..64}; echo ;;' \
+  '  exec*"lab-agent launch codex"*) echo codex-ready ;;' \
+  '  exec*"lab-agent launch claude"*) echo claude-ready ;;' \
+  '  exec*"tests/ocular/run.mjs"*) echo ocular-complete ;;' \
+  '  *) echo "unexpected ocular handoff Docker call: $*" >&2; exit 97 ;;' \
+  'esac' >"$TMP/ocular-handoff-bin/docker"
+chmod +x "$TMP/ocular-handoff-bin/docker"
+for mode in packed; do
+  : >"$TMP/ocular-handoff-$mode.log"
+  DOCKER_FAKE_MODE=$mode \
+    DOCKER_FAKE_LOG="$TMP/ocular-handoff-$mode.log" \
+    PATH="$TMP/ocular-handoff-bin:$TMP/bin:/usr/bin:/bin" \
+    "$TARGET" lab-gate --mode "$mode" --ocular \
+    >"$TMP/ocular-handoff-$mode.out" 2>"$TMP/ocular-handoff-$mode.err"
+  grep -Fq ocular-complete "$TMP/ocular-handoff-$mode.out"
+  grep -Fq codex-ready "$TMP/ocular-handoff-$mode.out"
+  grep -Fq claude-ready "$TMP/ocular-handoff-$mode.out"
+  grep -Fq "NEXUS_V015_READINESS_LEDGER_SHA256=$(printf 'a%.0s' {1..64})" \
+    "$TMP/ocular-handoff-$mode.log"
+  grep -Fq "NEXUS_V015_CANDIDATE_SHA256=$(printf 'd%.0s' {1..64})" \
+    "$TMP/ocular-handoff-$mode.log"
+  grep -Fq 'node tests/ocular/run.mjs --release' "$TMP/ocular-handoff-$mode.log"
+  if grep -Fq -- '--all' "$TMP/ocular-handoff-$mode.log"; then
+    echo "ocular Docker handoff passed an unsupported --all flag in $mode mode" >&2
+    exit 1
+  fi
+  codex_line=$(grep -n 'lab-agent launch codex' "$TMP/ocular-handoff-$mode.log" | cut -d: -f1)
+  claude_line=$(grep -n 'lab-agent launch claude' "$TMP/ocular-handoff-$mode.log" | cut -d: -f1)
+  runner_line=$(grep -n 'tests/ocular/run.mjs --release' "$TMP/ocular-handoff-$mode.log" | cut -d: -f1)
+  digest_line=$(grep -n 'nexus-v015-release-assemble.*--print-candidate-digest' \
+    "$TMP/ocular-handoff-$mode.log" | cut -d: -f1)
+  test -n "$codex_line" && test -n "$claude_line" && test -n "$runner_line" && test -n "$digest_line"
+  test "$digest_line" -lt "$codex_line"
+  test "$digest_line" -lt "$claude_line"
+  test "$codex_line" -lt "$runner_line"
+  test "$claude_line" -lt "$runner_line"
+  if [ "$mode" = packed ]; then
+    mapfile -t manifest_lines < <(grep -n 'NEXUS_MANIFEST_BINDING_ACTION=verify' \
+      "$TMP/ocular-handoff-$mode.log" | cut -d: -f1)
+    test "${#manifest_lines[@]}" -ge 3
+    test "${manifest_lines[1]}" -lt "$codex_line"
+    test "${manifest_lines[1]}" -lt "$claude_line"
+    test "${manifest_lines[-1]}" -gt "$codex_line"
+    test "${manifest_lines[-1]}" -gt "$claude_line"
+    test "${manifest_lines[-1]}" -lt "$runner_line"
+  fi
+done
+
+# WebUI runs the packed CLI lifecycle first, then the complete W1-W8 catalog
+# in strict release mode. Exercise the packed candidate and pin the bound
+# runner argv rather than relying on source-string checks.
+mkdir -p "$TMP/webui-handoff-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'mode=${DOCKER_FAKE_MODE:?}' \
+  'case "$*" in' \
+  '  ps*"name=^/nexus-v010-load51$"*) printf "7%.0s" {1..64}; echo ;;' \
+  '  *"{{.Image}}"*) printf "sha256:"; printf "e%.0s" {1..64}; echo ;;' \
+  '  *"{{.Id}}"*) printf "7%.0s" {1..64}; echo " true true true $mode" ;;' \
+  '  *"{{range .Config.Env}}"*) echo "NEXUS_LAB_MODE=$mode" ;;' \
+  '  *"{{.HostConfig.NanoCpus}}"*) echo "6000000000 8589934592 8589934592 1024" ;;' \
+  '  exec*"NEXUS_TOPOLOGY_ACTION=verify"*) echo "topology-ready-$mode" ;;' \
+  '  exec*"NEXUS_MANIFEST_BINDING_ACTION=verify"*) echo manifest-ready-packed ;;' \
+  '  exec*"candidate-ready.v1"*"sha256sum"*) printf "b%.0s" {1..64}; echo ;;' \
+  '  exec*"nexus-v015-release-assemble"*"--print-candidate-digest"*) printf "sha256:"; printf "d%.0s" {1..64}; echo ;;' \
+  '  exec*"lab-agent launch codex"*) echo webui-codex-ready ;;' \
+  '  exec*"lab-agent launch claude"*) echo webui-claude-ready ;;' \
+  '  exec*"webconsole stop --force"*) echo webconsole-stopped ;;' \
+  '  exec*"nexus-v015-webconsole-acceptance"*) echo webconsole-complete ;;' \
+  '  exec*"webconsole start --host 127.0.0.1 --port 4200"*) echo webconsole-started ;;' \
+  '  exec*"curl -fsS '\''http://127.0.0.1:4200/health'\''"*) echo healthy ;;' \
+  '  exec*"tests/ocular/webui-run.mjs --release"*) echo webui-complete ;;' \
+  '  *) echo "unexpected WebUI handoff Docker call: $*" >&2; exit 97 ;;' \
+  'esac' >"$TMP/webui-handoff-bin/docker"
+chmod +x "$TMP/webui-handoff-bin/docker"
+for mode in packed; do
+  : >"$TMP/webui-handoff-$mode.log"
+  DOCKER_FAKE_MODE=$mode \
+    DOCKER_FAKE_LOG="$TMP/webui-handoff-$mode.log" \
+    PATH="$TMP/webui-handoff-bin:$TMP/bin:/usr/bin:/bin" \
+    "$TARGET" lab-gate --mode "$mode" --webui \
+    >"$TMP/webui-handoff-$mode.out" 2>"$TMP/webui-handoff-$mode.err"
+  grep -Fq webui-complete "$TMP/webui-handoff-$mode.out"
+  grep -Fq webui-codex-ready "$TMP/webui-handoff-$mode.out"
+  grep -Fq webui-claude-ready "$TMP/webui-handoff-$mode.out"
+  grep -Fq "NEXUS_V015_READINESS_LEDGER_SHA256=$(printf 'b%.0s' {1..64})" \
+    "$TMP/webui-handoff-$mode.log"
+  grep -Fq "NEXUS_V015_CANDIDATE_SHA256=$(printf 'd%.0s' {1..64})" \
+    "$TMP/webui-handoff-$mode.log"
+  grep -Fq 'node tests/ocular/webui-run.mjs --release' "$TMP/webui-handoff-$mode.log"
+  if grep -Fq -- '--all' "$TMP/webui-handoff-$mode.log"; then
+    echo "WebUI Docker handoff passed an unsupported --all flag in $mode mode" >&2
+    exit 1
+  fi
+  runner_line=$(grep -n 'tests/ocular/webui-run.mjs --release' \
+    "$TMP/webui-handoff-$mode.log" | cut -d: -f1)
+  codex_line=$(grep -n 'lab-agent launch codex' \
+    "$TMP/webui-handoff-$mode.log" | cut -d: -f1)
+  claude_line=$(grep -n 'lab-agent launch claude' \
+    "$TMP/webui-handoff-$mode.log" | cut -d: -f1)
+  test -n "$runner_line" && test -n "$codex_line" && test -n "$claude_line"
+  test "$codex_line" -lt "$runner_line"
+  test "$claude_line" -lt "$runner_line"
+  if [ "$mode" = packed ]; then
+    grep -Fq webconsole-complete "$TMP/webui-handoff-$mode.out"
+    stop_line=$(grep -n 'webconsole stop --force' "$TMP/webui-handoff-$mode.log" | head -n1 | cut -d: -f1)
+    acceptance_line=$(grep -n 'nexus-v015-webconsole-acceptance --nexus-bin' \
+      "$TMP/webui-handoff-$mode.log" | cut -d: -f1)
+    start_line=$(grep -n 'webconsole start --host 127.0.0.1 --port 4200' \
+      "$TMP/webui-handoff-$mode.log" | tail -n1 | cut -d: -f1)
+    test -n "$stop_line" && test -n "$acceptance_line" && test -n "$start_line"
+    test "$stop_line" -lt "$acceptance_line"
+    test "$acceptance_line" -lt "$start_line"
+    test "$start_line" -lt "$runner_line"
+    grep -Fq -- '--nexus-bin /tmp/nexus-lab-bin/nexus --run-id' \
+      "$TMP/webui-handoff-$mode.log"
+    grep -Fq -- '--evidence-root "$NEXUS_LAB_ROOT/evidence/$NEXUS_V015_RUN_ID"' \
+      "$TMP/webui-handoff-$mode.log"
+    if grep -Fq -- '--evidence-dir' "$TMP/webui-handoff-$mode.log"; then
+      echo 'packed Webconsole handoff must use the exact run-scoped evidence root' >&2
+      exit 1
+    fi
+  else
+    if grep -Fq 'nexus-v015-webconsole-acceptance --nexus-bin' "$TMP/webui-handoff-$mode.log"; then
+      echo 'source WebUI handoff must not invoke the packed-only D2 producer' >&2
+      exit 1
+    fi
+  fi
+done
+
+# The canonical --all handoff must include the visible Lens plugin gate and
+# the O/W aggregate producer before the soak/final seal.  The candidate digest
+# is derived by the bound release assembler from this run's manifest; neither
+# runner may invent it.  Exercise the complete Docker argv/order instead of
+# accepting source tokens alone.
+mkdir -p "$TMP/all-handoff-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$*" in' \
+  '  ps*"name=^/nexus-v010-load51$"*) printf "5%.0s" {1..64}; echo ;;' \
+  '  *"{{.Image}}"*) printf "sha256:"; printf "e%.0s" {1..64}; echo ;;' \
+  '  *"{{.Id}}"*) printf "5%.0s" {1..64}; echo " true true true packed" ;;' \
+  '  *"{{range .Config.Env}}"*) echo NEXUS_LAB_MODE=packed ;;' \
+  '  *"{{.HostConfig.NanoCpus}}"*) echo "6000000000 8589934592 8589934592 1024" ;;' \
+  '  exec*"NEXUS_TOPOLOGY_ACTION=verify"*) echo topology-ready-packed ;;' \
+  '  exec*"NEXUS_MANIFEST_BINDING_ACTION=verify"*) echo manifest-ready-packed ;;' \
+  '  exec*"candidate-ready.v1"*"sha256sum"*) printf "a%.0s" {1..64}; echo ;;' \
+  '  exec*"nexus-v015-ws-acceptance"*) echo backend-complete ;;' \
+  '  exec*"nexus-hooks-practical-gate"*) echo hooks-complete ;;' \
+  '  exec*"nexus-v015-ws-soak"*) echo soak-complete ;;' \
+  '  exec*"lab-agent launch codex"*) echo codex-ready ;;' \
+  '  exec*"lab-agent launch claude"*) echo claude-ready ;;' \
+  '  exec*"tests/ocular/run.mjs --release"*) echo ocular-complete ;;' \
+  '  exec*"webconsole stop --force"*) echo webconsole-stopped ;;' \
+  '  exec*"nexus-v015-webconsole-acceptance"*) echo webconsole-complete ;;' \
+  '  exec*"webconsole start --host 127.0.0.1 --port 4200"*) echo webconsole-started ;;' \
+  '  exec*"curl -fsS '\''http://127.0.0.1:4200/health'\''"*) echo healthy ;;' \
+  '  exec*"tests/ocular/webui-run.mjs --release"*) echo webui-complete ;;' \
+  '  exec*"nexus-v015-release-assemble"*"--print-candidate-digest"*) printf "sha256:"; printf "d%.0s" {1..64}; echo ;;' \
+  '  exec*"tests/ocular/live-plugin.mjs --release"*) echo live-plugin-complete ;;' \
+  '  exec*"tests/ocular/aggregate.mjs --release"*) echo aggregate-complete ;;' \
+  '  cp*) echo release-input-copied ;;' \
+  '  exec*"python3 -"*) cat >/dev/null; echo diff-review-ready ;;' \
+  '  exec*"NEXUS_V015_RELEASE_INPUT_DIR="*) echo release-inputs-ready ;;' \
+  '  exec*"nexus-v015-release-assemble"*) [ "${DOCKER_FAKE_ASSEMBLER_FAIL:-0}" -eq 0 ] || exit 96; echo assemble-complete ;;' \
+  '  exec*"nexus-v015-evidence-validate --seal"*) echo seal-complete ;;' \
+  '  *) echo "unexpected all-handoff Docker call: $*" >&2; exit 97 ;;' \
+  'esac' >"$TMP/all-handoff-bin/docker"
+chmod +x "$TMP/all-handoff-bin/docker"
+: >"$TMP/all-handoff.log"
+mkdir -p "$TMP/host-nexus"
+DOCKER_FAKE_LOG="$TMP/all-handoff.log" \
+  NEXUS_DOCKER_TEST_HOST_NEXUS_HOME="$TMP/host-nexus" \
+  PATH="$TMP/all-handoff-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" lab-gate --mode packed --all --soak 1800 \
+  >"$TMP/all-handoff.out" 2>"$TMP/all-handoff.err"
+for marker in \
+  backend-complete hooks-complete ocular-complete webui-complete \
+  live-plugin-complete aggregate-complete assemble-complete; do
+  grep -Fq "$marker" "$TMP/all-handoff.out"
+done
+candidate=$(printf 'd%.0s' {1..64})
+grep -Fq "NEXUS_V015_CANDIDATE_DIGEST=sha256:$candidate" "$TMP/all-handoff.log"
+grep -Fq "NEXUS_V015_CANDIDATE_SHA256=$candidate" "$TMP/all-handoff.log"
+grep -Fq 'env -i PATH=/tmp/nexus-lab-bin:/usr/local/bin:/usr/bin:/bin' \
+  "$TMP/all-handoff.log"
+grep -Fq 'HOME=/tmp/nexus-lens-home/harness-home' "$TMP/all-handoff.log"
+grep -Fq 'XDG_CONFIG_HOME=/tmp/nexus-lens-home/harness-home/.config' \
+  "$TMP/all-handoff.log"
+grep -Fq 'NEXUS_HOME=/tmp/nexus-lens-home/nexus' "$TMP/all-handoff.log"
+grep -Fq 'LENS_DATA_HOME=/tmp/nexus-lens-home/lens-data' "$TMP/all-handoff.log"
+if grep -Eq 'LENS_NEXUS_(GATEWAY_URL|BEARER)' "$TMP/all-handoff.log"; then
+  echo 'live Lens gate must select the candidate through the visible UI, not a hidden env override' >&2
+  exit 1
+fi
+grep -Fq 'node tests/ocular/live-plugin.mjs --release' "$TMP/all-handoff.log"
+grep -Fq 'node tests/ocular/aggregate.mjs --release' "$TMP/all-handoff.log"
+mapfile -t digest_lines < <(grep -n \
+  'nexus-v015-release-assemble.*--print-candidate-digest' \
+  "$TMP/all-handoff.log" | cut -d: -f1)
+ocular_line=$(grep -n 'tests/ocular/run.mjs --release' "$TMP/all-handoff.log" | cut -d: -f1)
+webui_line=$(grep -n 'tests/ocular/webui-run.mjs --release' "$TMP/all-handoff.log" | cut -d: -f1)
+live_line=$(grep -n 'tests/ocular/live-plugin.mjs --release' "$TMP/all-handoff.log" | cut -d: -f1)
+aggregate_line=$(grep -n 'tests/ocular/aggregate.mjs --release' "$TMP/all-handoff.log" | cut -d: -f1)
+soak_line=$(grep -n 'export NEXUS_V015_SOAK_PASSWORD=' \
+  "$TMP/all-handoff.log" | tail -n1 | cut -d: -f1)
+assemble_line=$(grep -n 'nexus-v015-release-assemble.*--host-before' \
+  "$TMP/all-handoff.log" | tail -n1 | cut -d: -f1)
+seal_line=$(grep -n 'nexus-v015-evidence-validate --seal' \
+  "$TMP/all-handoff.log" | tail -n1 | cut -d: -f1)
+test "${#digest_lines[@]}" -ge 2
+test -n "$ocular_line" && test -n "$webui_line"
+test -n "$live_line" && test -n "$aggregate_line" && test -n "$soak_line"
+test -n "$assemble_line" && test -n "$seal_line"
+test "${digest_lines[0]}" -lt "$ocular_line"
+test "${digest_lines[0]}" -lt "$webui_line"
+test "$webui_line" -lt "${digest_lines[-1]}"
+test "${digest_lines[-1]}" -lt "$live_line"
+test "$webui_line" -lt "$live_line"
+test "$live_line" -lt "$aggregate_line"
+test "$aggregate_line" -lt "$soak_line"
+test "$soak_line" -lt "$assemble_line"
+test "$assemble_line" -lt "$seal_line"
+grep -Fq -- '--host-before' "$TMP/all-handoff.log"
+grep -Fq -- '--host-after' "$TMP/all-handoff.log"
+grep -Fq -- '--diff-review' "$TMP/all-handoff.log"
+grep -Fq -- '--cargo-metadata' "$TMP/all-handoff.log"
+grep -Fq -- '--readiness-sha256' "$TMP/all-handoff.log"
+
+# A full-assembler failure is terminal: no validator/seal call may run after
+# the failed cross-producer commit point.
+: >"$TMP/all-handoff-fail.log"
+set +e
+DOCKER_FAKE_LOG="$TMP/all-handoff-fail.log" \
+  DOCKER_FAKE_ASSEMBLER_FAIL=1 \
+  NEXUS_DOCKER_TEST_HOST_NEXUS_HOME="$TMP/host-nexus" \
+  PATH="$TMP/all-handoff-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" lab-gate --mode packed --all --soak 1800 \
+  >"$TMP/all-handoff-fail.out" 2>"$TMP/all-handoff-fail.err"
+all_handoff_fail_status=$?
+set -e
+test "$all_handoff_fail_status" -eq 96
+if grep -Fq 'nexus-v015-evidence-validate --seal' "$TMP/all-handoff-fail.log"; then
+  echo 'final validator ran after release assembler failure' >&2
+  exit 1
+fi
+
+# Revalidate the exact packed candidate after the Webconsole matrix. A
+# lifecycle command that mutates candidate/readiness state must prevent all
+# browser interaction and cannot produce a W1-W8 pass.
+mkdir -p "$TMP/webui-mutation-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$*" in' \
+  '  ps*"name=^/nexus-v010-load51$"*) printf "6%.0s" {1..64}; echo ;;' \
+  '  *"{{.Image}}"*) printf "sha256:"; printf "f%.0s" {1..64}; echo ;;' \
+  '  *"{{.Id}}"*) printf "6%.0s" {1..64}; echo " true true true packed" ;;' \
+  '  *"{{range .Config.Env}}"*) echo NEXUS_LAB_MODE=packed ;;' \
+  '  *"{{.HostConfig.NanoCpus}}"*) echo "6000000000 8589934592 8589934592 1024" ;;' \
+  '  exec*"NEXUS_TOPOLOGY_ACTION=verify"*) echo topology-ready-packed ;;' \
+  '  exec*"NEXUS_MANIFEST_BINDING_ACTION=verify"*)' \
+  '    count=$(cat "$DOCKER_FAKE_COUNT" 2>/dev/null || echo 0); count=$((count + 1)); echo "$count" >"$DOCKER_FAKE_COUNT"' \
+  '    if [ "$count" -eq 6 ]; then exit 90; fi' \
+  '    printf "c%.0s" {1..64}; echo ;;' \
+  '  exec*"candidate-ready.v1"*"sha256sum"*) printf "c%.0s" {1..64}; echo ;;' \
+  '  exec*"nexus-v015-release-assemble"*"--print-candidate-digest"*) printf "sha256:"; printf "d%.0s" {1..64}; echo ;;' \
+  '  exec*"lab-agent launch codex"*) echo webui-codex-ready ;;' \
+  '  exec*"lab-agent launch claude"*) echo webui-claude-ready ;;' \
+  '  exec*"webconsole stop --force"*) echo webconsole-stopped ;;' \
+  '  exec*"nexus-v015-webconsole-acceptance"*) touch "$DOCKER_FAKE_ACCEPTANCE"; echo webconsole-complete ;;' \
+  '  exec*"webconsole start --host 127.0.0.1 --port 4200"*) echo webconsole-started ;;' \
+  '  exec*"curl -fsS '\''http://127.0.0.1:4200/health'\''"*) echo healthy ;;' \
+  '  exec*"tests/ocular/webui-run.mjs --release"*) touch "$DOCKER_FAKE_RUNNER"; echo webui-complete ;;' \
+  '  *) echo "unexpected WebUI mutation Docker call: $*" >&2; exit 97 ;;' \
+  'esac' >"$TMP/webui-mutation-bin/docker"
+chmod +x "$TMP/webui-mutation-bin/docker"
+set +e
+DOCKER_FAKE_LOG="$TMP/webui-mutation.log" \
+  DOCKER_FAKE_COUNT="$TMP/webui-mutation-count" \
+  DOCKER_FAKE_ACCEPTANCE="$TMP/webui-mutation-acceptance" \
+  DOCKER_FAKE_RUNNER="$TMP/webui-mutation-runner" \
+  PATH="$TMP/webui-mutation-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" lab-gate --mode packed --webui \
+  >"$TMP/webui-mutation.out" 2>"$TMP/webui-mutation.err"
+status=$?
+set -e
+test "$status" -eq 90
+test -e "$TMP/webui-mutation-acceptance"
+test ! -e "$TMP/webui-mutation-runner"
+
+# A candidate/readiness mutation after prepare_existing_lab must fail before
+# either live agent starts.  A mutation caused by either live-agent launch must
+# be caught by the second handoff verification before the renderer runner.
+mkdir -p "$TMP/ocular-mutation-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$*" in' \
+  '  ps*"name=^/nexus-v010-load51$"*) printf "8%.0s" {1..64}; echo ;;' \
+  '  *"{{.Image}}"*) printf "sha256:"; printf "a%.0s" {1..64}; echo ;;' \
+  '  *"{{.Id}}"*) printf "8%.0s" {1..64}; echo " true true true packed" ;;' \
+  '  *"{{range .Config.Env}}"*) echo NEXUS_LAB_MODE=packed ;;' \
+  '  *"{{.HostConfig.NanoCpus}}"*) echo "6000000000 8589934592 8589934592 1024" ;;' \
+  '  exec*"NEXUS_TOPOLOGY_ACTION=verify"*) echo topology-ready-packed ;;' \
+  '  exec*"NEXUS_MANIFEST_BINDING_ACTION=verify"*)' \
+  '    count=$(cat "$DOCKER_FAKE_COUNT" 2>/dev/null || echo 0); count=$((count + 1)); echo "$count" >"$DOCKER_FAKE_COUNT"' \
+  '    if [ "$count" -eq "$DOCKER_FAKE_FAIL_AT" ]; then exit 89; fi' \
+  '    printf "a%.0s" {1..64}; echo ;;' \
+  '  exec*"candidate-ready.v1"*"sha256sum"*) printf "a%.0s" {1..64}; echo ;;' \
+  '  exec*"nexus-v015-release-assemble"*"--print-candidate-digest"*) printf "sha256:"; printf "d%.0s" {1..64}; echo ;;' \
+  '  exec*"lab-agent launch codex"*) touch "$DOCKER_FAKE_CODEX"; echo codex-ready ;;' \
+  '  exec*"lab-agent launch claude"*) touch "$DOCKER_FAKE_CLAUDE"; echo claude-ready ;;' \
+  '  exec*"tests/ocular/run.mjs --release"*) touch "$DOCKER_FAKE_RUNNER"; echo ocular-complete ;;' \
+  '  *) echo "unexpected ocular mutation Docker call: $*" >&2; exit 97 ;;' \
+  'esac' >"$TMP/ocular-mutation-bin/docker"
+chmod +x "$TMP/ocular-mutation-bin/docker"
+for fail_at in 2 4; do
+  rm -f "$TMP/ocular-mutation-count" "$TMP/ocular-mutation-codex" \
+    "$TMP/ocular-mutation-claude" "$TMP/ocular-mutation-runner"
+  set +e
+  DOCKER_FAKE_LOG="$TMP/ocular-mutation-$fail_at.log" \
+    DOCKER_FAKE_COUNT="$TMP/ocular-mutation-count" \
+    DOCKER_FAKE_FAIL_AT=$fail_at \
+    DOCKER_FAKE_CODEX="$TMP/ocular-mutation-codex" \
+    DOCKER_FAKE_CLAUDE="$TMP/ocular-mutation-claude" \
+    DOCKER_FAKE_RUNNER="$TMP/ocular-mutation-runner" \
+    PATH="$TMP/ocular-mutation-bin:$TMP/bin:/usr/bin:/bin" \
+    "$TARGET" lab-gate --mode packed --ocular \
+    >"$TMP/ocular-mutation-$fail_at.out" 2>"$TMP/ocular-mutation-$fail_at.err"
+  status=$?
+  set -e
+  test "$status" -eq 89
+  test ! -e "$TMP/ocular-mutation-runner"
+  if [ "$fail_at" -eq 2 ]; then
+    test ! -e "$TMP/ocular-mutation-codex"
+    test ! -e "$TMP/ocular-mutation-claude"
+  else
+    test -e "$TMP/ocular-mutation-codex"
+    test -e "$TMP/ocular-mutation-claude"
+  fi
+done
+
+# Opt-in real-Docker assertion. It is deliberately read-only: list, inspect,
+# and hash the already-running sole lab without start/stop/restart/remove.
+if [ "${NEXUS_DOCKER_TEST_REAL_LAB_ASSERT:-0}" = 1 ]; then
+  [ -n "$REAL_DOCKER" ] || { echo 'real Docker is unavailable' >&2; exit 1; }
+  mapfile -t real_labs < <("$REAL_DOCKER" ps -a --no-trunc \
+    --filter label=egregore-nexus-test=true --format '{{.ID}} {{.Names}}')
+  [ "${#real_labs[@]}" -eq 1 ] \
+    || { echo "expected one real validator, observed ${#real_labs[@]}" >&2; exit 1; }
+  read -r real_id real_name extra <<<"${real_labs[0]}"
+  [ -n "$real_id" ] && [ -n "$real_name" ] && [ -z "${extra:-}" ]
+  real_config=$("$REAL_DOCKER" container inspect -f \
+    '{{.Id}} {{index .Config.Labels "egregore-nexus-test"}} {{index .Config.Labels "egregore-nexus-lens-lab"}} {{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{.HostConfig.PidsLimit}}' \
+    "$real_id")
+  read -r observed_id validator_label lens_label nano memory memory_swap pids extra <<<"$real_config"
+  test "$observed_id" = "$real_id"
+  test "$validator_label:$lens_label" = true:true
+  test "$nano:$memory:$memory_swap:$pids" = 6000000000:8589934592:8589934592:1024
+  real_environment=$("$REAL_DOCKER" container inspect -f \
+    '{{range .Config.Env}}{{println .}}{{end}}' "$real_id")
+  real_mode=$(printf '%s\n' "$real_environment" | sed -n 's/^NEXUS_LAB_MODE=//p' | tail -n1)
+  case "$real_mode" in source|packed) ;; *) echo "invalid real lab mode: $real_mode" >&2; exit 1 ;; esac
+  real_mounts=$("$REAL_DOCKER" container inspect -f \
+    '{{range .Mounts}}{{println .Source "|" .Destination}}{{end}}' "$real_id")
+  nexus_state=$(realpath -m "$HOME/.nexus")
+  lens_state=$(realpath -m "$HOME/.local/share/egregore-lens")
+  while IFS='|' read -r mount_source mount_destination; do
+    [ -n "${mount_source:-}" ] || continue
+    mount_source=$(realpath -m "$mount_source")
+    case "$mount_source/" in
+      "$nexus_state/"*|"$lens_state/"*)
+        echo "real lab mounts host runtime state: $mount_source" >&2
+        exit 1
+        ;;
+    esac
+    case "$nexus_state/" in
+      "$mount_source/"*)
+        echo "real lab mount contains host Nexus runtime state: $mount_source" >&2
+        exit 1
+        ;;
+    esac
+    case "$lens_state/" in
+      "$mount_source/"*)
+        echo "real lab mount contains host Lens runtime state: $mount_source" >&2
+        exit 1
+        ;;
+    esac
+    if [ "$mount_destination" = "$HOME/.nexus" ]; then
+      echo 'real lab mounts host Nexus runtime state at its native destination' >&2
+      exit 1
+    fi
+  done <<<"$real_mounts"
+  real_topology=$("$REAL_DOCKER" exec "$real_id" bash -c '
+    set -euo pipefail
+    for path in /tmp/nexus-lab-bin/nexus /tmp/nexus-lab-bin/nexus-gateway /tmp/nexus-lab-bin/nexus-webui; do
+      target=$(readlink "$path")
+      resolved=$(readlink -f "$path")
+      hash=$(sha256sum "$resolved" | awk "{print \$1}")
+      printf "%s|%s|%s|%s\n" "$path" "$target" "$resolved" "$hash"
+    done')
+  test "$(printf '%s\n' "$real_topology" | wc -l)" -eq 3
+  printf '%s\n' "$real_topology" | awk -F'|' '
+    NF != 4 || length($4) != 64 || $4 !~ /^[0-9a-f]+$/ { exit 1 }
+  '
+  if [ "$real_mode" = source ]; then
+    printf '%s\n' "$real_topology" | grep -Fq \
+      '/tmp/nexus-lab-bin/nexus|/tmp/nexus-target/debug/nexus|/tmp/nexus-target/debug/nexus|'
+    printf '%s\n' "$real_topology" | grep -Fq \
+      '/tmp/nexus-lab-bin/nexus-gateway|/work/egregore-nexus/gateway/scripts/nexus-gateway.mjs|'
+    printf '%s\n' "$real_topology" | grep -Fq \
+      '/tmp/nexus-lab-bin/nexus-webui|/work/egregore-nexus/gateway/webconsole/bin/nexus-webui.mjs|'
+  else
+    printf '%s\n' "$real_topology" | grep -Fq \
+      '/tmp/nexus-lab-bin/nexus|/tmp/nexus-lab-install.'
+    printf '%s\n' "$real_topology" | grep -Fq \
+      '/tmp/nexus-lab-bin/nexus-gateway|/tmp/nexus-lab-install.'
+    printf '%s\n' "$real_topology" | grep -Fq \
+      '/tmp/nexus-lab-bin/nexus-webui|/tmp/nexus-lab-install.'
+  fi
+  printf 'real Docker lab HostConfig/topology: ok (%s %s)\n' "$real_name" "$real_mode"
+fi
+
+bash -n "$TARGET"
+grep -Fq "xvfb" "$SCRIPT_DIR/../tools/docker/nexus-test.Dockerfile"
+grep -Fq "python3-venv" "$SCRIPT_DIR/../tools/docker/nexus-test.Dockerfile"
+printf 'nexus Docker lab lifecycle contract: ok\n'

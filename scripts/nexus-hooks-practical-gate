@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
+import secrets
 import shutil
 import signal
 import socket
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -28,6 +32,30 @@ INSIDE_HOME = Path("/tmp/nexus-hooks-gate")
 INSIDE_HOME_ASSIGNMENT = "NEXUS_HOME=/tmp/nexus-hooks-gate"
 INSIDE_GATEWAY_PORT = 4195
 NEXUS_BIN = Path("/tmp/nexus-target/debug/nexus")
+PACKED_NEXUS_BIN = Path("/tmp/nexus-lab-bin/nexus")
+PACKED_GATEWAY_BIN = Path("/tmp/nexus-lab-bin/nexus-gateway")
+PACKED_CANDIDATE_VERIFIER = Path("/tmp/nexus-lab-bin/nexus-v015-ws-acceptance")
+SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+F2_ARTIFACTS = ("shell", "javascript", "python", "timing")
+
+HOOK_SPECS = (
+    ("practical-python-before-send", "before_send", 10, "hook-python.py", "python3"),
+    ("practical-javascript-before-send", "before_send", 20, "hook-javascript.mjs", "node"),
+    ("practical-shell-before-send", "before_send", 30, "hook-shell.sh", "sh"),
+    ("practical-shell-after-receipt", "after_receipt", 40, "hook-shell.sh", "sh"),
+    ("practical-javascript-after-receipt", "after_receipt", 50, "hook-javascript.mjs", "node"),
+    ("practical-python-after-receipt", "after_receipt", 60, "hook-python.py", "python3"),
+)
+
+HOOK_IDS_BY_LANGUAGE = {
+    "shell": {"practical-shell-before-send", "practical-shell-after-receipt"},
+    "javascript": {
+        "practical-javascript-before-send",
+        "practical-javascript-after-receipt",
+    },
+    "python": {"practical-python-before-send", "practical-python-after-receipt"},
+}
 
 SCENARIOS = (
     "direct-daemon-rpc",
@@ -50,6 +78,7 @@ SCENARIOS = (
 
 def usage() -> str:
     return """Usage: scripts/nexus-hooks-practical-gate [--container NAME] [--output PATH]
+       scripts/nexus-hooks-practical-gate --packed-v015 --evidence-dir DIR --run-id ID
 
 Runs the canonical message sources through live before_send and after_receipt hooks in the
 single existing clamped Docker validator. It covers direct daemon RPC, CLI command intent,
@@ -61,6 +90,9 @@ Options:
   --list            List scenario ids without running the gate.
   --container NAME  Sole validation container (default: nexus-v010-load51).
   --output PATH     JSON evidence path under this repository.
+  --packed-v015     Run the manifest/readiness-bound packed F2 gate in the isolated lab.
+  --evidence-dir    Canonical NEXUS_LAB_ROOT/evidence directory for packed F2 evidence.
+  --run-id ID       Exact NEXUS_V015_RUN_ID for packed F2 evidence.
   -h, --help        Show this help without inspecting Docker or changing files.
 """
 
@@ -71,11 +103,131 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--inside", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--packed-v015", action="store_true")
+    parser.add_argument("--evidence-dir", type=Path)
+    parser.add_argument("--run-id")
     parser.add_argument("-h", "--help", action="store_true")
     args, unknown = parser.parse_known_args(argv)
     if unknown:
         raise SystemExit(f"error: unknown argument(s): {' '.join(unknown)}\n{usage()}")
     return args
+
+
+def hook_programs() -> dict[str, str]:
+    return {
+        "hook-python.py": r'''#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import re
+import sys
+
+MARKER = re.compile(
+    r"^GATE\[(?P<source>[a-z0-9-]+)\|"
+    r"(?P<timing>interrupt|yield_turn|after_tool_loop)\]\s*(?P<body>.*)$",
+    re.DOTALL,
+)
+
+invocation = json.load(sys.stdin)
+event = invocation.get("event")
+invocation_id = invocation.get("invocationId")
+if event == "before_send":
+    message = invocation.get("message", {})
+    metadata = message.get("metadata", {}) if isinstance(message, dict) else {}
+    body = message.get("body", "") if isinstance(message, dict) else ""
+    match = MARKER.match(body) if isinstance(body, str) else None
+    if match:
+        source = match.group("source")
+        timing = match.group("timing")
+        clean_body = match.group("body")
+    else:
+        source = metadata.get("gateSource") if isinstance(metadata, dict) else None
+        timing = metadata.get("gateTiming") if isinstance(metadata, dict) else None
+        clean_body = body
+    if not isinstance(source, str) or timing not in {"interrupt", "yield_turn", "after_tool_loop"}:
+        result = {}
+    else:
+        result = {
+            "action": "continue",
+            "message": {"body": f"[hook:{source}] {clean_body}"},
+            "metadata": {
+                "hookGate": {"beforeSend": True, "source": source},
+                "f2Python": {"beforeSend": True, "invocationId": invocation_id},
+            },
+            "timing": timing,
+        }
+elif event == "after_receipt":
+    message_id = invocation.get("receipt", {}).get("messageId")
+    if not isinstance(message_id, str) or not message_id:
+        raise SystemExit("after_receipt requires receipt.messageId")
+    result = {
+        "metadata": {
+            "hookGate": {"afterReceipt": True, "receiptMessageId": message_id},
+            "f2Python": {
+                "afterReceipt": True,
+                "invocationId": invocation_id,
+                "receiptMessageId": message_id,
+            },
+        }
+    }
+else:
+    result = {}
+json.dump(result, sys.stdout, separators=(",", ":"))
+''',
+        "hook-javascript.mjs": r'''#!/usr/bin/env node
+let input = "";
+for await (const chunk of process.stdin) input += chunk;
+const invocation = JSON.parse(input);
+let result = {};
+if (invocation?.event === "before_send") {
+  result = {
+    action: "continue",
+    metadata: {
+      f2Javascript: { beforeSend: true, invocationId: invocation.invocationId },
+    },
+  };
+} else if (invocation?.event === "after_receipt") {
+  const messageId = invocation?.receipt?.messageId;
+  if (typeof messageId !== "string" || messageId.length === 0) {
+    throw new Error("after_receipt requires receipt.messageId");
+  }
+  result = {
+    metadata: {
+      f2Javascript: {
+        afterReceipt: true,
+        invocationId: invocation.invocationId,
+        receiptMessageId: messageId,
+      },
+    },
+  };
+}
+process.stdout.write(JSON.stringify(result));
+''',
+        "hook-shell.sh": r'''#!/bin/sh
+set -eu
+input=$(cat)
+event=$(printf '%s' "$input" | jq -er '.event')
+case "$event" in
+  before_send)
+    printf '%s' "$input" | jq -c '{
+      action:"continue",
+      metadata:{f2Shell:{beforeSend:true,invocationId:.invocationId}}
+    }'
+    ;;
+  after_receipt)
+    printf '%s' "$input" | jq -e '(.receipt.messageId | type == "string") and (.receipt.messageId | length > 0)' >/dev/null
+    printf '%s' "$input" | jq -c '{
+      metadata:{f2Shell:{
+        afterReceipt:true,
+        invocationId:.invocationId,
+        receiptMessageId:.receipt.messageId
+      }}
+    }'
+    ;;
+  *) printf '{}\n' ;;
+esac
+''',
+    }
 
 
 def command(
@@ -198,9 +350,26 @@ class GateFailure(RuntimeError):
 
 
 class LiveGate:
-    def __init__(self, output: Path):
+    def __init__(
+        self,
+        output: Path | None,
+        *,
+        home: Path = INSIDE_HOME,
+        nexus_bin: Path = NEXUS_BIN,
+        gateway_bin: Path = CONTAINER_ROOT / "gateway" / "scripts" / "nexus-gateway.mjs",
+        packed: bool = False,
+        resource_limits: dict[str, Any] | None = None,
+    ):
         self.output = output
-        self.home = INSIDE_HOME
+        self.home = home
+        self.nexus_bin = nexus_bin
+        self.gateway_bin = gateway_bin
+        self.packed = packed
+        self.resource_limits = resource_limits or {
+            "cpus": 2,
+            "memoryGiBMax": 10,
+            "pidsMax": 1024,
+        }
         self.gateway_url = f"http://127.0.0.1:{INSIDE_GATEWAY_PORT}"
         self.daemon: subprocess.Popen[str] | None = None
         self.gateway: subprocess.Popen[str] | None = None
@@ -208,6 +377,8 @@ class LiveGate:
         self.gateway_log: Any = None
         self.message_ids: dict[str, str] = {}
         self.scenario_status = {scenario: "pending" for scenario in SCENARIOS}
+        self.language_artifacts: dict[str, dict[str, Any]] = {}
+        self.timing_artifact: dict[str, Any] = {}
         self.started_at = time.time()
 
     def run(self) -> dict[str, Any]:
@@ -223,9 +394,10 @@ class LiveGate:
             self.verify_outage_modes()
             self.verify_token_stream_isolation()
             report = self.report()
-            self.output.parent.mkdir(parents=True, exist_ok=True)
-            self.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-            print(json.dumps(report, indent=2))
+            if self.output is not None:
+                self.output.parent.mkdir(parents=True, exist_ok=True)
+                self.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+                print(json.dumps(report, indent=2))
             return report
         finally:
             self.cleanup_processes()
@@ -233,56 +405,47 @@ class LiveGate:
     def prepare(self) -> None:
         self.cleanup_stale_home()
         self.home.mkdir(parents=True, mode=0o700)
+        (self.home / "operator-home").mkdir(mode=0o700)
         hooks = self.home / "gateway" / "hooks.d"
         hooks.mkdir(parents=True)
-        before = CONTAINER_ROOT / "core" / "tests" / "fixtures" / "hooks" / "before-send.py"
-        after = CONTAINER_ROOT / "core" / "tests" / "fixtures" / "hooks" / "after-receipt.mjs"
-        shutil.copy2(before, hooks / "before-send.py")
-        shutil.copy2(after, hooks / "after-receipt.mjs")
-        (hooks / "10-before-send.toml").write_text(
-            """version = 1
-id = "practical-before-send"
-event = "before_send"
-order = 10
-timeout_ms = 5000
-on_failure = "reject"
-
-[handler]
-kind = "local"
-entry = "before-send.py"
-entrypoint = "main"
-run = ["python3", "{entry}"]
-""",
-            encoding="utf-8",
-        )
-        (hooks / "20-after-receipt.toml").write_text(
-            """version = 1
-id = "practical-after-receipt"
-event = "after_receipt"
-order = 20
-timeout_ms = 5000
-on_failure = "continue"
-
-[handler]
-kind = "local"
-entry = "after-receipt.mjs"
-entrypoint = "main"
-run = ["node", "{entry}"]
-""",
-            encoding="utf-8",
-        )
+        for name, contents in hook_programs().items():
+            target = hooks / name
+            target.write_text(contents, encoding="utf-8")
+            target.chmod(0o500)
+        for hook_id, event, order, entry, runtime in HOOK_SPECS:
+            (hooks / f"{order:02d}-{hook_id}.toml").write_text(
+                "\n".join(
+                    (
+                        "version = 1",
+                        f'id = "{hook_id}"',
+                        f'event = "{event}"',
+                        f"order = {order}",
+                        "timeout_ms = 5000",
+                        f'on_failure = "{"reject" if event == "before_send" else "continue"}"',
+                        "",
+                        "[handler]",
+                        'kind = "local"',
+                        f'entry = "{entry}"',
+                        'entrypoint = "main"',
+                        f'run = ["{runtime}", "{{entry}}"]',
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
 
     def base_env(self, mode: str | None = None) -> dict[str, str]:
         env = os.environ.copy()
         env.update(
             {
                 "NEXUS_HOME": str(self.home),
+                "HOME": str(self.home / "operator-home"),
                 "NEXUS_DB_PATH": str(self.home / "nexus.db"),
                 "NEXUS_GATEWAY_DB": f"file:{self.home / 'gateway.db'}",
-                "NEXUS_STREAM_DB_PATH": "/dev/shm/nexus-hooks-gate-stream.db",
+                "NEXUS_STREAM_DB_PATH": str(self.home / "stream.db"),
                 "NEXUS_GATEWAY_BIND": "127.0.0.1",
                 "NEXUS_GATEWAY_PORT": str(INSIDE_GATEWAY_PORT),
-                "NEXUS_GATEWAY_BIN": str(CONTAINER_ROOT / "gateway" / "scripts" / "nexus-gateway.mjs"),
+                "NEXUS_GATEWAY_BIN": str(self.gateway_bin),
                 "NEXUS_WEB_AUTH_MODE": "local",
                 "RUST_MIN_STACK": "33554432",
             }
@@ -298,7 +461,7 @@ run = ["node", "{entry}"]
             raise GateFailure("isolated daemon is already running")
         self.daemon_log = open(self.home / "daemon.log", "a", encoding="utf-8")
         self.daemon = subprocess.Popen(
-            [str(NEXUS_BIN), "daemon"],
+            [str(self.nexus_bin), "daemon"],
             env=self.base_env(mode),
             stdin=subprocess.DEVNULL,
             stdout=self.daemon_log,
@@ -325,13 +488,13 @@ run = ["node", "{entry}"]
         if self.gateway and self.gateway.poll() is None:
             raise GateFailure("isolated Gateway is already running")
         self.gateway_log = open(self.home / "gateway.log", "a", encoding="utf-8")
+        gateway_command = (
+            [str(self.gateway_bin)]
+            if self.packed
+            else ["node", str(self.gateway_bin)]
+        )
         self.gateway = subprocess.Popen(
-            [
-                "node",
-                str(CONTAINER_ROOT / "gateway" / "scripts" / "nexus-gateway.mjs"),
-                "--api-only",
-                "--discovery=write",
-            ],
+            [*gateway_command, "--api-only", "--discovery=write"],
             env=self.base_env(),
             stdin=subprocess.DEVNULL,
             stdout=self.gateway_log,
@@ -342,7 +505,8 @@ run = ["node", "{entry}"]
         self.wait_until(self.gateway_healthy, 30, "Gateway health")
         hooks = self.http_json("GET", "/api/v1/hooks")
         ids = {hook["id"] for hook in hooks.get("hooks", [])}
-        if ids != {"practical-before-send", "practical-after-receipt"}:
+        expected_ids = {spec[0] for spec in HOOK_SPECS}
+        if ids != expected_ids:
             raise GateFailure(f"unexpected active hooks: {sorted(ids)}")
 
     def stop_gateway(self) -> None:
@@ -522,11 +686,22 @@ run = ["node", "{entry}"]
                     raise GateFailure(f"before_send metadata missing for {source}: {metadata}")
                 if gate.get("afterReceipt") is not True or gate.get("receiptMessageId") != message_id:
                     raise GateFailure(f"after_receipt metadata missing for {source}: {metadata}")
+                for language, metadata_key in (
+                    ("shell", "f2Shell"),
+                    ("javascript", "f2Javascript"),
+                    ("python", "f2Python"),
+                ):
+                    proof = metadata.get(metadata_key, {})
+                    if (
+                        proof.get("beforeSend") is not True
+                        or proof.get("afterReceipt") is not True
+                        or proof.get("receiptMessageId") != message_id
+                    ):
+                        raise GateFailure(
+                            f"{language} before_send/after_receipt proof missing for {source}: {proof}"
+                        )
                 executions = metadata.get("_nexus", {}).get("hooks", {}).get("executedBy", [])
-                if {item.get("hookId") for item in executions} != {
-                    "practical-before-send",
-                    "practical-after-receipt",
-                }:
+                if {item.get("hookId") for item in executions} != {spec[0] for spec in HOOK_SPECS}:
                     raise GateFailure(f"signed provenance missing for {source}: {executions}")
                 timings = {
                     row.get("delivery_timing")
@@ -540,10 +715,48 @@ run = ["node", "{entry}"]
         self.scenario_status["timing-yield-turn"] = "pass"
         self.scenario_status["timing-after-tool-loop"] = "pass"
         audit = self.http_json("GET", "/api/v1/hooks/audit?limit=100")
-        if not audit.get("executions") or not all(
-            item.get("verified") is True for item in audit["executions"]
+        audit_rows = audit.get("executions")
+        if not isinstance(audit_rows, list) or not audit_rows or not all(
+            isinstance(item, dict) and item.get("verified") is True for item in audit_rows
         ):
             raise GateFailure("hook audit contains an unverifiable execution")
+        for language, hook_ids in HOOK_IDS_BY_LANGUAGE.items():
+            language_rows = [row for row in audit_rows if row.get("hookId") in hook_ids]
+            expected_count = len(self.message_ids) * len(hook_ids)
+            if (
+                len(language_rows) != expected_count
+                or {row.get("hookId") for row in language_rows} != hook_ids
+                or {row.get("event") for row in language_rows} != {"before_send", "after_receipt"}
+                or any(row.get("outcome") != "completed" for row in language_rows)
+            ):
+                raise GateFailure(
+                    f"{language} hook audit is incomplete: expected {expected_count}, "
+                    f"observed {len(language_rows)}"
+                )
+            self.language_artifacts[language] = {
+                "schemaVersion": 1,
+                "language": language,
+                "handlerIds": sorted(hook_ids),
+                "events": ["before_send", "after_receipt"],
+                "executionCount": len(language_rows),
+                "executions": language_rows,
+            }
+        timing_rows = [
+            row
+            for row in delivery_outcomes
+            if row.get("message_id") in set(self.message_ids.values())
+        ]
+        if not timing_rows:
+            raise GateFailure("delivery timing evidence is empty")
+        self.timing_artifact = {
+            "schemaVersion": 1,
+            "expectedBySource": expected_timing,
+            "messageIds": self.message_ids.copy(),
+            "deliveryOutcomes": sorted(
+                timing_rows,
+                key=lambda row: json.dumps(row, sort_keys=True, separators=(",", ":")),
+            ),
+        }
         public_key = self.http_json("GET", "/api/v1/hooks/public-key")
         if public_key.get("algorithm") != "ed25519" or "BEGIN PUBLIC KEY" not in public_key.get(
             "publicKey", ""
@@ -571,7 +784,7 @@ run = ["node", "{entry}"]
                 "(SELECT evaluation_id FROM hook_pipeline_evaluations WHERE message_id = ?)",
                 (message_id,),
             ).fetchone()[0]
-        if (evaluations, executions) != (1, 1):
+        if (evaluations, executions) != (2, 6):
             raise GateFailure(
                 f"idempotent retry duplicated hook work: evaluations={evaluations}, executions={executions}"
             )
@@ -648,11 +861,12 @@ run = ["node", "{entry}"]
             }
         if not events or not events.issubset({"before_send", "after_receipt"}):
             raise GateFailure(f"non-message event entered hook pipeline: {sorted(events)}")
-        service_source = (
-            CONTAINER_ROOT / "gateway" / "src" / "server" / "hooks" / "service.ts"
-        ).read_text(encoding="utf-8")
-        if 'new Set(["before_send", "after_receipt"])' not in service_source:
-            raise GateFailure("hook service event allowlist no longer excludes token streams")
+        if not self.packed:
+            service_source = (
+                CONTAINER_ROOT / "gateway" / "src" / "server" / "hooks" / "service.ts"
+            ).read_text(encoding="utf-8")
+            if 'new Set(["before_send", "after_receipt"])' not in service_source:
+                raise GateFailure("hook service event allowlist no longer excludes token streams")
         self.scenario_status["token-stream-isolation"] = "pass"
 
     def report(self) -> dict[str, Any]:
@@ -671,7 +885,7 @@ run = ["node", "{entry}"]
             "status": "pass",
             "durationSeconds": round(time.time() - self.started_at, 3),
             "nexusHome": str(self.home),
-            "resourceLimits": {"cpus": 2, "memoryGiBMax": 10, "pidsMax": 1024},
+            "resourceLimits": self.resource_limits,
             "messages": self.message_ids,
             "completedHookExecutions": execution_count,
             "completedReceipts": receipt_count,
@@ -683,7 +897,7 @@ run = ["node", "{entry}"]
     def cli(
         self, args: list[str], *, env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
-        result = command([str(NEXUS_BIN), *args], env=env or self.base_env(), check=False)
+        result = command([str(self.nexus_bin), *args], env=env or self.base_env(), check=False)
         if result.returncode != 0:
             raise GateFailure(
                 f"nexus {' '.join(args)} failed rc={result.returncode}: "
@@ -890,7 +1104,225 @@ run = ["node", "{entry}"]
                 except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
                     pass
             shutil.rmtree(self.home)
-        Path("/dev/shm/nexus-hooks-gate-stream.db").unlink(missing_ok=True)
+
+
+def verify_packed_candidate(evidence_dir: Path, run_id: str) -> dict[str, Any]:
+    result = command(
+        [
+            str(PACKED_CANDIDATE_VERIFIER),
+            "--mode",
+            "packed",
+            "--evidence-dir",
+            str(evidence_dir),
+            "--run-id",
+            run_id,
+            "--verify-candidate-only",
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise GateFailure(
+            "packed candidate verification failed: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    try:
+        document = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise GateFailure("packed candidate verifier emitted invalid JSON") from error
+    expected_limits = {"cpus": 6, "memoryBytes": 8589934592, "pids": 1024}
+    runtime = document.get("runtime")
+    if (
+        document.get("schemaVersion") != 1
+        or document.get("status") != "PASS"
+        or document.get("mode") != "packed"
+        or document.get("runId") != run_id
+        or SHA256.fullmatch(str(document.get("candidateDigest", ""))) is None
+        or SHA256.fullmatch(str(document.get("readinessSha256", ""))) is None
+        or document.get("limits") != expected_limits
+        or not isinstance(runtime, dict)
+        or not isinstance(runtime.get("daemonExecutable"), str)
+        or not isinstance(runtime.get("gatewayEntrypoint"), str)
+    ):
+        raise GateFailure("packed candidate verifier returned an incomplete F2 binding")
+    return document
+
+
+def canonical_json(value: object) -> bytes:
+    return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write_new(path: Path, payload: bytes) -> tuple[int, int, str]:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.is_symlink() or path.exists():
+        raise GateFailure(f"refusing to replace existing F2 evidence: {path}")
+    temporary = path.parent / f".{path.name}.{os.getpid()}.{secrets.token_hex(12)}.tmp"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    linked = False
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise GateFailure(f"short write while publishing F2 evidence: {path}")
+            view = view[written:]
+        os.fchmod(descriptor, 0o400)
+        os.fsync(descriptor)
+        written_stat = os.fstat(descriptor)
+        os.link(temporary, path, follow_symlinks=False)
+        linked = True
+        fsync_directory(path.parent)
+        visible = path.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(visible.st_mode)
+            or (visible.st_dev, visible.st_ino, visible.st_size)
+            != (written_stat.st_dev, written_stat.st_ino, written_stat.st_size)
+            or stat.S_IMODE(visible.st_mode) != 0o400
+        ):
+            raise GateFailure(f"published F2 evidence changed identity: {path}")
+        digest = hashlib.sha256(payload).hexdigest()
+        return visible.st_dev, visible.st_ino, digest
+    except FileExistsError as error:
+        raise GateFailure(f"refusing to replace existing F2 evidence: {path}") from error
+    except BaseException:
+        if linked:
+            try:
+                path.unlink()
+                fsync_directory(path.parent)
+            except OSError:
+                pass
+        raise
+    finally:
+        os.close(descriptor)
+        try:
+            temporary.unlink()
+            fsync_directory(temporary.parent)
+        except FileNotFoundError:
+            pass
+
+
+def publish_f2_result(
+    run_root: Path,
+    candidate: dict[str, Any],
+    report: dict[str, Any],
+    artifact_documents: dict[str, dict[str, Any]],
+) -> Path:
+    if set(artifact_documents) != set(F2_ARTIFACTS):
+        raise GateFailure("F2 artifact set must be exactly shell, javascript, python, timing")
+    result_dir = run_root / "results" / "F2-message-hooks"
+    targets = {name: result_dir / f"{name}.json" for name in F2_ARTIFACTS}
+    result_path = result_dir / "result.json"
+    if any(path.exists() or path.is_symlink() for path in (*targets.values(), result_path)):
+        raise GateFailure("canonical F2 evidence already exists")
+    published: list[tuple[Path, int, int]] = []
+    records: dict[str, dict[str, str]] = {}
+    try:
+        for name in F2_ARTIFACTS:
+            document = {
+                **artifact_documents[name],
+                "runId": candidate["runId"],
+                "candidateDigest": candidate["candidateDigest"],
+                "readinessSha256": candidate["readinessSha256"],
+            }
+            payload = canonical_json(document)
+            device, inode, digest = atomic_write_new(targets[name], payload)
+            published.append((targets[name], device, inode))
+            records[name] = {
+                "path": targets[name].relative_to(run_root).as_posix(),
+                "sha256": digest,
+            }
+        result = {
+            "schemaVersion": 1,
+            "gate": "F2",
+            "runId": candidate["runId"],
+            "candidateDigest": candidate["candidateDigest"],
+            "status": "PASS",
+            "error": None,
+            "partial": False,
+            "flaky": False,
+            "skipped": False,
+            "refused": False,
+            "failureCount": 0,
+            "requiredArtifacts": list(F2_ARTIFACTS),
+            "artifacts": records,
+            "summary": report,
+        }
+        device, inode, _digest = atomic_write_new(result_path, canonical_json(result))
+        published.append((result_path, device, inode))
+        return result_path
+    except BaseException:
+        for path, device, inode in reversed(published):
+            try:
+                visible = path.stat(follow_symlinks=False)
+                if (visible.st_dev, visible.st_ino) == (device, inode):
+                    path.unlink()
+                    fsync_directory(path.parent)
+            except FileNotFoundError:
+                pass
+        raise
+
+
+def packed_main(args: argparse.Namespace) -> int:
+    if os.environ.get("OCULAR_LAB") != "1" or os.environ.get("NEXUS_LAB_MODE") != "packed":
+        raise GateFailure("packed F2 requires OCULAR_LAB=1 and NEXUS_LAB_MODE=packed")
+    lab_root_raw = os.environ.get("NEXUS_LAB_ROOT")
+    env_run_id = os.environ.get("NEXUS_V015_RUN_ID", "")
+    run_id = args.run_id or env_run_id
+    if not lab_root_raw or SAFE_RUN_ID.fullmatch(run_id or "") is None or run_id != env_run_id:
+        raise GateFailure("packed F2 requires the exact safe NEXUS_V015_RUN_ID")
+    lab_root = Path(os.path.abspath(lab_root_raw))
+    evidence_dir = Path(os.path.abspath(args.evidence_dir or ""))
+    if evidence_dir != lab_root / "evidence":
+        raise GateFailure("--evidence-dir must be exactly NEXUS_LAB_ROOT/evidence")
+    run_root = evidence_dir / run_id
+    if not run_root.is_dir():
+        raise GateFailure(f"packed candidate run root is missing: {run_root}")
+    result_dir = run_root / "results" / "F2-message-hooks"
+    result_targets = [result_dir / f"{name}.json" for name in F2_ARTIFACTS]
+    result_targets.append(result_dir / "result.json")
+    if any(path.exists() or path.is_symlink() for path in result_targets):
+        raise GateFailure("canonical F2 evidence already exists")
+    before = verify_packed_candidate(evidence_dir, run_id)
+    expected_readiness = lab_root / "lab" / "candidate-ready.v1"
+    if Path(before["readinessPath"]) != expected_readiness:
+        raise GateFailure("packed candidate readiness path is not canonical")
+    home = lab_root / "lab" / f"f2-message-hooks-{run_id}"
+    gate = LiveGate(
+        None,
+        home=home,
+        nexus_bin=PACKED_NEXUS_BIN,
+        gateway_bin=PACKED_GATEWAY_BIN,
+        packed=True,
+        resource_limits=before["limits"],
+    )
+    try:
+        report = gate.run()
+        after = verify_packed_candidate(evidence_dir, run_id)
+        if after != before:
+            raise GateFailure("packed candidate/readiness/runtime changed during F2")
+        artifact_documents = {
+            **gate.language_artifacts,
+            "timing": gate.timing_artifact,
+        }
+        result = publish_f2_result(run_root, before, report, artifact_documents)
+    finally:
+        gate.cleanup_stale_home()
+    print(
+        f"PASS F2 packed message hooks: run={run_id} "
+        f"candidate={before['candidateDigest']} result={result}"
+    )
+    return 0
 
 
 def required_message_id(value: dict[str, Any]) -> str:
@@ -920,6 +1352,12 @@ def main(argv: list[str]) -> int:
     if args.list:
         print("\n".join(SCENARIOS))
         return 0
+    if args.packed_v015:
+        if args.inside or args.evidence_dir is None:
+            raise GateFailure("--packed-v015 requires --evidence-dir and cannot use --inside")
+        return packed_main(args)
+    if args.evidence_dir is not None or args.run_id is not None:
+        raise GateFailure("--evidence-dir/--run-id require --packed-v015")
     if args.inside:
         LiveGate(args.output).run()
         return 0

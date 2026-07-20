@@ -4,17 +4,27 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$SCRIPT_DIR/.." && pwd)
 IMAGE="${NEXUS_DOCKER_TEST_IMAGE:-egregore-nexus-test:local}"
-NAME="${NEXUS_DOCKER_TEST_NAME:-nexus-test}"
-HOST_PORT="${NEXUS_DOCKER_TEST_PORT:-4510}"
-CPUS="${NEXUS_DOCKER_TEST_CPUS:-2}"
-MEMORY="${NEXUS_DOCKER_TEST_MEMORY:-10g}"
+NAME="${NEXUS_DOCKER_TEST_NAME:-nexus-v010-load51}"
+HOST_PORT="${NEXUS_DOCKER_TEST_PORT:-4551}"
+CDP_HOST_PORT="${NEXUS_DOCKER_TEST_CDP_PORT:-4553}"
+WEBUI_CDP_HOST_PORT="${NEXUS_DOCKER_TEST_WEBUI_CDP_PORT:-4554}"
+CPUS="${NEXUS_DOCKER_TEST_CPUS:-6}"
+MEMORY="${NEXUS_DOCKER_TEST_MEMORY:-8g}"
 PIDS_LIMIT="${NEXUS_DOCKER_TEST_PIDS_LIMIT:-1024}"
 CLAUDE_MODEL="${NEXUS_DOCKER_TEST_CLAUDE_MODEL:-claude-sonnet-5}"
 HOST_UID=$(id -u)
 HOST_GID=$(id -g)
+HOST_NEXUS_HOME="${NEXUS_DOCKER_TEST_HOST_NEXUS_HOME:-$HOME/.nexus}"
 CONTAINER_PORT="${NEXUS_DOCKER_TEST_CONTAINER_PORT:-4100}"
 GATEWAY_INTERNAL_PORT="${NEXUS_DOCKER_TEST_GATEWAY_INTERNAL_PORT:-4101}"
 NEXUS_BIN=/tmp/nexus-target/debug/nexus
+LENS_REPO="${NEXUS_DOCKER_TEST_LENS_REPO:-$HOME/Projects/egregore-lens}"
+EGREGORE_REPO="${NEXUS_DOCKER_TEST_EGREGORE_REPO:-$HOME/Projects/egregore-v2}"
+PACTREE_REPO="${NEXUS_DOCKER_TEST_PACTREE_REPO:-}"
+PACTREE_PY_REPO="${NEXUS_DOCKER_TEST_PACTREE_PY_REPO:-}"
+PACTREE_FS_REPO="${NEXUS_DOCKER_TEST_PACTREE_FS_REPO:-$HOME/Projects/pactree-fs}"
+LAB_ROOT=/tmp/nexus-lens-home
+V015_RUN_ID="${NEXUS_V015_RUN_ID:-}"
 
 usage() {
   cat <<'USAGE'
@@ -30,15 +40,29 @@ Commands:
   smoke          Run a small isolated CLI/API write/read smoke.
   locks          Assert Gateway owns its DB and has zero identity DB FDs/POSIX locks.
   logs           Tail the isolated daemon log.
+  lab-up --mode MODE
+                 Recreate the sole validator as the 6-CPU Nexus + Lens lab.
+  lab-status --mode MODE
+                 Report daemon, Gateway, Xvfb, Lens, and both CDP endpoints.
+  lab-readiness --mode MODE
+                 Verify an existing lab against its create-once readiness receipt.
+  lab-gate --mode MODE [--soak 1800]
+                 Run backend, Lens ocular, WebUI ocular, or all isolated gates.
+                 --soak 1800 adds the packed-only release restart soak.
+  lab-evidence --mode MODE
+                 Print the current container evidence directory and manifest.
+  lab-down --mode MODE
+                 Stop and remove the sole isolated lab container.
   down           Stop and remove the isolated container.
   clean          Remove stopped nexus-test containers.
 
 Environment:
-  NEXUS_DOCKER_TEST_NAME       Container name, default: nexus-test
-  NEXUS_DOCKER_TEST_PORT       Host gateway port, default: 4510
+  NEXUS_DOCKER_TEST_NAME       Container name, default: nexus-v010-load51
+  NEXUS_DOCKER_TEST_PORT       Host gateway port, default: 4551
+  NEXUS_DOCKER_TEST_CDP_PORT   Host Lens CDP port, default: 4553
   NEXUS_DOCKER_TEST_IMAGE      Image tag, default: egregore-nexus-test:local
-  NEXUS_DOCKER_TEST_CPUS       CPU quota for builds and gates, default: 2
-  NEXUS_DOCKER_TEST_MEMORY     Memory and memory+swap limit, default: 10g
+  NEXUS_DOCKER_TEST_CPUS       CPU quota for builds and gates, default: 6
+  NEXUS_DOCKER_TEST_MEMORY     Memory and memory+swap limit, default: 8g
   NEXUS_DOCKER_TEST_PIDS_LIMIT Process limit, default: 1024
   NEXUS_DOCKER_TEST_CLAUDE_MODEL Exact Claude model, default: claude-sonnet-5
 The container uses isolated /tmp Nexus state and never mounts ~/.nexus.
@@ -57,78 +81,170 @@ dockerfile() {
   printf '%s\n' "$REPO/tools/docker/nexus-test.Dockerfile"
 }
 
+CONTAINER_PRESENT=0
+CONTAINER_ID=""
+CONTAINER_RUNNING=false
+CONTAINER_KIND=""
+CONTAINER_MODE_LABEL=""
+CONTAINER_MODE_ENV=""
+ACTIVE_CONTAINER_ID=""
+LOOKUP_CONTAINER_ID=""
+
+lookup_named_container_id() {
+  local output ids=()
+  LOOKUP_CONTAINER_ID=""
+  if ! output=$(docker ps -a --no-trunc \
+    --filter "name=^/${NAME}$" --format '{{.ID}}'); then
+    die "Docker container listing failed for $NAME"
+  fi
+  while IFS= read -r id; do
+    [ -n "$id" ] && ids+=("$id")
+  done <<<"$output"
+  [ "${#ids[@]}" -le 1 ] || die "Docker returned multiple containers for exact name $NAME"
+  if [ "${#ids[@]}" -eq 0 ]; then
+    return 1
+  fi
+  LOOKUP_CONTAINER_ID=${ids[0]}
+  return 0
+}
+
+inspect_container_identity() {
+  local id=$1 metadata observed_id test_label lens_label environment
+  if ! metadata=$(docker container inspect -f \
+    '{{.Id}} {{.State.Running}} {{if eq (index .Config.Labels "egregore-nexus-test") "true"}}true{{else}}false{{end}} {{if eq (index .Config.Labels "egregore-nexus-lens-lab") "true"}}true{{else}}false{{end}} {{with index .Config.Labels "egregore-nexus-lab-mode"}}{{.}}{{end}}' \
+    "$id"); then
+    die "Docker container inspect failed for immutable ID $id"
+  fi
+  read -r observed_id CONTAINER_RUNNING test_label lens_label CONTAINER_MODE_LABEL extra <<<"$metadata"
+  [ -z "${extra:-}" ] && [ "$observed_id" = "$id" ] \
+    || die "Docker inspect identity mismatch for $id: ${metadata:-missing}"
+  case "$test_label:$lens_label" in
+    true:true) CONTAINER_KIND=lens ;;
+    true:false) CONTAINER_KIND=normal ;;
+    *) CONTAINER_KIND=foreign ;;
+  esac
+  if ! environment=$(docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$id"); then
+    die "Docker container environment inspect failed for immutable ID $id"
+  fi
+  CONTAINER_MODE_ENV=$(printf '%s\n' "$environment" \
+    | sed -n 's/^NEXUS_LAB_MODE=//p' | tail -n 1)
+}
+
+refresh_named_container() {
+  local id
+  CONTAINER_PRESENT=0
+  CONTAINER_ID=""
+  CONTAINER_RUNNING=false
+  CONTAINER_KIND=""
+  CONTAINER_MODE_LABEL=""
+  CONTAINER_MODE_ENV=""
+  ACTIVE_CONTAINER_ID=""
+  if ! lookup_named_container_id; then
+    return 1
+  fi
+  id=$LOOKUP_CONTAINER_ID
+  inspect_container_identity "$id"
+  CONTAINER_PRESENT=1
+  CONTAINER_ID=$id
+  ACTIVE_CONTAINER_ID=$id
+  return 0
+}
+
 container_exists() {
-  docker container inspect "$NAME" >/dev/null 2>&1
+  refresh_named_container
 }
 
 container_running() {
-  [ "$(docker container inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = "true" ]
+  refresh_named_container && [ "$CONTAINER_RUNNING" = true ]
+}
+
+require_container_kind() {
+  local expected=$1
+  [ "$CONTAINER_PRESENT" -eq 1 ] || die "container $NAME does not exist"
+  [ "$CONTAINER_KIND" = "$expected" ] \
+    || die "container $NAME has ownership kind ${CONTAINER_KIND:-unknown}; expected $expected"
+}
+
+require_named_container_id() {
+  local expected=$1
+  refresh_named_container || die "container $NAME disappeared; expected immutable ID $expected"
+  [ "$CONTAINER_ID" = "$expected" ] \
+    || die "container ID changed for $NAME: expected $expected, observed $CONTAINER_ID"
+}
+
+inspect_current_format() {
+  local format=$1 output
+  [ "$CONTAINER_PRESENT" -eq 1 ] || die "container $NAME does not exist"
+  if ! output=$(docker container inspect -f "$format" "$CONTAINER_ID"); then
+    die "Docker container inspect failed for immutable ID $CONTAINER_ID"
+  fi
+  printf '%s\n' "$output"
 }
 
 container_real_harnesses() {
-  [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-real-harnesses" }}' "$NAME" 2>/dev/null || true)" = "true" ]
+  [ "$(inspect_current_format '{{ index .Config.Labels "egregore-nexus-real-harnesses" }}')" = "true" ]
 }
 
 container_uses_tmpfs_stream_db() {
-  docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+  inspect_current_format '{{range .Config.Env}}{{println .}}{{end}}' \
     | grep -qx 'NEXUS_STREAM_DB_PATH=/dev/shm/nexus-stream.db'
 }
 
 container_uses_internal_gateway_port() {
-  docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+  inspect_current_format '{{range .Config.Env}}{{println .}}{{end}}' \
     | grep -qx "NEXUS_GATEWAY_PORT=$GATEWAY_INTERNAL_PORT"
 }
 
 container_uses_in_tree_gateway() {
-  docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+  inspect_current_format '{{range .Config.Env}}{{println .}}{{end}}' \
     | grep -qx 'NEXUS_GATEWAY_BIN=/work/egregore-nexus/gateway/scripts/nexus-gateway.mjs'
 }
 
 container_uses_split_stores() {
-  docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+  inspect_current_format '{{range .Config.Env}}{{println .}}{{end}}' \
     | grep -qx 'NEXUS_DB_PATH=/tmp/nexus-home/nexus.db' \
-    && docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+    && inspect_current_format '{{range .Config.Env}}{{println .}}{{end}}' \
       | grep -qx 'NEXUS_GATEWAY_DB=file:/tmp/nexus-home/gateway.db' \
-    && ! docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+    && ! inspect_current_format '{{range .Config.Env}}{{println .}}{{end}}' \
       | grep -q '^NEXUS_DB_URL='
 }
 
 container_uses_debug_stack() {
-  docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+  inspect_current_format '{{range .Config.Env}}{{println .}}{{end}}' \
     | grep -qx 'RUST_MIN_STACK=33554432'
 }
 
 container_uses_resource_limits() {
-  [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-test-cpus" }}' "$NAME" 2>/dev/null || true)" = "$CPUS" ] \
-    && [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-test-memory" }}' "$NAME" 2>/dev/null || true)" = "$MEMORY" ] \
-    && [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-test-pids-limit" }}' "$NAME" 2>/dev/null || true)" = "$PIDS_LIMIT" ]
+  [ "$(inspect_current_format '{{ index .Config.Labels "egregore-nexus-test-cpus" }}')" = "$CPUS" ] \
+    && [ "$(inspect_current_format '{{ index .Config.Labels "egregore-nexus-test-memory" }}')" = "$MEMORY" ] \
+    && [ "$(inspect_current_format '{{ index .Config.Labels "egregore-nexus-test-pids-limit" }}')" = "$PIDS_LIMIT" ]
 }
 
 container_uses_init_reaper() {
-  [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-test-init" }}' "$NAME" 2>/dev/null || true)" = "true" ]
+  [ "$(inspect_current_format '{{ index .Config.Labels "egregore-nexus-test-init" }}')" = "true" ]
 }
 
 container_uses_host_user() {
-  [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-test-user" }}' "$NAME" 2>/dev/null || true)" = "$HOST_UID:$HOST_GID" ]
+  [ "$(inspect_current_format '{{ index .Config.Labels "egregore-nexus-test-user" }}')" = "$HOST_UID:$HOST_GID" ]
 }
 
 container_mounts_host_bun() {
   [ ! -d "$HOME/.bun" ] && return 0
-  docker container inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$NAME" 2>/dev/null \
+  inspect_current_format '{{range .Mounts}}{{println .Destination}}{{end}}' \
     | grep -qx "$HOME/.bun" \
-    && docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+    && inspect_current_format '{{range .Config.Env}}{{println .}}{{end}}' \
       | grep -q "^PATH=.*$HOME/.bun/bin"
 }
 
 container_mounts_host_hermes() {
   [ ! -d "$HOME/.hermes" ] && return 0
-  docker container inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$NAME" 2>/dev/null \
+  inspect_current_format '{{range .Mounts}}{{println .Destination}}{{end}}' \
     | grep -qx "$HOME/.hermes"
 }
 
 container_mounts_host_uv_python() {
   [ ! -d "$HOME/.local/share/uv" ] && return 0
-  docker container inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$NAME" 2>/dev/null \
+  inspect_current_format '{{range .Mounts}}{{println .Destination}}{{end}}' \
     | grep -qx "$HOME/.local/share/uv"
 }
 
@@ -137,23 +253,31 @@ build_image() {
 }
 
 ensure_image() {
-  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  local images
+  if ! images=$(docker image ls --no-trunc --filter "reference=$IMAGE" --format '{{.ID}}'); then
+    die "Docker image listing failed for $IMAGE"
+  fi
+  if [ -z "$images" ]; then
     build_image
   fi
 }
 
 exec_bash() {
-  docker exec "$NAME" bash -c "$*"
+  local environment=()
+  [ -z "$V015_RUN_ID" ] || environment+=( -e "NEXUS_V015_RUN_ID=$V015_RUN_ID" )
+  docker exec "${environment[@]}" "${ACTIVE_CONTAINER_ID:-$NAME}" bash -c "$*"
 }
 
 exec_interactive() {
-  local tty_flags=()
+  local tty_flags=() environment=()
   if [ -t 0 ] && [ -t 1 ]; then
     tty_flags=(-it)
   else
     tty_flags=(-i)
   fi
-  docker exec "${tty_flags[@]}" -w /work/egregore-nexus "$NAME" "$@"
+  [ -z "$V015_RUN_ID" ] || environment+=( -e "NEXUS_V015_RUN_ID=$V015_RUN_ID" )
+  docker exec "${tty_flags[@]}" -w /work/egregore-nexus \
+    "${environment[@]}" "${ACTIVE_CONTAINER_ID:-$NAME}" "$@"
 }
 
 add_mount_if_dir() {
@@ -164,6 +288,624 @@ add_mount_if_dir() {
   if [ -d "$src" ]; then
     eval "$args_name+=( -v \"\$src:\$dst:\$mode\" )"
   fi
+}
+
+path_is_within() {
+  local candidate=$1
+  local boundary=$2
+  case "$candidate/" in
+    "$boundary/"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_lab_source() {
+  local label=$1
+  local source=$2
+  [ -d "$source" ] || die "$label source is missing: $source"
+  local resolved
+  resolved=$(realpath "$source")
+  local nexus_state lens_state
+  nexus_state=$(realpath -m "$HOME/.nexus")
+  lens_state=$(realpath -m "$HOME/.local/share/egregore-lens")
+  if path_is_within "$resolved" "$nexus_state" \
+    || path_is_within "$nexus_state" "$resolved" \
+    || path_is_within "$resolved" "$lens_state" \
+    || path_is_within "$lens_state" "$resolved"; then
+    die "refusing runtime-state mount for $label: $resolved"
+  fi
+}
+
+validate_lab_sources() {
+  validate_lab_source nexus "$REPO"
+  validate_lab_source lens "$LENS_REPO"
+  validate_lab_source egregore "$EGREGORE_REPO"
+  validate_lab_source pactree "$PACTREE_REPO"
+  validate_lab_source pactree-python "$PACTREE_PY_REPO"
+  validate_lab_source pactree-fs "$PACTREE_FS_REPO"
+}
+
+require_v015_run_id() {
+  [ -n "$V015_RUN_ID" ] \
+    || die "NEXUS_V015_RUN_ID is required for lab readiness and acceptance"
+  [[ "$V015_RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$ ]] \
+    || die "NEXUS_V015_RUN_ID must match [A-Za-z0-9][A-Za-z0-9_-]{0,127}"
+}
+
+container_is_lens_lab() {
+  [ "$CONTAINER_PRESENT" -eq 1 ] && [ "$CONTAINER_KIND" = lens ]
+}
+
+require_lens_lab_ownership() {
+  container_is_lens_lab \
+    || die "refusing to remove or replace $NAME: exact validator/lens-lab ownership labels are missing"
+}
+
+require_container_lab_mode() {
+  local requested=$1 observed
+  if [ "$CONTAINER_MODE_LABEL" = "$requested" ] \
+    && [ "$CONTAINER_MODE_ENV" = "$requested" ]; then
+    return 0
+  fi
+  if [ -n "$CONTAINER_MODE_LABEL" ] \
+    && [ "$CONTAINER_MODE_LABEL" = "$CONTAINER_MODE_ENV" ]; then
+    observed=$CONTAINER_MODE_LABEL
+  else
+    observed="label=${CONTAINER_MODE_LABEL:-missing}, environment=${CONTAINER_MODE_ENV:-missing}"
+  fi
+  die "requested lab mode $requested does not match container mode $observed"
+}
+
+validate_packed_resource_request() {
+  local mode=$1 memory_value memory_amount memory_unit memory_multiplier
+  [ "$mode" = packed ] || return 0
+
+  [ "$CPUS" = 6 ] \
+    || die "packed lab CPU limit must be exactly 6: $CPUS"
+  PACKED_EXPECTED_NANO_CPUS=$(awk -v value="$CPUS" 'BEGIN { printf "%.0f", value * 1000000000 }')
+
+  memory_value=${MEMORY,,}
+  [[ "$memory_value" =~ ^([0-9]+)([bkmg]?)$ ]] \
+    || die "packed lab memory limit must be <= 8GiB and use Docker b/k/m/g units: $MEMORY"
+  memory_amount=${BASH_REMATCH[1]}
+  memory_unit=${BASH_REMATCH[2]}
+  case "$memory_unit" in
+    ""|b) memory_multiplier=1 ;;
+    k) memory_multiplier=1024 ;;
+    m) memory_multiplier=1048576 ;;
+    g) memory_multiplier=1073741824 ;;
+  esac
+  PACKED_EXPECTED_MEMORY_BYTES=$(awk -v amount="$memory_amount" -v multiplier="$memory_multiplier" \
+    'BEGIN { printf "%.0f", amount * multiplier }')
+  [ "$PACKED_EXPECTED_MEMORY_BYTES" = 8589934592 ] \
+    || die "packed lab memory limit must be exactly 8GiB: $MEMORY"
+
+  [ "$PIDS_LIMIT" = 1024 ] \
+    || die "packed lab PID limit must be exactly 1024: $PIDS_LIMIT"
+  PACKED_EXPECTED_PIDS=$PIDS_LIMIT
+}
+
+verify_packed_host_config() {
+  local id=$1 actual actual_nano actual_memory actual_memory_swap actual_pids extra
+  if ! actual=$(docker container inspect -f \
+    '{{.HostConfig.NanoCpus}} {{.HostConfig.Memory}} {{.HostConfig.MemorySwap}} {{.HostConfig.PidsLimit}}' \
+    "$id"); then
+    die "Docker HostConfig inspect failed for immutable ID $id"
+  fi
+  read -r actual_nano actual_memory actual_memory_swap actual_pids extra <<<"$actual"
+  if [ -n "${extra:-}" ] \
+    || [ "$actual_nano" != "$PACKED_EXPECTED_NANO_CPUS" ] \
+    || [ "$actual_memory" != "$PACKED_EXPECTED_MEMORY_BYTES" ] \
+    || [ "$actual_memory_swap" != "$PACKED_EXPECTED_MEMORY_BYTES" ] \
+    || [ "$actual_pids" != "$PACKED_EXPECTED_PIDS" ]; then
+    die "Docker applied unexpected packed lab HostConfig: requested cpu=$PACKED_EXPECTED_NANO_CPUS memory=$PACKED_EXPECTED_MEMORY_BYTES memory-swap=$PACKED_EXPECTED_MEMORY_BYTES pids=$PACKED_EXPECTED_PIDS; observed ${actual:-missing}"
+  fi
+}
+
+remove_verified_named_container() {
+  local expected_id=$1 expected_kind=$2 expected_mode=${3:-}
+  require_named_container_id "$expected_id"
+  require_container_kind "$expected_kind"
+  if [ -n "$expected_mode" ]; then
+    require_container_lab_mode "$expected_mode"
+  fi
+  docker rm -f "$expected_id" >/dev/null
+}
+
+cleanup_verified_new_lab() {
+  local expected_id=$1 expected_mode=$2 current metadata environment observed_id running test_label lens_label label_mode env_mode
+  set +e
+  if ! current=$(docker ps -a --no-trunc --filter "name=^/${NAME}$" --format '{{.ID}}'); then
+    echo "warning: refusing cleanup of $expected_id because Docker listing failed" >&2
+    set -e
+    return 0
+  fi
+  if [ "$current" != "$expected_id" ]; then
+    echo "warning: refusing cleanup of $expected_id because container ID changed to ${current:-missing}" >&2
+    set -e
+    return 0
+  fi
+  if ! metadata=$(docker container inspect -f \
+    '{{.Id}} {{.State.Running}} {{if eq (index .Config.Labels "egregore-nexus-test") "true"}}true{{else}}false{{end}} {{if eq (index .Config.Labels "egregore-nexus-lens-lab") "true"}}true{{else}}false{{end}} {{with index .Config.Labels "egregore-nexus-lab-mode"}}{{.}}{{end}}' \
+    "$expected_id"); then
+    echo "warning: refusing cleanup of $expected_id because Docker inspect failed" >&2
+    set -e
+    return 0
+  fi
+  read -r observed_id running test_label lens_label label_mode extra <<<"$metadata"
+  if ! environment=$(docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$expected_id"); then
+    echo "warning: refusing cleanup of $expected_id because environment inspect failed" >&2
+    set -e
+    return 0
+  fi
+  env_mode=$(printf '%s\n' "$environment" | sed -n 's/^NEXUS_LAB_MODE=//p' | tail -n1)
+  if [ -n "${extra:-}" ] || [ "$observed_id" != "$expected_id" ] \
+    || [ "$test_label" != true ] || [ "$lens_label" != true ] \
+    || [ "$label_mode" != "$expected_mode" ] || [ "$env_mode" != "$expected_mode" ]; then
+    echo "warning: refusing cleanup of $expected_id because immutable Lens-lab ownership failed" >&2
+    set -e
+    return 0
+  fi
+  docker rm -f "$expected_id" >/dev/null \
+    || echo "warning: failed to clean newly created lab $expected_id" >&2
+  set -e
+}
+
+lab_topology_probe() {
+  local id=$1 mode=$2 action=$3 image_digest
+  image_digest=$(docker container inspect -f '{{.Image}}' "$id") \
+    || die "Docker image inspect failed for immutable ID $id"
+  [[ "$image_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+    || die "Docker image digest is invalid for immutable ID $id"
+  docker exec \
+    -e "NEXUS_EXPECTED_CONTAINER_ID=$id" \
+    -e "NEXUS_EXPECTED_IMAGE_DIGEST=$image_digest" \
+    -e "NEXUS_EXPECTED_LAB_MODE=$mode" \
+    -e "NEXUS_EXPECTED_RUN_ID=$V015_RUN_ID" \
+    -e "NEXUS_TOPOLOGY_ACTION=$action" \
+    "$id" bash -c 'set -euo pipefail
+      ready="$NEXUS_LAB_ROOT/lab/candidate-ready.v1"
+      [ "${NEXUS_LAB_MODE:-}" = "$NEXUS_EXPECTED_LAB_MODE" ] \
+        || { echo "candidate topology mode mismatch" >&2; exit 41; }
+      [[ "$NEXUS_EXPECTED_RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$ ]] \
+        || { echo "candidate readiness runId is invalid" >&2; exit 41; }
+      emit_topology() {
+        case "$NEXUS_EXPECTED_LAB_MODE" in
+          source)
+            expected_nexus=/tmp/nexus-target/debug/nexus
+            expected_gateway=/work/egregore-nexus/gateway/scripts/nexus-gateway.mjs
+            expected_webui=/work/egregore-nexus/gateway/webconsole/bin/nexus-webui.mjs
+            expected_nexus_resolved=$expected_nexus
+            expected_gateway_resolved=$expected_gateway
+            expected_webui_resolved=$expected_webui
+            expected_lens_renderer_mode=development
+            expected_lens_app=/work/egregore-lens
+            expected_lens_main=$expected_lens_app/electron/main.cjs
+            ;;
+          packed)
+            expected_nexus=$(readlink /tmp/nexus-lab-bin/nexus)
+            case "$expected_nexus" in
+              /tmp/nexus-lab-install.*/bin/nexus) ;;
+              *) echo "packed candidate install prefix mismatch" >&2; return 42 ;;
+            esac
+            install_root=${expected_nexus%/bin/nexus}
+            install_nonce=${install_root#/tmp/nexus-lab-install.}
+            [ -n "$install_nonce" ] && [[ "$install_nonce" =~ ^[A-Za-z0-9]+$ ]] \
+              || { echo "packed candidate install nonce mismatch" >&2; return 42; }
+            expected_gateway=$install_root/bin/nexus-gateway
+            expected_webui=$install_root/bin/nexus-webui
+            expected_nexus_resolved=$install_root/lib/node_modules/@egregore/nexus/bin/nexus.mjs
+            expected_gateway_resolved=$install_root/lib/node_modules/@egregore/nexus/bin/nexus-gateway.mjs
+            expected_webui_resolved=$install_root/lib/node_modules/@egregore/nexus/bin/nexus-webui.mjs
+            expected_lens_renderer_mode=production
+            expected_lens_app=$(readlink /tmp/nexus-lab-bin/lens-app)
+            case "$expected_lens_app" in
+              /tmp/nexus-lens-app.*) ;;
+              *) echo "packed Lens app topology mismatch" >&2; return 42 ;;
+            esac
+            expected_lens_main=$expected_lens_app/electron/main.cjs
+            top_level=$(find "$install_root/lib/node_modules" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" | sort)
+            scope_level=$(find "$install_root/lib/node_modules/@egregore" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" | sort)
+            [ "$top_level" = @egregore ] && [ "$scope_level" = nexus ] \
+              || { echo "packed candidate is not an umbrella-only install" >&2; return 42; }
+            umbrella=$install_root/lib/node_modules/@egregore/nexus
+            jq -e ".name == \"@egregore/nexus\" and .version == \"0.1.5\" and
+              .dependencies == {\"@egregore/nexus-cli\":\"0.1.5\",\"@egregore/nexus-gateway\":\"0.1.5\"} and
+              .bin == {\"nexus\":\"bin/nexus.mjs\",\"nexus-gateway\":\"bin/nexus-gateway.mjs\",\"nexus-webui\":\"bin/nexus-webui.mjs\"}" \
+              "$umbrella/package.json" >/dev/null \
+              || { echo "packed umbrella package contract mismatch" >&2; return 42; }
+            for facet in nexus-cli nexus-gateway; do
+              facet_package=$umbrella/node_modules/@egregore/$facet/package.json
+              jq -e --arg name "@egregore/$facet" ".name == \$name and .version == \"0.1.5\"" \
+                "$facet_package" >/dev/null \
+                || { echo "packed nested facet mismatch: $facet" >&2; return 42; }
+            done
+            ;;
+          *) echo "unsupported topology mode" >&2; return 41 ;;
+        esac
+        [ "$(readlink /tmp/nexus-lab-bin/nexus)" = "$expected_nexus" ] \
+          || { echo "candidate nexus topology mismatch" >&2; return 42; }
+        [ "$(readlink /tmp/nexus-lab-bin/nexus-gateway)" = "$expected_gateway" ] \
+          || { echo "candidate gateway topology mismatch" >&2; return 42; }
+        [ "$(readlink /tmp/nexus-lab-bin/nexus-webui)" = "$expected_webui" ] \
+          || { echo "candidate webui topology mismatch" >&2; return 42; }
+        nexus_resolved=$(readlink -f /tmp/nexus-lab-bin/nexus)
+        gateway_resolved=$(readlink -f /tmp/nexus-lab-bin/nexus-gateway)
+        webui_resolved=$(readlink -f /tmp/nexus-lab-bin/nexus-webui)
+        [ "$nexus_resolved" = "$(readlink -f "$expected_nexus_resolved")" ] \
+          && [ "$gateway_resolved" = "$(readlink -f "$expected_gateway_resolved")" ] \
+          && [ "$webui_resolved" = "$(readlink -f "$expected_webui_resolved")" ] \
+          || { echo "candidate resolved launcher topology mismatch" >&2; return 42; }
+        for resolved in "$nexus_resolved" "$gateway_resolved" "$webui_resolved"; do
+          [ -f "$resolved" ] || { echo "candidate topology target missing: $resolved" >&2; return 42; }
+        done
+        lens_app_resolved=$(readlink -f "$expected_lens_app")
+        lens_main_resolved=$(readlink -f "$expected_lens_main")
+        [ -d "$lens_app_resolved" ] && [ -f "$lens_main_resolved" ] \
+          || { echo "candidate Lens app topology target missing" >&2; return 42; }
+        if [ "$NEXUS_EXPECTED_LAB_MODE" = packed ]; then
+          [ "$(readlink /tmp/nexus-lab-bin/lens-app)" = "$expected_lens_app" ] \
+            || { echo "packed Lens app link mismatch" >&2; return 42; }
+          [ "$lens_app_resolved" = "$expected_lens_app" ] \
+            || { echo "packed Lens app resolved through an unsafe alias" >&2; return 42; }
+          if find "$lens_app_resolved" -type l -print -quit | grep -q .; then
+            echo "packed Lens app contains a symlink" >&2
+            return 42
+          fi
+          while IFS= read -r -d "" entry; do
+            if [ -d "$entry" ]; then expected_mode=555; else expected_mode=444; fi
+            [ "$(stat -c "%u:%g:%a" "$entry")" = "0:0:$expected_mode" ] \
+              || { echo "packed Lens app ownership or mode mismatch: $entry" >&2; return 42; }
+          done < <(find "$lens_app_resolved" \( -type d -o -type f \) -print0)
+          lens_tree_sha=$(cd "$lens_app_resolved" && \
+            find . -type f -printf "%P\0" | LC_ALL=C sort -z | \
+            while IFS= read -r -d "" relative; do
+              printf "%s\0%s\0" "$relative" "$(stat -c %a "$relative")"
+              sha256sum "$relative" | awk "{print \$1}"
+            done | sha256sum | awk "{print \$1}")
+          [[ "$lens_tree_sha" =~ ^[0-9a-f]{64}$ ]] \
+            || { echo "packed Lens app tree digest is invalid" >&2; return 42; }
+        else
+          lens_tree_sha=unsealed-source
+        fi
+        lab_process=/tmp/nexus-lab-bin/lab-process
+        lab_agent=/tmp/nexus-lab-bin/lab-agent
+        lab_fixture=/tmp/nexus-lab-bin/lab-fixture
+        ws_acceptance=/tmp/nexus-lab-bin/nexus-v015-ws-acceptance
+        ws_soak=/tmp/nexus-lab-bin/nexus-v015-ws-soak
+        webconsole_acceptance=/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance
+        webconsole_evidence_verifier=/tmp/nexus-lab-bin/nexus-v015-webconsole-evidence-verify
+        evidence_validator=/tmp/nexus-lab-bin/nexus-v015-evidence-validate
+        release_assembler=/tmp/nexus-lab-bin/nexus-v015-release-assemble
+        [ "$(stat -c "%u:%g:%a" /tmp/nexus-lab-bin)" = "0:0:555" ] \
+          || { echo "candidate lab hook ownership or mode mismatch: /tmp/nexus-lab-bin" >&2; return 42; }
+        for hook in \
+          "$lab_process" "$lab_agent" "$lab_fixture" \
+          "$ws_acceptance" "$ws_soak" "$webconsole_acceptance" \
+          "$webconsole_evidence_verifier" "$evidence_validator" \
+          "$release_assembler"; do
+          [ -f "$hook" ] && [ ! -L "$hook" ] && [ -x "$hook" ] \
+            || { echo "candidate lab hook is missing or unsafe: $hook" >&2; return 42; }
+          [ "$(stat -c "%u:%g:%a" "$hook")" = "0:0:555" ] \
+            || { echo "candidate lab hook ownership or mode mismatch: $hook" >&2; return 42; }
+        done
+        if [ "$NEXUS_EXPECTED_LAB_MODE" = packed ]; then
+          for resolved in "$nexus_resolved" "$gateway_resolved" "$webui_resolved"; do
+            case "$resolved" in
+              "$install_root"/*) ;;
+              *) echo "packed candidate resolved outside installed prefix" >&2; return 42 ;;
+            esac
+          done
+          install_tree_sha=$(python3 -c "import runpy,sys; from pathlib import Path; ns=runpy.run_path(sys.argv[2]); print(ns.get(\"install_tree_digest\")(Path(sys.argv[1])))" \
+            "$install_root" "$ws_acceptance")
+          [[ "$install_tree_sha" =~ ^[0-9a-f]{64}$ ]] \
+            || { echo "packed install tree digest is invalid" >&2; return 42; }
+          native_root="$install_root/lib/node_modules/@egregore/nexus/node_modules/@egregore/nexus-cli/native"
+          mapfile -t native_candidates < <(find "$native_root" -type f -name nexus -perm -u+x -print)
+          [ "${#native_candidates[@]}" -eq 1 ] \
+            || { echo "packed candidate native executable is missing or ambiguous" >&2; return 42; }
+          native_resolved=$(readlink -f "${native_candidates[0]}")
+          case "$native_resolved" in
+            "$install_root"/*) ;;
+            *) echo "packed candidate native executable resolved outside installed prefix" >&2; return 42 ;;
+          esac
+        else
+          install_tree_sha=unsealed-source
+          native_resolved=$nexus_resolved
+        fi
+        if [ "$NEXUS_EXPECTED_LAB_MODE" = packed ]; then
+          packs_root=/tmp/nexus-lab-packs
+          [ -d "$packs_root" ] && [ ! -L "$packs_root" ] \
+            || { echo "candidate tarball root is missing or unsafe" >&2; return 42; }
+          [ "$(stat -c "%u:%g:%a" "$packs_root")" = "0:0:555" ] \
+            || { echo "candidate tarball root ownership or mode mismatch" >&2; return 42; }
+          mapfile -t packed_tarballs < <(find "$packs_root" -mindepth 1 -maxdepth 1 -type f -name "*.tgz" -printf "%p\n" | LC_ALL=C sort)
+          [ "${#packed_tarballs[@]}" -eq 3 ] \
+            || { echo "candidate tarball inventory must contain exactly three archives" >&2; return 42; }
+          nexus_tarball=""; cli_tarball=""; gateway_tarball=""
+          for tarball in "${packed_tarballs[@]}"; do
+            [ ! -L "$tarball" ] && [ "$(stat -c %h "$tarball")" = 1 ] \
+              || { echo "candidate tarball is unsafe: $tarball" >&2; return 42; }
+            [ "$(stat -c "%u:%g:%a" "$tarball")" = "0:0:444" ] \
+              || { echo "candidate tarball ownership or mode mismatch: $tarball" >&2; return 42; }
+            identity=$(tar -xOf "$tarball" package/package.json 2>/dev/null | jq -er ".name + \"@\" + .version") \
+              || { echo "candidate tarball identity is unreadable: $tarball" >&2; return 42; }
+            case "$identity" in
+              @egregore/nexus@0.1.5) [ -z "$nexus_tarball" ] || return 42; nexus_tarball=$tarball ;;
+              @egregore/nexus-cli@0.1.5) [ -z "$cli_tarball" ] || return 42; cli_tarball=$tarball ;;
+              @egregore/nexus-gateway@0.1.5) [ -z "$gateway_tarball" ] || return 42; gateway_tarball=$tarball ;;
+              *) echo "unexpected candidate tarball identity: $identity" >&2; return 42 ;;
+            esac
+          done
+          [ -n "$nexus_tarball" ] && [ -n "$cli_tarball" ] && [ -n "$gateway_tarball" ] \
+            || { echo "candidate tarball identity set is incomplete" >&2; return 42; }
+        else
+          nexus_tarball=unsealed-source
+          cli_tarball=unsealed-source
+          gateway_tarball=unsealed-source
+        fi
+        printf "schema=1\ncontainerId=%s\nmode=%s\nrunId=%s\n" \
+          "$NEXUS_EXPECTED_CONTAINER_ID" "$NEXUS_EXPECTED_LAB_MODE" "$NEXUS_EXPECTED_RUN_ID"
+        printf "imageDigest=%s\ninstallTreeSha256=%s\n" \
+          "$NEXUS_EXPECTED_IMAGE_DIGEST" "$install_tree_sha"
+        if [ "$NEXUS_EXPECTED_LAB_MODE" = packed ]; then
+          printf "installRoot=%s\ninstallNonce=%s\n" "$install_root" "$install_nonce"
+        fi
+        printf "nexusLink=%s\nnexusResolved=%s\nnexusSha256=%s\n" \
+          "$expected_nexus" "$nexus_resolved" "$(sha256sum "$nexus_resolved" | awk "{print \$1}")"
+        printf "nativeResolved=%s\nnativeSha256=%s\n" \
+          "$native_resolved" "$(sha256sum "$native_resolved" | awk "{print \$1}")"
+        printf "gatewayLink=%s\ngatewayResolved=%s\ngatewaySha256=%s\n" \
+          "$expected_gateway" "$gateway_resolved" "$(sha256sum "$gateway_resolved" | awk "{print \$1}")"
+        printf "webuiLink=%s\nwebuiResolved=%s\nwebuiSha256=%s\n" \
+          "$expected_webui" "$webui_resolved" "$(sha256sum "$webui_resolved" | awk "{print \$1}")"
+        printf "lensRendererMode=%s\nlensApp=%s\nlensMain=%s\nlensTreeSha256=%s\n" \
+          "$expected_lens_renderer_mode" "$lens_app_resolved" "$lens_main_resolved" "$lens_tree_sha"
+        printf "labProcess=%s\nlabProcessSha256=%s\n" \
+          "$lab_process" "$(sha256sum "$lab_process" | awk "{print \$1}")"
+        printf "labAgent=%s\nlabAgentSha256=%s\n" \
+          "$lab_agent" "$(sha256sum "$lab_agent" | awk "{print \$1}")"
+        printf "labFixture=%s\nlabFixtureSha256=%s\n" \
+          "$lab_fixture" "$(sha256sum "$lab_fixture" | awk "{print \$1}")"
+        if [ "$NEXUS_EXPECTED_LAB_MODE" = packed ]; then
+          printf "nexusTarball=%s\nnexusTarballSha256=%s\n" \
+            "$nexus_tarball" "$(sha256sum "$nexus_tarball" | awk "{print \$1}")"
+          printf "cliTarball=%s\ncliTarballSha256=%s\n" \
+            "$cli_tarball" "$(sha256sum "$cli_tarball" | awk "{print \$1}")"
+          printf "gatewayTarball=%s\ngatewayTarballSha256=%s\n" \
+            "$gateway_tarball" "$(sha256sum "$gateway_tarball" | awk "{print \$1}")"
+        else
+          printf "nexusTarball=unsealed-source\nnexusTarballSha256=unsealed-source\n"
+          printf "cliTarball=unsealed-source\ncliTarballSha256=unsealed-source\n"
+          printf "gatewayTarball=unsealed-source\ngatewayTarballSha256=unsealed-source\n"
+        fi
+        printf "wsAcceptance=%s\nwsAcceptanceSha256=%s\n" \
+          "$ws_acceptance" "$(sha256sum "$ws_acceptance" | awk "{print \$1}")"
+        printf "wsSoak=%s\nwsSoakSha256=%s\n" \
+          "$ws_soak" "$(sha256sum "$ws_soak" | awk "{print \$1}")"
+        printf "webconsoleAcceptance=%s\nwebconsoleAcceptanceSha256=%s\n" \
+          "$webconsole_acceptance" "$(sha256sum "$webconsole_acceptance" | awk "{print \$1}")"
+        printf "webconsoleEvidenceVerifier=%s\nwebconsoleEvidenceVerifierSha256=%s\n" \
+          "$webconsole_evidence_verifier" "$(sha256sum "$webconsole_evidence_verifier" | awk "{print \$1}")"
+        printf "evidenceValidator=%s\nevidenceValidatorSha256=%s\n" \
+          "$evidence_validator" "$(sha256sum "$evidence_validator" | awk "{print \$1}")"
+        printf "releaseAssembler=%s\nreleaseAssemblerSha256=%s\n" \
+          "$release_assembler" "$(sha256sum "$release_assembler" | awk "{print \$1}")"
+      }
+      current=$(emit_topology)
+      case "$NEXUS_TOPOLOGY_ACTION" in
+        record)
+          [ ! -e "$ready" ] || { echo "candidate readiness ledger already exists" >&2; exit 43; }
+          [ ! -L "$ready" ] || { echo "candidate readiness ledger path is unsafe" >&2; exit 43; }
+          mkdir -p "$(dirname "$ready")"
+          temporary="${ready}.tmp.$$"
+          printf "%s\n" "$current" >"$temporary"
+          chmod 0444 "$temporary"
+          if ! ln "$temporary" "$ready"; then
+            rm -f "$temporary"
+            echo "candidate readiness ledger already exists" >&2
+            exit 43
+          fi
+          rm -f "$temporary"
+          ;;
+        verify)
+          [ -f "$ready" ] || { echo "candidate readiness ledger is missing" >&2; exit 43; }
+          [ "$(stat -c "%u:%g:%a" "$(dirname "$ready")")" = "0:0:1777" ] \
+            || { echo "candidate readiness directory ownership or mode mismatch" >&2; exit 43; }
+          [ "$(stat -c "%u:%g:%a" "$ready")" = "0:0:444" ] \
+            || { echo "candidate readiness ledger ownership or mode mismatch" >&2; exit 43; }
+          recorded=$(cat "$ready")
+          [ "$recorded" = "$current" ] \
+            || { echo "candidate readiness hash mismatch" >&2; exit 43; }
+          printf "%s\n" "$recorded"
+          ;;
+        *) echo "unsupported topology action" >&2; exit 41 ;;
+      esac'
+}
+
+record_lab_readiness() {
+  lab_topology_probe "$1" "$2" record
+}
+
+seal_lab_readiness() {
+  local id=$1
+  docker exec --user 0:0 "$id" bash -c 'set -euo pipefail
+    ready="$NEXUS_LAB_ROOT/lab/candidate-ready.v1"
+    parent=$(dirname "$ready")
+    [ -f "$ready" ] && [ ! -L "$ready" ] && [ "$(stat -c %h "$ready")" = 1 ] \
+      || { echo "candidate readiness ledger is missing or unsafe" >&2; exit 43; }
+    chown root:root "$parent" "$ready"
+    chmod 1777 "$parent"
+    chmod 0444 "$ready"
+    sync -f "$ready"
+    sync -f "$parent"'
+}
+
+verify_lab_readiness() {
+  lab_topology_probe "$1" "$2" verify
+}
+
+verify_packed_manifest_binding() {
+  local id=$1
+  docker exec \
+    -e "NEXUS_EXPECTED_CONTAINER_ID=$id" \
+    -e "NEXUS_EXPECTED_RUN_ID=$V015_RUN_ID" \
+    -e NEXUS_MANIFEST_BINDING_ACTION=verify \
+    "$id" bash -c 'set -euo pipefail
+      ready="$NEXUS_LAB_ROOT/lab/candidate-ready.v1"
+      manifest="$NEXUS_LAB_ROOT/evidence/$NEXUS_EXPECTED_RUN_ID/manifest.json"
+      for file in "$ready" "$manifest"; do
+        [ -f "$file" ] && [ ! -L "$file" ] && [ "$(stat -c %h "$file")" = 1 ] \
+          || { echo "packed candidate binding file is missing or unsafe: $file" >&2; exit 45; }
+      done
+      readiness_sha=$(sha256sum "$ready" | awk "{print \$1}")
+      jq -e \
+        --arg run "$NEXUS_EXPECTED_RUN_ID" \
+        --arg container "$NEXUS_EXPECTED_CONTAINER_ID" \
+        --arg ready "$ready" \
+        --arg digest "$readiness_sha" \
+        ".schemaVersion == 1 and .mode == \"packed\" and .runId == \$run and
+         .environment.NEXUS_V015_RUN_ID == \$run and
+         .environment.NEXUS_V015_CONTAINER_ID == \$container and
+         .environment.NEXUS_V015_READINESS_LEDGER == \$ready and
+         .environment.NEXUS_V015_READINESS_LEDGER_SHA256 == \$digest" \
+        "$manifest" >/dev/null \
+        || { echo "packed candidate manifest/readiness binding mismatch" >&2; exit 45; }
+      ledger_value() {
+        local key=$1
+        awk -F= -v key="$key" "\$1 == key { count += 1; value = substr(\$0, length(key) + 2) }
+          END { if (count != 1 || value == \"\") exit 1; print value }" "$ready"
+      }
+      for binding in \
+        imageDigest:NEXUS_V015_IMAGE_DIGEST \
+        installTreeSha256:NEXUS_V015_INSTALL_TREE_SHA256 \
+        nexusResolved:NEXUS_V015_NEXUS_BIN_RESOLVED \
+        nexusSha256:NEXUS_V015_NEXUS_BIN_SHA256 \
+        nativeResolved:NEXUS_V015_NATIVE_BIN \
+        nativeSha256:NEXUS_V015_NATIVE_BIN_SHA256 \
+        gatewayResolved:NEXUS_V015_GATEWAY_BIN_RESOLVED \
+        gatewaySha256:NEXUS_V015_GATEWAY_BIN_SHA256 \
+        webuiResolved:NEXUS_V015_WEBUI_BIN_RESOLVED \
+        webuiSha256:NEXUS_V015_WEBUI_BIN_SHA256 \
+        lensRendererMode:NEXUS_V015_LENS_RENDERER_MODE \
+        lensApp:NEXUS_V015_LENS_APP \
+        lensMain:NEXUS_V015_LENS_MAIN \
+        lensTreeSha256:NEXUS_V015_LENS_TREE_SHA256 \
+        labProcess:NEXUS_V015_LAB_PROCESS \
+        labProcessSha256:NEXUS_V015_LAB_PROCESS_SHA256 \
+        labAgent:NEXUS_V015_LAB_AGENT \
+        labAgentSha256:NEXUS_V015_LAB_AGENT_SHA256 \
+        labFixture:NEXUS_V015_LAB_FIXTURE \
+        labFixtureSha256:NEXUS_V015_LAB_FIXTURE_SHA256 \
+        nexusTarball:NEXUS_V015_NEXUS_TARBALL \
+        nexusTarballSha256:NEXUS_V015_NEXUS_TARBALL_SHA256 \
+        cliTarball:NEXUS_V015_CLI_TARBALL \
+        cliTarballSha256:NEXUS_V015_CLI_TARBALL_SHA256 \
+        gatewayTarball:NEXUS_V015_GATEWAY_TARBALL \
+        gatewayTarballSha256:NEXUS_V015_GATEWAY_TARBALL_SHA256 \
+        wsAcceptance:NEXUS_V015_WS_ACCEPTANCE \
+        wsAcceptanceSha256:NEXUS_V015_WS_ACCEPTANCE_SHA256 \
+        wsSoak:NEXUS_V015_WS_SOAK \
+        wsSoakSha256:NEXUS_V015_WS_SOAK_SHA256 \
+        webconsoleAcceptance:NEXUS_V015_WEBCONSOLE_ACCEPTANCE \
+        webconsoleAcceptanceSha256:NEXUS_V015_WEBCONSOLE_ACCEPTANCE_SHA256 \
+        webconsoleEvidenceVerifier:NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER \
+        webconsoleEvidenceVerifierSha256:NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER_SHA256 \
+        evidenceValidator:NEXUS_V015_EVIDENCE_VALIDATOR \
+        evidenceValidatorSha256:NEXUS_V015_EVIDENCE_VALIDATOR_SHA256 \
+        releaseAssembler:NEXUS_V015_RELEASE_ASSEMBLER \
+        releaseAssemblerSha256:NEXUS_V015_RELEASE_ASSEMBLER_SHA256; do
+        ledger_key=${binding%%:*}
+        manifest_key=${binding#*:}
+        ledger_digest=$(ledger_value "$ledger_key") \
+          || { echo "candidate readiness ledger has invalid $ledger_key" >&2; exit 45; }
+        manifest_digest=$(jq -er --arg key "$manifest_key" ".environment[\$key]" "$manifest") \
+          || { echo "candidate manifest is missing $manifest_key" >&2; exit 45; }
+        [ "$ledger_digest" = "$manifest_digest" ] \
+          || { echo "candidate manifest binding mismatch: $ledger_key" >&2; exit 45; }
+      done
+      jq -e "
+        [.packages[].name] == [\"@egregore/nexus\",\"@egregore/nexus-cli\",\"@egregore/nexus-gateway\"] and
+        .packages[0].tarball.sha256 == .environment.NEXUS_V015_NEXUS_TARBALL_SHA256 and
+        .packages[1].tarball.sha256 == .environment.NEXUS_V015_CLI_TARBALL_SHA256 and
+        .packages[2].tarball.sha256 == .environment.NEXUS_V015_GATEWAY_TARBALL_SHA256
+      " "$manifest" >/dev/null \
+        || { echo "candidate manifest tarball bindings are inconsistent" >&2; exit 45; }
+      printf "%s\n" "$readiness_sha"'
+}
+
+prepare_existing_lab() {
+  local mode=$1 id
+  require_v015_run_id
+  validate_packed_resource_request "$mode"
+  refresh_named_container || die "container $NAME does not exist"
+  require_lens_lab_ownership
+  require_container_lab_mode "$mode"
+  id=$CONTAINER_ID
+  ACTIVE_CONTAINER_ID=$id
+  if [ "$mode" = packed ]; then
+    verify_packed_host_config "$id"
+  fi
+  verify_lab_readiness "$id" "$mode" >/dev/null
+  if [ "$mode" = packed ]; then
+    verify_packed_manifest_binding "$id" >/dev/null
+  fi
+  require_named_container_id "$id"
+  require_lens_lab_ownership
+  require_container_lab_mode "$mode"
+}
+
+verify_gate_candidate() {
+  local id=$1 mode=$2 readiness_sha256
+  require_named_container_id "$id" || return
+  require_lens_lab_ownership || return
+  require_container_lab_mode "$mode" || return
+  [ "$CONTAINER_RUNNING" = true ] || die "container $NAME is not running"
+  if [ "$mode" = packed ]; then
+    verify_packed_host_config "$id" || return
+  fi
+  verify_lab_readiness "$id" "$mode" >/dev/null || return
+  if [ "$mode" = packed ]; then
+    verify_packed_manifest_binding "$id" >/dev/null || return
+  fi
+  readiness_sha256=$(docker exec "$id" bash -c 'set -euo pipefail
+    ready="$NEXUS_LAB_ROOT/lab/candidate-ready.v1"
+    [ -f "$ready" ] && [ ! -L "$ready" ] && [ "$(stat -c %h "$ready")" = 1 ]
+    [ "$(stat -c "%u:%g:%a" "$(dirname "$ready")")" = "0:0:1777" ]
+    [ "$(stat -c "%u:%g:%a" "$ready")" = "0:0:444" ]
+    sha256sum "$ready" | awk "{print \$1}"') || return
+  [[ "$readiness_sha256" =~ ^[0-9a-f]{64}$ ]] \
+    || die "candidate readiness ledger hash is invalid"
+  require_named_container_id "$id" || return
+  require_lens_lab_ownership || return
+  require_container_lab_mode "$mode" || return
+  printf '%s\n' "$readiness_sha256"
+}
+
+add_host_harness_mounts() {
+  local -n args=$1
+  local -n path_ref=$2
+  local node_root
+  node_root=$(host_node_root || true)
+  if [ -n "$node_root" ]; then
+    args+=( -v "$node_root:/host-node:ro" )
+    path_ref="/tmp/nexus-lab-bin:/usr/local/cargo/bin:/host-node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  fi
+  add_mount_if_dir "$1" "$HOME/.cargo/bin" /host-cargo-bin ro
+  path_ref="$path_ref:/host-cargo-bin"
+  add_mount_if_dir "$1" "$HOME/.local/bin" /host-local-bin ro
+  path_ref="$path_ref:/host-local-bin"
+  add_mount_if_dir "$1" "$HOME/.bun" "$HOME/.bun" ro
+  path_ref="$path_ref:$HOME/.bun/bin"
+  add_mount_if_dir "$1" "$HOME/.hermes" "$HOME/.hermes" ro
+  add_mount_if_dir "$1" "$HOME/.local/share/uv" "$HOME/.local/share/uv" ro
+  add_mount_if_dir "$1" "$HOME/.claude" /host-auth/.claude ro
+  [ -f "$HOME/.claude.json" ] && args+=( -v "$HOME/.claude.json:/host-auth/.claude.json:ro" )
+  add_mount_if_dir "$1" "$HOME/.codex" /host-auth/.codex ro
+  add_mount_if_dir "$1" "$HOME/.opencode" /host-auth/.opencode ro
+  add_mount_if_dir "$1" "$HOME/.config/opencode" /host-auth/opencode-config ro
+  add_mount_if_dir "$1" "$HOME/.local/share/opencode" /host-auth/opencode-share ro
+  add_mount_if_dir "$1" "$HOME/.hermes" /host-auth/hermes ro
 }
 
 host_node_root() {
@@ -177,7 +919,8 @@ host_node_root() {
 ensure_harness_home_owned() {
   # Older cached validator images created HOME as root. Repair the disposable directory on every
   # reuse before the host-UID process copies OAuth state into it; this does not touch host auth.
-  docker exec --user 0:0 "$NAME" install -d -o "$HOST_UID" -g "$HOST_GID" -m 0700 /tmp/harness-home
+  docker exec --user 0:0 "${ACTIVE_CONTAINER_ID:-$NAME}" \
+    install -d -o "$HOST_UID" -g "$HOST_GID" -m 0700 /tmp/harness-home
 }
 
 prepare_host_harnesses() {
@@ -281,14 +1024,15 @@ EOF
 
 wait_for_daemon() {
   for _ in $(seq 1 160); do
-    if docker exec "$NAME" bash -c \
+    if docker exec "${ACTIVE_CONTAINER_ID:-$NAME}" bash -c \
       "pid=\$(cat /tmp/nexus-home/daemon.pid 2>/dev/null || true); proxy=\$(cat /tmp/nexus-home/gateway-proxy.pid 2>/dev/null || true); test -n \"\$pid\" && kill -0 \"\$pid\" 2>/dev/null && test -n \"\$proxy\" && kill -0 \"\$proxy\" 2>/dev/null && curl -fsS \"http://127.0.0.1:$CONTAINER_PORT/api/v1/health\" >/dev/null" \
       >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.25
   done
-  docker exec "$NAME" bash -c 'cat /tmp/nexus-home/daemon.log 2>/dev/null || true' >&2 || true
+  docker exec "${ACTIVE_CONTAINER_ID:-$NAME}" \
+    bash -c 'cat /tmp/nexus-home/daemon.log 2>/dev/null || true' >&2 || true
   die "isolated daemon/gateway did not become ready"
 }
 
@@ -346,56 +1090,69 @@ cmd_up() {
 
   # Reusing the sole validation container must not start a transient image-probe
   # container alongside it. Only inspect/build the image when no container exists.
-  if ! container_exists; then
+  if container_exists; then
+    case "$CONTAINER_KIND" in
+      lens) die "preserving Lens lab $NAME; use lab-status/lab-gate/lab-down with its explicit mode" ;;
+      normal) ACTIVE_CONTAINER_ID=$CONTAINER_ID ;;
+      *) die "refusing normal up for foreign container $NAME" ;;
+    esac
+  else
     ensure_image
   fi
   if container_exists; then
     if [ "$with_host_harnesses" = "1" ] && ! container_real_harnesses; then
       echo "recreating $NAME with host harness mounts"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif [ "$with_host_harnesses" = "0" ] && container_real_harnesses; then
       echo "recreating $NAME without host harness mounts"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif ! container_uses_tmpfs_stream_db; then
       echo "recreating $NAME with tmpfs stream DB configuration"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif ! container_uses_internal_gateway_port; then
       echo "recreating $NAME with proxied gateway port configuration"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif ! container_uses_in_tree_gateway; then
       echo "recreating $NAME with the in-tree gateway package"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif ! container_uses_split_stores; then
       echo "recreating $NAME with split daemon/Gateway store configuration"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif ! container_uses_debug_stack; then
       echo "recreating $NAME with the debug daemon stack bound inherited by lifecycle children"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif ! container_uses_resource_limits; then
       echo "recreating $NAME with CPU, memory, and process limits"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif ! container_uses_init_reaper; then
       echo "recreating $NAME with Docker init child reaping"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif ! container_uses_host_user; then
       echo "recreating $NAME as the host user for OAuth harness compatibility"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif [ "$with_host_harnesses" = "1" ] && ! container_mounts_host_bun; then
       echo "recreating $NAME with host Bun mount"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif [ "$with_host_harnesses" = "1" ] && ! container_mounts_host_hermes; then
       echo "recreating $NAME with host Hermes mount"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif [ "$with_host_harnesses" = "1" ] && ! container_mounts_host_uv_python; then
       echo "recreating $NAME with host UV Python mount"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     fi
   fi
 
   if container_exists; then
+    local existing_id=$CONTAINER_ID
+    require_container_kind normal
     if ! container_running; then
-      docker start "$NAME" >/dev/null
+      require_named_container_id "$existing_id"
+      require_container_kind normal
+      docker start "$existing_id" >/dev/null
     fi
+    require_named_container_id "$existing_id"
+    require_container_kind normal
+    ACTIVE_CONTAINER_ID=$existing_id
   else
     local run_args=()
     local real_label=false
@@ -420,7 +1177,8 @@ cmd_up() {
       add_mount_if_dir run_args "$HOME/.hermes" /host-auth/hermes ro
     fi
 
-    docker run -d \
+    local normal_id
+    normal_id=$(docker run -d \
       --init \
       --user "$HOST_UID:$HOST_GID" \
       --name "$NAME" \
@@ -449,7 +1207,12 @@ cmd_up() {
       "${run_args[@]}" \
       -w /work/egregore-nexus \
       "$IMAGE" \
-      sleep infinity >/dev/null
+      sleep infinity)
+    [[ "$normal_id" =~ ^[0-9a-f]{12,64}$ ]] \
+      || die "Docker run did not return an immutable container ID: ${normal_id:-missing}"
+    require_named_container_id "$normal_id"
+    require_container_kind normal
+    ACTIVE_CONTAINER_ID=$normal_id
   fi
 
   if [ "$with_host_harnesses" = "1" ]; then
@@ -473,6 +1236,1002 @@ cmd_up() {
   start_gateway
   wait_for_daemon
   container_env_summary
+}
+
+wait_lab_http() {
+  local url=$1
+  local label=$2
+  for _ in $(seq 1 240); do
+    if exec_bash "curl -fsS '$url' >/dev/null" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  die "$label did not become ready at $url"
+}
+
+start_source_lens() {
+  exec_bash 'set -euo pipefail
+    lab="$NEXUS_LAB_ROOT/lab"
+    pidfile_alive() {
+      pid=$(cat "$1" 2>/dev/null || true)
+      [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+    }
+    if ! pidfile_alive "$lab/vite.pid"; then
+      cd /work/egregore-lens
+      nohup node_modules/.bin/vite --host 127.0.0.1 --port 1422 --strictPort \
+        >"$lab/vite.log" 2>&1 &
+      echo $! >"$lab/vite.pid"
+    fi'
+  wait_lab_http "http://127.0.0.1:1422" "Lens Vite"
+
+  exec_bash 'set -euo pipefail
+    lab="$NEXUS_LAB_ROOT/lab"
+    pidfile_alive() {
+      pid=$(cat "$1" 2>/dev/null || true)
+      [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+    }
+    if ! pidfile_alive "$lab/lens.pid"; then
+      cd /work/egregore-lens
+      nohup env -u LENS_NEXUS_GATEWAY_URL \
+        DISPLAY=:99 \
+        NODE_ENV=development \
+        VITE_DEV_SERVER_URL=http://127.0.0.1:1422 \
+        LENS_PYTHON="$NEXUS_LAB_ROOT/lens-venv/bin/python" \
+        node_modules/.bin/electron \
+          --no-sandbox \
+          --use-gl=angle --use-angle=swiftshader \
+          --disable-low-res-tiling --disable-checker-imaging --disable-partial-raster \
+          --remote-debugging-port=9222 electron/main.cjs \
+        >"$lab/lens.log" 2>&1 &
+      echo $! >"$lab/lens.pid"
+    fi'
+}
+
+start_packed_lens() {
+  exec_bash 'set -euo pipefail
+    lab="$NEXUS_LAB_ROOT/lab"
+    pidfile_alive() {
+      pid=$(cat "$1" 2>/dev/null || true)
+      [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+    }
+    lens_app=$(readlink -f /tmp/nexus-lab-bin/lens-app)
+    case "$lens_app" in
+      /tmp/nexus-lens-app.*) ;;
+      *) echo "packed Lens app path is outside the candidate staging root" >&2; exit 1 ;;
+    esac
+    [ -f "$lens_app/electron/main.cjs" ] && [ -f "$lens_app/dist/index.html" ] \
+      || { echo "packed Lens app is incomplete" >&2; exit 1; }
+    if ! pidfile_alive "$lab/lens.pid"; then
+      cd "$lens_app"
+      nohup env -u VITE_DEV_SERVER_URL -u LENS_NEXUS_GATEWAY_URL \
+        DISPLAY=:99 \
+        NODE_ENV=production \
+        LENS_PYTHON="$NEXUS_LAB_ROOT/lens-venv/bin/python" \
+        /work/egregore-lens/node_modules/.bin/electron \
+          --no-sandbox \
+          --use-gl=angle --use-angle=swiftshader \
+          --disable-low-res-tiling --disable-checker-imaging --disable-partial-raster \
+          --remote-debugging-port=9222 /tmp/nexus-lab-bin/lens-app/electron/main.cjs \
+        >"$lab/lens.log" 2>&1 &
+      echo $! >"$lab/lens.pid"
+    fi'
+}
+
+start_lab_stack() {
+  local mode=$1
+  case "$mode" in source|packed) ;; *) die "unsupported Lens lab mode: $mode" ;; esac
+  exec_bash 'set -euo pipefail
+    lab="$NEXUS_LAB_ROOT/lab"
+    mkdir -p "$lab" "$NEXUS_HOME" "$LENS_DATA_HOME" "$NEXUS_LAB_ROOT/gateway"
+    pidfile_alive() {
+      pid=$(cat "$1" 2>/dev/null || true)
+      [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+    }
+
+    if ! pidfile_alive "$lab/gateway-proxy.pid"; then
+      nohup socat TCP-LISTEN:4100,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:4101 \
+        >"$lab/gateway-proxy.log" 2>&1 &
+      echo $! >"$lab/gateway-proxy.pid"
+    fi
+    if ! pidfile_alive "$NEXUS_HOME/daemon.pid"; then
+      cd /work/egregore-nexus
+      nohup /tmp/nexus-lab-bin/nexus daemon >"$NEXUS_HOME/daemon.log" 2>&1 &
+      echo $! >"$NEXUS_HOME/daemon.pid"
+    fi'
+  for _ in $(seq 1 240); do
+    if docker exec "${ACTIVE_CONTAINER_ID:-$NAME}" \
+      /tmp/nexus-lab-bin/nexus daemon status >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.25
+  done
+  docker exec "${ACTIVE_CONTAINER_ID:-$NAME}" \
+    /tmp/nexus-lab-bin/nexus daemon status >/dev/null \
+    || die "Nexus daemon did not become ready"
+  exec_bash '/tmp/nexus-lab-bin/nexus gateway restart >"$NEXUS_LAB_ROOT/lab/gateway-start.log"'
+  wait_lab_http "http://127.0.0.1:4100/api/v1/health" "Nexus Gateway"
+  exec_bash '/tmp/nexus-lab-bin/nexus webconsole start --host 127.0.0.1 --port 4200 >"$NEXUS_LAB_ROOT/lab/webconsole-start.log"'
+  wait_lab_http "http://127.0.0.1:4200/health" "Nexus Webconsole"
+  exec_bash '/tmp/nexus-lab-bin/nexus webconsole launch --no-open >"$NEXUS_LAB_ROOT/lab/webconsole-launch.log"'
+
+  exec_bash 'set -euo pipefail
+    lab="$NEXUS_LAB_ROOT/lab"
+    pidfile_alive() {
+      pid=$(cat "$1" 2>/dev/null || true)
+      [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+    }
+    if ! pidfile_alive "$lab/xvfb.pid"; then
+      nohup Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp >"$lab/xvfb.log" 2>&1 &
+      echo $! >"$lab/xvfb.pid"
+    fi
+    if ! pidfile_alive "$lab/lens-cdp-proxy.pid"; then
+      nohup socat TCP-LISTEN:9223,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:9222 \
+        >"$lab/lens-cdp-proxy.log" 2>&1 &
+      echo $! >"$lab/lens-cdp-proxy.pid"
+    fi
+    if ! pidfile_alive "$lab/webui-cdp-proxy.pid"; then
+      nohup socat TCP-LISTEN:9225,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:9224 \
+        >"$lab/webui-cdp-proxy.log" 2>&1 &
+      echo $! >"$lab/webui-cdp-proxy.pid"
+    fi'
+
+  if [ "$mode" = source ]; then
+    start_source_lens
+  else
+    start_packed_lens
+  fi
+
+  exec_bash 'set -euo pipefail
+    lab="$NEXUS_LAB_ROOT/lab"
+    pidfile_alive() {
+      pid=$(cat "$1" 2>/dev/null || true)
+      [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+    }
+    if ! pidfile_alive "$lab/webui-browser.pid"; then
+      cd /work/egregore-lens
+      nohup env DISPLAY=:99 node_modules/.bin/electron \
+        --no-sandbox \
+        --user-data-dir="$NEXUS_LAB_ROOT/webui-profile" \
+        --remote-debugging-port=9224 \
+        --app=http://127.0.0.1:4200 \
+        >"$lab/webui-browser.log" 2>&1 &
+      echo $! >"$lab/webui-browser.pid"
+    fi'
+  wait_lab_http "http://127.0.0.1:9222/json/version" "Lens CDP"
+  wait_lab_http "http://127.0.0.1:9224/json/version" "WebUI CDP"
+}
+
+build_lab_candidate() {
+  local mode=$1
+  if [ "$mode" = source ]; then
+    exec_bash 'set -euo pipefail
+      cd /work/egregore-nexus/core
+      CARGO_BUILD_JOBS=4 cargo build -p egregore-nexus
+      cd /work/egregore-nexus/gateway
+      CI=true pnpm install --frozen-lockfile --config.confirmModulesPurge=false
+      CI=true pnpm build
+      CI=true pnpm webconsole:build
+      install -d /tmp/nexus-lab-bin
+      ln -sfn /tmp/nexus-target/debug/nexus /tmp/nexus-lab-bin/nexus
+      ln -sfn /work/egregore-nexus/gateway/scripts/nexus-gateway.mjs /tmp/nexus-lab-bin/nexus-gateway
+      ln -sfn /work/egregore-nexus/gateway/webconsole/bin/nexus-webui.mjs /tmp/nexus-lab-bin/nexus-webui'
+  else
+    exec_bash 'set -euo pipefail
+      packs=/tmp/nexus-lab-packs
+      assembly=/tmp/nexus-lab-cli-assembly
+      install_root=$(mktemp -d /tmp/nexus-lab-install.XXXXXX)
+      chmod 0700 "$install_root"
+      registry_root=$(mktemp -d /tmp/nexus-lab-registry.XXXXXX)
+      install -d "$packs" "$assembly" /tmp/nexus-lab-bin
+      cd /work/egregore-nexus/core
+      CARGO_BUILD_JOBS=4 cargo build --release -p egregore-nexus
+      cd /work/egregore-nexus/gateway
+      CI=true pnpm install --frozen-lockfile --config.confirmModulesPurge=false
+      gateway_tar=$(npm pack --pack-destination "$packs" --silent | tail -n1)
+      cp -a /work/egregore-nexus/packages/nexus-cli/. "$assembly/"
+      /work/egregore-nexus/scripts/nexus-pack-native-npm \
+        --binary /tmp/nexus-target/release/nexus --output "$assembly" >/dev/null
+      cli_tar=$(cd "$assembly" && NEXUS_VERSION_ROOT=/work/egregore-nexus \
+        npm pack --pack-destination "$packs" --silent | tail -n1)
+      nexus_tar=$(cd /work/egregore-nexus/packages/nexus && \
+        npm pack --pack-destination "$packs" --silent | tail -n1)
+
+      registry_ready="$registry_root/url"
+      registry_pid=""
+      cleanup_registry() {
+        if [ -n "$registry_pid" ]; then
+          kill "$registry_pid" 2>/dev/null || true
+          wait "$registry_pid" 2>/dev/null || true
+          registry_pid=""
+        fi
+      }
+      trap cleanup_registry EXIT
+      npmrc="$registry_root/npmrc"
+      /work/egregore-nexus/scripts/nexus-v015-scoped-registry \
+        --ready-file "$registry_ready" \
+        --npmrc "$npmrc" \
+        --package "@egregore/nexus-cli=$packs/$cli_tar" \
+        --package "@egregore/nexus-gateway=$packs/$gateway_tar" \
+        --package "@egregore/nexus=$packs/$nexus_tar" \
+        >"$registry_root/server.log" 2>&1 &
+      registry_pid=$!
+      deadline=$((SECONDS + 10))
+      while [ ! -s "$registry_ready" ] || [ ! -s "$npmrc" ]; do
+        kill -0 "$registry_pid" 2>/dev/null \
+          || { cat "$registry_root/server.log" >&2; exit 1; }
+        [ "$SECONDS" -lt "$deadline" ] || { echo "scoped registry did not become ready" >&2; exit 1; }
+        sleep 0.05
+      done
+      registry_url=$(cat "$registry_ready")
+      curl -fsS "$registry_url/-/ping" >/dev/null
+      foreign_cwd=$(mktemp -d /tmp/nexus-lab-install-cwd.XXXXXX)
+      cd "$foreign_cwd"
+      NPM_CONFIG_USERCONFIG="$npmrc" \
+        npm install --global --prefix "$install_root" --ignore-scripts --no-audit --no-fund \
+        "@egregore/nexus@0.1.5" >/dev/null
+      cleanup_registry
+      trap - EXIT
+
+      test -f "$install_root/lib/node_modules/@egregore/nexus/package.json"
+      test ! -e "$install_root/lib/node_modules/@egregore/nexus-cli"
+      test ! -e "$install_root/lib/node_modules/@egregore/nexus-gateway"
+      test -f "$install_root/lib/node_modules/@egregore/nexus/node_modules/@egregore/nexus-cli/package.json"
+      test -f "$install_root/lib/node_modules/@egregore/nexus/node_modules/@egregore/nexus-gateway/package.json"
+      ln -sfn "$install_root/bin/nexus" /tmp/nexus-lab-bin/nexus
+      ln -sfn "$install_root/bin/nexus-gateway" /tmp/nexus-lab-bin/nexus-gateway
+      ln -sfn "$install_root/bin/nexus-webui" /tmp/nexus-lab-bin/nexus-webui
+      /tmp/nexus-lab-bin/nexus --version | grep -Fx "nexus 0.1.5" >/dev/null
+      /tmp/nexus-lab-bin/nexus-gateway --help >/dev/null
+      /tmp/nexus-lab-bin/nexus-webui --help >/dev/null'
+  fi
+
+  exec_bash 'set -euo pipefail
+    install -m 0555 /work/egregore-nexus/scripts/nexus-v015-lab-process /tmp/nexus-lab-bin/lab-process
+    install -m 0555 /work/egregore-nexus/scripts/nexus-v015-lab-agent /tmp/nexus-lab-bin/lab-agent
+    install -m 0555 /work/egregore-nexus/scripts/nexus-v015-lab-fixture /tmp/nexus-lab-bin/lab-fixture
+    install -m 0555 /work/egregore-nexus/scripts/nexus-v015-ws-acceptance /tmp/nexus-lab-bin/nexus-v015-ws-acceptance
+    install -m 0555 /work/egregore-nexus/scripts/nexus-v015-ws-soak /tmp/nexus-lab-bin/nexus-v015-ws-soak
+    install -m 0555 /work/egregore-nexus/scripts/nexus-v015-webconsole-acceptance /tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance
+    install -m 0555 /work/egregore-nexus/scripts/nexus-v015-webconsole-evidence-verify /tmp/nexus-lab-bin/nexus-v015-webconsole-evidence-verify
+    install -m 0555 /work/egregore-nexus/scripts/nexus-v015-evidence-validate /tmp/nexus-lab-bin/nexus-v015-evidence-validate
+    install -m 0555 /work/egregore-nexus/scripts/nexus-v015-release-assemble /tmp/nexus-lab-bin/nexus-v015-release-assemble
+    install -m 0555 /work/egregore-nexus/scripts/nexus-hooks-practical-gate /tmp/nexus-lab-bin/nexus-hooks-practical-gate'
+
+  exec_bash 'set -euo pipefail
+    cd /work/egregore-lens
+    npm ci --no-audit --no-fund
+    if [ "$NEXUS_LAB_MODE" = packed ]; then
+      npm run build
+      lens_app=$(mktemp -d /tmp/nexus-lens-app.XXXXXX)
+      cp -a dist electron package.json "$lens_app/"
+      ln -sfn "$lens_app" /tmp/nexus-lab-bin/lens-app
+    fi
+    if [ ! -x "$NEXUS_LAB_ROOT/lens-venv/bin/python" ]; then
+      python3 -m venv "$NEXUS_LAB_ROOT/lens-venv"
+    fi
+    "$NEXUS_LAB_ROOT/lens-venv/bin/python" -m pip install --disable-pip-version-check -U pip wheel maturin
+    "$NEXUS_LAB_ROOT/lens-venv/bin/python" -m pip install --disable-pip-version-check \
+      -e /work/pactree-py -e /work/pactree-fs -e /work/egregore-v2 \
+      -e /work/egregore-v2/egregore/providers/claude-code \
+      -e /work/egregore-v2/egregore/providers/codex \
+      -e /work/egregore-v2/egregore/providers/gemini-cli \
+      -e /work/egregore-lens/src-tauri'
+}
+
+cmd_lab_up() {
+  local mode=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mode)
+        [ $# -ge 2 ] || die "--mode requires source or packed"
+        mode=$2
+        shift 2
+        ;;
+      *) die "unknown lab-up argument: $1" ;;
+    esac
+  done
+  [ -n "$mode" ] || die "lab-up requires --mode source or packed"
+  case "$mode" in source|packed) ;; *) die "lab-up mode must be source or packed" ;; esac
+  require_v015_run_id
+  validate_packed_resource_request "$mode"
+  validate_lab_sources
+
+  local validators current_id="" validator_id validator_name
+  if ! validators=$(docker ps -a --no-trunc --filter label=egregore-nexus-test=true \
+    --format '{{.ID}} {{.Names}}'); then
+    die "Docker container listing failed while checking validator ownership"
+  fi
+  if refresh_named_container; then
+    require_lens_lab_ownership
+    current_id=$CONTAINER_ID
+  fi
+  while read -r validator_id validator_name extra; do
+    [ -n "${validator_id:-}" ] || continue
+    [ -z "${extra:-}" ] || die "invalid Docker validator inventory row"
+    if [ "$validator_id" != "$current_id" ] || [ "$validator_name" != "$NAME" ]; then
+      die "another Nexus validator exists: $validator_name ($validator_id)"
+    fi
+  done <<<"$validators"
+
+  build_image
+  if [ -n "$current_id" ]; then
+    remove_verified_named_container "$current_id" lens "$CONTAINER_MODE_LABEL"
+  fi
+
+  local run_args=()
+  local path_env="/tmp/nexus-lab-bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  add_host_harness_mounts run_args path_env
+  local new_id
+  new_id=$(docker run -d \
+    --init \
+    --user "$HOST_UID:$HOST_GID" \
+    --name "$NAME" \
+    --label egregore-nexus-test=true \
+    --label egregore-nexus-real-harnesses=true \
+    --label egregore-nexus-lens-lab=true \
+    --label "egregore-nexus-lab-mode=$mode" \
+    --label "egregore-nexus-test-cpus=$CPUS" \
+    --label "egregore-nexus-test-memory=$MEMORY" \
+    --label "egregore-nexus-test-pids-limit=$PIDS_LIMIT" \
+    --label egregore-nexus-test-init=true \
+    --label "egregore-nexus-test-user=$HOST_UID:$HOST_GID" \
+    --cpus "$CPUS" \
+    --memory "$MEMORY" \
+    --memory-swap "$MEMORY" \
+    --pids-limit "$PIDS_LIMIT" \
+    --shm-size 1g \
+    -p "127.0.0.1:$HOST_PORT:4100" \
+    -p "127.0.0.1:$CDP_HOST_PORT:9223" \
+    -p "127.0.0.1:$WEBUI_CDP_HOST_PORT:9225" \
+    -e "PATH=$path_env" \
+    -e "HOME=$LAB_ROOT/harness-home" \
+    -e "XDG_CONFIG_HOME=$LAB_ROOT/harness-home/.config" \
+    -e "CODEX_HOME=$LAB_ROOT/harness-home/.codex" \
+    -e "CLAUDE_CONFIG_DIR=$LAB_ROOT/harness-home/.claude" \
+    -e "HERMES_HOME=$LAB_ROOT/harness-home/.hermes" \
+    -e "NEXUS_OPENCODE_HOME=$LAB_ROOT/harness-home/.opencode-nexus" \
+    -e "OPENCODE_DB=$LAB_ROOT/harness-home/.opencode-nexus/opencode.db" \
+    -e "NEXUS_LAB_ROOT=$LAB_ROOT" \
+    -e "NEXUS_LAB_MODE=$mode" \
+    -e "NEXUS_V015_RUN_ID=$V015_RUN_ID" \
+    -e "NEXUS_HOME=$LAB_ROOT/nexus" \
+    -e "NEXUS_DB_PATH=$LAB_ROOT/nexus/nexus.db" \
+    -e "NEXUS_SOCKET_PATH=$LAB_ROOT/nexus/nexus.sock" \
+    -e "NEXUS_GATEWAY_DB=file:$LAB_ROOT/gateway/gateway.db" \
+    -e "NEXUS_STREAM_DB_PATH=/dev/shm/nexus-stream.db" \
+    -e "NEXUS_GATEWAY_BIND=127.0.0.1" \
+    -e "NEXUS_GATEWAY_PORT=4101" \
+    -e "NEXUS_WEB_AUTH_MODE=remote-human" \
+    -e "NEXUS_GATEWAY_BIN=/tmp/nexus-lab-bin/nexus-gateway" \
+    -e "NEXUS_WEBUI_BIN=/tmp/nexus-lab-bin/nexus-webui" \
+    -e "LENS_DATA_HOME=$LAB_ROOT/lens-data" \
+    -e "EGREGORE_LENS_DATA_HOME=$LAB_ROOT/lens-data" \
+    -e "LENS_CDP_URL=http://127.0.0.1:9222" \
+    -e "OCULAR_WEBUI_CDP_URL=http://127.0.0.1:9224" \
+    -e "OCULAR_WEBUI_URL=http://127.0.0.1:4200" \
+    -e "OCULAR_LAB=1" \
+    -e "DISPLAY=:99" \
+    -e "ANTHROPIC_MODEL=$CLAUDE_MODEL" \
+    -e "RUST_MIN_STACK=33554432" \
+    -v "$REPO:/work/egregore-nexus:rw" \
+    -v "$LENS_REPO:/work/egregore-lens:rw" \
+    -v "$EGREGORE_REPO:/work/egregore-v2:rw" \
+    -v "$PACTREE_REPO:/work/pactree:rw" \
+    -v "$PACTREE_PY_REPO:/work/pactree-py:rw" \
+    -v "$PACTREE_FS_REPO:/work/pactree-fs:rw" \
+    -v "${NAME}-gateway-node:/work/egregore-nexus/gateway/node_modules" \
+    -v "${NAME}-lens-node:/work/egregore-lens/node_modules" \
+    "${run_args[@]}" \
+    -w /work/egregore-nexus \
+    "$IMAGE" sleep infinity)
+  [[ "$new_id" =~ ^[0-9a-f]{12,64}$ ]] \
+    || die "Docker run did not return an immutable container ID: ${new_id:-missing}"
+
+  local setup_status
+  set +e
+  (
+    set -e
+    require_named_container_id "$new_id"
+    require_lens_lab_ownership
+    require_container_lab_mode "$mode"
+    ACTIVE_CONTAINER_ID=$new_id
+    if [ "$mode" = packed ]; then
+      verify_packed_host_config "$new_id"
+    fi
+
+    docker exec --user 0:0 "$new_id" bash -c \
+      "install -d -o '$HOST_UID' -g '$HOST_GID' -m 0700 '$LAB_ROOT' '$LAB_ROOT/harness-home' '$LAB_ROOT/harness-home/.config' '$LAB_ROOT/nexus' '$LAB_ROOT/gateway' '$LAB_ROOT/lens-data' '$LAB_ROOT/lab' '$LAB_ROOT/evidence'; install -d -o 0 -g 0 -m 0700 /tmp/nexus-v015-evidence; chown -R '$HOST_UID:$HOST_GID' /work/egregore-nexus/gateway/node_modules /work/egregore-lens/node_modules"
+    prepare_host_harnesses
+
+    build_lab_candidate "$mode"
+    docker exec --user 0:0 "$new_id" bash -c '
+      set -euo pipefail
+      chown root:root /tmp/nexus-lab-bin \
+        /tmp/nexus-lab-bin/lab-process /tmp/nexus-lab-bin/lab-agent /tmp/nexus-lab-bin/lab-fixture \
+        /tmp/nexus-lab-bin/nexus-v015-ws-acceptance /tmp/nexus-lab-bin/nexus-v015-ws-soak \
+        /tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance /tmp/nexus-lab-bin/nexus-v015-webconsole-evidence-verify \
+        /tmp/nexus-lab-bin/nexus-v015-evidence-validate /tmp/nexus-lab-bin/nexus-v015-release-assemble \
+        /tmp/nexus-lab-bin/nexus-hooks-practical-gate
+      chmod 0555 /tmp/nexus-lab-bin \
+        /tmp/nexus-lab-bin/lab-process /tmp/nexus-lab-bin/lab-agent /tmp/nexus-lab-bin/lab-fixture \
+        /tmp/nexus-lab-bin/nexus-v015-ws-acceptance /tmp/nexus-lab-bin/nexus-v015-ws-soak \
+        /tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance /tmp/nexus-lab-bin/nexus-v015-webconsole-evidence-verify \
+        /tmp/nexus-lab-bin/nexus-v015-evidence-validate /tmp/nexus-lab-bin/nexus-v015-release-assemble \
+        /tmp/nexus-lab-bin/nexus-hooks-practical-gate
+      if [ "$NEXUS_LAB_MODE" = packed ]; then
+        chown root:root /tmp/nexus-lab-packs /tmp/nexus-lab-packs/*.tgz
+        chmod 0555 /tmp/nexus-lab-packs
+        chmod 0444 /tmp/nexus-lab-packs/*.tgz
+        lens_app=$(readlink -f /tmp/nexus-lab-bin/lens-app)
+        case "$lens_app" in /tmp/nexus-lens-app.*) ;; *) exit 42 ;; esac
+        chown -R root:root "$lens_app"
+        find "$lens_app" -type d -exec chmod 0555 {} +
+        find "$lens_app" -type f -exec chmod 0444 {} +
+        chown -h root:root /tmp/nexus-lab-bin/lens-app
+      fi
+    '
+    record_lab_readiness "$new_id" "$mode" >/dev/null
+    seal_lab_readiness "$new_id"
+    start_lab_stack "$mode"
+    require_named_container_id "$new_id"
+    require_container_lab_mode "$mode"
+    if [ "$mode" = packed ]; then
+      verify_packed_host_config "$new_id"
+    fi
+    verify_lab_readiness "$new_id" "$mode" >/dev/null
+    if [ "$mode" = packed ] && [ -x "$REPO/scripts/nexus-v015-lab-manifest" ]; then
+      "$REPO/scripts/nexus-v015-lab-manifest" --container "$new_id" --mode "$mode"
+    fi
+    cmd_lab_status --mode "$mode"
+  )
+  setup_status=$?
+  set -e
+  if [ "$setup_status" -ne 0 ]; then
+    cleanup_verified_new_lab "$new_id" "$mode"
+    return "$setup_status"
+  fi
+}
+
+parse_lab_mode_only() {
+  local command=$1
+  shift
+  PARSED_LAB_MODE=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mode)
+        [ $# -ge 2 ] || die "--mode requires source or packed"
+        PARSED_LAB_MODE=$2
+        shift 2
+        ;;
+      *) die "unknown $command argument: $1" ;;
+    esac
+  done
+  [ -n "$PARSED_LAB_MODE" ] || die "$command requires --mode source or packed"
+  case "$PARSED_LAB_MODE" in
+    source|packed) ;;
+    *) die "$command mode must be source or packed" ;;
+  esac
+}
+
+cmd_lab_status() {
+  parse_lab_mode_only lab-status "$@"
+  local mode=$PARSED_LAB_MODE
+  prepare_existing_lab "$mode"
+  [ "$CONTAINER_RUNNING" = true ] || die "container $NAME is not running"
+  printf 'container=%s cpus=%s memory=%s pids=%s\n' "$NAME" "$CPUS" "$MEMORY" "$PIDS_LIMIT"
+  printf 'gateway=http://127.0.0.1:%s lens_cdp=http://127.0.0.1:%s webui_cdp=http://127.0.0.1:%s\n' \
+    "$HOST_PORT" "$CDP_HOST_PORT" "$WEBUI_CDP_HOST_PORT"
+  exec_bash 'set -euo pipefail
+    set -- \
+      "$NEXUS_HOME/daemon.pid:daemon" \
+      "$NEXUS_LAB_ROOT/lab/gateway-proxy.pid:gateway-proxy" \
+      "$NEXUS_LAB_ROOT/lab/xvfb.pid:xvfb"
+    if [ "$NEXUS_LAB_MODE" = source ]; then
+      set -- "$@" "$NEXUS_LAB_ROOT/lab/vite.pid:vite"
+    fi
+    set -- "$@" \
+      "$NEXUS_LAB_ROOT/lab/lens.pid:lens" \
+      "$NEXUS_LAB_ROOT/lab/webui-browser.pid:webui-browser"
+    for item in "$@"; do
+      path=${item%%:*}; label=${item#*:}; pid=$(cat "$path" 2>/dev/null || true)
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then state=live; else state=down; fi
+      printf "%s=%s pid=%s\n" "$label" "$state" "${pid:-none}"
+    done
+    curl -fsS http://127.0.0.1:4100/api/v1/health
+    echo
+    /tmp/nexus-lab-bin/nexus webconsole status
+    curl -fsS http://127.0.0.1:4200/health >/dev/null
+    curl -fsS http://127.0.0.1:9222/json/version >/dev/null
+    curl -fsS http://127.0.0.1:9224/json/version >/dev/null'
+}
+
+cmd_lab_readiness() {
+  parse_lab_mode_only lab-readiness "$@"
+  local mode=$PARSED_LAB_MODE id verified
+  require_v015_run_id
+  validate_packed_resource_request "$mode"
+  refresh_named_container || die "container $NAME does not exist"
+  require_lens_lab_ownership
+  require_container_lab_mode "$mode"
+  [ "$CONTAINER_RUNNING" = true ] || die "container $NAME is not running"
+  id=$CONTAINER_ID
+  ACTIVE_CONTAINER_ID=$id
+  if [ "$mode" = packed ]; then
+    verify_packed_host_config "$id"
+  fi
+
+  verified=$(verify_lab_readiness "$id" "$mode")
+  if [ "$mode" = packed ]; then
+    verify_packed_manifest_binding "$id" >/dev/null
+  fi
+  require_named_container_id "$id"
+  require_lens_lab_ownership
+  require_container_lab_mode "$mode"
+  printf 'lab readiness verified: container=%s mode=%s runId=%s receipt=%s\n' \
+    "$id" "$mode" "$V015_RUN_ID" "$LAB_ROOT/lab/candidate-ready.v1"
+  printf '%s\n' "$verified"
+}
+
+cmd_lab_gate() {
+  local mode="" run_backend=0 run_ocular=0 run_webui=0 run_soak=0 requested_all=0
+  local release_capture_dir="" host_before_snapshot="" host_after_snapshot=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all) requested_all=1; run_backend=1; run_ocular=1; run_webui=1; shift ;;
+      --backend-only) run_backend=1; shift ;;
+      --ocular) run_ocular=1; shift ;;
+      --webui) run_webui=1; shift ;;
+      --soak)
+        [ $# -ge 2 ] || die "--soak requires exactly 1800"
+        [ "$2" = 1800 ] || die "--soak must be exactly 1800 seconds"
+        run_soak=1
+        shift 2
+        ;;
+      --mode)
+        [ $# -ge 2 ] || die "--mode requires source or packed"
+        mode=$2
+        shift 2
+        ;;
+      *) die "unknown lab-gate argument: $1" ;;
+    esac
+  done
+  [ -n "$mode" ] || die "lab-gate requires --mode source or packed"
+  case "$mode" in
+    packed) ;;
+    source) die "v0.1.5 acceptance publication requires lab-gate --mode packed" ;;
+    *) die "lab-gate mode must be source or packed" ;;
+  esac
+  if [ "$run_soak" -eq 1 ] && [ "$requested_all" -ne 1 ]; then
+    die "release sealing requires lab-gate --mode packed --all --soak 1800"
+  fi
+  if [ "$run_soak" -eq 1 ]; then
+    release_capture_dir=$(mktemp -d "${TMPDIR:-/tmp}/nexus-v015-release-inputs.XXXXXX")
+    local release_cleanup
+    printf -v release_cleanup 'rm -rf -- %q' "$release_capture_dir"
+    trap "$release_cleanup" EXIT
+    host_before_snapshot="$release_capture_dir/host-before.json"
+    host_after_snapshot="$release_capture_dir/host-after.json"
+    "$REPO/scripts/nexus-v015-host-isolation-snapshot" \
+      --home "$HOST_NEXUS_HOME" snapshot >"$host_before_snapshot"
+    chmod 0400 "$host_before_snapshot"
+  fi
+  prepare_existing_lab "$mode"
+  [ "$CONTAINER_RUNNING" = true ] || die "container $NAME is not running"
+  if [ "$run_backend" -eq 0 ] && [ "$run_ocular" -eq 0 ] && [ "$run_webui" -eq 0 ]; then
+    run_backend=1; run_ocular=1; run_webui=1
+  fi
+  if [ "$run_backend" -eq 1 ]; then
+    exec_interactive bash -lc '/tmp/nexus-lab-bin/nexus-v015-ws-acceptance --mode "${NEXUS_LAB_MODE:-source}" --evidence-dir "$NEXUS_LAB_ROOT/evidence"'
+  fi
+  if [ "$requested_all" -eq 1 ]; then
+    exec_interactive bash -lc '/tmp/nexus-lab-bin/nexus-hooks-practical-gate --packed-v015 --evidence-dir "$NEXUS_LAB_ROOT/evidence" --run-id "$NEXUS_V015_RUN_ID"'
+  fi
+  local readiness_sha256="" candidate_digest="" candidate_sha256=""
+  if [ "$run_ocular" -eq 1 ] || [ "$run_webui" -eq 1 ]; then
+    readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" "$mode")
+    candidate_digest=$(docker exec -i "$CONTAINER_ID" \
+      /tmp/nexus-lab-bin/nexus-v015-release-assemble \
+        --run-root "$LAB_ROOT/evidence/$V015_RUN_ID" \
+        --print-candidate-digest)
+    [[ "$candidate_digest" =~ ^sha256:[0-9a-f]{64}$ ]] \
+      || die "candidate manifest produced an invalid candidate digest"
+    candidate_sha256=${candidate_digest#sha256:}
+    local post_digest_readiness_sha256
+    post_digest_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" "$mode")
+    [ "$post_digest_readiness_sha256" = "$readiness_sha256" ] \
+      || die "candidate readiness ledger changed during candidate digest derivation"
+  fi
+  # Both renderer catalogs depend on genuine, run-bound Codex and Claude
+  # identities.  Provision them once for either entry point so a standalone
+  # --webui gate cannot accidentally grade optimistic rows or ambient roster
+  # state as live-agent evidence.
+  if [ "$run_ocular" -eq 1 ] || [ "$run_webui" -eq 1 ]; then
+    docker exec -i \
+      -e "NEXUS_V015_RUN_ID=$V015_RUN_ID" \
+      -e "NEXUS_V015_READINESS_LEDGER_SHA256=$readiness_sha256" \
+      "$CONTAINER_ID" lab-agent launch codex
+    docker exec -i \
+      -e "NEXUS_V015_RUN_ID=$V015_RUN_ID" \
+      -e "NEXUS_V015_READINESS_LEDGER_SHA256=$readiness_sha256" \
+      "$CONTAINER_ID" lab-agent launch claude
+    local post_agent_readiness_sha256
+    post_agent_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" "$mode")
+    [ "$post_agent_readiness_sha256" = "$readiness_sha256" ] \
+      || die "candidate readiness ledger changed during live-agent launch"
+  fi
+  if [ "$run_ocular" -eq 1 ]; then
+    docker exec -i \
+      -e "NEXUS_V015_RUN_ID=$V015_RUN_ID" \
+      -e "NEXUS_V015_READINESS_LEDGER_SHA256=$post_agent_readiness_sha256" \
+      -e "NEXUS_V015_CANDIDATE_SHA256=$candidate_sha256" \
+      -w /work/egregore-lens "$CONTAINER_ID" node tests/ocular/run.mjs --release
+  fi
+  if [ "$run_webui" -eq 1 ]; then
+    readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" "$mode")
+    if [ "$mode" = packed ]; then
+      exec_interactive bash -lc '/tmp/nexus-lab-bin/nexus webconsole stop --force >"$NEXUS_LAB_ROOT/lab/webconsole-d2-preflight-stop.log"'
+      exec_interactive bash -lc '/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance --nexus-bin /tmp/nexus-lab-bin/nexus --run-id "$NEXUS_V015_RUN_ID" --evidence-root "$NEXUS_LAB_ROOT/evidence/$NEXUS_V015_RUN_ID"'
+      local post_webconsole_readiness_sha256
+      post_webconsole_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" "$mode")
+      [ "$post_webconsole_readiness_sha256" = "$readiness_sha256" ] \
+        || die "candidate readiness ledger changed during Webconsole acceptance"
+      exec_interactive bash -lc '/tmp/nexus-lab-bin/nexus webconsole start --host 127.0.0.1 --port 4200 >"$NEXUS_LAB_ROOT/lab/webconsole-ocular-start.log"'
+      wait_lab_http "http://127.0.0.1:4200/health" "Nexus Webconsole after D2"
+    else
+      wait_lab_http "http://127.0.0.1:4200/health" "source-mode Nexus Webconsole"
+    fi
+    local post_webconsole_readiness_sha256
+    post_webconsole_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" "$mode")
+    [ "$post_webconsole_readiness_sha256" = "$readiness_sha256" ] \
+      || die "candidate readiness ledger changed before WebUI ocular acceptance"
+    docker exec -i \
+      -e "NEXUS_V015_RUN_ID=$V015_RUN_ID" \
+      -e "NEXUS_V015_READINESS_LEDGER_SHA256=$post_webconsole_readiness_sha256" \
+      -e "NEXUS_V015_CANDIDATE_SHA256=$candidate_sha256" \
+      -w /work/egregore-lens "$CONTAINER_ID" node tests/ocular/webui-run.mjs --release
+  fi
+  if [ "$requested_all" -eq 1 ]; then
+    local surface_readiness_sha256 surface_candidate_digest
+    surface_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" "$mode")
+    [ "$surface_readiness_sha256" = "$readiness_sha256" ] \
+      || die "candidate readiness ledger changed before live Lens plugin acceptance"
+    surface_candidate_digest=$(docker exec -i "$CONTAINER_ID" \
+      /tmp/nexus-lab-bin/nexus-v015-release-assemble \
+        --run-root "$LAB_ROOT/evidence/$V015_RUN_ID" \
+        --print-candidate-digest)
+    [ "$surface_candidate_digest" = "$candidate_digest" ] \
+      || die "candidate manifest digest changed before live Lens plugin acceptance"
+
+    # The live gate gets an explicit clean environment.  The Lens client must
+    # select the gateway through its visible manual affordance; inherited
+    # host/session Nexus identity or a hidden gateway/bearer override is a
+    # release failure, not configuration.
+    docker exec -i -w /work/egregore-lens "$CONTAINER_ID" env -i \
+      PATH=/tmp/nexus-lab-bin:/usr/local/bin:/usr/bin:/bin \
+      HOME="$LAB_ROOT/harness-home" \
+      XDG_CONFIG_HOME="$LAB_ROOT/harness-home/.config" \
+      NEXUS_HOME="$LAB_ROOT/nexus" \
+      LENS_DATA_HOME="$LAB_ROOT/lens-data" \
+      NEXUS_LAB_ROOT="$LAB_ROOT" \
+      NEXUS_V015_RUN_ID="$V015_RUN_ID" \
+      NEXUS_V015_READINESS_LEDGER_SHA256="$surface_readiness_sha256" \
+      NEXUS_V015_CANDIDATE_DIGEST="$candidate_digest" \
+      OCULAR_LAB=1 \
+      LENS_CDP_URL=http://127.0.0.1:9222 \
+      OCULAR_GATEWAY_URL=http://127.0.0.1:4100 \
+      OCULAR_EVIDENCE_DIR="$LAB_ROOT/evidence/$V015_RUN_ID" \
+      node tests/ocular/live-plugin.mjs --release
+    local post_live_readiness_sha256
+    post_live_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" "$mode")
+    [ "$post_live_readiness_sha256" = "$surface_readiness_sha256" ] \
+      || die "candidate readiness ledger changed during live Lens plugin acceptance"
+
+    docker exec -i -w /work/egregore-lens "$CONTAINER_ID" env -i \
+      PATH=/usr/local/bin:/usr/bin:/bin \
+      HOME="$LAB_ROOT/harness-home" \
+      XDG_CONFIG_HOME="$LAB_ROOT/harness-home/.config" \
+      NEXUS_HOME="$LAB_ROOT/nexus" \
+      LENS_DATA_HOME="$LAB_ROOT/lens-data" \
+      NEXUS_LAB_ROOT="$LAB_ROOT" \
+      NEXUS_V015_RUN_ID="$V015_RUN_ID" \
+      NEXUS_V015_READINESS_LEDGER_SHA256="$post_live_readiness_sha256" \
+      NEXUS_V015_CANDIDATE_DIGEST="$candidate_digest" \
+      OCULAR_LAB=1 \
+      OCULAR_EVIDENCE_DIR="$LAB_ROOT/evidence/$V015_RUN_ID" \
+      node tests/ocular/aggregate.mjs --release
+    local post_aggregate_readiness_sha256
+    post_aggregate_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" "$mode")
+    [ "$post_aggregate_readiness_sha256" = "$surface_readiness_sha256" ] \
+      || die "candidate readiness ledger changed during Lens evidence aggregation"
+  fi
+  if [ "$run_soak" -eq 1 ]; then
+    require_named_container_id "$CONTAINER_ID"
+    require_lens_lab_ownership
+    require_container_lab_mode packed
+    verify_packed_host_config "$CONTAINER_ID"
+    verify_lab_readiness "$CONTAINER_ID" packed >/dev/null
+    exec_interactive bash -lc '
+      set -euo pipefail
+      ready="$NEXUS_LAB_ROOT/lab/candidate-ready.v1"
+      [ -f "$ready" ] && [ ! -L "$ready" ] && [ "$(stat -c %h "$ready")" = 1 ] \
+        || { echo "candidate readiness ledger is missing or unsafe" >&2; exit 1; }
+      ledger_value() {
+        local key=$1 count value
+        count=$(awk -F= -v key="$key" "\$1 == key { count += 1 } END { print count + 0 }" "$ready")
+        [ "$count" = 1 ] \
+          || { echo "candidate readiness ledger has an invalid $key field" >&2; exit 1; }
+        value=$(awk -F= -v key="$key" "\$1 == key { print substr(\$0, length(key) + 2) }" "$ready")
+        [ -n "$value" ] \
+          || { echo "candidate readiness ledger has an empty $key field" >&2; exit 1; }
+        printf "%s\n" "$value"
+      }
+      [ "$(ledger_value schema)" = 1 ] \
+        || { echo "candidate readiness ledger schema mismatch" >&2; exit 1; }
+      [ "$(ledger_value mode)" = packed ] \
+        || { echo "candidate readiness ledger is not packed" >&2; exit 1; }
+      [ "$(ledger_value runId)" = "$NEXUS_V015_RUN_ID" ] \
+        || { echo "candidate readiness runId mismatch" >&2; exit 1; }
+      NEXUS_V015_READINESS_LEDGER_SHA256=$(sha256sum "$ready" | awk "{print \$1}")
+      [[ "$NEXUS_V015_READINESS_LEDGER_SHA256" =~ ^[0-9a-f]{64}$ ]] \
+        || { echo "candidate readiness ledger hash is invalid" >&2; exit 1; }
+      export NEXUS_V015_READINESS_LEDGER_SHA256
+      export NEXUS_V015_SOAK_PASSWORD="v015-soak-$NEXUS_V015_RUN_ID"
+      lab-agent launch codex
+      lab-agent launch claude
+      /tmp/nexus-lab-bin/nexus-v015-ws-soak
+    '
+    "$REPO/scripts/nexus-v015-host-isolation-snapshot" \
+      --home "$HOST_NEXUS_HOME" snapshot >"$host_after_snapshot"
+    chmod 0400 "$host_after_snapshot"
+    "$REPO/scripts/nexus-v015-host-isolation-snapshot" compare \
+      "$host_before_snapshot" "$host_after_snapshot" >/dev/null
+
+    local assembly_readiness_sha256 release_input_dir run_root
+    assembly_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" packed)
+    [ "$assembly_readiness_sha256" = "$surface_readiness_sha256" ] \
+      || die "candidate readiness ledger changed before release assembly"
+    release_input_dir="$LAB_ROOT/lab/release-inputs-$V015_RUN_ID"
+    run_root="$LAB_ROOT/evidence/$V015_RUN_ID"
+    docker exec --user 0:0 -i \
+      -e "NEXUS_V015_RELEASE_INPUT_DIR=$release_input_dir" \
+      "$CONTAINER_ID" bash -lc '
+        set -euo pipefail
+        [ ! -e "$NEXUS_V015_RELEASE_INPUT_DIR" ] \
+          || { echo "release assembly input directory already exists" >&2; exit 1; }
+        install -d -o 0 -g 0 -m 0700 "$NEXUS_V015_RELEASE_INPUT_DIR"
+      '
+    docker cp "$host_before_snapshot" \
+      "$CONTAINER_ID:$release_input_dir/host-before.json"
+    docker cp "$host_after_snapshot" \
+      "$CONTAINER_ID:$release_input_dir/host-after.json"
+    docker exec --user 0:0 -i \
+      -e "NEXUS_V015_RELEASE_INPUT_DIR=$release_input_dir" \
+      "$CONTAINER_ID" bash -lc '
+        set -euo pipefail
+        chown 0:0 "$NEXUS_V015_RELEASE_INPUT_DIR/host-before.json" \
+          "$NEXUS_V015_RELEASE_INPUT_DIR/host-after.json"
+        chmod 0400 "$NEXUS_V015_RELEASE_INPUT_DIR/host-before.json" \
+          "$NEXUS_V015_RELEASE_INPUT_DIR/host-after.json"
+        umask 077
+        cargo metadata --manifest-path /work/egregore-nexus/core/Cargo.toml \
+          --format-version 1 --no-deps \
+          >"$NEXUS_V015_RELEASE_INPUT_DIR/cargo-metadata.json"
+        chmod 0400 "$NEXUS_V015_RELEASE_INPUT_DIR/cargo-metadata.json"
+        python3 - "$NEXUS_V015_RELEASE_INPUT_DIR" <<"PY"
+import os
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+for name in ("host-before.json", "host-after.json", "cargo-metadata.json"):
+    descriptor = os.open(root / name, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+PY
+      '
+    docker exec --user 0:0 -i \
+      -e "NEXUS_V015_RUN_ID=$V015_RUN_ID" \
+      -e "NEXUS_V015_CANDIDATE_DIGEST=$candidate_digest" \
+      "$CONTAINER_ID" python3 - "$run_root" \
+        "$release_input_dir/diff-review.json" <<'PY'
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+
+run_root = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+run_id = os.environ["NEXUS_V015_RUN_ID"]
+candidate = os.environ["NEXUS_V015_CANDIDATE_DIGEST"]
+
+def load(path: Path) -> dict[str, object]:
+    with path.open("r", encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise SystemExit(f"release input is not an object: {path}")
+    return value
+
+manifest = load(run_root / "manifest.json")
+sources = manifest.get("sources")
+if not isinstance(sources, dict) or not sources:
+    raise SystemExit("candidate manifest has no source ledger")
+source_rows = []
+for name, row in sorted(sources.items()):
+    if not isinstance(row, dict) or not isinstance(row.get("revision"), str):
+        raise SystemExit(f"candidate source row is invalid: {name}")
+    dirty = row.get("dirty")
+    dirty_paths = row.get("dirtyPaths")
+    if dirty is not False or dirty_paths != []:
+        raise SystemExit(f"candidate source is not clean: {name}")
+    source_rows.append(
+        {
+            "source": name,
+            "revision": row["revision"],
+            "dirty": dirty,
+            "dirtyPaths": dirty_paths,
+        }
+    )
+
+result_paths = {
+    "B1": "results/B1-stable-identity/result.json",
+    "B2": "results/B2-restart-reconciliation/result.json",
+    "C1": "results/C1-browser-mutation-security/result.json",
+    "C2": "results/C2-developer-event-websocket/result.json",
+    "C3": "results/C3-agent-session-websocket/result.json",
+    "C4": "results/C4-rest-websocket-agreement/result.json",
+    "D1": "results/D1-clean-packed-install/result.json",
+    "D2": "results/D2-webconsole-cli/result.json",
+    "D3": "results/D3-webui-browser/result.json",
+    "E1": "results/E1-pactbin2-session-store/result.json",
+    "E2": "results/E2-lens-ocular/result.json",
+    "F1": "results/F1-live-codex-claude/result.json",
+    "F2": "results/F2-message-hooks/result.json",
+    "F3": "results/F3-restart-soak/result.json",
+}
+review_rows = []
+for gate, relative in result_paths.items():
+    path = run_root / relative
+    document = load(path)
+    if (
+        document.get("gate") != gate
+        or document.get("runId") != run_id
+        or document.get("candidateDigest") != candidate
+        or document.get("status") != "PASS"
+    ):
+        raise SystemExit(f"canonical pre-assembly result is not a bound PASS: {gate}")
+    review_rows.append(
+        {
+            "gate": gate,
+            "status": "PASS",
+            "resultSha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    )
+
+payload = {
+    "schemaVersion": 1,
+    "runId": run_id,
+    "candidateDigest": candidate,
+    "diff": {
+        "unexpectedChanges": 0,
+        "trackedDiff": source_rows,
+        "untrackedInventory": [
+            {"source": row["source"], "entries": []} for row in source_rows
+        ],
+        "intendedChanges": [
+            {"source": row["source"], "revision": row["revision"]}
+            for row in source_rows
+        ],
+    },
+    "review": {
+        "unresolvedBlockers": 0,
+        "reviewReport": review_rows,
+        "blockerDisposition": [
+            {
+                "status": "closed",
+                "basis": "all canonical pre-assembly result documents are candidate-bound PASS",
+            }
+        ],
+    },
+}
+data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+descriptor = os.open(
+    destination,
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+    0o400,
+)
+try:
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short write")
+        view = view[written:]
+    os.fchmod(descriptor, 0o400)
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+parent = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+try:
+    os.fsync(parent)
+finally:
+    os.close(parent)
+PY
+    docker exec --user 0:0 -i "$CONTAINER_ID" \
+      /tmp/nexus-lab-bin/nexus-v015-release-assemble \
+        --run-root "$run_root" \
+        --host-before "$release_input_dir/host-before.json" \
+        --host-after "$release_input_dir/host-after.json" \
+        --diff-review "$release_input_dir/diff-review.json" \
+        --cargo-metadata "$release_input_dir/cargo-metadata.json" \
+        --nexus-bin /tmp/nexus-lab-bin/nexus \
+        --readiness-sha256 "$assembly_readiness_sha256"
+    require_named_container_id "$CONTAINER_ID"
+    require_lens_lab_ownership
+    require_container_lab_mode packed
+    verify_packed_host_config "$CONTAINER_ID"
+    verify_lab_readiness "$CONTAINER_ID" packed >/dev/null
+    local final_readiness_sha256
+    final_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" packed)
+    [ "$final_readiness_sha256" = "$assembly_readiness_sha256" ] \
+      || die "candidate readiness ledger changed during release assembly"
+    docker exec --user 0:0 -i \
+      -e "NEXUS_LAB_ROOT=$LAB_ROOT" \
+      -e "NEXUS_V015_RUN_ID=$V015_RUN_ID" \
+      -e "NEXUS_V015_CONTAINER_ID=$CONTAINER_ID" \
+      -e "NEXUS_V015_READINESS_LEDGER_SHA256=$final_readiness_sha256" \
+      "$CONTAINER_ID" bash -lc '
+        set -euo pipefail
+        authority=/tmp/nexus-v015-evidence
+        [ -d "$authority" ] && [ ! -L "$authority" ] \
+          && [ "$(stat -c %u:%g:%a "$authority")" = 0:0:700 ] \
+          || { echo "canonical evidence authority is missing or invalid" >&2; exit 1; }
+        run_root="$NEXUS_LAB_ROOT/evidence/$NEXUS_V015_RUN_ID"
+        /tmp/nexus-lab-bin/nexus-v015-evidence-validate --seal "$run_root"
+        /tmp/nexus-lab-bin/nexus-v015-evidence-validate "$run_root"
+      '
+    require_named_container_id "$CONTAINER_ID"
+    require_lens_lab_ownership
+    require_container_lab_mode packed
+    verify_packed_host_config "$CONTAINER_ID"
+    verify_lab_readiness "$CONTAINER_ID" packed >/dev/null
+    local post_seal_readiness_sha256
+    post_seal_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" packed)
+    [ "$post_seal_readiness_sha256" = "$final_readiness_sha256" ] \
+      || die "candidate readiness ledger changed during final evidence sealing"
+  fi
+}
+
+cmd_lab_evidence() {
+  parse_lab_mode_only lab-evidence "$@"
+  local mode=$PARSED_LAB_MODE
+  prepare_existing_lab "$mode"
+  [ "$CONTAINER_RUNNING" = true ] || die "container $NAME is not running"
+  exec_bash 'find "$NEXUS_LAB_ROOT/evidence" -maxdepth 2 -type f -print | sort; latest=$(find "$NEXUS_LAB_ROOT/evidence" -name manifest.json -type f -printf "%T@ %p\n" 2>/dev/null | sort -nr | head -n1 | cut -d" " -f2-); if [ -n "$latest" ]; then cat "$latest"; fi'
+}
+
+cmd_lab_down() {
+  parse_lab_mode_only lab-down "$@"
+  local mode=$PARSED_LAB_MODE id
+  if ! refresh_named_container; then
+    echo "container $NAME does not exist"
+    return 0
+  fi
+  require_lens_lab_ownership
+  require_container_lab_mode "$mode"
+  id=$CONTAINER_ID
+  remove_verified_named_container "$id" lens "$mode"
+  echo "removed $NAME ($id)"
 }
 
 cmd_status() {
@@ -619,24 +2378,45 @@ PY'
 
 cmd_logs() {
   container_running || die "container $NAME is not running"
-  docker exec -it "$NAME" bash -c 'tail -n 200 -f /tmp/nexus-home/daemon.log'
+  docker exec -it "$CONTAINER_ID" bash -c 'tail -n 200 -f /tmp/nexus-home/daemon.log'
 }
 
 cmd_down() {
-  if container_exists; then
-    docker rm -f "$NAME" >/dev/null
-    echo "removed $NAME"
-  else
+  local id
+  if ! refresh_named_container; then
     echo "container $NAME does not exist"
+    return 0
   fi
+  case "$CONTAINER_KIND" in
+    lens)
+      echo "preserving Lens lab $NAME; use lab-down --mode ${CONTAINER_MODE_LABEL:-source}"
+      ;;
+    normal)
+      id=$CONTAINER_ID
+      remove_verified_named_container "$id" normal
+      echo "removed $NAME ($id)"
+      ;;
+    *) die "refusing to remove foreign container $NAME" ;;
+  esac
 }
 
 cmd_clean() {
-  docker ps -a \
+  local ids id
+  if ! ids=$(docker ps -a --no-trunc \
     --filter label=egregore-nexus-test=true \
     --filter status=exited \
-    --format '{{.Names}}' \
-    | xargs -r docker rm >/dev/null
+    --format '{{.ID}}'); then
+    die "Docker container listing failed while cleaning stopped validators"
+  fi
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    inspect_container_identity "$id"
+    case "$CONTAINER_KIND" in
+      lens) printf 'preserving stopped Lens lab %s\n' "$id" ;;
+      normal) docker rm "$id" >/dev/null ;;
+      *) die "refusing to clean container $id with invalid ownership" ;;
+    esac
+  done <<<"$ids"
 }
 
 case "${1:-}" in
@@ -650,6 +2430,12 @@ case "${1:-}" in
   logs) shift; cmd_logs "$@" ;;
   down) shift; cmd_down "$@" ;;
   clean) shift; cmd_clean "$@" ;;
+  lab-up) shift; cmd_lab_up "$@" ;;
+  lab-status) shift; cmd_lab_status "$@" ;;
+  lab-readiness) shift; cmd_lab_readiness "$@" ;;
+  lab-gate) shift; cmd_lab_gate "$@" ;;
+  lab-evidence) shift; cmd_lab_evidence "$@" ;;
+  lab-down) shift; cmd_lab_down "$@" ;;
   -h|--help|help|"") usage ;;
   *) usage >&2; die "unknown command: $1" ;;
 esac

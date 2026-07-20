@@ -1,0 +1,1159 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TARGET="$SCRIPT_DIR/nexus-v015-ws-soak"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+[ -x "$TARGET" ] || { echo "missing executable soak producer: $TARGET" >&2; exit 1; }
+grep -Fq 'RELEASE_DURATION_SECONDS = 1800' "$TARGET"
+! grep -Fq 'NEXUS_V015_SOAK_DURATION' "$TARGET"
+! grep -Eq -- '--duration|--seconds|--evidence-root' "$TARGET"
+
+# F3 is packed-only. Its process, listener, and CDP evidence must describe the
+# built Electron renderer rather than the source-mode Vite development stack.
+if grep -Eq 'vite\.pid|127\.0\.0\.1:1422|[,( ]1422[), ]' "$TARGET"; then
+  echo 'packed WS soak must not require the Lens Vite development server' >&2
+  exit 1
+fi
+grep -Fq 'cdp_runtime_probe(LENS_CDP_URL, "file://", "Lens")' "$TARGET"
+
+python3 - "$TARGET" "$TMP/runner" "$TMP" <<'PY'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+root = Path(sys.argv[3])
+replacements = {
+    'LAB_ROOT_PREFIX = Path("/tmp/nexus-lens-home")': f"LAB_ROOT_PREFIX = Path({str(root / 'lab')!r})",
+    'PACKED_PREFIX_PATTERN = re.compile(r"/tmp/nexus-lab-install\\.[A-Za-z0-9]+")': f"PACKED_PREFIX_PATTERN = re.compile(re.escape({str(root / 'nexus-lab-install.fixture')!r}))",
+    'NEXUS_LAUNCHER = Path("/tmp/nexus-lab-bin/nexus")': f"NEXUS_LAUNCHER = Path({str(root / 'bin' / 'nexus')!r})",
+    'GATEWAY_LAUNCHER = Path("/tmp/nexus-lab-bin/nexus-gateway")': f"GATEWAY_LAUNCHER = Path({str(root / 'bin' / 'nexus-gateway')!r})",
+    'LAB_PROCESS = Path("/tmp/nexus-lab-bin/lab-process")': f"LAB_PROCESS = Path({str(root / 'lab-process')!r})",
+    'WS_ACCEPTANCE = Path("/tmp/nexus-lab-bin/nexus-v015-ws-acceptance")': f"WS_ACCEPTANCE = Path({str(root / 'nexus-v015-ws-acceptance')!r})",
+    'Path("/tmp/nexus-lab-bin/nexus-webui")': f"Path({str(root / 'bin' / 'nexus-webui')!r})",
+    'GATEWAY_URL = "http://127.0.0.1:4100"': 'GATEWAY_URL = "http://127.0.0.1:49100"',
+    'CGROUP_ROOT = Path("/sys/fs/cgroup")': f"CGROUP_ROOT = Path({str(root / 'cgroup')!r})",
+    'PROC_ROOT = Path("/proc")': f"PROC_ROOT = Path({str(root / 'proc')!r})",
+}
+for old, new in replacements.items():
+    if source.count(old) != 1:
+        raise SystemExit(f"test-only seam changed or missing: {old}")
+    source = source.replace(old, new)
+target = Path(sys.argv[2])
+target.write_text(source, encoding="utf-8")
+target.chmod(0o755)
+PY
+
+PYTHONPYCACHEPREFIX="$TMP/pycache" python3 -m py_compile "$TARGET" "$TMP/runner"
+
+python3 - "$TMP/runner" "$TMP" <<'PY'
+from __future__ import annotations
+
+import asyncio
+from collections import Counter
+from contextlib import redirect_stderr
+from copy import deepcopy
+from dataclasses import replace
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import runpy
+import subprocess
+import stat
+import sys
+from types import SimpleNamespace
+
+
+module = runpy.run_path(sys.argv[1])
+tmp = Path(sys.argv[2])
+SoakFailure = module["SoakFailure"]
+
+
+def require(value: object, message: str) -> None:
+    if not value:
+        raise AssertionError(message)
+
+
+def expect_failure(action, contains: str | None = None) -> None:
+    try:
+        action()
+    except SoakFailure as error:
+        if contains is not None and contains.lower() not in str(error).lower():
+            raise AssertionError(
+                f"failure did not mention {contains!r}: {error}"
+            ) from error
+    except BaseException as error:
+        raise AssertionError(
+            f"expected typed SoakFailure, got {type(error).__name__}: {error}"
+        ) from error
+    else:
+        raise AssertionError("operation unexpectedly satisfied a rejecting contract")
+
+
+def expect_path_rejection(action) -> None:
+    try:
+        action()
+    except SoakFailure:
+        return
+    except BaseException as error:
+        raise AssertionError(
+            f"expected typed SoakFailure, got {type(error).__name__}: {error}"
+        ) from error
+    else:
+        raise AssertionError("unsafe filesystem path unexpectedly satisfied the contract")
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def write_executable(path: Path, version: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "[ \"${1:-}\" = --version ]\n"
+        f"printf '%s\\n' {version!r}\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+# The public command is deliberately no-argument and refuses non-container use.
+module["parse_args"]([])
+try:
+    with redirect_stderr(io.StringIO()):
+        module["parse_args"](["--evidence-root", str(tmp)])
+except SystemExit as error:
+    require(error.code != 0, "obsolete evidence-root option was accepted")
+else:
+    raise AssertionError("obsolete evidence-root option was accepted")
+
+saved_lab = os.environ.pop("OCULAR_LAB", None)
+try:
+    expect_failure(
+        lambda: asyncio.run(module["run_gate"](module["parse_args"]([]))),
+        "isolated ocular lab",
+    )
+finally:
+    if saved_lab is not None:
+        os.environ["OCULAR_LAB"] = saved_lab
+
+
+# F3 delegates immutable candidate/seal/package authority to the exact
+# readiness-bound WS acceptance runner before any live work.
+authority_path = module["WS_ACCEPTANCE"]
+authority_path.write_bytes(b"canonical authority fixture\n")
+authority_path.chmod(0o555)
+readiness_path = tmp / "lab" / "lab" / "candidate-ready.v1"
+readiness_path.parent.mkdir(parents=True, exist_ok=True)
+readiness_path.write_text("authority=contract\n", encoding="utf-8")
+candidate = module["Candidate"](
+    run_id="contract-run",
+    digest="sha256:" + "d" * 64,
+    manifest={
+        "environment": {
+            "NEXUS_V015_WS_ACCEPTANCE": str(authority_path),
+            "NEXUS_V015_WS_ACCEPTANCE_SHA256": sha256(authority_path),
+            "NEXUS_V015_READINESS_LEDGER": str(readiness_path),
+        }
+    },
+    packed_prefix=tmp / "nexus-lab-install.fixture",
+    readiness_ledger=readiness_path,
+)
+validated = SimpleNamespace(
+    run_id=candidate.run_id,
+    digest=candidate.digest,
+    install_root=candidate.packed_prefix,
+    manifest={
+        "environment": {
+            "NEXUS_V015_READINESS_LEDGER": str(candidate.readiness_ledger),
+        }
+    },
+)
+real_fstat = os.fstat
+fstat_calls = 0
+
+
+def root_owned_support_fstat(fd: int):
+    global fstat_calls
+    fstat_calls += 1
+    observed = real_fstat(fd)
+    if fstat_calls in {2, 4}:
+        mode = (stat.S_IFDIR | 0o555) if fstat_calls == 2 else (stat.S_IFREG | 0o555)
+        return SimpleNamespace(st_uid=0, st_mode=mode)
+    return observed
+
+
+authority_globals = module["validate_canonical_candidate_authority"].__globals__
+real_run_path = authority_globals["runpy"].run_path
+real_os_fstat = authority_globals["os"].fstat
+authority_globals["runpy"].run_path = lambda _path: {
+    "validate_candidate": lambda *_args: validated,
+}
+authority_globals["os"].fstat = root_owned_support_fstat
+try:
+    checkpoint = module["validate_canonical_candidate_authority"](candidate, tmp / "lab")
+    require(
+        checkpoint.run_id == candidate.run_id
+        and checkpoint.candidate_digest == candidate.digest
+        and checkpoint.runner_sha256 == sha256(authority_path),
+        "canonical authority checkpoint is not candidate/script bound",
+    )
+    fstat_calls = 0
+    wrong = replace(candidate, digest="sha256:" + "e" * 64)
+    expect_failure(
+        lambda: module["validate_canonical_candidate_authority"](wrong, tmp / "lab"),
+        "disagrees",
+    )
+finally:
+    authority_globals["runpy"].run_path = real_run_path
+    authority_globals["os"].fstat = real_os_fstat
+
+require(
+    Path(sys.argv[1]).read_text(encoding="utf-8").count(
+        "validate_canonical_candidate_authority(candidate, lab_root)"
+    ) == 2,
+    "release runner must revalidate canonical candidate authority at start and finish",
+)
+
+
+# Lifecycle validation proves the requested process restarted and every non-target
+# process remained identical. Malformed or partial observations fail typed.
+LifecycleState = module["LifecycleState"]
+validate_restart_transition = module["validate_restart_transition"]
+base = LifecycleState(
+    daemon_pid=101,
+    daemon_start_ticks=1_001,
+    daemon_boot_id="boot-a",
+    daemon_created_at=11,
+    daemon_exe_sha256="a" * 64,
+    daemon_ipc_path="/tmp/daemon.sock",
+    daemon_ipc_inode=10_001,
+    stream_boot_id="boot-a",
+    stream_created_at=12,
+    gateway_pid=202,
+    gateway_start_ticks=2_002,
+    gateway_instance_id="gateway-stable",
+    gateway_bound_at=21,
+    gateway_url="http://127.0.0.1:4101",
+    gateway_port=4101,
+    gateway_auth_mode="local",
+    gateway_exe_sha256="b" * 64,
+    gateway_discovery_inode=20_002,
+    gateway_discovery_sha256="c" * 64,
+    proxy_pid=303,
+    proxy_start_ticks=3_003,
+)
+daemon_after = replace(
+    base,
+    daemon_pid=111,
+    daemon_start_ticks=1_111,
+    daemon_boot_id="boot-b",
+    daemon_created_at=31,
+    daemon_ipc_inode=10_111,
+    stream_boot_id="boot-b",
+    stream_created_at=32,
+)
+gateway_after = replace(
+    base,
+    gateway_pid=222,
+    gateway_start_ticks=2_222,
+    gateway_bound_at=41,
+    gateway_discovery_inode=20_222,
+    gateway_discovery_sha256="d" * 64,
+)
+validate_restart_transition("daemon", base, daemon_after)
+validate_restart_transition("gateway", base, gateway_after)
+expect_failure(lambda: validate_restart_transition("daemon", base, base), "daemon restart")
+expect_failure(lambda: validate_restart_transition("gateway", base, base), "gateway restart")
+expect_failure(
+    lambda: validate_restart_transition(
+        "daemon",
+        base,
+        replace(daemon_after, gateway_pid=223),
+    ),
+    "gateway",
+)
+expect_failure(
+    lambda: validate_restart_transition(
+        "gateway",
+        base,
+        replace(gateway_after, daemon_boot_id="wrong-target"),
+    ),
+    "daemon",
+)
+expect_failure(
+    lambda: validate_restart_transition(
+        "daemon",
+        replace(base, daemon_pid=0),
+        daemon_after,
+    ),
+    "lifecycle",
+)
+expect_failure(
+    lambda: validate_restart_transition(
+        "gateway",
+        replace(base, gateway_instance_id=""),
+        gateway_after,
+    ),
+    "lifecycle",
+)
+expect_failure(
+    lambda: validate_restart_transition(
+        "daemon",
+        base,
+        replace(daemon_after, stream_boot_id="stale-boot"),
+    ),
+    "disagree",
+)
+expect_failure(
+    lambda: validate_restart_transition(
+        "daemon",
+        replace(base, gateway_discovery_sha256=None),  # type: ignore[arg-type]
+        daemon_after,
+    ),
+    "lifecycle",
+)
+expect_failure(
+    lambda: validate_restart_transition(
+        "daemon",
+        SimpleNamespace(daemon_pid=base.daemon_pid),
+        daemon_after,
+    ),
+    "lifecycle",
+)
+
+
+# The restart proof must be assembled from traffic accepted before the lifecycle
+# transition and observed after reconnecting from the previous accepted cursors.
+async def planned_restart_straddles_accepted_traffic() -> None:
+    calls: list[str] = []
+    restart_agents = tuple(
+        SimpleNamespace(
+            kind=kind,
+            name=f"fixture-{kind}",
+            agent_id=f"a_{kind}",
+            session_id=f"s_{kind}",
+        )
+        for kind in ("codex", "claude")
+    )
+    soak = object.__new__(module["Soak"])
+    soak.candidate = SimpleNamespace(run_id="contract-run")
+    soak.lab_root = Path("/tmp/contract-lab")
+    soak.lab_process = "lab-process"
+    soak.nexus_bin = "nexus"
+    soak.thread = "contract"
+    soak.thread_topic = "sys.message.thread.contract"
+    soak.restarts = Counter()
+    soak.restart_proofs = []
+    soak.replay_counts = Counter()
+    soak.resync_counts = Counter()
+    soak.baseline_dlq = 0
+    soak.ledger = module["Ledger"]()
+    soak.evidence = SimpleNamespace(
+        log=lambda *_args, **_kwargs: None,
+        jsonl=lambda *_args, **_kwargs: None,
+    )
+    soak.agents = restart_agents
+
+    class Developer:
+        def __init__(self):
+            self.cursors = {soak.thread_topic: 7}
+            self.reconnects = 0
+            self.last_cursor = 7
+
+        async def pause_reader(self):
+            calls.append("pause-developer")
+
+        async def connect(self, *, reconnect=False):
+            require(reconnect is True, "restart did not request a developer reconnect")
+            calls.append("reconnect-developer")
+            self.reconnects += 1
+            self.cursors[soak.thread_topic] = 8
+            self.last_cursor = 8
+
+    class Session:
+        def __init__(self, agent):
+            self.agent = agent
+            self.last_numeric_cursor = 10
+            self.reconnects = 0
+            self.frames = []
+
+        async def begin_prompt(self, marker, timeout):
+            del marker, timeout
+            calls.append(f"begin-{self.agent.kind}")
+            return SimpleNamespace(
+                client_message_id=f"client-{self.agent.kind}",
+                start_index=0,
+            )
+
+        async def pause_reader(self):
+            calls.append(f"pause-{self.agent.kind}")
+
+        async def connect(self, *, reconnect=False):
+            require(reconnect is True, "restart did not request an agent-session reconnect")
+            calls.append(f"reconnect-{self.agent.kind}")
+            self.reconnects += 1
+            self.last_numeric_cursor = 11
+
+        async def finish_prompt(self, attempt, timeout):
+            del timeout
+            calls.append(f"finish-{self.agent.kind}")
+            return {
+                "clientMessageId": attempt.client_message_id,
+                "cursorBefore": 10,
+                "cursorAfter": 11,
+                "completionCount": 1,
+            }
+
+    soak.developer = Developer()
+    soak.sessions = {agent.kind: Session(agent) for agent in restart_agents}
+
+    async def begin_message(*_args, **_kwargs):
+        calls.append("accept-developer")
+        return SimpleNamespace(message_id="message-restart")
+
+    async def finish_message(_attempt, timeout):
+        del timeout
+        calls.append("finish-developer")
+        return {
+            "messageId": "message-restart",
+            "cursorBefore": 7,
+            "cursorAfter": 8,
+            "receivedCount": 1,
+        }
+
+    async def sample_resources(_phase):
+        return None
+
+    async def traffic(*, allow_session):
+        require(allow_session is True, "post-restart traffic disabled agent sessions")
+
+    soak.begin_message = begin_message
+    soak.finish_message = finish_message
+    soak.sample_resources = sample_resources
+    soak.traffic = traffic
+
+    restart_states = iter((base, gateway_after))
+    globals_ = module["Soak"].planned_restart.__globals__
+    originals = {
+        key: globals_[key]
+        for key in ("lifecycle_state", "run_command", "wait_health", "identity_rows", "check_identities", "dlq_total")
+    }
+    globals_["lifecycle_state"] = lambda _home: next(restart_states)
+    globals_["run_command"] = lambda *_args, **_kwargs: calls.append("restart")
+    globals_["wait_health"] = lambda _http: calls.append("health")
+    globals_["identity_rows"] = lambda _bin: []
+    globals_["check_identities"] = lambda *_args: None
+    globals_["dlq_total"] = lambda _bin: 0
+    soak.http = object()
+    try:
+        await soak.planned_restart("gateway")
+    finally:
+        globals_.update(originals)
+
+    require(len(soak.restart_proofs) == 1, "restart emitted no accepted-traffic proof")
+    require(
+        module["restart_proof_is_complete"](soak.restart_proofs[0]),
+        "restart proof is not accepted-traffic/cursor complete",
+    )
+    restart_at = calls.index("restart")
+    require(calls.index("accept-developer") < restart_at, "developer traffic was accepted after restart")
+    for kind in ("codex", "claude"):
+        require(calls.index(f"begin-{kind}") < restart_at, f"{kind} input was accepted after restart")
+        require(calls.index(f"finish-{kind}") > restart_at, f"{kind} completed before restart")
+    require(calls.index("finish-developer") > restart_at, "developer delivery completed before restart")
+
+
+asyncio.run(planned_restart_straddles_accepted_traffic())
+
+
+# Build an immutable packed-candidate fixture wholly under the temporary tree.
+lab_root = module["LAB_ROOT_PREFIX"]
+prefix = tmp / "nexus-lab-install.fixture"
+evidence_root = lab_root / "evidence" / "contract-run"
+evidence_root.mkdir(parents=True)
+(lab_root / "nexus").mkdir()
+(lab_root / "lab").mkdir(exist_ok=True)
+(lab_root / "harness-workspaces" / "codex").mkdir(parents=True)
+(lab_root / "harness-workspaces" / "claude").mkdir(parents=True)
+(tmp / "bin").mkdir()
+
+nexus_target = prefix / "bin" / "nexus"
+gateway_target = prefix / "bin" / "nexus-gateway"
+webui_target = prefix / "bin" / "nexus-webui"
+write_executable(nexus_target, "nexus 0.1.5")
+write_executable(gateway_target, "nexus-gateway 0.1.5")
+write_executable(webui_target, "nexus-webui 0.1.5")
+module["NEXUS_LAUNCHER"].symlink_to(nexus_target)
+module["GATEWAY_LAUNCHER"].symlink_to(gateway_target)
+webui_launcher = tmp / "bin" / "nexus-webui"
+webui_launcher.symlink_to(webui_target)
+write_executable(module["LAB_PROCESS"], "lab-process 0.1.5")
+
+umbrella = prefix / "lib" / "node_modules" / "@egregore" / "nexus"
+package_paths = {
+    "@egregore/nexus": umbrella / "package.json",
+    "@egregore/nexus-cli": umbrella / "node_modules" / "@egregore" / "nexus-cli" / "package.json",
+    "@egregore/nexus-gateway": umbrella / "node_modules" / "@egregore" / "nexus-gateway" / "package.json",
+}
+for name, path in package_paths.items():
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"name": name, "version": "0.1.5"}), encoding="utf-8")
+
+native_record = evidence_root / "candidate" / "native" / "nexus"
+native_record.parent.mkdir(parents=True)
+native_record.write_bytes(b"native candidate bytes\n")
+native_installed = umbrella / "node_modules" / "@egregore" / "nexus-cli" / "native" / "nexus"
+native_installed.parent.mkdir(parents=True)
+native_installed.write_bytes(native_record.read_bytes())
+native_installed.chmod(0o755)
+gateway_module = umbrella / "node_modules" / "@egregore" / "nexus-gateway" / "dist-gateway" / "headless.mjs"
+gateway_module.parent.mkdir(parents=True, exist_ok=True)
+gateway_module.write_bytes(b"export const fixture = true;\n")
+
+packages = []
+for index, name in enumerate(module["PACKAGE_NAMES"]):
+    tarball = evidence_root / "candidate" / "npm" / f"package-{index}.tgz"
+    tarball.parent.mkdir(parents=True, exist_ok=True)
+    tarball.write_bytes(f"{name}@0.1.5\n".encode())
+    packages.append({
+        "name": name,
+        "version": "0.1.5",
+        "tarball": {
+            "path": str(tarball.relative_to(evidence_root)),
+            "sha256": sha256(tarball),
+        },
+    })
+
+readiness = lab_root / "lab" / "candidate-ready.v1"
+readiness_rows = {
+    "schema": "1",
+    "containerId": "container-contract",
+    "mode": "packed",
+    "runId": "contract-run",
+    "installRoot": str(prefix),
+    "nexusLink": str(nexus_target),
+    "nexusResolved": str(nexus_target),
+    "nexusSha256": sha256(nexus_target),
+    "gatewayLink": str(gateway_target),
+    "gatewayResolved": str(gateway_target),
+    "gatewaySha256": sha256(gateway_target),
+    "webuiLink": str(webui_target),
+    "webuiResolved": str(webui_target),
+    "webuiSha256": sha256(webui_target),
+}
+readiness.write_text(
+    "".join(f"{key}={value}\n" for key, value in readiness_rows.items()),
+    encoding="utf-8",
+)
+environment = {
+    "NEXUS_V015_RUN_ID": "contract-run",
+    "NEXUS_V015_PACKED_PREFIX": str(prefix),
+    "NEXUS_V015_NEXUS_BIN": str(module["NEXUS_LAUNCHER"]),
+    "NEXUS_V015_GATEWAY_BIN": str(module["GATEWAY_LAUNCHER"]),
+    "NEXUS_V015_WEBUI_BIN": str(webui_launcher),
+    "NEXUS_V015_LAB_PROCESS": str(module["LAB_PROCESS"]),
+    "NEXUS_V015_READINESS_LEDGER": str(readiness),
+    "NEXUS_V015_GATEWAY_URL": module["GATEWAY_URL"],
+    "NEXUS_V015_NEXUS_BIN_RESOLVED": str(nexus_target),
+    "NEXUS_V015_NEXUS_BIN_SHA256": sha256(nexus_target),
+    "NEXUS_V015_GATEWAY_BIN_RESOLVED": str(gateway_target),
+    "NEXUS_V015_GATEWAY_BIN_SHA256": sha256(gateway_target),
+    "NEXUS_V015_WEBUI_BIN_RESOLVED": str(webui_target),
+    "NEXUS_V015_WEBUI_BIN_SHA256": sha256(webui_target),
+    "NEXUS_V015_GATEWAY_MODULE": str(gateway_module),
+    "NEXUS_V015_GATEWAY_MODULE_SHA256": sha256(gateway_module),
+    "NEXUS_V015_LAB_PROCESS_SHA256": sha256(module["LAB_PROCESS"]),
+    "NEXUS_V015_NATIVE_BIN": str(native_installed),
+    "NEXUS_V015_NATIVE_BIN_SHA256": sha256(native_installed),
+    "NEXUS_V015_READINESS_LEDGER_SHA256": sha256(readiness),
+    "NEXUS_V015_CONTAINER_ID": "container-contract",
+}
+manifest = {
+    "schemaVersion": 1,
+    "runId": "contract-run",
+    "mode": "packed",
+    "sources": {"nexus": {"revision": "1" * 40, "dirty": False, "dirtyPaths": []}},
+    "native": {
+        "path": str(native_record.relative_to(evidence_root)),
+        "sha256": sha256(native_record),
+    },
+    "packages": packages,
+    "image": {"digest": "sha256:" + "e" * 64},
+    "container": {"limits": {"cpus": 6, "memoryBytes": 8 * 1024**3, "pids": 1024}},
+    "toolchains": {"nexus": "nexus 0.1.5"},
+    "environment": environment,
+}
+manifest_path = evidence_root / "manifest.json"
+manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+candidate = module["validate_candidate"](evidence_root, lab_root)
+require(candidate.run_id == "contract-run", "valid packed candidate was not bound")
+
+
+def rewrite_candidate_nexus_version(version: str) -> None:
+    write_executable(nexus_target, version)
+    nexus_digest = sha256(nexus_target)
+    readiness_rows["nexusSha256"] = nexus_digest
+    readiness.write_text(
+        "".join(f"{key}={value}\n" for key, value in readiness_rows.items()),
+        encoding="utf-8",
+    )
+    environment["NEXUS_V015_NEXUS_BIN_SHA256"] = nexus_digest
+    environment["NEXUS_V015_READINESS_LEDGER_SHA256"] = sha256(readiness)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+
+rewrite_candidate_nexus_version("nexus 0.1.5-dev")
+expect_failure(
+    lambda: module["validate_candidate"](evidence_root, lab_root),
+    "not 0.1.5",
+)
+rewrite_candidate_nexus_version("nexus 0.1.50")
+expect_failure(
+    lambda: module["validate_candidate"](evidence_root, lab_root),
+    "not 0.1.5",
+)
+rewrite_candidate_nexus_version("nexus 0.1.5\nfixture build")
+expect_failure(
+    lambda: module["validate_candidate"](evidence_root, lab_root),
+    "not 0.1.5",
+)
+rewrite_candidate_nexus_version("nexus 0.1.5")
+candidate = module["validate_candidate"](evidence_root, lab_root)
+
+candidate_link = tmp / "candidate-link"
+candidate_link.symlink_to(evidence_root, target_is_directory=True)
+expect_path_rejection(lambda: module["validate_candidate"](candidate_link, lab_root))
+
+first_tarball = evidence_root / packages[0]["tarball"]["path"]
+backing = first_tarball.with_suffix(".backing")
+first_tarball.rename(backing)
+first_tarball.symlink_to(backing)
+expect_failure(lambda: module["validate_candidate"](evidence_root, lab_root), "unsafe")
+first_tarball.unlink()
+backing.rename(first_tarball)
+
+extra_link = tmp / "multiply-linked-package.tgz"
+os.link(first_tarball, extra_link)
+expect_failure(lambda: module["validate_candidate"](evidence_root, lab_root), "multiply-linked")
+extra_link.unlink()
+module["validate_candidate"](evidence_root, lab_root)
+
+
+# Resource probes bind to the exact 6 CPU / 8 GiB / 1024 PID cgroup contract,
+# fail closed on malformed counters, and detect sustained—not one-off—growth.
+cgroup_root = module["CGROUP_ROOT"]
+cgroup_root.mkdir(parents=True)
+cgroup_files = {
+    "memory.current": "1048576\n",
+    "memory.max": f"{8 * 1024**3}\n",
+    "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n",
+    "cpu.max": "600000 100000\n",
+    "cpu.stat": "usage_usec 100\nuser_usec 60\nsystem_usec 40\n",
+    "pids.current": "11\n",
+    "pids.max": "1024\n",
+    "pids.events": "max 0\n",
+}
+for name, value in cgroup_files.items():
+    (cgroup_root / name).write_text(value, encoding="utf-8")
+cgroup = module["cgroup_sample"]()
+require(cgroup["memoryMax"] == 8 * 1024**3, "memory cgroup limit was not bound")
+require(cgroup["cpuMax"]["cpus"] == 6, "CPU cgroup limit was not bound")
+require(cgroup["pidsMax"] == 1024, "PID cgroup limit was not bound")
+
+(cgroup_root / "memory.max").write_text("max\n", encoding="utf-8")
+expect_failure(module["cgroup_sample"], "memory limit")
+(cgroup_root / "memory.max").write_text(cgroup_files["memory.max"], encoding="utf-8")
+(cgroup_root / "pids.max").write_text("2048\n", encoding="utf-8")
+expect_failure(module["cgroup_sample"], "PID limit")
+(cgroup_root / "pids.max").write_text(cgroup_files["pids.max"], encoding="utf-8")
+(cgroup_root / "cpu.max").write_text("500000 100000\n", encoding="utf-8")
+expect_failure(module["cgroup_sample"], "CPU limit")
+(cgroup_root / "cpu.max").write_text(cgroup_files["cpu.max"], encoding="utf-8")
+(cgroup_root / "memory.events").write_text("oom 0\noom 1\n", encoding="utf-8")
+expect_failure(module["cgroup_sample"], "malformed")
+(cgroup_root / "memory.events").write_text(cgroup_files["memory.events"], encoding="utf-8")
+
+growth_floor = module["MEMORY_TREND_MIN_GROWTH"]
+require(
+    module["trend_is_unhealthy"]([0, 1, 2, 3, 4, 5, 6, 7, 8, growth_floor], growth_floor),
+    "sustained resource growth was not detected",
+)
+require(
+    not module["trend_is_unhealthy"]([0, growth_floor, 0, 0, 0, 0, 0, 0, 0, 0], growth_floor),
+    "one-off resource spike was misclassified as a sustained leak",
+)
+
+
+# Live harness identity binds executable bytes, version, workspace, and online presence.
+agent_manifest_path = lab_root / "lab" / "agents.json"
+agent_rows: dict[str, dict[str, str]] = {}
+for kind, version in (("codex", "codex 1.2.3"), ("claude", "claude 4.5.6")):
+    executable = tmp / "harness" / kind
+    write_executable(executable, version)
+    agent_rows[kind] = {
+        "name": f"fixture-{kind}",
+        "agentId": f"a_{kind}",
+        "sessionId": f"s_{kind}",
+        "executable": str(executable),
+        "sha256": sha256(executable),
+        "version": version,
+        "workspace": str(lab_root / "harness-workspaces" / kind),
+    }
+
+
+def write_agent_manifest(rows: dict[str, dict[str, str]]) -> None:
+    agent_manifest_path.write_text(
+        json.dumps({
+            "version": 1,
+            "runId": "contract-run",
+            "readinessSha256": sha256(readiness),
+            "candidate": {
+                "runId": "contract-run",
+                "readinessSha256": sha256(readiness),
+            },
+            "agents": rows,
+        }),
+        encoding="utf-8",
+    )
+
+
+write_agent_manifest(agent_rows)
+agents = module["load_agents"](lab_root, "contract-run", sha256(readiness))
+require(tuple(agent.kind for agent in agents) == ("codex", "claude"), "valid agents rejected")
+
+expect_failure(
+    lambda: module["load_agents"](lab_root, "contract-run", "f" * 64),
+    "readiness",
+)
+
+wrong_hash = deepcopy(agent_rows)
+wrong_hash["codex"]["sha256"] = "0" * 64
+write_agent_manifest(wrong_hash)
+expect_failure(lambda: module["load_agents"](lab_root, "contract-run", sha256(readiness)), "hash")
+
+wrong_version = deepcopy(agent_rows)
+wrong_version["codex"]["version"] = "codex 9.9.9"
+write_agent_manifest(wrong_version)
+expect_failure(lambda: module["load_agents"](lab_root, "contract-run", sha256(readiness)), "version")
+
+wrong_workspace = deepcopy(agent_rows)
+wrong_workspace["claude"]["workspace"] = str(tmp / "other-workspace")
+write_agent_manifest(wrong_workspace)
+expect_failure(lambda: module["load_agents"](lab_root, "contract-run", sha256(readiness)), "workspace")
+
+write_agent_manifest(agent_rows)
+agents = module["load_agents"](lab_root, "contract-run", sha256(readiness))
+unknown_ledger = module["Ledger"]()
+module["check_identities"](
+    [
+        {"name": "fixture-codex", "agentId": "a_codex", "sessionId": "s_codex", "status": "online"},
+        {"name": "fixture-claude", "agentId": "a_claude", "sessionId": "s_claude", "status": "unknown"},
+    ],
+    agents,
+    unknown_ledger,
+)
+require(
+    unknown_ledger.failure["offlineRestoredParticipants"] == 1,
+    "unknown live-harness presence was not rejected",
+)
+
+
+# A real-agent correlation is not progressive when the complete marker arrives
+# in one content frame, even if the user echo and run terminal are otherwise valid.
+class LaneEvidence:
+    def jsonl(self, *_args, **_kwargs):
+        return None
+
+
+class LaneHttp:
+    cookie = "nexus_human=fixture; nexus_csrf=fixture"
+    csrf = "fixture"
+
+
+async def reject_single_frame_assistant_output() -> None:
+    marker = "V015_PROGRESSIVE_MARKER"
+    lane = module["AgentSessionLane"](
+        LaneEvidence(),
+        module["Ledger"](),
+        LaneHttp(),
+        agents[0],
+    )
+
+    class Socket:
+        async def send(self, raw: str) -> None:
+            request = json.loads(raw)
+            client_message_id = request["clientMessageId"]
+            frames = [
+                {"t": "input.ack", "clientMessageId": client_message_id, "commandId": "c-1"},
+                {"event": {"type": "TEXT_MESSAGE_END", "messageId": client_message_id}},
+                {"event": {"type": "RUN_STARTED", "runId": "run-progressive"}},
+                {
+                    "event": {
+                        "type": "TEXT_MESSAGE_START",
+                        "role": "assistant",
+                        "messageId": "assistant-progressive",
+                    }
+                },
+                {
+                    "event": {
+                        "type": "TEXT_MESSAGE_CONTENT",
+                        "messageId": "assistant-progressive",
+                        "delta": marker,
+                    }
+                },
+                {"event": {"type": "TEXT_MESSAGE_END", "messageId": "assistant-progressive"}},
+                {"event": {"type": "RUN_FINISHED", "runId": "run-progressive", "id": 1}},
+            ]
+            for frame in frames:
+                lane.frames.append(frame)
+                lane.consume(frame)
+            lane.changed.set()
+
+    lane.socket = Socket()
+    await lane.prompt(marker, timeout=1)
+
+
+try:
+    asyncio.run(reject_single_frame_assistant_output())
+except SoakFailure as error:
+    require("progressive" in str(error).lower(), "single-frame rejection was not typed")
+else:
+    raise AssertionError("single-frame assistant output satisfied the progressive-output gate")
+
+
+async def correlate_prompt_across_an_explicit_boundary() -> None:
+    marker = "V015_CROSS_RESTART_MARKER"
+    lane = module["AgentSessionLane"](
+        LaneEvidence(),
+        module["Ledger"](),
+        LaneHttp(),
+        agents[0],
+    )
+
+    class Socket:
+        async def send(self, raw: str) -> None:
+            request = json.loads(raw)
+            frame = {
+                "t": "input.ack",
+                "clientMessageId": request["clientMessageId"],
+                "commandId": "command-cross-restart",
+            }
+            lane.frames.append(frame)
+            lane.consume(frame)
+            lane.changed.set()
+
+    lane.socket = Socket()
+    attempt = await lane.begin_prompt(marker, timeout=1)
+    require(
+        attempt.client_message_id in lane.ledger.session_accepted,
+        "accepted session input was not recorded before the restart boundary",
+    )
+    post_restart = [
+        {"event": {"type": "TEXT_MESSAGE_END", "messageId": attempt.client_message_id}},
+        {"event": {"type": "RUN_STARTED", "runId": "run-cross-restart"}},
+        {
+            "event": {
+                "type": "TEXT_MESSAGE_START",
+                "role": "assistant",
+                "messageId": "assistant-cross-restart",
+            }
+        },
+        {
+            "event": {
+                "type": "TEXT_MESSAGE_CONTENT",
+                "messageId": "assistant-cross-restart",
+                "delta": "V015_CROSS_",
+            }
+        },
+        {
+            "event": {
+                "type": "TEXT_MESSAGE_CONTENT",
+                "messageId": "assistant-cross-restart",
+                "delta": "RESTART_MARKER",
+            }
+        },
+        {"event": {"type": "TEXT_MESSAGE_END", "messageId": "assistant-cross-restart"}},
+        {"event": {"type": "RUN_FINISHED", "runId": "run-cross-restart", "id": 9}},
+    ]
+    for frame in post_restart:
+        lane.frames.append(frame)
+        lane.consume(frame)
+    lane.changed.set()
+    proof = await lane.finish_prompt(attempt, timeout=1)
+    require(proof["clientMessageId"] == attempt.client_message_id, "prompt proof lost identity")
+    require(proof["cursorBefore"] == 0 and proof["cursorAfter"] == 9, "prompt proof lost cursor")
+    require(proof["completionCount"] == 1, "prompt proof was not exact-once")
+
+
+asyncio.run(correlate_prompt_across_an_explicit_boundary())
+
+
+async def correlate_developer_message_across_an_explicit_boundary() -> None:
+    topic = "sys.message.thread.contract"
+    soak = object.__new__(module["Soak"])
+    soak.ledger = module["Ledger"]()
+
+    class Http:
+        def request(self, method, path, body):
+            require(method == "POST" and path == "/api/v1/messages", "wrong message ingress")
+            require(body["to"]["thread"] == "contract", "wrong thread target")
+            return {"messageId": "message-cross-restart", "_headers": {}}
+
+    class Developer:
+        def __init__(self):
+            self.cursors = {topic: 7}
+
+        async def wait_message(self, message_id, observed_topic, timeout):
+            del timeout
+            soak.ledger.receive_message(message_id, observed_topic)
+            self.cursors[observed_topic] = 8
+
+    soak.http = Http()
+    soak.developer = Developer()
+    attempt = await soak.begin_message(
+        {"verb": "post", "thread": "contract"},
+        topic,
+        "V015_DEVELOPER_CROSS_RESTART",
+    )
+    require(
+        soak.ledger.expected_messages == {"message-cross-restart": topic},
+        "developer message was not accepted before the restart boundary",
+    )
+    proof = await soak.finish_message(attempt, timeout=1)
+    require(proof["messageId"] == "message-cross-restart", "developer proof lost identity")
+    require(proof["cursorBefore"] == 7 and proof["cursorAfter"] == 8, "developer proof lost cursor")
+    require(proof["receivedCount"] == 1, "developer proof was not exact-once")
+
+
+asyncio.run(correlate_developer_message_across_an_explicit_boundary())
+
+
+# PASS is the literal conjunction of nine independently testable invariants.
+INVARIANT_KEYS = {
+    "duration",
+    "restartCount",
+    "restartStraddle",
+    "traffic",
+    "sessionCorrelation",
+    "delivery",
+    "websocketReconnect",
+    "resources",
+    "topology",
+    "diagnostics",
+}
+
+
+def make_soak():
+    ledger = module["Ledger"]()
+    ledger.expected_messages["m-1"] = "sys.message.thread.contract"
+    ledger.received_messages["m-1"].append("sys.message.thread.contract")
+    ledger.session_accepted.add("client-1")
+    ledger.session_completed.add("client-1")
+    ledger.session_correlations = [{
+        "clientMessageId": "client-1",
+        "commandId": "command-1",
+        "runId": "run-1",
+        "assistantMessageId": "assistant-1",
+    }]
+    restart_proofs = []
+    for index, target in enumerate(("gateway", "daemon", "gateway", "daemon"), start=1):
+        restart_proofs.append({
+            "status": "PASS",
+            "target": target,
+            "transportRecoveryObserved": True,
+            "developer": {
+                "messageId": f"message-{index}",
+                "cursorBefore": index * 10,
+                "cursorAfter": index * 10 + 1,
+                "receivedCount": 1,
+            },
+            "agentSessions": {
+                kind: {
+                    "clientMessageId": f"client-{kind}-{index}",
+                    "cursorBefore": index * 10,
+                    "cursorAfter": index * 10 + 1,
+                    "completionCount": 1,
+                }
+                for kind in ("codex", "claude")
+            },
+        })
+    return SimpleNamespace(
+        ledger=ledger,
+        developer=SimpleNamespace(
+            reconnects=4,
+            last_cursor=40,
+            cursors={
+                "sys.message.thread.contract": 40,
+                "sys.dm.fixture-codex": 41,
+                "sys.dm.fixture-claude": 42,
+            },
+        ),
+        sessions={
+            "codex": SimpleNamespace(reconnects=4, last_numeric_cursor=41),
+            "claude": SimpleNamespace(reconnects=4, last_numeric_cursor=42),
+        },
+        restarts=Counter({"daemon": 2, "gateway": 2}),
+        restart_proofs=restart_proofs,
+        replay_counts=Counter({"developer": 4, "codex": 4, "claude": 4}),
+        resync_counts=Counter({"developer": 0, "codex": 0, "claude": 0}),
+        traffic_rounds=3,
+        session_rounds=1,
+        resource_health={
+            "status": "PASS",
+            "withinBounds": True,
+            "trendHealthy": True,
+            "sampleCount": 60,
+        },
+        topology={"status": "PASS", "healthy": True},
+        diagnostics_healthy=True,
+    )
+
+
+bounds = module["ResourceBounds"]([100, 110], [200, 210])
+
+
+def document(soak=None, *, elapsed=1800.0, error=None):
+    return module["result_document"](
+        candidate,
+        soak or make_soak(),
+        1_000.0,
+        1_000.0 + elapsed,
+        bounds,
+        error,
+    )
+
+
+passing = document()
+require(passing["status"] == "PASS", "complete soak did not PASS")
+require(set(passing.get("invariants", {})) == INVARIANT_KEYS, "invariant schema drift")
+require(
+    all(value is True for value in passing["invariants"].values()),
+    "PASS contains a false/non-boolean invariant",
+)
+require(passing.get("resourceHealth") == make_soak().resource_health, "resource summary missing")
+require(passing.get("topology") == make_soak().topology, "topology summary missing")
+require(
+    passing.get("restartProofs") == make_soak().restart_proofs,
+    "accepted-traffic restart proofs are missing from the sealed result",
+)
+require(
+    passing["checkpoints"]["developerWebSocket"].get("topicCursors")
+    == make_soak().developer.cursors,
+    "per-topic developer cursors are missing from the sealed result",
+)
+require(
+    passing["checkpoints"]["agentSessionWebSocket"].get("agentCursors")
+    == {"codex": 41, "claude": 42},
+    "per-agent session cursors are missing from the sealed result",
+)
+require(
+    passing["checkpoints"]["developerWebSocket"].get("replayCount") == 4
+    and passing["checkpoints"]["agentSessionWebSocket"].get("replayCounts")
+    == {"codex": 4, "claude": 4},
+    "restart replay counts are missing from the sealed result",
+)
+
+
+def require_failed(doc: dict, invariant: str) -> None:
+    require(doc["status"] == "FAIL", f"{invariant} violation unexpectedly PASSed")
+    require(doc["invariants"].get(invariant) is False, f"{invariant} was not marked false")
+
+
+require_failed(document(elapsed=1799.999), "duration")
+soak = make_soak()
+soak.restarts["daemon"] = 1
+require_failed(document(soak), "restartCount")
+soak = make_soak()
+soak.restarts["gateway"] = 3
+require_failed(document(soak), "restartCount")
+soak = make_soak()
+soak.restart_proofs.pop()
+require_failed(document(soak), "restartStraddle")
+soak = make_soak()
+soak.restart_proofs[0]["developer"]["receivedCount"] = 2
+require_failed(document(soak), "restartStraddle")
+soak = make_soak()
+soak.restart_proofs[0]["agentSessions"]["codex"]["cursorAfter"] = 10
+require_failed(document(soak), "restartStraddle")
+soak = make_soak()
+soak.traffic_rounds = 0
+require_failed(document(soak), "traffic")
+soak = make_soak()
+soak.session_rounds = 0
+soak.ledger.session_accepted.clear()
+soak.ledger.session_completed.clear()
+soak.ledger.session_correlations.clear()
+require_failed(document(soak), "sessionCorrelation")
+soak = make_soak()
+soak.ledger.failure["lostAcceptedMessages"] = 1
+require_failed(document(soak), "delivery")
+soak = make_soak()
+soak.ledger.failure["offlineRestoredParticipants"] = 1
+require_failed(document(soak), "delivery")
+soak = make_soak()
+soak.developer.reconnects = 1
+require_failed(document(soak), "websocketReconnect")
+soak = make_soak()
+soak.resource_health = {
+    "status": "FAIL",
+    "withinBounds": False,
+    "trendHealthy": False,
+    "sampleCount": 60,
+}
+require_failed(document(soak), "resources")
+soak = make_soak()
+soak.topology = {"status": "FAIL", "healthy": False}
+require_failed(document(soak), "topology")
+soak = make_soak()
+soak.diagnostics_healthy = False
+require_failed(document(soak), "diagnostics")
+require(document(error="explicit soak failure")["status"] == "FAIL", "explicit error PASSed")
+
+
+# A failed ps/ss diagnostic is fatal rather than being embedded as nominal evidence.
+class EvidenceProbe:
+    def __init__(self):
+        self.writes = []
+
+    def write_text(self, *_args, **_kwargs):
+        self.writes.append(("write", _args, _kwargs))
+
+    def log(self, *_args, **_kwargs):
+        self.writes.append(("log", _args, _kwargs))
+
+
+function_globals = module["capture_final_artifacts"].__globals__
+original_run_command = function_globals["run_command"]
+
+
+def diagnostic_command(command, *, timeout, check=True, env=None):
+    del timeout, env
+    if command[0] in {"ps", "ss"}:
+        if check:
+            raise SoakFailure(f"required diagnostic failed: {command[0]}")
+        return subprocess.CompletedProcess(command, 1, "", "fixture diagnostic failure")
+    return subprocess.CompletedProcess(command, 0, "", "")
+
+
+function_globals["run_command"] = diagnostic_command
+try:
+    evidence_probe = EvidenceProbe()
+    expect_failure(
+        lambda: module["capture_final_artifacts"](evidence_probe, "nexus", lab_root),
+        "diagnostic",
+    )
+    require(evidence_probe.writes, "failed diagnostics produced no audit evidence")
+finally:
+    function_globals["run_command"] = original_run_command
+
+print("v0.1.5 WebSocket soak external contracts: ok")
+PY
+
+printf 'v0.1.5 WebSocket soak regression gate: ok\n'

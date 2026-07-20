@@ -6,47 +6,604 @@ TARGET="$SCRIPT_DIR/nexus-v015-lab-manifest"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-mkdir -p "$TMP/bin"
-printf '%s\n' \
-  '#!/usr/bin/env bash' \
-  'case "$*" in' \
-  '*"{{.Image}}"*) printf "sha256:image-fixture\\n" ;;' \
-  '*"{{json .RepoDigests}}"*) echo "[\"fixture@sha256:digest\"]" ;;' \
-  '*"{{json .HostConfig}}"*) echo "{\"NanoCpus\":6000000000,\"Memory\":8589934592,\"PidsLimit\":1024}" ;;' \
-  '*"{{json .NetworkSettings.Ports}}"*) printf "{}\\n" ;;' \
-  '*"{{json .Config.Env}}"*) echo "[\"SAFE=value\",\"API_TOKEN=secret\"]" ;;' \
-  '*"nexus --version"*) printf "nexus 0.1.5\\n" ;;' \
-  '*"node --version"*) printf "v24.0.0\\n" ;;' \
-  '*"rustc --version"*) printf "rustc 1.90.0\\n" ;;' \
-  'cp*) exit 0 ;;' \
-  '*) printf "unexpected docker call: %s\\n" "$*" >&2; exit 98 ;;' \
-  'esac' >"$TMP/bin/docker"
+mkdir -p "$TMP/bin" "$TMP/container/packs" "$TMP/container/native" \
+  "$TMP/container-root/evidence"
+chmod 0700 "$TMP/container-root" "$TMP/container-root/evidence"
+printf 'native fixture\n' >"$TMP/container/native/nexus"
+chmod +x "$TMP/container/native/nexus"
+NATIVE_SHA=$(sha256sum "$TMP/container/native/nexus" | cut -d' ' -f1)
+for package in nexus nexus-cli nexus-gateway; do
+  stage="$TMP/package-$package/package"
+  mkdir -p "$stage"
+  printf '{"name":"@egregore/%s","version":"0.1.5"}\n' "$package" >"$stage/package.json"
+  tar -czf "$TMP/container/packs/$package.tgz" -C "$(dirname "$stage")" package
+done
+NEXUS_TAR_SHA=$(sha256sum "$TMP/container/packs/nexus.tgz" | cut -d' ' -f1)
+CLI_TAR_SHA=$(sha256sum "$TMP/container/packs/nexus-cli.tgz" | cut -d' ' -f1)
+GATEWAY_TAR_SHA=$(sha256sum "$TMP/container/packs/nexus-gateway.tgz" | cut -d' ' -f1)
+
+for repo in nexus lens egregore pactree pactree-py pactree-fs; do
+  path="$TMP/repos/$repo"
+  mkdir -p "$path"
+  git -C "$path" init -q
+  git -C "$path" config user.name fixture
+  git -C "$path" config user.email fixture@example.invalid
+  printf '%s\n' "$repo" >"$path/README"
+  git -C "$path" add README
+  git -C "$path" commit -qm initial
+done
+
+cat >"$TMP/bindings.json" <<JSON
+{
+  "containerId":"$(printf 'd%.0s' {1..64})",
+  "prefix":"/tmp/nexus-lab-install.fixtureABC",
+  "installNonce":"fixtureABC",
+  "launcher":"/tmp/nexus-lab-bin/nexus",
+  "launcherResolved":"/tmp/nexus-lab-install.fixtureABC/bin/nexus",
+  "launcherSha256":"$(printf '1%.0s' {1..64})",
+  "gateway":"/tmp/nexus-lab-bin/nexus-gateway",
+  "gatewayResolved":"/tmp/nexus-lab-install.fixtureABC/bin/nexus-gateway",
+  "gatewaySha256":"$(printf '2%.0s' {1..64})",
+  "webui":"/tmp/nexus-lab-bin/nexus-webui",
+  "webuiResolved":"/tmp/nexus-lab-install.fixtureABC/bin/nexus-webui",
+  "webuiSha256":"$(printf '5%.0s' {1..64})",
+  "gatewayModule":"/tmp/nexus-lab-install.fixtureABC/lib/node_modules/@egregore/nexus/node_modules/@egregore/nexus-gateway/dist-gateway/headless.mjs",
+  "gatewayModuleSha256":"$(printf '6%.0s' {1..64})",
+  "lensRendererMode":"production",
+  "lensApp":"/tmp/nexus-lens-app.fixtureABC",
+  "lensMain":"/tmp/nexus-lens-app.fixtureABC/electron/main.cjs",
+  "lensTreeSha256":"$(printf '9%.0s' {1..64})",
+  "native":"/tmp/nexus-lab-install.fixtureABC/lib/node_modules/@egregore/nexus/node_modules/@egregore/nexus-cli/native/linux-x64/nexus",
+  "nativeSha256":"$NATIVE_SHA",
+  "imageDigest":"sha256:$(printf '0%.0s' {1..64})",
+  "installTreeSha256":"$(printf 'a%.0s' {1..64})",
+  "wsAcceptance":"/tmp/nexus-lab-bin/nexus-v015-ws-acceptance",
+  "wsAcceptanceSha256":"$(printf 'b%.0s' {1..64})",
+  "wsSoak":"/tmp/nexus-lab-bin/nexus-v015-ws-soak",
+  "wsSoakSha256":"$(printf 'c%.0s' {1..64})",
+  "webconsoleAcceptance":"/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance",
+  "webconsoleAcceptanceSha256":"$(printf 'd%.0s' {1..64})",
+  "webconsoleEvidenceVerifier":"/tmp/nexus-lab-bin/nexus-v015-webconsole-evidence-verify",
+  "webconsoleEvidenceVerifierSha256":"$(printf 'f%.0s' {1..64})",
+  "evidenceValidator":"/tmp/nexus-lab-bin/nexus-v015-evidence-validate",
+  "evidenceValidatorSha256":"$(printf 'e%.0s' {1..64})",
+  "releaseAssembler":"/tmp/nexus-lab-bin/nexus-v015-release-assemble",
+  "releaseAssemblerSha256":"$(printf '0%.0s' {1..64})",
+  "labProcess":"/tmp/nexus-lab-bin/lab-process",
+  "labProcessSha256":"$(printf '3%.0s' {1..64})",
+  "labAgent":"/tmp/nexus-lab-bin/lab-agent",
+  "labAgentSha256":"$(printf '7%.0s' {1..64})",
+  "labFixture":"/tmp/nexus-lab-bin/lab-fixture",
+  "labFixtureSha256":"$(printf '8%.0s' {1..64})",
+  "nexusTarball":"/tmp/nexus-lab-packs/nexus.tgz",
+  "nexusTarballSha256":"$NEXUS_TAR_SHA",
+  "cliTarball":"/tmp/nexus-lab-packs/nexus-cli.tgz",
+  "cliTarballSha256":"$CLI_TAR_SHA",
+  "gatewayTarball":"/tmp/nexus-lab-packs/nexus-gateway.tgz",
+  "gatewayTarballSha256":"$GATEWAY_TAR_SHA",
+  "readiness":"/tmp/nexus-lens-home/lab/candidate-ready.v1",
+  "readinessSha256":"$(printf '4%.0s' {1..64})",
+  "gatewayUrl":"http://127.0.0.1:4100"
+}
+JSON
+
+cat >"$TMP/bin/docker" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"${DOCKER_FIXTURE_LOG:?}"
+map_container_path() {
+  case "$1" in
+    /tmp/nexus-lens-home*) printf '%s%s\n' "$DOCKER_FIXTURE_CONTAINER_ROOT" "${1#/tmp/nexus-lens-home}" ;;
+    /tmp/nexus-lab-packs*) printf '%s%s\n' "$DOCKER_FIXTURE_CONTAINER_DATA/packs" "${1#/tmp/nexus-lab-packs}" ;;
+    /tmp/nexus-lab-install.fixtureABC/lib/node_modules/@egregore/nexus/node_modules/@egregore/nexus-cli/native/linux-x64/nexus) printf '%s\n' "$DOCKER_FIXTURE_CONTAINER_DATA/native/nexus" ;;
+    /fixture*) printf '%s%s\n' "$DOCKER_FIXTURE_CONTAINER_DATA" "${1#/fixture}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+if [ "${1:-}" = exec ] && [ "${2:-}" = -i ]; then
+  shift 2
+  env_args=()
+  while [ "${1:-}" = -e ]; do env_args+=("$2"); shift 2; done
+  shift # container
+  [ "${1:-}" = python3 ] && [ "${2:-}" = - ] || exit 98
+  shift 2
+  mapped=()
+  for argument in "$@"; do mapped+=("$(map_container_path "$argument")"); done
+  readiness_snapshot=0
+  expected_run=""
+  for variable in "${env_args[@]}"; do
+    case "$variable" in NEXUS_EXPECTED_RUN_ID=*) expected_run=${variable#*=} ;; esac
+  done
+  for argument in "${mapped[@]}"; do
+    [ "$argument" = --expected-uid ] && readiness_snapshot=1
+  done
+  if [ "$readiness_snapshot" -eq 1 ]; then
+    [ -n "$expected_run" ] || exit 98
+    readiness=${mapped[0]}
+    mkdir -p "$(dirname "$readiness")"
+    chmod 1777 "$(dirname "$readiness")"
+    [ ! -e "$readiness" ] || chmod 0644 "$readiness"
+    jq -r --arg run "$expected_run" '
+      {
+        schema:"1",containerId:.containerId,mode:"packed",runId:$run,
+        installRoot:.prefix,installNonce:.installNonce,
+        nexusLink:(.prefix + "/bin/nexus"),nexusResolved:.launcherResolved,nexusSha256:.launcherSha256,
+        gatewayLink:(.prefix + "/bin/nexus-gateway"),gatewayResolved:.gatewayResolved,gatewaySha256:.gatewaySha256,
+        webuiLink:(.prefix + "/bin/nexus-webui"),webuiResolved:.webuiResolved,webuiSha256:.webuiSha256,
+        labProcess:.labProcess,labProcessSha256:.labProcessSha256,
+        labAgent:.labAgent,labAgentSha256:.labAgentSha256,
+        labFixture:.labFixture,labFixtureSha256:.labFixtureSha256,
+        nexusTarball:.nexusTarball,nexusTarballSha256:.nexusTarballSha256,
+        cliTarball:.cliTarball,cliTarballSha256:.cliTarballSha256,
+        gatewayTarball:.gatewayTarball,gatewayTarballSha256:.gatewayTarballSha256,
+        imageDigest:.imageDigest,installTreeSha256:.installTreeSha256,
+        wsAcceptance:.wsAcceptance,wsAcceptanceSha256:.wsAcceptanceSha256,
+        wsSoak:.wsSoak,wsSoakSha256:.wsSoakSha256,
+        lensRendererMode:.lensRendererMode,lensApp:.lensApp,lensMain:.lensMain,lensTreeSha256:.lensTreeSha256,
+        nativeResolved:.native,nativeSha256:.nativeSha256,
+        webconsoleAcceptance:.webconsoleAcceptance,
+        webconsoleAcceptanceSha256:.webconsoleAcceptanceSha256,
+        webconsoleEvidenceVerifier:.webconsoleEvidenceVerifier,
+        webconsoleEvidenceVerifierSha256:.webconsoleEvidenceVerifierSha256,
+        evidenceValidator:.evidenceValidator,evidenceValidatorSha256:.evidenceValidatorSha256,
+        releaseAssembler:.releaseAssembler,releaseAssemblerSha256:.releaseAssemblerSha256
+      } | to_entries[] | "\(.key)=\(.value)"
+    ' "$DOCKER_FIXTURE_BINDINGS" >"$readiness"
+    chmod 0444 "$readiness"
+    count=1
+    if [ -n "${DOCKER_FIXTURE_READINESS_COUNT:-}" ]; then
+      previous=0
+      [ ! -f "$DOCKER_FIXTURE_READINESS_COUNT" ] \
+        || previous=$(cat "$DOCKER_FIXTURE_READINESS_COUNT")
+      count=$((previous + 1))
+      printf '%s\n' "$count" >"$DOCKER_FIXTURE_READINESS_COUNT"
+    fi
+    case "${DOCKER_FIXTURE_READINESS_FAULT:-}" in
+      duplicate) chmod 0644 "$readiness"; printf 'schema=1\n' >>"$readiness"; chmod 0444 "$readiness" ;;
+      mode) chmod 0644 "$readiness" ;;
+      hardlink) ln "$readiness" "$readiness.alias" ;;
+      replace-final)
+        if [ "$count" -eq 2 ]; then
+          cp -p "$readiness" "$readiness.replacement"
+          mv -f "$readiness.replacement" "$readiness"
+        fi
+        ;;
+      bytes-final)
+        if [ "$count" -eq 2 ]; then
+          chmod 0644 "$readiness"
+          sed -i 's/^mode=packed$/mode=source/' "$readiness"
+          chmod 0444 "$readiness"
+        fi
+        ;;
+    esac
+    for index in "${!mapped[@]}"; do
+      case "${mapped[$index]}" in
+        --expected-uid) mapped[$((index + 1))]=$(id -u) ;;
+        --expected-gid) mapped[$((index + 1))]=$(id -g) ;;
+      esac
+    done
+  fi
+  set +e
+  output=$(env "${env_args[@]}" python3 - "${mapped[@]}")
+  status=$?
+  set -e
+  if [ "$status" -eq 0 ]; then
+    if [ "$readiness_snapshot" -eq 1 ]; then
+      output=$(jq -c '.uid = 0 | .gid = 0' <<<"$output")
+    fi
+    printf '%s\n' "${output//$DOCKER_FIXTURE_CONTAINER_ROOT/\/tmp\/nexus-lens-home}"
+    case " ${mapped[*]} " in *" publish "*) touch "$DOCKER_FIXTURE_VERIFIED" ;; esac
+  fi
+  exit "$status"
+fi
+if [ "${1:-}" = cp ]; then
+  shift
+  preserve=0
+  if [ "${1:-}" = -a ]; then preserve=1; shift; fi
+  source=$1
+  destination=$2
+  if [[ "$source" == *:* ]]; then
+    source_path=$(map_container_path "${source#*:}")
+    cp -a "$source_path" "$destination"
+  else
+    destination_path=$(map_container_path "${destination#*:}")
+    touch "$DOCKER_FIXTURE_COPIED"
+    if [ "${DOCKER_FIXTURE_COPY_FAIL:-0}" -eq 1 ]; then
+      cp -a "${source%/.}/manifest.json" "$destination_path/manifest.json"
+      exit 91
+    fi
+    cp -a "${source%/.}/." "$destination_path/"
+    case "${DOCKER_FIXTURE_COPY_MUTATION:-}" in
+      hash) printf 'tamper\n' >>"$destination_path/candidate/native/nexus" ;;
+      symlink) rm "$destination_path/candidate/native/nexus"; ln -s /etc/passwd "$destination_path/candidate/native/nexus" ;;
+      hardlink) ln "$destination_path/candidate/native/nexus" "$destination_path/candidate/native/alias" ;;
+      native-mode) chmod 0400 "$destination_path/candidate/native/nexus" ;;
+      tarball-mode) chmod 0555 "$destination_path/candidate/npm/nexus.tgz" ;;
+      directory-mode) chmod 0700 "$destination_path/candidate/npm" ;;
+    esac
+  fi
+  exit 0
+fi
+case "$*" in
+  *"{{.Image}}"*) printf 'sha256:%064d\n' 0 ;;
+  *"{{.Id}}"*) printf 'd%.0s' {1..64}; printf '\n' ;;
+  *"{{.Config.User}}"*) printf '%s\n' "${DOCKER_FIXTURE_CONFIG_USER:-$(id -u):$(id -g)}" ;;
+  *"{{json .HostConfig}}"*)
+    echo '{"NanoCpus":6000000000,"Memory":8589934592,"MemorySwap":8589934592,"PidsLimit":1024}'
+    ;;
+  *"{{json .Config.Env}}"*)
+    echo '["OCULAR_LAB=1","NEXUS_HOME=/tmp/nexus-lens-home/nexus","API_TOKEN=secret"]'
+    ;;
+  exec*"NEXUS_EXPECTED_CONTAINER_ID="*) cat "$DOCKER_FIXTURE_BINDINGS" ;;
+  exec*"/tmp/nexus-lab-bin/nexus --version"*) echo 'nexus 0.1.5' ;;
+  exec*"node --version"*) echo 'v24.18.0' ;;
+  exec*"rustc --version"*) echo 'rustc 1.90.0 (fixture)' ;;
+  *) echo "unexpected docker call: $*" >&2; exit 98 ;;
+esac
+SH
 chmod +x "$TMP/bin/docker"
 
 PATH="$TMP/bin:/usr/bin:/bin" "$TARGET" --help >"$TMP/help"
+grep -Fq 'PACTREE_REPO="${NEXUS_V015_PACTREE_REPO:-}"' "$TARGET"
+grep -Fq 'PACTREE_PY_REPO="${NEXUS_V015_PACTREE_PY_REPO:-}"' "$TARGET"
+grep -Fq '[ "$NEXUS_VERSION" = "nexus $VERSION" ]' "$TARGET"
 grep -Fq -- "--container" "$TMP/help"
 grep -Fq -- "--mode" "$TMP/help"
 grep -Fq -- "--output" "$TMP/help"
 
-PATH="$TMP/bin:/usr/bin:/bin" "$TARGET" \
+COMMON_ENV=(
+  "PATH=$TMP/bin:/usr/bin:/bin"
+  "DOCKER_FIXTURE_BINDINGS=$TMP/bindings.json"
+  "DOCKER_FIXTURE_NATIVE=$TMP/container/native/nexus"
+  "DOCKER_FIXTURE_PACKS=$TMP/container/packs"
+  "DOCKER_FIXTURE_CONTAINER_DATA=$TMP/container"
+  "DOCKER_FIXTURE_CONTAINER_ROOT=$TMP/container-root"
+  "DOCKER_FIXTURE_LOG=$TMP/docker.log"
+  "DOCKER_FIXTURE_COPIED=$TMP/copied"
+  "DOCKER_FIXTURE_CLEANED=$TMP/cleaned"
+  "DOCKER_FIXTURE_VERIFIED=$TMP/verified"
+  "NEXUS_V015_NEXUS_REPO=$TMP/repos/nexus"
+  "NEXUS_V015_LENS_REPO=$TMP/repos/lens"
+  "NEXUS_V015_EGREGORE_REPO=$TMP/repos/egregore"
+  "NEXUS_V015_PACTREE_REPO=$TMP/repos/pactree"
+  "NEXUS_V015_PACTREE_PY_REPO=$TMP/repos/pactree-py"
+  "NEXUS_V015_PACTREE_FS_REPO=$TMP/repos/pactree-fs"
+)
+
+env "${COMMON_ENV[@]}" "$TARGET" \
   --container fixture \
-  --mode source \
-  --output "$TMP/manifest.json" \
+  --mode packed \
+  --run-id fixture-run \
+  --output "$TMP/out/fixture-run/manifest.json" \
   --no-copy
 
+# A repository edit between the fd-backed capture and its generation check
+# must reject the entire manifest before any canonical run root is published.
+printf 'race-before\n' >"$TMP/repos/nexus/race.txt"
+SOURCE_READY="$TMP/source-ready"
+SOURCE_CONTINUE="$TMP/source-continue"
+set +e
+env "${COMMON_ENV[@]}" \
+  "NEXUS_V015_SOURCE_CAPTURE_PAUSE_REPO=$TMP/repos/nexus" \
+  "NEXUS_V015_SOURCE_CAPTURE_PAUSE_READY=$SOURCE_READY" \
+  "NEXUS_V015_SOURCE_CAPTURE_PAUSE_CONTINUE=$SOURCE_CONTINUE" \
+  "$TARGET" --container fixture --mode packed --run-id source-race \
+  --output "$TMP/out/source-race/manifest.json" --no-copy \
+  >"$TMP/source-race.stdout" 2>"$TMP/source-race.stderr" &
+SOURCE_PID=$!
+set -e
+for _ in $(seq 1 500); do
+  [ -e "$SOURCE_READY" ] && break
+  kill -0 "$SOURCE_PID" 2>/dev/null || break
+  sleep 0.01
+done
+[ -e "$SOURCE_READY" ] || {
+  kill "$SOURCE_PID" 2>/dev/null || true
+  wait "$SOURCE_PID" 2>/dev/null || true
+  echo 'source capture did not reach the mutation barrier' >&2
+  exit 1
+}
+printf 'race-after\n' >>"$TMP/repos/nexus/race.txt"
+touch "$SOURCE_CONTINUE"
+set +e
+wait "$SOURCE_PID"
+SOURCE_STATUS=$?
+set -e
+[ "$SOURCE_STATUS" -ne 0 ]
+grep -Fq 'source changed while manifest snapshot was captured' "$TMP/source-race.stderr"
+[ ! -e "$TMP/out/source-race" ]
+rm -f "$TMP/repos/nexus/race.txt" "$SOURCE_READY" "$SOURCE_CONTINUE"
+
+FINAL_READY="$TMP/source-final-ready"
+FINAL_CONTINUE="$TMP/source-final-continue"
+set +e
+env "${COMMON_ENV[@]}" \
+  "NEXUS_V015_SOURCE_FINAL_PAUSE_READY=$FINAL_READY" \
+  "NEXUS_V015_SOURCE_FINAL_PAUSE_CONTINUE=$FINAL_CONTINUE" \
+  "$TARGET" --container fixture --mode packed --run-id source-final-race \
+  --output "$TMP/out/source-final-race/manifest.json" --no-copy \
+  >"$TMP/source-final-race.stdout" 2>"$TMP/source-final-race.stderr" &
+FINAL_PID=$!
+set -e
+for _ in $(seq 1 1000); do
+  [ -e "$FINAL_READY" ] && break
+  kill -0 "$FINAL_PID" 2>/dev/null || break
+  sleep 0.01
+done
+[ -e "$FINAL_READY" ] || {
+  kill "$FINAL_PID" 2>/dev/null || true
+  wait "$FINAL_PID" 2>/dev/null || true
+  echo 'source final verification did not reach the mutation barrier' >&2
+  exit 1
+}
+printf 'late mutation\n' >"$TMP/repos/lens/late.txt"
+touch "$FINAL_CONTINUE"
+set +e
+wait "$FINAL_PID"
+FINAL_STATUS=$?
+set -e
+[ "$FINAL_STATUS" -ne 0 ]
+grep -Fq 'source changed after manifest snapshot was captured' "$TMP/source-final-race.stderr"
+[ ! -e "$TMP/out/source-final-race" ]
+rm -f "$TMP/repos/lens/late.txt" "$FINAL_READY" "$FINAL_CONTINUE"
+
+# The readiness ledger is one root-authority fd snapshot. Duplicate keys,
+# mutable metadata, multiply-linked files, and either an inode or byte change
+# between capture and publication must leave no canonical run root.
+for fault in duplicate mode hardlink; do
+  run="readiness-$fault"
+  set +e
+  env "${COMMON_ENV[@]}" DOCKER_FIXTURE_READINESS_FAULT=$fault \
+    "$TARGET" --container fixture --mode packed --run-id "$run" \
+    --output "$TMP/out/$run/manifest.json" --no-copy \
+    >"$TMP/$run.stdout" 2>"$TMP/$run.stderr"
+  status=$?
+  set -e
+  test "$status" -ne 0
+  grep -Fq 'candidate readiness snapshot failed' "$TMP/$run.stderr"
+  test ! -e "$TMP/out/$run"
+  rm -f "$TMP/container-root/lab/candidate-ready.v1.alias"
+done
+
+for fault in replace-final bytes-final; do
+  run="readiness-$fault"
+  count_file="$TMP/$run.count"
+  set +e
+  env "${COMMON_ENV[@]}" \
+    DOCKER_FIXTURE_READINESS_FAULT=$fault \
+    DOCKER_FIXTURE_READINESS_COUNT=$count_file \
+    "$TARGET" --container fixture --mode packed --run-id "$run" \
+    --output "$TMP/out/$run/manifest.json" --no-copy \
+    >"$TMP/$run.stdout" 2>"$TMP/$run.stderr"
+  status=$?
+  set -e
+  test "$status" -ne 0
+  grep -Fq 'candidate readiness changed during manifest capture' "$TMP/$run.stderr"
+  test ! -e "$TMP/out/$run"
+done
+
+MANIFEST="$TMP/out/fixture-run/manifest.json"
 jq -e '
-  .schemaVersion == 1 and
-  .mode == "source" and
-  .container.name == "fixture" and
-  .container.limits.cpus == 6 and
-  .container.limits.memoryBytes == 8589934592 and
-  .container.limits.pids == 1024 and
-  .image.id == "sha256:image-fixture" and
-  .environment.SAFE == "value" and
+  (keys | sort) == (["container","environment","image","mode","native","packages","runId","schemaVersion","sources","toolchains"] | sort) and
+  .schemaVersion == 1 and .runId == "fixture-run" and .mode == "packed" and
+  .container == {limits:{cpus:6,memoryBytes:8589934592,pids:1024}} and
+  (.image.digest | test("^sha256:[0-9a-f]{64}$")) and
+  (.sources | keys | sort) == (["nexus","lens","egregore","pactree","pactreePython","pactreeFs"] | sort) and
+  ([.sources[] | keys | sort] | all(. == ["dirty","dirtyPaths","revision"])) and
+  [.packages[].name] == ["@egregore/nexus","@egregore/nexus-cli","@egregore/nexus-gateway"] and
+  ([.packages[].version] | all(. == "0.1.5")) and
   .environment.API_TOKEN == "<redacted>" and
-  .sources.nexus.sha != null and
-  .toolchains.nexus == "nexus 0.1.5"
-' "$TMP/manifest.json" >/dev/null
+  .environment.NEXUS_V015_PACKED_PREFIX == "/tmp/nexus-lab-install.fixtureABC" and
+  .environment.NEXUS_V015_INSTALL_NONCE == "fixtureABC" and
+  .environment.NEXUS_V015_NEXUS_BIN == "/tmp/nexus-lab-bin/nexus" and
+  .environment.NEXUS_V015_WEBUI_BIN == "/tmp/nexus-lab-bin/nexus-webui" and
+  .environment.NEXUS_V015_WEBUI_BIN_RESOLVED == "/tmp/nexus-lab-install.fixtureABC/bin/nexus-webui" and
+  (.environment.NEXUS_V015_WEBUI_BIN_SHA256 | test("^[0-9a-f]{64}$")) and
+  .environment.NEXUS_V015_GATEWAY_MODULE == "/tmp/nexus-lab-install.fixtureABC/lib/node_modules/@egregore/nexus/node_modules/@egregore/nexus-gateway/dist-gateway/headless.mjs" and
+  (.environment.NEXUS_V015_GATEWAY_MODULE_SHA256 | test("^[0-9a-f]{64}$")) and
+  .environment.NEXUS_V015_LENS_RENDERER_MODE == "production" and
+  .environment.NEXUS_V015_LENS_APP == "/tmp/nexus-lens-app.fixtureABC" and
+  .environment.NEXUS_V015_LENS_MAIN == "/tmp/nexus-lens-app.fixtureABC/electron/main.cjs" and
+  (.environment.NEXUS_V015_LENS_TREE_SHA256 | test("^[0-9a-f]{64}$")) and
+  (.environment.NEXUS_V015_IMAGE_DIGEST | test("^sha256:[0-9a-f]{64}$")) and
+  (.environment.NEXUS_V015_INSTALL_TREE_SHA256 | test("^[0-9a-f]{64}$")) and
+  .environment.NEXUS_V015_WS_ACCEPTANCE == "/tmp/nexus-lab-bin/nexus-v015-ws-acceptance" and
+  (.environment.NEXUS_V015_WS_ACCEPTANCE_SHA256 | test("^[0-9a-f]{64}$")) and
+  .environment.NEXUS_V015_WS_SOAK == "/tmp/nexus-lab-bin/nexus-v015-ws-soak" and
+  (.environment.NEXUS_V015_WS_SOAK_SHA256 | test("^[0-9a-f]{64}$")) and
+  .environment.NEXUS_V015_WEBCONSOLE_ACCEPTANCE == "/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance" and
+  (.environment.NEXUS_V015_WEBCONSOLE_ACCEPTANCE_SHA256 | test("^[0-9a-f]{64}$")) and
+  .environment.NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER == "/tmp/nexus-lab-bin/nexus-v015-webconsole-evidence-verify" and
+  (.environment.NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER_SHA256 | test("^[0-9a-f]{64}$")) and
+  .environment.NEXUS_V015_EVIDENCE_VALIDATOR == "/tmp/nexus-lab-bin/nexus-v015-evidence-validate" and
+  (.environment.NEXUS_V015_EVIDENCE_VALIDATOR_SHA256 | test("^[0-9a-f]{64}$")) and
+  .environment.NEXUS_V015_RELEASE_ASSEMBLER == "/tmp/nexus-lab-bin/nexus-v015-release-assemble" and
+  (.environment.NEXUS_V015_RELEASE_ASSEMBLER_SHA256 | test("^[0-9a-f]{64}$")) and
+  .environment.NEXUS_V015_LAB_PROCESS == "/tmp/nexus-lab-bin/lab-process" and
+  .environment.NEXUS_V015_LAB_AGENT == "/tmp/nexus-lab-bin/lab-agent" and
+  .environment.NEXUS_V015_LAB_FIXTURE == "/tmp/nexus-lab-bin/lab-fixture" and
+  (.environment.NEXUS_V015_LAB_PROCESS_SHA256 | test("^[0-9a-f]{64}$")) and
+  (.environment.NEXUS_V015_LAB_AGENT_SHA256 | test("^[0-9a-f]{64}$")) and
+  (.environment.NEXUS_V015_LAB_FIXTURE_SHA256 | test("^[0-9a-f]{64}$")) and
+  .environment.NEXUS_V015_NEXUS_TARBALL == "/tmp/nexus-lab-packs/nexus.tgz" and
+  .environment.NEXUS_V015_CLI_TARBALL == "/tmp/nexus-lab-packs/nexus-cli.tgz" and
+  .environment.NEXUS_V015_GATEWAY_TARBALL == "/tmp/nexus-lab-packs/nexus-gateway.tgz" and
+  .environment.NEXUS_V015_NEXUS_TARBALL_SHA256 == .packages[0].tarball.sha256 and
+  .environment.NEXUS_V015_CLI_TARBALL_SHA256 == .packages[1].tarball.sha256 and
+  .environment.NEXUS_V015_GATEWAY_TARBALL_SHA256 == .packages[2].tarball.sha256 and
+  .environment.NEXUS_V015_READINESS_LEDGER == "/tmp/nexus-lens-home/lab/candidate-ready.v1"
+' "$MANIFEST" >/dev/null
+for path in \
+  candidate/native/nexus \
+  candidate/npm/nexus.tgz \
+  candidate/npm/nexus-cli.tgz \
+  candidate/npm/nexus-gateway.tgz; do
+  test -f "$TMP/out/fixture-run/$path"
+done
+test -f "$TMP/out/fixture-run/.candidate-committed"
+test "$(stat -c %a "$TMP/out/fixture-run/.candidate-committed")" = 400
+python3 - "$SCRIPT_DIR/nexus-v015-evidence-validate" "$TMP/out/fixture-run" <<'PY'
+from pathlib import Path
+import os
+import runpy
+import stat
+import sys
+
+namespace = runpy.run_path(sys.argv[1])
+root = Path(sys.argv[2])
+authority = namespace["RunAuthority"](
+    lab_root=Path("/tmp/nexus-lens-home"),
+    run_root=root,
+    run_id=root.name,
+    container_id="d" * 64,
+    readiness_path=Path("/tmp/nexus-lens-home/lab/candidate-ready.v1"),
+    readiness_sha256="4" * 64,
+    readiness_rows={"schema": "1", "mode": "packed", "runId": root.name},
+    seal_root=root.parent.parent / "seal-authority",
+    fixture=True,
+)
+validator = namespace["Validator"](root, authority)
+try:
+    validator.validate_manifest()
+finally:
+    validator.close()
+
+mutations = {
+    Path("candidate/native/nexus"): 0o400,
+    Path("candidate/npm/nexus.tgz"): 0o555,
+    Path("candidate/npm/nexus-cli.tgz"): 0o555,
+    Path("candidate/npm/nexus-gateway.tgz"): 0o555,
+    Path("candidate"): 0o700,
+    Path("candidate/native"): 0o700,
+    Path("candidate/npm"): 0o700,
+}
+for relative, bad_mode in mutations.items():
+    path = root / relative
+    original = stat.S_IMODE(os.lstat(path).st_mode)
+    os.chmod(path, bad_mode, follow_symlinks=False)
+    try:
+        validator = namespace["Validator"](root, authority)
+        try:
+            validator.validate_manifest()
+        except namespace["EvidenceError"] as error:
+            if error.code != "CANDIDATE_SEAL_MODE":
+                raise AssertionError(f"wrong mode error for {relative}: {error}") from error
+        else:
+            raise AssertionError(f"unsafe candidate payload mode passed: {relative}")
+        finally:
+            validator.close()
+    finally:
+        os.chmod(path, original, follow_symlinks=False)
+PY
+
+# The real copy path preserves the configured numeric validator ownership and
+# then proves the sealed manifest plus every candidate artifact are readable
+# by that default user. A plain root-owned docker cp is not acceptable.
+env "${COMMON_ENV[@]}" "$TARGET" \
+  --container fixture \
+  --mode packed \
+  --run-id copied-run \
+  --output "$TMP/out/copied-run/manifest.json"
+test -e "$TMP/copied"
+test -e "$TMP/verified"
+test -f "$TMP/out/copied-run/.candidate-committed"
+test -f "$TMP/container-root/evidence/copied-run/manifest.json"
+test -f "$TMP/container-root/evidence/copied-run/.candidate-committed"
+test "$(stat -c %a "$TMP/container-root/evidence/copied-run/.candidate-committed")" = 400
+test -z "$(find "$TMP/container-root/evidence" -maxdepth 1 -name '.copied-run.copy-*' -print -quit)"
+
+# A validator user mismatch must fail before any container evidence copy or
+# publication.  Candidate evidence is always owned by the configured runtime
+# user, never by an incidental root producer.
+rm -f "$TMP/copied" "$TMP/verified"
+set +e
+env "${COMMON_ENV[@]}" DOCKER_FIXTURE_CONFIG_USER=12345:12345 "$TARGET" \
+  --container fixture \
+  --mode packed \
+  --run-id wrong-user \
+  --output "$TMP/out/wrong-user/manifest.json" \
+  >"$TMP/wrong-user.out" 2>"$TMP/wrong-user.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq 'validator Config.User does not match the manifest producer UID:GID' \
+  "$TMP/wrong-user.err"
+test ! -e "$TMP/copied"
+test ! -e "$TMP/verified"
+
+# A partial docker cp is retained only as a hidden, unsealed diagnostic stage;
+# neither the container nor host canonical run root is ever published.
+rm -f "$TMP/copied" "$TMP/cleaned" "$TMP/verified"
+set +e
+env "${COMMON_ENV[@]}" DOCKER_FIXTURE_COPY_FAIL=1 "$TARGET" \
+  --container fixture \
+  --mode packed \
+  --run-id copy-fail \
+  --output "$TMP/out/copy-fail/manifest.json" \
+  >"$TMP/copy-fail.out" 2>"$TMP/copy-fail.err"
+status=$?
+set -e
+test "$status" -eq 91
+test -e "$TMP/copied"
+test ! -e "$TMP/verified"
+test ! -e "$TMP/out/copy-fail"
+test ! -e "$TMP/container-root/evidence/copy-fail"
+mapfile -t copy_fail_stages < <(find "$TMP/container-root/evidence" -maxdepth 1 -type d -name '.copy-fail.copy-*')
+test "${#copy_fail_stages[@]}" -eq 1
+test -f "${copy_fail_stages[0]}/manifest.json"
+test ! -e "${copy_fail_stages[0]}/.candidate-committed"
+
+# Every copy-side mutation is detected by the fd-backed verifier before
+# canonical publication.  The hidden stage is retained instead of deleting a
+# swapped or foreign pathname.
+for mutation in hash symlink hardlink native-mode tarball-mode directory-mode; do
+  run="copy-$mutation"
+  set +e
+  env "${COMMON_ENV[@]}" DOCKER_FIXTURE_COPY_MUTATION=$mutation "$TARGET" \
+    --container fixture --mode packed --run-id "$run" \
+    --output "$TMP/out/$run/manifest.json" \
+    >"$TMP/$run.out" 2>"$TMP/$run.err"
+  status=$?
+  set -e
+  test "$status" -ne 0
+  test ! -e "$TMP/out/$run"
+  test ! -e "$TMP/container-root/evidence/$run"
+  test -n "$(find "$TMP/container-root/evidence" -maxdepth 1 -name ".$run.copy-*" -print -quit)"
+done
+
+# A post-rename durability fault leaves no valid commit seal.  Consumers can
+# observe the diagnostic canonical directory but must reject it as incomplete.
+set +e
+env "${COMMON_ENV[@]}" \
+  NEXUS_V015_EVIDENCE_TREE_TESTING=1 \
+  NEXUS_V015_EVIDENCE_TREE_FAULT=after-rename-parent-fsync \
+  "$TARGET" --container fixture --mode packed --run-id fsync-fail \
+  --output "$TMP/out/fsync-fail/manifest.json" \
+  >"$TMP/fsync-fail.out" 2>"$TMP/fsync-fail.err"
+status=$?
+set -e
+test "$status" -ne 0
+test ! -e "$TMP/out/fsync-fail"
+test -f "$TMP/container-root/evidence/fsync-fail/manifest.json"
+test ! -e "$TMP/container-root/evidence/fsync-fail/.candidate-committed"
+
+set +e
+env "${COMMON_ENV[@]}" "$TARGET" \
+  --container fixture --mode packed --run-id fixture-run \
+  --output "$TMP/out/fixture-run/manifest.json" --no-copy \
+  >"$TMP/reuse.out" 2>"$TMP/reuse.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq 'refusing to replace existing run root' "$TMP/reuse.err"
+
+set +e
+env "${COMMON_ENV[@]}" "$TARGET" --container fixture --mode source --no-copy \
+  >"$TMP/source.out" 2>"$TMP/source.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq 'requires --mode packed' "$TMP/source.err"
 
 bash -n "$TARGET"
-printf 'v0.1.5 lab manifest contract: ok\n'
+printf 'v0.1.5 strict packed lab manifest: ok\n'

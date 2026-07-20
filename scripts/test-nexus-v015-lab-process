@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TARGET="$SCRIPT_DIR/nexus-v015-lab-process"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$TMP/bin" "$TMP/lab/nexus" "$TMP/lab/evidence"
+
+cat >"$TMP/bin/nexus-fixture" <<'FIXTURE'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$FIXTURE_COMMANDS"
+surface=${1:-}
+action=${2:-}
+state="$FIXTURE_STATE_DIR/$surface"
+case "$action" in
+  start|restart) touch "$state" ;;
+  stop) rm -f "$state" ;;
+  status) [ -f "$state" ] || exit 2 ;;
+  *) exit 64 ;;
+esac
+FIXTURE
+chmod +x "$TMP/bin/nexus-fixture"
+
+cat >"$TMP/bin/curl" <<'FIXTURE'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'curl %s\n' "$*" >>"$FIXTURE_COMMANDS"
+[ -f "$FIXTURE_STATE_DIR/gateway" ] || exit 7
+printf '{"status":"ok"}\n'
+FIXTURE
+chmod +x "$TMP/bin/curl"
+
+run_hook() {
+  PATH="$TMP/bin:/usr/bin:/bin" \
+    OCULAR_LAB=1 \
+    NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+    NEXUS_V015_NEXUS_BIN="$TMP/bin/nexus-fixture" \
+    NEXUS_LAB_ROOT="$TMP/lab" \
+    NEXUS_HOME="$TMP/lab/nexus" \
+    FIXTURE_COMMANDS="$TMP/commands" \
+    FIXTURE_STATE_DIR="$TMP/state" \
+    "$TARGET" "$@"
+}
+
+mkdir -p "$TMP/state"
+
+set +e
+"$TARGET" --help >"$TMP/help.stdout" 2>"$TMP/help.stderr"
+help_status=$?
+set -e
+[ "$help_status" -eq 0 ]
+grep -Fq 'restart|stop|start gateway|daemon' "$TMP/help.stdout"
+[ ! -e "$TMP/commands" ]
+
+set +e
+PATH="$TMP/bin:/usr/bin:/bin" \
+  NEXUS_V015_NEXUS_BIN="$TMP/bin/nexus-fixture" \
+  NEXUS_LAB_ROOT="$TMP/lab" \
+  NEXUS_HOME="$TMP/lab/nexus" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_STATE_DIR="$TMP/state" \
+  "$TARGET" restart daemon >"$TMP/outside.stdout" 2>"$TMP/outside.stderr"
+outside_status=$?
+set -e
+[ "$outside_status" -eq 1 ]
+grep -Fq 'refusing to run outside' "$TMP/outside.stderr"
+[ ! -e "$TMP/commands" ]
+
+touch "$TMP/state/daemon" "$TMP/state/gateway"
+run_hook stop daemon
+[ ! -e "$TMP/state/daemon" ]
+run_hook start daemon
+[ -e "$TMP/state/daemon" ]
+run_hook restart daemon
+[ -e "$TMP/state/daemon" ]
+
+run_hook stop gateway
+[ ! -e "$TMP/state/gateway" ]
+run_hook start gateway
+[ -e "$TMP/state/gateway" ]
+run_hook restart gateway
+[ -e "$TMP/state/gateway" ]
+
+grep -Fxq 'daemon stop' "$TMP/commands"
+grep -Fxq 'daemon start' "$TMP/commands"
+grep -Fxq 'daemon restart' "$TMP/commands"
+grep -Fxq 'gateway stop' "$TMP/commands"
+grep -Fxq 'gateway start' "$TMP/commands"
+grep -Fxq 'gateway restart' "$TMP/commands"
+grep -Fq 'curl -fsS --max-time 2 http://127.0.0.1:4100/api/v1/health' "$TMP/commands"
+
+set +e
+run_hook bounce daemon >"$TMP/bad-action.stdout" 2>"$TMP/bad-action.stderr"
+bad_action_status=$?
+run_hook restart webconsole >"$TMP/bad-target.stdout" 2>"$TMP/bad-target.stderr"
+bad_target_status=$?
+set -e
+[ "$bad_action_status" -eq 2 ]
+[ "$bad_target_status" -eq 2 ]
+grep -Fq 'action must be restart, stop, or start' "$TMP/bad-action.stderr"
+grep -Fq 'target must be gateway or daemon' "$TMP/bad-target.stderr"
+
+set +e
+PATH="$TMP/bin:/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_NEXUS_BIN="$TMP/bin/nexus-fixture" \
+  NEXUS_LAB_ROOT="$TMP/lab" \
+  NEXUS_HOME="$TMP/other-home" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_STATE_DIR="$TMP/state" \
+  "$TARGET" restart daemon >"$TMP/wrong-home.stdout" 2>"$TMP/wrong-home.stderr"
+wrong_home_status=$?
+set -e
+[ "$wrong_home_status" -eq 1 ]
+grep -Fq 'NEXUS_HOME must be owned by NEXUS_LAB_ROOT' "$TMP/wrong-home.stderr"
+
+ln -s "$TARGET" "$TMP/bin/lab-process"
+ln -s "$TMP/bin/nexus-fixture" "$TMP/bin/nexus"
+PATH="/usr/bin:/bin" \
+  OCULAR_LAB=1 \
+  NEXUS_V015_ALLOW_FIXTURE_HOME=1 \
+  NEXUS_LAB_ROOT="$TMP/lab" \
+  NEXUS_HOME="$TMP/lab/nexus" \
+  FIXTURE_COMMANDS="$TMP/commands" \
+  FIXTURE_STATE_DIR="$TMP/state" \
+  "$TMP/bin/lab-process" restart daemon
+grep -Fxq 'daemon restart' "$TMP/commands"
+
+bash -n "$TARGET"
+printf 'v0.1.5 lab process hook: ok\n'

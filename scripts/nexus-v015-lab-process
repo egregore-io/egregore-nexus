@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ -n "${NEXUS_V015_NEXUS_BIN:-}" ]; then
+  NEXUS_BIN=$NEXUS_V015_NEXUS_BIN
+elif [ -x "$SCRIPT_DIR/nexus" ]; then
+  NEXUS_BIN="$SCRIPT_DIR/nexus"
+else
+  NEXUS_BIN=nexus
+fi
+
+usage() {
+  cat <<'USAGE'
+Usage: lab-process restart|stop|start gateway|daemon
+
+Control only the Nexus process pair inside the isolated v0.1.5 ocular lab.
+USAGE
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+usage_error() {
+  echo "error: $*" >&2
+  usage >&2
+  exit 2
+}
+
+if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then
+  usage
+  exit 0
+fi
+[ "$#" -eq 2 ] || usage_error "expected an action and target"
+ACTION=$1
+TARGET=$2
+case "$ACTION" in
+  restart|stop|start) ;;
+  *) usage_error "action must be restart, stop, or start" ;;
+esac
+case "$TARGET" in
+  gateway|daemon) ;;
+  *) usage_error "target must be gateway or daemon" ;;
+esac
+
+[ "${OCULAR_LAB:-}" = 1 ] || die "refusing to run outside the isolated ocular lab"
+[ -n "${NEXUS_LAB_ROOT:-}" ] || die "NEXUS_LAB_ROOT is required"
+[ -n "${NEXUS_HOME:-}" ] || die "NEXUS_HOME is required"
+for command in realpath timeout; do
+  command -v "$command" >/dev/null 2>&1 || die "required command is unavailable: $command"
+done
+if [[ "$NEXUS_BIN" == */* ]]; then
+  [ -x "$NEXUS_BIN" ] || die "Nexus CLI is not executable: $NEXUS_BIN"
+else
+  command -v "$NEXUS_BIN" >/dev/null 2>&1 || die "Nexus CLI is unavailable: $NEXUS_BIN"
+fi
+
+LAB_ROOT=$(realpath -m "$NEXUS_LAB_ROOT")
+LAB_HOME=$(realpath -m "$NEXUS_HOME")
+case "$LAB_HOME" in
+  "$LAB_ROOT"/*) ;;
+  *) die "NEXUS_HOME must be owned by NEXUS_LAB_ROOT" ;;
+esac
+if [ "${NEXUS_V015_ALLOW_FIXTURE_HOME:-}" != 1 ]; then
+  case "$LAB_ROOT" in
+    /tmp/nexus-lens-home|/tmp/nexus-lens-home/*) ;;
+    *) die "refusing non-lab NEXUS_LAB_ROOT: $LAB_ROOT" ;;
+  esac
+fi
+
+run_lifecycle() {
+  timeout --kill-after=5s 60s "$NEXUS_BIN" "$TARGET" "$ACTION"
+}
+
+daemon_up() {
+  timeout --kill-after=1s 5s "$NEXUS_BIN" daemon status >/dev/null 2>&1
+}
+
+gateway_up() {
+  command -v curl >/dev/null 2>&1 || die "required command is unavailable: curl"
+  curl -fsS --max-time 2 http://127.0.0.1:4100/api/v1/health >/dev/null 2>&1
+}
+
+wait_for_state() {
+  local expected=$1
+  local attempts=120
+  for _ in $(seq 1 "$attempts"); do
+    if [ "$TARGET" = daemon ]; then
+      if daemon_up; then current=up; else current=down; fi
+    else
+      if gateway_up; then current=up; else current=down; fi
+    fi
+    [ "$current" = "$expected" ] && return 0
+    sleep 0.25
+  done
+  die "$TARGET did not become $expected after $ACTION"
+}
+
+run_lifecycle
+if [ "$ACTION" = stop ]; then
+  wait_for_state down
+else
+  wait_for_state up
+fi
+printf '%s %s: ok\n' "$TARGET" "$ACTION"

@@ -1,0 +1,1717 @@
+#!/usr/bin/env python3
+"""Adversarial contract tests for the v0.1.5 evidence validator."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+TARGET = SCRIPT_DIR / "nexus-v015-evidence-validate"
+RUN_ID = "v015-fixture-run"
+SOURCE_NAMES = ("nexus", "lens", "egregore", "pactree", "pactreePython", "pactreeFs")
+PACKAGE_NAMES = ("@egregore/nexus", "@egregore/nexus-cli", "@egregore/nexus-gateway")
+OCULAR_CASES = tuple(f"O{index}" for index in range(1, 19))
+WEBUI_CASES = tuple(f"W{index}" for index in range(1, 9))
+EXPECTED_CASES = OCULAR_CASES + WEBUI_CASES
+OCULAR_ARTIFACTS = (
+    "preScreenshot",
+    "postScreenshot",
+    "dom",
+    "console",
+    "network",
+    "websocket",
+    "processLogs",
+    "health",
+    "pactbin2",
+)
+WEBUI_ARTIFACTS = OCULAR_ARTIFACTS[:-1]
+SOAK_COUNTERS = (
+    "deadLetters",
+    "lostAcceptedMessages",
+    "duplicateAcceptedMessages",
+    "crossRouteDeliveries",
+    "silentSubscriptionFailures",
+    "offlineRestoredParticipants",
+    "identityDrift",
+    "queueWedges",
+    "crashLoops",
+)
+RESULT_SPECS = {
+    "A1": ("results/A1-candidate-identity/result.json", ("versionReport", "cargoVersions", "packedInventory")),
+    "A2": ("results/A2-host-isolation/result.json", ("beforeSnapshot", "afterSnapshot", "comparison")),
+    "B1": ("results/B1-stable-identity/result.json", ("identityMatrix", "renameRegression", "agentIdResolution")),
+    "B2": ("results/B2-restart-reconciliation/result.json", ("restartTimeline", "rosterComparison", "humanRebind")),
+    "B3": ("results/B3-human-webconsole-attribution/result.json", ("attributionRows", "renderedAttribution", "principalTransitions")),
+    "C1": ("results/C1-browser-mutation-security/result.json", ("csrfMatrix", "packedHttp", "packedWebsocket")),
+    "C2": ("results/C2-developer-event-websocket/result.json", ("upgrades", "frames", "cursorCheckpoints", "backpressure", "noPolling")),
+    "C3": ("results/C3-agent-session-websocket/result.json", ("sessionFrames", "correlation", "reconnect", "backpressure", "laneIsolation")),
+    "C4": ("results/C4-rest-websocket-agreement/result.json", ("restSnapshot", "websocketDeltas", "recovery")),
+    "D1": ("results/D1-clean-packed-install/result.json", ("packedInventory", "installLog", "foreignCwd", "shutdown")),
+    "D2": ("results/D2-webconsole-cli/result.json", ("cliTranscript", "discoveryRecovery", "occupiedPort")),
+    "D3": ("results/D3-webui-browser/result.json", ("browserTranscript", "attribution", "reconnect")),
+    "E1": ("results/E1-pactbin2-session-store/result.json", ("revisions", "roundTrip", "damageFixtures")),
+    "E2": ("results/E2-lens-ocular/result.json", ("ocularSummary", "affordanceCoverage", "artifactsIndex")),
+    "F1": ("results/F1-live-codex-claude/result.json", ("codex", "claude", "deliveryMatrix")),
+    "F2": ("results/F2-message-hooks/result.json", ("shell", "javascript", "python", "timing")),
+    "F3": (
+        "results/F3-restart-soak/result.json",
+        (
+            "metrics",
+            "dualWebsocketFrames",
+            "reconnectCheckpoints",
+            "memory",
+            "disk",
+            "finalProcesses",
+            "finalListeners",
+            "logs",
+        ),
+    ),
+    "DIFF": ("release/diff-disposition.json", ("trackedDiff", "untrackedInventory", "intendedChanges")),
+    "REVIEW": ("release/review-disposition.json", ("reviewReport", "blockerDisposition")),
+}
+D2_RESULT_RELATIVE = Path(RESULT_SPECS["D2"][0])
+D2_SEAL_RELATIVE = Path("results/D2-webconsole-cli.result.sha256")
+RUN_SEAL_SUFFIX = ".run-committed.json"
+
+
+def load_validator_module():
+    name = "nexus_v015_evidence_validate_for_tests"
+    existing = sys.modules.get(name)
+    if existing is not None:
+        return existing
+    loader = importlib.machinery.SourceFileLoader(name, str(TARGET))
+    spec = importlib.util.spec_from_loader(name, loader)
+    if spec is None:
+        raise RuntimeError("cannot create validator module spec")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    loader.exec_module(module)
+    return module
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(64 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    previous_mode: int | None = None
+    if path.exists():
+        previous_mode = stat.S_IMODE(path.stat().st_mode)
+        if previous_mode & 0o200 == 0:
+            os.chmod(path, previous_mode | 0o200)
+    try:
+        path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+    finally:
+        if previous_mode is not None:
+            os.chmod(path, previous_mode)
+
+
+def rewrite_readonly_json(path: Path, value: object) -> None:
+    mode = stat.S_IMODE(os.lstat(path).st_mode)
+    os.chmod(path, mode | stat.S_IWUSR)
+    try:
+        write_json(path, value)
+    finally:
+        os.chmod(path, mode)
+
+
+def read_json(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def candidate_ledger(manifest: dict[str, object]) -> dict[str, object]:
+    return {
+        "mode": manifest["mode"],
+        "sources": manifest["sources"],
+        "nativeSha256": manifest["native"]["sha256"],
+        "packages": [
+            {
+                "name": package["name"],
+                "version": package["version"],
+                "tarballSha256": package["tarball"]["sha256"],
+            }
+            for package in manifest["packages"]
+        ],
+        "imageDigest": manifest["image"]["digest"],
+        "limits": manifest["container"]["limits"],
+        "toolchains": manifest["toolchains"],
+        "environment": manifest["environment"],
+    }
+
+
+def candidate_digest(manifest: dict[str, object]) -> str:
+    encoded = json.dumps(
+        candidate_ledger(manifest),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+class EvidenceFixture:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.lab_root = self.root.parents[1]
+        self.readiness_path = self.lab_root / "lab/candidate-ready.v1"
+        self.seal_root = self.lab_root.parent / f"{self.lab_root.name}-evidence-authority"
+        self.container_id = "a" * 64
+        self.run_seal_path = self.seal_root / f"{RUN_ID}{RUN_SEAL_SUFFIX}"
+        self.case_meta: dict[str, Path] = {}
+        self.result_paths: dict[str, Path] = {}
+        self.manifest_path = self.root / "manifest.json"
+        self.manifest: dict[str, object] = {}
+        self.candidate_digest = ""
+        self._build()
+
+    def artifact(self, relative: Path, content: bytes) -> dict[str, str]:
+        absolute = self.root / relative
+        absolute.parent.mkdir(parents=True, exist_ok=True)
+        absolute.write_bytes(content)
+        return {"path": relative.as_posix(), "sha256": sha256(absolute)}
+
+    def artifacts(self, owner: str, names: tuple[str, ...]) -> dict[str, dict[str, str]]:
+        return {
+            name: self.artifact(
+                Path("artifacts") / owner / f"{name}.json",
+                json.dumps({"owner": owner, "artifact": name}).encode("utf-8") + b"\n",
+            )
+            for name in names
+        }
+
+    @staticmethod
+    def passing_outcome() -> dict[str, object]:
+        return {
+            "status": "PASS",
+            "error": None,
+            "partial": False,
+            "flaky": False,
+            "skipped": False,
+            "refused": False,
+            "failureCount": 0,
+        }
+
+    def _build_manifest(self) -> None:
+        native = self.artifact(Path("candidate/native/nexus"), b"native-v0.1.5\n")
+        os.chmod(self.root / native["path"], 0o555)
+        packages = []
+        package_files = ("nexus.tgz", "nexus-cli.tgz", "nexus-gateway.tgz")
+        for index, (name, filename) in enumerate(zip(PACKAGE_NAMES, package_files, strict=True)):
+            tarball = self.artifact(
+                Path("candidate/npm") / filename,
+                f"{name}@0.1.5\n".encode("utf-8"),
+            )
+            os.chmod(self.root / tarball["path"], 0o444)
+            packages.append({"name": name, "version": "0.1.5", "tarball": tarball})
+        for relative in (Path("candidate"), Path("candidate/native"), Path("candidate/npm")):
+            os.chmod(self.root / relative, 0o755)
+        sources = {}
+        for index, name in enumerate(SOURCE_NAMES, start=1):
+            dirty_paths = []
+            if name == "nexus":
+                dirty_paths = [
+                    {
+                        "path": "gateway/src/candidate.ts",
+                        "state": "present",
+                        "sha256": "b" * 64,
+                    }
+                ]
+            sources[name] = {
+                "revision": format(index, "x") * 40,
+                "dirty": bool(dirty_paths),
+                "dirtyPaths": dirty_paths,
+            }
+        self.manifest = {
+            "schemaVersion": 1,
+            "runId": RUN_ID,
+            "mode": "packed",
+            "sources": sources,
+            "native": native,
+            "packages": packages,
+            "image": {"digest": "sha256:" + "c" * 64},
+            "container": {"limits": {"cpus": 6, "memoryBytes": 8589934592, "pids": 1024}},
+            "toolchains": {
+                "nexus": "nexus 0.1.5",
+                "node": "v24.18.0",
+                "rustc": "rustc 1.90.0",
+            },
+            "environment": {
+                "OCULAR_LAB": "1",
+                "NEXUS_HOME": str(self.lab_root / "nexus"),
+                "NEXUS_V015_RUN_ID": RUN_ID,
+                "NEXUS_V015_CONTAINER_ID": self.container_id,
+                "NEXUS_V015_PACKED_PREFIX": "/tmp/nexus-lab-install.fixture",
+                "NEXUS_V015_INSTALL_NONCE": "fixture",
+                "NEXUS_V015_NEXUS_BIN": "/tmp/nexus-lab-bin/nexus",
+                "NEXUS_V015_NEXUS_BIN_RESOLVED": "/tmp/nexus-lab-install.fixture/lib/node_modules/@egregore/nexus/bin/nexus.mjs",
+                "NEXUS_V015_NEXUS_BIN_SHA256": "1" * 64,
+                "NEXUS_V015_GATEWAY_BIN": "/tmp/nexus-lab-bin/nexus-gateway",
+                "NEXUS_V015_GATEWAY_BIN_RESOLVED": "/tmp/nexus-lab-install.fixture/lib/node_modules/@egregore/nexus/bin/nexus-gateway.mjs",
+                "NEXUS_V015_GATEWAY_BIN_SHA256": "2" * 64,
+                "NEXUS_V015_WEBUI_BIN": "/tmp/nexus-lab-bin/nexus-webui",
+                "NEXUS_V015_WEBUI_BIN_RESOLVED": "/tmp/nexus-lab-install.fixture/lib/node_modules/@egregore/nexus/bin/nexus-webui.mjs",
+                "NEXUS_V015_WEBUI_BIN_SHA256": "3" * 64,
+                "NEXUS_V015_GATEWAY_MODULE": "/tmp/nexus-lab-install.fixture/lib/node_modules/@egregore/nexus/node_modules/@egregore/nexus-gateway/dist-gateway/headless.mjs",
+                "NEXUS_V015_GATEWAY_MODULE_SHA256": "4" * 64,
+                "NEXUS_V015_LENS_RENDERER_MODE": "production",
+                "NEXUS_V015_LENS_APP": "/tmp/nexus-lens-app.fixture",
+                "NEXUS_V015_LENS_MAIN": "/tmp/nexus-lens-app.fixture/electron/main.cjs",
+                "NEXUS_V015_LENS_TREE_SHA256": "d" * 64,
+                "NEXUS_V015_NATIVE_BIN": "/tmp/nexus-lab-install.fixture/lib/node_modules/@egregore/nexus/node_modules/@egregore/nexus-cli/native/linux-x64/nexus",
+                "NEXUS_V015_NATIVE_BIN_SHA256": native["sha256"],
+                "NEXUS_V015_LAB_PROCESS": "/tmp/nexus-lab-bin/lab-process",
+                "NEXUS_V015_LAB_PROCESS_SHA256": "5" * 64,
+                "NEXUS_V015_LAB_AGENT": "/tmp/nexus-lab-bin/lab-agent",
+                "NEXUS_V015_LAB_AGENT_SHA256": "6" * 64,
+                "NEXUS_V015_LAB_FIXTURE": "/tmp/nexus-lab-bin/lab-fixture",
+                "NEXUS_V015_LAB_FIXTURE_SHA256": "7" * 64,
+                "NEXUS_V015_NEXUS_TARBALL": "/tmp/nexus-lab-packs/nexus.tgz",
+                "NEXUS_V015_NEXUS_TARBALL_SHA256": packages[0]["tarball"]["sha256"],
+                "NEXUS_V015_CLI_TARBALL": "/tmp/nexus-lab-packs/nexus-cli.tgz",
+                "NEXUS_V015_CLI_TARBALL_SHA256": packages[1]["tarball"]["sha256"],
+                "NEXUS_V015_GATEWAY_TARBALL": "/tmp/nexus-lab-packs/nexus-gateway.tgz",
+                "NEXUS_V015_GATEWAY_TARBALL_SHA256": packages[2]["tarball"]["sha256"],
+                "NEXUS_V015_READINESS_LEDGER": str(self.readiness_path),
+                "NEXUS_V015_READINESS_LEDGER_SHA256": sha256(self.readiness_path),
+                "NEXUS_V015_GATEWAY_URL": "http://127.0.0.1:4100",
+                "NEXUS_V015_IMAGE_DIGEST": "sha256:" + "c" * 64,
+                "NEXUS_V015_INSTALL_TREE_SHA256": "9" * 64,
+                "NEXUS_V015_WS_ACCEPTANCE": "/tmp/nexus-lab-bin/nexus-v015-ws-acceptance",
+                "NEXUS_V015_WS_ACCEPTANCE_SHA256": "e" * 64,
+                "NEXUS_V015_WS_SOAK": "/tmp/nexus-lab-bin/nexus-v015-ws-soak",
+                "NEXUS_V015_WS_SOAK_SHA256": "f" * 64,
+                "NEXUS_V015_WEBCONSOLE_ACCEPTANCE": "/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance",
+                "NEXUS_V015_WEBCONSOLE_ACCEPTANCE_SHA256": "0" * 64,
+                "NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER": "/tmp/nexus-lab-bin/nexus-v015-webconsole-evidence-verify",
+                "NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER_SHA256": "b" * 64,
+                "NEXUS_V015_EVIDENCE_VALIDATOR": "/tmp/nexus-lab-bin/nexus-v015-evidence-validate",
+                "NEXUS_V015_EVIDENCE_VALIDATOR_SHA256": "a" * 64,
+                "NEXUS_V015_RELEASE_ASSEMBLER": "/tmp/nexus-lab-bin/nexus-v015-release-assemble",
+                "NEXUS_V015_RELEASE_ASSEMBLER_SHA256": "b" * 64,
+                "NPM_TOKEN": "<redacted>",
+            },
+        }
+        self.candidate_digest = candidate_digest(self.manifest)
+        write_json(self.manifest_path, self.manifest)
+        os.chmod(self.manifest_path, 0o400)
+
+        payload_paths = (
+            Path("manifest.json"),
+            Path("candidate/native/nexus"),
+            Path("candidate/npm/nexus.tgz"),
+            Path("candidate/npm/nexus-cli.tgz"),
+            Path("candidate/npm/nexus-gateway.tgz"),
+        )
+        tree = hashlib.sha256()
+        for relative in sorted(payload_paths, key=lambda item: item.as_posix()):
+            absolute = self.root / relative
+            tree.update(
+                relative.as_posix().encode("utf-8")
+                + b"\0"
+                + str(stat.S_IMODE(absolute.stat().st_mode)).encode("ascii")
+                + b"\0"
+                + sha256(absolute).encode("ascii")
+                + b"\0"
+            )
+        root_stat = self.root.stat()
+        seal_path = self.root / ".candidate-committed"
+        write_json(
+            seal_path,
+            {
+                "schemaVersion": 1,
+                "runId": RUN_ID,
+                "device": root_stat.st_dev,
+                "inode": root_stat.st_ino,
+                "manifestSha256": sha256(self.manifest_path),
+                "treeSha256": tree.hexdigest(),
+            },
+        )
+        os.chmod(seal_path, 0o400)
+
+    def _build_cases(self) -> None:
+        for case_id in EXPECTED_CASES:
+            ocular = case_id.startswith("O")
+            surface = "ocular" if ocular else "webui"
+            required = list(OCULAR_ARTIFACTS if ocular else WEBUI_ARTIFACTS)
+            if case_id in {"O3", "O4"}:
+                required.append("mechanism")
+            case_directory = Path(f"{case_id}-20260720T000000Z")
+            artifacts = {}
+            for name in required:
+                artifact_path = case_directory / f"{name}.json"
+                if name == "preScreenshot":
+                    artifact_path = case_directory / "preScreenshot.jpeg"
+                    artifact_data = b"\xff\xd8\xff\xe0pre-action-jpeg"
+                elif name == "postScreenshot":
+                    artifact_path = case_directory / "postScreenshot.jpeg"
+                    artifact_data = b"\xff\xd8\xff\xe0post-action-jpeg"
+                elif name == "dom":
+                    artifact_path = case_directory / "dom.html"
+                    artifact_data = b"<!DOCTYPE html>\n<html><body>fixture</body></html>\n"
+                elif name == "console":
+                    artifact_data = b'{"messages":[],"violations":[]}\n'
+                elif name == "network":
+                    artifact_data = b"[]\n"
+                elif name == "websocket":
+                    artifact_data = (
+                        b'[{"payload":"input.ack"}]\n'
+                        if case_id in {"O3", "O4"}
+                        else b"[]\n"
+                    )
+                elif name == "processLogs":
+                    artifact_data = json.dumps(
+                        {
+                            "capturedAt": "2026-07-20T00:00:00Z",
+                            "runnerPid": 4242,
+                            "rendererTarget": {
+                                "id": "fixture-target",
+                                "url": "http://127.0.0.1:1422/",
+                            },
+                            "logs": {
+                                "daemon": {
+                                    "path": str(self.lab_root / "nexus/daemon.log"),
+                                    "tail": "daemon ok",
+                                },
+                                "gateway": {
+                                    "path": str(self.lab_root / "lab/gateway-start.log"),
+                                    "tail": "gateway ok",
+                                },
+                                "lens": {
+                                    "path": str(self.lab_root / "lab/lens.log"),
+                                    "tail": "lens ok",
+                                },
+                            },
+                        }
+                    ).encode("utf-8") + b"\n"
+                elif name == "health":
+                    artifact_data = json.dumps(
+                        {
+                            "capturedAt": "2026-07-20T00:00:00Z",
+                            "url": "http://127.0.0.1:4100/api/v1/health",
+                            "status": 200,
+                            "body": '{"ok":true}',
+                        }
+                    ).encode("utf-8") + b"\n"
+                elif name == "pactbin2":
+                    artifact_path = case_directory / "pactbin2.pact"
+                    artifact_data = b"PACTBIN2" + b"\0" * 4088
+                elif name == "mechanism":
+                    artifact_data = b'{"pushFrames":1,"postCommitWakes":1,"timerReads":0}\n'
+                else:
+                    raise AssertionError(f"unhandled fixture artifact: {name}")
+                artifacts[name] = self.artifact(artifact_path, artifact_data)
+            manifest = {
+                "schemaVersion": 1,
+                "schema": "ocular-evidence/2",
+                "runId": RUN_ID,
+                "readinessSha256": sha256(self.readiness_path),
+                "case": case_id,
+                "surface": surface,
+                **self.passing_outcome(),
+                "requiredArtifacts": required,
+                "artifacts": artifacts,
+            }
+            if case_id in {"O3", "O4"}:
+                manifest["mechanism"] = {
+                    "pushFrames": 1,
+                    "postCommitWakes": 1,
+                    "timerReads": 0,
+                }
+            manifest_path = self.root / case_directory / "manifest.json"
+            self.case_meta[case_id] = manifest_path
+            write_json(manifest_path, manifest)
+
+    def _build_results(self) -> None:
+        for gate, (relative, artifact_names) in RESULT_SPECS.items():
+            if gate == "D2":
+                result_directory = Path(relative).parent
+                artifacts = {
+                    name: self.artifact(
+                        result_directory / f"{name}.jsonl",
+                        json.dumps({"owner": gate, "artifact": name}).encode("utf-8") + b"\n",
+                    )
+                    for name in artifact_names
+                }
+                self.artifact(result_directory / "version.stdout", b"nexus 0.1.5\n")
+                evidence_inventory = []
+                for absolute in sorted((self.root / result_directory).iterdir()):
+                    relative_path = absolute.relative_to(self.root).as_posix()
+                    evidence_inventory.append(
+                        {
+                            "path": relative_path,
+                            "sha256": sha256(absolute),
+                            "size": absolute.stat().st_size,
+                        }
+                    )
+            else:
+                artifacts = self.artifacts(f"results/{gate}", artifact_names)
+                evidence_inventory = None
+            result = {
+                "schemaVersion": 1,
+                "runId": RUN_ID,
+                "candidateDigest": self.candidate_digest,
+                "gate": gate,
+                **self.passing_outcome(),
+                "requiredArtifacts": list(artifact_names),
+                "artifacts": artifacts,
+            }
+            if evidence_inventory is not None:
+                result["evidenceInventory"] = evidence_inventory
+            if gate == "DIFF":
+                result["unexpectedChanges"] = 0
+            elif gate == "REVIEW":
+                result["unresolvedBlockers"] = 0
+            elif gate == "F3":
+                restart_proofs = []
+                for index, target in enumerate(("daemon", "daemon", "gateway", "gateway"), 1):
+                    before = index * 10
+                    restart_proofs.append(
+                        {
+                            "status": "PASS",
+                            "target": target,
+                            "transportRecoveryObserved": True,
+                            "developer": {
+                                "messageId": f"m-restart-{index}",
+                                "cursorBefore": before,
+                                "cursorAfter": before + 1,
+                                "receivedCount": 1,
+                            },
+                            "agentSessions": {
+                                kind: {
+                                    "clientMessageId": f"cm-{kind}-{index}",
+                                    "cursorBefore": before,
+                                    "cursorAfter": before + offset,
+                                    "completionCount": 1,
+                                }
+                                for kind, offset in (("codex", 2), ("claude", 3))
+                            },
+                        }
+                    )
+                result.update(
+                    {
+                        "startedAt": 1_000.0,
+                        "endedAt": 2_800.0,
+                        "elapsedSeconds": 1_800.0,
+                        "failureCounters": {name: 0 for name in SOAK_COUNTERS},
+                        "checkpoints": {
+                            "developerWebSocket": {
+                                "status": "PASS",
+                                "reconnects": 4,
+                                "lastAcceptedCursor": 14,
+                                "topicCursors": {
+                                    "sys.message.thread.acceptance": 12,
+                                    "sys.dm.codex": 13,
+                                    "sys.dm.claude": 14,
+                                },
+                                "replayCount": 4,
+                                "resyncCount": 0,
+                            },
+                            "agentSessionWebSocket": {
+                                "status": "PASS",
+                                "reconnects": 4,
+                                "lastAcceptedCursor": 31,
+                                "agentCursors": {"codex": 31, "claude": 32},
+                                "replayCounts": {"codex": 4, "claude": 4},
+                                "resyncCounts": {"codex": 0, "claude": 0},
+                            },
+                            "daemonReconnects": 2,
+                            "gatewayReconnects": 2,
+                        },
+                        "restartProofs": restart_proofs,
+                        "bounds": {
+                            "memoryBytes": {
+                                "start": 100_000_000,
+                                "end": 120_000_000,
+                                "peak": 150_000_000,
+                                "limit": 8589934592,
+                            },
+                            "diskBytes": {
+                                "start": 1_000_000,
+                                "end": 1_200_000,
+                                "peak": 1_500_000,
+                                "limit": 10 * 1024 * 1024 * 1024,
+                            },
+                        },
+                        "resourceHealth": {
+                            "status": "PASS",
+                            "withinBounds": True,
+                            "trendHealthy": True,
+                            "sampleCount": 64,
+                            "processRssPeak": 220_000_000,
+                            "memoryEventDeltas": {"oom": 0, "oom_kill": 0, "max": 0},
+                            "pidsMaxDelta": 0,
+                        },
+                        "topology": {
+                            "status": "PASS",
+                            "healthy": True,
+                            "processes": {
+                                "daemon": 101,
+                                "gateway": 102,
+                                "gatewayProxy": 103,
+                                "xvfb": 104,
+                                "lens": 105,
+                                "lensCdpProxy": 106,
+                                "webuiBrowser": 107,
+                                "webuiCdpProxy": 108,
+                            },
+                            "tcpPorts": [4100, 4101, 4200, 9222, 9224],
+                            "unixSockets": ["/tmp/nexus.sock", "/tmp/gateway-stream.sock"],
+                        },
+                        "invariants": {
+                            "duration": True,
+                            "restartCount": True,
+                            "restartStraddle": True,
+                            "traffic": True,
+                            "sessionCorrelation": True,
+                            "delivery": True,
+                            "websocketReconnect": True,
+                            "resources": True,
+                            "topology": True,
+                            "diagnostics": True,
+                        },
+                    }
+                )
+            path = self.root / relative
+            self.result_paths[gate] = path
+            write_json(path, result)
+            if gate == "D2":
+                os.chmod(path, 0o400)
+                result_raw = path.read_bytes()
+                seal_path = self.root / D2_SEAL_RELATIVE
+                write_json(
+                    seal_path,
+                    {
+                        "schemaVersion": 1,
+                        "runId": RUN_ID,
+                        "candidateDigest": self.candidate_digest,
+                        "gate": "D2",
+                        "resultPath": D2_RESULT_RELATIVE.as_posix(),
+                        "resultSha256": hashlib.sha256(result_raw).hexdigest(),
+                        "resultSize": len(result_raw),
+                    },
+                )
+                os.chmod(seal_path, 0o400)
+
+    def _harden_and_seal(self) -> None:
+        candidate_directories = {
+            Path("candidate"),
+            Path("candidate/native"),
+            Path("candidate/npm"),
+        }
+        executable = Path("candidate/native/nexus")
+        archives = {
+            Path("candidate/npm/nexus.tgz"),
+            Path("candidate/npm/nexus-cli.tgz"),
+            Path("candidate/npm/nexus-gateway.tgz"),
+        }
+        for directory, directory_names, filenames in os.walk(self.root, topdown=False):
+            base = Path(directory)
+            for filename in filenames:
+                path = base / filename
+                relative = path.relative_to(self.root)
+                if relative == executable:
+                    mode = 0o555
+                elif relative in archives:
+                    mode = 0o444
+                else:
+                    mode = 0o400
+                os.chmod(path, mode)
+            for name in directory_names:
+                path = base / name
+                relative = path.relative_to(self.root)
+                os.chmod(path, 0o755 if relative in candidate_directories else 0o555)
+        os.chmod(self.root, 0o700)
+
+        inventory: list[dict[str, object]] = []
+        for directory, directory_names, filenames in os.walk(self.root):
+            base = Path(directory)
+            for name in sorted(directory_names):
+                path = base / name
+                info = path.stat(follow_symlinks=False)
+                inventory.append(
+                    {
+                        "path": path.relative_to(self.root).as_posix(),
+                        "kind": "directory",
+                        "device": info.st_dev,
+                        "inode": info.st_ino,
+                        "uid": info.st_uid,
+                        "gid": info.st_gid,
+                        "mode": stat.S_IMODE(info.st_mode),
+                        "nlink": info.st_nlink,
+                        "mtimeNs": info.st_mtime_ns,
+                        "ctimeNs": info.st_ctime_ns,
+                    }
+                )
+            for name in sorted(filenames):
+                path = base / name
+                info = path.stat(follow_symlinks=False)
+                inventory.append(
+                    {
+                        "path": path.relative_to(self.root).as_posix(),
+                        "kind": "file",
+                        "device": info.st_dev,
+                        "inode": info.st_ino,
+                        "uid": info.st_uid,
+                        "gid": info.st_gid,
+                        "mode": stat.S_IMODE(info.st_mode),
+                        "nlink": info.st_nlink,
+                        "size": info.st_size,
+                        "mtimeNs": info.st_mtime_ns,
+                        "ctimeNs": info.st_ctime_ns,
+                        "sha256": sha256(path),
+                    }
+                )
+        inventory.sort(key=lambda row: str(row["path"]))
+        root_info = self.root.stat()
+        write_json(
+            self.run_seal_path,
+            {
+                "schemaVersion": 1,
+                "runId": RUN_ID,
+                "candidateDigest": self.candidate_digest,
+                "containerId": self.container_id,
+                "labRoot": str(self.lab_root),
+                "runRoot": str(self.root),
+                "runDevice": root_info.st_dev,
+                "runInode": root_info.st_ino,
+                "evidenceUid": root_info.st_uid,
+                "evidenceGid": root_info.st_gid,
+                "readinessPath": str(self.readiness_path),
+                "readinessSha256": sha256(self.readiness_path),
+                "inventory": inventory,
+            },
+        )
+        os.chmod(self.run_seal_path, 0o400)
+
+    def _build(self) -> None:
+        self.root.mkdir(parents=True)
+        self.seal_root.mkdir(mode=0o700)
+        os.chmod(self.seal_root, 0o700)
+        os.chmod(self.lab_root, 0o700)
+        os.chmod(self.root.parent, 0o700)
+        os.chmod(self.root, 0o700)
+        self.readiness_path.parent.mkdir(mode=0o1777)
+        self.readiness_path.write_text(
+            "\n".join(
+                (
+                    "schema=1",
+                    f"containerId={self.container_id}",
+                    "mode=packed",
+                    f"runId={RUN_ID}",
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(self.readiness_path.parent, 0o1777)
+        os.chmod(self.readiness_path, 0o444)
+        self._build_manifest()
+        self._build_cases()
+        self._build_results()
+        self._harden_and_seal()
+
+
+class EvidenceValidatorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="nexus-v015-evidence-test-")
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+
+    def fixture(self, name: str) -> EvidenceFixture:
+        return EvidenceFixture(self.base / name / "lab-root" / "evidence" / RUN_ID)
+
+    def fixture_environment(self, fixture: EvidenceFixture) -> dict[str, str]:
+        return {
+            "NEXUS_LAB_ROOT": str(fixture.lab_root),
+            "NEXUS_V015_RUN_ID": RUN_ID,
+            "NEXUS_V015_CONTAINER_ID": fixture.container_id,
+            "NEXUS_V015_READINESS_LEDGER_SHA256": sha256(fixture.readiness_path),
+            "NEXUS_V015_ALLOW_FIXTURE_HOME": "1",
+            "NEXUS_V015_EVIDENCE_AUTHORITY_ROOT": str(fixture.seal_root),
+        }
+
+    def run_validator(
+        self,
+        *arguments: object,
+        env_override: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = dict(os.environ)
+        paths = [Path(str(argument)) for argument in arguments if not str(argument).startswith("-")]
+        if paths:
+            run_root = paths[-1]
+            if len(run_root.parents) >= 2:
+                lab_root = run_root.parents[1]
+                readiness = lab_root / "lab/candidate-ready.v1"
+                environment.update(
+                    {
+                        "NEXUS_LAB_ROOT": str(lab_root),
+                        "NEXUS_V015_RUN_ID": RUN_ID,
+                        "NEXUS_V015_CONTAINER_ID": "a" * 64,
+                        "NEXUS_V015_READINESS_LEDGER_SHA256": (
+                            sha256(readiness) if readiness.is_file() else "0" * 64
+                        ),
+                        "NEXUS_V015_ALLOW_FIXTURE_HOME": "1",
+                        "NEXUS_V015_EVIDENCE_AUTHORITY_ROOT": str(
+                            lab_root.parent / f"{lab_root.name}-evidence-authority"
+                        ),
+                    }
+                )
+        if env_override:
+            environment.update(env_override)
+        return subprocess.run(
+            [sys.executable, str(TARGET), *[str(argument) for argument in arguments]],
+            cwd=self.base,
+            text=True,
+            capture_output=True,
+            env=environment,
+            check=False,
+        )
+
+    def assert_invalid(self, fixture: EvidenceFixture, code: str, root: Path | None = None) -> None:
+        result = self.run_validator(root or fixture.root)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"EVIDENCE_{code}:", result.stderr)
+
+    def test_help_is_successful_and_side_effect_free(self) -> None:
+        before = set(self.base.iterdir())
+        result = self.run_validator("--help")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("RUN_DIR", result.stdout)
+        self.assertEqual(set(self.base.iterdir()), before)
+
+    def test_complete_strict_evidence_ledger_passes(self) -> None:
+        fixture = self.fixture("valid")
+        result = self.run_validator(fixture.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"validated {len(EXPECTED_CASES)} cases", result.stdout)
+        self.assertIn(f"{len(RESULT_SPECS)} canonical results", result.stdout)
+        self.assertIn(fixture.candidate_digest, result.stdout)
+
+    def test_run_root_and_readiness_must_match_the_canonical_lab_authority(self) -> None:
+        fixture = self.fixture("canonical-authority")
+        wrong_lab = self.base / "wrong-lab"
+        result = self.run_validator(
+            fixture.root,
+            env_override={"NEXUS_LAB_ROOT": str(wrong_lab)},
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("EVIDENCE_RUN_AUTHORITY:", result.stderr)
+
+        result = self.run_validator(
+            fixture.root,
+            env_override={"NEXUS_V015_READINESS_LEDGER_SHA256": "f" * 64},
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("EVIDENCE_READINESS_AUTHORITY:", result.stderr)
+
+    def test_root_owned_run_seal_binds_the_complete_evidence_inventory(self) -> None:
+        missing = self.fixture("run-seal-missing")
+        missing.run_seal_path.unlink()
+        self.assert_invalid(missing, "RUN_SEAL_MISSING")
+
+        coordinated = self.fixture("run-seal-coordinated-rewrite")
+        artifact = coordinated.root / "artifacts/results/A1/versionReport.json"
+        artifact_data = b'{"coordinated":"rewrite"}\n'
+        os.chmod(artifact, 0o600)
+        artifact.write_bytes(artifact_data)
+        os.chmod(artifact, 0o400)
+        result = read_json(coordinated.result_paths["A1"])
+        result["artifacts"]["versionReport"]["sha256"] = hashlib.sha256(
+            artifact_data
+        ).hexdigest()
+        rewrite_readonly_json(coordinated.result_paths["A1"], result)
+        self.assert_invalid(coordinated, "RUN_SEAL_MISMATCH")
+
+        foreign = self.fixture("run-seal-extra-file")
+        extra = foreign.root / "unsealed-extra.txt"
+        extra.write_text("not sealed\n", encoding="utf-8")
+        os.chmod(extra, 0o400)
+        self.assert_invalid(foreign, "INVENTORY_UNDECLARED")
+
+        residue = self.fixture("run-seal-temp-residue")
+        stale = residue.seal_root / f".{RUN_ID}{RUN_SEAL_SUFFIX}.tmp-crashed"
+        stale.write_text("incomplete\n", encoding="utf-8")
+        os.chmod(stale, 0o400)
+        self.assert_invalid(residue, "RUN_SEAL_RESIDUE")
+
+    def test_seal_mode_hardens_and_commits_an_unsealed_ledger_once(self) -> None:
+        fixture = self.fixture("seal-mode")
+        fixture.run_seal_path.unlink()
+        artifact = fixture.root / "artifacts/results/A1/versionReport.json"
+        artifact_directory = artifact.parent
+        os.chmod(artifact, 0o600)
+        os.chmod(artifact_directory, 0o700)
+
+        result = self.run_validator("--seal", fixture.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(artifact.stat().st_mode & 0o777, 0o400)
+        self.assertEqual(artifact_directory.stat().st_mode & 0o777, 0o555)
+        self.assertEqual(fixture.run_seal_path.stat().st_uid, 0)
+        self.assertEqual(fixture.run_seal_path.stat().st_gid, 0)
+        self.assertEqual(fixture.run_seal_path.stat().st_mode & 0o777, 0o400)
+        self.assertEqual(fixture.run_seal_path.stat().st_nlink, 1)
+        for path in (fixture.root, *fixture.root.rglob("*")):
+            info = path.stat(follow_symlinks=False)
+            self.assertEqual((info.st_uid, info.st_gid), (0, 0), path)
+        self.assertEqual(self.run_validator(fixture.root).returncode, 0)
+
+        before = (
+            fixture.run_seal_path.read_bytes(),
+            fixture.run_seal_path.stat().st_dev,
+            fixture.run_seal_path.stat().st_ino,
+        )
+        repeated = self.run_validator("--seal", fixture.root)
+        self.assertEqual(repeated.returncode, 1, repeated.stdout + repeated.stderr)
+        self.assertIn("EVIDENCE_RUN_SEAL_EXISTS:", repeated.stderr)
+        after = (
+            fixture.run_seal_path.read_bytes(),
+            fixture.run_seal_path.stat().st_dev,
+            fixture.run_seal_path.stat().st_ino,
+        )
+        self.assertEqual(after, before)
+
+    def test_seal_mode_rejects_residue_and_undeclared_paths(self) -> None:
+        residue = self.fixture("seal-mode-temp-residue")
+        residue.run_seal_path.unlink()
+        stale = residue.seal_root / f".{RUN_ID}{RUN_SEAL_SUFFIX}.tmp-crashed"
+        stale.write_text("incomplete\n", encoding="utf-8")
+        os.chmod(stale, 0o400)
+        result = self.run_validator("--seal", residue.root)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("EVIDENCE_RUN_SEAL_RESIDUE:", result.stderr)
+
+        for name, create in (
+            (
+                "file",
+                lambda root: (root / "unreferenced-secret.txt").write_text(
+                    "not declared\n", encoding="utf-8"
+                ),
+            ),
+            ("directory", lambda root: (root / "unreferenced-empty").mkdir()),
+        ):
+            with self.subTest(kind=name):
+                fixture = self.fixture(f"seal-mode-undeclared-{name}")
+                fixture.run_seal_path.unlink()
+                create(fixture.root)
+                result = self.run_validator("--seal", fixture.root)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("EVIDENCE_INVENTORY_UNDECLARED:", result.stderr)
+
+    def test_validation_rechecks_readiness_and_held_root_ancestry_at_completion(self) -> None:
+        module = load_validator_module()
+
+        readiness = self.fixture("readiness-reread")
+        with mock.patch.dict(os.environ, self.fixture_environment(readiness), clear=False):
+            authority = module.resolve_run_authority(readiness.root)
+            validator = module.Validator(readiness.root, authority)
+            try:
+                os.chmod(readiness.readiness_path, 0o600)
+                readiness.readiness_path.write_text(
+                    readiness.readiness_path.read_text(encoding="utf-8") + "nonce=changed\n",
+                    encoding="utf-8",
+                )
+                os.chmod(readiness.readiness_path, 0o444)
+                with self.assertRaises(module.EvidenceError) as raised:
+                    validator.validate()
+                self.assertEqual(raised.exception.code, "READINESS_AUTHORITY")
+            finally:
+                validator.close()
+
+        readiness_ancestry = self.fixture("readiness-ancestry-reread")
+        with mock.patch.dict(
+            os.environ, self.fixture_environment(readiness_ancestry), clear=False
+        ):
+            authority = module.resolve_run_authority(readiness_ancestry.root)
+            validator = module.Validator(readiness_ancestry.root, authority)
+            moved_lab_state = readiness_ancestry.readiness_path.parent.with_name("lab-moved")
+            try:
+                readiness_ancestry.readiness_path.parent.rename(moved_lab_state)
+                readiness_ancestry.readiness_path.parent.symlink_to(
+                    moved_lab_state, target_is_directory=True
+                )
+                with self.assertRaises(module.EvidenceError) as raised:
+                    validator.validate()
+                self.assertEqual(raised.exception.code, "READINESS_AUTHORITY")
+            finally:
+                validator.close()
+
+        ancestry = self.fixture("held-root-ancestry")
+        with mock.patch.dict(os.environ, self.fixture_environment(ancestry), clear=False):
+            authority = module.resolve_run_authority(ancestry.root)
+            validator = module.Validator(ancestry.root, authority)
+            moved = ancestry.lab_root.with_name(f"{ancestry.lab_root.name}-moved")
+            try:
+                ancestry.lab_root.rename(moved)
+                ancestry.lab_root.symlink_to(moved, target_is_directory=True)
+                with self.assertRaises(module.EvidenceError) as raised:
+                    validator.validate()
+                self.assertEqual(raised.exception.code, "RUN_SEAL_CHANGED")
+            finally:
+                validator.close()
+
+    def test_seal_chowns_every_entry_and_revalidates_after_publication(self) -> None:
+        module = load_validator_module()
+        fixture = self.fixture("seal-owner-and-post-publish")
+        fixture.run_seal_path.unlink()
+        artifact = fixture.root / "artifacts/results/A1/versionReport.json"
+        expected_fchowns = 1 + sum(1 for _ in fixture.root.rglob("*"))
+        with mock.patch.dict(os.environ, self.fixture_environment(fixture), clear=False):
+            authority = module.resolve_run_authority(fixture.root)
+            validator = module.Validator(fixture.root, authority)
+            original_publish = validator.publish_run_seal
+
+            def publish_then_mutate(document: dict[str, object]) -> None:
+                original_publish(document)
+                os.chmod(artifact, 0o600)
+                artifact.write_bytes(b'{"changed":"after-publish"}\n')
+                os.chmod(artifact, 0o400)
+
+            validator.publish_run_seal = publish_then_mutate
+            try:
+                with mock.patch.object(module.os, "fchown", wraps=os.fchown) as fchown:
+                    with self.assertRaises(module.EvidenceError):
+                        validator.seal()
+                self.assertEqual(
+                    fchown.call_count,
+                    expected_fchowns,
+                    "seal must root-own every evidence entry and the run root",
+                )
+            finally:
+                validator.close()
+
+    def test_manifest_is_one_strict_packed_candidate_ledger(self) -> None:
+        mutations = (
+            ("source-mode", lambda doc: doc.__setitem__("mode", "source"), "MANIFEST_MODE"),
+            ("source-revision", lambda doc: doc["sources"]["nexus"].__setitem__("revision", "nope"), "SOURCE_REVISION"),
+            ("package-set", lambda doc: doc["packages"].pop(), "PACKAGE_SET"),
+            ("package-version", lambda doc: doc["packages"][0].__setitem__("version", "0.1.4"), "PACKAGE_VERSION"),
+            ("image", lambda doc: doc["image"].__setitem__("digest", "latest"), "IMAGE_DIGEST"),
+            ("dirty-hash", lambda doc: doc["sources"]["nexus"]["dirtyPaths"][0].__setitem__("sha256", "bad"), "SHA256_FORMAT"),
+            ("toolchains", lambda doc: doc["toolchains"].pop("rustc"), "TOOLCHAINS"),
+            (
+                "nexus-version-suffix",
+                lambda doc: doc["toolchains"].__setitem__(
+                    "nexus", "nexus 0.1.5 (revision 0123456789abcdef)"
+                ),
+                "TOOLCHAINS",
+            ),
+            ("environment", lambda doc: doc["environment"].__setitem__("NPM_TOKEN", "npm_secret"), "ENV_REDACTION"),
+            ("limits", lambda doc: doc["container"]["limits"].__setitem__("cpus", 7), "RESOURCE_LIMITS"),
+        )
+        for name, mutate, code in mutations:
+            with self.subTest(name=name):
+                fixture = self.fixture(f"manifest-{name}")
+                document = read_json(fixture.manifest_path)
+                mutate(document)
+                write_json(fixture.manifest_path, document)
+                self.assert_invalid(fixture, code)
+
+    def test_candidate_commit_seal_is_required_and_binds_the_tree(self) -> None:
+        missing = self.fixture("candidate-seal-missing")
+        (missing.root / ".candidate-committed").unlink()
+        self.assert_invalid(missing, "CANDIDATE_SEAL_MISSING")
+
+        changed = self.fixture("candidate-seal-changed")
+        seal_path = changed.root / ".candidate-committed"
+        seal = read_json(seal_path)
+        seal["treeSha256"] = "0" * 64
+        write_json(seal_path, seal)
+        self.assert_invalid(changed, "CANDIDATE_SEAL_MISMATCH")
+
+        mutable_mode = self.fixture("candidate-payload-mode")
+        os.chmod(mutable_mode.root / "candidate/npm/nexus.tgz", 0o644)
+        self.assert_invalid(mutable_mode, "CANDIDATE_SEAL_MODE")
+
+    def test_manifest_tarball_bindings_match_the_exact_candidate_packages(self) -> None:
+        for name, key in (
+            ("nexus", "NEXUS_V015_NEXUS_TARBALL_SHA256"),
+            ("cli", "NEXUS_V015_CLI_TARBALL_SHA256"),
+            ("gateway", "NEXUS_V015_GATEWAY_TARBALL_SHA256"),
+        ):
+            with self.subTest(name=name):
+                fixture = self.fixture(f"manifest-tarball-{name}")
+                document = read_json(fixture.manifest_path)
+                document["environment"][key] = "0" * 64
+                write_json(fixture.manifest_path, document)
+                self.assert_invalid(fixture, "PACKED_RUNTIME_BINDING")
+
+    def test_manifest_requires_candidate_bound_production_lens_renderer(self) -> None:
+        for name, mutate in (
+            (
+                "missing-mode",
+                lambda environment: environment.pop("NEXUS_V015_LENS_RENDERER_MODE"),
+            ),
+            (
+                "development-mode",
+                lambda environment: environment.__setitem__(
+                    "NEXUS_V015_LENS_RENDERER_MODE", "development"
+                ),
+            ),
+            (
+                "source-app",
+                lambda environment: environment.__setitem__(
+                    "NEXUS_V015_LENS_APP", "/work/egregore-lens"
+                ),
+            ),
+            (
+                "wrong-main",
+                lambda environment: environment.__setitem__(
+                    "NEXUS_V015_LENS_MAIN", "/tmp/other/electron/main.cjs"
+                ),
+            ),
+            (
+                "bad-tree-hash",
+                lambda environment: environment.__setitem__(
+                    "NEXUS_V015_LENS_TREE_SHA256", "not-a-digest"
+                ),
+            ),
+        ):
+            with self.subTest(name=name):
+                fixture = self.fixture(f"manifest-lens-{name}")
+                document = read_json(fixture.manifest_path)
+                mutate(document["environment"])
+                write_json(fixture.manifest_path, document)
+                self.assert_invalid(fixture, "LENS_RENDERER_BINDING")
+
+    def test_manifest_requires_complete_packed_runtime_binding(self) -> None:
+        mutations = (
+            (
+                "missing-readiness",
+                lambda env: env.pop("NEXUS_V015_READINESS_LEDGER_SHA256"),
+            ),
+            (
+                "wrong-run",
+                lambda env: env.__setitem__("NEXUS_V015_RUN_ID", "another-run"),
+            ),
+            (
+                "source-prefix",
+                lambda env: env.__setitem__("NEXUS_V015_PACKED_PREFIX", "/work/egregore-nexus"),
+            ),
+            (
+                "native-mismatch",
+                lambda env: env.__setitem__("NEXUS_V015_NATIVE_BIN_SHA256", "0" * 64),
+            ),
+            (
+                "image-mismatch",
+                lambda env: env.__setitem__("NEXUS_V015_IMAGE_DIGEST", "sha256:" + "0" * 64),
+            ),
+            (
+                "bad-install-tree",
+                lambda env: env.__setitem__("NEXUS_V015_INSTALL_TREE_SHA256", "bad"),
+            ),
+            (
+                "source-ws-acceptance",
+                lambda env: env.__setitem__(
+                    "NEXUS_V015_WS_ACCEPTANCE",
+                    "/work/egregore-nexus/scripts/nexus-v015-ws-acceptance",
+                ),
+            ),
+            (
+                "bad-ws-soak-hash",
+                lambda env: env.__setitem__("NEXUS_V015_WS_SOAK_SHA256", "bad"),
+            ),
+            (
+                "source-webconsole-acceptance",
+                lambda env: env.__setitem__(
+                    "NEXUS_V015_WEBCONSOLE_ACCEPTANCE",
+                    "/work/egregore-nexus/scripts/nexus-v015-webconsole-acceptance",
+                ),
+            ),
+            (
+                "bad-evidence-validator-hash",
+                lambda env: env.__setitem__("NEXUS_V015_EVIDENCE_VALIDATOR_SHA256", "bad"),
+            ),
+            (
+                "source-release-assembler",
+                lambda env: env.__setitem__(
+                    "NEXUS_V015_RELEASE_ASSEMBLER",
+                    "/work/egregore-nexus/scripts/nexus-v015-release-assemble",
+                ),
+            ),
+            (
+                "bad-release-assembler-hash",
+                lambda env: env.__setitem__("NEXUS_V015_RELEASE_ASSEMBLER_SHA256", "bad"),
+            ),
+            (
+                "source-webconsole-evidence-verifier",
+                lambda env: env.__setitem__(
+                    "NEXUS_V015_WEBCONSOLE_EVIDENCE_VERIFIER",
+                    "/work/egregore-nexus/scripts/nexus-v015-webconsole-evidence-verify",
+                ),
+            ),
+        )
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                fixture = self.fixture(f"manifest-runtime-{name}")
+                document = read_json(fixture.manifest_path)
+                mutate(document["environment"])
+                write_json(fixture.manifest_path, document)
+                self.assert_invalid(fixture, "PACKED_RUNTIME_BINDING")
+
+    def test_candidate_identity_is_derived_and_caller_ids_are_forbidden(self) -> None:
+        caller_id = self.fixture("caller-id")
+        document = read_json(caller_id.manifest_path)
+        document["candidateId"] = "please-trust-me"
+        write_json(caller_id.manifest_path, document)
+        self.assert_invalid(caller_id, "MANIFEST_FIELDS")
+
+        changed_ledger = self.fixture("changed-ledger")
+        document = read_json(changed_ledger.manifest_path)
+        native_path = changed_ledger.root / document["native"]["path"]
+        os.chmod(native_path, 0o755)
+        native_path.write_bytes(b"different-native\n")
+        os.chmod(native_path, 0o555)
+        document["native"]["sha256"] = sha256(native_path)
+        document["environment"]["NEXUS_V015_NATIVE_BIN_SHA256"] = document["native"]["sha256"]
+        write_json(changed_ledger.manifest_path, document)
+        self.assert_invalid(changed_ledger, "CANDIDATE_SEAL_MISMATCH")
+
+    def test_all_canonical_A_through_F_results_and_artifacts_are_required(self) -> None:
+        missing = self.fixture("missing-result")
+        missing.result_paths["B2"].unlink()
+        self.assert_invalid(missing, "RESULT_MISSING")
+
+        artifact = self.fixture("missing-result-artifact")
+        document = read_json(artifact.result_paths["C2"])
+        document["requiredArtifacts"].remove("noPolling")
+        document["artifacts"].pop("noPolling")
+        write_json(artifact.result_paths["C2"], document)
+        self.assert_invalid(artifact, "ARTIFACT_REQUIRED")
+
+        unexpected = self.fixture("unexpected-result")
+        shutil.copy2(
+            unexpected.result_paths["A1"],
+            unexpected.root / "results" / "unexpected-result.json",
+        )
+        self.assert_invalid(unexpected, "RESULT_UNEXPECTED")
+
+    def test_D2_exact_evidence_inventory_is_canonical_and_fail_closed(self) -> None:
+        missing_ledger = self.fixture("d2-inventory-missing-ledger")
+        document = read_json(missing_ledger.result_paths["D2"])
+        document.pop("evidenceInventory")
+        rewrite_readonly_json(missing_ledger.result_paths["D2"], document)
+        self.assert_invalid(missing_ledger, "D2_INVENTORY")
+
+        unexpected = self.fixture("d2-inventory-unexpected")
+        result_directory = unexpected.result_paths["D2"].parent
+        (result_directory / "unlisted.txt").write_text("unlisted\n", encoding="utf-8")
+        self.assert_invalid(unexpected, "D2_INVENTORY_UNEXPECTED")
+
+        linked = self.fixture("d2-inventory-symlink")
+        result_directory = linked.result_paths["D2"].parent
+        (result_directory / "unlisted-link").symlink_to("version.stdout")
+        self.assert_invalid(linked, "D2_INVENTORY_TYPE")
+
+        changed = self.fixture("d2-inventory-changed")
+        output = changed.result_paths["D2"].parent / "version.stdout"
+        output.write_text("nexus 0.1.4\n", encoding="utf-8")
+        self.assert_invalid(changed, "D2_INVENTORY_HASH")
+
+        reserved = self.fixture("d2-inventory-reserved")
+        document = read_json(reserved.result_paths["D2"])
+        document["evidenceInventory"][0]["path"] = reserved.result_paths["D2"].relative_to(
+            reserved.root
+        ).as_posix()
+        rewrite_readonly_json(reserved.result_paths["D2"], document)
+        self.assert_invalid(reserved, "D2_INVENTORY")
+
+    def test_D2_detached_seal_is_mandatory_and_candidate_bound(self) -> None:
+        missing = self.fixture("d2-seal-missing")
+        (missing.root / D2_SEAL_RELATIVE).unlink()
+        self.assert_invalid(missing, "D2_SEAL_MISSING")
+
+        mutations = (
+            ("run-id", "runId", "different-run"),
+            ("candidate", "candidateDigest", "sha256:" + "f" * 64),
+            ("gate", "gate", "D1"),
+            ("result-path", "resultPath", "results/D2-webconsole-cli/other.json"),
+            ("result-hash", "resultSha256", "0" * 64),
+            ("result-size", "resultSize", 1),
+        )
+        for name, field, value in mutations:
+            with self.subTest(name=name):
+                fixture = self.fixture(f"d2-seal-{name}")
+                seal_path = fixture.root / D2_SEAL_RELATIVE
+                document = read_json(seal_path)
+                document[field] = value
+                rewrite_readonly_json(seal_path, document)
+                self.assert_invalid(fixture, "D2_SEAL_MISMATCH")
+
+    def test_D2_detached_seal_requires_canonical_modes_and_strict_json(self) -> None:
+        wrong_result_mode = self.fixture("d2-seal-result-mode")
+        os.chmod(wrong_result_mode.result_paths["D2"], 0o600)
+        self.assert_invalid(wrong_result_mode, "D2_SEAL_MODE")
+
+        wrong_seal_mode = self.fixture("d2-seal-seal-mode")
+        os.chmod(wrong_seal_mode.root / D2_SEAL_RELATIVE, 0o600)
+        self.assert_invalid(wrong_seal_mode, "D2_SEAL_MODE")
+
+        invalid_documents = (
+            ("invalid", b"{not-json}\n"),
+            ("duplicate", b'{"schemaVersion":1,"schemaVersion":1}\n'),
+            ("nonfinite", b'{"schemaVersion":1,"resultSize":NaN}\n'),
+        )
+        for name, raw in invalid_documents:
+            with self.subTest(name=name):
+                fixture = self.fixture(f"d2-seal-json-{name}")
+                seal_path = fixture.root / D2_SEAL_RELATIVE
+                os.chmod(seal_path, 0o600)
+                seal_path.write_bytes(raw)
+                os.chmod(seal_path, 0o400)
+                self.assert_invalid(fixture, "D2_SEAL_INVALID")
+
+    def test_D2_detached_seal_rejects_symlink_and_hardlink_aliases(self) -> None:
+        symlink = self.fixture("d2-seal-symlink")
+        seal_path = symlink.root / D2_SEAL_RELATIVE
+        replacement = symlink.root / "detached-seal-copy"
+        replacement.write_bytes(seal_path.read_bytes())
+        seal_path.unlink()
+        seal_path.symlink_to(replacement)
+        self.assert_invalid(symlink, "D2_SEAL_TYPE")
+
+        hardlink = self.fixture("d2-seal-hardlink")
+        seal_path = hardlink.root / D2_SEAL_RELATIVE
+        os.link(seal_path, hardlink.root / "detached-seal-alias")
+        self.assert_invalid(hardlink, "D2_SEAL_TYPE")
+
+    def test_D2_detached_seal_rejects_coordinated_result_rewrite(self) -> None:
+        fixture = self.fixture("d2-seal-coordinated-rewrite")
+        result_path = fixture.result_paths["D2"]
+        output_path = result_path.parent / "version.stdout"
+        output_path.write_text("nexus 0.1.5 rewritten\n", encoding="utf-8")
+
+        result = read_json(result_path)
+        output_relative = output_path.relative_to(fixture.root).as_posix()
+        for record in result["evidenceInventory"]:
+            if record["path"] == output_relative:
+                record["sha256"] = sha256(output_path)
+                record["size"] = output_path.stat().st_size
+                break
+        else:
+            self.fail("fixture D2 inventory did not include version.stdout")
+        rewrite_readonly_json(result_path, result)
+
+        self.assert_invalid(fixture, "D2_SEAL_MISMATCH")
+
+    def test_required_results_reject_nonfinal_outcomes(self) -> None:
+        mutations = (
+            ("status", "status", "SKIP", "OUTCOME_STATUS"),
+            ("error", "error", "flaked once", "OUTCOME_ERROR"),
+            ("partial", "partial", True, "OUTCOME_FLAGS"),
+            ("flaky", "flaky", True, "OUTCOME_FLAGS"),
+            ("skipped", "skipped", True, "OUTCOME_FLAGS"),
+            ("refused", "refused", True, "OUTCOME_FLAGS"),
+            ("failures", "failureCount", 1, "FAILURE_COUNT"),
+        )
+        for name, field, value, code in mutations:
+            with self.subTest(name=name):
+                fixture = self.fixture(f"outcome-{name}")
+                document = read_json(fixture.result_paths["C3"])
+                document[field] = value
+                write_json(fixture.result_paths["C3"], document)
+                self.assert_invalid(fixture, code)
+
+    def test_diff_and_review_dispositions_must_be_clean(self) -> None:
+        diff = self.fixture("diff-disposition")
+        document = read_json(diff.result_paths["DIFF"])
+        document["unexpectedChanges"] = 1
+        write_json(diff.result_paths["DIFF"], document)
+        self.assert_invalid(diff, "DIFF_DISPOSITION")
+
+        review = self.fixture("review-disposition")
+        document = read_json(review.result_paths["REVIEW"])
+        document["unresolvedBlockers"] = 1
+        write_json(review.result_paths["REVIEW"], document)
+        self.assert_invalid(review, "REVIEW_DISPOSITION")
+
+    def test_exact_case_set_rejects_missing_duplicate_and_mechanism_pseudocases(self) -> None:
+        missing = self.fixture("missing-case")
+        missing.case_meta["O18"].unlink()
+        self.assert_invalid(missing, "CASE_MISSING")
+
+        duplicate = self.fixture("duplicate-case")
+        duplicate_path = duplicate.root / "O1-copy" / "manifest.json"
+        duplicate_path.parent.mkdir(parents=True)
+        shutil.copy2(duplicate.case_meta["O1"], duplicate_path)
+        self.assert_invalid(duplicate, "CASE_DUPLICATE")
+
+        pseudo = self.fixture("mechanism-pseudocase")
+        document = read_json(pseudo.case_meta["O3"])
+        document["case"] = "O3a"
+        write_json(pseudo.case_meta["O3"], document)
+        self.assert_invalid(pseudo, "CASE_UNEXPECTED")
+
+    def test_case_manifest_v2_is_readiness_bound_and_directory_scoped(self) -> None:
+        stale = self.fixture("case-stale-readiness")
+        document = read_json(stale.case_meta["O1"])
+        document["readinessSha256"] = "f" * 64
+        write_json(stale.case_meta["O1"], document)
+        self.assert_invalid(stale, "READINESS_AUTHORITY")
+
+        obsolete = self.fixture("case-obsolete-schema")
+        document = read_json(obsolete.case_meta["W1"])
+        document["schema"] = "ocular-evidence/1"
+        write_json(obsolete.case_meta["W1"], document)
+        self.assert_invalid(obsolete, "CASE_SCHEMA")
+
+        wrong_version = self.fixture("case-wrong-schema-version")
+        document = read_json(wrong_version.case_meta["W1"])
+        document["schemaVersion"] = 2
+        write_json(wrong_version.case_meta["W1"], document)
+        self.assert_invalid(wrong_version, "SCHEMA_VERSION")
+
+        extra = self.fixture("case-extra-field")
+        document = read_json(extra.case_meta["O2"])
+        document["candidateDigest"] = "0" * 64
+        write_json(extra.case_meta["O2"], document)
+        self.assert_invalid(extra, "CASE_SCHEMA")
+
+        escaped = self.fixture("case-artifact-other-directory")
+        document = read_json(escaped.case_meta["W2"])
+        artifact_record = document["artifacts"]["dom"]
+        original = escaped.root / artifact_record["path"]
+        relocated = escaped.root / "other-case" / original.name
+        relocated.parent.mkdir()
+        original.rename(relocated)
+        artifact_record["path"] = relocated.relative_to(escaped.root).as_posix()
+        artifact_record["sha256"] = sha256(relocated)
+        write_json(escaped.case_meta["W2"], document)
+        self.assert_invalid(escaped, "ARTIFACT_PATH")
+
+    def test_O3_and_O4_fold_push_mechanism_evidence_into_the_case(self) -> None:
+        missing = self.fixture("missing-mechanism")
+        document = read_json(missing.case_meta["O3"])
+        document["requiredArtifacts"].remove("mechanism")
+        document["artifacts"].pop("mechanism")
+        write_json(missing.case_meta["O3"], document)
+        self.assert_invalid(missing, "ARTIFACT_REQUIRED")
+
+        polling = self.fixture("timer-polling")
+        document = read_json(polling.case_meta["O4"])
+        document["mechanism"]["timerReads"] = 1
+        write_json(polling.case_meta["O4"], document)
+        self.assert_invalid(polling, "MECHANISM_EVIDENCE")
+
+    def test_case_artifact_contract_cannot_be_weakened_by_metadata(self) -> None:
+        fixture = self.fixture("case-artifacts")
+        document = read_json(fixture.case_meta["W4"])
+        document["requiredArtifacts"].remove("websocket")
+        document["artifacts"].pop("websocket")
+        write_json(fixture.case_meta["W4"], document)
+        self.assert_invalid(fixture, "ARTIFACT_REQUIRED")
+
+    def test_pactbin2_case_artifact_is_the_actual_store_bytes(self) -> None:
+        fixture = self.fixture("pactbin2-magic")
+        document = read_json(fixture.case_meta["O5"])
+        record = document["artifacts"]["pactbin2"]
+        artifact = fixture.root / record["path"]
+        artifact.write_bytes(b"not a Pact file\n")
+        record["sha256"] = sha256(artifact)
+        write_json(fixture.case_meta["O5"], document)
+        self.assert_invalid(fixture, "PACTBIN2_EVIDENCE")
+
+    def test_case_artifact_payloads_are_semantic_evidence_not_placeholders(self) -> None:
+        mutations = (
+            ("preScreenshot", b"not a jpeg\n", "SCREENSHOT_EVIDENCE"),
+            ("dom", b"plain text without markup\n", "DOM_EVIDENCE"),
+            ("console", b'{"messages":[],"violations":["boom"]}\n', "CONSOLE_EVIDENCE"),
+            ("network", b'{"not":"an array"}\n', "NETWORK_EVIDENCE"),
+            ("websocket", b'{"not":"an array"}\n', "WEBSOCKET_EVIDENCE"),
+            (
+                "processLogs",
+                b'{"capturedAt":"t","runnerPid":1,"rendererTarget":null,"logs":{"daemon":{"tail":"ok"},"gateway":{"absent":true},"lens":{"tail":"ok"}}}\n',
+                "PROCESS_LOG_EVIDENCE",
+            ),
+            (
+                "health",
+                b'{"capturedAt":"t","url":"http://127.0.0.1:4100/api/v1/health","status":503,"body":"down"}\n',
+                "HEALTH_EVIDENCE",
+            ),
+        )
+        for name, payload, code in mutations:
+            with self.subTest(name=name):
+                fixture = self.fixture(f"case-payload-{name}")
+                document = read_json(fixture.case_meta["O5"])
+                record = document["artifacts"][name]
+                artifact = fixture.root / record["path"]
+                artifact.write_bytes(payload)
+                record["sha256"] = sha256(artifact)
+                write_json(fixture.case_meta["O5"], document)
+                self.assert_invalid(fixture, code)
+
+        mechanism = self.fixture("case-payload-mechanism")
+        document = read_json(mechanism.case_meta["O3"])
+        record = document["artifacts"]["mechanism"]
+        artifact = mechanism.root / record["path"]
+        artifact.write_text(
+            '{"pushFrames":2,"postCommitWakes":1,"timerReads":0}\n',
+            encoding="utf-8",
+        )
+        record["sha256"] = sha256(artifact)
+        write_json(mechanism.case_meta["O3"], document)
+        self.assert_invalid(mechanism, "MECHANISM_EVIDENCE")
+
+    def test_textual_case_artifacts_reject_unredacted_credentials(self) -> None:
+        fixture = self.fixture("case-credential-leak")
+        document = read_json(fixture.case_meta["O2"])
+        record = document["artifacts"]["console"]
+        artifact = fixture.root / record["path"]
+        artifact.write_text(
+            '{"messages":[{"text":"nexus_ck_0123456789abcdef0123456789abcdef"}],"violations":[]}\n',
+            encoding="utf-8",
+        )
+        record["sha256"] = sha256(artifact)
+        write_json(fixture.case_meta["O2"], document)
+        self.assert_invalid(fixture, "EVIDENCE_REDACTION")
+
+    def test_duplicate_JSON_keys_and_nonfinite_numbers_are_rejected(self) -> None:
+        duplicate = self.fixture("duplicate-json-key")
+        text = duplicate.manifest_path.read_text(encoding="utf-8")
+        text = text.replace(
+            f'"runId": "{RUN_ID}"',
+            f'"runId": "{RUN_ID}",\n  "runId": "other-run"',
+            1,
+        )
+        os.chmod(duplicate.manifest_path, 0o600)
+        duplicate.manifest_path.write_text(text, encoding="utf-8")
+        os.chmod(duplicate.manifest_path, 0o400)
+        self.assert_invalid(duplicate, "JSON_DUPLICATE_KEY")
+
+        nan = self.fixture("nan-json")
+        document = read_json(nan.result_paths["F3"])
+        document["elapsedSeconds"] = float("nan")
+        write_json(nan.result_paths["F3"], document)
+        self.assert_invalid(nan, "JSON_NONFINITE")
+
+        overflow = self.fixture("overflow-json")
+        path = overflow.result_paths["F3"]
+        text = path.read_text(encoding="utf-8").replace('"elapsedSeconds": 1800.0', '"elapsedSeconds": 1e999')
+        path.write_text(text, encoding="utf-8")
+        self.assert_invalid(overflow, "JSON_NONFINITE")
+
+    def test_parent_symlinks_are_rejected_for_documents_and_artifacts(self) -> None:
+        document_link = self.fixture("document-parent-link")
+        original_parent = document_link.result_paths["B1"].parent
+        real_parent = original_parent.with_name(original_parent.name + "-real")
+        original_parent.rename(real_parent)
+        original_parent.symlink_to(real_parent.name, target_is_directory=True)
+        self.assert_invalid(document_link, "DOCUMENT_SYMLINK")
+
+        artifact_link = self.fixture("artifact-parent-link")
+        document = read_json(artifact_link.case_meta["O5"])
+        artifact = artifact_link.root / document["artifacts"]["dom"]["path"]
+        real_artifact = artifact.with_name(artifact.name + "-real")
+        artifact.rename(real_artifact)
+        artifact.symlink_to(real_artifact.name)
+        self.assert_invalid(artifact_link, "ARTIFACT_SYMLINK")
+
+        root_link = self.fixture("run-parent-link")
+        real_base = self.base / "real-parent"
+        real_base.mkdir()
+        moved_root = real_base / root_link.root.name
+        root_link.root.rename(moved_root)
+        linked_base = self.base / "linked-parent"
+        linked_base.symlink_to(real_base, target_is_directory=True)
+        result = self.run_validator(linked_base / moved_root.name)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("EVIDENCE_RUN_DIR_SYMLINK:", result.stderr)
+
+    def test_cross_case_hardlink_reuse_is_rejected(self) -> None:
+        fixture = self.fixture("hardlink-reuse")
+        first = read_json(fixture.case_meta["O1"])
+        second = read_json(fixture.case_meta["O2"])
+        first_path = fixture.root / first["artifacts"]["dom"]["path"]
+        second_path = fixture.root / second["artifacts"]["dom"]["path"]
+        second_path.unlink()
+        os.link(first_path, second_path)
+        second["artifacts"]["dom"]["sha256"] = sha256(first_path)
+        write_json(fixture.case_meta["O2"], second)
+        self.assert_invalid(fixture, "HARDLINK_REUSE")
+
+    def test_artifact_missing_tamper_and_traversal_fail_closed(self) -> None:
+        missing = self.fixture("missing-artifact")
+        document = read_json(missing.case_meta["O2"])
+        artifact = missing.root / document["artifacts"]["dom"]["path"]
+        artifact.unlink()
+        self.assert_invalid(missing, "ARTIFACT_MISSING")
+
+        tampered = self.fixture("tampered-artifact")
+        document = read_json(tampered.result_paths["D1"])
+        artifact = tampered.root / document["artifacts"]["installLog"]["path"]
+        artifact.write_text("tampered\n", encoding="utf-8")
+        self.assert_invalid(tampered, "ARTIFACT_HASH")
+
+        traversal = self.fixture("artifact-traversal")
+        document = read_json(traversal.case_meta["O4"])
+        document["artifacts"]["console"]["path"] = "../outside.json"
+        write_json(traversal.case_meta["O4"], document)
+        self.assert_invalid(traversal, "ARTIFACT_PATH")
+
+    def test_soak_requires_finite_correlated_thirty_minute_timestamps(self) -> None:
+        short = self.fixture("short-soak")
+        document = read_json(short.result_paths["F3"])
+        document["endedAt"] = 2_799.0
+        document["elapsedSeconds"] = 1_799.0
+        write_json(short.result_paths["F3"], document)
+        self.assert_invalid(short, "SOAK_DURATION")
+
+        inconsistent = self.fixture("inconsistent-soak")
+        document = read_json(inconsistent.result_paths["F3"])
+        document["elapsedSeconds"] = 1_900.0
+        write_json(inconsistent.result_paths["F3"], document)
+        self.assert_invalid(inconsistent, "SOAK_TIMESTAMPS")
+
+    def test_soak_requires_typed_zero_failure_counters(self) -> None:
+        nonzero = self.fixture("soak-counter-nonzero")
+        document = read_json(nonzero.result_paths["F3"])
+        document["failureCounters"]["deadLetters"] = 1
+        write_json(nonzero.result_paths["F3"], document)
+        self.assert_invalid(nonzero, "SOAK_FAILURE_COUNTER")
+
+        wrong_type = self.fixture("soak-counter-type")
+        document = read_json(wrong_type.result_paths["F3"])
+        document["failureCounters"]["queueWedges"] = False
+        write_json(wrong_type.result_paths["F3"], document)
+        self.assert_invalid(wrong_type, "SOAK_FAILURE_COUNTER")
+
+    def test_soak_requires_both_websocket_lanes_and_reconnect_checkpoints(self) -> None:
+        fixture = self.fixture("soak-checkpoints")
+        document = read_json(fixture.result_paths["F3"])
+        document["checkpoints"]["agentSessionWebSocket"]["reconnects"] = 1
+        write_json(fixture.result_paths["F3"], document)
+        self.assert_invalid(fixture, "SOAK_CHECKPOINT")
+
+        topic_replay = self.fixture("soak-topic-replay")
+        document = read_json(topic_replay.result_paths["F3"])
+        document["checkpoints"]["developerWebSocket"]["replayCount"] = 3
+        write_json(topic_replay.result_paths["F3"], document)
+        self.assert_invalid(topic_replay, "SOAK_CHECKPOINT")
+
+        agent_replay = self.fixture("soak-agent-replay")
+        document = read_json(agent_replay.result_paths["F3"])
+        document["checkpoints"]["agentSessionWebSocket"]["replayCounts"]["claude"] = 3
+        write_json(agent_replay.result_paths["F3"], document)
+        self.assert_invalid(agent_replay, "SOAK_CHECKPOINT")
+
+    def test_soak_requires_accepted_traffic_to_straddle_every_restart(self) -> None:
+        missing = self.fixture("soak-restart-proof-missing")
+        document = read_json(missing.result_paths["F3"])
+        document["restartProofs"].pop()
+        write_json(missing.result_paths["F3"], document)
+        self.assert_invalid(missing, "SOAK_RESTART_STRADDLE")
+
+        duplicate = self.fixture("soak-restart-proof-duplicate")
+        document = read_json(duplicate.result_paths["F3"])
+        document["restartProofs"][1]["developer"]["messageId"] = document["restartProofs"][0][
+            "developer"
+        ]["messageId"]
+        write_json(duplicate.result_paths["F3"], document)
+        self.assert_invalid(duplicate, "SOAK_RESTART_STRADDLE")
+
+        no_transport = self.fixture("soak-restart-proof-no-transport")
+        document = read_json(no_transport.result_paths["F3"])
+        document["restartProofs"][2]["transportRecoveryObserved"] = False
+        write_json(no_transport.result_paths["F3"], document)
+        self.assert_invalid(no_transport, "SOAK_RESTART_STRADDLE")
+
+        missing_agent = self.fixture("soak-restart-proof-missing-agent")
+        document = read_json(missing_agent.result_paths["F3"])
+        document["restartProofs"][0]["agentSessions"].pop("claude")
+        write_json(missing_agent.result_paths["F3"], document)
+        self.assert_invalid(missing_agent, "SOAK_RESTART_STRADDLE")
+
+    def test_soak_requires_bounded_resources_and_final_process_listener_evidence(self) -> None:
+        unbounded = self.fixture("soak-unbounded")
+        document = read_json(unbounded.result_paths["F3"])
+        document["bounds"]["memoryBytes"]["peak"] = 8589934593
+        write_json(unbounded.result_paths["F3"], document)
+        self.assert_invalid(unbounded, "SOAK_BOUNDS")
+
+        missing_final = self.fixture("soak-final-artifact")
+        document = read_json(missing_final.result_paths["F3"])
+        document["requiredArtifacts"].remove("finalListeners")
+        document["artifacts"].pop("finalListeners")
+        write_json(missing_final.result_paths["F3"], document)
+        self.assert_invalid(missing_final, "ARTIFACT_REQUIRED")
+
+    def test_soak_requires_every_explicit_release_invariant(self) -> None:
+        for key in (
+            "duration",
+            "restartCount",
+            "restartStraddle",
+            "traffic",
+            "sessionCorrelation",
+            "delivery",
+            "websocketReconnect",
+            "resources",
+            "topology",
+            "diagnostics",
+        ):
+            fixture = self.fixture(f"soak-invariant-{key}")
+            document = read_json(fixture.result_paths["F3"])
+            document["invariants"][key] = False
+            write_json(fixture.result_paths["F3"], document)
+            self.assert_invalid(fixture, "SOAK_INVARIANT")
+
+    def test_soak_requires_resource_health_and_topology_summaries(self) -> None:
+        samples = self.fixture("soak-resource-samples")
+        document = read_json(samples.result_paths["F3"])
+        document["resourceHealth"]["sampleCount"] = 59
+        write_json(samples.result_paths["F3"], document)
+        self.assert_invalid(samples, "SOAK_RESOURCE_HEALTH")
+
+        oom = self.fixture("soak-resource-oom")
+        document = read_json(oom.result_paths["F3"])
+        document["resourceHealth"]["memoryEventDeltas"]["oom_kill"] = 1
+        write_json(oom.result_paths["F3"], document)
+        self.assert_invalid(oom, "SOAK_RESOURCE_HEALTH")
+
+        topology = self.fixture("soak-topology")
+        document = read_json(topology.result_paths["F3"])
+        document["topology"]["tcpPorts"].remove(4200)
+        write_json(topology.result_paths["F3"], document)
+        self.assert_invalid(topology, "SOAK_TOPOLOGY")
+
+    def test_soak_requires_exact_restart_counts_and_positive_cursors(self) -> None:
+        excessive = self.fixture("soak-restart-excessive")
+        document = read_json(excessive.result_paths["F3"])
+        document["checkpoints"]["daemonReconnects"] = 3
+        write_json(excessive.result_paths["F3"], document)
+        self.assert_invalid(excessive, "SOAK_CHECKPOINT")
+
+        zero_cursor = self.fixture("soak-zero-cursor")
+        document = read_json(zero_cursor.result_paths["F3"])
+        document["checkpoints"]["developerWebSocket"]["lastAcceptedCursor"] = 0
+        write_json(zero_cursor.result_paths["F3"], document)
+        self.assert_invalid(zero_cursor, "SOAK_CHECKPOINT")
+
+
+if __name__ == "__main__":
+    if os.geteuid() != 0 and os.environ.get("NEXUS_V015_VALIDATOR_TEST_USERNS") != "1":
+        environment = dict(os.environ)
+        environment["NEXUS_V015_VALIDATOR_TEST_USERNS"] = "1"
+        os.execvpe(
+            "unshare",
+            ["unshare", "-Ur", sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+            environment,
+        )
+    unittest.main(verbosity=2)

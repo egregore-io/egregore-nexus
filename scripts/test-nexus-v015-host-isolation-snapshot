@@ -16,6 +16,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts/nexus-v015-host-isolation-snapshot"
+TRACKED_FILES = (
+    "daemon.pid",
+    "daemon-ipc-endpoint.json",
+    "gateway.json",
+    "webconsole.json",
+    "nexus.db",
+    "nexus.db-wal",
+    "nexus.db-shm",
+    "gateway.db",
+    "gateway.db-wal",
+    "gateway.db-shm",
+)
 
 
 class Fixture:
@@ -130,11 +142,48 @@ class Fixture:
             **process("webconsole"),
             "listener": "tcp://127.0.0.1:4200 inode=7002 owner=303",
         }
+
+        def file_identity(name: str) -> dict[str, object]:
+            path = self.home / name
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                return {
+                    "kind": "missing",
+                    "device": 0,
+                    "inode": 0,
+                    "mode": 0,
+                    "uid": 0,
+                    "gid": 0,
+                    "nlink": 0,
+                    "size": 0,
+                    "mtimeNs": 0,
+                    "ctimeNs": 0,
+                }
+            if path.is_fifo():
+                kind = "fifo"
+            elif path.is_file():
+                kind = "regular"
+            else:
+                kind = "other"
+            return {
+                "kind": kind,
+                "device": info.st_dev,
+                "inode": info.st_ino,
+                "mode": info.st_mode,
+                "uid": info.st_uid,
+                "gid": info.st_gid,
+                "nlink": info.st_nlink,
+                "size": info.st_size,
+                "mtimeNs": info.st_mtime_ns,
+                "ctimeNs": info.st_ctime_ns,
+            }
         return {
             "daemon": daemon,
             "gateway": gateway,
             "webconsole": webconsole,
             "ipc": {"path": str(self.ipc_path), "inode": self.ipc_path.stat().st_ino},
+            "files": {name: file_identity(name) for name in TRACKED_FILES},
         }
 
 
@@ -206,7 +255,7 @@ class HostIsolationSnapshotTest(unittest.TestCase):
         self.assertNotIn("must-not-leak", result.stdout)
         self.assertNotIn(database_marker, result.stdout)
 
-    def test_database_changes_do_not_change_snapshot_identity(self) -> None:
+    def test_database_metadata_changes_fail_host_isolation_comparison(self) -> None:
         database = self.fixture.home / "nexus.db"
         gateway_database = self.fixture.home / "gateway.db"
         database.write_bytes(b"before daemon state")
@@ -219,11 +268,15 @@ class HostIsolationSnapshotTest(unittest.TestCase):
         after_result = self.fixture.command("snapshot")
         self.assertEqual(after_result.returncode, 0, after_result.stderr)
 
-        before = json.loads(before_result.stdout)
-        after = json.loads(after_result.stdout)
-        before.pop("capturedAt")
-        after.pop("capturedAt")
-        self.assertEqual(before, after)
+        before_path = self.fixture.root / "before.json"
+        after_path = self.fixture.root / "after.json"
+        before_path.write_text(before_result.stdout, encoding="utf-8")
+        after_path.write_text(after_result.stdout, encoding="utf-8")
+        comparison = self.fixture.command("compare", str(before_path), str(after_path))
+
+        self.assertEqual(comparison.returncode, 1)
+        self.assertIn("files.nexus.db", comparison.stderr)
+        self.assertIn("files.gateway.db", comparison.stderr)
 
     def test_missing_runtime_components_use_the_empty_contract_shape(self) -> None:
         empty_home = self.fixture.root / "empty-home"
@@ -261,6 +314,21 @@ class HostIsolationSnapshotTest(unittest.TestCase):
                     "sha256": "",
                 },
                 "ipc": {"path": "", "inode": 0},
+                "files": {
+                    name: {
+                        "kind": "missing",
+                        "device": 0,
+                        "inode": 0,
+                        "mode": 0,
+                        "uid": 0,
+                        "gid": 0,
+                        "nlink": 0,
+                        "size": 0,
+                        "mtimeNs": 0,
+                        "ctimeNs": 0,
+                    }
+                    for name in TRACKED_FILES
+                },
             },
         )
 
@@ -272,6 +340,25 @@ class HostIsolationSnapshotTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("gateway listener", result.stderr)
         self.assertIn("pid 202", result.stderr)
+
+    def test_snapshot_accepts_listener_owned_by_discovered_process_child(self) -> None:
+        (self.fixture.proc / "202/fd/7").unlink()
+        child_fd = self.fixture.proc / "212/fd"
+        child_fd.mkdir(parents=True)
+        (child_fd / "9").symlink_to("socket:[7001]")
+        (self.fixture.proc / "212/status").write_text(
+            "Name:\tgateway-worker\nPPid:\t202\n",
+            encoding="utf-8",
+        )
+
+        result = self.fixture.command()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snapshot = json.loads(result.stdout)
+        self.assertEqual(
+            snapshot["gateway"]["listener"],
+            "tcp://127.0.0.1:4100 inode=7001 owner=212",
+        )
 
     def test_snapshot_rejects_listener_owned_by_a_different_process(self) -> None:
         (self.fixture.proc / "202/fd/7").unlink()

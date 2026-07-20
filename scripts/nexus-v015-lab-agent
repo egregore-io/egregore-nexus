@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ -n "${NEXUS_V015_NEXUS_BIN:-}" ]; then
+  NEXUS_BIN=$NEXUS_V015_NEXUS_BIN
+elif [ -x "$SCRIPT_DIR/nexus" ]; then
+  NEXUS_BIN="$SCRIPT_DIR/nexus"
+else
+  NEXUS_BIN=nexus
+fi
+
+usage() {
+  cat <<'USAGE'
+Usage: lab-agent launch codex|claude|offline
+
+Launch a genuine installed Codex or Claude harness only inside the isolated
+v0.1.5 validator. `offline` registers and immediately detaches a dedicated
+fixture identity without starting a harness. The hook never installs,
+compiles, or modifies a harness.
+USAGE
+}
+
+die() {
+  local code=$1
+  shift
+  echo "error[$code]: $*" >&2
+  case "$code" in
+    LAB_AGENT_HARNESS_MISSING) exit 3 ;;
+    LAB_AGENT_EXTERNAL_UNAVAILABLE) exit 4 ;;
+    LAB_AGENT_NEXUS_FAILURE) exit 5 ;;
+    *) exit 1 ;;
+  esac
+}
+
+usage_error() {
+  echo "error: $*" >&2
+  usage >&2
+  exit 2
+}
+
+if [ "${1:-}" = --help ] || [ "${1:-}" = -h ]; then
+  usage
+  exit 0
+fi
+[ "$#" -eq 2 ] || usage_error "expected launch and a harness kind"
+[ "$1" = launch ] || usage_error "action must be launch"
+KIND=$2
+case "$KIND" in
+  codex|claude|offline) ;;
+  *) usage_error "kind must be codex, claude, or offline" ;;
+esac
+
+[ "${OCULAR_LAB:-}" = 1 ] || die LAB_AGENT_LAB_ONLY "refusing to run outside the isolated ocular lab"
+[ -n "${NEXUS_LAB_ROOT:-}" ] || die LAB_AGENT_LAB_ONLY "NEXUS_LAB_ROOT is required"
+[ -n "${NEXUS_HOME:-}" ] || die LAB_AGENT_LAB_ONLY "NEXUS_HOME is required"
+[ -n "${NEXUS_V015_RUN_ID:-}" ] \
+  || die LAB_AGENT_LAB_ONLY "NEXUS_V015_RUN_ID is required"
+[[ "$NEXUS_V015_RUN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] \
+  || die LAB_AGENT_LAB_ONLY "NEXUS_V015_RUN_ID is invalid"
+[[ "${NEXUS_V015_READINESS_LEDGER_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] \
+  || die LAB_AGENT_LAB_ONLY "NEXUS_V015_READINESS_LEDGER_SHA256 is required"
+for command in jq realpath sha256sum timeout; do
+  command -v "$command" >/dev/null 2>&1 || die LAB_AGENT_LAB_ONLY "required command is unavailable: $command"
+done
+if [[ "$NEXUS_BIN" == */* ]]; then
+  [ -x "$NEXUS_BIN" ] || die LAB_AGENT_NEXUS_FAILURE "Nexus CLI is not executable: $NEXUS_BIN"
+else
+  command -v "$NEXUS_BIN" >/dev/null 2>&1 || die LAB_AGENT_NEXUS_FAILURE "Nexus CLI is unavailable: $NEXUS_BIN"
+fi
+
+LAB_ROOT=$(realpath -m "$NEXUS_LAB_ROOT")
+LAB_HOME=$(realpath -m "$NEXUS_HOME")
+case "$LAB_HOME" in
+  "$LAB_ROOT"/*) ;;
+  *) die LAB_AGENT_LAB_ONLY "NEXUS_HOME must be owned by NEXUS_LAB_ROOT" ;;
+esac
+if [ "${NEXUS_V015_ALLOW_FIXTURE_HOME:-}" != 1 ]; then
+  case "$LAB_ROOT" in
+    /tmp/nexus-lens-home|/tmp/nexus-lens-home/*) ;;
+    *) die LAB_AGENT_LAB_ONLY "refusing non-lab NEXUS_LAB_ROOT: $LAB_ROOT" ;;
+  esac
+fi
+
+READINESS="$LAB_ROOT/lab/candidate-ready.v1"
+[ -f "$READINESS" ] && [ ! -L "$READINESS" ] \
+  || die LAB_AGENT_LAB_ONLY "candidate readiness receipt is missing or unsafe"
+[ "$(stat -c %h "$READINESS")" = 1 ] \
+  || die LAB_AGENT_LAB_ONLY "candidate readiness receipt must be single-linked"
+[ "$(stat -c %a "$READINESS")" = 444 ] \
+  || die LAB_AGENT_LAB_ONLY "candidate readiness receipt mode mismatch"
+if [ "${NEXUS_V015_ALLOW_FIXTURE_HOME:-}" != 1 ]; then
+  [ "$(stat -c %u "$READINESS")" = 0 ] \
+    || die LAB_AGENT_LAB_ONLY "candidate readiness receipt is not root-owned"
+fi
+READINESS_SHA=$(sha256sum "$READINESS" | awk '{print $1}')
+[ "$READINESS_SHA" = "$NEXUS_V015_READINESS_LEDGER_SHA256" ] \
+  || die LAB_AGENT_LAB_ONLY "candidate readiness receipt hash mismatch"
+READY_RUN_COUNT=$(awk -F= '$1 == "runId" { count += 1 } END { print count + 0 }' "$READINESS")
+READY_RUN_ID=$(awk -F= '$1 == "runId" { print substr($0, 7) }' "$READINESS")
+[ "$READY_RUN_COUNT" = 1 ] && [ "$READY_RUN_ID" = "$NEXUS_V015_RUN_ID" ] \
+  || die LAB_AGENT_LAB_ONLY "candidate readiness runId mismatch"
+
+if [ "$KIND" != offline ]; then
+  case "$KIND" in
+    codex) HARNESS_BIN=${NEXUS_V015_CODEX_BIN:-} ;;
+    claude) HARNESS_BIN=${NEXUS_V015_CLAUDE_BIN:-} ;;
+  esac
+  if [ -z "$HARNESS_BIN" ]; then
+    HARNESS_BIN=$(command -v "$KIND" || true)
+  fi
+  [ -n "$HARNESS_BIN" ] && [ -x "$HARNESS_BIN" ] \
+    || die LAB_AGENT_HARNESS_MISSING "$KIND is not installed for the validator user"
+  HARNESS_BIN=$(realpath "$HARNESS_BIN")
+  HARNESS_SHA=$(sha256sum "$HARNESS_BIN" | awk '{print $1}')
+  set +e
+  HARNESS_VERSION=$(timeout --kill-after=2s 10s "$HARNESS_BIN" --version 2>&1)
+  VERSION_STATUS=$?
+  set -e
+  [ "$VERSION_STATUS" -eq 0 ] \
+    || die LAB_AGENT_EXTERNAL_UNAVAILABLE "$KIND --version failed (status $VERSION_STATUS)"
+  HARNESS_VERSION=$(printf '%s\n' "$HARNESS_VERSION" \
+    | tr -d '\r' \
+    | grep -E '(^|[[:space:]])v?[0-9]+\.[0-9]+\.[0-9]+' \
+    | tail -n1)
+  [ -n "$HARNESS_VERSION" ] \
+    || die LAB_AGENT_EXTERNAL_UNAVAILABLE "$KIND --version did not report a semantic version"
+fi
+
+RUN_ID="$NEXUS_V015_RUN_ID"
+NAME="v015-$KIND"
+WORKSPACE="$LAB_ROOT/harness-workspaces/$KIND"
+EVIDENCE="$LAB_ROOT/evidence/$RUN_ID/live-agents"
+MANIFEST="$LAB_ROOT/lab/agents.json"
+mkdir -p "$WORKSPACE" "$EVIDENCE" "$(dirname "$MANIFEST")"
+
+CURRENT='{"version":1,"runId":"","readinessSha256":"","candidate":{},"agents":{}}'
+if [ -e "$MANIFEST" ]; then
+  [ -f "$MANIFEST" ] && [ ! -L "$MANIFEST" ] && [ "$(stat -c %h "$MANIFEST")" = 1 ] \
+    || die LAB_AGENT_NEXUS_FAILURE "existing live-agent manifest is unsafe"
+  CURRENT=$(cat "$MANIFEST")
+  jq -e \
+    --arg runId "$RUN_ID" \
+    --arg readiness "$READINESS_SHA" \
+    '.version == 1 and .runId == $runId and
+     .readinessSha256 == $readiness and
+     .candidate.runId == $runId and
+     .candidate.readinessSha256 == $readiness and
+     (.agents | type == "object")' <<<"$CURRENT" >/dev/null \
+    || die LAB_AGENT_NEXUS_FAILURE "existing live-agent manifest is not bound to this candidate"
+fi
+
+read_member() {
+  local response matches count
+  response=$(NEXUS_PROJECT=v015-lab timeout --kill-after=2s 10s "$NEXUS_BIN" members --json --include-offline) \
+    || die LAB_AGENT_NEXUS_FAILURE "could not read Nexus members"
+  matches=$(jq -c --arg name "$NAME" '[.members[]? | select(.name == $name)]' <<<"$response") \
+    || die LAB_AGENT_NEXUS_FAILURE "members returned invalid JSON"
+  count=$(jq 'length' <<<"$matches")
+  [ "$count" -le 1 ] \
+    || die LAB_AGENT_NEXUS_FAILURE "$KIND has ambiguous same-name member rows"
+  jq -c '.[0] // empty' <<<"$matches"
+}
+
+MEMBER=$(read_member)
+REUSED=0
+if [ -n "$MEMBER" ]; then
+  REUSED=1
+fi
+if [ "$KIND" = offline ]; then
+  if [ -z "$MEMBER" ]; then
+    OFFLINE_SUFFIX=$(printf '%s' "$RUN_ID" | sha256sum | cut -c1-24)
+    OFFLINE_CLIENT_KEY="ck_v015_offline_$OFFLINE_SUFFIX"
+    set +e
+    REGISTER_OUTPUT=$(NEXUS_SESSION_ID="hs_v015_offline_$OFFLINE_SUFFIX" \
+      "$NEXUS_BIN" register --json \
+        --name "$NAME" \
+        --agent codex \
+        --kind agent \
+        --project v015-lab \
+        --client-key "$OFFLINE_CLIENT_KEY" 2>&1)
+    REGISTER_STATUS=$?
+    set -e
+    [ "$REGISTER_STATUS" -eq 0 ] \
+      || die LAB_AGENT_NEXUS_FAILURE "offline fixture registration failed (status $REGISTER_STATUS): ${REGISTER_OUTPUT:0:300}"
+    set +e
+    REMOVE_OUTPUT=$(env -u NEXUS_CLIENT_KEY -u NEXUS_SESSION_ID -u NEXUS_AGENT_ID \
+      NEXUS_PROJECT=v015-lab "$NEXUS_BIN" admin remove "$NAME" --json 2>&1)
+    REMOVE_STATUS=$?
+    set -e
+    [ "$REMOVE_STATUS" -eq 0 ] \
+      || die LAB_AGENT_NEXUS_FAILURE "offline fixture detach failed (status $REMOVE_STATUS): ${REMOVE_OUTPUT:0:300}"
+    for _ in $(seq 1 40); do
+      MEMBER=$(read_member)
+      [ -n "$MEMBER" ] && [ "$(jq -r '.presence // empty' <<<"$MEMBER")" = offline ] && break
+      sleep 0.25
+    done
+  fi
+
+  [ -n "$MEMBER" ] \
+    || die LAB_AGENT_NEXUS_FAILURE "offline fixture did not materialize"
+  AGENT_ID=$(jq -r '.agentId // .agent_id // empty' <<<"$MEMBER")
+  SESSION_ID=$(jq -r '.sessionId // .session_id // empty' <<<"$MEMBER")
+  PRESENCE=$(jq -r '.presence // empty' <<<"$MEMBER")
+  MEMBER_HARNESS=$(jq -r '.agent // .harness // empty' <<<"$MEMBER")
+  [ -n "$AGENT_ID" ] && [ -n "$SESSION_ID" ] \
+    || die LAB_AGENT_NEXUS_FAILURE "offline fixture is missing a stable agentId or sessionId"
+  [ "$PRESENCE" = offline ] \
+    || die LAB_AGENT_NEXUS_FAILURE "offline fixture is not offline"
+  [ "$MEMBER_HARNESS" = codex ] \
+    || die LAB_AGENT_NEXUS_FAILURE "offline fixture reports a different harness"
+  if [ "$REUSED" = 1 ]; then
+    jq -e \
+      --arg name "$NAME" \
+      --arg agentId "$AGENT_ID" \
+      --arg sessionId "$SESSION_ID" \
+      '.agents.offline == {
+        name: $name,
+        agentId: $agentId,
+        sessionId: $sessionId,
+        fixture: "registered-never-connected"
+      }' <<<"$CURRENT" >/dev/null \
+      || die LAB_AGENT_NEXUS_FAILURE "existing offline member is not attested for this candidate run"
+  fi
+  TMP_MANIFEST=$(mktemp "$MANIFEST.tmp.XXXXXX")
+  jq \
+    --arg runId "$RUN_ID" \
+    --arg readiness "$READINESS_SHA" \
+    --arg name "$NAME" \
+    --arg agentId "$AGENT_ID" \
+    --arg sessionId "$SESSION_ID" \
+    '.version = 1 |
+     .runId = $runId |
+     .readinessSha256 = $readiness |
+     .candidate = {runId: $runId, readinessSha256: $readiness} |
+     .agents.offline = {
+       name: $name,
+       agentId: $agentId,
+       sessionId: $sessionId,
+       fixture: "registered-never-connected"
+     }' <<<"$CURRENT" >"$TMP_MANIFEST"
+  chmod 0600 "$TMP_MANIFEST"
+  mv "$TMP_MANIFEST" "$MANIFEST"
+  printf '%s\n' "$MEMBER"
+  exit 0
+fi
+if [ -z "$MEMBER" ]; then
+  LAUNCH_STDOUT="$EVIDENCE/$KIND-launch.stdout"
+  LAUNCH_STDERR="$EVIDENCE/$KIND-launch.stderr"
+  META=$(printf '{"v015Acceptance":true,"harness":"%s","runId":"%s"}' "$KIND" "$RUN_ID")
+  set +e
+  timeout --kill-after=5s 180s "$NEXUS_BIN" launch \
+    --json \
+    --name "$NAME" \
+    --project v015-lab \
+    --cwd "$WORKSPACE" \
+    --initial-prompt "Nexus v0.1.5 live acceptance agent. Respond briefly to messages and remain available for DM, thread, queue, steer, reconnect, and replay tests." \
+    --meta "$META" \
+    --headless \
+    --detach \
+    "$KIND" >"$LAUNCH_STDOUT" 2>"$LAUNCH_STDERR"
+  LAUNCH_STATUS=$?
+  set -e
+  if [ "$LAUNCH_STATUS" -ne 0 ]; then
+    FAILURE=$(cat "$LAUNCH_STDERR")
+    if grep -Eqi 'oauth|auth|login|token|credit|quota|rate.?limit|billing|subscription' <<<"$FAILURE"; then
+      die LAB_AGENT_EXTERNAL_UNAVAILABLE "$KIND could not start because its external authentication or credits are unavailable"
+    fi
+    die LAB_AGENT_NEXUS_FAILURE "$KIND launch failed (status $LAUNCH_STATUS): ${FAILURE:0:300}"
+  fi
+  for _ in $(seq 1 240); do
+    MEMBER=$(read_member)
+    [ -n "$MEMBER" ] && break
+    sleep 0.5
+  done
+  [ -n "$MEMBER" ] || die LAB_AGENT_NEXUS_FAILURE "$KIND launched but did not register within 120s"
+fi
+
+AGENT_ID=$(jq -r '.agentId // .agent_id // empty' <<<"$MEMBER")
+SESSION_ID=$(jq -r '.sessionId // .session_id // empty' <<<"$MEMBER")
+PRESENCE=$(jq -r '.presence // empty' <<<"$MEMBER")
+MEMBER_HARNESS=$(jq -r '.agent // .harness // empty' <<<"$MEMBER")
+[ -n "$AGENT_ID" ] && [ -n "$SESSION_ID" ] \
+  || die LAB_AGENT_NEXUS_FAILURE "$KIND member is missing a stable agentId or sessionId"
+[ "$PRESENCE" = online ] \
+  || die LAB_AGENT_NEXUS_FAILURE "$KIND member is not online"
+[ "$MEMBER_HARNESS" = "$KIND" ] \
+  || die LAB_AGENT_NEXUS_FAILURE "$KIND member reports a different harness"
+
+if [ "$REUSED" = 1 ]; then
+  jq -e \
+    --arg kind "$KIND" \
+    --arg name "$NAME" \
+    --arg agentId "$AGENT_ID" \
+    --arg sessionId "$SESSION_ID" \
+    --arg executable "$HARNESS_BIN" \
+    --arg sha256 "$HARNESS_SHA" \
+    '.agents[$kind].name == $name and
+     .agents[$kind].agentId == $agentId and
+     .agents[$kind].sessionId == $sessionId and
+     .agents[$kind].executable == $executable and
+     .agents[$kind].sha256 == $sha256' <<<"$CURRENT" >/dev/null \
+    || die LAB_AGENT_NEXUS_FAILURE "$KIND existing member is not attested for this candidate run"
+fi
+TMP_MANIFEST=$(mktemp "$MANIFEST.tmp.XXXXXX")
+jq \
+  --arg runId "$RUN_ID" \
+  --arg readiness "$READINESS_SHA" \
+  --arg kind "$KIND" \
+  --arg name "$NAME" \
+  --arg agentId "$AGENT_ID" \
+  --arg sessionId "$SESSION_ID" \
+  --arg executable "$HARNESS_BIN" \
+  --arg sha256 "$HARNESS_SHA" \
+  --arg versionText "$HARNESS_VERSION" \
+  --arg workspace "$WORKSPACE" \
+  '.version = 1 |
+   .runId = $runId |
+   .readinessSha256 = $readiness |
+   .candidate = {runId: $runId, readinessSha256: $readiness} |
+   .agents[$kind] = {
+     name: $name,
+     agentId: $agentId,
+     sessionId: $sessionId,
+     executable: $executable,
+     sha256: $sha256,
+     version: $versionText,
+     workspace: $workspace
+   }' <<<"$CURRENT" >"$TMP_MANIFEST"
+chmod 0600 "$TMP_MANIFEST"
+mv "$TMP_MANIFEST" "$MANIFEST"
+printf '%s\n' "$MEMBER"
