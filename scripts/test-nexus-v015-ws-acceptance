@@ -1827,16 +1827,29 @@ class WsAcceptanceContracts(unittest.TestCase):
                 "TEXT_MESSAGE_START",
                 51,
                 role="assistant",
-                messageId="assistant-current",
+                messageId="assistant-current-commentary",
             ),
             event(
                 "TEXT_MESSAGE_CONTENT",
                 52,
+                messageId="assistant-current-commentary",
+                delta="I’m using the Nexus bus skill to send both messages.",
+            ),
+            event("TEXT_MESSAGE_END", 53, messageId="assistant-current-commentary"),
+            event(
+                "TEXT_MESSAGE_START",
+                54,
+                role="assistant",
+                messageId="assistant-current",
+            ),
+            event(
+                "TEXT_MESSAGE_CONTENT",
+                55,
                 messageId="assistant-current",
                 delta="V015_AGENT_DONE_current",
             ),
-            event("TEXT_MESSAGE_END", 53, messageId="assistant-current"),
-            event("RUN_FINISHED", 54, runId="run-current"),
+            event("TEXT_MESSAGE_END", 56, messageId="assistant-current"),
+            event("RUN_FINISHED", 57, runId="run-current"),
         ]
         core = {
             "session_event": lambda frame: frame["event"],
@@ -1850,6 +1863,7 @@ class WsAcceptanceContracts(unittest.TestCase):
                 start_index=0,
                 before_cursor=40,
                 client_message_id=client_message_id,
+                expected_text="V015_AGENT_DONE_current",
                 timeout=1,
                 label="codex bus-action",
             )
@@ -1858,6 +1872,7 @@ class WsAcceptanceContracts(unittest.TestCase):
         self.assertEqual(reply["runId"], "run-current")
         self.assertEqual(reply["assistantMessageId"], "assistant-current")
         self.assertEqual(reply["assistantText"], "V015_AGENT_DONE_current")
+        self.assertEqual(reply["assistantMessageCount"], 2)
 
         unrelated = [
             event("RUN_STARTED", 60, runId="run-unrelated"),
@@ -1885,6 +1900,52 @@ class WsAcceptanceContracts(unittest.TestCase):
                     start_index=0,
                     before_cursor=40,
                     client_message_id=client_message_id,
+                    expected_text="V015_AGENT_DONE_current",
+                    timeout=1,
+                    label="codex bus-action",
+                )
+            )
+
+        marker_then_extra = [
+            event("RUN_STARTED", 70, runId="run-extra"),
+            event("TEXT_MESSAGE_END", 70, messageId=client_message_id),
+            event(
+                "TEXT_MESSAGE_START",
+                71,
+                role="assistant",
+                messageId="assistant-marker",
+            ),
+            event(
+                "TEXT_MESSAGE_CONTENT",
+                72,
+                messageId="assistant-marker",
+                delta="V015_AGENT_DONE_current",
+            ),
+            event("TEXT_MESSAGE_END", 73, messageId="assistant-marker"),
+            event(
+                "TEXT_MESSAGE_START",
+                74,
+                role="assistant",
+                messageId="assistant-extra",
+            ),
+            event(
+                "TEXT_MESSAGE_CONTENT",
+                75,
+                messageId="assistant-extra",
+                delta="unexpected text after the marker",
+            ),
+            event("TEXT_MESSAGE_END", 76, messageId="assistant-extra"),
+            event("RUN_FINISHED", 77, runId="run-extra"),
+        ]
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "marker mismatch"):
+            asyncio.run(
+                module["wait_correlated_assistant_reply"](
+                    core,
+                    Lane(marker_then_extra),
+                    start_index=0,
+                    before_cursor=40,
+                    client_message_id=client_message_id,
+                    expected_text="V015_AGENT_DONE_current",
                     timeout=1,
                     label="codex bus-action",
                 )
