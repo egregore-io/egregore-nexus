@@ -337,6 +337,61 @@ describe("agent-session WebSocket backpressure", () => {
     keeper.close();
   });
 
+  it("applies resumable session backpressure to queue snapshots", async () => {
+    const { handleWs } = await loadWs();
+    const sessionId = "slow-queue";
+    const source = controlledTextStream();
+    let onSnapshot: ((snapshot: Record<string, unknown>) => void) | undefined;
+    const socket = new TestSocket();
+    const control = handleWs(
+      socket,
+      new Request(`http://localhost/api/agui/ws?session=${sessionId}`),
+      {
+        observe: async () => new Response(source.stream, {
+          headers: {
+            "content-type": "text/event-stream",
+            "x-nexus-session-id": sessionId,
+            "x-nexus-agent-id": `a_${sessionId}`,
+            "x-nexus-agent-name": sessionId,
+          },
+        }),
+        commandQueueHub: {
+          subscribe(_request: Request, _target: unknown, handlers: {
+            onSnapshot(snapshot: Record<string, unknown>): void;
+          }) {
+            onSnapshot = handlers.onSnapshot;
+            return () => {};
+          },
+        },
+      },
+    );
+    await vi.waitFor(() => expect(onSnapshot).toBeDefined());
+
+    const firstCursor = encodeCursor(BOOT_ID, 1);
+    const secondCursor = encodeCursor(BOOT_ID, 2);
+    source.enqueue(`data: ${JSON.stringify({
+      type: "TEXT_MESSAGE_CONTENT",
+      messageId: "accepted-1",
+      delta: "accepted one",
+      cursor: firstCursor,
+      epoch: BOOT_ID,
+    })}\n\ndata: ${JSON.stringify({
+      type: "TEXT_MESSAGE_CONTENT",
+      messageId: "accepted-2",
+      delta: "accepted two",
+      cursor: secondCursor,
+      epoch: BOOT_ID,
+    })}\n\n`);
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(2));
+
+    socket.bufferedAmount = MAX_OUTBOUND_BYTES + 1;
+    onSnapshot?.({ sessionId, seq: 2, commands: [] });
+
+    await control.closed;
+    expect(opaqueCursorFromClose(socket)).toBe(firstCursor);
+    expect(socket.sent).toHaveLength(2);
+  });
+
   it("isolates a saturated subscriber from a healthy agent-session lane", async () => {
     const { handleWs } = await loadWs();
     const source = fanoutHarness();
