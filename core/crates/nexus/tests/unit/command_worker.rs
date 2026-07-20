@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use nexus_common::{Config, HookGatewayMode};
 use nexus_contracts::{
-    AgentTurnExecutionPort, InterruptRequest, Kind, NexusBatch, NotifySendRequest, NotifyTarget,
-    PortResult, PromptRequest, RegisterRequest, RemoveRequest, RemoveResponse, SessionId,
-    SpawnRequest, SpawnResponse, SteerRequest, Tier,
+    AgentTurnExecutionPort, InterruptRequest, Kind, Locality, NexusBatch, NotifySendRequest,
+    NotifyTarget, PortResult, PromptRequest, RegisterRequest, RemoveRequest, RemoveResponse,
+    SessionId, SpawnRequest, SpawnResponse, SteerRequest, Tier,
 };
 use nexus_store::command_kinds;
 use nexus_store::repos::{
@@ -904,6 +904,114 @@ async fn human_command_auth_never_resolves_its_display_name_as_an_agent() {
     assert_eq!(caller.session, human.session_id);
     assert_eq!(caller.name, "browser-user");
     assert_eq!(caller.agent_id, None);
+}
+
+#[tokio::test]
+async fn gateway_transport_external_principal_is_a_caller_without_native_session_identity() {
+    let state = test_state().await;
+    Agents::new(&state.store)
+        .create(NewAgent {
+            agent_id: "a_outside_alias".into(),
+            project: "default".into(),
+            name: Some("outside-user".into()),
+            default_harness: None,
+            role: None,
+            tier: Some("agent".into()),
+            owner: None,
+        })
+        .await
+        .unwrap();
+    let repo = CommandIntents::new(&state.store);
+    repo.insert_pending(NewCommandIntent {
+        command_id: "cmd_external_transport".into(),
+        kind: command_kinds::message_post::SEND.into(),
+        project: "default".into(),
+        caller_name: "outside-user".into(),
+        caller_session_id: Some("transport:telegram".into()),
+        caller_agent_id: None,
+        caller_runtime_id: Some("transport:telegram".into()),
+        caller_client_key: None,
+        caller_principal_id: Some("x_outside".into()),
+        caller_kind: Some("external.human".into()),
+        caller_tier: Some("agent".into()),
+        idempotency_key: Some("transport:telegram:update-1".into()),
+        request_json: "{}".into(),
+        created_at: 1,
+    })
+    .await
+    .unwrap();
+    let row = repo
+        .get("cmd_external_transport")
+        .await
+        .unwrap()
+        .expect("external transport command");
+
+    let caller = resolve_command_caller(&state, &row)
+        .await
+        .expect("gateway-authenticated external principal");
+
+    assert_eq!(caller.agent_id, None);
+    assert_eq!(caller.session, SessionId("transport:telegram".into()));
+    assert_eq!(caller.name, "outside-user");
+    assert_eq!(caller.locality, Locality::External);
+    assert_eq!(caller.access.as_deref(), Some("guest"));
+    assert_eq!(caller.principal_id.as_deref(), Some("x_outside"));
+}
+
+#[tokio::test]
+async fn no_other_client_keyless_shape_can_enter_the_gateway_transport_principal_lane() {
+    let state = test_state().await;
+    let repo = CommandIntents::new(&state.store);
+    repo.insert_pending(NewCommandIntent {
+        command_id: "cmd_external_shape_base".into(),
+        kind: command_kinds::message_post::SEND.into(),
+        project: "default".into(),
+        caller_name: "outside-user".into(),
+        caller_session_id: Some("transport:telegram".into()),
+        caller_agent_id: None,
+        caller_runtime_id: Some("transport:telegram".into()),
+        caller_client_key: None,
+        caller_principal_id: Some("x_outside".into()),
+        caller_kind: Some("external.human".into()),
+        caller_tier: Some("agent".into()),
+        idempotency_key: None,
+        request_json: "{}".into(),
+        created_at: 1,
+    })
+    .await
+    .unwrap();
+    let base = repo
+        .get("cmd_external_shape_base")
+        .await
+        .unwrap()
+        .expect("shape base");
+
+    let mut invalid = Vec::new();
+    let mut row = base.clone();
+    row.caller_kind = Some("external.agent".into());
+    invalid.push(("external agent", row));
+    let mut row = base.clone();
+    row.caller_kind = Some("local.human".into());
+    invalid.push(("local human", row));
+    let mut row = base.clone();
+    row.caller_kind = Some("trusted.human".into());
+    invalid.push(("trusted human", row));
+    let mut row = base.clone();
+    row.caller_principal_id = Some("h_local".into());
+    invalid.push(("non-external principal", row));
+    let mut row = base.clone();
+    row.caller_session_id = Some("source:telegram".into());
+    row.caller_runtime_id = row.caller_session_id.clone();
+    invalid.push(("non-transport session", row));
+    let mut row = base.clone();
+    row.kind = command_kinds::thread::CREATE.into();
+    invalid.push(("non-message command", row));
+
+    for (label, row) in invalid {
+        let error = resolve_command_caller(&state, &row).await.expect_err(label);
+        assert_eq!(error.code, codes::UNAUTHORIZED, "{label}");
+        assert!(error.message.contains("verified client key"), "{label}");
+    }
 }
 
 #[tokio::test]

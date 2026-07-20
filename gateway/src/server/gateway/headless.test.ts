@@ -94,17 +94,28 @@ describe("headless gateway", () => {
         await options.afterReceipt?.({} as never);
         expect(afterReceipt).toHaveBeenCalledOnce();
       },
+      async startTransports() {
+        calls.push("transports:start");
+        return {
+          start: async () => undefined,
+          stop: async () => undefined,
+          states: () => [],
+        };
+      },
+      async stopTransports() { calls.push("transports:stop"); },
       async stopProjection() { calls.push("projection:stop"); },
       async stopHooks() { calls.push("hooks:stop"); },
       async stopConnection() { calls.push("connection:stop"); },
     });
 
-    expect(calls).toEqual(["hooks:start", "projection:start"]);
+    expect(calls).toEqual(["hooks:start", "projection:start", "transports:start"]);
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     await server.shutdown();
     expect(calls).toEqual([
       "hooks:start",
       "projection:start",
+      "transports:start",
+      "transports:stop",
       "projection:stop",
       "hooks:stop",
       "connection:stop",

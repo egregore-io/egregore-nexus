@@ -1,5 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { once } from "node:events";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import { dispatchNetworkMcp } from "../../routes/api/mcp";
 import { dispatchApiV1 } from "../../routes/api/v1/$";
@@ -29,6 +31,7 @@ import {
 import { createGatewayStore, getGatewayStore } from "../store/client";
 import { gatewayStoreConfig } from "../store/config";
 import { CURRENT_GATEWAY_SCHEMA_VERSION } from "../store/migrations";
+import { createTransportHost, type TransportHost } from "../transport/host";
 
 export {
   closeSharedDaemonPushConnector,
@@ -62,6 +65,8 @@ export interface HeadlessGatewayLifecycle {
   startProjection(options: GatewayProjectionServiceOptions): Promise<unknown>;
   stopProjection(): Promise<void>;
   stopHooks(): Promise<void>;
+  startTransports?(): Promise<TransportHost | undefined>;
+  stopTransports?(host: TransportHost | undefined): Promise<void>;
   stopConnection?(): Promise<void> | void;
 }
 
@@ -75,6 +80,15 @@ const DEFAULT_LIFECYCLE: HeadlessGatewayLifecycle = {
   startProjection: startGatewayProjectionService,
   stopProjection: stopGatewayProjectionService,
   stopHooks: stopGatewayHookService,
+  startTransports: async () => {
+    const host = createTransportHost({
+      nexusHome: process.env.NEXUS_HOME?.trim() || join(homedir(), ".nexus"),
+      db: getGatewayStore,
+    });
+    await host.start();
+    return host;
+  },
+  stopTransports: async (host) => host?.stop(),
   stopConnection: async () => closeSharedDaemonPushConnector(),
 };
 
@@ -143,11 +157,15 @@ export async function createHeadlessGatewayServer(
   lifecycle: HeadlessGatewayLifecycle = DEFAULT_LIFECYCLE,
 ) {
   const hooks = await lifecycle.startHooks();
+  let transportHost: TransportHost | undefined;
   try {
     await lifecycle.startProjection({
       ...(hooks ? { afterReceipt: (event) => hooks.afterReceipt(event) } : {}),
     });
+    transportHost = await lifecycle.startTransports?.();
   } catch (error) {
+    await lifecycle.stopTransports?.(transportHost);
+    await lifecycle.stopProjection().catch(() => undefined);
     await lifecycle.stopHooks();
     await lifecycle.stopConnection?.();
     throw error;
@@ -159,7 +177,9 @@ export async function createHeadlessGatewayServer(
   });
   await attachHeadlessGatewayWs(server, { fetchHandler });
   let cleanup: Promise<void> | undefined;
-  const stopServices = () => cleanup ??= lifecycle.stopProjection()
+  const stopServices = () => cleanup ??= Promise.resolve()
+    .then(() => lifecycle.stopTransports?.(transportHost))
+    .then(() => lifecycle.stopProjection())
     .then(() => lifecycle.stopHooks())
     .then(() => lifecycle.stopConnection?.())
     .then(() => undefined);
@@ -170,6 +190,7 @@ export async function createHeadlessGatewayServer(
       });
   });
   return Object.assign(server, {
+    transportHost,
     async shutdown(): Promise<void> {
       if (server.listening) {
         await new Promise<void>((resolve, reject) => {

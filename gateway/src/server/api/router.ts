@@ -147,6 +147,8 @@ const ROUTES: Route[] = [
   { method: "POST", pattern: "/admin/channel", projection: { command: COMMAND_KINDS.adminChannel }, handler: h.postAdminChannel },
   { method: "POST", pattern: "/admin/route", projection: { command: COMMAND_KINDS.adminRoute }, handler: h.postAdminRoute },
   { method: "POST", pattern: "/admin/monitor", projection: { command: COMMAND_KINDS.adminMonitor }, handler: h.postAdminMonitor },
+  { method: "POST", pattern: "/admin/transport/secrets", projection: { command: "gateway.transport.secret.set" }, handler: h.postTransportSecret },
+  { method: "DELETE", pattern: "/admin/transport/secrets/:key", projection: { command: "gateway.transport.secret.rm" }, handler: h.deleteTransportSecret },
 
   // ── notification sources ──
   { method: "GET", pattern: "/sources", projection: { read: "source.list" }, handler: h.getSources },

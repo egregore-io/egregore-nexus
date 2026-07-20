@@ -7,9 +7,11 @@
 //! `source.push` carries its command-envelope idempotency key through an internal service seam
 //! because crash-reclaim identity is transaction context, not part of the public producer payload.
 //!
-//! Authenticated command rows resolve their caller from the registered session `client_key` only.
-//! A bare `caller_name` or copied session id is not proof of identity. Verified registered
-//! command activity refreshes that caller session's heartbeat and runtime presence.
+//! Authenticated native command rows resolve their caller from the registered session `client_key`
+//! only. The one client-key-less human lane is a Gateway-authenticated external transport
+//! principal on `message.post.send`; it is bound by its `x_*` principal id and `transport:*`
+//! session evidence and never resolves through a mutable name. Verified registered command
+//! activity refreshes that caller session's heartbeat and runtime presence.
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -1067,6 +1069,23 @@ async fn resolve_command_caller(
         });
     }
 
+    if is_gateway_transport_external_principal(row) {
+        return Ok(Caller {
+            agent_id: None,
+            session: SessionId(
+                row.caller_session_id
+                    .clone()
+                    .expect("verified transport caller has a session id"),
+            ),
+            name: row.caller_name.clone(),
+            project: row.project.clone(),
+            tier: Tier::Agent,
+            locality: Locality::External,
+            access: Some("guest".into()),
+            principal_id: row.caller_principal_id.clone(),
+        });
+    }
+
     let sessions = Sessions::new(&state.store);
     let Some(client_key) = row.caller_client_key.as_deref() else {
         return Err(unauthorized_command_caller(
@@ -1170,6 +1189,24 @@ fn is_verified_source_push(row: &CommandIntentRow) -> bool {
             == Some(entity_kind::dotted(Locality::Local, Kind::Notification).as_str())
         && row.caller_tier.as_deref() == Some("agent")
         && row.caller_client_key.is_none()
+}
+
+fn is_gateway_transport_external_principal(row: &CommandIntentRow) -> bool {
+    row.kind == command_kinds::message_post::SEND
+        && row
+            .caller_session_id
+            .as_deref()
+            .is_some_and(|session_id| session_id.starts_with("transport:") && session_id.len() > 10)
+        && row.caller_runtime_id == row.caller_session_id
+        && row.caller_agent_id.is_none()
+        && row.caller_client_key.is_none()
+        && row
+            .caller_principal_id
+            .as_deref()
+            .is_some_and(|principal_id| principal_id.starts_with("x_") && principal_id.len() > 2)
+        && row.caller_kind.as_deref()
+            == Some(entity_kind::dotted(Locality::External, Kind::Human).as_str())
+        && row.caller_tier.as_deref() == Some("agent")
 }
 
 fn unauthorized_command_caller(message: impl Into<String>) -> ContractError {

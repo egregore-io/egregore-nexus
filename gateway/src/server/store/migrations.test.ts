@@ -165,6 +165,27 @@ describe("Gateway v0.1.0 store baseline", () => {
     db.close();
   });
 
+  it("chains the v0.1.6 principal marker into the transport-host schema", async () => {
+    const db = createClient({ url: ":memory:" });
+    await migrateGatewayStore(db);
+    await db.batch([
+      "DROP TABLE transport_outbox",
+      "DROP TABLE transport_ingress",
+      `UPDATE gateway_schema_migrations
+       SET version = 6, name = 'v0.1.6_principals_and_transport_bindings'`,
+    ], "write");
+
+    await migrateGatewayStore(db);
+
+    expect(await tableExists(db, "transport_ingress")).toBe(true);
+    expect(await tableExists(db, "transport_outbox")).toBe(true);
+    const marker = await db.execute("SELECT version, name FROM gateway_schema_migrations");
+    expect(marker.rows).toMatchObject([
+      { version: CURRENT_GATEWAY_SCHEMA_VERSION, name: CURRENT_GATEWAY_SCHEMA_NAME },
+    ]);
+    db.close();
+  });
+
   it("rejects the pre-release v1/v2 ladder without changing it", async () => {
     const db = createClient({ url: ":memory:" });
     await db.batch(

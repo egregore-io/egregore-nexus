@@ -38,6 +38,7 @@ import {
   channelSchema,
   routeForwardSchema,
   monitorSchema,
+  transportSecretSchema,
   routeRuleSchema,
   sourceRegisterSchema,
   sourcePushSchema,
@@ -99,6 +100,10 @@ import {
   type SendRequest,
 } from "@shared/types";
 import { dottedEntityKind } from "@server/identity/entityKind";
+import {
+  removeTransportSecret,
+  setTransportSecret,
+} from "@server/transport/secrets";
 
 /** Maximum time an authorized read may wait for its best-effort human delivery receipt. */
 const HUMAN_READ_RECEIPT_TIMEOUT_MS = 250;
@@ -985,6 +990,17 @@ export const postAdminMonitor: Handler = async ({ deps, ...rest }) => {
       rest.req.caller,
     ),
   );
+};
+
+export const postTransportSecret: Handler = async ({ deps, ...rest }) => {
+  if (!deps.canonicalDb) throw new GatewayError(503, "canonical Gateway store is unavailable");
+  const body = parseBody({ deps, ...rest }, transportSecretSchema);
+  return ok(await setTransportSecret(await deps.canonicalDb(), body.key, body.value));
+};
+
+export const deleteTransportSecret: Handler = async ({ deps, params }) => {
+  if (!deps.canonicalDb) throw new GatewayError(503, "canonical Gateway store is unavailable");
+  return ok(await removeTransportSecret(await deps.canonicalDb(), params.key ?? ""));
 };
 
 // --- notification source management ---

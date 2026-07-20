@@ -214,6 +214,12 @@ export const monitorSchema = z.object({
   scope: z.string().optional(),
 });
 
+/** POST /admin/transport/secrets — the value is carried only in the request body. */
+export const transportSecretSchema = z.object({
+  key: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
+  value: z.string().min(1),
+});
+
 /** POST /routing-rules → route (standing rule; at least one of source/topic). */
 export const routeRuleSchema = z
   .object({

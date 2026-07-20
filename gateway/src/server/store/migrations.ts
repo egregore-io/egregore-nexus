@@ -12,8 +12,10 @@ const GATEWAY_V4_SCHEMA_VERSION = 4;
 const GATEWAY_V4_SCHEMA_NAME = "v0.1.5_resumable_message_hooks";
 const GATEWAY_V5_SCHEMA_VERSION = 5;
 const GATEWAY_V5_SCHEMA_NAME = "v0.1.5_bearer_authority";
-export const CURRENT_GATEWAY_SCHEMA_VERSION = 6;
-export const CURRENT_GATEWAY_SCHEMA_NAME = "v0.1.6_principals_and_transport_bindings";
+const GATEWAY_V6_SCHEMA_VERSION = 6;
+const GATEWAY_V6_SCHEMA_NAME = "v0.1.6_principals_and_transport_bindings";
+export const CURRENT_GATEWAY_SCHEMA_VERSION = 7;
+export const CURRENT_GATEWAY_SCHEMA_NAME = "v0.1.6_transport_host";
 
 const INITIAL_SCHEMA: InStatement[] = [
   `CREATE TABLE IF NOT EXISTS projection_events (
@@ -330,6 +332,30 @@ const V016_PRINCIPAL_TRANSPORT_SCHEMA: InStatement[] = [
   )`,
 ];
 
+const V016_TRANSPORT_HOST_SCHEMA: InStatement[] = [
+  `CREATE TABLE IF NOT EXISTS transport_ingress (
+    provider TEXT NOT NULL,
+    ingress_id TEXT NOT NULL,
+    received_at INTEGER NOT NULL,
+    PRIMARY KEY(provider, ingress_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS transport_outbox (
+    obligation_id TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    external_chat_id TEXT NOT NULL,
+    lane_kind TEXT NOT NULL,
+    lane_name TEXT NOT NULL,
+    text TEXT NOT NULL,
+    state TEXT NOT NULL,
+    external_message_id TEXT,
+    created_at INTEGER NOT NULL,
+    settled_at INTEGER
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_transport_outbox_pending
+    ON transport_outbox(provider, state, created_at, obligation_id)`,
+];
+
 const V1_REQUIRED_INDEXES = [
   "idx_projection_epoch_seq",
   "idx_runtime_agent",
@@ -347,10 +373,12 @@ const HOOK_REQUIRED_INDEXES = [
   "idx_hook_execution_evaluation",
 ] as const;
 const V016_REQUIRED_INDEXES = ["idx_human_user_id", "idx_transport_lane"] as const;
+const V016_HOST_REQUIRED_INDEXES = ["idx_transport_outbox_pending"] as const;
 const REQUIRED_INDEXES = [
   ...V1_REQUIRED_INDEXES,
   ...HOOK_REQUIRED_INDEXES,
   ...V016_REQUIRED_INDEXES,
+  ...V016_HOST_REQUIRED_INDEXES,
 ] as const;
 const V016_TABLES = new Set([
   "principals",
@@ -358,6 +386,8 @@ const V016_TABLES = new Set([
   "subject_bindings",
   "transport_lane_bindings",
   "transport_secrets",
+  "transport_ingress",
+  "transport_outbox",
 ]);
 
 /** Bootstrap or validate the single local-only Gateway v0.1.0 schema baseline. */
@@ -382,6 +412,7 @@ export async function migrateGatewayStore(db: Client): Promise<void> {
         ...BEARER_AUTHORITY_UPGRADE_SCHEMA,
         ...V016_IDENTITY_COLUMNS,
         ...V016_PRINCIPAL_TRANSPORT_SCHEMA,
+        ...V016_TRANSPORT_HOST_SCHEMA,
         {
           sql: `INSERT INTO gateway_schema_migrations (version, name, applied_at)
                 VALUES (?, ?, ?)`,
@@ -413,6 +444,10 @@ async function upgradeOrValidateBaseline(db: Client): Promise<void> {
   const name = String(marker.name);
   if (version === CURRENT_GATEWAY_SCHEMA_VERSION && name === CURRENT_GATEWAY_SCHEMA_NAME) {
     return;
+  }
+  if (version === GATEWAY_V6_SCHEMA_VERSION && name === GATEWAY_V6_SCHEMA_NAME) {
+    await validateV6Objects(db);
+    return upgradeTransportHost(db);
   }
   if (version === GATEWAY_V1_SCHEMA_VERSION && name === GATEWAY_V1_SCHEMA_NAME) {
     await validateV1Objects(db);
@@ -542,9 +577,22 @@ async function upgradePrincipalIdentity(db: Client): Promise<void> {
     migrationMarkerUpdate(
       GATEWAY_V5_SCHEMA_VERSION,
       GATEWAY_V5_SCHEMA_NAME,
+      GATEWAY_V6_SCHEMA_VERSION,
+      GATEWAY_V6_SCHEMA_NAME,
     ),
   );
   await db.batch(statements, "write");
+  await upgradeTransportHost(db);
+}
+
+async function upgradeTransportHost(db: Client): Promise<void> {
+  await db.batch([
+    ...V016_TRANSPORT_HOST_SCHEMA,
+    migrationMarkerUpdate(
+      GATEWAY_V6_SCHEMA_VERSION,
+      GATEWAY_V6_SCHEMA_NAME,
+    ),
+  ], "write");
 }
 
 async function columnExists(
@@ -581,6 +629,20 @@ async function validateV2Objects(db: Client): Promise<void> {
   for (const index of [...V1_REQUIRED_INDEXES, ...HOOK_REQUIRED_INDEXES]) {
     if (!(await objectExists(db, "index", index))) {
       throw new Error(`incomplete v0.1.5 Gateway hook schema: missing index ${index}`);
+    }
+  }
+}
+
+async function validateV6Objects(db: Client): Promise<void> {
+  for (const table of GATEWAY_CANONICAL_TABLES) {
+    if (table === "transport_ingress" || table === "transport_outbox") continue;
+    if (!(await objectExists(db, "table", table))) {
+      throw new Error(`incomplete v0.1.6 Gateway principal schema: missing table ${table}`);
+    }
+  }
+  for (const index of [...V1_REQUIRED_INDEXES, ...HOOK_REQUIRED_INDEXES, ...V016_REQUIRED_INDEXES]) {
+    if (!(await objectExists(db, "index", index))) {
+      throw new Error(`incomplete v0.1.6 Gateway principal schema: missing index ${index}`);
     }
   }
 }

@@ -54,6 +54,18 @@ function requireHumanCaller(
   caller: GatewayCallerIdentity,
 ): asserts caller is GatewayCallerIdentity & { sessionId: string } {
   if (isLocalOperatorCaller(caller)) return;
+  if (
+    caller.sessionId?.startsWith("transport:") &&
+    caller.kind === "human" &&
+    caller.locality === "external" &&
+    caller.access === "guest" &&
+    caller.principalId?.startsWith("x_") &&
+    caller.tier === "agent" &&
+    caller.credentialFacet === "source" &&
+    !caller.agentId &&
+    !caller.clientKey &&
+    (!caller.runtimeId || caller.runtimeId === caller.sessionId)
+  ) return;
   if (!caller.sessionId || !caller.clientKey) {
     throw new GatewayError(401, "message post requires a logged-in human identity");
   }

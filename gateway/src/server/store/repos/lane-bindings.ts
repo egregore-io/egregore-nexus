@@ -1,4 +1,6 @@
-import type { Client, Row } from "@libsql/client";
+import type { Client, Row, Transaction } from "@libsql/client";
+
+type SqlExecutor = Pick<Client, "execute"> | Pick<Transaction, "execute">;
 
 export type LaneKind = "thread" | "dm";
 
@@ -27,7 +29,7 @@ export class LaneBindingConflictError extends Error {
 }
 
 /** Idempotently bind a provider chat, refusing implicit rebinds. */
-export async function bindLane(db: Client, input: LaneBindingRow): Promise<LaneBindingRow> {
+export async function bindLane(db: SqlExecutor, input: LaneBindingRow): Promise<LaneBindingRow> {
   const row = validated(input);
   await db.execute({
     sql: `INSERT OR IGNORE INTO transport_lane_bindings
@@ -44,7 +46,7 @@ export async function bindLane(db: Client, input: LaneBindingRow): Promise<LaneB
 }
 
 export async function laneForChat(
-  db: Client,
+  db: SqlExecutor,
   provider: string,
   externalChatId: string,
 ): Promise<LaneBindingRow | undefined> {
@@ -59,7 +61,7 @@ export async function laneForChat(
 
 /** Contract-G outbound fan-out query: chats are membership, not agent rows. */
 export async function chatsForLane(
-  db: Client,
+  db: SqlExecutor,
   laneKind: LaneKind,
   laneName: string,
 ): Promise<LaneBindingRow[]> {

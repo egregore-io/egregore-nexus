@@ -114,11 +114,7 @@ export async function upsertSubjectBinding(
     return existing;
   }
 
-  const principalId = stableId(
-    "x",
-    "external-subject",
-    `${provider}\0${externalUserId}`,
-  );
+  const principalId = externalPrincipalIdForSubject(provider, externalUserId);
   const createdAt = Date.now();
   await db.batch(
     [
@@ -172,6 +168,14 @@ async function updateSubjectDisplayName(
           WHERE provider = ? AND external_user_id = ?`,
     args: [displayName, provider, externalUserId],
   });
+}
+
+export function externalPrincipalIdForSubject(provider: string, externalUserId: string): string {
+  return stableId(
+    "x",
+    "external-subject",
+    `${required(provider, "provider")}\0${required(externalUserId, "externalUserId")}`,
+  );
 }
 
 function mapPrincipal(row: Row): PrincipalRow {

@@ -22,6 +22,8 @@ export const GATEWAY_CANONICAL_TABLES = [
   "subject_bindings",
   "transport_lane_bindings",
   "transport_secrets",
+  "transport_ingress",
+  "transport_outbox",
   "rest_bearer_token",
   "logs",
   "rendered_conversations",
