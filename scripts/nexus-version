@@ -53,7 +53,7 @@ function readRequired(relative) {
 
 function canonicalVersion() {
   const text = readRequired("VERSION");
-  const match = text.match(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\n$/);
+  const match = text.match(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\r?\n$/);
   if (!match) {
     throw new VersionError("VERSION must contain one SemVer value and a trailing newline");
   }
