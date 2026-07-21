@@ -21,6 +21,9 @@ All notable public changes to Egregore Nexus are documented here. This project f
 - Canonical send acceptance now uses one correlated daemon-to-Gateway hook evaluation when a
   hook-capable Gateway is available. Optional mode preserves transport during Gateway outage;
   required mode makes Gateway hook availability a policy boundary.
+- Normal Codex, Claude Code, OpenCode, and Hermes launches now use the authentication authority
+  selected by the machine installation. Nexus keeps runtime state isolated per session but no
+  longer copies provider credentials or configuration into session-owned homes.
 
 ### Security
 

@@ -73,7 +73,7 @@ async fn known_thread_resume_uses_existing_codex_home_without_copying_rollout() 
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(external_codex_home.clone()),
                 model: None,
                 bus_mcp: None,
                 cwd: None,
@@ -161,7 +161,7 @@ async fn resumed_in_progress_turn_blocks_new_prompt_until_native_boundary() {
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(external_codex_home.clone()),
                 model: None,
                 bus_mcp: None,
                 cwd: None,
@@ -261,7 +261,7 @@ async fn resume_refuses_mismatched_or_ambiguous_native_turn_authority() {
                 SupervisorOpts {
                     codex_exe: FAKE_BIN.to_string(),
                     session_dir,
-                    codex_home: None,
+                    codex_home: Some(external_codex_home.clone()),
                     model: None,
                     bus_mcp: None,
                     cwd: None,

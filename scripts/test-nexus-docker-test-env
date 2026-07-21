@@ -692,6 +692,7 @@ grep -Fq "refusing runtime-state mount" "$TMP/rejected.err"
 mkdir -p \
   "$TMP/lab-home" \
   "$TMP/lab-home/.codex" \
+  "$TMP/lab-home/.nexus/codex-sessions/s_stale/codex-home" \
   "$TMP/active-codex" \
   "$TMP/lab-sources/lens" \
   "$TMP/lab-sources/egregore" \
@@ -842,6 +843,31 @@ if grep -Fq -- "-v $TMP/lab-home/.codex:/host-auth/.codex:ro" \
 fi
 if grep -Eq '(^| )exec( |$)' "$TMP/hostconfig-docker.log"; then
   echo 'HostConfig mismatch must fail before container setup or candidate build' >&2
+  exit 1
+fi
+
+# A Nexus-launched operator inherits its current session's runtime CODEX_HOME.
+# That legacy path is never machine auth authority for a packed candidate: the
+# launcher must fall back to the machine HOME/.codex just like normal runtime.
+rm -f "$TMP/hostconfig-created"
+: >"$TMP/hostconfig-docker.log"
+set +e
+env "${LAB_ENV[@]}" \
+  "CODEX_HOME=$TMP/lab-home/.nexus/codex-sessions/s_stale/codex-home" \
+  DOCKER_FAKE_LOG="$TMP/hostconfig-docker.log" \
+  DOCKER_FAKE_CREATED="$TMP/hostconfig-created" \
+  PATH="$TMP/hostconfig-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" lab-up --mode packed \
+  >"$TMP/hostconfig-stale-home.out" 2>"$TMP/hostconfig-stale-home.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq -- "-v $TMP/lab-home/.codex:/host-auth/.codex:ro" \
+  "$TMP/hostconfig-docker.log"
+if grep -Fq -- \
+  "-v $TMP/lab-home/.nexus/codex-sessions/s_stale/codex-home:/host-auth/.codex:ro" \
+  "$TMP/hostconfig-docker.log"; then
+  echo 'lab must reject a Nexus session CODEX_HOME as machine auth authority' >&2
   exit 1
 fi
 

@@ -15,7 +15,14 @@ CLAUDE_MODEL="${NEXUS_DOCKER_TEST_CLAUDE_MODEL:-claude-sonnet-5}"
 HOST_UID=$(id -u)
 HOST_GID=$(id -g)
 HOST_NEXUS_HOME="${NEXUS_DOCKER_TEST_HOST_NEXUS_HOME:-$HOME/.nexus}"
-HOST_CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+if [ -n "${CODEX_HOME:-}" ] \
+  && [[ "$CODEX_HOME" != */codex-sessions/*/codex-home ]]; then
+  HOST_CODEX_HOME=$CODEX_HOME
+else
+  # Nexus sessions used to export a private runtime CODEX_HOME containing a
+  # stale auth copy. That path is never the machine credential authority.
+  HOST_CODEX_HOME=$HOME/.codex
+fi
 CONTAINER_PORT="${NEXUS_DOCKER_TEST_CONTAINER_PORT:-4100}"
 GATEWAY_INTERNAL_PORT="${NEXUS_DOCKER_TEST_GATEWAY_INTERNAL_PORT:-4101}"
 NEXUS_BIN=/tmp/nexus-target/debug/nexus
@@ -71,7 +78,8 @@ The container uses isolated /tmp Nexus state and never mounts ~/.nexus.
 Host harness auth/config is mounted read-only and copied into the container's
 isolated /tmp/harness-home so you can run commands like `nexus launch claude`
 without using the live Nexus DB/socket.
-Codex auth comes from the active CODEX_HOME, falling back to ~/.codex when unset.
+Codex auth comes from a machine CODEX_HOME, falling back to ~/.codex when unset
+or when the inherited value is a legacy Nexus session runtime home.
 USAGE
 }
 

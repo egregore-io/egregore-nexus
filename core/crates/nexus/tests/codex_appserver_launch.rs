@@ -413,7 +413,7 @@ async fn bridge_emits_text_update_after_rollout_discovery() {
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: None,

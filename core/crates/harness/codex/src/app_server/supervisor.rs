@@ -1,4 +1,4 @@
-//! Codex app-server supervisor: spawn/adopt, seed runtime state, wait-until-ready, shutdown.
+//! Codex app-server supervisor: spawn/adopt, use machine auth, wait-until-ready, shutdown.
 //!
 //! # Spawn invocation (pinned from source)
 //!
@@ -10,13 +10,12 @@
 //!   ```
 //!
 //! Exact command: `<codex_exe> app-server -c <override> ... --listen <endpoint>`
-//! with `CODEX_HOME=<session_dir>/codex-home` in the environment for fresh Nexus-owned sessions.
+//! with the machine-owned `CODEX_HOME` in the environment for normal Nexus sessions.
 //! Unix uses a private Unix-domain socket. Windows uses the native Windows Codex binary with a
 //! loopback-only WebSocket endpoint because Codex does not expose Unix sockets there.
-//! Nexus copies the operator's real `~/.codex/config.toml` into that home immediately before each
-//! spawn, then layers Nexus runtime state through `-c` overrides. External resume launches may
-//! pass an existing `CODEX_HOME`; in that case Nexus leaves the home completely untouched and still
-//! passes runtime-only overrides on argv.
+//! Nexus never copies credentials or provider configuration. It layers Nexus runtime state through
+//! `-c` overrides. External resume launches may pass an explicit `CODEX_HOME`; that home remains
+//! authoritative and untouched.
 //!
 //! The supervisor also writes `<session_dir>/app-server.pid` as one JSON line after spawn and
 //! before readiness polling:
@@ -329,9 +328,9 @@ fn terminate_child_process_group_sync(
 pub struct SupervisorOpts {
     /// Path to the `codex` executable (or a hermetic fake for tests).
     pub codex_exe: String,
-    /// Per-session directory. The supervisor creates `codex.sock` here on Unix, writes
-    /// `app-server.pid` for spawned processes on every platform, and fresh Nexus-owned launches
-    /// also create `codex-home/` here as `CODEX_HOME`.
+    /// Per-session runtime directory. The supervisor creates `codex.sock` here on Unix and writes
+    /// `app-server.pid` for spawned processes on every platform. Provider auth/config never lives
+    /// here.
     pub session_dir: PathBuf,
     /// Existing Codex home to use for resume launches. When set, the supervisor starts the
     /// app-server with this `CODEX_HOME` and leaves the home completely untouched.
@@ -384,37 +383,27 @@ impl CodexAppServer {
     /// JSON-RPC requests (≤30 s).
     ///
     /// Steps:
-    /// 1. Resolve `CODEX_HOME`: either `opts.codex_home` or `<session_dir>/codex-home/`.
+    /// 1. Resolve `CODEX_HOME`: either explicit `opts.codex_home`, a non-Nexus machine
+    ///    `CODEX_HOME`, or `HOME/.codex`.
     /// 2. Reuse an existing live `<session_dir>/codex.sock` when present on Unix.
-    /// 3. For fresh Nexus homes, copy the operator's real `config.toml` into `CODEX_HOME`;
-    ///    missing user config becomes an empty file. Existing homes are not touched.
-    /// 4. Pass Nexus runtime state (features, model, identity instructions, project trust,
+    /// 3. Pass Nexus runtime state (features, model, identity instructions, project trust,
     ///    `mcp_servers.nexus-bus`) as `-c` overrides for every spawn.
-    /// 5. Spawn the native platform Codex app-server on a Unix socket (Unix) or loopback
-    ///    WebSocket (Windows), with `CODEX_HOME=<session_dir>/codex-home`.
-    /// 6. Write `<session_dir>/app-server.pid` with `{pid,pgid}` before readiness polling.
-    /// 7. Poll `JsonRpc::connect` + `initialize` until it round-trips or
+    /// 4. Spawn the native platform Codex app-server on a Unix socket (Unix) or loopback
+    ///    WebSocket (Windows), with the resolved machine-owned `CODEX_HOME`.
+    /// 5. Write `<session_dir>/app-server.pid` with `{pid,pgid}` before readiness polling.
+    /// 6. Poll `JsonRpc::connect` + `initialize` until it round-trips or
     ///    the 30 s deadline expires.
     pub async fn start(opts: SupervisorOpts) -> Result<CodexAppServer, CodexRpcError> {
-        // 1. Prepare CODEX_HOME directory.
-        let external_codex_home = opts.codex_home.is_some();
-        let codex_home = opts
-            .codex_home
-            .clone()
-            .unwrap_or_else(|| opts.session_dir.join("codex-home"));
+        // 1. Prepare the machine-owned CODEX_HOME directory. An inherited Nexus session home is
+        // legacy runtime state, not machine authority, so the resolver falls back to HOME/.codex.
+        let codex_home = match opts.codex_home.clone() {
+            Some(home) => home,
+            None => resolve_machine_codex_home_from_env(&opts.session_dir)
+                .map_err(CodexRpcError::Connect)?,
+        };
         std::fs::create_dir_all(&codex_home).map_err(|e| {
             CodexRpcError::Connect(format!("create CODEX_HOME {codex_home:?}: {e}"))
         })?;
-
-        // 1b. Seed credentials from the operator's real codex home. A fresh CODEX_HOME has no
-        // `auth.json`; without it codex cannot authenticate, and every turn completes with NO
-        // assistant output (the model is never reached). Copy rather than symlink so a token
-        // refresh during this session does not mutate the operator's primary credentials. Source
-        // is the daemon's `CODEX_HOME` if set, else `~/.codex` (codex's default).
-        if !external_codex_home {
-            let src_home = default_codex_home_for_seed(&codex_home);
-            seed_auth(&src_home, &codex_home);
-        }
 
         #[cfg(unix)]
         let sock = opts.session_dir.join("codex.sock");
@@ -423,18 +412,7 @@ impl CodexAppServer {
             return Ok(existing);
         }
 
-        // 2. Rebase fresh Nexus-owned homes from the operator's current Codex config before every
-        // spawn. Existing Codex homes are user state and must be left completely untouched.
-        if !external_codex_home {
-            let src_home = default_codex_home_for_seed(&codex_home);
-            seed_user_config(&src_home, &codex_home, false).map_err(|e| {
-                CodexRpcError::Connect(format!(
-                    "seed config.toml from {src_home:?} into {codex_home:?}: {e}"
-                ))
-            })?;
-        }
-
-        // 3. Spawn the subprocess.
+        // 2. Spawn the subprocess.
         #[cfg(unix)]
         let listen_url = {
             // Remove any stale socket from a previous run.
@@ -675,81 +653,73 @@ fn should_scrub_inherited_env(key: &std::ffi::OsStr) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime home seeding helpers
+// Machine provider-home resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve the operator's Codex home for seeding runtime state.
+/// Resolve the machine-owned Codex home without consulting or mutating credential contents.
 ///
-/// Prefer the daemon's own `CODEX_HOME` when it is distinct from this session home; otherwise use
-/// codex's default `~/.codex`.
+/// `CODEX_HOME` values that point at `<...>/codex-sessions/<session>/codex-home` are legacy
+/// Nexus-owned runtime homes. They are deliberately ignored so a daemon launched from one Nexus
+/// agent cannot make that agent's stale credential copy authoritative for every later session.
 #[doc(hidden)]
-pub fn default_codex_home_for_seed(codex_home: &Path) -> PathBuf {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p != codex_home)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".codex")
-        })
-}
-
-/// Copy the operator's live `config.toml` into a Nexus-owned Codex home.
-///
-/// Existing Codex homes are external user state and are left untouched. Missing user config is
-/// represented as an empty destination file so Codex still owns a writable runtime surface.
-#[doc(hidden)]
-pub fn seed_user_config(
-    src_home: &Path,
-    codex_home: &Path,
-    external_codex_home: bool,
-) -> std::io::Result<()> {
-    if external_codex_home {
-        return Ok(());
-    }
-
-    let dst_config = codex_home.join("config.toml");
-    match std::fs::read(src_home.join("config.toml")) {
-        Ok(bytes) => std::fs::write(dst_config, bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::write(dst_config, []),
-        Err(e) => Err(e),
-    }
-}
-
-/// Copy `<src_home>/auth.json` into `<codex_home>/auth.json` (0600) when the
-/// source exists and the destination does not.
-///
-/// This is the ONLY place auth seeding may happen — centralised here so the
-/// logic is unit-testable without env-var manipulation.
-///
-/// REGRESSION GUARD (Fix 3 / Task 4): a fresh `CODEX_HOME` contains no
-/// `auth.json`; without it real codex cannot authenticate and every turn
-/// produces zero assistant output.  Do NOT remove this call from
-/// `CodexAppServer::start`.
-#[doc(hidden)]
-pub fn seed_auth(src_home: &Path, codex_home: &Path) {
-    let src_auth = src_home.join("auth.json");
-    let dst_auth = codex_home.join("auth.json");
-    if src_auth.exists() && !dst_auth.exists() {
-        match std::fs::copy(&src_auth, &dst_auth) {
-            Ok(_) => {
-                // Match codex's own 0600 on the credentials file.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(&dst_auth, std::fs::Permissions::from_mode(0o600));
-                }
-            }
-            Err(e) => {
-                tracing::warn!("codex bridge: could not seed auth.json from {src_auth:?}: {e}");
-            }
+pub fn resolve_machine_codex_home(
+    session_dir: &Path,
+    codex_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if let Some(selected) = codex_home.filter(|path| !path.as_os_str().is_empty()) {
+        if !selected.is_absolute() {
+            return Err(format!(
+                "machine CODEX_HOME must be absolute, got {}",
+                selected.display()
+            ));
+        }
+        if !is_nexus_managed_codex_home(selected, session_dir) {
+            return Ok(selected.to_path_buf());
         }
     }
+
+    let home = home
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| {
+            "cannot resolve machine CODEX_HOME: neither CODEX_HOME nor HOME is set".to_string()
+        })?;
+    if !home.is_absolute() {
+        return Err(format!(
+            "machine HOME must be absolute to resolve CODEX_HOME, got {}",
+            home.display()
+        ));
+    }
+    Ok(home.join(".codex"))
+}
+
+#[doc(hidden)]
+pub fn resolve_machine_codex_home_from_env(session_dir: &Path) -> Result<PathBuf, String> {
+    let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_machine_codex_home(session_dir, codex_home.as_deref(), home.as_deref())
+}
+
+fn is_nexus_managed_codex_home(path: &Path, session_dir: &Path) -> bool {
+    let expected_shape = path.file_name().is_some_and(|name| name == "codex-home")
+        && path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "codex-sessions");
+    if expected_shape {
+        return true;
+    }
+
+    session_dir.parent().is_some_and(|sessions_root| {
+        path.starts_with(sessions_root) && path.file_name().is_some_and(|name| name == "codex-home")
+    })
 }
 
 /// Build `codex app-server -c key=value` overrides for Nexus runtime state.
 ///
-/// The copied user `config.toml` remains Codex-owned runtime state; Nexus identity, trust, MCP, and
-/// feature flags are layered on argv for every spawn instead of being persisted.
+/// Machine `config.toml` remains Codex-owned state; Nexus identity, trust, MCP, and feature flags
+/// are layered on argv for every spawn instead of being persisted.
 #[doc(hidden)]
 pub fn config_overrides(
     model: Option<&str>,

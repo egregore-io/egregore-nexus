@@ -1889,7 +1889,8 @@ fn scrub_inherited_identity_env(command: &mut Command) {
     }
 }
 
-fn should_scrub_inherited_env(key: &std::ffi::OsStr) -> bool {
+#[doc(hidden)]
+pub fn should_scrub_inherited_env(key: &std::ffi::OsStr) -> bool {
     let Some(key) = key.to_str() else {
         return false;
     };

@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use nexus_harness_codex::app_server::supervisor::{
-    config_overrides, mcp_env_override, nexus_identity_developer_instructions, seed_auth,
-    seed_user_config,
+    config_overrides, mcp_env_override, nexus_identity_developer_instructions,
+    resolve_machine_codex_home,
 };
 use nexus_harness_codex::BusMcp;
 
@@ -136,139 +136,83 @@ fn nexus_identity_instructions_require_name_and_session() {
 }
 
 #[test]
-fn seed_auth_copies_when_src_exists_and_dst_missing() {
-    let tmp = tempdir("auth-copy");
-    let src = tmp.join("src");
-    let dst = tmp.join("dst");
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::create_dir_all(&dst).unwrap();
+fn machine_codex_home_prefers_external_machine_selection() {
+    let tmp = tempdir("machine-home");
+    let session_dir = tmp.join(".nexus/codex-sessions/s_current");
+    let selected = tmp.join("profiles/operator-codex");
+    let home = tmp.join("home");
 
-    let auth_bytes = b"fake-auth-token-content";
-    std::fs::write(src.join("auth.json"), auth_bytes).unwrap();
+    let resolved = resolve_machine_codex_home(&session_dir, Some(&selected), Some(&home))
+        .expect("resolve selected machine home");
 
-    seed_auth(&src, &dst);
-
-    let dst_auth = dst.join("auth.json");
-    assert!(
-        dst_auth.exists(),
-        "auth.json must be copied into codex_home"
-    );
-    assert_eq!(std::fs::read(&dst_auth).unwrap(), auth_bytes);
-
+    assert_eq!(resolved, selected);
     cleanup(&tmp);
 }
 
 #[test]
-fn seed_auth_skips_when_dst_already_exists() {
-    let tmp = tempdir("auth-skip");
-    let src = tmp.join("src");
-    let dst = tmp.join("dst");
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::create_dir_all(&dst).unwrap();
+fn machine_codex_home_falls_back_to_home_default() {
+    let tmp = tempdir("home-default");
+    let session_dir = tmp.join(".nexus/codex-sessions/s_current");
+    let home = tmp.join("home");
 
-    std::fs::write(src.join("auth.json"), b"src-bytes").unwrap();
-    std::fs::write(dst.join("auth.json"), b"dst-bytes-existing").unwrap();
+    let resolved =
+        resolve_machine_codex_home(&session_dir, None, Some(&home)).expect("resolve HOME/.codex");
 
-    seed_auth(&src, &dst);
-
-    assert_eq!(
-        std::fs::read(dst.join("auth.json")).unwrap(),
-        b"dst-bytes-existing"
-    );
-
+    assert_eq!(resolved, home.join(".codex"));
     cleanup(&tmp);
 }
 
 #[test]
-fn seed_auth_noop_when_src_auth_missing() {
-    let tmp = tempdir("auth-nosrc");
-    let src = tmp.join("src");
-    let dst = tmp.join("dst");
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::create_dir_all(&dst).unwrap();
-
-    seed_auth(&src, &dst);
-
-    assert!(!dst.join("auth.json").exists());
-
-    cleanup(&tmp);
-}
-
-#[test]
-fn seed_user_config_copies_user_bytes_into_fresh_home() {
-    let tmp = tempdir("config-copy");
-    let src_home = tmp.join("operator");
-    let codex_home = tmp.join("session-codex-home");
-    std::fs::create_dir_all(&src_home).unwrap();
-    std::fs::create_dir_all(&codex_home).unwrap();
-    std::fs::write(src_home.join("config.toml"), b"model = \"gpt-5\"\n").unwrap();
-
-    seed_user_config(&src_home, &codex_home, false).expect("seed user config");
-
-    assert_eq!(
-        std::fs::read(codex_home.join("config.toml")).unwrap(),
-        b"model = \"gpt-5\"\n"
-    );
-
-    cleanup(&tmp);
-}
-
-#[test]
-fn seed_user_config_recopies_when_user_config_changes() {
-    let tmp = tempdir("config-recopy");
-    let src_home = tmp.join("operator");
-    let codex_home = tmp.join("session-codex-home");
-    std::fs::create_dir_all(&src_home).unwrap();
-    std::fs::create_dir_all(&codex_home).unwrap();
-
-    std::fs::write(src_home.join("config.toml"), b"model = \"gpt-5\"\n").unwrap();
-    seed_user_config(&src_home, &codex_home, false).expect("first seed");
-
-    std::fs::write(
-        src_home.join("config.toml"),
-        b"model = \"gpt-5.1\"\napproval_policy = \"never\"\n",
+fn machine_codex_home_is_shared_across_nexus_sessions() {
+    let tmp = tempdir("shared-machine-home");
+    let home = tmp.join("home");
+    let first = resolve_machine_codex_home(
+        &tmp.join(".nexus/codex-sessions/s_first"),
+        None,
+        Some(&home),
     )
-    .unwrap();
-    seed_user_config(&src_home, &codex_home, false).expect("second seed");
+    .expect("resolve first session");
+    let second = resolve_machine_codex_home(
+        &tmp.join(".nexus/codex-sessions/s_second"),
+        None,
+        Some(&home),
+    )
+    .expect("resolve second session");
 
-    assert_eq!(
-        std::fs::read(codex_home.join("config.toml")).unwrap(),
-        b"model = \"gpt-5.1\"\napproval_policy = \"never\"\n"
-    );
-
+    assert_eq!(first, home.join(".codex"));
+    assert_eq!(second, first);
     cleanup(&tmp);
 }
 
 #[test]
-fn seed_user_config_writes_empty_file_when_user_config_missing() {
-    let tmp = tempdir("config-missing");
-    let src_home = tmp.join("operator");
-    let codex_home = tmp.join("session-codex-home");
-    std::fs::create_dir_all(&src_home).unwrap();
-    std::fs::create_dir_all(&codex_home).unwrap();
+fn nexus_session_codex_home_is_not_machine_authority() {
+    let tmp = tempdir("reject-session-home");
+    let session_dir = tmp.join(".nexus/codex-sessions/s_current");
+    let inherited = tmp.join(".nexus/codex-sessions/s_other/codex-home");
+    let home = tmp.join("home");
 
-    seed_user_config(&src_home, &codex_home, false).expect("seed empty config");
+    let resolved = resolve_machine_codex_home(&session_dir, Some(&inherited), Some(&home))
+        .expect("fall back from Nexus-owned home");
 
-    assert_eq!(std::fs::read(codex_home.join("config.toml")).unwrap(), b"");
-
+    assert_eq!(resolved, home.join(".codex"));
     cleanup(&tmp);
 }
 
 #[test]
-fn seed_user_config_leaves_external_home_untouched() {
-    let tmp = tempdir("config-external");
-    let src_home = tmp.join("operator");
-    let codex_home = tmp.join("external-codex-home");
-    std::fs::create_dir_all(&src_home).unwrap();
-    std::fs::create_dir_all(&codex_home).unwrap();
-    std::fs::write(src_home.join("config.toml"), b"model = \"gpt-5\"\n").unwrap();
+fn machine_codex_home_requires_absolute_nonempty_authority() {
+    let tmp = tempdir("missing-authority");
+    let session_dir = tmp.join(".nexus/codex-sessions/s_current");
 
-    seed_user_config(&src_home, &codex_home, true).expect("external seed no-op");
+    let missing = resolve_machine_codex_home(&session_dir, None, None)
+        .expect_err("missing machine authority must fail");
+    assert!(missing.contains("CODEX_HOME") && missing.contains("HOME"));
 
-    assert!(
-        !codex_home.join("config.toml").exists(),
-        "external CODEX_HOME config.toml must be untouched"
-    );
-
+    let relative = resolve_machine_codex_home(
+        &session_dir,
+        Some(Path::new("relative-codex-home")),
+        Some(Path::new("relative-home")),
+    )
+    .expect_err("relative authority must fail");
+    assert!(relative.contains("absolute"));
     cleanup(&tmp);
 }

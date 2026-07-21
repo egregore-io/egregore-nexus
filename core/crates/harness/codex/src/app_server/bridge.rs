@@ -13,12 +13,12 @@
 //!    `rollout-*.jsonl` under `CODEX_HOME/sessions`.
 //! 4. Bind injection and forward notifications to Nexus.
 //!
-//! Explicit resume is different: Nexus finds the existing Codex home that already contains the
-//! requested thread rollout, starts `codex app-server` with that `CODEX_HOME`, and opens the TUI
-//! with `codex resume --remote ... <thread>`. It never copies rollout history into a fresh home.
+//! Explicit resume first checks the machine Codex home. A rollout found only in a legacy
+//! Nexus-owned session home is migrated into the machine home; an intentional external profile
+//! remains authoritative. Credentials and configuration are never copied.
 
 use std::collections::{HashMap, HashSet};
-use std::io::BufRead;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -33,7 +33,7 @@ use super::approvals::AutoApprove;
 use super::client::CodexAppServerClient;
 use super::forwarder::{spawn_codex_forwarder_with_tool_observations, CodexToolObservationSink};
 use super::jsonrpc::CodexRpcError;
-use super::supervisor::{CodexAppServer, SupervisorOpts};
+use super::supervisor::{resolve_machine_codex_home_from_env, CodexAppServer, SupervisorOpts};
 use super::transport::CodexAppServerTransport;
 use crate::storage::{CodexRuntimeLaunch, CodexRuntimeStateRepo};
 
@@ -193,9 +193,24 @@ impl CodexBridge {
             tool_observations,
         } = options;
 
+        let canonical_home = match opts.codex_home.clone() {
+            Some(home) => home,
+            None => resolve_machine_codex_home_from_env(&opts.session_dir)
+                .map_err(CodexRpcError::Connect)?,
+        };
+
         if let Some(thread_id) = known_thread_id.as_deref() {
-            let Some(home) =
-                codex_home_with_thread(&opts.session_dir, &resume_codex_homes, thread_id)
+            let Some(home) = resolve_resume_codex_home(
+                &opts.session_dir,
+                &canonical_home,
+                &resume_codex_homes,
+                thread_id,
+            )
+            .map_err(|error| {
+                CodexRpcError::Connect(format!(
+                    "migrate codex rollout for thread {thread_id}: {error}"
+                ))
+            })?
             else {
                 return Err(CodexRpcError::Connect(format!(
                     "cannot resume codex thread {thread_id}: no rollout found under explicit resume homes, CODEX_HOME, ~/.codex, or Nexus codex session homes"
@@ -209,6 +224,8 @@ impl CodexBridge {
                 "codex bridge: resolved existing codex home for thread resume"
             );
             opts.codex_home = Some(home);
+        } else if opts.codex_home.is_none() {
+            opts.codex_home = Some(canonical_home);
         }
         let rollout_root = opts
             .codex_home
@@ -612,46 +629,194 @@ fn resumed_active_turn_id(
     }
 }
 
-fn codex_home_with_thread(
+#[doc(hidden)]
+pub fn resolve_resume_codex_home(
     session_dir: &Path,
+    canonical_home: &Path,
     explicit_homes: &[PathBuf],
     thread_id: &str,
-) -> Option<PathBuf> {
+) -> std::io::Result<Option<PathBuf>> {
     let mut seen = HashSet::new();
-    let mut matching_home = |home: PathBuf| {
-        if !seen.insert(home.clone()) {
+    let mut matching_rollout = |home: &Path| {
+        if !seen.insert(home.to_path_buf()) {
             return None;
         }
         rollout_with_thread_id(&home.join("sessions"), thread_id)
-            .is_some()
-            .then_some(home)
     };
 
+    if matching_rollout(canonical_home).is_some() {
+        return Ok(Some(canonical_home.to_path_buf()));
+    }
+
     for home in explicit_homes {
-        if let Some(home) = matching_home(home.clone()) {
-            return Some(home);
-        }
-    }
-    if let Some(home) = std::env::var_os("CODEX_HOME") {
-        if let Some(home) = matching_home(PathBuf::from(home)) {
-            return Some(home);
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        if let Some(home) = matching_home(PathBuf::from(home).join(".codex")) {
-            return Some(home);
+        if let Some(source) = matching_rollout(home) {
+            if nexus_managed_codex_home(home) {
+                migrate_rollout(home, canonical_home, &source)?;
+                return Ok(Some(canonical_home.to_path_buf()));
+            }
+            return Ok(Some(home.clone()));
         }
     }
     if let Some(codex_sessions_root) = session_dir.parent() {
         if let Ok(entries) = std::fs::read_dir(codex_sessions_root) {
-            for entry in entries.flatten() {
-                if let Some(home) = matching_home(entry.path().join("codex-home")) {
-                    return Some(home);
+            let mut homes = entries
+                .flatten()
+                .map(|entry| entry.path().join("codex-home"))
+                .collect::<Vec<_>>();
+            homes.sort();
+            for home in homes {
+                if let Some(source) = matching_rollout(&home) {
+                    migrate_rollout(&home, canonical_home, &source)?;
+                    return Ok(Some(canonical_home.to_path_buf()));
                 }
             }
         }
     }
-    None
+    Ok(None)
+}
+
+fn nexus_managed_codex_home(home: &Path) -> bool {
+    home.file_name().is_some_and(|name| name == "codex-home")
+        && home
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "codex-sessions")
+}
+
+fn migrate_rollout(source_home: &Path, target_home: &Path, source: &Path) -> std::io::Result<()> {
+    if !nexus_managed_codex_home(source_home) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refuse rollout migration from non-Nexus home {}",
+                source_home.display()
+            ),
+        ));
+    }
+    let source_root = source_home.join("sessions");
+    let relative = source.strip_prefix(&source_root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "rollout {} escapes {}",
+                source.display(),
+                source_root.display()
+            ),
+        )
+    })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("rollout path is not contained: {}", relative.display()),
+        ));
+    }
+
+    let metadata = std::fs::symlink_metadata(source)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("rollout source is not a regular file: {}", source.display()),
+        ));
+    }
+    let bytes = std::fs::read(source)?;
+    let target_root = target_home.join("sessions");
+    let destination = target_root.join(relative);
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "rollout destination has no parent",
+        )
+    })?;
+    create_contained_directories(
+        &target_root,
+        relative.parent().unwrap_or_else(|| Path::new("")),
+    )?;
+
+    match std::fs::symlink_metadata(&destination) {
+        Ok(destination_metadata) => {
+            if !destination_metadata.file_type().is_file()
+                || destination_metadata.file_type().is_symlink()
+                || std::fs::read(&destination)? != bytes
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("conflicting rollout destination {}", destination.display()),
+                ));
+            }
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(".nexus-rollout-{}-{nonce}.tmp", std::process::id()));
+    let publish = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &destination)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if publish.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    publish
+}
+
+fn create_contained_directories(root: &Path, relative: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(root)?;
+    let root_metadata = std::fs::symlink_metadata(root)?;
+    if !root_metadata.file_type().is_dir() || root_metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "rollout destination root is not a real directory: {}",
+                root.display()
+            ),
+        ));
+    }
+
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "rollout destination contains a non-normal component",
+            ));
+        };
+        current.push(name);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            }
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "rollout destination ancestry is not a directory: {}",
+                        current.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Read the newest Codex rollout under `CODEX_HOME/sessions` and return its thread id.
@@ -728,8 +893,17 @@ fn newest_rollout_matching(root: &Path, matches: impl Fn(&Path) -> bool) -> Opti
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 walk(&path, best, matches);
+                continue;
+            }
+            if !file_type.is_file() {
                 continue;
             }
 

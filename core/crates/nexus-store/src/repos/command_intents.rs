@@ -721,7 +721,7 @@ impl<'a> CommandIntents<'a> {
     /// The split daemon restores durable delivery obligations into its boot-scoped inbox after
     /// command ingress becomes available. A prompt accepted after one of those messages must stay
     /// queued until the older recipient obligation settles; otherwise the prompt worker can start
-    /// a native turn first and the restored bus delivery is appended to that same Codex turn.
+    /// a native turn first and the restored bus delivery is appended to that same native turn.
     async fn has_older_unsettled_delivery(
         &self,
         command: &CommandIntentRow,
