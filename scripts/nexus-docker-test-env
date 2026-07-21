@@ -1266,6 +1266,10 @@ wait_lab_http() {
 start_source_lens() {
   exec_bash 'set -euo pipefail
     lab="$NEXUS_LAB_ROOT/lab"
+    ready="$NEXUS_LAB_ROOT/lab/candidate-ready.v1"
+    [ -f "$ready" ] && [ ! -L "$ready" ] && [ "$(stat -c %h "$ready")" = 1 ]
+    readiness_sha256=$(sha256sum "$ready" | awk "{print \$1}")
+    [[ "$readiness_sha256" =~ ^[0-9a-f]{64}$ ]]
     pidfile_alive() {
       pid=$(cat "$1" 2>/dev/null || true)
       [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
@@ -1291,6 +1295,7 @@ start_source_lens() {
         NODE_ENV=development \
         VITE_DEV_SERVER_URL=http://127.0.0.1:1422 \
         LENS_PYTHON="$NEXUS_LAB_ROOT/lens-venv/bin/python" \
+        NEXUS_V015_READINESS_LEDGER_SHA256="$readiness_sha256" \
         node_modules/.bin/electron \
           --no-sandbox \
           --use-gl=angle --use-angle=swiftshader \
@@ -1304,6 +1309,10 @@ start_source_lens() {
 start_packed_lens() {
   exec_bash 'set -euo pipefail
     lab="$NEXUS_LAB_ROOT/lab"
+    ready="$NEXUS_LAB_ROOT/lab/candidate-ready.v1"
+    [ -f "$ready" ] && [ ! -L "$ready" ] && [ "$(stat -c %h "$ready")" = 1 ]
+    readiness_sha256=$(sha256sum "$ready" | awk "{print \$1}")
+    [[ "$readiness_sha256" =~ ^[0-9a-f]{64}$ ]]
     pidfile_alive() {
       pid=$(cat "$1" 2>/dev/null || true)
       [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
@@ -1321,6 +1330,7 @@ start_packed_lens() {
         DISPLAY=:99 \
         NODE_ENV=production \
         LENS_PYTHON="$NEXUS_LAB_ROOT/lens-venv/bin/python" \
+        NEXUS_V015_READINESS_LEDGER_SHA256="$readiness_sha256" \
         /work/egregore-lens/node_modules/.bin/electron \
           --no-sandbox \
           --use-gl=angle --use-angle=swiftshader \

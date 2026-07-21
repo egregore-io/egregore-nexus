@@ -161,6 +161,18 @@ for needle in (
     if needle not in packed_lens:
         raise SystemExit(f"packed Lens startup is missing {needle}")
 
+for label, body in (("source", source_lens), ("packed", packed_lens)):
+    for needle in (
+        'ready="$NEXUS_LAB_ROOT/lab/candidate-ready.v1"',
+        'readiness_sha256=$(sha256sum "$ready"',
+        '[[ "$readiness_sha256" =~ ^[0-9a-f]{64}$ ]]',
+        'NEXUS_V015_READINESS_LEDGER_SHA256="$readiness_sha256"',
+    ):
+        if needle not in body:
+            raise SystemExit(
+                f"{label} Lens startup does not bind recorder evidence to readiness: {needle}"
+            )
+
 for needle in (
     'local mode=$1',
     'if [ "$mode" = source ]; then',
