@@ -235,6 +235,34 @@ class HooksPracticalGateContractTests(unittest.TestCase):
                 self.assertIs(before_metadata[f"f2{language.title()}"]["beforeSend"], True)
                 self.assertIs(after_metadata[f"f2{language.title()}"]["afterReceipt"], True)
 
+    def test_packed_candidate_verifier_accepts_canonical_prefixed_digest(self) -> None:
+        namespace = runpy.run_path(str(SCRIPT))
+        verify = namespace["verify_packed_candidate"]
+        document = {
+            "schemaVersion": 1,
+            "status": "PASS",
+            "mode": "packed",
+            "runId": "f2-contract",
+            "candidateDigest": "sha256:" + "a" * 64,
+            "readinessSha256": "b" * 64,
+            "limits": {"cpus": 6, "memoryBytes": 8589934592, "pids": 1024},
+            "runtime": {
+                "daemonExecutable": "/tmp/nexus",
+                "gatewayEntrypoint": "/tmp/nexus-gateway.mjs",
+            },
+        }
+        original_command = verify.__globals__["command"]
+        verify.__globals__["command"] = lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=json.dumps(document), stderr=""
+        )
+        try:
+            self.assertEqual(
+                verify(Path("/tmp/evidence"), "f2-contract")["candidateDigest"],
+                "sha256:" + "a" * 64,
+            )
+        finally:
+            verify.__globals__["command"] = original_command
+
     def test_f2_result_publication_is_atomic_candidate_bound_and_no_clobber(self) -> None:
         namespace = runpy.run_path(str(SCRIPT))
         publish = namespace["publish_f2_result"]
@@ -243,7 +271,7 @@ class HooksPracticalGateContractTests(unittest.TestCase):
             "status": "PASS",
             "mode": "packed",
             "runId": "f2-contract",
-            "candidateDigest": "a" * 64,
+            "candidateDigest": "sha256:" + "a" * 64,
             "readinessPath": "/tmp/lab/lab/candidate-ready.v1",
             "readinessSha256": "b" * 64,
             "installRoot": "/tmp/nexus-lab-install.contract",
@@ -265,7 +293,7 @@ class HooksPracticalGateContractTests(unittest.TestCase):
             result = json.loads(result_path.read_text(encoding="utf-8"))
             self.assertEqual(result["gate"], "F2")
             self.assertEqual(result["runId"], "f2-contract")
-            self.assertEqual(result["candidateDigest"], "a" * 64)
+            self.assertEqual(result["candidateDigest"], "sha256:" + "a" * 64)
             self.assertEqual(result["status"], "PASS")
             self.assertEqual(result["requiredArtifacts"], [
                 "shell", "javascript", "python", "timing",

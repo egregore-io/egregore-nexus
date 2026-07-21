@@ -37,6 +37,7 @@ PACKED_GATEWAY_BIN = Path("/tmp/nexus-lab-bin/nexus-gateway")
 PACKED_CANDIDATE_VERIFIER = Path("/tmp/nexus-lab-bin/nexus-v015-ws-acceptance")
 SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+PREFIXED_SHA256 = re.compile(r"^sha256:[0-9a-f]{64}$")
 F2_ARTIFACTS = ("shell", "javascript", "python", "timing")
 
 HOOK_SPECS = (
@@ -1136,7 +1137,7 @@ def verify_packed_candidate(evidence_dir: Path, run_id: str) -> dict[str, Any]:
         or document.get("status") != "PASS"
         or document.get("mode") != "packed"
         or document.get("runId") != run_id
-        or SHA256.fullmatch(str(document.get("candidateDigest", ""))) is None
+        or PREFIXED_SHA256.fullmatch(str(document.get("candidateDigest", ""))) is None
         or SHA256.fullmatch(str(document.get("readinessSha256", ""))) is None
         or document.get("limits") != expected_limits
         or not isinstance(runtime, dict)
