@@ -605,8 +605,8 @@ enum TurnEnd {
     Response(Result<PromptResponse, agent_client_protocol::Error>),
     /// Turn-end inferred from stream quiescence: content streamed, then no further
     /// `session/update` arrived for the quiescence window. Direct/legacy turns accept any buffered
-    /// content. Observed Hermes turns accept this only after a real renderable harness event; the
-    /// synthetic accepted-input event is deliberately excluded.
+    /// content. Observed Hermes and compatibility-fallback turns accept this only after a real
+    /// renderable harness event; the synthetic accepted-input event is deliberately excluded.
     Quiescent,
     /// The bridge appended an interrupt-and-send replacement prompt, answered the cancelled
     /// request with its exact handoff diagnostic, and then emitted real replacement model output.
@@ -1505,9 +1505,10 @@ impl AcpEngine {
     /// Like [`AcpEngine::inject`], but prepends a synthetic stream event immediately after the ACP
     /// prompt request is submitted and before assistant updates can be relayed. Presence of this
     /// event identifies durable observed delivery, which normally requires the canonical
-    /// `PromptResponse`. Hermes may also settle from quiescence after a real model event. The
-    /// exact interrupt-and-send handoff diagnostic may settle only after subsequent replacement
-    /// model output becomes quiescent. The synthetic accepted event alone is never sufficient.
+    /// `PromptResponse`. Hermes and the pinned compatibility bridge may also settle from
+    /// quiescence after a real model event. The exact interrupt-and-send handoff diagnostic may
+    /// settle only after subsequent replacement model output becomes quiescent. The synthetic
+    /// accepted event alone is never sufficient.
     pub async fn inject_with_accepted_event(
         &self,
         prompt: String,
@@ -1602,6 +1603,22 @@ impl AcpEngine {
                     // `session/prompt`. A real model update followed by silence proves that the
                     // recipient processed the delivery. Synthetic accepted-input does not advance
                     // `model_events`, so an empty/provider-rejected turn cannot take this path.
+                    () = wait_for_model_quiescence(
+                        &activity,
+                        model_events_before,
+                        quiescence,
+                    ) => TurnEnd::Quiescent,
+                }
+            } else if require_terminal_response
+                && self.harness.as_ref().is_some_and(|h| h.as_str() == "codex")
+            {
+                tokio::select! {
+                    // Canonical completion remains preferred when available.
+                    response = &mut prompt_response => TurnEnd::Response(response),
+                    // The pinned compatibility bridge can stream a complete model turn yet never
+                    // answer `session/prompt`. A new renderable model event followed by silence is
+                    // recipient-side evidence for this exact observed delivery; the synthetic
+                    // accepted-input event does not advance `model_events`.
                     () = wait_for_model_quiescence(
                         &activity,
                         model_events_before,
@@ -1720,8 +1737,8 @@ impl AcpEngine {
                 Err(NexusError::Adapter(format!("session/prompt failed: {e}")).into())
             }
             // (2) Quiescence turn-end: the bridge streamed the reply and went idle without ever
-            // answering session/prompt. For observed Hermes delivery, the waiter already proved
-            // that at least one real model event arrived; direct calls retain legacy behavior.
+            // answering session/prompt. For observed compatibility delivery, the waiter already
+            // proved that at least one real model event arrived; direct calls retain legacy behavior.
             Ok(TurnEnd::Quiescent) => {
                 info!(
                     target: "nexus_agent::acp",

@@ -836,6 +836,110 @@ async fn observed_engine_inject_rejects_quiescence_without_terminal_response() {
     std::env::remove_var("NEXUS_ACP_QUIESCENCE_MS");
 }
 
+/// The pinned codex-acp bridge can render a complete model reply and then leave
+/// `session/prompt` unanswered. A durable observed delivery may settle only after a real Codex
+/// model event from this turn reaches quiescence; the synthetic accepted-input event alone is
+/// insufficient. Other ACP harnesses retain the strict terminal-response rule above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_observed_engine_settles_rendered_reply_via_quiescence() {
+    std::env::set_var("NEXUS_ACP_TURN_TIMEOUT_SECS", "2");
+    std::env::set_var("NEXUS_ACP_QUIESCENCE_MS", "100");
+
+    let engine = AcpEngine::for_harness(HarnessId::new("codex").unwrap());
+    let cmd = HarnessCommand {
+        program: FAKE_HARNESS.to_string(),
+        args: vec![],
+        cwd: None,
+        env: vec![
+            ("FAKE_ACP_NO_TURN_END".to_string(), "1".to_string()),
+            ("FAKE_ACP_REPLY".to_string(), "bare".to_string()),
+            (
+                "FAKE_ACP_REPLY_BODY".to_string(),
+                "codex-rendered-reply".to_string(),
+            ),
+        ],
+    };
+    engine
+        .spawn_and_initialize(&cmd)
+        .await
+        .expect("spawn + initialize");
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .expect("session/new");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        engine.inject_with_accepted_event(
+            "Codex must visibly receive this delivery".to_string(),
+            Some(StreamEvent {
+                kind: AgentUpdateKind::UserInput,
+                data: json!({"text": "accepted input"}),
+            }),
+        ),
+    )
+    .await
+    .expect("Codex observed delivery must settle after rendered output goes quiet")
+    .expect("rendered Codex output is recipient-side delivery evidence");
+
+    assert_eq!(
+        reply_text(engine.take_updates()),
+        "codex-rendered-reply",
+        "the rendered reply must remain available to the stream relay"
+    );
+
+    std::env::remove_var("NEXUS_ACP_TURN_TIMEOUT_SECS");
+    std::env::remove_var("NEXUS_ACP_QUIESCENCE_MS");
+}
+
+/// Codex's observed-delivery fallback must never treat the synthetic accepted-input event as model
+/// output. Without a fresh renderable event, a missing `session/prompt` response remains a typed
+/// completion timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_observed_engine_rejects_quiescence_without_real_model_output() {
+    std::env::set_var("NEXUS_ACP_TURN_TIMEOUT_SECS", "1");
+    std::env::set_var("NEXUS_ACP_QUIESCENCE_MS", "100");
+
+    let engine = AcpEngine::for_harness(HarnessId::new("codex").unwrap());
+    let cmd = HarnessCommand {
+        program: FAKE_HARNESS.to_string(),
+        args: vec![],
+        cwd: None,
+        env: vec![
+            ("FAKE_ACP_NO_TURN_END".to_string(), "1".to_string()),
+            ("FAKE_ACP_REPLY".to_string(), "bare".to_string()),
+            ("FAKE_ACP_REPLY_BODY".to_string(), String::new()),
+        ],
+    };
+    engine
+        .spawn_and_initialize(&cmd)
+        .await
+        .expect("spawn + initialize");
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .expect("session/new");
+
+    let error = engine
+        .inject_with_accepted_event(
+            "accepted input without a model reply".to_string(),
+            Some(StreamEvent::text("accepted input")),
+        )
+        .await
+        .expect_err("the synthetic accepted-input event alone must not prove completion");
+    assert!(
+        matches!(
+            error,
+            AdapterInjectError::CompletionTimeout { ref origin }
+                if origin == "codex.acp.turn_completion"
+        ),
+        "missing Codex model output must remain a typed completion timeout, got {error:?}"
+    );
+
+    std::env::remove_var("NEXUS_ACP_TURN_TIMEOUT_SECS");
+    std::env::remove_var("NEXUS_ACP_QUIESCENCE_MS");
+}
+
 /// Hermes 0.17 can render a real assistant response and then leave `session/prompt` unanswered.
 /// For a durable observed delivery, that non-empty harness output reaching quiescence is sufficient
 /// recipient evidence: the target model demonstrably saw and answered the message. This fallback
