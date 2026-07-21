@@ -296,6 +296,23 @@ describe("submitCommandIntent", () => {
     expect(daemonEnqueue).not.toHaveBeenCalled();
   });
 
+  it("maps the daemon session queue capacity rejection to typed HTTP 429", async () => {
+    await expect(enqueueCommandIntent(
+      COMMAND_KINDS.harnessPrompt,
+      { name: "fable", agentId: "a_fable", text: "bounded" },
+      localOperatorCaller(),
+      {
+        daemonEnqueue: async () => {
+          throw new DaemonIpcError("session command queue is full", -32010);
+        },
+      },
+      "cm-queue-full",
+    )).rejects.toMatchObject({
+      code: 429,
+      message: "session command queue is full",
+    });
+  });
+
   it("settles Gateway-local idempotency around daemon IPC and replays the original result", async () => {
     const ingressDb = createClient({ url: ":memory:" });
     await migrateGatewayStore(ingressDb);

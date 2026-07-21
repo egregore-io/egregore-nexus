@@ -29,6 +29,7 @@ use crate::local_operator::{
 /// Maximum encoded local IPC frame. Large transcripts are paginated domain responses; one caller
 /// cannot turn the daemon socket into an unbounded allocation.
 pub const MAX_DAEMON_IPC_FRAME_LEN: usize = 16 * 1024 * 1024;
+const MAX_PENDING_SESSION_PROMPTS: i64 = 100;
 const ENDPOINT_MANIFEST: &str = "daemon-ipc-endpoint.json";
 
 /// Boot-scoped local endpoint published for CLI, MCP, and gateway producers.
@@ -1473,10 +1474,15 @@ async fn insert_before_shutdown_fence(
             message: "daemon is shutting down; retry against the next boot".into(),
         });
     }
-    CommandIntents::new(&state.store)
-        .insert_pending_or_resume(row)
-        .await
-        .map_err(|error| error.to_contract_error())
+    let commands = CommandIntents::new(&state.store);
+    if row.kind == nexus_store::command_kinds::harness::PROMPT {
+        commands
+            .insert_pending_or_resume_bounded_session_prompt(row, MAX_PENDING_SESSION_PROMPTS)
+            .await
+    } else {
+        commands.insert_pending_or_resume(row).await
+    }
+    .map_err(|error| error.to_contract_error())
 }
 
 fn command_row(

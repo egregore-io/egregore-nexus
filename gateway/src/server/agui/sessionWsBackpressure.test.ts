@@ -392,6 +392,52 @@ describe("agent-session WebSocket backpressure", () => {
     expect(socket.sent).toHaveLength(2);
   });
 
+  it("allows one bounded canonical queue snapshot on an empty socket", async () => {
+    const { handleWs } = await loadWs();
+    const sessionId = "full-queue";
+    const source = controlledTextStream();
+    let onSnapshot: ((snapshot: Record<string, unknown>) => void) | undefined;
+    const socket = new TestSocket();
+    const control = handleWs(
+      socket,
+      new Request(`http://localhost/api/agui/ws?session=${sessionId}`),
+      {
+        observe: async () => new Response(source.stream, {
+          headers: {
+            "content-type": "text/event-stream",
+            "x-nexus-session-id": sessionId,
+            "x-nexus-agent-id": `a_${sessionId}`,
+            "x-nexus-agent-name": sessionId,
+          },
+        }),
+        commandQueueHub: {
+          subscribe(_request: Request, _target: unknown, handlers: {
+            onSnapshot(snapshot: Record<string, unknown>): void;
+          }) {
+            onSnapshot = handlers.onSnapshot;
+            return () => {};
+          },
+        },
+      },
+    );
+    await vi.waitFor(() => expect(onSnapshot).toBeDefined());
+
+    onSnapshot?.({
+      sessionId,
+      seq: 100,
+      commands: [{ commandId: "cmd_full", text: "Q".repeat(2 * 1024 * 1024) }],
+    });
+
+    expect(socket.closes).toEqual([]);
+    expect(JSON.parse(socket.sent[0] ?? "{}")).toMatchObject({
+      t: "queue.snapshot",
+      sessionId,
+      seq: 100,
+    });
+    control.close();
+    await control.closed;
+  });
+
   it("isolates a saturated subscriber from a healthy agent-session lane", async () => {
     const { handleWs } = await loadWs();
     const source = fanoutHarness();

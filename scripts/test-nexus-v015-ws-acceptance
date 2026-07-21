@@ -2076,6 +2076,24 @@ class WsAcceptanceContracts(unittest.TestCase):
             body,
         )
 
+    def test_capacity_flood_isolates_the_slow_subscriber_from_control(self) -> None:
+        source = TARGET.read_text(encoding="utf-8")
+        body = source.split(
+            "    async def agent_session_backpressure_and_queue_full", 1
+        )[1].split("    async def run(self)", 1)[0]
+
+        lane_close = body.index("await lane.close()")
+        slow_open = body.index("slow = await open_raw(path, 1)")
+        control_open = body.index('control = await open_raw("/api/agui/ws", 512)')
+        flood_end = body.index("await asyncio.wait_for(slow.wait_closed(), 30)")
+        flood = body[control_open:flood_end]
+
+        self.assertLess(lane_close, slow_open)
+        self.assertLess(slow_open, control_open)
+        self.assertIn("await control.send", flood)
+        self.assertNotIn("await lane.send", flood)
+        self.assertIn('self.http.request,\n                    "PATCH"', body)
+
     def test_exact_roster_rejects_stale_or_duplicate_rows(self) -> None:
         module = runpy.run_path(str(TARGET))
         agents = (

@@ -152,6 +152,81 @@ impl<'a> CommandIntents<'a> {
         }
     }
 
+    /// Insert one session prompt under a caller-held ingress serialization boundary.
+    /// Existing command/idempotency retries remain resumable even when the target is full;
+    /// only a genuinely new pending row consumes capacity.
+    pub async fn insert_pending_or_resume_bounded_session_prompt(
+        &self,
+        row: NewCommandIntent,
+        max_pending: i64,
+    ) -> Result<String, NexusError> {
+        if max_pending <= 0 {
+            return Err(NexusError::Invalid(
+                "session command queue capacity must be positive".into(),
+            ));
+        }
+        if row.kind != crate::command_kinds::harness::PROMPT {
+            return self.insert_pending_or_resume(row).await;
+        }
+        if let Some(existing) = self.get(&row.command_id).await? {
+            return matching_existing_command(&existing, &row, "command id");
+        }
+        if let Some(idempotency_key) = row.idempotency_key.as_deref() {
+            if let Some(existing_id) = self
+                .find_idempotent_command(
+                    &row.project,
+                    &row.kind,
+                    &row.caller_name,
+                    row.caller_session_id.as_deref(),
+                    row.caller_client_key.as_deref(),
+                    idempotency_key,
+                )
+                .await?
+            {
+                let existing = self.get(&existing_id).await?.ok_or_else(|| {
+                    store_msg(format!("idempotent command disappeared: {existing_id}"))
+                })?;
+                return matching_existing_command(&existing, &row, "idempotency key");
+            }
+        }
+        if self.pending_session_prompt_count(&row).await? >= max_pending {
+            return Err(NexusError::CommandQueueFull);
+        }
+        self.insert_pending_or_resume(row).await
+    }
+
+    async fn pending_session_prompt_count(
+        &self,
+        row: &NewCommandIntent,
+    ) -> Result<i64, NexusError> {
+        let request: serde_json::Value =
+            serde_json::from_str(&row.request_json).map_err(store_msg)?;
+        let agent_id = request.get("agentId").and_then(serde_json::Value::as_str);
+        let name = request.get("name").and_then(serde_json::Value::as_str);
+        if agent_id.is_none() && name.is_none() {
+            return Err(NexusError::Invalid(
+                "session prompt target requires name or agentId".into(),
+            ));
+        }
+        let mut rows = self
+            .store
+            .identity_conn()
+            .query(
+                "SELECT COUNT(*) FROM command_intents WHERE kind = ?1 AND status = 'pending' \
+                 AND ((?2 IS NOT NULL AND json_extract(request_json, '$.agentId') = ?2) \
+                 OR (?2 IS NULL AND \
+                 json_extract(request_json, '$.agentId') IS NULL AND \
+                 json_extract(request_json, '$.name') = ?3))",
+                params![crate::command_kinds::harness::PROMPT, agent_id, name],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            Some(count) => Ok(get_opt_int(&count, 0)?.unwrap_or_default()),
+            None => Ok(0),
+        }
+    }
+
     /// Insert a command row, or return the existing command id for the same caller-provided
     /// idempotency key. This is used by retry-prone producer surfaces such as MCP tool calls: a
     /// retried call polls the first row instead of executing a duplicate write.

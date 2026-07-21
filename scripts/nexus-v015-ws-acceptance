@@ -4277,6 +4277,7 @@ class BackendAcceptance:
             "/events?view=agui"
         )
         slow: Any = None
+        control: Any = None
         resumed: Any = None
 
         async def open_raw(raw_path: str, max_queue: int) -> Any:
@@ -4335,6 +4336,11 @@ class BackendAcceptance:
             if not isinstance(run_id, str) or not run_id:
                 raise AcceptanceFailure("session backpressure run has no runId")
 
+            # The capacity producer must not also be the deliberately slow
+            # session subscriber. A bare control socket receives only its
+            # input receipts while the raw session socket proves isolated
+            # outbound backpressure.
+            await lane.close()
             slow = await open_raw(path, 1)
             await receive_queue_snapshot(
                 slow,
@@ -4342,44 +4348,79 @@ class BackendAcceptance:
                 timeout=30,
                 label="isolated slow-reader queue snapshot",
             )
+            control = await open_raw("/api/agui/ws", 512)
 
             accepted: list[dict[str, Any]] = []
             rejected: list[dict[str, Any]] = []
             payload = "Q" * 32768
             for index in range(128):
                 client_id = f"cm-bp-{index:03d}-{time.time_ns()}"
-                frame_start = len(lane.frames)
-                await lane.send({
+                await control.send(json.dumps({
                     "t": "input",
                     "mode": "session",
+                    "target": {
+                        "name": self.live_agents[1].name,
+                        "agentId": self.live_agents[1].agent_id,
+                    },
                     "text": f"{index:03d}:{payload}",
                     "clientMessageId": client_id,
-                })
-                result = await lane.wait_for(
-                    lambda frame, client_id=client_id: (
-                        frame.get("clientMessageId") == client_id
-                        and frame.get("t") in {"input.ack", "input.err"}
-                    ),
-                    after=frame_start,
-                    timeout=30,
-                    label=f"queue capacity response {index}",
-                )
+                }, separators=(",", ":")))
+                deadline = time.monotonic() + 30
+                while True:
+                    try:
+                        raw = await asyncio.wait_for(
+                            control.recv(),
+                            deadline - time.monotonic(),
+                        )
+                    except asyncio.TimeoutError as error:
+                        raise AcceptanceFailure(
+                            f"queue capacity response {index} timed out"
+                        ) from error
+                    try:
+                        result = json.loads(str(raw))
+                    except json.JSONDecodeError as error:
+                        raise AcceptanceFailure(
+                            f"queue capacity response {index} was not JSON"
+                        ) from error
+                    if not isinstance(result, dict):
+                        raise AcceptanceFailure(
+                            f"queue capacity response {index} was not an object"
+                        )
+                    if (
+                        result.get("clientMessageId") == client_id
+                        and result.get("t") in {"input.ack", "input.err"}
+                    ):
+                        break
                 if result.get("t") == "input.ack":
-                    if result.get("state") != "queued" or not isinstance(
-                        result.get("commandId"), str
+                    revision = result.get("revision")
+                    if (
+                        result.get("state") != "queued"
+                        or not isinstance(result.get("commandId"), str)
+                        or isinstance(revision, bool)
+                        or not isinstance(revision, int)
                     ):
                         raise AcceptanceFailure(
                             f"capacity probe escaped the bounded queue: {result!r}"
                         )
                     accepted.append(result)
                 else:
-                    if not result.get("error") and not result.get("code"):
+                    error_text = result.get("error")
+                    if (
+                        result.get("status") != 429
+                        or not isinstance(error_text, str)
+                        or "queue" not in error_text.lower()
+                        or "full" not in error_text.lower()
+                    ):
                         raise AcceptanceFailure(
                             f"queue capacity rejection was not typed: {result!r}"
                         )
                     rejected.append(result)
-                if slow.close_code == 1013:
+                if slow.close_code == 1013 and accepted and rejected:
                     break
+            if not accepted or not rejected:
+                raise AcceptanceFailure(
+                    "capacity probe did not prove both queued acceptance and typed rejection"
+                )
             try:
                 await asyncio.wait_for(slow.wait_closed(), 30)
             except asyncio.TimeoutError as error:
@@ -4389,40 +4430,31 @@ class BackendAcceptance:
             code = slow.close_code or 0
             reason = slow.close_reason or ""
             resume_cursor = parse_session_backpressure(code, reason)
+            await control.close()
+            control = None
 
             cancelled: list[str] = []
             for ack in accepted:
                 command_id = ack["commandId"]
-                rest = await asyncio.to_thread(self.queue_snapshot, self.live_agents[1])
-                revision = rest.get("revision")
-                if isinstance(revision, bool) or not isinstance(revision, int):
-                    raise AcceptanceFailure("capacity cleanup snapshot has no revision")
-                if not any(
-                    row.get("commandId") == command_id for row in rest["commands"]
-                ):
-                    raise AcceptanceFailure(
-                        f"accepted queued command vanished before cancellation: {command_id}"
-                    )
                 mutation_id = f"mut-bp-{command_id}"
-                mutation_start = len(lane.frames)
-                await lane.send({
-                    "t": "queue.cancel",
-                    "clientMutationId": mutation_id,
-                    "commandId": command_id,
-                    "expectedRevision": revision,
-                })
-                mutation = await lane.wait_for(
-                    lambda frame, mutation_id=mutation_id: (
-                        frame.get("clientMutationId") == mutation_id
-                        and frame.get("t") in {"queue.mutation.ack", "queue.mutation.err"}
-                    ),
-                    after=mutation_start,
-                    timeout=30,
-                    label=f"backpressure cleanup {command_id}",
+                mutation = await asyncio.to_thread(
+                    self.http.request,
+                    "PATCH",
+                    "/api/conversation/prompt",
+                    {
+                        "name": self.live_agents[1].name,
+                        "agentId": self.live_agents[1].agent_id,
+                        "action": "cancel",
+                        "clientMutationId": mutation_id,
+                        "commandId": command_id,
+                        "expectedRevision": ack["revision"],
+                    },
                 )
+                mutation.pop("_headers", None)
                 if (
-                    mutation.get("t") != "queue.mutation.ack"
-                    or mutation.get("state") != "cancelled"
+                    mutation.get("state") != "cancelled"
+                    or mutation.get("clientMutationId") != mutation_id
+                    or mutation.get("commandId") != command_id
                 ):
                     raise AcceptanceFailure(
                         f"backpressure queue cleanup failed: {mutation!r}"
@@ -4430,6 +4462,19 @@ class BackendAcceptance:
                 cancelled.append(command_id)
             if len(cancelled) != len(accepted):
                 raise AcceptanceFailure("capacity probe did not cancel every accepted queue row")
+
+            reconnect_start = len(lane.frames)
+            await lane.connect(reconnect=True)
+            post_cleanup_snapshot = await lane.wait_for(
+                lambda frame: frame.get("t") == "queue.snapshot",
+                after=reconnect_start,
+                timeout=60,
+                label="capacity-probe post-cleanup queue snapshot",
+            )
+            require_queue_snapshot(
+                post_cleanup_snapshot,
+                self.live_agents[1].session_id,
+            )
 
             steer_id = f"cm-bp-stop-{time.time_ns()}"
             steer_start = len(lane.frames)
@@ -4495,7 +4540,7 @@ class BackendAcceptance:
             }
         finally:
             await lane.close()
-            for socket in (slow, resumed):
+            for socket in (control, slow, resumed):
                 if socket is not None:
                     try:
                         await socket.close()

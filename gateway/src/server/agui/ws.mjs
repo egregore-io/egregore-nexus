@@ -11,6 +11,7 @@ import { bindWebSocketCsrf } from "../auth/browserMutationAuth.mjs";
 const AGUI_WS_PATH = "/api/agui/ws";
 const SESSION_EVENTS_PATH = /^\/api\/v1\/agent-sessions\/[^/]+\/events$/;
 const MAX_BUFFERED_AMOUNT = 1024 * 1024;
+const MAX_SESSION_CONTROL_FRAME_BYTES = 8 * 1024 * 1024;
 const SESSION_BACKPRESSURE_REASON = "session.bp:";
 const DEVELOPER_BACKPRESSURE_REASON = "developer.backpressure:";
 const TOOL_CALL_TOPIC_PREFIX = "sys.agent.";
@@ -1926,9 +1927,10 @@ function sendJson(socket, body) {
   const outbound = SESSION_OUTBOUND.get(socket);
   if (outbound?.session) {
     if (outbound.stopped) return false;
+    const payloadBytes = Buffer.byteLength(payload, "utf8");
     if (
-      (socket.bufferedAmount ?? 0) + Buffer.byteLength(payload, "utf8")
-      > MAX_BUFFERED_AMOUNT
+      payloadBytes > MAX_SESSION_CONTROL_FRAME_BYTES
+      || (socket.bufferedAmount ?? 0) > MAX_BUFFERED_AMOUNT
     ) {
       closeOutboundBackpressure(outbound);
       return false;

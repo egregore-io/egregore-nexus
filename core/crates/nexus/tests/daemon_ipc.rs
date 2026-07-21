@@ -216,6 +216,108 @@ async fn enqueue_call_returns_a_durable_receipt_without_waiting_for_execution() 
 }
 
 #[tokio::test]
+async fn session_prompt_enqueue_is_atomically_bounded_and_retry_safe() {
+    let state = state().await;
+    CommandIntents::new(&state.store)
+        .insert_pending(nexus_store::repos::NewCommandIntent {
+            command_id: "cmd-capacity-foreign-metadata".into(),
+            kind: nexus_store::command_kinds::harness::PROMPT.into(),
+            project: "foreign-metadata".into(),
+            caller_name: "foreign-caller".into(),
+            caller_session_id: None,
+            caller_agent_id: None,
+            caller_runtime_id: None,
+            caller_client_key: None,
+            caller_kind: Some("human".into()),
+            caller_tier: Some("admin".into()),
+            idempotency_key: Some("cm-capacity-foreign-metadata".into()),
+            request_json: serde_json::json!({
+                "name": "bounded",
+                "agentId": "a_bounded",
+                "text": "project metadata cannot partition capacity",
+                "clientMessageId": "cm-capacity-foreign-metadata"
+            })
+            .to_string(),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+    let request = |index: usize, target: &str| DaemonIpcRequest {
+        version: DAEMON_IPC_PROTOCOL_VERSION,
+        token: "boot-token".into(),
+        request_id: format!("rpc-capacity-{target}-{index}"),
+        caller: None,
+        call: DaemonIpcCall::Enqueue {
+            command_id: format!("cmd-capacity-{target}-{index}"),
+            kind: nexus_store::command_kinds::harness::PROMPT.into(),
+            params: serde_json::json!({
+                "name": target,
+                "agentId": format!("a_{target}"),
+                "text": format!("queued input {index}"),
+                "clientMessageId": format!("cm-capacity-{target}-{index}")
+            }),
+            idempotency_key: Some(format!("cm-capacity-{target}-{index}")),
+        },
+    };
+
+    let responses =
+        futures::future::join_all((0..128).map(|index| {
+            daemon_ipc::handle_request(&state, "boot-token", request(index, "bounded"))
+        }))
+        .await;
+    let accepted = responses
+        .iter()
+        .filter(|response| response.error.is_none())
+        .count();
+    let full = responses
+        .iter()
+        .filter(|response| {
+            response.error.as_ref().map(|error| error.code)
+                == Some(nexus_contracts::codes::COMMAND_QUEUE_FULL)
+        })
+        .count();
+    assert_eq!(accepted, 99);
+    assert_eq!(full, 29);
+
+    let accepted_index = responses
+        .iter()
+        .position(|response| response.error.is_none())
+        .expect("one capacity probe must be accepted");
+    let mut retry = request(accepted_index, "bounded");
+    retry.request_id = "rpc-capacity-retry".into();
+    let retry = daemon_ipc::handle_request(&state, "boot-token", retry).await;
+    assert!(
+        retry.error.is_none(),
+        "an accepted command retry must remain accepted"
+    );
+    assert_eq!(
+        retry.result.unwrap()["commandId"],
+        format!("cmd-capacity-bounded-{accepted_index}")
+    );
+
+    let other = daemon_ipc::handle_request(&state, "boot-token", request(0, "independent")).await;
+    assert!(
+        other.error.is_none(),
+        "capacity must be isolated by stable target"
+    );
+
+    let mut rows = state
+        .store
+        .conn
+        .query(
+            "SELECT COUNT(*) FROM command_intents WHERE kind = 'harness.prompt' \
+             AND status = 'pending' AND json_extract(request_json, '$.agentId') = 'a_bounded'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        100
+    );
+}
+
+#[tokio::test]
 async fn shutdown_fence_rejects_new_enqueue_before_durable_acceptance() {
     let state = state().await;
     command_worker::begin_shutdown(&state).await;

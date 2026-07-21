@@ -21,6 +21,8 @@ pub enum NexusError {
     HookRejected,
     #[error("hook-capable Gateway is unavailable")]
     HookGatewayUnavailable,
+    #[error("session command queue is full")]
+    CommandQueueFull,
     #[error("message policy denied: {0}")]
     PolicyDenied(String),
     #[error("ambiguous name: {0}")]
@@ -46,6 +48,7 @@ impl NexusError {
             NexusError::Paused => codes::PAUSED,
             NexusError::HookRejected => codes::HOOK_REJECTED,
             NexusError::HookGatewayUnavailable => codes::HOOK_GATEWAY_UNAVAILABLE,
+            NexusError::CommandQueueFull => codes::COMMAND_QUEUE_FULL,
             NexusError::PolicyDenied(_) => codes::UNAUTHORIZED,
             NexusError::Invalid(_) | NexusError::Ambiguous(_) => codes::INVALID_PARAMS,
             _ => codes::INTERNAL_ERROR,
@@ -67,6 +70,7 @@ impl From<ContractError> for NexusError {
             codes::PAUSED => NexusError::Paused,
             codes::HOOK_REJECTED => NexusError::HookRejected,
             codes::HOOK_GATEWAY_UNAVAILABLE => NexusError::HookGatewayUnavailable,
+            codes::COMMAND_QUEUE_FULL => NexusError::CommandQueueFull,
             _ => NexusError::Internal(e.message),
         }
     }
