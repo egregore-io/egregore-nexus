@@ -37,6 +37,7 @@ fn verify_repository_version() {
             version_path.display()
         ),
     };
+    let repository_version = repository_version.replace("\r\n", "\n");
     let canonical = repository_version.trim();
     let cargo = env::var("CARGO_PKG_VERSION").expect("Cargo must provide CARGO_PKG_VERSION");
     assert_eq!(
