@@ -514,6 +514,9 @@ impl<'a> CommandIntents<'a> {
                     .has_pending_initial_prompt(&candidate, target.as_ref())
                     .await?
                 || self
+                    .has_older_unsettled_delivery(&candidate, target.as_ref())
+                    .await?
+                || self
                     .has_claimed_prompt_for_target(now, &candidate, target.as_ref())
                     .await?
             {
@@ -548,6 +551,9 @@ impl<'a> CommandIntents<'a> {
             if target.as_ref().map(|row| row.session_id.0.as_str()) != Some(target_session_id)
                 || self
                     .has_pending_initial_prompt(&candidate, target.as_ref())
+                    .await?
+                || self
+                    .has_older_unsettled_delivery(&candidate, target.as_ref())
                     .await?
                 || self
                     .has_claimed_prompt_for_target(now, &candidate, target.as_ref())
@@ -704,6 +710,47 @@ impl<'a> CommandIntents<'a> {
                  ((?1 IS NOT NULL AND agent_id = ?1) OR (?2 IS NOT NULL AND session_id = ?2)) \
                  LIMIT 1",
                 params![agent_id, session_id],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows.next().await.map_err(store_err)?.is_some())
+    }
+
+    /// Preserve accepted ordering across daemon restart.
+    ///
+    /// The split daemon restores durable delivery obligations into its boot-scoped inbox after
+    /// command ingress becomes available. A prompt accepted after one of those messages must stay
+    /// queued until the older recipient obligation settles; otherwise the prompt worker can start
+    /// a native turn first and the restored bus delivery is appended to that same Codex turn.
+    async fn has_older_unsettled_delivery(
+        &self,
+        command: &CommandIntentRow,
+        target: Option<&SessionRow>,
+    ) -> Result<bool, NexusError> {
+        if !self.store.has_split_authority() {
+            return Ok(false);
+        }
+        let request: serde_json::Value =
+            serde_json::from_str(&command.request_json).map_err(store_msg)?;
+        let agent_id = request
+            .get("agentId")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| target.and_then(|row| row.agent_id.as_deref()));
+        let runtime_id = target.map(|row| row.session_id.0.as_str());
+        if agent_id.is_none() && runtime_id.is_none() {
+            return Ok(false);
+        }
+        let mut rows = self
+            .store
+            .identity_conn()
+            .query(
+                "SELECT 1 FROM delivery_obligations
+                 WHERE state NOT IN ('delivered', 'rejected')
+                   AND created_at <= ?1
+                   AND ((?2 IS NOT NULL AND recipient_agent_id = ?2)
+                     OR (?3 IS NOT NULL AND recipient_runtime_id = ?3))
+                 LIMIT 1",
+                params![command.created_at, agent_id, runtime_id],
             )
             .await
             .map_err(store_err)?;
