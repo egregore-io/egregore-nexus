@@ -2076,6 +2076,43 @@ class WsAcceptanceContracts(unittest.TestCase):
             body,
         )
 
+    def test_developer_backpressure_load_is_metadata_sized_and_kernel_bound(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        name = module["developer_backpressure_thread_name"](
+            "contract-run",
+            "0123456789ab",
+        )
+        target_bytes = module["DEVELOPER_BACKPRESSURE_THREAD_BYTES"]
+        self.assertEqual(len(name.encode("utf-8")), target_bytes)
+        self.assertTrue(name.startswith("v015-bp-0123456789ab-"))
+
+        # A message developer-event frame contains both the topic and thread name.
+        frame_floor = target_bytes * 2
+        receive_max = 33_554_432
+        send_max = 4_194_304
+        application_max = module["DEVELOPER_BACKPRESSURE_MAX_BUFFERED_BYTES"]
+        count = module["developer_backpressure_post_count"](
+            frame_floor,
+            receive_max=receive_max,
+            send_max=send_max,
+        )
+        self.assertGreater(
+            count * frame_floor,
+            receive_max + send_max + application_max,
+        )
+
+        source = TARGET.read_text(encoding="utf-8")
+        body = source.split("    async def developer_backpressure", 1)[1].split(
+            "    async def agent_session_backpressure_and_queue_full", 1
+        )[0]
+        self.assertIn("post_thread_for_backpressure", body)
+        self.assertIn("pause_websocket_reads", body)
+        self.assertIn("developer_backpressure_post_count", body)
+        self.assertNotIn('"B" * 16384', body)
+        # Giant metadata frames are verified on raw sockets and summarized; they must not
+        # inflate the canonical dual-WebSocket frame evidence by tens of megabytes.
+        self.assertNotIn('self.core["DeveloperLane"]', body)
+
     def test_backpressure_cleanup_does_not_steer_an_already_finished_run(self) -> None:
         module = runpy.run_path(str(TARGET))
         helper = module.get("ensure_run_terminal")
