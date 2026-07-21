@@ -1226,6 +1226,14 @@ async fn resolve_command_caller(
         });
     }
 
+    // A human command accepted under the previous daemon boot owns the exact caller snapshot
+    // stamped at ingress. A reconnect may legitimately bind the same client key to a fresh
+    // session before the new worker drains that command; the new registration must not replace
+    // or invalidate the already-accepted authority.
+    if let Some(caller) = resolve_restart_validated_human_caller(state, row).await? {
+        return Ok(caller);
+    }
+
     let sessions = Sessions::new(&state.store);
     let Some(client_key) = row.caller_client_key.as_deref() else {
         return Err(unauthorized_command_caller(
@@ -1238,9 +1246,6 @@ async fn resolve_command_caller(
         .await
         .map_err(|e| e.to_contract_error())?
     else {
-        if let Some(caller) = resolve_restart_validated_human_caller(state, row).await? {
-            return Ok(caller);
-        }
         return Err(unauthorized_command_caller(
             "command intent caller client key is not registered",
         ));

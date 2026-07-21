@@ -1236,6 +1236,15 @@ async fn daemon_accepted_human_command_survives_only_a_real_boot_change() {
         .set_boot_epoch("boot_restarted", 2)
         .await
         .unwrap();
+    let rebound = state
+        .identity
+        .register(human_register("restart-human", "ck_restart_human"))
+        .await
+        .unwrap();
+    assert_ne!(
+        rebound.session_id, human.session_id,
+        "a fresh daemon registration must exercise the new-session boundary"
+    );
     let caller = resolve_command_caller(&state, &row)
         .await
         .expect("daemon-validated human authority must survive a boot change");
