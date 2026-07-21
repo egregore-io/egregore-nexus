@@ -286,7 +286,7 @@ fn hermes_gateway_profile_is_isolated_and_loads_nexus_platform() {
     )
     .unwrap();
     let profile = HermesGatewayProfile {
-        home: dir.path().join("hermes-home"),
+        home: source_home.join("profiles/nexus-test"),
         source_home,
         bridge_socket: dir.path().join("bridge.sock"),
         bridge_token: "tok_profile".into(),
@@ -313,9 +313,9 @@ fn hermes_gateway_profile_is_isolated_and_loads_nexus_platform() {
     assert!(config.contains("fallback_providers: []"));
     assert!(!config.contains("enabled: [other]"));
     assert!(!config.contains("slack:"));
-    assert_eq!(
-        std::fs::read_to_string(profile.home.join("auth.json")).unwrap(),
-        r#"{"providers":{"openai-codex":{}}}"#
+    assert!(
+        !profile.home.join("auth.json").exists(),
+        "Nexus runtime profiles must use Hermes global machine auth without copying auth.json"
     );
     let skill = std::fs::read_to_string(profile.home.join("skills/nexus-bus/SKILL.md"))
         .expect("headed Hermes profile must install its launch-pinned Nexus bus skill");

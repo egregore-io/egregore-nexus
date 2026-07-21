@@ -167,6 +167,16 @@ async fn public_delivery_timing_store_upgrades_additively_without_losing_command
             .await
             .unwrap();
     }
+    if column_exists(&store, "command_intents", "caller_validated_boot_epoch").await {
+        store
+            .conn
+            .execute(
+                "ALTER TABLE command_intents DROP COLUMN caller_validated_boot_epoch",
+                (),
+            )
+            .await
+            .unwrap();
+    }
     store
         .conn
         .execute_batch(
@@ -189,7 +199,7 @@ async fn public_delivery_timing_store_upgrades_additively_without_losing_command
         .unwrap()
         .unwrap();
     assert_eq!(row.caller_principal_id, None);
-    assert_eq!(schema_marker(&store).await, "v0.1.6_caller_principal");
+    assert_eq!(schema_marker(&store).await, "v0.1.6_caller_authority");
 }
 
 #[tokio::test]

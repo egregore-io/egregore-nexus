@@ -1358,6 +1358,7 @@ mod rpc {
         assert_eq!(codes::INVALID_PARAMS, -32602);
         assert_eq!(codes::INTERNAL_ERROR, -32603);
         assert_eq!(codes::ACTIVE_TURN_REQUIRED, -32006);
+        assert_eq!(codes::COMMAND_QUEUE_FULL, -32010);
     }
 }
 

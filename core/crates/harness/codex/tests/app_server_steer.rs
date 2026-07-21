@@ -65,7 +65,7 @@ async fn setup_with_env(
     let server = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,

@@ -744,7 +744,7 @@ fn read_webconsole_health(host: &str, port: u16) -> Result<Option<WebconsoleHeal
         .set_read_timeout(Some(Duration::from_secs(3)))
         .map_err(|error| error.to_string())?;
     let authority = webconsole_authority(host, port);
-    let request = format!("GET /health HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    let request = format!("GET /health HTTP/1.0\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .map_err(|error| error.to_string())?;
@@ -968,3 +968,6 @@ fn follow_file_tail(path: &Path, lines: usize) -> io::Result<()> {
         printed = len;
     }
 }
+
+#[path = "../tests/unit/webconsole_health.rs"]
+mod webconsole_health_contracts;

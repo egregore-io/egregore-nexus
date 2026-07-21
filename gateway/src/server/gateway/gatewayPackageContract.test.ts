@@ -9,16 +9,17 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 describe("public gateway package contract", () => {
   test("publishes Gateway plus its bundled WebUI and installs the native CLI", async () => {
     const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+    const version = (await readFile(join(root, "../VERSION"), "utf8")).trim();
 
     expect(manifest.name).toBe("@egregore/nexus-gateway");
-    expect(manifest.version).toBe("0.1.5");
+    expect(manifest.version).toBe(version);
     expect(manifest.private).toBe(false);
     expect(manifest.license).toBe("Apache-2.0");
     expect(manifest.engines?.node).toBe(">=20");
     expect(manifest.bin?.nexus).toBe("scripts/nexus.mjs");
     expect(manifest.bin?.["nexus-gateway"]).toBe("scripts/nexus-gateway.mjs");
     expect(manifest.bin?.["nexus-webui"]).toBe("webconsole/bin/nexus-webui.mjs");
-    expect(manifest.dependencies?.["@egregore/nexus-cli"]).toBe("0.1.5");
+    expect(manifest.dependencies?.["@egregore/nexus-cli"]).toBe(version);
     expect(manifest.files).toEqual([
       "dist-gateway/headless.mjs",
       "scripts/gateway-serve-impl.mjs",
@@ -57,7 +58,7 @@ describe("public gateway package contract", () => {
     expect(serveSource).toContain('value === "local-operator"');
     expect(serveSource).toContain('value === "remote-human"');
     expect(serveSource).toContain('value === "remote-agent"');
-    expect(serveSource).toContain("writeGatewayDiscovery(port, process.pid)");
+    expect(serveSource).toContain("writeGatewayDiscovery(port, process.pid, host)");
     expect(serveSource).not.toContain("writeGatewayDiscovery(port, runner.pid)");
   });
 });

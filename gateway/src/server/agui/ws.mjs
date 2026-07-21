@@ -11,6 +11,7 @@ import { bindWebSocketCsrf } from "../auth/browserMutationAuth.mjs";
 const AGUI_WS_PATH = "/api/agui/ws";
 const SESSION_EVENTS_PATH = /^\/api\/v1\/agent-sessions\/[^/]+\/events$/;
 const MAX_BUFFERED_AMOUNT = 1024 * 1024;
+const MAX_SESSION_CONTROL_FRAME_BYTES = 8 * 1024 * 1024;
 const SESSION_BACKPRESSURE_REASON = "session.bp:";
 const DEVELOPER_BACKPRESSURE_REASON = "developer.backpressure:";
 const TOOL_CALL_TOPIC_PREFIX = "sys.agent.";
@@ -25,6 +26,7 @@ const TOOL_CALL_NAME_LIMIT = 1024;
 const TOOL_CALL_START = "TOOL_CALL_START";
 const TOOL_CALL_RESULT = "TOOL_CALL_RESULT";
 const DEFAULT_COMMAND_QUEUE_EVENT_POLL_MS = 100;
+const SESSION_OUTBOUND = new WeakMap();
 
 export function handleWs(socket, request, deps = {}) {
   const observe = deps.observe ?? ((req) => routeThroughFetchHandler(deps, req));
@@ -33,6 +35,17 @@ export function handleWs(socket, request, deps = {}) {
   const steerInput = deps.steerInput ?? defaultSteerInput(deps);
   const interruptInput = deps.interruptInput ?? defaultInterruptInput(deps);
   const sessionLane = new SessionLaneBinding(request);
+  const sessionOutbound = sessionLane.isSessionLane
+    ? {
+        socket,
+        observer: undefined,
+        session: true,
+        stopped: false,
+        lastAcceptedCursor: undefined,
+        pendingAcceptedCursor: undefined,
+      }
+    : undefined;
+  if (sessionOutbound) SESSION_OUTBOUND.set(socket, sessionOutbound);
   const commands = new CommandFrames(socket, request, deps, sessionInput, sessionLane);
   const commandQueue = new SessionCommandQueue(socket, request, deps, sessionLane);
   const subscriptions = new DeveloperEventSubscriptions(socket, request, deps);
@@ -99,6 +112,7 @@ export function handleWs(socket, request, deps = {}) {
       }
       await pumpSseResponseToSocket(response, socket, abort.signal, subscriptions, {
         session: Boolean(sessionLaneTargetFromRequest(request) || sessionIdFromPath(request)),
+        outbound: sessionOutbound,
       });
       close(1000, "observe ended");
     } catch (error) {
@@ -158,7 +172,7 @@ export async function pumpSseResponseToSocket(response, socket, signal, observer
   if (!response.body) return;
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  const outbound = {
+  const outbound = options.outbound ?? {
     socket,
     observer,
     session: options.session === true,
@@ -166,6 +180,7 @@ export async function pumpSseResponseToSocket(response, socket, signal, observer
     lastAcceptedCursor: undefined,
     pendingAcceptedCursor: undefined,
   };
+  outbound.observer = observer;
   let pending = "";
   for (;;) {
     if (signal?.aborted) {
@@ -1910,7 +1925,21 @@ function routeThroughFetchHandler(deps, request) {
 }
 
 function sendJson(socket, body) {
-  socket.send(JSON.stringify(body));
+  const payload = JSON.stringify(body);
+  const outbound = SESSION_OUTBOUND.get(socket);
+  if (outbound?.session) {
+    if (outbound.stopped) return false;
+    const payloadBytes = Buffer.byteLength(payload, "utf8");
+    if (
+      payloadBytes > MAX_SESSION_CONTROL_FRAME_BYTES
+      || (socket.bufferedAmount ?? 0) > MAX_BUFFERED_AMOUNT
+    ) {
+      closeOutboundBackpressure(outbound);
+      return false;
+    }
+  }
+  socket.send(payload);
+  return true;
 }
 
 async function errorReason(response) {

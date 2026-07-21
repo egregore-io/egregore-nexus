@@ -1,6 +1,8 @@
 use nexus_store::command_kinds;
-use nexus_store::repos::{CommandIntents, NewCommandIntent};
-use nexus_store::Store;
+use nexus_store::repos::{
+    CommandIntents, DeliveryObligations, NewCommandIntent, NewDeliveryObligation,
+};
+use nexus_store::{DaemonStore, Store};
 
 async fn migrated() -> Store {
     let store = Store::open(":memory:").await.unwrap();
@@ -501,6 +503,44 @@ async fn stale_claim_cannot_complete_after_reclaim() {
 }
 
 #[tokio::test]
+async fn shutdown_retry_releases_only_the_current_unfinished_claim() {
+    let store = migrated().await;
+    let repo = CommandIntents::new(&store);
+    let mut prompt = pending("cmd_shutdown_retry", 1);
+    prompt.kind = command_kinds::harness::PROMPT.into();
+    repo.insert_pending(prompt).await.unwrap();
+
+    let claimed = repo.claim_next(100, 1_000).await.unwrap().unwrap();
+    let claimed_at = claimed.claimed_at.expect("claim timestamp");
+    assert!(repo
+        .mark_started_for_claim("cmd_shutdown_retry", claimed_at, 101)
+        .await
+        .unwrap());
+    assert!(repo
+        .release_claim_for_shutdown_retry("cmd_shutdown_retry", claimed_at)
+        .await
+        .unwrap());
+
+    let released = repo.get("cmd_shutdown_retry").await.unwrap().unwrap();
+    assert_eq!(released.status, "pending");
+    assert_eq!(released.claimed_at, None);
+    assert_eq!(released.started_at, None);
+    assert_eq!(released.lease_until, None);
+    assert_eq!(released.attempts, 1);
+
+    let reclaimed = repo.claim_next(200, 1_000).await.unwrap().unwrap();
+    assert_eq!(reclaimed.claimed_at, Some(200));
+    assert!(!repo
+        .release_claim_for_shutdown_retry("cmd_shutdown_retry", claimed_at)
+        .await
+        .unwrap());
+    let still_reclaimed = repo.get("cmd_shutdown_retry").await.unwrap().unwrap();
+    assert_eq!(still_reclaimed.status, "claimed");
+    assert_eq!(still_reclaimed.claimed_at, Some(200));
+    assert_eq!(still_reclaimed.attempts, 2);
+}
+
+#[tokio::test]
 async fn stale_heartbeat_inbox_consume_claims_are_expired() {
     let store = migrated().await;
     store
@@ -817,6 +857,79 @@ async fn harness_prompt_claim_skips_turn_tracker_active_sessions() {
     );
     let skipped = repo.get("cmd_ada").await.unwrap().unwrap();
     assert_eq!(skipped.status, "pending");
+}
+
+#[tokio::test]
+async fn harness_prompt_claim_waits_for_older_durable_delivery_obligation() {
+    let identity_path = std::env::temp_dir().join(format!(
+        "nexus-command-intents-obligation-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    ));
+    let daemon = DaemonStore::open(identity_path.to_string_lossy().as_ref())
+        .await
+        .unwrap();
+    let store = daemon.compatibility_store();
+    insert_session_with_agent_id(&store, "s_ada", "ada", "a_ada").await;
+    let repo = CommandIntents::new(&store);
+    repo.insert_pending(prompt_pending("cmd_ada", "ada", 20))
+        .await
+        .unwrap();
+    DeliveryObligations::new(&store)
+        .insert(NewDeliveryObligation {
+            message_id: "m_before_prompt".into(),
+            recipient_agent_id: "a_ada".into(),
+            recipient_runtime_id: Some("s_ada".into()),
+            payload_json: r#"{"message":{"id":"m_before_prompt"}}"#.into(),
+            dedupe_key: "m_before_prompt:a_ada".into(),
+            attempt: 0,
+            state: "pending".into(),
+            created_at: 10,
+        })
+        .await
+        .unwrap();
+
+    assert!(repo
+        .claim_next_ready_harness_prompt(100, 5_000, &[])
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        repo.get("cmd_ada").await.unwrap().unwrap().status,
+        "pending",
+        "a prompt must not overtake older durable bus delivery during restart recovery"
+    );
+
+    DeliveryObligations::new(&store)
+        .remove("m_before_prompt", "a_ada")
+        .await
+        .unwrap();
+    DeliveryObligations::new(&store)
+        .insert(NewDeliveryObligation {
+            message_id: "m_after_prompt".into(),
+            recipient_agent_id: "a_ada".into(),
+            recipient_runtime_id: Some("s_ada".into()),
+            payload_json: r#"{"message":{"id":"m_after_prompt"}}"#.into(),
+            dedupe_key: "m_after_prompt:a_ada".into(),
+            attempt: 0,
+            state: "pending".into(),
+            created_at: 30,
+        })
+        .await
+        .unwrap();
+    let claimed = repo
+        .claim_next_ready_harness_prompt(101, 5_000, &[])
+        .await
+        .unwrap()
+        .expect("a newer delivery must not hold an older prompt");
+    assert_eq!(claimed.command_id, "cmd_ada");
+
+    drop(store);
+    drop(daemon);
+    let _ = std::fs::remove_file(identity_path);
 }
 
 #[tokio::test]

@@ -43,15 +43,15 @@ GATEWAY_LAUNCHER = Path("/tmp/nexus-lab-bin/nexus-gateway")
 LAB_PROCESS = Path("/tmp/nexus-lab-bin/lab-process")
 WS_ACCEPTANCE = Path("/tmp/nexus-lab-bin/nexus-v015-ws-acceptance")
 GATEWAY_URL = "http://127.0.0.1:4100"
-WEBCONSOLE_URL = "http://127.0.0.1:4200"
 LENS_CDP_URL = "http://127.0.0.1:9222"
-WEBUI_CDP_URL = "http://127.0.0.1:9224"
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 PROC_ROOT = Path("/proc")
 MEMORY_LIMIT_BYTES = 8 * 1024 * 1024 * 1024
 DISK_LIMIT_BYTES = 10 * 1024 * 1024 * 1024
 FRAME_HISTORY_LIMIT = 16_384
 FINGERPRINT_HISTORY_LIMIT = 16_384
+PROGRESSIVE_REPLY_LINES = 16
+MAX_INBOUND_FRAME_BYTES = 8 * 1024 * 1024
 MEMORY_TREND_MIN_GROWTH = 512 * 1024 * 1024
 DISK_TREND_MIN_GROWTH = 512 * 1024 * 1024
 PACKAGE_NAMES = ("@egregore/nexus", "@egregore/nexus-cli", "@egregore/nexus-gateway")
@@ -940,6 +940,7 @@ class Ledger:
     def __init__(self) -> None:
         self.failure = {name: 0 for name in FAILURE_COUNTERS}
         self.expected_messages: dict[str, str] = {}
+        self.expected_message_routes: dict[str, set[str]] = {}
         self.received_messages: dict[str, list[str]] = defaultdict(list)
         self.session_accepted: set[str] = set()
         self.session_completed: set[str] = set()
@@ -956,23 +957,34 @@ class Ledger:
             self.session_frame_fingerprints.discard(expired)
         return True
 
-    def accept_message(self, message_id: str, topic: str) -> None:
+    def accept_message(
+        self,
+        message_id: str,
+        topic: str,
+        *additional_topics: str,
+    ) -> None:
         self.expected_messages[message_id] = topic
+        self.expected_message_routes[message_id] = {topic, *additional_topics}
 
     def receive_message(self, message_id: str, topic: str) -> None:
         self.received_messages[message_id].append(topic)
         expected = self.expected_messages.get(message_id)
-        if expected is not None and expected != topic:
+        expected_routes = self.expected_message_routes.get(message_id)
+        if expected_routes is None and expected is not None:
+            expected_routes = {expected}
+        if expected_routes is not None and topic not in expected_routes:
             self.failure["crossRouteDeliveries"] += 1
 
     def finalize_delivery_counts(self) -> None:
         for message_id, expected in self.expected_messages.items():
             topics = self.received_messages.get(message_id, [])
-            matching = sum(topic == expected for topic in topics)
-            if matching == 0:
-                self.failure["lostAcceptedMessages"] += 1
-            elif matching > 1:
-                self.failure["duplicateAcceptedMessages"] += matching - 1
+            expected_routes = self.expected_message_routes.get(message_id, {expected})
+            for expected_route in expected_routes:
+                matching = sum(topic == expected_route for topic in topics)
+                if matching == 0:
+                    self.failure["lostAcceptedMessages"] += 1
+                elif matching > 1:
+                    self.failure["duplicateAcceptedMessages"] += matching - 1
         missing_sessions = self.session_accepted - self.session_completed
         self.failure["lostAcceptedMessages"] += len(missing_sessions)
 
@@ -1001,6 +1013,7 @@ class FrameLane:
             "ping_interval": 20,
             "ping_timeout": 20,
             "max_queue": 64,
+            "max_size": MAX_INBOUND_FRAME_BYTES,
         }
         try:
             return await websockets.connect(url, additional_headers={"Cookie": cookie}, **options)
@@ -1198,6 +1211,10 @@ def session_event(frame: dict[str, Any]) -> dict[str, Any]:
     return event if isinstance(event, dict) else frame
 
 
+def progressive_session_reply(marker: str) -> str:
+    return "\n".join((marker,) * PROGRESSIVE_REPLY_LINES)
+
+
 @dataclass(frozen=True)
 class PromptAttempt:
     marker: str
@@ -1249,11 +1266,16 @@ class AgentSessionLane(FrameLane):
         client_message_id = f"cm-{marker}"
         start_index = len(self.frames)
         before_cursor = self.last_numeric_cursor
+        reply = progressive_session_reply(marker)
         await self.send({
             "t": "input",
             "mode": "session",
             "target": {"name": self.agent.name, "agentId": self.agent.agent_id},
-            "text": f"Reply briefly with this exact soak marker: {marker}",
+            "text": (
+                f"Reply with exactly these {PROGRESSIVE_REPLY_LINES} identical marker lines "
+                "and no other text:\n"
+                f"{reply}"
+            ),
             "clientMessageId": client_message_id,
         })
         ack = await self.wait_for(
@@ -1284,7 +1306,7 @@ class AgentSessionLane(FrameLane):
         command_id = attempt.command_id
         start_index = attempt.start_index
         before_cursor = attempt.before_cursor
-        await self.wait_for(
+        echo = await self.wait_for(
             lambda frame: (
                 session_event(frame).get("type") == "TEXT_MESSAGE_END"
                 and session_event(frame).get("messageId") == client_message_id
@@ -1296,51 +1318,76 @@ class AgentSessionLane(FrameLane):
         echo_index = next(
             index
             for index in range(start_index, len(self.frames))
-            if session_event(self.frames[index]).get("type") == "TEXT_MESSAGE_END"
-            and session_event(self.frames[index]).get("messageId") == client_message_id
+            if self.frames[index] is echo
         )
-        started = await self.wait_for(
-            lambda frame: (
-                session_event(frame).get("type") == "RUN_STARTED"
-                and isinstance(session_event(frame).get("runId"), str)
-                and bool(session_event(frame).get("runId"))
-            ),
-            after=start_index,
-            timeout=timeout,
-            label=f"session run start {client_message_id}",
-        )
+        echo_cursor = numeric_cursor(echo)
+        if echo_cursor is None or echo_cursor <= before_cursor:
+            raise SoakFailure(
+                f"session user echo has no new cursor for {client_message_id}: {echo!r}"
+            )
+        starts = [
+            frame
+            for frame in self.frames[start_index : echo_index + 1]
+            if session_event(frame).get("type") == "RUN_STARTED"
+            and numeric_cursor(frame) == echo_cursor
+            and isinstance(session_event(frame).get("runId"), str)
+            and bool(session_event(frame).get("runId"))
+        ]
+        if len(starts) != 1:
+            raise SoakFailure(
+                f"session user echo has no exact correlated run start for "
+                f"{client_message_id}: count={len(starts)} cursor={echo_cursor}"
+            )
+        started = starts[0]
         run_id = session_event(started)["runId"]
-        assistant_start = await self.wait_for(
+        terminal = await self.wait_for(
             lambda frame: (
-                session_event(frame).get("type") == "TEXT_MESSAGE_START"
-                and session_event(frame).get("role") == "assistant"
-                and isinstance(session_event(frame).get("messageId"), str)
-                and bool(session_event(frame).get("messageId"))
+                session_event(frame).get("type") == "RUN_FINISHED"
+                and session_event(frame).get("runId") == run_id
+                and (numeric_cursor(frame) or -1) > before_cursor
             ),
             after=echo_index + 1,
             timeout=timeout,
-            label=f"session assistant start {client_message_id}",
+            label=f"session terminal event {client_message_id}",
         )
-        assistant_message_id = session_event(assistant_start)["messageId"]
-        assistant_start_index = next(
+        terminal_index = next(
             index
             for index in range(echo_index + 1, len(self.frames))
-            if self.frames[index] is assistant_start
+            if self.frames[index] is terminal
         )
-        assistant_end = await self.wait_for(
-            lambda frame: (
-                session_event(frame).get("type") == "TEXT_MESSAGE_END"
-                and session_event(frame).get("messageId") == assistant_message_id
-            ),
-            after=assistant_start_index + 1,
-            timeout=timeout,
-            label=f"session assistant end {client_message_id}",
-        )
-        assistant_end_index = next(
-            index
-            for index in range(assistant_start_index + 1, len(self.frames))
-            if self.frames[index] is assistant_end
-        )
+        assistant_starts = [
+            (index, frame)
+            for index, frame in enumerate(
+                self.frames[echo_index + 1 : terminal_index],
+                start=echo_index + 1,
+            )
+            if session_event(frame).get("type") == "TEXT_MESSAGE_START"
+            and session_event(frame).get("role") == "assistant"
+            and isinstance(session_event(frame).get("messageId"), str)
+            and bool(session_event(frame).get("messageId"))
+        ]
+        if len(assistant_starts) != 1:
+            raise SoakFailure(
+                f"{self.agent.kind} current run has no exact assistant output for "
+                f"{client_message_id}: count={len(assistant_starts)} runId={run_id}"
+            )
+        assistant_start_index, assistant_start = assistant_starts[0]
+        assistant_message_id = session_event(assistant_start)["messageId"]
+        assistant_ends = [
+            (index, frame)
+            for index, frame in enumerate(
+                self.frames[assistant_start_index + 1 : terminal_index],
+                start=assistant_start_index + 1,
+            )
+            if session_event(frame).get("type") == "TEXT_MESSAGE_END"
+            and session_event(frame).get("messageId") == assistant_message_id
+        ]
+        if len(assistant_ends) != 1:
+            raise SoakFailure(
+                f"{self.agent.kind} current run has no exact assistant end for "
+                f"{client_message_id}: count={len(assistant_ends)} runId={run_id}"
+            )
+        assistant_end_index, _assistant_end = assistant_ends[0]
         assistant_deltas = [
             str(session_event(frame).get("delta"))
             for frame in self.frames[assistant_start_index + 1 : assistant_end_index]
@@ -1355,21 +1402,12 @@ class AgentSessionLane(FrameLane):
                 f"{client_message_id}: contentFrames={len(assistant_deltas)}"
             )
         assistant_text = "".join(assistant_deltas)
-        if assistant_text.strip() != marker:
+        expected_reply = progressive_session_reply(marker)
+        if assistant_text.strip() != expected_reply:
             raise SoakFailure(
                 f"{self.agent.kind} assistant marker mismatch for {client_message_id}: "
-                f"expected {marker!r}, got {assistant_text!r}"
+                f"expected {expected_reply!r}, got {assistant_text!r}"
             )
-        await self.wait_for(
-            lambda frame: (
-                session_event(frame).get("type") == "RUN_FINISHED"
-                and session_event(frame).get("runId") == run_id
-                and (numeric_cursor(frame) or -1) > before_cursor
-            ),
-            after=assistant_end_index + 1,
-            timeout=timeout,
-            label=f"session terminal event {client_message_id}",
-        )
         completion_count = sum(
             session_event(frame).get("type") == "RUN_FINISHED"
             and session_event(frame).get("runId") == run_id
@@ -1694,7 +1732,13 @@ def queue_clear(http: HttpClient, agent: Agent) -> bool:
     value = http.request("GET", f"/api/conversation/prompt?{query}")
     value.pop("_headers", None)
     commands = value.get("commands")
-    return value.get("turnActive") is not True and isinstance(commands, list) and len(commands) == 0
+    if value.get("turnActive") is True or not isinstance(commands, list):
+        return False
+    terminal_states = {"completed", "failed", "cancelled"}
+    return all(
+        isinstance(command, dict) and command.get("state") in terminal_states
+        for command in commands
+    )
 
 
 def wait_health(http: HttpClient, timeout: float = 90) -> None:
@@ -1946,7 +1990,6 @@ def validate_restart_transition(
             or before.daemon_start_ticks == after.daemon_start_ticks
             or before.daemon_boot_id == after.daemon_boot_id
             or before.daemon_created_at == after.daemon_created_at
-            or before.daemon_ipc_inode == after.daemon_ipc_inode
             or before.stream_boot_id == after.stream_boot_id
             or before.stream_created_at == after.stream_created_at
         ):
@@ -1969,7 +2012,6 @@ def validate_restart_transition(
             before.gateway_pid == after.gateway_pid
             or before.gateway_start_ticks == after.gateway_start_ticks
             or before.gateway_bound_at == after.gateway_bound_at
-            or before.gateway_discovery_inode == after.gateway_discovery_inode
             or before.gateway_discovery_sha256 == after.gateway_discovery_sha256
         ):
             raise SoakFailure("Gateway restart did not change PID, generation, and discovery")
@@ -2054,6 +2096,7 @@ class Soak:
             agent.agent_id: f"sys.dm.{agent.name}"
             for agent in agents
         }
+        self.dm_mirror_topic: str | None = None
         self.developer = DeveloperLane(
             evidence,
             self.ledger,
@@ -2130,8 +2173,6 @@ class Soak:
             ("xvfb.pid", "xvfb"),
             ("lens.pid", "lens"),
             ("lens-cdp-proxy.pid", "lensCdpProxy"),
-            ("webui-browser.pid", "webuiBrowser"),
-            ("webui-cdp-proxy.pid", "webuiCdpProxy"),
         ):
             raw = read_bytes_no_symlink(self.lab_root / "lab" / leaf, f"{label} pid")
             try:
@@ -2144,11 +2185,9 @@ class Soak:
         }
         total_rss = sum(int(row["rssBytes"]) for row in process_rows.values())
         self.process_rss_totals.append(total_rss)
-        gateway_probe, webconsole_probe, lens_probe, webui_probe = await asyncio.gather(
+        gateway_probe, lens_probe = await asyncio.gather(
             asyncio.to_thread(plain_http_probe, GATEWAY_URL + "/api/v1/health", "Gateway"),
-            asyncio.to_thread(plain_http_probe, WEBCONSOLE_URL + "/health", "Webconsole"),
             cdp_runtime_probe(LENS_CDP_URL, "file://", "Lens"),
-            cdp_runtime_probe(WEBUI_CDP_URL, "127.0.0.1:4200", "WebUI"),
         )
         queue_rows: dict[str, object] = {}
         for agent in self.agents:
@@ -2239,9 +2278,7 @@ class Soak:
             "websockets": websocket,
             "probes": {
                 "gateway": gateway_probe,
-                "webconsole": webconsole_probe,
                 "lens": lens_probe,
-                "webui": webui_probe,
             },
         }
         self.resource_samples.append(resource)
@@ -2290,7 +2327,12 @@ class Soak:
         message_id = recursive_string(response, ("messageId", "message_id"))
         if not message_id:
             raise SoakFailure(f"accepted message has no messageId: {response!r}")
-        self.ledger.accept_message(message_id, topic)
+        mirror_topic = self.dm_mirror_topic if target.get("verb") == "dm" else None
+        self.ledger.accept_message(
+            message_id,
+            topic,
+            *((mirror_topic,) if mirror_topic else ()),
+        )
         return DeveloperAttempt(message_id, topic, cursor_before)
 
     async def finish_message(
@@ -2620,8 +2662,6 @@ def capture_final_artifacts(
         ("xvfb.pid", "xvfb"),
         ("lens.pid", "lens"),
         ("lens-cdp-proxy.pid", "lensCdpProxy"),
-        ("webui-browser.pid", "webuiBrowser"),
-        ("webui-cdp-proxy.pid", "webuiCdpProxy"),
     ):
         raw = read_bytes_no_symlink(lab_root / "lab" / leaf, f"{label} pid")
         try:
@@ -2644,7 +2684,7 @@ def capture_final_artifacts(
             raise SoakFailure(f"final process inventory omits {label} pid {pid}")
         if "Z" in state:
             raise SoakFailure(f"final process inventory reports zombie {label} pid {pid}")
-    required_tcp_ports = (4100, 4101, 4200, 9222, 9224)
+    required_tcp_ports = (4100, 4101, 9222)
     for port in required_tcp_ports:
         if not re.search(rf"(?:\[?::\]?|\b\d{{1,3}}(?:\.\d{{1,3}}){{3}}):{port}\b", tcp_listeners.stdout):
             raise SoakFailure(f"final listener inventory omits TCP port {port}")

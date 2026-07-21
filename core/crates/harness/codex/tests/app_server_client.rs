@@ -48,7 +48,7 @@ async fn turn_start_streams_a_delta_then_turn_end() {
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,

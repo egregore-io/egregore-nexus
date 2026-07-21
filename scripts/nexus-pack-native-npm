@@ -21,7 +21,7 @@ VERSION_OUTPUT=
 EXPECTED_SHA256=
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 "$ROOT/scripts/nexus-version" check >/dev/null
-VERSION=$(tr -d '\n' < "$ROOT/VERSION")
+VERSION=$(tr -d '\r\n' < "$ROOT/VERSION")
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -76,6 +76,7 @@ else
     exit 1
   }
 fi
+VERSION_OUTPUT=${VERSION_OUTPUT%$'\r'}
 EXPECTED_VERSION="nexus ${VERSION}"
 if [ "$VERSION_OUTPUT" != "$EXPECTED_VERSION" ]; then
   echo "native binary does not report $EXPECTED_VERSION exactly: $VERSION_OUTPUT" >&2

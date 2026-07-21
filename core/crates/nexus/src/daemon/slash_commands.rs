@@ -47,7 +47,11 @@ pub(crate) fn prompt_slash_action(
             }
         }
         SlashCommandAction::NativeCompact => {
-            if (kind.as_str() == "codex" && row.transport.as_deref() == Some("codex-appserver"))
+            if (kind.as_str() == "codex"
+                && matches!(
+                    row.transport.as_deref(),
+                    Some("codex-appserver") | Some("acp")
+                ))
                 || (kind.as_str() == "hermes" && row.transport.as_deref() == Some("pty"))
             {
                 Ok(Some(PromptSlashAction::NativeCompact))
@@ -139,12 +143,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_acp_compact_fails_fast_instead_of_text_injection() {
-        let err = prompt_slash_action(&row(Some("codex"), Some("acp")), "/compact").unwrap_err();
-        assert!(err
-            .message
-            .contains("unsupported slash command /compact for codex"));
-        assert!(err.message.contains("native compact-capable transport"));
+    fn codex_acp_compact_maps_to_native_action() {
+        assert_eq!(
+            prompt_slash_action(&row(Some("codex"), Some("acp")), "/compact").unwrap(),
+            Some(PromptSlashAction::NativeCompact)
+        );
     }
 
     #[test]

@@ -172,19 +172,19 @@ async fn reconnecting_command_cannot_reuse_an_id_for_a_different_payload() {
 }
 
 #[tokio::test]
-async fn enqueue_call_returns_a_durable_receipt_without_waiting_for_execution() {
+async fn gateway_transport_enqueue_returns_a_principal_bound_durable_receipt() {
     let state = state().await;
     let request = DaemonIpcRequest {
         version: DAEMON_IPC_PROTOCOL_VERSION,
         token: "boot-token".into(),
-        request_id: "rpc-prompt-enqueue".into(),
+        request_id: "rpc-external-enqueue".into(),
         caller: Some(DaemonIpcCaller {
             name: Some("outside".into()),
             project: "default".into(),
-            session_id: Some("s_external".into()),
+            session_id: Some("transport:telegram".into()),
             agent_id: None,
-            runtime_id: None,
-            client_key: Some("external-client".into()),
+            runtime_id: Some("transport:telegram".into()),
+            client_key: None,
             kind: Kind::Human,
             locality: Locality::External,
             access: Some("guest".into()),
@@ -192,12 +192,11 @@ async fn enqueue_call_returns_a_durable_receipt_without_waiting_for_execution() 
             tier: Tier::Agent,
         }),
         call: DaemonIpcCall::Enqueue {
-            command_id: "cmd-prompt-enqueue".into(),
-            kind: nexus_store::command_kinds::harness::PROMPT.into(),
+            command_id: "cmd-external-enqueue".into(),
+            kind: nexus_store::command_kinds::message_post::SEND.into(),
             params: serde_json::json!({
-                "name": "ipc-agent",
-                "text": "queued while active",
-                "clientMessageId": "client-prompt-1"
+                "to": {"verb": "dm", "name": "ipc-agent"},
+                "body": "queued while active"
             }),
             idempotency_key: Some("client-prompt-1".into()),
         },
@@ -212,23 +211,259 @@ async fn enqueue_call_returns_a_durable_receipt_without_waiting_for_execution() 
     assert!(response.error.is_none(), "{:?}", response.error);
     assert_eq!(
         response.result.as_ref().unwrap()["commandId"],
-        "cmd-prompt-enqueue"
+        "cmd-external-enqueue"
     );
     assert_eq!(response.result.as_ref().unwrap()["status"], "pending");
     assert_eq!(response.result.as_ref().unwrap()["revision"], 1);
-    assert_eq!(response.result.as_ref().unwrap()["seq"], 1);
+    assert_eq!(response.result.as_ref().unwrap()["seq"], 0);
     assert_eq!(
         response.result.as_ref().unwrap()["sessionId"],
         serde_json::Value::Null
     );
     let row = CommandIntents::new(&state.store)
-        .get("cmd-prompt-enqueue")
+        .get("cmd-external-enqueue")
         .await
         .unwrap()
         .expect("durable queued row");
     assert_eq!(row.status, "pending");
     assert_eq!(row.caller_principal_id.as_deref(), Some("x_external_abc"));
     assert_eq!(row.caller_kind.as_deref(), Some("external.human"));
+}
+
+#[tokio::test]
+async fn gateway_transport_principal_bypass_rejects_every_near_miss() {
+    let state = state().await;
+    let caller = DaemonIpcCaller {
+        name: Some("outside".into()),
+        project: "default".into(),
+        session_id: Some("transport:telegram".into()),
+        agent_id: None,
+        runtime_id: Some("transport:telegram".into()),
+        client_key: None,
+        kind: Kind::Human,
+        locality: Locality::External,
+        access: Some("guest".into()),
+        principal_id: Some("x_external_abc".into()),
+        tier: Tier::Agent,
+    };
+    let mut cases = Vec::new();
+    let mut changed = caller.clone();
+    changed.access = Some("admin".into());
+    cases.push((
+        "wrong access",
+        changed,
+        nexus_store::command_kinds::message_post::SEND,
+    ));
+    let mut changed = caller.clone();
+    changed.principal_id = Some("h_local".into());
+    cases.push((
+        "wrong principal",
+        changed,
+        nexus_store::command_kinds::message_post::SEND,
+    ));
+    let mut changed = caller.clone();
+    changed.runtime_id = Some("transport:other".into());
+    cases.push((
+        "wrong runtime",
+        changed,
+        nexus_store::command_kinds::message_post::SEND,
+    ));
+    let mut changed = caller.clone();
+    changed.agent_id = Some("a_intruder".into());
+    cases.push((
+        "agent shaped",
+        changed,
+        nexus_store::command_kinds::message_post::SEND,
+    ));
+    let mut changed = caller.clone();
+    changed.client_key = Some("unregistered".into());
+    cases.push((
+        "client keyed",
+        changed,
+        nexus_store::command_kinds::message_post::SEND,
+    ));
+    cases.push((
+        "wrong command",
+        caller,
+        nexus_store::command_kinds::thread::CREATE,
+    ));
+
+    for (index, (label, caller, kind)) in cases.into_iter().enumerate() {
+        let command_id = format!("cmd-external-rejected-{index}");
+        let response = daemon_ipc::handle_request(
+            &state,
+            "boot-token",
+            DaemonIpcRequest {
+                version: DAEMON_IPC_PROTOCOL_VERSION,
+                token: "boot-token".into(),
+                request_id: format!("rpc-external-rejected-{index}"),
+                caller: Some(caller),
+                call: DaemonIpcCall::Enqueue {
+                    command_id: command_id.clone(),
+                    kind: kind.into(),
+                    params: serde_json::json!({
+                        "to": {"verb": "dm", "name": "ipc-agent"},
+                        "body": "must not enqueue"
+                    }),
+                    idempotency_key: None,
+                },
+            },
+        )
+        .await;
+        assert_eq!(
+            response.error.expect(label).code,
+            nexus_contracts::codes::UNAUTHORIZED,
+            "{label}"
+        );
+        assert!(
+            CommandIntents::new(&state.store)
+                .get(&command_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "{label}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_prompt_enqueue_is_atomically_bounded_and_retry_safe() {
+    let state = state().await;
+    CommandIntents::new(&state.store)
+        .insert_pending(nexus_store::repos::NewCommandIntent {
+            command_id: "cmd-capacity-foreign-metadata".into(),
+            kind: nexus_store::command_kinds::harness::PROMPT.into(),
+            project: "foreign-metadata".into(),
+            caller_name: "foreign-caller".into(),
+            caller_session_id: None,
+            caller_agent_id: None,
+            caller_runtime_id: None,
+            caller_client_key: None,
+            caller_principal_id: None,
+            caller_kind: Some("human".into()),
+            caller_tier: Some("admin".into()),
+            idempotency_key: Some("cm-capacity-foreign-metadata".into()),
+            request_json: serde_json::json!({
+                "name": "bounded",
+                "agentId": "a_bounded",
+                "text": "project metadata cannot partition capacity",
+                "clientMessageId": "cm-capacity-foreign-metadata"
+            })
+            .to_string(),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+    let request = |index: usize, target: &str| DaemonIpcRequest {
+        version: DAEMON_IPC_PROTOCOL_VERSION,
+        token: "boot-token".into(),
+        request_id: format!("rpc-capacity-{target}-{index}"),
+        caller: None,
+        call: DaemonIpcCall::Enqueue {
+            command_id: format!("cmd-capacity-{target}-{index}"),
+            kind: nexus_store::command_kinds::harness::PROMPT.into(),
+            params: serde_json::json!({
+                "name": target,
+                "agentId": format!("a_{target}"),
+                "text": format!("queued input {index}"),
+                "clientMessageId": format!("cm-capacity-{target}-{index}")
+            }),
+            idempotency_key: Some(format!("cm-capacity-{target}-{index}")),
+        },
+    };
+
+    let responses =
+        futures::future::join_all((0..128).map(|index| {
+            daemon_ipc::handle_request(&state, "boot-token", request(index, "bounded"))
+        }))
+        .await;
+    let accepted = responses
+        .iter()
+        .filter(|response| response.error.is_none())
+        .count();
+    let full = responses
+        .iter()
+        .filter(|response| {
+            response.error.as_ref().map(|error| error.code)
+                == Some(nexus_contracts::codes::COMMAND_QUEUE_FULL)
+        })
+        .count();
+    assert_eq!(accepted, 99);
+    assert_eq!(full, 29);
+
+    let accepted_index = responses
+        .iter()
+        .position(|response| response.error.is_none())
+        .expect("one capacity probe must be accepted");
+    let mut retry = request(accepted_index, "bounded");
+    retry.request_id = "rpc-capacity-retry".into();
+    let retry = daemon_ipc::handle_request(&state, "boot-token", retry).await;
+    assert!(
+        retry.error.is_none(),
+        "an accepted command retry must remain accepted"
+    );
+    assert_eq!(
+        retry.result.unwrap()["commandId"],
+        format!("cmd-capacity-bounded-{accepted_index}")
+    );
+
+    let other = daemon_ipc::handle_request(&state, "boot-token", request(0, "independent")).await;
+    assert!(
+        other.error.is_none(),
+        "capacity must be isolated by stable target"
+    );
+
+    let mut rows = state
+        .store
+        .conn
+        .query(
+            "SELECT COUNT(*) FROM command_intents WHERE kind = 'harness.prompt' \
+             AND status = 'pending' AND json_extract(request_json, '$.agentId') = 'a_bounded'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        100
+    );
+}
+
+#[tokio::test]
+async fn shutdown_fence_rejects_new_enqueue_before_durable_acceptance() {
+    let state = state().await;
+    command_worker::begin_shutdown(&state).await;
+    let request = DaemonIpcRequest {
+        version: DAEMON_IPC_PROTOCOL_VERSION,
+        token: "boot-token".into(),
+        request_id: "rpc-after-shutdown-fence".into(),
+        caller: None,
+        call: DaemonIpcCall::Enqueue {
+            command_id: "cmd-after-shutdown-fence".into(),
+            kind: nexus_store::command_kinds::harness::PROMPT.into(),
+            params: serde_json::json!({
+                "name": "ipc-agent",
+                "text": "must retry against the next daemon",
+                "clientMessageId": "client-after-shutdown-fence"
+            }),
+            idempotency_key: Some("client-after-shutdown-fence".into()),
+        },
+    };
+
+    let response = daemon_ipc::handle_request(&state, "boot-token", request).await;
+    let error = response
+        .error
+        .expect("post-fence ingress must fail before durable acceptance");
+    assert_eq!(error.code, nexus_contracts::codes::INTERNAL_ERROR);
+    assert!(error.message.contains("shutting down"));
+    assert!(
+        CommandIntents::new(&state.store)
+            .get("cmd-after-shutdown-fence")
+            .await
+            .unwrap()
+            .is_none(),
+        "a rejected post-fence command must leave no durable row"
+    );
 }
 
 #[tokio::test]

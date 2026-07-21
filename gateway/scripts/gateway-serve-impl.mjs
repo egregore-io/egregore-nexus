@@ -31,11 +31,14 @@ process.on("unhandledRejection", (error) => {
 const apiOnly = process.argv.includes("--api-only") || truthy(process.env.NEXUS_GATEWAY_API_ONLY);
 const discoveryMode = resolveDiscoveryMode(apiOnly);
 const port = await resolvePort();
-const runner = apiOnly ? await startApiOnlyGateway(port) : await startPackagedGateway(port);
+const host = clean(process.env.HOST) ?? clean(process.env.NEXUS_GATEWAY_BIND) ?? "127.0.0.1";
+const runner = apiOnly
+  ? await startApiOnlyGateway(port, host)
+  : await startPackagedGateway(port, host);
 
 await waitForGateway(port);
 const discoveryRecord = discoveryMode === "write"
-  ? await writeGatewayDiscovery(port, process.pid)
+  ? await writeGatewayDiscovery(port, process.pid, host)
   : undefined;
 
 runner.onExit((code, signal) => {
@@ -48,7 +51,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   });
 }
 
-async function startApiOnlyGateway(port) {
+async function startApiOnlyGateway(port, host) {
   const packagedEntry = join(FRONTEND_DIR, "dist-gateway/headless.mjs");
   if (!existsSync(packagedEntry)) {
     throw new Error(
@@ -60,7 +63,6 @@ async function startApiOnlyGateway(port) {
   const sockets = new Set();
   server.on("connection", (socket) => trackSocket(sockets, socket));
   server.on("upgrade", (_request, socket) => trackSocket(sockets, socket));
-  const host = clean(process.env.HOST) ?? clean(process.env.NEXUS_GATEWAY_BIND) ?? "127.0.0.1";
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, resolve);
@@ -110,7 +112,7 @@ async function removeRunDistSnapshot() {
   }
 }
 
-async function startPackagedGateway(port) {
+async function startPackagedGateway(port, host) {
   const projectionBundle = join(FRONTEND_DIR, "dist-gateway/headless.mjs");
   if (!existsSync(projectionBundle)) {
     throw new Error(
@@ -140,7 +142,6 @@ async function startPackagedGateway(port) {
   servingClientDir = join(distDir, "client");
   const handler = await loadPackagedServerHandler(join(distDir, "server/server.js"));
   const guardedHandler = (request) => guardGatewayBrowserRequest(request, handler);
-  const host = clean(process.env.HOST) ?? clean(process.env.NEXUS_GATEWAY_BIND) ?? "127.0.0.1";
   const sockets = new Set();
   const server = createHttpServer((req, res) => {
     void handlePackagedRequest(guardedHandler, req, res);
@@ -382,12 +383,13 @@ async function waitForGateway(port) {
   );
 }
 
-async function writeGatewayDiscovery(port, pid) {
+async function writeGatewayDiscovery(port, pid, host) {
   const home = process.env.NEXUS_HOME ?? join(homedir(), ".nexus");
   const instanceId = await loadOrCreateInstanceId(home);
+  const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   const record = {
     instanceId,
-    url: `http://localhost:${port}`,
+    url: `http://${urlHost}:${port}`,
     port,
     authMode: resolveAuthMode(),
     pid,

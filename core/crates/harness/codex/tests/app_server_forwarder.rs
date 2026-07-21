@@ -90,7 +90,7 @@ async fn forwarder_emits_text_then_turn_end() {
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,
@@ -206,7 +206,7 @@ async fn forwarder_suppresses_completed_agent_message_after_streamed_delta() {
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,
@@ -344,7 +344,7 @@ async fn forwarder_preserves_native_text_item_id_across_interleaved_tool_call() 
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,
@@ -471,7 +471,7 @@ async fn forwarder_publishes_tool_call_observations_once_per_item_phase() {
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -134,6 +135,35 @@ struct BlockingAdapter {
     release: tokio::sync::Semaphore,
 }
 
+#[derive(Default)]
+struct CompactAdapter {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl Adapter for CompactAdapter {
+    async fn open_session(&self) -> Result<(), NexusError> {
+        Ok(())
+    }
+
+    async fn resume(&self, _resume_key: &str) -> Result<(), NexusError> {
+        Ok(())
+    }
+
+    async fn inject(&self, _prompt: String) -> Result<(), AdapterInjectError> {
+        Ok(())
+    }
+
+    async fn compact(&self) -> Result<(), AdapterInjectError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn stream_updates(&self) -> Result<Vec<StreamEvent>, NexusError> {
+        Ok(Vec::new())
+    }
+}
+
 impl Default for BlockingAdapter {
     fn default() -> Self {
         Self {
@@ -215,6 +245,47 @@ async fn acp_turn_activity_is_observable_until_authoritative_completion() {
     turn.await.unwrap().unwrap();
     completion.await.unwrap().unwrap();
     assert!(agent.active_turn_sessions().is_empty());
+}
+
+#[tokio::test]
+async fn compact_dispatches_to_the_bound_adapter_exactly_once() {
+    let agent = Agent::new(
+        AdapterRegistry::with_builtins(),
+        Arc::new(StubIdentity),
+        Arc::new(RecordingSink::default()),
+    );
+    let adapter = Arc::new(CompactAdapter::default());
+    let session = SessionId("s_compact".into());
+    agent.bind_session(
+        session.clone(),
+        "compact-agent",
+        "demo",
+        adapter.clone(),
+        false,
+    );
+
+    agent
+        .compact(&session)
+        .await
+        .expect("compact should succeed");
+
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn compact_refuses_an_unsupported_adapter_without_injecting_text() {
+    let (agent, mock, _sink, session) = agent_with_bound_mock();
+
+    let error = agent
+        .compact(&session)
+        .await
+        .expect_err("unsupported compact must fail closed");
+
+    assert!(error.message.contains("compact is not supported"));
+    assert!(
+        mock.injected_prompts().is_empty(),
+        "unsupported compact must never become ordinary model text"
+    );
 }
 
 #[tokio::test]

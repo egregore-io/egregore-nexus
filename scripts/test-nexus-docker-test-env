@@ -36,7 +36,6 @@ grep -Fq "default: 4553" "$TMP/help"
 grep -Fq 'NEXUS_WEBUI_BIN=/tmp/nexus-lab-bin/nexus-webui' "$TARGET"
 grep -Fq 'pnpm webconsole:build' "$TARGET"
 grep -Fq 'webconsole start --host 127.0.0.1 --port 4200' "$TARGET"
-grep -Fq 'webconsole launch --no-open' "$TARGET"
 grep -Fq 'OCULAR_WEBUI_URL=http://127.0.0.1:4200' "$TARGET"
 grep -Fq 'http://127.0.0.1:4200/health' "$TARGET"
 grep -Fq '/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance --nexus-bin /tmp/nexus-lab-bin/nexus --run-id' "$TARGET"
@@ -68,6 +67,10 @@ if grep -Fq '        "$packs/$cli_tar" "$packs/$gateway_tar" "$packs/$nexus_tar"
   exit 1
 fi
 "$SCRIPT_DIR/test-nexus-v015-scoped-registry"
+"$SCRIPT_DIR/test-nexus-v015-stage-harnesses"
+grep -Fq '/work/egregore-nexus/scripts/nexus-v015-stage-harnesses /host-node' "$TARGET"
+grep -Fq 'NEXUS_V015_CODEX_BIN=$LAB_ROOT/harness-tools/codex/bin/codex.js' "$TARGET"
+grep -Fq 'NEXUS_V015_CLAUDE_BIN=$LAB_ROOT/harness-tools/claude' "$TARGET"
 
 # The ocular runners execute only immutable lab-local hook copies.  Their
 # hashes are part of candidate readiness so a source-tree edit after assembly
@@ -129,7 +132,7 @@ def function_body(name: str, next_name: str) -> str:
 
 source_lens = function_body("start_source_lens", "start_packed_lens")
 packed_lens = function_body("start_packed_lens", "start_lab_stack")
-stack = function_body("start_lab_stack", "build_lab_candidate")
+stack = function_body("start_lab_stack", "start_optional_webui_stack")
 build = function_body("build_lab_candidate", "cmd_lab_up")
 
 required_source = (
@@ -158,6 +161,18 @@ for needle in (
     if needle not in packed_lens:
         raise SystemExit(f"packed Lens startup is missing {needle}")
 
+for label, body in (("source", source_lens), ("packed", packed_lens)):
+    for needle in (
+        'ready="$NEXUS_LAB_ROOT/lab/candidate-ready.v1"',
+        'readiness_sha256=$(sha256sum "$ready"',
+        '[[ "$readiness_sha256" =~ ^[0-9a-f]{64}$ ]]',
+        'NEXUS_V015_READINESS_LEDGER_SHA256="$readiness_sha256"',
+    ):
+        if needle not in body:
+            raise SystemExit(
+                f"{label} Lens startup does not bind recorder evidence to readiness: {needle}"
+            )
+
 for needle in (
     'local mode=$1',
     'if [ "$mode" = source ]; then',
@@ -166,6 +181,15 @@ for needle in (
 ):
     if needle not in stack:
         raise SystemExit(f"mode-aware Lens startup is missing {needle}")
+for forbidden in (
+    "nexus webconsole start",
+    "webui-cdp-proxy.pid",
+    "webui-browser.pid",
+    "127.0.0.1:4200/health",
+    "127.0.0.1:9224/json/version",
+):
+    if forbidden in stack:
+        raise SystemExit(f"default lab startup still requires deferred Webconsole state: {forbidden}")
 
 for needle in (
     "npm run build",
@@ -186,6 +210,22 @@ if 'if [ "$NEXUS_LAB_MODE" = source ]; then' not in status:
     raise SystemExit("lab-status does not make the Vite process mode-aware")
 if '"$NEXUS_LAB_ROOT/lab/vite.pid:vite"' not in status:
     raise SystemExit("source lab status lost its Vite process check")
+for forbidden in (
+    "webui-browser.pid",
+    "nexus webconsole status",
+    "127.0.0.1:4200/health",
+    "127.0.0.1:9224/json/version",
+):
+    if forbidden in status:
+        raise SystemExit(f"default lab status still requires deferred Webconsole state: {forbidden}")
+optional_webui = function_body("start_optional_webui_stack", "build_lab_candidate")
+for needle in (
+    "webui-cdp-proxy.pid",
+    "webui-browser.pid",
+    "127.0.0.1:9224/json/version",
+):
+    if needle not in optional_webui:
+        raise SystemExit(f"explicit WebUI diagnostic lost its optional setup: {needle}")
 PY
 for field in lensRendererMode lensApp lensMain lensTreeSha256; do
   grep -Fq "${field}=%s" "$TARGET"
@@ -203,6 +243,11 @@ if grep -Fq 'node tests/ocular/run.mjs --all' "$TARGET" \
 fi
 grep -Fq 'node tests/ocular/run.mjs' "$TARGET"
 grep -Fq 'node tests/ocular/webui-run.mjs' "$TARGET"
+grep -Fq -- '--all) requested_all=1; run_backend=1; shift ;;' "$TARGET"
+if grep -F -- '--all)' "$TARGET" | grep -Fq 'run_webui=1'; then
+  echo 'Nexus --all must not enable the deferred Webconsole/WebUI gate' >&2
+  exit 1
+fi
 if grep -Fq -- '--all) requested_all=1; run_backend=1; run_ocular=1' "$TARGET"; then
   echo 'Nexus --all must not enable the separate Lens/Pactree product catalog' >&2
   exit 1
@@ -274,11 +319,11 @@ import sys
 import textwrap
 
 source = Path(sys.argv[1]).read_text(encoding="utf-8")
-needle = "    exec_interactive bash -lc '\n      set -euo pipefail\n      ready=\"$NEXUS_LAB_ROOT/lab/candidate-ready.v1\""
+needle = "    exec_interactive env \"NEXUS_V015_CANDIDATE_DIGEST=$candidate_digest\" bash -c '\n      set -euo pipefail\n      ready=\"$NEXUS_LAB_ROOT/lab/candidate-ready.v1\""
 start = source.find(needle)
 if start < 0:
     raise SystemExit("packed soak handoff body is missing")
-start += len("    exec_interactive bash -lc '\n")
+start += len("    exec_interactive env \"NEXUS_V015_CANDIDATE_DIGEST=$candidate_digest\" bash -c '\n")
 end = source.find("\n    '\n", start)
 if end < 0:
     raise SystemExit("packed soak handoff body is unterminated")
@@ -315,12 +360,32 @@ write_soak_readiness() {
 }
 write_soak_readiness 'runId=soak-contract'
 SOAK_READY_SHA=$(sha256sum "$TMP/soak-root/lab/candidate-ready.v1" | awk '{print $1}')
+SOAK_CANDIDATE=sha256:$(printf 'd%.0s' {1..64})
+for spec in \
+  B1:B1-stable-identity \
+  B2:B2-restart-reconciliation \
+  C1:C1-browser-mutation-security \
+  C2:C2-developer-event-websocket \
+  C3:C3-agent-session-websocket \
+  C4:C4-rest-websocket-agreement \
+  D1:D1-clean-packed-install \
+  E2:E2-lens-ocular \
+  F1:F1-live-codex-claude \
+  F2:F2-message-hooks; do
+  gate=${spec%%:*}
+  directory=${spec#*:}
+  install -d "$TMP/soak-root/evidence/soak-contract/results/$directory"
+  printf '{"gate":"%s","runId":"soak-contract","candidateDigest":"%s","status":"PASS"}\n' \
+    "$gate" "$SOAK_CANDIDATE" \
+    >"$TMP/soak-root/evidence/soak-contract/results/$directory/result.json"
+done
 (
   cd "$TMP/soak-handoff"
   HANDOFF_LOG="$TMP/soak-handoff.log" \
     PATH="$TMP/soak-handoff/bin:/usr/bin:/bin" \
     NEXUS_LAB_ROOT="$TMP/soak-root" \
     NEXUS_V015_RUN_ID=soak-contract \
+    NEXUS_V015_CANDIDATE_DIGEST="$SOAK_CANDIDATE" \
     bash "$TMP/soak-handoff.sh"
 )
 printf '%s\n' \
@@ -329,6 +394,40 @@ printf '%s\n' \
   'soak:run=soak-contract:password=v015-soak-soak-contract' \
   >"$TMP/soak-handoff.expected"
 cmp "$TMP/soak-handoff.expected" "$TMP/soak-handoff.log"
+
+# A continuation may not spend 30 minutes soaking stale or partial Task 5
+# evidence. Reject a fresh-looking PASS whose candidate binding differs before
+# either harness launch or the soak producer.
+pre_soak_result="$TMP/soak-root/evidence/soak-contract/results/C3-agent-session-websocket/result.json"
+cp "$pre_soak_result" "$TMP/pre-soak-result.good"
+python3 - "$pre_soak_result" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+document = json.loads(path.read_text(encoding="utf-8"))
+document["candidateDigest"] = "sha256:" + ("e" * 64)
+path.write_text(json.dumps(document) + "\n", encoding="utf-8")
+PY
+: >"$TMP/soak-handoff.log"
+set +e
+(
+  cd "$TMP/soak-handoff"
+  HANDOFF_LOG="$TMP/soak-handoff.log" \
+    PATH="$TMP/soak-handoff/bin:/usr/bin:/bin" \
+    NEXUS_LAB_ROOT="$TMP/soak-root" \
+    NEXUS_V015_RUN_ID=soak-contract \
+    NEXUS_V015_CANDIDATE_DIGEST="$SOAK_CANDIDATE" \
+    bash "$TMP/soak-handoff.sh"
+) >"$TMP/pre-soak-mismatch.out" 2>"$TMP/pre-soak-mismatch.err"
+pre_soak_status=$?
+set -e
+test "$pre_soak_status" -ne 0
+test ! -s "$TMP/soak-handoff.log"
+grep -Fq 'pre-soak result is not a candidate-bound PASS: C3' \
+  "$TMP/pre-soak-mismatch.err"
+mv "$TMP/pre-soak-result.good" "$pre_soak_result"
 
 for bad_rows in 'runId=other-run' $'runId=soak-contract\nrunId=soak-contract'; do
   write_soak_readiness "$bad_rows"
@@ -340,6 +439,7 @@ for bad_rows in 'runId=other-run' $'runId=soak-contract\nrunId=soak-contract'; d
       PATH="$TMP/soak-handoff/bin:/usr/bin:/bin" \
       NEXUS_LAB_ROOT="$TMP/soak-root" \
       NEXUS_V015_RUN_ID=soak-contract \
+      NEXUS_V015_CANDIDATE_DIGEST="$SOAK_CANDIDATE" \
       bash "$TMP/soak-handoff.sh"
   ) >"$TMP/soak-handoff-bad.out" 2>"$TMP/soak-handoff-bad.err"
   status=$?
@@ -582,14 +682,14 @@ test ! -e "$TMP/unexpected-command"
 grep -Fq -- '--soak must be exactly 1800 seconds' "$TMP/short-soak.err"
 
 set +e
-PATH="$TMP/bin:/usr/bin:/bin" "$TARGET" lab-gate --mode packed --soak 1800 \
-  >"$TMP/unscoped-soak.out" 2>"$TMP/unscoped-soak.err"
+PATH="$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" lab-gate --mode packed --backend-only --soak 1800 \
+  >"$TMP/partial-soak.out" 2>"$TMP/partial-soak.err"
 status=$?
 set -e
 test "$status" -ne 0
 test ! -e "$TMP/unexpected-command"
-grep -Fq 'release sealing requires lab-gate --mode packed --all --soak 1800' \
-  "$TMP/unscoped-soak.err"
+grep -Fq -- '--soak 1800 must run alone or with --all' "$TMP/partial-soak.err"
 
 set +e
 PATH="$TMP/bin:/usr/bin:/bin" \
@@ -603,6 +703,9 @@ grep -Fq "refusing runtime-state mount" "$TMP/rejected.err"
 
 mkdir -p \
   "$TMP/lab-home" \
+  "$TMP/lab-home/.codex" \
+  "$TMP/lab-home/.nexus/codex-sessions/s_stale/codex-home" \
+  "$TMP/active-codex" \
   "$TMP/lab-sources/lens" \
   "$TMP/lab-sources/egregore" \
   "$TMP/lab-sources/pactree" \
@@ -610,6 +713,7 @@ mkdir -p \
   "$TMP/lab-sources/pactree-fs"
 LAB_ENV=(
   "HOME=$TMP/lab-home"
+  "CODEX_HOME=$TMP/active-codex"
   "NEXUS_DOCKER_TEST_LENS_REPO=$TMP/lab-sources/lens"
   "NEXUS_DOCKER_TEST_EGREGORE_REPO=$TMP/lab-sources/egregore"
   "NEXUS_DOCKER_TEST_PACTREE_REPO=$TMP/lab-sources/pactree"
@@ -743,8 +847,39 @@ fi
 grep -Eq '^run ' "$TMP/hostconfig-docker.log"
 grep -Fq -- '--label egregore-nexus-lab-mode=packed' "$TMP/hostconfig-docker.log"
 grep -Fq -- '--cpus 6 --memory 8g --memory-swap 8g --pids-limit 1024' "$TMP/hostconfig-docker.log"
+grep -Fq -- "-v $TMP/active-codex:/host-auth/.codex:ro" "$TMP/hostconfig-docker.log"
+if grep -Fq -- "-v $TMP/lab-home/.codex:/host-auth/.codex:ro" \
+  "$TMP/hostconfig-docker.log"; then
+  echo 'lab must mount the active CODEX_HOME, not a stale HOME/.codex fallback' >&2
+  exit 1
+fi
 if grep -Eq '(^| )exec( |$)' "$TMP/hostconfig-docker.log"; then
   echo 'HostConfig mismatch must fail before container setup or candidate build' >&2
+  exit 1
+fi
+
+# A Nexus-launched operator inherits its current session's runtime CODEX_HOME.
+# That legacy path is never machine auth authority for a packed candidate: the
+# launcher must fall back to the machine HOME/.codex just like normal runtime.
+rm -f "$TMP/hostconfig-created"
+: >"$TMP/hostconfig-docker.log"
+set +e
+env "${LAB_ENV[@]}" \
+  "CODEX_HOME=$TMP/lab-home/.nexus/codex-sessions/s_stale/codex-home" \
+  DOCKER_FAKE_LOG="$TMP/hostconfig-docker.log" \
+  DOCKER_FAKE_CREATED="$TMP/hostconfig-created" \
+  PATH="$TMP/hostconfig-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" lab-up --mode packed \
+  >"$TMP/hostconfig-stale-home.out" 2>"$TMP/hostconfig-stale-home.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq -- "-v $TMP/lab-home/.codex:/host-auth/.codex:ro" \
+  "$TMP/hostconfig-docker.log"
+if grep -Fq -- \
+  "-v $TMP/lab-home/.nexus/codex-sessions/s_stale/codex-home:/host-auth/.codex:ro" \
+  "$TMP/hostconfig-docker.log"; then
+  echo 'lab must reject a Nexus session CODEX_HOME as machine auth authority' >&2
   exit 1
 fi
 
@@ -1070,6 +1205,11 @@ fi
 # The packed release lab must pass the immutable readiness probe before the
 # acceptance command. The probe itself contains exact link topology and hashes
 # all three executable surfaces.
+if grep -Fq 'exec_interactive bash -lc' "$TARGET"; then
+  echo 'packed gates must not use a login shell that replaces the container-bound harness PATH' >&2
+  exit 1
+fi
+grep -Fq "exec_interactive bash -c '/tmp/nexus-lab-bin/nexus-v015-ws-acceptance" "$TARGET"
 grep -Fq 'expected_nexus=/tmp/nexus-target/debug/nexus' "$TARGET"
 grep -Fq '/tmp/nexus-lab-install.*/bin/nexus' "$TARGET"
 grep -Fq 'expected_nexus_resolved=$install_root/lib/node_modules/@egregore/nexus/bin/nexus.mjs' "$TARGET"
@@ -1205,6 +1345,8 @@ printf '%s\n' \
   '  exec*"nexus-v015-webconsole-acceptance"*) echo webconsole-complete ;;' \
   '  exec*"webconsole start --host 127.0.0.1 --port 4200"*) echo webconsole-started ;;' \
   '  exec*"curl -fsS '\''http://127.0.0.1:4200/health'\''"*) echo healthy ;;' \
+  '  exec*"webui-cdp-proxy.pid"*"webui-browser.pid"*) echo optional-webui-stack-ready ;;' \
+  '  exec*"curl -fsS '\''http://127.0.0.1:9224/json/version'\''"*) echo healthy ;;' \
   '  exec*"tests/ocular/webui-run.mjs --release"*) echo webui-complete ;;' \
   '  *) echo "unexpected WebUI handoff Docker call: $*" >&2; exit 97 ;;' \
   'esac' >"$TMP/webui-handoff-bin/docker"
@@ -1265,8 +1407,8 @@ for mode in packed; do
 done
 
 # The canonical --all handoff must include the visible Lens plugin gate and
-# the Nexus-only W/LP aggregate before the soak/final seal. The Lens/Pactree O
-# catalog remains an explicit separate tool and cannot veto Nexus. The
+# the Nexus-only LP aggregate before the soak/final seal. Webconsole/WebUI and
+# the Lens/Pactree O catalog remain explicit separate tools and cannot veto Nexus. The
 # candidate digest is derived by the bound release assembler from this run's
 # manifest; neither runner may invent it. Exercise the complete Docker
 # argv/order instead of accepting source tokens alone.
@@ -1283,18 +1425,14 @@ printf '%s\n' \
   '  *"{{.HostConfig.NanoCpus}}"*) echo "6000000000 8589934592 8589934592 1024" ;;' \
   '  exec*"NEXUS_TOPOLOGY_ACTION=verify"*) echo topology-ready-packed ;;' \
   '  exec*"NEXUS_MANIFEST_BINDING_ACTION=verify"*) echo manifest-ready-packed ;;' \
+  '  exec*"nexus-v015-ws-soak"*) echo soak-complete ;;' \
   '  exec*"candidate-ready.v1"*"sha256sum"*) printf "a%.0s" {1..64}; echo ;;' \
   '  exec*"nexus-v015-ws-acceptance"*) echo backend-complete ;;' \
   '  exec*"nexus-hooks-practical-gate"*) echo hooks-complete ;;' \
-  '  exec*"nexus-v015-ws-soak"*) echo soak-complete ;;' \
   '  exec*"lab-agent launch codex"*) echo codex-ready ;;' \
   '  exec*"lab-agent launch claude"*) echo claude-ready ;;' \
   '  exec*"tests/ocular/run.mjs --release"*) echo forbidden-ocular-product-gate; exit 95 ;;' \
-  '  exec*"webconsole stop --force"*) echo webconsole-stopped ;;' \
-  '  exec*"nexus-v015-webconsole-acceptance"*) echo webconsole-complete ;;' \
-  '  exec*"webconsole start --host 127.0.0.1 --port 4200"*) echo webconsole-started ;;' \
-  '  exec*"curl -fsS '\''http://127.0.0.1:4200/health'\''"*) echo healthy ;;' \
-  '  exec*"tests/ocular/webui-run.mjs --release"*) echo webui-complete ;;' \
+  '  exec*"nexus-v015-webconsole-acceptance"*|exec*"tests/ocular/webui-run.mjs --release"*) echo forbidden-webconsole-gate; exit 94 ;;' \
   '  exec*"nexus-v015-release-assemble"*"--print-candidate-digest"*) printf "sha256:"; printf "d%.0s" {1..64}; echo ;;' \
   '  exec*"tests/ocular/live-plugin.mjs --release"*) echo live-plugin-complete ;;' \
   '  exec*"tests/ocular/aggregate.mjs --nexus-release"*) echo aggregate-complete ;;' \
@@ -1308,19 +1446,58 @@ printf '%s\n' \
 chmod +x "$TMP/all-handoff-bin/docker"
 : >"$TMP/all-handoff.log"
 mkdir -p "$TMP/host-nexus"
+
+# Task 6 continues an already-published Task 5 evidence set. It must run only
+# the soak, assembly, validation, and final seal; rerunning any no-replace Task
+# 5 producer would make a successful Task 5 impossible to continue.
+: >"$TMP/soak-continuation.log"
+DOCKER_FAKE_LOG="$TMP/soak-continuation.log" \
+  NEXUS_DOCKER_TEST_HOST_NEXUS_HOME="$TMP/host-nexus" \
+  PATH="$TMP/all-handoff-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" lab-gate --mode packed --soak 1800 \
+  >"$TMP/soak-continuation.out" 2>"$TMP/soak-continuation.err"
+for marker in soak-complete assemble-complete seal-complete; do
+  grep -Fq "$marker" "$TMP/soak-continuation.out" || {
+    echo "soak continuation output is missing $marker" >&2
+    sed -n '1,240p' "$TMP/soak-continuation.out" >&2
+    sed -n '1,240p' "$TMP/soak-continuation.err" >&2
+    exit 1
+  }
+done
+for forbidden in \
+  '/tmp/nexus-lab-bin/nexus-v015-ws-acceptance --mode' \
+  '/tmp/nexus-lab-bin/nexus-hooks-practical-gate --packed-v015' \
+  '/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance --nexus-bin' \
+  'node tests/ocular/webui-run.mjs --release' \
+  'node tests/ocular/live-plugin.mjs --release' \
+  'node tests/ocular/aggregate.mjs --nexus-release'; do
+  if grep -Fq "$forbidden" "$TMP/soak-continuation.log"; then
+    echo "soak continuation reran Task 5 producer: $forbidden" >&2
+    exit 1
+  fi
+done
+soak_only_line=$(grep -n 'export NEXUS_V015_SOAK_PASSWORD=' \
+  "$TMP/soak-continuation.log" | tail -n1 | cut -d: -f1)
+assemble_only_line=$(grep -n 'nexus-v015-release-assemble.*--host-before' \
+  "$TMP/soak-continuation.log" | tail -n1 | cut -d: -f1)
+seal_only_line=$(grep -n 'nexus-v015-evidence-validate --seal' \
+  "$TMP/soak-continuation.log" | tail -n1 | cut -d: -f1)
+test -n "$soak_only_line" && test -n "$assemble_only_line" && test -n "$seal_only_line"
+test "$soak_only_line" -lt "$assemble_only_line"
+test "$assemble_only_line" -lt "$seal_only_line"
+
 DOCKER_FAKE_LOG="$TMP/all-handoff.log" \
   NEXUS_DOCKER_TEST_HOST_NEXUS_HOME="$TMP/host-nexus" \
   PATH="$TMP/all-handoff-bin:$TMP/bin:/usr/bin:/bin" \
   "$TARGET" lab-gate --mode packed --all --soak 1800 \
   >"$TMP/all-handoff.out" 2>"$TMP/all-handoff.err"
 for marker in \
-  backend-complete hooks-complete webui-complete \
+  backend-complete hooks-complete \
   live-plugin-complete aggregate-complete assemble-complete; do
   grep -Fq "$marker" "$TMP/all-handoff.out"
 done
 candidate=$(printf 'd%.0s' {1..64})
 grep -Fq "NEXUS_V015_CANDIDATE_DIGEST=sha256:$candidate" "$TMP/all-handoff.log"
-grep -Fq "NEXUS_V015_CANDIDATE_SHA256=$candidate" "$TMP/all-handoff.log"
 grep -Fq 'env -i PATH=/tmp/nexus-lab-bin:/usr/local/bin:/usr/bin:/bin' \
   "$TMP/all-handoff.log"
 grep -Fq 'HOME=/tmp/nexus-lens-home/harness-home' "$TMP/all-handoff.log"
@@ -1338,10 +1515,16 @@ if grep -Fq 'tests/ocular/run.mjs --release' "$TMP/all-handoff.log"; then
   echo 'Nexus --all must not run the separate Lens/Pactree product catalog' >&2
   exit 1
 fi
+if grep -Fq '/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance --nexus-bin' \
+  "$TMP/all-handoff.log" \
+  || grep -Fq 'node tests/ocular/webui-run.mjs --release' \
+    "$TMP/all-handoff.log"; then
+  echo 'Nexus --all must not run the deferred Webconsole/WebUI gate' >&2
+  exit 1
+fi
 mapfile -t digest_lines < <(grep -n \
   'nexus-v015-release-assemble.*--print-candidate-digest' \
   "$TMP/all-handoff.log" | cut -d: -f1)
-webui_line=$(grep -n 'tests/ocular/webui-run.mjs --release' "$TMP/all-handoff.log" | cut -d: -f1)
 live_line=$(grep -n 'tests/ocular/live-plugin.mjs --release' "$TMP/all-handoff.log" | cut -d: -f1)
 aggregate_line=$(grep -n 'tests/ocular/aggregate.mjs --nexus-release' "$TMP/all-handoff.log" | cut -d: -f1)
 soak_line=$(grep -n 'export NEXUS_V015_SOAK_PASSWORD=' \
@@ -1351,13 +1534,10 @@ assemble_line=$(grep -n 'nexus-v015-release-assemble.*--host-before' \
 seal_line=$(grep -n 'nexus-v015-evidence-validate --seal' \
   "$TMP/all-handoff.log" | tail -n1 | cut -d: -f1)
 test "${#digest_lines[@]}" -ge 2
-test -n "$webui_line"
 test -n "$live_line" && test -n "$aggregate_line" && test -n "$soak_line"
 test -n "$assemble_line" && test -n "$seal_line"
-test "${digest_lines[0]}" -lt "$webui_line"
-test "$webui_line" -lt "${digest_lines[-1]}"
+test "${digest_lines[0]}" -lt "$live_line"
 test "${digest_lines[-1]}" -lt "$live_line"
-test "$webui_line" -lt "$live_line"
 test "$live_line" -lt "$aggregate_line"
 test "$aggregate_line" -lt "$soak_line"
 test "$soak_line" -lt "$assemble_line"

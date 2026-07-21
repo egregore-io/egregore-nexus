@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TARGET="$SCRIPT_DIR/nexus-v015-stage-harnesses"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+SOURCE="$TMP/host-node"
+LAB_ROOT="$TMP/lab"
+CODEX_SOURCE="$SOURCE/lib/node_modules/@openai/codex"
+CLAUDE_SOURCE="$SOURCE/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+mkdir -p "$CODEX_SOURCE/bin" "$CODEX_SOURCE/node_modules/@openai/codex-linux-x64/vendor" \
+  "$(dirname "$CLAUDE_SOURCE")" "$LAB_ROOT"
+
+printf '%s\n' '#!/usr/bin/env bash' 'echo "codex-cli 1.2.3"' >"$CODEX_SOURCE/bin/codex.js"
+printf '%s\n' '{"name":"@openai/codex"}' >"$CODEX_SOURCE/package.json"
+printf '%s\n' 'platform payload' \
+  >"$CODEX_SOURCE/node_modules/@openai/codex-linux-x64/vendor/payload"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "claude 4.5.6"' >"$CLAUDE_SOURCE"
+ln "$CLAUDE_SOURCE" "$(dirname "$CLAUDE_SOURCE")/claude-hardlink"
+chmod 0775 "$CODEX_SOURCE" "$CODEX_SOURCE/bin" "$CODEX_SOURCE/bin/codex.js" \
+  "$CODEX_SOURCE/node_modules" "$CODEX_SOURCE/node_modules/@openai" \
+  "$CODEX_SOURCE/node_modules/@openai/codex-linux-x64" \
+  "$CODEX_SOURCE/node_modules/@openai/codex-linux-x64/vendor" "$CLAUDE_SOURCE"
+chmod 0664 "$CODEX_SOURCE/package.json" \
+  "$CODEX_SOURCE/node_modules/@openai/codex-linux-x64/vendor/payload"
+
+codex_source_mode=$(stat -c %a "$CODEX_SOURCE/bin/codex.js")
+claude_source_mode=$(stat -c %a "$CLAUDE_SOURCE")
+NEXUS_LAB_ROOT="$LAB_ROOT" "$TARGET" "$SOURCE"
+
+STAGED="$LAB_ROOT/harness-tools"
+test -x "$STAGED/codex/bin/codex.js"
+test -x "$STAGED/claude"
+test "$("$STAGED/codex/bin/codex.js" --version)" = 'codex-cli 1.2.3'
+test "$("$STAGED/claude" --version)" = 'claude 4.5.6'
+test "$(stat -c %a "$STAGED/codex/bin/codex.js")" = 755
+test "$(stat -c %a "$STAGED/claude")" = 755
+test "$(stat -c %a "$STAGED/codex/package.json")" = 644
+test -z "$(find "$STAGED" -perm /022 -print -quit)"
+test "$(stat -c %a "$CODEX_SOURCE/bin/codex.js")" = "$codex_source_mode"
+test "$(stat -c %a "$CLAUDE_SOURCE")" = "$claude_source_mode"
+
+set +e
+NEXUS_LAB_ROOT="$LAB_ROOT" "$TARGET" "$SOURCE" \
+  >"$TMP/repeat.out" 2>"$TMP/repeat.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq 'staged harness directory already exists' "$TMP/repeat.err"
+
+rm -rf "$STAGED"
+rm -rf "$CODEX_SOURCE"
+ln -s "$TMP/foreign-codex" "$SOURCE/lib/node_modules/@openai/codex"
+set +e
+NEXUS_LAB_ROOT="$LAB_ROOT" "$TARGET" "$SOURCE" \
+  >"$TMP/symlink.out" 2>"$TMP/symlink.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq 'Codex package source is missing or unsafe' "$TMP/symlink.err"
+test ! -e "$STAGED"
+
+echo 'v0.1.5 staged harness contract: ok'

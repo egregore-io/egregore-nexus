@@ -44,6 +44,10 @@ mod error {
             codes::PROJECT_SCOPE_VIOLATION
         );
         assert_eq!(NexusError::Paused.to_contract_error().code, codes::PAUSED);
+        assert_eq!(
+            NexusError::CommandQueueFull.to_contract_error().code,
+            codes::COMMAND_QUEUE_FULL
+        );
     }
 }
 

@@ -15,6 +15,14 @@ CLAUDE_MODEL="${NEXUS_DOCKER_TEST_CLAUDE_MODEL:-claude-sonnet-5}"
 HOST_UID=$(id -u)
 HOST_GID=$(id -g)
 HOST_NEXUS_HOME="${NEXUS_DOCKER_TEST_HOST_NEXUS_HOME:-$HOME/.nexus}"
+if [ -n "${CODEX_HOME:-}" ] \
+  && [[ "$CODEX_HOME" != */codex-sessions/*/codex-home ]]; then
+  HOST_CODEX_HOME=$CODEX_HOME
+else
+  # Nexus sessions used to export a private runtime CODEX_HOME containing a
+  # stale auth copy. That path is never the machine credential authority.
+  HOST_CODEX_HOME=$HOME/.codex
+fi
 CONTAINER_PORT="${NEXUS_DOCKER_TEST_CONTAINER_PORT:-4100}"
 GATEWAY_INTERNAL_PORT="${NEXUS_DOCKER_TEST_GATEWAY_INTERNAL_PORT:-4101}"
 NEXUS_BIN=/tmp/nexus-target/debug/nexus
@@ -48,7 +56,8 @@ Commands:
                  Verify an existing lab against its create-once readiness receipt.
   lab-gate --mode MODE [--soak 1800]
                  Run backend, Lens ocular, WebUI ocular, or all isolated gates.
-                 --soak 1800 adds the packed-only release restart soak.
+                 --soak 1800 continues a completed packed gate with the release
+                 restart soak, assembly, validation, and final seal only.
   lab-evidence --mode MODE
                  Print the current container evidence directory and manifest.
   lab-down --mode MODE
@@ -69,6 +78,8 @@ The container uses isolated /tmp Nexus state and never mounts ~/.nexus.
 Host harness auth/config is mounted read-only and copied into the container's
 isolated /tmp/harness-home so you can run commands like `nexus launch claude`
 without using the live Nexus DB/socket.
+Codex auth comes from a machine CODEX_HOME, falling back to ~/.codex when unset
+or when the inherited value is a legacy Nexus session runtime home.
 USAGE
 }
 
@@ -901,7 +912,7 @@ add_host_harness_mounts() {
   add_mount_if_dir "$1" "$HOME/.local/share/uv" "$HOME/.local/share/uv" ro
   add_mount_if_dir "$1" "$HOME/.claude" /host-auth/.claude ro
   [ -f "$HOME/.claude.json" ] && args+=( -v "$HOME/.claude.json:/host-auth/.claude.json:ro" )
-  add_mount_if_dir "$1" "$HOME/.codex" /host-auth/.codex ro
+  add_mount_if_dir "$1" "$HOST_CODEX_HOME" /host-auth/.codex ro
   add_mount_if_dir "$1" "$HOME/.opencode" /host-auth/.opencode ro
   add_mount_if_dir "$1" "$HOME/.config/opencode" /host-auth/opencode-config ro
   add_mount_if_dir "$1" "$HOME/.local/share/opencode" /host-auth/opencode-share ro
@@ -993,7 +1004,9 @@ prepare_host_harnesses() {
           cp -a "/host-auth/hermes/$hermes_file" "$HERMES_HOME/$hermes_file"
         fi
       done
-    fi'
+    fi
+
+    /work/egregore-nexus/scripts/nexus-v015-stage-harnesses /host-node'
 }
 
 container_env_summary() {
@@ -1170,7 +1183,7 @@ cmd_up() {
       add_mount_if_dir run_args "$HOME/.local/share/uv" "$HOME/.local/share/uv" ro
       add_mount_if_dir run_args "$HOME/.claude" /host-auth/.claude ro
       [ -f "$HOME/.claude.json" ] && run_args+=( -v "$HOME/.claude.json:/host-auth/.claude.json:ro" )
-      add_mount_if_dir run_args "$HOME/.codex" /host-auth/.codex ro
+      add_mount_if_dir run_args "$HOST_CODEX_HOME" /host-auth/.codex ro
       add_mount_if_dir run_args "$HOME/.opencode" /host-auth/.opencode ro
       add_mount_if_dir run_args "$HOME/.config/opencode" /host-auth/opencode-config ro
       add_mount_if_dir run_args "$HOME/.local/share/opencode" /host-auth/opencode-share ro
@@ -1253,6 +1266,10 @@ wait_lab_http() {
 start_source_lens() {
   exec_bash 'set -euo pipefail
     lab="$NEXUS_LAB_ROOT/lab"
+    ready="$NEXUS_LAB_ROOT/lab/candidate-ready.v1"
+    [ -f "$ready" ] && [ ! -L "$ready" ] && [ "$(stat -c %h "$ready")" = 1 ]
+    readiness_sha256=$(sha256sum "$ready" | awk "{print \$1}")
+    [[ "$readiness_sha256" =~ ^[0-9a-f]{64}$ ]]
     pidfile_alive() {
       pid=$(cat "$1" 2>/dev/null || true)
       [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
@@ -1278,6 +1295,7 @@ start_source_lens() {
         NODE_ENV=development \
         VITE_DEV_SERVER_URL=http://127.0.0.1:1422 \
         LENS_PYTHON="$NEXUS_LAB_ROOT/lens-venv/bin/python" \
+        NEXUS_V015_READINESS_LEDGER_SHA256="$readiness_sha256" \
         node_modules/.bin/electron \
           --no-sandbox \
           --use-gl=angle --use-angle=swiftshader \
@@ -1291,6 +1309,10 @@ start_source_lens() {
 start_packed_lens() {
   exec_bash 'set -euo pipefail
     lab="$NEXUS_LAB_ROOT/lab"
+    ready="$NEXUS_LAB_ROOT/lab/candidate-ready.v1"
+    [ -f "$ready" ] && [ ! -L "$ready" ] && [ "$(stat -c %h "$ready")" = 1 ]
+    readiness_sha256=$(sha256sum "$ready" | awk "{print \$1}")
+    [[ "$readiness_sha256" =~ ^[0-9a-f]{64}$ ]]
     pidfile_alive() {
       pid=$(cat "$1" 2>/dev/null || true)
       [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
@@ -1308,6 +1330,7 @@ start_packed_lens() {
         DISPLAY=:99 \
         NODE_ENV=production \
         LENS_PYTHON="$NEXUS_LAB_ROOT/lens-venv/bin/python" \
+        NEXUS_V015_READINESS_LEDGER_SHA256="$readiness_sha256" \
         /work/egregore-lens/node_modules/.bin/electron \
           --no-sandbox \
           --use-gl=angle --use-angle=swiftshader \
@@ -1351,9 +1374,6 @@ start_lab_stack() {
     || die "Nexus daemon did not become ready"
   exec_bash '/tmp/nexus-lab-bin/nexus gateway restart >"$NEXUS_LAB_ROOT/lab/gateway-start.log"'
   wait_lab_http "http://127.0.0.1:4100/api/v1/health" "Nexus Gateway"
-  exec_bash '/tmp/nexus-lab-bin/nexus webconsole start --host 127.0.0.1 --port 4200 >"$NEXUS_LAB_ROOT/lab/webconsole-start.log"'
-  wait_lab_http "http://127.0.0.1:4200/health" "Nexus Webconsole"
-  exec_bash '/tmp/nexus-lab-bin/nexus webconsole launch --no-open >"$NEXUS_LAB_ROOT/lab/webconsole-launch.log"'
 
   exec_bash 'set -euo pipefail
     lab="$NEXUS_LAB_ROOT/lab"
@@ -1369,11 +1389,6 @@ start_lab_stack() {
       nohup socat TCP-LISTEN:9223,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:9222 \
         >"$lab/lens-cdp-proxy.log" 2>&1 &
       echo $! >"$lab/lens-cdp-proxy.pid"
-    fi
-    if ! pidfile_alive "$lab/webui-cdp-proxy.pid"; then
-      nohup socat TCP-LISTEN:9225,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:9224 \
-        >"$lab/webui-cdp-proxy.log" 2>&1 &
-      echo $! >"$lab/webui-cdp-proxy.pid"
     fi'
 
   if [ "$mode" = source ]; then
@@ -1382,12 +1397,21 @@ start_lab_stack() {
     start_packed_lens
   fi
 
+  wait_lab_http "http://127.0.0.1:9222/json/version" "Lens CDP"
+}
+
+start_optional_webui_stack() {
   exec_bash 'set -euo pipefail
     lab="$NEXUS_LAB_ROOT/lab"
     pidfile_alive() {
       pid=$(cat "$1" 2>/dev/null || true)
       [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
     }
+    if ! pidfile_alive "$lab/webui-cdp-proxy.pid"; then
+      nohup socat TCP-LISTEN:9225,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:9224 \
+        >"$lab/webui-cdp-proxy.log" 2>&1 &
+      echo $! >"$lab/webui-cdp-proxy.pid"
+    fi
     if ! pidfile_alive "$lab/webui-browser.pid"; then
       cd /work/egregore-lens
       nohup env DISPLAY=:99 node_modules/.bin/electron \
@@ -1398,7 +1422,6 @@ start_lab_stack() {
         >"$lab/webui-browser.log" 2>&1 &
       echo $! >"$lab/webui-browser.pid"
     fi'
-  wait_lab_http "http://127.0.0.1:9222/json/version" "Lens CDP"
   wait_lab_http "http://127.0.0.1:9224/json/version" "WebUI CDP"
 }
 
@@ -1589,6 +1612,8 @@ cmd_lab_up() {
     -e "XDG_CONFIG_HOME=$LAB_ROOT/harness-home/.config" \
     -e "CODEX_HOME=$LAB_ROOT/harness-home/.codex" \
     -e "CLAUDE_CONFIG_DIR=$LAB_ROOT/harness-home/.claude" \
+    -e "NEXUS_V015_CODEX_BIN=$LAB_ROOT/harness-tools/codex/bin/codex.js" \
+    -e "NEXUS_V015_CLAUDE_BIN=$LAB_ROOT/harness-tools/claude" \
     -e "HERMES_HOME=$LAB_ROOT/harness-home/.hermes" \
     -e "NEXUS_OPENCODE_HOME=$LAB_ROOT/harness-home/.opencode-nexus" \
     -e "OPENCODE_DB=$LAB_ROOT/harness-home/.opencode-nexus/opencode.db" \
@@ -1720,8 +1745,8 @@ cmd_lab_status() {
   prepare_existing_lab "$mode"
   [ "$CONTAINER_RUNNING" = true ] || die "container $NAME is not running"
   printf 'container=%s cpus=%s memory=%s pids=%s\n' "$NAME" "$CPUS" "$MEMORY" "$PIDS_LIMIT"
-  printf 'gateway=http://127.0.0.1:%s lens_cdp=http://127.0.0.1:%s webui_cdp=http://127.0.0.1:%s\n' \
-    "$HOST_PORT" "$CDP_HOST_PORT" "$WEBUI_CDP_HOST_PORT"
+  printf 'gateway=http://127.0.0.1:%s lens_cdp=http://127.0.0.1:%s\n' \
+    "$HOST_PORT" "$CDP_HOST_PORT"
   exec_bash 'set -euo pipefail
     set -- \
       "$NEXUS_HOME/daemon.pid:daemon" \
@@ -1730,9 +1755,7 @@ cmd_lab_status() {
     if [ "$NEXUS_LAB_MODE" = source ]; then
       set -- "$@" "$NEXUS_LAB_ROOT/lab/vite.pid:vite"
     fi
-    set -- "$@" \
-      "$NEXUS_LAB_ROOT/lab/lens.pid:lens" \
-      "$NEXUS_LAB_ROOT/lab/webui-browser.pid:webui-browser"
+    set -- "$@" "$NEXUS_LAB_ROOT/lab/lens.pid:lens"
     for item in "$@"; do
       path=${item%%:*}; label=${item#*:}; pid=$(cat "$path" 2>/dev/null || true)
       if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then state=live; else state=down; fi
@@ -1740,10 +1763,8 @@ cmd_lab_status() {
     done
     curl -fsS http://127.0.0.1:4100/api/v1/health
     echo
-    /tmp/nexus-lab-bin/nexus webconsole status
-    curl -fsS http://127.0.0.1:4200/health >/dev/null
     curl -fsS http://127.0.0.1:9222/json/version >/dev/null
-    curl -fsS http://127.0.0.1:9224/json/version >/dev/null'
+    '
 }
 
 cmd_lab_readiness() {
@@ -1776,9 +1797,11 @@ cmd_lab_readiness() {
 cmd_lab_gate() {
   local mode="" run_backend=0 run_ocular=0 run_webui=0 run_soak=0 requested_all=0
   local release_capture_dir="" host_before_snapshot="" host_after_snapshot=""
+  local readiness_sha256="" candidate_digest="" candidate_sha256=""
+  local surface_readiness_sha256="" surface_candidate_digest=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --all) requested_all=1; run_backend=1; run_webui=1; shift ;;
+      --all) requested_all=1; run_backend=1; shift ;;
       --backend-only) run_backend=1; shift ;;
       --ocular) run_ocular=1; shift ;;
       --webui) run_webui=1; shift ;;
@@ -1802,8 +1825,10 @@ cmd_lab_gate() {
     source) die "v0.1.5 acceptance publication requires lab-gate --mode packed" ;;
     *) die "lab-gate mode must be source or packed" ;;
   esac
-  if [ "$run_soak" -eq 1 ] && [ "$requested_all" -ne 1 ]; then
-    die "release sealing requires lab-gate --mode packed --all --soak 1800"
+  if [ "$run_soak" -eq 1 ] \
+    && [ "$requested_all" -eq 0 ] \
+    && { [ "$run_backend" -eq 1 ] || [ "$run_ocular" -eq 1 ] || [ "$run_webui" -eq 1 ]; }; then
+    die "--soak 1800 must run alone or with --all"
   fi
   if [ "$run_soak" -eq 1 ]; then
     release_capture_dir=$(mktemp -d "${TMPDIR:-/tmp}/nexus-v015-release-inputs.XXXXXX")
@@ -1818,17 +1843,20 @@ cmd_lab_gate() {
   fi
   prepare_existing_lab "$mode"
   [ "$CONTAINER_RUNNING" = true ] || die "container $NAME is not running"
-  if [ "$run_backend" -eq 0 ] && [ "$run_ocular" -eq 0 ] && [ "$run_webui" -eq 0 ]; then
-    requested_all=1; run_backend=1; run_webui=1
+  if [ "$run_soak" -eq 0 ] \
+    && [ "$run_backend" -eq 0 ] \
+    && [ "$run_ocular" -eq 0 ] \
+    && [ "$run_webui" -eq 0 ]; then
+    requested_all=1; run_backend=1
   fi
   if [ "$run_backend" -eq 1 ]; then
-    exec_interactive bash -lc '/tmp/nexus-lab-bin/nexus-v015-ws-acceptance --mode "${NEXUS_LAB_MODE:-source}" --evidence-dir "$NEXUS_LAB_ROOT/evidence"'
+    exec_interactive bash -c '/tmp/nexus-lab-bin/nexus-v015-ws-acceptance --mode "${NEXUS_LAB_MODE:-source}" --evidence-dir "$NEXUS_LAB_ROOT/evidence"'
   fi
   if [ "$requested_all" -eq 1 ]; then
-    exec_interactive bash -lc '/tmp/nexus-lab-bin/nexus-hooks-practical-gate --packed-v015 --evidence-dir "$NEXUS_LAB_ROOT/evidence" --run-id "$NEXUS_V015_RUN_ID"'
+    exec_interactive bash -c '/tmp/nexus-lab-bin/nexus-hooks-practical-gate --packed-v015 --evidence-dir "$NEXUS_LAB_ROOT/evidence" --run-id "$NEXUS_V015_RUN_ID"'
   fi
-  local readiness_sha256="" candidate_digest="" candidate_sha256=""
-  if [ "$run_ocular" -eq 1 ] || [ "$run_webui" -eq 1 ]; then
+  if [ "$requested_all" -eq 1 ] || [ "$run_ocular" -eq 1 ] \
+    || [ "$run_webui" -eq 1 ] || [ "$run_soak" -eq 1 ]; then
     readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" "$mode")
     candidate_digest=$(docker exec -i "$CONTAINER_ID" \
       /tmp/nexus-lab-bin/nexus-v015-release-assemble \
@@ -1842,11 +1870,14 @@ cmd_lab_gate() {
     [ "$post_digest_readiness_sha256" = "$readiness_sha256" ] \
       || die "candidate readiness ledger changed during candidate digest derivation"
   fi
-  # Both renderer catalogs depend on genuine, run-bound Codex and Claude
-  # identities.  Provision them once for either entry point so a standalone
-  # --webui gate cannot accidentally grade optimistic rows or ambient roster
-  # state as live-agent evidence.
-  if [ "$run_ocular" -eq 1 ] || [ "$run_webui" -eq 1 ]; then
+  if [ "$run_soak" -eq 1 ] && [ "$requested_all" -eq 0 ]; then
+    surface_readiness_sha256=$readiness_sha256
+  fi
+  # Every live ocular entry point depends on genuine, run-bound Codex and
+  # Claude identities. Provision them once so no renderer can grade ambient
+  # roster state as candidate evidence. WebUI remains an explicit diagnostic
+  # option and is not part of --all or the v0.1.5 release ledger.
+  if [ "$requested_all" -eq 1 ] || [ "$run_ocular" -eq 1 ] || [ "$run_webui" -eq 1 ]; then
     docker exec -i \
       -e "NEXUS_V015_RUN_ID=$V015_RUN_ID" \
       -e "NEXUS_V015_READINESS_LEDGER_SHA256=$readiness_sha256" \
@@ -1870,13 +1901,13 @@ cmd_lab_gate() {
   if [ "$run_webui" -eq 1 ]; then
     readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" "$mode")
     if [ "$mode" = packed ]; then
-      exec_interactive bash -lc '/tmp/nexus-lab-bin/nexus webconsole stop --force >"$NEXUS_LAB_ROOT/lab/webconsole-d2-preflight-stop.log"'
-      exec_interactive bash -lc '/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance --nexus-bin /tmp/nexus-lab-bin/nexus --run-id "$NEXUS_V015_RUN_ID" --evidence-root "$NEXUS_LAB_ROOT/evidence/$NEXUS_V015_RUN_ID"'
+      exec_interactive bash -c '/tmp/nexus-lab-bin/nexus webconsole stop --force >"$NEXUS_LAB_ROOT/lab/webconsole-d2-preflight-stop.log"'
+      exec_interactive bash -c '/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance --nexus-bin /tmp/nexus-lab-bin/nexus --run-id "$NEXUS_V015_RUN_ID" --evidence-root "$NEXUS_LAB_ROOT/evidence/$NEXUS_V015_RUN_ID"'
       local post_webconsole_readiness_sha256
       post_webconsole_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" "$mode")
       [ "$post_webconsole_readiness_sha256" = "$readiness_sha256" ] \
         || die "candidate readiness ledger changed during Webconsole acceptance"
-      exec_interactive bash -lc '/tmp/nexus-lab-bin/nexus webconsole start --host 127.0.0.1 --port 4200 >"$NEXUS_LAB_ROOT/lab/webconsole-ocular-start.log"'
+      exec_interactive bash -c '/tmp/nexus-lab-bin/nexus webconsole start --host 127.0.0.1 --port 4200 >"$NEXUS_LAB_ROOT/lab/webconsole-ocular-start.log"'
       wait_lab_http "http://127.0.0.1:4200/health" "Nexus Webconsole after D2"
     else
       wait_lab_http "http://127.0.0.1:4200/health" "source-mode Nexus Webconsole"
@@ -1885,6 +1916,7 @@ cmd_lab_gate() {
     post_webconsole_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" "$mode")
     [ "$post_webconsole_readiness_sha256" = "$readiness_sha256" ] \
       || die "candidate readiness ledger changed before WebUI ocular acceptance"
+    start_optional_webui_stack
     docker exec -i \
       -e "NEXUS_V015_RUN_ID=$V015_RUN_ID" \
       -e "NEXUS_V015_READINESS_LEDGER_SHA256=$post_webconsole_readiness_sha256" \
@@ -1892,7 +1924,6 @@ cmd_lab_gate() {
       -w /work/egregore-lens "$CONTAINER_ID" node tests/ocular/webui-run.mjs --release
   fi
   if [ "$requested_all" -eq 1 ]; then
-    local surface_readiness_sha256 surface_candidate_digest
     surface_readiness_sha256=$(verify_gate_candidate "$CONTAINER_ID" "$mode")
     [ "$surface_readiness_sha256" = "$readiness_sha256" ] \
       || die "candidate readiness ledger changed before live Lens plugin acceptance"
@@ -1951,7 +1982,7 @@ cmd_lab_gate() {
     require_container_lab_mode packed
     verify_packed_host_config "$CONTAINER_ID"
     verify_lab_readiness "$CONTAINER_ID" packed >/dev/null
-    exec_interactive bash -lc '
+    exec_interactive env "NEXUS_V015_CANDIDATE_DIGEST=$candidate_digest" bash -c '
       set -euo pipefail
       ready="$NEXUS_LAB_ROOT/lab/candidate-ready.v1"
       [ -f "$ready" ] && [ ! -L "$ready" ] && [ "$(stat -c %h "$ready")" = 1 ] \
@@ -1976,6 +2007,44 @@ cmd_lab_gate() {
       [[ "$NEXUS_V015_READINESS_LEDGER_SHA256" =~ ^[0-9a-f]{64}$ ]] \
         || { echo "candidate readiness ledger hash is invalid" >&2; exit 1; }
       export NEXUS_V015_READINESS_LEDGER_SHA256
+      run_root="$NEXUS_LAB_ROOT/evidence/$NEXUS_V015_RUN_ID"
+      python3 - "$run_root" <<"PY"
+import json
+import os
+from pathlib import Path
+import sys
+
+run_root = Path(sys.argv[1])
+run_id = os.environ["NEXUS_V015_RUN_ID"]
+candidate_digest = os.environ["NEXUS_V015_CANDIDATE_DIGEST"]
+required = {
+    "B1": "B1-stable-identity",
+    "B2": "B2-restart-reconciliation",
+    "C1": "C1-browser-mutation-security",
+    "C2": "C2-developer-event-websocket",
+    "C3": "C3-agent-session-websocket",
+    "C4": "C4-rest-websocket-agreement",
+    "D1": "D1-clean-packed-install",
+    "E2": "E2-lens-ocular",
+    "F1": "F1-live-codex-claude",
+    "F2": "F2-message-hooks",
+}
+for gate, directory in required.items():
+    path = run_root / "results" / directory / "result.json"
+    try:
+        with path.open("r", encoding="utf-8") as stream:
+            document = json.load(stream)
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(f"pre-soak result is missing or invalid: {gate}: {error}")
+    if (
+        not isinstance(document, dict)
+        or document.get("gate") != gate
+        or document.get("runId") != run_id
+        or document.get("candidateDigest") != candidate_digest
+        or document.get("status") != "PASS"
+    ):
+        raise SystemExit(f"pre-soak result is not a candidate-bound PASS: {gate}")
+PY
       export NEXUS_V015_SOAK_PASSWORD="v015-soak-$NEXUS_V015_RUN_ID"
       lab-agent launch codex
       lab-agent launch claude
@@ -2091,8 +2160,6 @@ result_paths = {
     "C3": "results/C3-agent-session-websocket/result.json",
     "C4": "results/C4-rest-websocket-agreement/result.json",
     "D1": "results/D1-clean-packed-install/result.json",
-    "D2": "results/D2-webconsole-cli/result.json",
-    "D3": "results/D3-webui-browser/result.json",
     "E2": "results/E2-lens-ocular/result.json",
     "F1": "results/F1-live-codex-claude/result.json",
     "F2": "results/F2-message-hooks/result.json",

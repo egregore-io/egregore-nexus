@@ -67,7 +67,7 @@ async fn launch_discovers_rollout_binds_transport_and_forwards_notifications() {
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: None,
@@ -148,7 +148,7 @@ async fn fresh_launch_can_create_and_bind_an_injectable_thread_immediately() {
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: Some(session_dir.clone()),
@@ -188,7 +188,7 @@ async fn launch_reports_discovered_thread_id_for_persistence() {
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: None,
@@ -241,7 +241,7 @@ async fn launch_with_known_thread_rebinds_existing_bound_session_when_thread_dif
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: None,
@@ -271,7 +271,7 @@ async fn launch_with_known_thread_rebinds_existing_bound_session_when_thread_dif
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: None,
@@ -321,7 +321,7 @@ async fn launch_with_known_thread_id_binds_from_existing_codex_home() {
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: None,

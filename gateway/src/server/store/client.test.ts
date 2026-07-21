@@ -73,6 +73,72 @@ describe("Gateway canonical store client", () => {
     db.close();
   });
 
+  it("queues same-process work without blocking the transaction owner", async () => {
+    const url = await temporaryStoreUrl();
+    const db = await createGatewayStore({ url });
+    await db.execute("CREATE TABLE serialized_writes (value TEXT PRIMARY KEY)");
+
+    const tx = await db.transaction("write");
+    await tx.execute("INSERT INTO serialized_writes (value) VALUES ('transaction')");
+    let concurrentState: "pending" | "fulfilled" | "rejected" = "pending";
+    const concurrent = db.execute(
+      "INSERT INTO serialized_writes (value) VALUES ('concurrent')",
+    ).then(
+      (result) => {
+        concurrentState = "fulfilled";
+        return result;
+      },
+      (error: unknown) => {
+        concurrentState = "rejected";
+        throw error;
+      },
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(concurrentState).toBe("pending");
+    await tx.commit();
+    await expect(concurrent).resolves.toMatchObject({ rowsAffected: 1 });
+    expect(concurrentState).toBe("fulfilled");
+
+    const rows = await db.execute("SELECT value FROM serialized_writes ORDER BY value");
+    expect(rows.rows.map((row) => String(row.value))).toEqual([
+      "concurrent",
+      "transaction",
+    ]);
+    db.close();
+  });
+
+  it("releases queued work after an interactive transaction is closed", async () => {
+    const url = await temporaryStoreUrl();
+    const db = await createGatewayStore({ url });
+    await db.execute("CREATE TABLE closed_transactions (value TEXT PRIMARY KEY)");
+
+    const rolledBack = await db.transaction("write");
+    await rolledBack.execute(
+      "INSERT INTO closed_transactions (value) VALUES ('rolled-back')",
+    );
+    const afterRollback = db.execute(
+      "INSERT INTO closed_transactions (value) VALUES ('after-rollback')",
+    );
+    await rolledBack.rollback();
+    await expect(afterRollback).resolves.toMatchObject({ rowsAffected: 1 });
+
+    const closed = await db.transaction("write");
+    await closed.execute("INSERT INTO closed_transactions (value) VALUES ('closed')");
+    const afterClose = db.execute(
+      "INSERT INTO closed_transactions (value) VALUES ('after-close')",
+    );
+    closed.close();
+    await expect(afterClose).resolves.toMatchObject({ rowsAffected: 1 });
+
+    const rows = await db.execute("SELECT value FROM closed_transactions ORDER BY value");
+    expect(rows.rows.map((row) => String(row.value))).toEqual([
+      "after-close",
+      "after-rollback",
+    ]);
+    db.close();
+  });
+
   it("waits for a concurrent initializer before applying WAL without retrying", async () => {
     const url = await temporaryStoreUrl();
     const lock = await holdExclusiveStoreLock(url);

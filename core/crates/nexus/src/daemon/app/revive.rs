@@ -274,6 +274,10 @@ impl AppState {
         let Some(supervisor) = self.pty.clone() else {
             return Ok(session);
         };
+        // Boot adoption and durable prompt recovery can both discover the same dead structured
+        // runtime. Collapse them into one revive, then re-check the final transport binding while
+        // still holding the shared gate.
+        let _revive = self.runtime_revive_gate.acquire(&session).await;
         let transport = supervisor.codex_transport();
         if transport.is_bound(&session) {
             let bound_thread_id = transport.bound_thread_id(&session);

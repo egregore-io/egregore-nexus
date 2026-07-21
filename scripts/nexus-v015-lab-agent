@@ -254,7 +254,7 @@ if [ -z "$MEMBER" ]; then
     --name "$NAME" \
     --project v015-lab \
     --cwd "$WORKSPACE" \
-    --initial-prompt "Nexus v0.1.5 live acceptance agent. Respond briefly to messages and remain available for DM, thread, queue, steer, reconnect, and replay tests." \
+    --initial-prompt "Nexus v0.1.5 live acceptance agent. When an inbound turn is wrapped in <nexus> and its payload contains V015_, do not call any Nexus messaging tool and do not send an acknowledgement; simply remain available. Only call Nexus messaging tools when an unwrapped direct session prompt explicitly tells you to. Follow direct session prompt output instructions exactly and remain available for DM, thread, queue, steer, reconnect, and replay tests." \
     --meta "$META" \
     --headless \
     --detach \

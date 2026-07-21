@@ -873,8 +873,7 @@ async fn route_request_inner(
             }
             let caller_kind = authenticated_caller_kind(state, c).await?;
             state
-                .agent
-                .prompt_observed(
+                .prompt_observed_before_shutdown(
                     &session,
                     r.text.clone(),
                     std::sync::Arc::new(state.ws.clone()),

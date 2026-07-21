@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo 'Usage: nexus-v015-stage-harnesses HOST_NODE_ROOT' >&2
+  exit 2
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+[ "$#" -eq 1 ] || usage
+[ -n "${NEXUS_LAB_ROOT:-}" ] || die 'NEXUS_LAB_ROOT is required'
+[ -d "$NEXUS_LAB_ROOT" ] && [ ! -L "$NEXUS_LAB_ROOT" ] \
+  || die 'NEXUS_LAB_ROOT is missing or unsafe'
+[ -d "$1" ] && [ ! -L "$1" ] || die 'host Node root is missing or unsafe'
+
+LAB_ROOT=$(realpath "$NEXUS_LAB_ROOT")
+HOST_NODE_ROOT=$(realpath "$1")
+DESTINATION="$LAB_ROOT/harness-tools"
+CODEX_SOURCE="$HOST_NODE_ROOT/lib/node_modules/@openai/codex"
+CLAUDE_SOURCE="$HOST_NODE_ROOT/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+
+[ ! -e "$DESTINATION" ] && [ ! -L "$DESTINATION" ] \
+  || die 'staged harness directory already exists'
+[ -d "$CODEX_SOURCE" ] && [ ! -L "$CODEX_SOURCE" ] \
+  || die 'Codex package source is missing or unsafe'
+[ -f "$CLAUDE_SOURCE" ] && [ ! -L "$CLAUDE_SOURCE" ] \
+  || die 'Claude executable source is missing or unsafe'
+[ -z "$(find "$CODEX_SOURCE" -type l -print -quit)" ] \
+  || die 'Codex package source contains a symbolic link'
+
+STAGE=$(mktemp -d "$LAB_ROOT/.harness-tools.stage.XXXXXX")
+cleanup() {
+  [ -z "${STAGE:-}" ] || rm -rf -- "$STAGE"
+}
+trap cleanup EXIT
+
+mkdir -p "$STAGE/codex"
+cp -a --no-preserve=ownership "$CODEX_SOURCE/." "$STAGE/codex/"
+cp -a --no-preserve=ownership "$CLAUDE_SOURCE" "$STAGE/claude"
+chmod -R go-w "$STAGE"
+chmod 0755 "$STAGE/codex/bin/codex.js" "$STAGE/claude"
+
+[ -z "$(find "$STAGE" -perm /022 -print -quit)" ] \
+  || die 'staged harness bytes remain mutable by group or other users'
+[ "$(stat -c %u "$STAGE/codex/bin/codex.js")" = "$(id -u)" ] \
+  || die 'staged Codex executable owner mismatch'
+[ "$(stat -c %u "$STAGE/claude")" = "$(id -u)" ] \
+  || die 'staged Claude executable owner mismatch'
+"$STAGE/codex/bin/codex.js" --version >/dev/null \
+  || die 'staged Codex executable failed its version probe'
+"$STAGE/claude" --version >/dev/null \
+  || die 'staged Claude executable failed its version probe'
+
+mv -T "$STAGE" "$DESTINATION"
+STAGE=
+trap - EXIT
+printf '%s\n' "$DESTINATION"

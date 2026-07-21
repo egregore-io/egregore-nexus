@@ -146,6 +146,12 @@ impl Adapter for CodexAdapter {
         self.engine.cancel_active_turn().await
     }
 
+    async fn compact(&self) -> Result<(), AdapterInjectError> {
+        // The pinned codex-acp bridge recognizes this ACP session/prompt as a built-in command
+        // and invokes Codex `thread/compact/start`; it never reaches the model as chat text.
+        self.engine.inject("/compact".to_string()).await
+    }
+
     async fn inject_with_accepted_event(
         &self,
         prompt: String,

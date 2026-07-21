@@ -85,7 +85,7 @@ class WsAcceptanceContracts(unittest.TestCase):
                 "rustc": "rustc 1.90.0",
             },
             "environment": {
-                "HOME": str(root),
+                "HOME": str(root / "harness-home"),
                 "NEXUS_HOME": str(root / "nexus"),
                 "API_TOKEN": "<redacted>",
             },
@@ -141,6 +141,13 @@ class WsAcceptanceContracts(unittest.TestCase):
             )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("packed", result.stderr)
+
+    def test_backend_binds_the_authenticated_human_dm_mirror_route(self) -> None:
+        source = TARGET.read_text(encoding="utf-8")
+        self.assertIn(
+            'self.soak.dm_mirror_topic = f"sys.dm.{self.human_name}"',
+            source,
+        )
 
     def test_module_contracts_are_candidate_bound_and_fail_closed(self) -> None:
         module = runpy.run_path(str(TARGET))
@@ -270,7 +277,19 @@ class WsAcceptanceContracts(unittest.TestCase):
                 root,
                 root / "install",
             )
-            document = module["candidate_verification_document"](candidate)
+            readiness_bytes = readiness.read_bytes()
+            checker = mock.Mock(return_value=readiness_bytes)
+            globals_ = module["candidate_verification_document"].__globals__
+            with mock.patch.dict(globals_, {"checked_file": checker}):
+                document = module["candidate_verification_document"](candidate)
+
+        checker.assert_called_once_with(
+            readiness,
+            root,
+            "candidate readiness ledger",
+            expected_uid=0,
+            expected_mode=0o444,
+        )
 
         self.assertEqual(document["status"], "PASS")
         self.assertEqual(document["runId"], "contract-run")
@@ -284,6 +303,101 @@ class WsAcceptanceContracts(unittest.TestCase):
             "--verify-candidate-only",
         ])
         self.assertTrue(parsed.verify_candidate_only)
+
+    def test_readiness_reads_require_root_owned_immutable_authority(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        root = Path("/tmp/nexus-lens-home")
+        readiness = root / "lab" / "candidate-ready.v1"
+        raw = b"schema=1\nrunId=contract-run\n"
+
+        parse_checker = mock.Mock(return_value=raw)
+        parse_globals = module["parse_readiness"].__globals__
+        with mock.patch.dict(parse_globals, {"checked_file": parse_checker}):
+            self.assertEqual(
+                module["parse_readiness"](readiness, root),
+                {"schema": "1", "runId": "contract-run"},
+            )
+        parse_checker.assert_called_once_with(
+            readiness,
+            root,
+            "candidate readiness ledger",
+            expected_uid=0,
+            expected_mode=0o444,
+        )
+
+        bound_checker = mock.Mock(return_value=raw)
+        bound_globals = module["require_bound_file"].__globals__
+        with mock.patch.dict(bound_globals, {"checked_file": bound_checker}):
+            module["require_bound_file"](
+                readiness,
+                digest(raw),
+                "candidate readiness ledger",
+                root,
+                expected_uid=0,
+                expected_mode=0o444,
+            )
+        bound_checker.assert_called_once_with(
+            readiness,
+            root,
+            "candidate readiness ledger",
+            expected_uid=0,
+            expected_mode=0o444,
+        )
+
+    def test_container_runtime_text_reads_require_root_authority(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        path = Path("/etc/hostname")
+        checker = mock.Mock(return_value=b"container-id\n")
+        globals_ = module["checked_system_text"].__globals__
+        with mock.patch.dict(globals_, {"checked_file": checker}):
+            self.assertEqual(
+                module["checked_system_text"](path, "container hostname"),
+                "container-id",
+            )
+        checker.assert_called_once_with(
+            path,
+            Path("/"),
+            "container hostname",
+            expected_uid=0,
+        )
+
+    def test_gateway_command_line_accepts_only_candidate_resolving_launcher(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            expected = root / "install" / "nexus-gateway.mjs"
+            expected.parent.mkdir()
+            expected.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+            launcher = root / "bin" / "nexus-gateway"
+            launcher.parent.mkdir()
+            launcher.symlink_to(expected)
+            decoy = root / "bin" / "decoy"
+            decoy.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+
+            self.assertTrue(
+                module["argv_binds_path"](["node", str(launcher)], expected)
+            )
+            self.assertTrue(
+                module["argv_binds_path"](["node", str(expected)], expected)
+            )
+            self.assertFalse(
+                module["argv_binds_path"](["node", str(decoy)], expected)
+            )
+            self.assertFalse(
+                module["argv_binds_path"](["node", "nexus-gateway"], expected)
+            )
+
+    def test_listener_tables_use_the_numeric_process_network_namespace(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        reader = mock.Mock(return_value="sl local_address rem_address st tx_queue")
+        globals_ = module["_listener_inodes"].__globals__
+        with mock.patch.dict(globals_, {"checked_system_text": reader}):
+            with mock.patch.object(globals_["os"], "getpid", return_value=4321):
+                self.assertEqual(module["_listener_inodes"](4101), set())
+        self.assertEqual(
+            [call.args[0] for call in reader.call_args_list],
+            [Path("/proc/4321/net/tcp"), Path("/proc/4321/net/tcp6")],
+        )
 
     def test_post_acceptance_revalidates_candidate_and_runtime_before_publish(self) -> None:
         module = runpy.run_path(str(TARGET))
@@ -811,6 +925,12 @@ class WsAcceptanceContracts(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             install = root / "install"
+            gateway_entrypoint = install / "bin" / "nexus-gateway.mjs"
+            gateway_entrypoint.parent.mkdir(parents=True)
+            gateway_entrypoint.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+            gateway_launcher = root / "lab-bin" / "nexus-gateway"
+            gateway_launcher.parent.mkdir()
+            gateway_launcher.symlink_to(gateway_entrypoint)
             readiness = {
                 "containerId": "a" * 64,
                 "imageDigest": "sha256:" + "b" * 64,
@@ -818,7 +938,7 @@ class WsAcceptanceContracts(unittest.TestCase):
                 "nexusResolved": str(install / "bin" / "nexus.mjs"),
                 "nativeResolved": str(install / "native" / "nexus"),
                 "nativeSha256": "f" * 64,
-                "gatewayResolved": str(install / "bin" / "nexus-gateway.mjs"),
+                "gatewayResolved": str(gateway_entrypoint),
                 "gatewaySha256": "d" * 64,
                 "lensRendererMode": "production",
                 "lensApp": "/tmp/nexus-lens-app.contract",
@@ -835,7 +955,7 @@ class WsAcceptanceContracts(unittest.TestCase):
                         "limits": {"cpus": 6, "memoryBytes": 8589934592, "pids": 1024}
                     },
                     "environment": {
-                        "HOME": str(root),
+                        "HOME": str(root / "harness-home"),
                         "NEXUS_HOME": str(root / "nexus"),
                         "NEXUS_V015_NATIVE_BIN": readiness["nativeResolved"],
                         "NEXUS_V015_NATIVE_BIN_SHA256": readiness["nativeSha256"],
@@ -857,7 +977,7 @@ class WsAcceptanceContracts(unittest.TestCase):
                 memory_max="8589934592",
                 memory_swap_max="0",
                 pids_max="1024",
-                home=str(root),
+                home=str(root / "harness-home"),
                 nexus_home=str(root / "nexus"),
                 install_tree_sha256=readiness["installTreeSha256"],
                 daemon_pid=101,
@@ -866,7 +986,7 @@ class WsAcceptanceContracts(unittest.TestCase):
                 gateway_pid=202,
                 gateway_url="http://127.0.0.1:4101",
                 gateway_listener_owned=True,
-                gateway_argv=("node", readiness["gatewayResolved"]),
+                gateway_argv=("node", str(gateway_launcher)),
                 gateway_entrypoint=readiness["gatewayResolved"],
                 gateway_entrypoint_sha256=readiness["gatewaySha256"],
                 lens_pid=303,
@@ -975,13 +1095,23 @@ class WsAcceptanceContracts(unittest.TestCase):
                 expected.update(b"\0" + b"444" + b"\0")
                 expected.update(digest(rows[relative]).encode("ascii") + b"\n")
             try:
-                first = module["lens_tree_digest"](app)
+                first = module["lens_tree_digest"](
+                    app, expected_uid=os.geteuid()
+                )
                 self.assertEqual(first, expected.hexdigest())
+                wrong_uid = 1 if os.geteuid() == 0 else 0
+                with self.assertRaisesRegex(module["AcceptanceFailure"], "ownership"):
+                    module["lens_tree_digest"](app, expected_uid=wrong_uid)
                 changed = app / "a.txt"
                 changed.chmod(0o644)
                 changed.write_bytes(b"mutated\n")
                 changed.chmod(0o444)
-                self.assertNotEqual(module["lens_tree_digest"](app), first)
+                self.assertNotEqual(
+                    module["lens_tree_digest"](
+                        app, expected_uid=os.geteuid()
+                    ),
+                    first,
+                )
             finally:
                 app.chmod(0o755)
                 nested.chmod(0o755)
@@ -998,7 +1128,9 @@ class WsAcceptanceContracts(unittest.TestCase):
             app.chmod(0o555)
             try:
                 with self.assertRaisesRegex(module["AcceptanceFailure"], "symlink"):
-                    module["lens_tree_digest"](app)
+                    module["lens_tree_digest"](
+                        app, expected_uid=os.geteuid()
+                    )
             finally:
                 app.chmod(0o755)
 
@@ -1063,6 +1195,38 @@ class WsAcceptanceContracts(unittest.TestCase):
                         root,
                     )
 
+    def test_soak_loader_preserves_root_owned_script_authority(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        soak = Path("/tmp/nexus-lab-bin/nexus-v015-ws-soak")
+        candidate = module["Candidate"](
+            "contract-run",
+            "sha256:" + "d" * 64,
+            {"environment": {}},
+            Path("/tmp/nexus-lens-home/evidence/contract-run"),
+            Path("/tmp/nexus-lens-home"),
+            Path("/tmp/nexus-lab-install.Ab12"),
+            readiness={},
+        )
+        checker = mock.Mock(return_value=b"#!/usr/bin/env python3\n")
+        validator = mock.Mock()
+        globals_ = module["load_soak_core"].__globals__
+        with mock.patch.dict(
+            globals_,
+            {
+                "SOAK_CORE": soak,
+                "validate_support_script_bindings": validator,
+                "checked_file": checker,
+            },
+        ), mock.patch.object(globals_["runpy"], "run_path", return_value={"ok": True}):
+            self.assertEqual(module["load_soak_core"](candidate), {"ok": True})
+        checker.assert_called_once_with(
+            soak,
+            Path("/"),
+            "WebSocket soak core",
+            expected_uid=0,
+            expected_mode=0o555,
+        )
+
     def test_final_release_tools_are_root_owned_immutable_and_manifest_bound(self) -> None:
         module = runpy.run_path(str(TARGET))
         with tempfile.TemporaryDirectory() as raw:
@@ -1070,18 +1234,22 @@ class WsAcceptanceContracts(unittest.TestCase):
             webconsole = root / "nexus-v015-webconsole-acceptance"
             webconsole_evidence = root / "nexus-v015-webconsole-evidence-verify"
             validator = root / "nexus-v015-evidence-validate"
+            assembler = root / "nexus-v015-release-assemble"
             webconsole.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
             webconsole_evidence.write_text(
                 "#!/usr/bin/env python3\n", encoding="utf-8"
             )
             validator.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            assembler.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             webconsole.chmod(0o555)
             webconsole_evidence.chmod(0o555)
             validator.chmod(0o555)
+            assembler.chmod(0o555)
             function_globals = module["validate_final_support_script_bindings"].__globals__
             function_globals["WEBCONSOLE_ACCEPTANCE_BIN"] = webconsole
             function_globals["WEBCONSOLE_EVIDENCE_VERIFIER_BIN"] = webconsole_evidence
             function_globals["EVIDENCE_VALIDATOR_BIN"] = validator
+            function_globals["RELEASE_ASSEMBLER_BIN"] = assembler
             readiness = {
                 "webconsoleAcceptance": str(webconsole),
                 "webconsoleAcceptanceSha256": digest(webconsole.read_bytes()),
@@ -1091,6 +1259,8 @@ class WsAcceptanceContracts(unittest.TestCase):
                 ),
                 "evidenceValidator": str(validator),
                 "evidenceValidatorSha256": digest(validator.read_bytes()),
+                "releaseAssembler": str(assembler),
+                "releaseAssemblerSha256": digest(assembler.read_bytes()),
             }
             environment = {
                 "NEXUS_V015_WEBCONSOLE_ACCEPTANCE": str(webconsole),
@@ -1106,6 +1276,10 @@ class WsAcceptanceContracts(unittest.TestCase):
                 "NEXUS_V015_EVIDENCE_VALIDATOR": str(validator),
                 "NEXUS_V015_EVIDENCE_VALIDATOR_SHA256": readiness[
                     "evidenceValidatorSha256"
+                ],
+                "NEXUS_V015_RELEASE_ASSEMBLER": str(assembler),
+                "NEXUS_V015_RELEASE_ASSEMBLER_SHA256": readiness[
+                    "releaseAssemblerSha256"
                 ],
             }
             real_fstat = os.fstat
@@ -1525,6 +1699,335 @@ class WsAcceptanceContracts(unittest.TestCase):
             backend.record_observations.assert_not_called()
             self.assertTrue(backend.soak.closed)
 
+    def test_straddled_restart_finishes_the_accepted_session_before_human_traffic(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        backend = module["BackendAcceptance"].__new__(module["BackendAcceptance"])
+        backend.candidate = type("Candidate", (), {"run_id": "contract-run"})()
+        backend.straddled_replay = []
+        order: list[str] = []
+
+        developer_attempt = type(
+            "DeveloperAttempt",
+            (),
+            {"message_id": "m-straddled"},
+        )()
+        session_attempt = type(
+            "SessionAttempt",
+            (),
+            {
+                "client_message_id": "cm-straddled",
+                "command_id": "cmd-straddled",
+            },
+        )()
+
+        class DeveloperLane:
+            async def close(self) -> None:
+                order.append("developer-closed")
+
+        class SessionLane:
+            async def begin_prompt(self, *_args: object, **_kwargs: object) -> object:
+                order.append("session-accepted")
+                return session_attempt
+
+            async def close(self) -> None:
+                order.append("session-closed")
+
+            async def finish_prompt(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+                order.append("session-finished")
+                return {"cursorAfter": 3}
+
+        class Soak:
+            developer = DeveloperLane()
+            thread = "contract-thread"
+            thread_topic = "sys.thread.contract-thread"
+            sessions = {"codex": SessionLane()}
+
+            async def begin_message(self, *_args: object) -> object:
+                order.append("developer-accepted")
+                return developer_attempt
+
+            async def finish_message(self, *_args: object, **_kwargs: object) -> dict[str, object]:
+                order.append("developer-finished")
+                return {"cursorAfter": 2}
+
+        backend.soak = Soak()
+
+        async def restart(
+            target: str,
+            *,
+            before_post_restart_human_write: object,
+        ) -> None:
+            self.assertEqual(target, "gateway")
+            order.append("restart-recovered")
+            await before_post_restart_human_write()
+            order.append("human-write")
+
+        backend.restart = restart
+        result = asyncio.run(backend.straddle_restart("gateway"))
+
+        self.assertEqual(result["session"]["clientMessageId"], "cm-straddled")
+        self.assertLess(order.index("developer-finished"), order.index("human-write"))
+        self.assertLess(order.index("session-finished"), order.index("human-write"))
+        source = TARGET.read_text(encoding="utf-8")
+        restart_body = source.split("    async def restart(", 1)[1].split(
+            "    async def final_invariants", 1
+        )[0]
+        self.assertLess(
+            restart_body.index("await before_post_restart_human_write()"),
+            restart_body.index("human = await self.human_write"),
+        )
+
+    def test_bus_action_reply_is_correlated_to_the_exact_user_echo_and_run(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        client_message_id = "cm-current-bus-action"
+
+        def event(
+            event_type: str,
+            cursor: int,
+            **fields: object,
+        ) -> dict[str, object]:
+            return {
+                "event": {
+                    "type": event_type,
+                    "streamEventId": cursor,
+                    **fields,
+                }
+            }
+
+        class Lane:
+            def __init__(self, frames: list[dict[str, object]]) -> None:
+                self.frames = frames
+
+            async def wait_for(
+                self,
+                predicate: object,
+                *,
+                after: int,
+                timeout: float,
+                label: str,
+            ) -> dict[str, object]:
+                del timeout
+                for frame in self.frames[after:]:
+                    if predicate(frame):
+                        return frame
+                raise module["AcceptanceFailure"](f"{label} timed out")
+
+        frames = [
+            event("RUN_STARTED", 41, runId="run-stale"),
+            event(
+                "TEXT_MESSAGE_START",
+                42,
+                role="assistant",
+                messageId="assistant-stale",
+            ),
+            event(
+                "TEXT_MESSAGE_CONTENT",
+                43,
+                messageId="assistant-stale",
+                delta="*Conversation interrupted*",
+            ),
+            event("TEXT_MESSAGE_END", 44, messageId="assistant-stale"),
+            event("RUN_FINISHED", 45, runId="run-stale"),
+            event("RUN_STARTED", 50, runId="run-current"),
+            event("TEXT_MESSAGE_END", 50, messageId=client_message_id),
+            event(
+                "TEXT_MESSAGE_START",
+                51,
+                role="assistant",
+                messageId="assistant-current-commentary",
+            ),
+            event(
+                "TEXT_MESSAGE_CONTENT",
+                52,
+                messageId="assistant-current-commentary",
+                delta="I’m using the Nexus bus skill to send both messages.",
+            ),
+            event("TEXT_MESSAGE_END", 53, messageId="assistant-current-commentary"),
+            event(
+                "TEXT_MESSAGE_START",
+                54,
+                role="assistant",
+                messageId="assistant-current",
+            ),
+            event(
+                "TEXT_MESSAGE_CONTENT",
+                55,
+                messageId="assistant-current",
+                delta="V015_AGENT_DONE_current",
+            ),
+            event("TEXT_MESSAGE_END", 56, messageId="assistant-current"),
+            event("RUN_FINISHED", 57, runId="run-current"),
+        ]
+        core = {
+            "session_event": lambda frame: frame["event"],
+            "numeric_cursor": lambda frame: frame["event"].get("streamEventId"),
+        }
+
+        reply = asyncio.run(
+            module["wait_correlated_assistant_reply"](
+                core,
+                Lane(frames),
+                start_index=0,
+                before_cursor=40,
+                client_message_id=client_message_id,
+                expected_text="V015_AGENT_DONE_current",
+                timeout=1,
+                label="codex bus-action",
+            )
+        )
+
+        self.assertEqual(reply["runId"], "run-current")
+        self.assertEqual(reply["assistantMessageId"], "assistant-current")
+        self.assertEqual(reply["assistantText"], "V015_AGENT_DONE_current")
+        self.assertEqual(reply["assistantMessageCount"], 2)
+
+        unrelated = [
+            event("RUN_STARTED", 60, runId="run-unrelated"),
+            event("TEXT_MESSAGE_END", 60, messageId="cm-unrelated"),
+            event(
+                "TEXT_MESSAGE_START",
+                61,
+                role="assistant",
+                messageId="assistant-unrelated",
+            ),
+            event(
+                "TEXT_MESSAGE_CONTENT",
+                62,
+                messageId="assistant-unrelated",
+                delta="V015_AGENT_DONE_current",
+            ),
+            event("TEXT_MESSAGE_END", 63, messageId="assistant-unrelated"),
+            event("RUN_FINISHED", 64, runId="run-unrelated"),
+        ]
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "user echo"):
+            asyncio.run(
+                module["wait_correlated_assistant_reply"](
+                    core,
+                    Lane(unrelated),
+                    start_index=0,
+                    before_cursor=40,
+                    client_message_id=client_message_id,
+                    expected_text="V015_AGENT_DONE_current",
+                    timeout=1,
+                    label="codex bus-action",
+                )
+            )
+
+        marker_then_extra = [
+            event("RUN_STARTED", 70, runId="run-extra"),
+            event("TEXT_MESSAGE_END", 70, messageId=client_message_id),
+            event(
+                "TEXT_MESSAGE_START",
+                71,
+                role="assistant",
+                messageId="assistant-marker",
+            ),
+            event(
+                "TEXT_MESSAGE_CONTENT",
+                72,
+                messageId="assistant-marker",
+                delta="V015_AGENT_DONE_current",
+            ),
+            event("TEXT_MESSAGE_END", 73, messageId="assistant-marker"),
+            event(
+                "TEXT_MESSAGE_START",
+                74,
+                role="assistant",
+                messageId="assistant-extra",
+            ),
+            event(
+                "TEXT_MESSAGE_CONTENT",
+                75,
+                messageId="assistant-extra",
+                delta="unexpected text after the marker",
+            ),
+            event("TEXT_MESSAGE_END", 76, messageId="assistant-extra"),
+            event("RUN_FINISHED", 77, runId="run-extra"),
+        ]
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "marker mismatch"):
+            asyncio.run(
+                module["wait_correlated_assistant_reply"](
+                    core,
+                    Lane(marker_then_extra),
+                    start_index=0,
+                    before_cursor=40,
+                    client_message_id=client_message_id,
+                    expected_text="V015_AGENT_DONE_current",
+                    timeout=1,
+                    label="codex bus-action",
+                )
+            )
+
+    def test_bus_action_marker_must_be_the_unique_terminal_line(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        marker = "V015_AGENT_DONE_current"
+
+        module["require_terminal_marker"](
+            "Both sends returned message-ID receipts.\n\nV015_AGENT_DONE_current",
+            marker,
+            "claude bus-action",
+        )
+        for invalid in (
+            "prefix V015_AGENT_DONE_current",
+            "V015_AGENT_DONE_current\nunexpected trailing text",
+            "V015_AGENT_DONE_current\nV015_AGENT_DONE_current",
+        ):
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(module["AcceptanceFailure"], "marker mismatch"):
+                    module["require_terminal_marker"](
+                        invalid,
+                        marker,
+                        "claude bus-action",
+                    )
+
+    def test_daemon_restart_accepts_only_gap_or_ordered_fleet_resync_as_boot_reset(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        backend = module["BackendAcceptance"].__new__(module["BackendAcceptance"])
+        backend.fleet_cursor = 999
+        backend.fleet_frames = []
+
+        class FleetSocket:
+            def __init__(self, frames: list[dict[str, object]]) -> None:
+                self.frames = iter(frames)
+
+            async def recv(self) -> str:
+                return json.dumps(next(self.frames))
+
+        ordinary = {
+            "type": "developer.event",
+            "event": {
+                "topic": "sys.fleet.status",
+                "seq": 1000,
+                "lifecycle": "status",
+            },
+        }
+        resync = {
+            "type": "developer.event",
+            "event": {
+                "topic": "sys.fleet.status",
+                "seq": 1,
+                "lifecycle": "resync",
+                "data": {"reason": "subscribe", "source": "members"},
+            },
+        }
+        backend.fleet_socket = FleetSocket([ordinary, resync])
+        reset = asyncio.run(backend.wait_fleet_boot_reset("daemon restart", timeout=1))
+        self.assertEqual(reset, {"mode": "resync", "frame": resync})
+        self.assertEqual(backend.fleet_cursor, 1)
+        self.assertEqual(backend.fleet_frames, [ordinary, resync])
+
+        gap = {
+            "t": "subscribe.gap",
+            "topic": "sys.fleet.status",
+            "afterSeq": 999,
+            "retry": "ephemeral",
+        }
+        backend.fleet_socket = FleetSocket([gap])
+        backend.fleet_cursor = 999
+        reset = asyncio.run(backend.wait_fleet_boot_reset("daemon restart", timeout=1))
+        self.assertEqual(reset, {"mode": "gap", "frame": gap})
+        self.assertEqual(backend.fleet_cursor, 999)
+
     def test_backend_run_drives_every_release_boundary_before_observation(self) -> None:
         module = runpy.run_path(str(TARGET))
         source = TARGET.read_text(encoding="utf-8")
@@ -1553,6 +2056,335 @@ class WsAcceptanceContracts(unittest.TestCase):
             ("gateway", "gateway", "daemon", "daemon"),
         )
 
+    def test_queue_control_cancels_before_steer_terminal_and_compact(self) -> None:
+        source = TARGET.read_text(encoding="utf-8")
+        body = source.split("    async def queue_steer_compact_controls", 1)[1].split(
+            "    async def queue_authority_outage_recovery", 1
+        )[0]
+
+        cancel_send = body.index('"t": "queue.cancel"')
+        cancel_confirmed = body.index('cancel_ack.get("state") != "cancelled"')
+        steer_send = body.index('"t": "steer"')
+        active_terminal = body.index('label="steered active turn terminal"')
+        compact_send = body.index('"name": "compact"')
+
+        self.assertLess(cancel_send, cancel_confirmed)
+        self.assertLess(cancel_confirmed, steer_send)
+        self.assertLess(steer_send, active_terminal)
+        self.assertLess(active_terminal, compact_send)
+
+    def test_backpressure_raw_client_uses_the_soak_inbound_frame_bound(self) -> None:
+        source = TARGET.read_text(encoding="utf-8")
+        body = source.split("        async def open_raw", 1)[1].split(
+            "        try:", 1
+        )[0]
+        self.assertIn(
+            '"max_size": self.core["MAX_INBOUND_FRAME_BYTES"]',
+            body,
+        )
+
+    def test_developer_backpressure_load_is_metadata_sized_and_kernel_bound(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        name = module["developer_backpressure_thread_name"](
+            "contract-run",
+            "0123456789ab",
+        )
+        target_bytes = module["DEVELOPER_BACKPRESSURE_THREAD_BYTES"]
+        self.assertEqual(len(name.encode("utf-8")), target_bytes)
+        self.assertTrue(name.startswith("v015-bp-0123456789ab-"))
+
+        # A message developer-event frame contains both the topic and thread name.
+        frame_floor = target_bytes * 2
+        receive_max = 33_554_432
+        send_max = 4_194_304
+        application_max = module["DEVELOPER_BACKPRESSURE_MAX_BUFFERED_BYTES"]
+        count = module["developer_backpressure_post_count"](
+            frame_floor,
+            receive_max=receive_max,
+            send_max=send_max,
+        )
+        self.assertGreater(
+            count * frame_floor,
+            receive_max + send_max + application_max,
+        )
+
+        source = TARGET.read_text(encoding="utf-8")
+        body = source.split("    async def developer_backpressure", 1)[1].split(
+            "    async def agent_session_backpressure_and_queue_full", 1
+        )[0]
+        self.assertIn("post_thread_for_backpressure", body)
+        self.assertIn("pause_websocket_reads", body)
+        self.assertIn("developer_backpressure_post_count", body)
+        self.assertNotIn('"B" * 16384', body)
+        # Giant metadata frames are verified on raw sockets and summarized; they must not
+        # inflate the canonical dual-WebSocket frame evidence by tens of megabytes.
+        self.assertNotIn('self.core["DeveloperLane"]', body)
+
+    def test_backpressure_cleanup_does_not_steer_an_already_finished_run(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        helper = module.get("ensure_run_terminal")
+        self.assertIsNotNone(
+            helper,
+            "the backpressure cleanup must observe the original run terminal before steering",
+        )
+
+        frames = [
+            {"event": {"type": "RUN_STARTED", "runId": "run-active"}},
+            {"event": {"type": "RUN_FINISHED", "runId": "run-active"}},
+        ]
+
+        class Lane:
+            def __init__(self) -> None:
+                self.frames = list(frames)
+                self.sent: list[dict[str, object]] = []
+                self.waits: list[tuple[int, str]] = []
+
+            async def send(self, frame: dict[str, object]) -> None:
+                self.sent.append(frame)
+
+            async def wait_for(
+                self,
+                predicate: object,
+                *,
+                after: int,
+                timeout: float,
+                label: str,
+            ) -> dict[str, object]:
+                del timeout
+                self.waits.append((after, label))
+                for frame in self.frames[after:]:
+                    if predicate(frame):
+                        return frame
+                raise module["AcceptanceFailure"](f"{label}: timed out")
+
+        lane = Lane()
+        terminal = asyncio.run(
+            helper(
+                {"session_event": lambda frame: frame["event"]},
+                lane,
+                run_id="run-active",
+                after=0,
+                client_message_id="cm-stop",
+                timeout=1,
+                label="backpressure active-turn",
+            )
+        )
+
+        self.assertIs(terminal, frames[1])
+        self.assertEqual(lane.sent, [])
+        self.assertEqual(lane.waits, [])
+
+    def test_backpressure_cleanup_accepts_terminal_racing_the_steer_response(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        helper = module["ensure_run_terminal"]
+        frames = [
+            {"event": {"type": "RUN_STARTED", "runId": "run-active"}},
+        ]
+
+        class Lane:
+            def __init__(self) -> None:
+                self.frames = list(frames)
+                self.sent: list[dict[str, object]] = []
+
+            async def send(self, frame: dict[str, object]) -> None:
+                self.sent.append(frame)
+                self.frames.extend([
+                    {"event": {"type": "RUN_FINISHED", "runId": "run-active"}},
+                    {
+                        "t": "steer.err",
+                        "clientMessageId": "cm-stop",
+                        "status": 409,
+                        "error": "turn already terminal",
+                    },
+                ])
+
+            async def wait_for(
+                self,
+                predicate: object,
+                *,
+                after: int,
+                timeout: float,
+                label: str,
+            ) -> dict[str, object]:
+                del timeout
+                for frame in self.frames[after:]:
+                    if predicate(frame):
+                        return frame
+                raise module["AcceptanceFailure"](f"{label}: timed out")
+
+        lane = Lane()
+        try:
+            terminal = asyncio.run(
+                helper(
+                    {"session_event": lambda frame: frame.get("event", frame)},
+                    lane,
+                    run_id="run-active",
+                    after=0,
+                    client_message_id="cm-stop",
+                    timeout=1,
+                    label="race",
+                )
+            )
+        except module["AcceptanceFailure"] as error:
+            self.fail(f"the original terminal must win the steer-response race: {error}")
+
+        self.assertIs(terminal, lane.frames[1])
+        self.assertEqual(len(lane.sent), 1)
+
+    def test_capacity_flood_isolates_the_slow_subscriber_from_control(self) -> None:
+        source = TARGET.read_text(encoding="utf-8")
+        body = source.split(
+            "    async def agent_session_backpressure_and_queue_full", 1
+        )[1].split("    async def run(self)", 1)[0]
+
+        lane_close = body.index("await lane.close()")
+        slow_open = body.index("slow = await open_raw(path, 1)")
+        control_open = body.index("control = await open_raw(path, 512)")
+        flood_end = body.index("await drain_websocket_until_closed(")
+        flood = body[control_open:flood_end]
+
+        self.assertLess(lane_close, slow_open)
+        self.assertLess(slow_open, control_open)
+        self.assertIn("await control.send", flood)
+        self.assertIn("await receive_capacity_response(", flood)
+        self.assertIn("require_projection=(index + 1) % 4 == 0", flood)
+        self.assertNotIn("await lane.send", flood)
+        self.assertIn('self.http.request,\n                    "PATCH"', body)
+
+    def test_close_observation_drains_the_bounded_application_queue(self) -> None:
+        module = runpy.run_path(str(TARGET))
+
+        class Closed(Exception):
+            pass
+
+        class Socket:
+            def __init__(self) -> None:
+                self.close_code: int | None = None
+                self.recv_calls = 0
+                self.wait_closed_calls = 0
+
+            async def recv(self) -> str:
+                self.recv_calls += 1
+                if self.recv_calls == 1:
+                    return '{"t":"queue.snapshot"}'
+                self.close_code = 1013
+                raise Closed("retry later")
+
+            async def wait_closed(self) -> None:
+                self.wait_closed_calls += 1
+                if self.close_code is None:
+                    await asyncio.Future()
+
+        socket = Socket()
+        asyncio.run(module["drain_websocket_until_closed"](
+            socket,
+            timeout=1,
+            label="bounded close probe",
+        ))
+        self.assertEqual(socket.close_code, 1013)
+        self.assertEqual(socket.recv_calls, 2)
+        self.assertEqual(socket.wait_closed_calls, 1)
+
+    def test_capacity_response_waits_for_exact_queue_projection(self) -> None:
+        module = runpy.run_path(str(TARGET))
+
+        class Socket:
+            def __init__(self) -> None:
+                self.frames = [
+                    {
+                        "t": "input.ack",
+                        "clientMessageId": "cm-exact",
+                        "commandId": "cmd-exact",
+                        "state": "queued",
+                        "revision": 1,
+                    },
+                    {
+                        "t": "queue.snapshot",
+                        "sessionId": "s-exact",
+                        "seq": 1,
+                        "commands": [{"commandId": "cmd-other"}],
+                    },
+                    {
+                        "t": "queue.snapshot",
+                        "sessionId": "s-exact",
+                        "seq": 2,
+                        "commands": [{"commandId": "cmd-exact"}],
+                    },
+                ]
+                self.recv_calls = 0
+
+            async def recv(self) -> str:
+                self.recv_calls += 1
+                return json.dumps(self.frames.pop(0))
+
+        socket = Socket()
+        result = asyncio.run(module["receive_capacity_response"](
+            socket,
+            "cm-exact",
+            "s-exact",
+            timeout=1,
+            label="capacity projection",
+        ))
+        self.assertEqual(result["commandId"], "cmd-exact")
+        self.assertEqual(socket.recv_calls, 3)
+
+    def test_capacity_probe_pauses_the_real_transport_until_after_the_flood(self) -> None:
+        module = runpy.run_path(str(TARGET))
+
+        class RawSocket:
+            def __init__(self) -> None:
+                self.options: list[tuple[int, int, int]] = []
+
+            def setsockopt(self, level: int, option: int, value: int) -> None:
+                self.options.append((level, option, value))
+
+        class Transport:
+            def __init__(self) -> None:
+                self.raw = RawSocket()
+                self.paused = False
+                self.resumed = False
+
+            def get_extra_info(self, name: str) -> object | None:
+                return self.raw if name == "socket" else None
+
+            def pause_reading(self) -> None:
+                self.paused = True
+
+            def resume_reading(self) -> None:
+                self.resumed = True
+
+        transport = Transport()
+        websocket = type("WebSocket", (), {"transport": transport})()
+
+        held = module["pause_websocket_reads"](websocket)
+        self.assertIs(held, transport)
+        self.assertTrue(transport.paused)
+        self.assertFalse(transport.resumed)
+        self.assertEqual(
+            transport.raw.options,
+            [],
+            "the slow-reader probe must preserve the kernel receive window so the "
+            "typed close can drain after reads resume",
+        )
+
+        module["resume_websocket_reads"](held)
+        self.assertTrue(transport.resumed)
+
+        source = TARGET.read_text(encoding="utf-8")
+        body = source.split(
+            "    async def agent_session_backpressure_and_queue_full", 1
+        )[1].split("    async def run(self)", 1)[0]
+        pause = body.index("slow_transport = pause_websocket_reads(slow)")
+        control_open = body.index("control = await open_raw(path, 512)")
+        control_snapshot = body.index('label="fast capacity-control queue snapshot"')
+        resume = body.index("resume_websocket_reads(slow_transport)")
+        drain_closed = body.index("await drain_websocket_until_closed(")
+        self.assertLess(pause, control_open)
+        self.assertLess(control_open, control_snapshot)
+        self.assertLess(control_snapshot, resume)
+        self.assertLess(control_open, resume)
+        self.assertLess(resume, drain_closed)
+
     def test_exact_roster_rejects_stale_or_duplicate_rows(self) -> None:
         module = runpy.run_path(str(TARGET))
         agents = (
@@ -1571,6 +2403,119 @@ class WsAcceptanceContracts(unittest.TestCase):
             )
         with self.assertRaisesRegex(module["AcceptanceFailure"], "duplicate"):
             module["require_exact_roster"]([rows[0], rows[0], rows[1]], agents)
+
+    def test_exact_roster_waits_for_daemon_reregistration_without_accepting_drift(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        agents = (
+            type("Agent", (), {"agent_id": "a_codex", "name": "codex", "session_id": "s_c"})(),
+            type("Agent", (), {"agent_id": "a_claude", "name": "claude", "session_id": "s_h"})(),
+        )
+        pending = [
+            {"agentId": "a_codex", "name": "codex", "sessionId": "s_c", "status": "offline"},
+            {"agentId": "a_claude", "name": "claude", "sessionId": "s_h", "status": "online"},
+        ]
+        ready = [
+            {**pending[0], "status": "online"},
+            pending[1],
+        ]
+        snapshots = iter((pending, ready))
+        reads: list[str] = []
+
+        def identity_rows(nexus_bin: str) -> list[dict[str, object]]:
+            reads.append(nexus_bin)
+            return next(snapshots)
+
+        rows = asyncio.run(
+            module["wait_for_exact_roster"](
+                identity_rows,
+                "/candidate/nexus",
+                agents,
+                timeout=1,
+                interval=0,
+            )
+        )
+        self.assertEqual(rows, ready)
+        self.assertEqual(reads, ["/candidate/nexus", "/candidate/nexus"])
+
+        stale_reads = 0
+
+        def stale_roster(_nexus_bin: str) -> list[dict[str, object]]:
+            nonlocal stale_reads
+            stale_reads += 1
+            return [
+                *pending,
+                {"agentId": "a_stale", "name": "stale", "sessionId": "s_old", "status": "online"},
+            ]
+
+        with self.assertRaisesRegex(module["AcceptanceFailure"], "differs from live-agent truth"):
+            asyncio.run(
+                module["wait_for_exact_roster"](
+                    stale_roster,
+                    "/candidate/nexus",
+                    agents,
+                    timeout=1,
+                    interval=0,
+                )
+            )
+        self.assertEqual(stale_reads, 1)
+
+    def test_final_invariants_wait_for_matching_roster_to_recover(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        agents = (
+            type("Agent", (), {"agent_id": "a_codex", "name": "codex", "session_id": "s_c"})(),
+            type("Agent", (), {"agent_id": "a_claude", "name": "claude", "session_id": "s_h"})(),
+        )
+        pending = [
+            {"agentId": "a_codex", "name": "codex", "sessionId": "s_c", "status": "offline"},
+            {"agentId": "a_claude", "name": "claude", "sessionId": "s_h", "status": "online"},
+        ]
+        ready = [
+            {**pending[0], "status": "online"},
+            pending[1],
+        ]
+        snapshots = iter((pending, ready))
+        reads: list[str] = []
+
+        def identity_rows(nexus_bin: str) -> list[dict[str, object]]:
+            reads.append(nexus_bin)
+            return next(snapshots)
+
+        class Reader:
+            def done(self) -> bool:
+                return False
+
+        lane = type("Lane", (), {"reader": Reader()})()
+        ledger = type(
+            "Ledger",
+            (),
+            {"failure": {"deadLetters": 0, "queueWedges": 0, "crashLoops": 0}},
+        )()
+        soak = type(
+            "Soak",
+            (),
+            {
+                "baseline_dlq": 0,
+                "ledger": ledger,
+                "agents": agents,
+                "developer": lane,
+                "sessions": {"codex": lane, "claude": lane},
+            },
+        )()
+        backend = object.__new__(module["BackendAcceptance"])
+        backend.core = {
+            "identity_rows": identity_rows,
+            "check_identities": lambda *_args: None,
+            "dlq_total": lambda *_args: 0,
+            "queue_clear": lambda *_args: True,
+        }
+        backend.soak = soak
+        backend.live_agents = agents
+        backend.human_dm = lane
+        backend.http = object()
+
+        asyncio.run(backend.final_invariants())
+
+        self.assertEqual(len(reads), 2)
 
     def test_rest_and_websocket_queue_snapshots_must_match_exactly(self) -> None:
         module = runpy.run_path(str(TARGET))
@@ -1629,6 +2574,36 @@ class WsAcceptanceContracts(unittest.TestCase):
                 "gatewayTarball": "gatewayTarballSha256",
             },
         )
+        self.assertEqual(
+            module["READINESS_BINDING_AUTHORITIES"],
+            {
+                "labProcess": (0, 0o555),
+                "labAgent": (0, 0o555),
+                "labFixture": (0, 0o555),
+                "nexusTarball": (0, 0o444),
+                "cliTarball": (0, 0o444),
+                "gatewayTarball": (0, 0o444),
+            },
+        )
+
+        readiness: dict[str, str] = {}
+        for key, hash_key in module["READINESS_BINDING_HASHES"].items():
+            readiness[key] = f"/candidate/{key}"
+            readiness[hash_key] = "a" * 64
+        checker = mock.Mock()
+        function_globals = module["validate_readiness_bindings"].__globals__
+        with mock.patch.dict(function_globals, {"require_bound_file": checker}):
+            module["validate_readiness_bindings"](
+                readiness,
+                Path("/tmp/nexus-lens-home"),
+            )
+        calls = {call.args[2]: call for call in checker.call_args_list}
+        for key, (expected_uid, expected_mode) in module[
+            "READINESS_BINDING_AUTHORITIES"
+        ].items():
+            call = calls[f"readiness {key}"]
+            self.assertEqual(call.kwargs["expected_uid"], expected_uid)
+            self.assertEqual(call.kwargs["expected_mode"], expected_mode)
 
     def test_harness_version_requires_one_recorded_semver_line(self) -> None:
         module = runpy.run_path(str(TARGET))
@@ -1665,7 +2640,7 @@ class WsAcceptanceContracts(unittest.TestCase):
             hook.write_text("#!/bin/sh\n", encoding="utf-8")
             hook.chmod(0o755)
             hook_sha256 = digest(hook.read_bytes())
-            module["launch_live_agents"].__globals__["LAB_AGENT"] = hook
+            bound_checker = mock.Mock()
             candidate = module["Candidate"](
                 "contract-run",
                 "sha256:" + "d" * 64,
@@ -1681,7 +2656,11 @@ class WsAcceptanceContracts(unittest.TestCase):
                 root,
                 root / "install",
             )
-            module["launch_live_agents"](candidate, runner=fake_run)
+            with mock.patch.dict(
+                module["launch_live_agents"].__globals__,
+                {"LAB_AGENT": hook, "require_bound_file": bound_checker},
+            ):
+                module["launch_live_agents"](candidate, runner=fake_run)
 
         self.assertEqual(
             [argv for argv, _env in calls],
@@ -1692,6 +2671,10 @@ class WsAcceptanceContracts(unittest.TestCase):
             self.assertEqual(env["NEXUS_V015_RUN_ID"], "contract-run")
             self.assertEqual(env["NEXUS_V015_NEXUS_BIN"], "/tmp/nexus-lab-bin/nexus")
             self.assertEqual(env["NEXUS_V015_READINESS_LEDGER_SHA256"], "a" * 64)
+        self.assertEqual(bound_checker.call_count, 2)
+        for call in bound_checker.call_args_list:
+            self.assertEqual(call.kwargs["expected_uid"], 0)
+            self.assertEqual(call.kwargs["expected_mode"], 0o555)
 
     def test_retired_developer_polling_source_is_detected(self) -> None:
         module = runpy.run_path(str(TARGET))
@@ -1735,6 +2718,32 @@ class WsAcceptanceContracts(unittest.TestCase):
                 {"t": "queue.snapshot", "seq": 0},
                 "s_expected",
             )
+
+    def test_raw_session_open_accepts_content_before_queue_snapshot(self) -> None:
+        module = runpy.run_path(str(TARGET))
+
+        class Socket:
+            def __init__(self) -> None:
+                self.frames = iter([
+                    {"type": "RUN_STARTED", "cursor": "cur-1"},
+                    {"t": "queue.snapshot", "sessionId": "s_expected", "seq": 7},
+                ])
+
+            async def recv(self) -> str:
+                return json.dumps(next(self.frames))
+
+        snapshot = asyncio.run(
+            module["receive_queue_snapshot"](
+                Socket(),
+                "s_expected",
+                timeout=1,
+                label="raw initial queue snapshot",
+            )
+        )
+        self.assertEqual(
+            snapshot,
+            {"t": "queue.snapshot", "sessionId": "s_expected", "seq": 7},
+        )
 
 
 if __name__ == "__main__":

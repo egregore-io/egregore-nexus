@@ -298,6 +298,7 @@ CREATE TABLE IF NOT EXISTS command_intents (
   caller_runtime_id TEXT,
   caller_client_key TEXT,
   caller_principal_id TEXT,
+  caller_validated_boot_epoch TEXT,
   caller_kind       TEXT,
   caller_tier       TEXT,
   idempotency_key   TEXT,

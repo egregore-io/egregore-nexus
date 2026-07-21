@@ -12,6 +12,7 @@
 
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 
@@ -131,7 +132,7 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     // --- Store-backed ingress: producers submit command rows; the daemon executes them. ---
     state.wait_for_runtime_identity_ready().await;
     tracing::info!("nexus daemon runtime identity directory restored");
-    let command_worker = nexus::daemon::command_worker::spawn(state.clone());
+    let mut command_worker = nexus::daemon::command_worker::spawn(state.clone());
     tracing::info!("nexus daemon command worker running");
     let daemon_ipc = nexus::daemon::daemon_ipc::spawn_daemon_ipc(
         state.clone(),
@@ -147,6 +148,27 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     // are durable runtime attachments; boot revive/rebind reconciles liveness instead of treating
     // restart as a destructive lifecycle command.
     shutdown_signal().await;
+    nexus::daemon::command_worker::begin_shutdown(&state).await;
+    // Stop accepting fresh IPC connections after the ingress fence is durable. Requests already
+    // inside the server linearize on the same store write gate: accepted rows drain here, while
+    // later requests fail before insertion and reconnect to the next daemon boot.
+    drop(daemon_ipc);
+    let graceful_drain = async {
+        let worker_result = (&mut command_worker).await;
+        nexus::daemon::command_worker::wait_for_active_turns(&state).await;
+        worker_result
+    };
+    match tokio::time::timeout(Duration::from_secs(30), graceful_drain).await {
+        Ok(Ok(())) => tracing::info!("nexus daemon command lanes drained for shutdown"),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "nexus daemon command worker ended abnormally during shutdown")
+        }
+        Err(_) => {
+            tracing::warn!("nexus daemon command drain timed out; cancelling ambiguous work");
+            command_worker.abort();
+            let _ = command_worker.await;
+        }
+    }
     tracing::info!("nexus daemon tearing down recorded transports for shutdown");
     let transports = state.teardown_owned_transports_for_shutdown().await;
     tracing::info!(transports, "nexus daemon transport teardown complete");
@@ -157,8 +179,6 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         "nexus daemon reaped in-flight command intents for shutdown"
     );
     drop(gateway_stream_socket);
-    drop(daemon_ipc);
-    command_worker.abort();
     // A failed final checkpoint must not turn a completed graceful shutdown into an error
     // exit — deploy tooling gates on this process's exit code (#29).
     if let Err(error) = nexus::daemon::lifecycle::checkpoint_wal(&store).await {

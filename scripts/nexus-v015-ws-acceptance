@@ -47,6 +47,7 @@ WEBCONSOLE_EVIDENCE_VERIFIER_BIN = Path(
     "/tmp/nexus-lab-bin/nexus-v015-webconsole-evidence-verify"
 )
 EVIDENCE_VALIDATOR_BIN = Path("/tmp/nexus-lab-bin/nexus-v015-evidence-validate")
+RELEASE_ASSEMBLER_BIN = Path("/tmp/nexus-lab-bin/nexus-v015-release-assemble")
 NEXUS_BIN = Path("/tmp/nexus-lab-bin/nexus")
 GATEWAY_BIN = Path("/tmp/nexus-lab-bin/nexus-gateway")
 WEBUI_BIN = Path("/tmp/nexus-lab-bin/nexus-webui")
@@ -55,6 +56,10 @@ LAB_AGENT = Path("/tmp/nexus-lab-bin/lab-agent")
 LENS_APP_LINK = Path("/tmp/nexus-lab-bin/lens-app")
 GATEWAY_URL = "http://127.0.0.1:4100"
 GATEWAY_DISCOVERY_URL = "http://127.0.0.1:4101"
+DEVELOPER_BACKPRESSURE_THREAD_BYTES = 400_000
+DEVELOPER_BACKPRESSURE_MAX_BUFFERED_BYTES = 1024 * 1024
+TCP_RECEIVE_LIMITS = Path("/proc/sys/net/ipv4/tcp_rmem")
+TCP_SEND_LIMITS = Path("/proc/sys/net/ipv4/tcp_wmem")
 SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 PACKED_PREFIX = re.compile(r"/tmp/nexus-lab-install\.[A-Za-z0-9]+")
@@ -95,6 +100,14 @@ READINESS_BINDING_HASHES = {
     "nexusTarball": "nexusTarballSha256",
     "cliTarball": "cliTarballSha256",
     "gatewayTarball": "gatewayTarballSha256",
+}
+READINESS_BINDING_AUTHORITIES = {
+    "labProcess": (0, 0o555),
+    "labAgent": (0, 0o555),
+    "labFixture": (0, 0o555),
+    "nexusTarball": (0, 0o444),
+    "cliTarball": (0, 0o444),
+    "gatewayTarball": (0, 0o444),
 }
 
 
@@ -600,6 +613,230 @@ def require_queue_snapshot(frame: dict[str, Any], session_id: str) -> None:
         raise AcceptanceFailure("queue.snapshot has no valid global reconnect seq")
 
 
+async def receive_queue_snapshot(
+    socket: Any,
+    session_id: str,
+    *,
+    timeout: float,
+    label: str,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AcceptanceFailure(f"{label}: timed out")
+        try:
+            raw = await asyncio.wait_for(socket.recv(), remaining)
+        except asyncio.TimeoutError as error:
+            raise AcceptanceFailure(f"{label}: timed out") from error
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        try:
+            frame = json.loads(str(raw))
+        except (TypeError, ValueError) as error:
+            raise AcceptanceFailure(f"{label}: emitted invalid JSON") from error
+        if not isinstance(frame, dict):
+            raise AcceptanceFailure(f"{label}: emitted a non-object frame")
+        if frame.get("t") != "queue.snapshot":
+            continue
+        require_queue_snapshot(frame, session_id)
+        return frame
+
+
+async def receive_capacity_response(
+    socket: Any,
+    client_id: str,
+    session_id: str,
+    *,
+    timeout: float,
+    label: str,
+    require_projection: bool = True,
+) -> dict[str, Any]:
+    """Await one input result and, when accepted, its exact fast-lane queue projection."""
+    deadline = time.monotonic() + timeout
+    response: dict[str, Any] | None = None
+    projected_command_ids: set[str] = set()
+    while True:
+        if response is not None:
+            if response.get("t") == "input.err" or not require_projection:
+                return response
+            command_id = response.get("commandId")
+            if not isinstance(command_id, str) or not command_id:
+                return response
+            if command_id in projected_command_ids:
+                return response
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if response is not None:
+                raise AcceptanceFailure(
+                    f"{label}: accepted command was not projected before timeout"
+                )
+            raise AcceptanceFailure(f"{label}: timed out")
+        try:
+            raw = await asyncio.wait_for(socket.recv(), remaining)
+        except asyncio.TimeoutError as error:
+            if response is not None:
+                raise AcceptanceFailure(
+                    f"{label}: accepted command was not projected before timeout"
+                ) from error
+            raise AcceptanceFailure(f"{label}: timed out") from error
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        try:
+            frame = json.loads(str(raw))
+        except (TypeError, ValueError) as error:
+            raise AcceptanceFailure(f"{label}: emitted invalid JSON") from error
+        if not isinstance(frame, dict):
+            raise AcceptanceFailure(f"{label}: emitted a non-object frame")
+
+        if frame.get("t") == "queue.snapshot":
+            require_queue_snapshot(frame, session_id)
+            commands = frame.get("commands")
+            if not isinstance(commands, list) or any(
+                not isinstance(command, dict) for command in commands
+            ):
+                raise AcceptanceFailure(f"{label}: queue.snapshot commands are invalid")
+            for command in commands:
+                command_id = command.get("commandId")
+                if not isinstance(command_id, str) or not command_id:
+                    raise AcceptanceFailure(
+                        f"{label}: queue.snapshot command has no commandId"
+                    )
+                projected_command_ids.add(command_id)
+
+        if (
+            frame.get("clientMessageId") == client_id
+            and frame.get("t") in {"input.ack", "input.err"}
+        ):
+            response = frame
+
+
+def pause_websocket_reads(websocket: Any) -> Any:
+    """Pause reads without shrinking the receive window needed to drain the typed close."""
+    transport = getattr(websocket, "transport", None)
+    if transport is None:
+        raise AcceptanceFailure("slow-reader websocket exposes no transport")
+    try:
+        transport.pause_reading()
+    except (AttributeError, OSError) as error:
+        raise AcceptanceFailure("slow-reader websocket transport cannot pause reads") from error
+    return transport
+
+
+def resume_websocket_reads(transport: Any) -> None:
+    try:
+        transport.resume_reading()
+    except (AttributeError, OSError) as error:
+        raise AcceptanceFailure("slow-reader websocket transport cannot resume reads") from error
+
+
+def developer_backpressure_thread_name(run_id: str, nonce: str) -> str:
+    """Build a large, ASCII-only thread name whose metadata frames stay below 1 MiB."""
+    binding = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:12]
+    prefix = f"v015-bp-{nonce}-{binding}-"
+    if len(prefix.encode("utf-8")) >= DEVELOPER_BACKPRESSURE_THREAD_BYTES:
+        raise AcceptanceFailure("developer backpressure thread prefix is too large")
+    return prefix + ("x" * (DEVELOPER_BACKPRESSURE_THREAD_BYTES - len(prefix)))
+
+
+def developer_backpressure_post_count(
+    frame_floor_bytes: int,
+    *,
+    receive_max: int,
+    send_max: int,
+) -> int:
+    """Return a bounded load that exceeds both TCP windows and the application queue."""
+    if min(frame_floor_bytes, receive_max, send_max) <= 0:
+        raise AcceptanceFailure("developer backpressure byte bounds must be positive")
+    backlog = receive_max + send_max + DEVELOPER_BACKPRESSURE_MAX_BUFFERED_BYTES
+    # Two additional frames cover JSON framing and a concurrent kernel-window update without
+    # mutating SO_RCVBUF/SO_SNDBUF or relying on platform-specific raw-socket controls.
+    return (backlog // frame_floor_bytes) + 3
+
+
+def tcp_buffer_max(path: Path, label: str) -> int:
+    try:
+        values = [int(value) for value in path.read_text(encoding="utf-8").split()]
+    except (OSError, ValueError) as error:
+        raise AcceptanceFailure(f"cannot read {label} TCP buffer limits") from error
+    if len(values) != 3 or any(value <= 0 for value in values):
+        raise AcceptanceFailure(f"{label} TCP buffer limits are malformed")
+    return max(values)
+
+
+def post_thread_for_backpressure(http: Any, name: str) -> None:
+    """Create the large metadata thread through the shipped authenticated HTTP route."""
+    data = canonical_json({"name": name, "members": []})
+    request = Request(
+        http.base_url.rstrip("/") + "/api/v1/threads",
+        data=data,
+        method="POST",
+        headers={
+            "accept": "application/json",
+            "content-type": "application/json",
+            "cookie": http.cookie,
+            "x-nexus-csrf": http.csrf,
+        },
+    )
+    try:
+        with urlopen(request, timeout=60) as response:
+            raw = response.read()
+            status = response.status
+    except HTTPError as error:
+        error.read()
+        raise AcceptanceFailure(
+            f"developer backpressure thread creation returned HTTP {error.code}"
+        ) from error
+    except (OSError, URLError) as error:
+        raise AcceptanceFailure("developer backpressure thread creation failed") from error
+    if status not in {200, 201}:
+        raise AcceptanceFailure(
+            f"developer backpressure thread creation returned HTTP {status}"
+        )
+    try:
+        result = json.loads(raw.decode("utf-8")) if raw else None
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise AcceptanceFailure("developer backpressure thread creation returned invalid JSON") from error
+    if result is not None:
+        raise AcceptanceFailure("developer backpressure thread creation returned unexpected data")
+
+
+async def drain_websocket_until_closed(
+    websocket: Any,
+    *,
+    timeout: float,
+    label: str,
+) -> None:
+    """Consume queued application frames so a bounded client can observe the peer close."""
+    deadline = time.monotonic() + timeout
+    while getattr(websocket, "close_code", None) is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AcceptanceFailure(f"{label}: timed out waiting for close")
+        try:
+            await asyncio.wait_for(websocket.recv(), remaining)
+        except asyncio.TimeoutError as error:
+            raise AcceptanceFailure(f"{label}: timed out waiting for close") from error
+        except Exception as error:
+            if getattr(websocket, "close_code", None) is None:
+                raise AcceptanceFailure(f"{label}: receive failed before close") from error
+            break
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise AcceptanceFailure(f"{label}: timed out waiting for close")
+    try:
+        await asyncio.wait_for(websocket.wait_closed(), remaining)
+    except asyncio.TimeoutError as error:
+        raise AcceptanceFailure(f"{label}: timed out waiting for close") from error
+    if getattr(websocket, "close_code", None) is None:
+        raise AcceptanceFailure(f"{label}: closed without a close code")
+
+
+class ExactRosterPending(AcceptanceFailure):
+    """The exact stable roster exists but has not returned fully online yet."""
+
+
 def require_exact_roster(rows: object, agents: Iterable[object]) -> None:
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise AcceptanceFailure("exact roster is not an array of member rows")
@@ -615,8 +852,15 @@ def require_exact_roster(rows: object, agents: Iterable[object]) -> None:
         if agent_id in by_id:
             raise AcceptanceFailure(f"exact roster has duplicate agentId {agent_id}")
         by_id[agent_id] = row
-    if set(by_id) != set(expected):
+    extra_ids = set(by_id) - set(expected)
+    missing_ids = set(expected) - set(by_id)
+    if extra_ids:
         raise AcceptanceFailure(
+            "exact roster differs from live-agent truth: "
+            f"expected={sorted(expected)} observed={sorted(by_id)}"
+        )
+    if missing_ids:
+        raise ExactRosterPending(
             "exact roster differs from live-agent truth: "
             f"expected={sorted(expected)} observed={sorted(by_id)}"
         )
@@ -629,7 +873,30 @@ def require_exact_roster(rows: object, agents: Iterable[object]) -> None:
         if name != getattr(agent, "name") or session_id != getattr(agent, "session_id"):
             raise AcceptanceFailure(f"exact roster identity mismatch for {agent_id}")
         if state not in online_states:
-            raise AcceptanceFailure(f"exact roster member {agent_id} is not online")
+            raise ExactRosterPending(f"exact roster member {agent_id} is not online")
+
+
+async def wait_for_exact_roster(
+    identity_reader: Any,
+    nexus_bin: str,
+    agents: Iterable[object],
+    *,
+    timeout: float = 30,
+    interval: float = 0.25,
+) -> list[dict[str, Any]]:
+    deadline = time.monotonic() + timeout
+    while True:
+        rows = await asyncio.to_thread(identity_reader, nexus_bin)
+        try:
+            require_exact_roster(rows, agents)
+        except ExactRosterPending as error:
+            if time.monotonic() >= deadline:
+                raise AcceptanceFailure(
+                    f"exact roster did not converge before timeout: {error}"
+                ) from error
+            await asyncio.sleep(interval)
+            continue
+        return rows
 
 
 def require_queue_agreement(
@@ -850,7 +1117,13 @@ class LiveAgent:
 
 
 def parse_readiness(path: Path, lab_root: Path) -> dict[str, str]:
-    raw = checked_file(path, lab_root, "candidate readiness ledger")
+    raw = checked_file(
+        path,
+        lab_root,
+        "candidate readiness ledger",
+        expected_uid=0,
+        expected_mode=0o444,
+    )
     try:
         text = raw.decode("utf-8")
     except UnicodeError as error:
@@ -931,7 +1204,7 @@ def validate_runtime_observation(
             "actual cgroup limits are not 8 GiB, zero extra swap, and 1024 PIDs"
         )
 
-    expected_home = str(candidate.lab_root)
+    expected_home = str(candidate.lab_root / "harness-home")
     expected_nexus_home = str(candidate.lab_root / "nexus")
     if observation.home != expected_home or observation.nexus_home != expected_nexus_home:
         raise AcceptanceFailure(
@@ -978,9 +1251,11 @@ def validate_runtime_observation(
     expected_gateway = readiness.get("gatewayResolved")
     expected_gateway_hash = readiness.get("gatewaySha256")
     if (
-        observation.gateway_entrypoint != expected_gateway
+        not isinstance(expected_gateway, str)
+        or not isinstance(expected_gateway_hash, str)
+        or observation.gateway_entrypoint != expected_gateway
         or observation.gateway_entrypoint_sha256 != expected_gateway_hash
-        or expected_gateway not in observation.gateway_argv
+        or not argv_binds_path(observation.gateway_argv, Path(expected_gateway))
     ):
         raise AcceptanceFailure("actual Gateway process is not the packed candidate entrypoint")
     validate_lens_ledger(readiness, environment)
@@ -1008,6 +1283,14 @@ def validate_runtime_observation(
 
 def _checked_text(path: Path, root: Path, label: str) -> str:
     raw = checked_file(path, root, label)
+    try:
+        return raw.decode("utf-8").strip()
+    except UnicodeError as error:
+        raise AcceptanceFailure(f"{label} is not UTF-8") from error
+
+
+def checked_system_text(path: Path, label: str) -> str:
+    raw = checked_file(path, Path("/"), label, expected_uid=0)
     try:
         return raw.decode("utf-8").strip()
     except UnicodeError as error:
@@ -1058,6 +1341,23 @@ def _process_argv(pid: int, label: str) -> tuple[str, ...]:
     return rows
 
 
+def argv_binds_path(argv: tuple[str, ...] | list[str], expected: Path) -> bool:
+    try:
+        expected_resolved = absolute(expected.resolve(strict=True))
+    except OSError:
+        return False
+    for argument in argv:
+        path = Path(argument)
+        if not path.is_absolute():
+            continue
+        try:
+            if absolute(path.resolve(strict=True)) == expected_resolved:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _process_cwd(pid: int, label: str) -> Path:
     try:
         target = os.readlink(Path("/proc") / str(pid) / "cwd")
@@ -1089,8 +1389,9 @@ def _process_environment(pid: int, label: str) -> dict[str, str]:
 
 def _listener_inodes(port: int) -> set[str]:
     result: set[str] = set()
-    for path in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
-        text = _checked_text(path, Path("/"), f"kernel TCP listener table {path.name}")
+    net_root = Path("/proc") / str(os.getpid()) / "net"
+    for path in (net_root / "tcp", net_root / "tcp6"):
+        text = checked_system_text(path, f"kernel TCP listener table {path.name}")
         for line in text.splitlines()[1:]:
             fields = line.split()
             if len(fields) < 10 or fields[3] != "0A":
@@ -1131,17 +1432,15 @@ def observe_runtime(candidate: Candidate) -> RuntimeObservation:
     """Capture actual container and process authority without mutating runtime."""
     lab_root = candidate.lab_root
     nexus_home = lab_root / "nexus"
-    container_id = _checked_text(Path("/etc/hostname"), Path("/"), "container hostname")
-    cpu_max = _checked_text(Path("/sys/fs/cgroup/cpu.max"), Path("/"), "cgroup cpu.max")
-    memory_max = _checked_text(
-        Path("/sys/fs/cgroup/memory.max"), Path("/"), "cgroup memory.max"
+    container_id = checked_system_text(Path("/etc/hostname"), "container hostname")
+    cpu_max = checked_system_text(Path("/sys/fs/cgroup/cpu.max"), "cgroup cpu.max")
+    memory_max = checked_system_text(
+        Path("/sys/fs/cgroup/memory.max"), "cgroup memory.max"
     )
-    memory_swap_max = _checked_text(
-        Path("/sys/fs/cgroup/memory.swap.max"),
-        Path("/"),
-        "cgroup memory.swap.max",
+    memory_swap_max = checked_system_text(
+        Path("/sys/fs/cgroup/memory.swap.max"), "cgroup memory.swap.max"
     )
-    pids_max = _checked_text(Path("/sys/fs/cgroup/pids.max"), Path("/"), "cgroup pids.max")
+    pids_max = checked_system_text(Path("/sys/fs/cgroup/pids.max"), "cgroup pids.max")
     daemon_pid = _positive_pid(
         _checked_text(nexus_home / "daemon.pid", lab_root, "daemon pid"),
         "daemon",
@@ -1169,7 +1468,7 @@ def observe_runtime(candidate: Candidate) -> RuntimeObservation:
     )
     gateway_argv = _process_argv(gateway_pid, "Gateway")
     expected_gateway = Path(candidate.readiness.get("gatewayResolved", ""))
-    if str(expected_gateway) not in gateway_argv:
+    if not argv_binds_path(gateway_argv, expected_gateway):
         raise AcceptanceFailure("actual Gateway command line omits the packed entrypoint")
     gateway_bytes = checked_file(
         expected_gateway,
@@ -1225,13 +1524,47 @@ def observe_runtime(candidate: Candidate) -> RuntimeObservation:
     return observation
 
 
-def require_bound_file(path: Path, expected: object, label: str, root: Path) -> None:
+def require_bound_file(
+    path: Path,
+    expected: object,
+    label: str,
+    root: Path,
+    *,
+    expected_uid: int | None = None,
+    expected_mode: int | None = None,
+) -> None:
     if not isinstance(expected, str) or SHA256.fullmatch(expected) is None:
         raise AcceptanceFailure(f"{label} expected hash is invalid")
-    raw = checked_file(path, root, label)
+    raw = checked_file(
+        path,
+        root,
+        label,
+        expected_uid=expected_uid,
+        expected_mode=expected_mode,
+    )
     actual = sha256_bytes(raw)
     if actual != expected:
         raise AcceptanceFailure(f"{label} hash mismatch: expected {expected}, got {actual}")
+
+
+def validate_readiness_bindings(
+    readiness: dict[str, str],
+    lab_root: Path,
+) -> None:
+    for key, hash_key in READINESS_BINDING_HASHES.items():
+        path = Path(readiness[key])
+        binding_root = lab_root if inside(path, lab_root) else Path("/")
+        expected_uid, expected_mode = READINESS_BINDING_AUTHORITIES.get(
+            key, (None, None)
+        )
+        require_bound_file(
+            path,
+            readiness[hash_key],
+            f"readiness {key}",
+            binding_root,
+            expected_uid=expected_uid,
+            expected_mode=expected_mode,
+        )
 
 
 def validate_image_and_limits(manifest: dict[str, Any]) -> None:
@@ -1625,6 +1958,14 @@ def validate_final_support_script_bindings(
             EVIDENCE_VALIDATOR_BIN,
             "evidence validator",
         ),
+        (
+            "releaseAssembler",
+            "releaseAssemblerSha256",
+            "NEXUS_V015_RELEASE_ASSEMBLER",
+            "NEXUS_V015_RELEASE_ASSEMBLER_SHA256",
+            RELEASE_ASSEMBLER_BIN,
+            "release assembler",
+        ),
     )
     for path_key, hash_key, environment_path, environment_hash, path, label in bindings:
         digest_value = readiness.get(hash_key)
@@ -1726,7 +2067,7 @@ def install_tree_digest(install_root: Path) -> str:
     return sha256_bytes(canonical_json(full_install_inventory(install_root)))
 
 
-def lens_tree_digest(root: Path) -> str:
+def lens_tree_digest(root: Path, *, expected_uid: int = 0) -> str:
     """Match the sealed Lens tree digest emitted by the packed lab topology."""
     root = absolute(root)
     try:
@@ -1736,7 +2077,7 @@ def lens_tree_digest(root: Path) -> str:
     if (
         not stat.S_ISDIR(root_info.st_mode)
         or stat.S_ISLNK(root_info.st_mode)
-        or root_info.st_uid != os.geteuid()
+        or root_info.st_uid != expected_uid
         or stat.S_IMODE(root_info.st_mode) != 0o555
     ):
         raise AcceptanceFailure("packed Lens app root ownership or mode is invalid")
@@ -1755,7 +2096,7 @@ def lens_tree_digest(root: Path) -> str:
                 raise AcceptanceFailure(
                     f"cannot inspect packed Lens entry {child_relative}: {error}"
                 ) from error
-            if info.st_uid != os.geteuid():
+            if info.st_uid != expected_uid:
                 raise AcceptanceFailure(
                     f"packed Lens entry owner mismatch: {child_relative}"
                 )
@@ -1786,7 +2127,13 @@ def lens_tree_digest(root: Path) -> str:
         raise AcceptanceFailure("packed Lens app tree is empty")
     digest = hashlib.sha256()
     for relative, path, mode in sorted(files, key=lambda row: row[0]):
-        raw = checked_file(path, root, f"packed Lens file {relative}")
+        raw = checked_file(
+            path,
+            root,
+            f"packed Lens file {relative}",
+            expected_uid=expected_uid,
+            expected_mode=0o444,
+        )
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
         digest.update(f"{mode:o}".encode("ascii"))
@@ -1852,6 +2199,7 @@ def validate_candidate(lab_root: Path, evidence_dir: Path, run_id: str) -> Candi
         "webconsoleAcceptance", "webconsoleAcceptanceSha256",
         "webconsoleEvidenceVerifier", "webconsoleEvidenceVerifierSha256",
         "evidenceValidator", "evidenceValidatorSha256",
+        "releaseAssembler", "releaseAssemblerSha256",
     }
     if set(readiness) != required:
         raise AcceptanceFailure("candidate readiness ledger has unexpected or missing fields")
@@ -1957,7 +2305,13 @@ def validate_candidate(lab_root: Path, evidence_dir: Path, run_id: str) -> Candi
         raise AcceptanceFailure(f"canonical Lens app link cannot resolve: {error}") from error
     if resolved_lens_link != lens_app or lens_main != lens_app / "electron" / "main.cjs":
         raise AcceptanceFailure("canonical Lens app/main topology mismatch")
-    checked_file(lens_main, lens_app, "packed Lens Electron main")
+    checked_file(
+        lens_main,
+        lens_app,
+        "packed Lens Electron main",
+        expected_uid=0,
+        expected_mode=0o444,
+    )
     if lens_tree_digest(lens_app) != readiness["lensTreeSha256"]:
         raise AcceptanceFailure("packed Lens app tree differs from readiness")
     expected_environment = {
@@ -2014,25 +2368,15 @@ def validate_candidate(lab_root: Path, evidence_dir: Path, run_id: str) -> Candi
         "NEXUS_V015_EVIDENCE_VALIDATOR_SHA256": readiness[
             "evidenceValidatorSha256"
         ],
+        "NEXUS_V015_RELEASE_ASSEMBLER": readiness["releaseAssembler"],
+        "NEXUS_V015_RELEASE_ASSEMBLER_SHA256": readiness[
+            "releaseAssemblerSha256"
+        ],
     }
     for key, expected in expected_environment.items():
         if environment.get(key) != expected:
             raise AcceptanceFailure(f"packed manifest binding {key} mismatch")
-    bindings = {
-        "nexusResolved": Path(readiness["nexusResolved"]),
-        "gatewayResolved": Path(readiness["gatewayResolved"]),
-        "webuiResolved": Path(readiness["webuiResolved"]),
-        "labProcess": Path(readiness["labProcess"]),
-        "labAgent": Path(readiness["labAgent"]),
-        "labFixture": Path(readiness["labFixture"]),
-        "nexusTarball": Path(readiness["nexusTarball"]),
-        "cliTarball": Path(readiness["cliTarball"]),
-        "gatewayTarball": Path(readiness["gatewayTarball"]),
-    }
-    for key, path in bindings.items():
-        hash_key = READINESS_BINDING_HASHES[key]
-        binding_root = lab_root if inside(path, lab_root) else Path("/")
-        require_bound_file(path, readiness[hash_key], f"readiness {key}", binding_root)
+    validate_readiness_bindings(readiness, lab_root)
     try:
         observed_tarballs = set(Path("/tmp/nexus-lab-packs").iterdir())
     except OSError as error:
@@ -2040,7 +2384,14 @@ def validate_candidate(lab_root: Path, evidence_dir: Path, run_id: str) -> Candi
     if observed_tarballs != set(tarball_paths.values()):
         raise AcceptanceFailure("candidate tarball directory has extra or missing entries")
     readiness_expected = environment.get("NEXUS_V015_READINESS_LEDGER_SHA256")
-    require_bound_file(readiness_path, readiness_expected, "candidate readiness ledger", lab_root)
+    require_bound_file(
+        readiness_path,
+        readiness_expected,
+        "candidate readiness ledger",
+        lab_root,
+        expected_uid=0,
+        expected_mode=0o444,
+    )
     native_path = validate_native_binding(
         install_root,
         nested_cli,
@@ -2271,7 +2622,14 @@ def launch_live_agents(
     if hook != LAB_AGENT:
         raise AcceptanceFailure("live-agent hook is not the canonical isolated-lab hook")
     hook_hash = environment.get("NEXUS_V015_LAB_AGENT_SHA256")
-    require_bound_file(hook, hook_hash, "live-agent hook", Path("/"))
+    require_bound_file(
+        hook,
+        hook_hash,
+        "live-agent hook",
+        Path("/"),
+        expected_uid=0,
+        expected_mode=0o555,
+    )
     nexus_bin = environment.get("NEXUS_V015_NEXUS_BIN")
     readiness_hash = environment.get("NEXUS_V015_READINESS_LEDGER_SHA256")
     if nexus_bin != str(NEXUS_BIN) or not isinstance(readiness_hash, str):
@@ -2303,7 +2661,14 @@ def launch_live_agents(
             raise AcceptanceFailure(
                 f"genuine {kind} harness launch failed with {result.returncode}: {detail}"
             )
-    require_bound_file(hook, hook_hash, "live-agent hook after launches", Path("/"))
+    require_bound_file(
+        hook,
+        hook_hash,
+        "live-agent hook after launches",
+        Path("/"),
+        expected_uid=0,
+        expected_mode=0o555,
+    )
 
 
 def load_soak_core(candidate: Candidate) -> dict[str, Any]:
@@ -2315,7 +2680,13 @@ def load_soak_core(candidate: Candidate) -> dict[str, Any]:
         environment,
         Path("/"),
     )
-    raw = checked_file(SOAK_CORE, Path("/"), "WebSocket soak core")
+    raw = checked_file(
+        SOAK_CORE,
+        Path("/"),
+        "WebSocket soak core",
+        expected_uid=0,
+        expected_mode=0o555,
+    )
     if not raw.startswith(b"#!/usr/bin/env python3"):
         raise AcceptanceFailure("WebSocket soak core has an unexpected interpreter")
     return runpy.run_path(str(SOAK_CORE))
@@ -2334,7 +2705,13 @@ def candidate_verification_document(
     expected_readiness = candidate.lab_root / "lab" / "candidate-ready.v1"
     if readiness_path != expected_readiness:
         raise AcceptanceFailure("candidate readiness path is not canonical")
-    readiness = checked_file(readiness_path, candidate.lab_root, "candidate readiness ledger")
+    readiness = checked_file(
+        readiness_path,
+        candidate.lab_root,
+        "candidate readiness ledger",
+        expected_uid=0,
+        expected_mode=0o444,
+    )
     document: dict[str, Any] = {
         "schemaVersion": 1,
         "status": "PASS",
@@ -2431,6 +2808,203 @@ class GateObservations:
                 name: pretty_json(self.values[gate][name]) for name in names
             }
         return payloads
+
+
+def require_terminal_marker(
+    assistant_text: object,
+    expected_text: str,
+    label: str,
+) -> None:
+    if not isinstance(assistant_text, str):
+        raise AcceptanceFailure(f"{label} assistant marker mismatch: {assistant_text!r}")
+    normalized = assistant_text.strip()
+    lines = normalized.splitlines()
+    if (
+        not lines
+        or lines[-1].strip() != expected_text
+        or normalized.count(expected_text) != 1
+    ):
+        raise AcceptanceFailure(f"{label} assistant marker mismatch: {assistant_text!r}")
+
+
+async def wait_correlated_assistant_reply(
+    core: dict[str, Any],
+    lane: Any,
+    *,
+    start_index: int,
+    before_cursor: int,
+    client_message_id: str,
+    expected_text: str,
+    timeout: float,
+    label: str,
+) -> dict[str, object]:
+    session_event = core["session_event"]
+    numeric_cursor = core["numeric_cursor"]
+    echo = await lane.wait_for(
+        lambda frame: (
+            session_event(frame).get("type") == "TEXT_MESSAGE_END"
+            and session_event(frame).get("messageId") == client_message_id
+        ),
+        after=start_index,
+        timeout=timeout,
+        label=f"{label} user echo",
+    )
+    echo_index = next(
+        index
+        for index in range(start_index, len(lane.frames))
+        if lane.frames[index] is echo
+    )
+    echo_cursor = numeric_cursor(echo)
+    if echo_cursor is None or echo_cursor <= before_cursor:
+        raise AcceptanceFailure(
+            f"{label} user echo has no new cursor for {client_message_id}: {echo!r}"
+        )
+    starts = [
+        frame
+        for frame in lane.frames[start_index : echo_index + 1]
+        if session_event(frame).get("type") == "RUN_STARTED"
+        and numeric_cursor(frame) == echo_cursor
+        and isinstance(session_event(frame).get("runId"), str)
+        and bool(session_event(frame).get("runId"))
+    ]
+    if len(starts) != 1:
+        raise AcceptanceFailure(
+            f"{label} user echo has no exact correlated run start for "
+            f"{client_message_id}: count={len(starts)} cursor={echo_cursor}"
+        )
+    run_id = session_event(starts[0])["runId"]
+    terminal = await lane.wait_for(
+        lambda frame: (
+            session_event(frame).get("type") == "RUN_FINISHED"
+            and session_event(frame).get("runId") == run_id
+            and (numeric_cursor(frame) or -1) > before_cursor
+        ),
+        after=echo_index + 1,
+        timeout=timeout,
+        label=f"{label} RUN_FINISHED",
+    )
+    terminal_index = next(
+        index
+        for index in range(echo_index + 1, len(lane.frames))
+        if lane.frames[index] is terminal
+    )
+    assistant_starts = [
+        (index, frame)
+        for index, frame in enumerate(
+            lane.frames[echo_index + 1 : terminal_index],
+            start=echo_index + 1,
+        )
+        if session_event(frame).get("type") == "TEXT_MESSAGE_START"
+        and session_event(frame).get("role") == "assistant"
+        and isinstance(session_event(frame).get("messageId"), str)
+        and bool(session_event(frame).get("messageId"))
+    ]
+    if not assistant_starts:
+        raise AcceptanceFailure(
+            f"{label} current run has no exact assistant output for "
+            f"{client_message_id}: count=0 runId={run_id}"
+        )
+    assistant_messages: list[dict[str, object]] = []
+    for position, (assistant_start_index, assistant_start) in enumerate(assistant_starts):
+        assistant_message_id = session_event(assistant_start)["messageId"]
+        next_start_index = (
+            assistant_starts[position + 1][0]
+            if position + 1 < len(assistant_starts)
+            else terminal_index
+        )
+        assistant_ends = [
+            (index, frame)
+            for index, frame in enumerate(
+                lane.frames[assistant_start_index + 1 : next_start_index],
+                start=assistant_start_index + 1,
+            )
+            if session_event(frame).get("type") == "TEXT_MESSAGE_END"
+            and session_event(frame).get("messageId") == assistant_message_id
+        ]
+        if len(assistant_ends) != 1:
+            raise AcceptanceFailure(
+                f"{label} current run has no exact assistant end for "
+                f"{client_message_id}: messageId={assistant_message_id} "
+                f"count={len(assistant_ends)} runId={run_id}"
+            )
+        assistant_end_index, _assistant_end = assistant_ends[0]
+        assistant_text = "".join(
+            str(session_event(frame).get("delta"))
+            for frame in lane.frames[assistant_start_index + 1 : assistant_end_index]
+            if session_event(frame).get("type") == "TEXT_MESSAGE_CONTENT"
+            and session_event(frame).get("messageId") == assistant_message_id
+            and isinstance(session_event(frame).get("delta"), str)
+        )
+        assistant_messages.append(
+            {
+                "messageId": assistant_message_id,
+                "text": assistant_text,
+            }
+        )
+    final_assistant = assistant_messages[-1]
+    assistant_text = final_assistant["text"]
+    require_terminal_marker(assistant_text, expected_text, label)
+    return {
+        "runId": run_id,
+        "assistantMessageId": final_assistant["messageId"],
+        "assistantText": assistant_text,
+        "assistantMessageCount": len(assistant_messages),
+        "terminalIndex": terminal_index,
+    }
+
+
+async def ensure_run_terminal(
+    core: dict[str, Any],
+    lane: Any,
+    *,
+    run_id: str,
+    after: int,
+    client_message_id: str,
+    timeout: float,
+    label: str,
+    ack_timeout: float = 60,
+) -> dict[str, Any]:
+    session_event = core["session_event"]
+
+    def is_terminal(frame: dict[str, Any]) -> bool:
+        event = session_event(frame)
+        return event.get("type") == "RUN_FINISHED" and event.get("runId") == run_id
+
+    for frame in lane.frames[after:]:
+        if is_terminal(frame):
+            return frame
+
+    steer_start = len(lane.frames)
+    await lane.send({
+        "t": "steer",
+        "text": "Stop immediately and finish.",
+        "clientMessageId": client_message_id,
+    })
+    outcome = await lane.wait_for(
+        lambda frame: is_terminal(frame)
+        or (
+            frame.get("t") in {"steer.ack", "steer.err"}
+            and frame.get("clientMessageId") == client_message_id
+        ),
+        after=steer_start,
+        timeout=ack_timeout,
+        label=f"{label} interrupt response",
+    )
+    if is_terminal(outcome):
+        return outcome
+    for frame in lane.frames[after:]:
+        if is_terminal(frame):
+            return frame
+    if outcome.get("t") == "steer.err":
+        raise AcceptanceFailure(
+            f"{label} interrupt failed before the original run terminal: {outcome!r}"
+        )
+    return await lane.wait_for(
+        is_terminal,
+        after=after,
+        timeout=timeout,
+        label=f"{label} terminal",
+    )
 
 
 class BackendAcceptance:
@@ -2537,6 +3111,7 @@ class BackendAcceptance:
             self.http,
             (f"sys.dm.{self.human_name}",),
         )
+        self.soak.dm_mirror_topic = f"sys.dm.{self.human_name}"
         snapshot_starts = {
             kind: len(lane.frames) for kind, lane in self.soak.sessions.items()
         }
@@ -3080,7 +3655,12 @@ class BackendAcceptance:
                     return frame
         raise AcceptanceFailure(f"{label} did not produce a fleet event")
 
-    async def wait_fleet_gap(self, label: str, *, timeout: float = 60) -> dict[str, Any]:
+    async def wait_fleet_boot_reset(
+        self,
+        label: str,
+        *,
+        timeout: float = 60,
+    ) -> dict[str, Any]:
         if self.fleet_socket is None:
             raise AcceptanceFailure("fleet socket is not mounted")
         deadline = time.monotonic() + timeout
@@ -3092,10 +3672,24 @@ class BackendAcceptance:
                 continue
             self.fleet_frames.append(frame)
             if frame.get("t") == "subscribe.gap":
-                return frame
+                return {"mode": "gap", "frame": frame}
             if frame.get("t") == "subscribe.err":
-                raise AcceptanceFailure(f"{label} emitted subscribe.err instead of gap: {frame!r}")
-        raise AcceptanceFailure(f"{label} did not signal a boot-aware gap")
+                raise AcceptanceFailure(
+                    f"{label} emitted subscribe.err instead of a boot reset: {frame!r}"
+                )
+            event = frame.get("event")
+            if (
+                frame.get("type") == "developer.event"
+                and isinstance(event, dict)
+                and event.get("topic") == "sys.fleet.status"
+                and event.get("lifecycle") == "resync"
+            ):
+                seq = event.get("seq")
+                if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+                    raise AcceptanceFailure(f"{label} emitted an invalid fleet resync: {frame!r}")
+                self.fleet_cursor = seq
+                return {"mode": "resync", "frame": frame}
+        raise AcceptanceFailure(f"{label} did not signal a boot-aware gap or resync")
 
     async def concurrent_thread_subscribers(self) -> dict[str, Any]:
         socket = await self.soak.developer._open(
@@ -3165,11 +3759,22 @@ class BackendAcceptance:
         codex = self.soak.sessions["codex"]
         session_attempt = await codex.begin_prompt(session_marker, timeout=120)
         await codex.close()
-        await self.restart(target)
-        developer_result, session_result = await asyncio.gather(
-            self.soak.finish_message(developer_attempt, timeout=120),
-            codex.finish_prompt(session_attempt, timeout=240),
+        developer_result: dict[str, object] | None = None
+        session_result: dict[str, object] | None = None
+
+        async def finish_straddled_traffic() -> None:
+            nonlocal developer_result, session_result
+            developer_result, session_result = await asyncio.gather(
+                self.soak.finish_message(developer_attempt, timeout=120),
+                codex.finish_prompt(session_attempt, timeout=240),
+            )
+
+        await self.restart(
+            target,
+            before_post_restart_human_write=finish_straddled_traffic,
         )
+        if developer_result is None or session_result is None:
+            raise AcceptanceFailure("straddled traffic did not finish after reconnect")
         record = {
             "target": target,
             "developer": {
@@ -3203,8 +3808,8 @@ class BackendAcceptance:
         instruction = (
             f"Use your Nexus dm tool exactly once to send {dm_marker!r} to {self.human_name!r}. "
             f"Use your Nexus thread post tool exactly once to post {thread_marker!r} to "
-            f"thread {self.soak.thread!r}. After both tools succeed, reply in this session with "
-            f"exactly {assistant_marker!r} and no other text."
+            f"thread {self.soak.thread!r}. After both tools succeed, end your reply with "
+            f"{assistant_marker!r} as its final standalone line, with nothing after it."
         )
         session_start = len(lane.frames)
         dm_start = len(self.human_dm.frames)
@@ -3227,68 +3832,17 @@ class BackendAcceptance:
         if not isinstance(command_id, str) or not command_id:
             raise AcceptanceFailure(f"{agent.kind} bus-action ack has no commandId")
         self.soak.ledger.session_accepted.add(client_message_id)
-        started = await lane.wait_for(
-            lambda frame: (
-                self.core["session_event"](frame).get("type") == "RUN_STARTED"
-                and isinstance(self.core["session_event"](frame).get("runId"), str)
-            ),
-            after=session_start,
-            timeout=180,
-            label=f"{agent.kind} bus-action RUN_STARTED",
-        )
-        run_id = self.core["session_event"](started)["runId"]
-        assistant_start = await lane.wait_for(
-            lambda frame: (
-                self.core["session_event"](frame).get("type") == "TEXT_MESSAGE_START"
-                and self.core["session_event"](frame).get("role") == "assistant"
-            ),
-            after=session_start,
+        reply = await wait_correlated_assistant_reply(
+            self.core,
+            lane,
+            start_index=session_start,
+            before_cursor=before_cursor,
+            client_message_id=client_message_id,
+            expected_text=assistant_marker,
             timeout=240,
-            label=f"{agent.kind} bus-action assistant start",
+            label=f"{agent.kind} bus-action",
         )
-        assistant_id = self.core["session_event"](assistant_start).get("messageId")
-        if not isinstance(assistant_id, str) or not assistant_id:
-            raise AcceptanceFailure(f"{agent.kind} bus-action assistant has no messageId")
-        assistant_start_index = next(
-            index
-            for index in range(session_start, len(lane.frames))
-            if lane.frames[index] is assistant_start
-        )
-        assistant_end = await lane.wait_for(
-            lambda frame: (
-                self.core["session_event"](frame).get("type") == "TEXT_MESSAGE_END"
-                and self.core["session_event"](frame).get("messageId") == assistant_id
-            ),
-            after=assistant_start_index + 1,
-            timeout=240,
-            label=f"{agent.kind} bus-action assistant end",
-        )
-        assistant_end_index = next(
-            index
-            for index in range(assistant_start_index + 1, len(lane.frames))
-            if lane.frames[index] is assistant_end
-        )
-        assistant_text = "".join(
-            str(self.core["session_event"](frame).get("delta"))
-            for frame in lane.frames[assistant_start_index + 1 : assistant_end_index]
-            if self.core["session_event"](frame).get("type") == "TEXT_MESSAGE_CONTENT"
-            and self.core["session_event"](frame).get("messageId") == assistant_id
-            and isinstance(self.core["session_event"](frame).get("delta"), str)
-        )
-        if assistant_text.strip() != assistant_marker:
-            raise AcceptanceFailure(
-                f"{agent.kind} bus-action assistant marker mismatch: {assistant_text!r}"
-            )
-        await lane.wait_for(
-            lambda frame: (
-                self.core["session_event"](frame).get("type") == "RUN_FINISHED"
-                and self.core["session_event"](frame).get("runId") == run_id
-                and (self.core["numeric_cursor"](frame) or -1) > before_cursor
-            ),
-            after=assistant_end_index + 1,
-            timeout=240,
-            label=f"{agent.kind} bus-action RUN_FINISHED",
-        )
+        run_id = reply["runId"]
         self.soak.ledger.session_completed.add(client_message_id)
         dm_topic = f"sys.dm.{self.human_name}"
         dm_path = f"/api/v1/dms/{quote(agent.name, safe='')}/history?limit=100"
@@ -3469,7 +4023,12 @@ class BackendAcceptance:
                 "idWithStaleNameAndProjectMetadata": id_first,
             })
 
-    async def restart(self, target: str) -> None:
+    async def restart(
+        self,
+        target: str,
+        *,
+        before_post_restart_human_write: Any | None = None,
+    ) -> None:
         before = await asyncio.to_thread(self.core["lifecycle_state"], self.candidate.lab_root / "nexus")
         fleet_cursor_before = self.fleet_cursor
         cursors = {
@@ -3522,9 +4081,12 @@ class BackendAcceptance:
         for topic, cursor in cursors["humanDm"].items():
             if self.human_dm.cursors.get(topic, -1) < cursor:
                 raise AcceptanceFailure(f"human DM cursor regressed across {target} restart")
-        rows = await asyncio.to_thread(self.core["identity_rows"], str(NEXUS_BIN))
+        rows = await wait_for_exact_roster(
+            self.core["identity_rows"],
+            str(NEXUS_BIN),
+            self.live_agents,
+        )
         self.core["check_identities"](rows, self.soak.agents, self.soak.ledger)
-        require_exact_roster(rows, self.live_agents)
         dlq = await asyncio.to_thread(self.core["dlq_total"], str(NEXUS_BIN))
         self.soak.ledger.failure["deadLetters"] = max(
             self.soak.ledger.failure["deadLetters"],
@@ -3540,17 +4102,23 @@ class BackendAcceptance:
                 "ack": ack,
             }
         else:
-            gap = await self.wait_fleet_gap(f"fleet after {target} restart")
-            self.fleet_cursor = 0
-            ack = await self.open_fleet(0)
-            event = await self.wait_fleet_event(f"fleet resync after {target} restart")
+            gaps: list[dict[str, Any]] = []
+            reset = await self.wait_fleet_boot_reset(f"fleet after {target} restart")
+            while reset["mode"] == "gap":
+                gaps.append(reset["frame"])
+                if len(gaps) > 2:
+                    raise AcceptanceFailure("fleet emitted repeated gaps without a resync boundary")
+                reset = await self.wait_fleet_boot_reset(
+                    f"fleet resync after {target} restart"
+                )
             fleet_recovery = {
-                "mode": "boot-gap-resync",
+                "mode": "boot-aware-resync",
                 "previousCursor": fleet_cursor_before,
-                "gap": gap,
-                "ack": ack,
-                "event": event,
+                "gaps": gaps,
+                "resync": reset["frame"],
             }
+        if before_post_restart_human_write is not None:
+            await before_post_restart_human_write()
         human = await self.human_write(f"after-{target}-{len(self.restart_timeline) + 1}")
         checkpoint = {
             "target": target,
@@ -3583,9 +4151,12 @@ class BackendAcceptance:
         lanes = [self.soak.developer, self.human_dm, *self.soak.sessions.values()]
         if any(lane.reader is None or lane.reader.done() for lane in lanes):
             self.soak.ledger.failure["crashLoops"] += 1
-        rows = await asyncio.to_thread(self.core["identity_rows"], str(NEXUS_BIN))
+        rows = await wait_for_exact_roster(
+            self.core["identity_rows"],
+            str(NEXUS_BIN),
+            self.live_agents,
+        )
         self.core["check_identities"](rows, self.soak.agents, self.soak.ledger)
-        require_exact_roster(rows, self.live_agents)
 
     async def lane_isolation(self) -> dict[str, Any]:
         probe_ledger = self.core["Ledger"]()
@@ -3697,6 +4268,23 @@ class BackendAcceptance:
         ):
             raise AcceptanceFailure("queued input acknowledgement is incomplete")
 
+        mutation_id = f"mut-cancel-{time.time_ns()}"
+        await lane.send({
+            "t": "queue.cancel",
+            "clientMutationId": mutation_id,
+            "commandId": command_id,
+            "expectedRevision": revision,
+        })
+        cancel_ack = await lane.wait_for(
+            lambda frame: frame.get("t") == "queue.mutation.ack"
+            and frame.get("clientMutationId") == mutation_id,
+            after=start,
+            timeout=60,
+            label="queue cancellation acknowledgement",
+        )
+        if cancel_ack.get("state") != "cancelled":
+            raise AcceptanceFailure(f"queued command was not cancelled: {cancel_ack!r}")
+
         steer_id = f"cm-steer-{time.time_ns()}"
         await lane.send({
             "t": "steer",
@@ -3709,6 +4297,14 @@ class BackendAcceptance:
             after=start,
             timeout=60,
             label="steer acknowledgement",
+        )
+
+        finished = await lane.wait_for(
+            lambda frame: self.core["session_event"](frame).get("type") == "RUN_FINISHED"
+            and self.core["session_event"](frame).get("runId") == run_id,
+            after=start,
+            timeout=240,
+            label="steered active turn terminal",
         )
 
         compact_id = f"cc-compact-{time.time_ns()}"
@@ -3733,30 +4329,6 @@ class BackendAcceptance:
         )
         if compact_done.get("ok") is not True:
             raise AcceptanceFailure(f"compact command failed: {compact_done!r}")
-
-        mutation_id = f"mut-cancel-{time.time_ns()}"
-        await lane.send({
-            "t": "queue.cancel",
-            "clientMutationId": mutation_id,
-            "commandId": command_id,
-            "expectedRevision": revision,
-        })
-        cancel_ack = await lane.wait_for(
-            lambda frame: frame.get("t") == "queue.mutation.ack"
-            and frame.get("clientMutationId") == mutation_id,
-            after=start,
-            timeout=60,
-            label="queue cancellation acknowledgement",
-        )
-        if cancel_ack.get("state") != "cancelled":
-            raise AcceptanceFailure(f"queued command was not cancelled: {cancel_ack!r}")
-        finished = await lane.wait_for(
-            lambda frame: self.core["session_event"](frame).get("type") == "RUN_FINISHED"
-            and self.core["session_event"](frame).get("runId") == run_id,
-            after=start,
-            timeout=240,
-            label="steered active turn terminal",
-        )
         queued_event_count = sum(
             self.core["session_event"](frame).get("messageId") == queued_id
             for frame in lane.frames[start:]
@@ -3849,96 +4421,170 @@ class BackendAcceptance:
             from websockets.exceptions import ConnectionClosed
         except ImportError as error:
             raise AcceptanceFailure("Python package websockets is required") from error
-        thread = f"v015-bp-{hashlib.sha256((self.candidate.run_id + str(time.time_ns())).encode()).hexdigest()[:12]}"
-        self.core["run_command"](
-            [
-                str(NEXUS_BIN),
-                "thread",
-                "new",
-                thread,
-                "--project",
-                "v015-lab",
-                "--json",
-            ],
-            timeout=60,
+        nonce = hashlib.sha256(
+            (self.candidate.run_id + str(time.time_ns())).encode()
+        ).hexdigest()[:12]
+        thread = developer_backpressure_thread_name(self.candidate.run_id, nonce)
+        await asyncio.to_thread(
+            post_thread_for_backpressure,
+            self.http,
+            thread,
         )
         topic = f"sys.message.thread.{thread}"
-        socket = await self.soak.developer._open(self.http.ws_url("/api/agui/ws"), self.http.cookie, self.http.csrf)
-        await socket.send(json.dumps({"t": "subscribe", "topic": topic, "afterSeq": 0}, separators=(",", ":")))
-        ack = json.loads(str(await asyncio.wait_for(socket.recv(), 30)))
-        if ack.get("t") != "subscribe.ack" or ack.get("topic") != topic:
-            raise AcceptanceFailure(f"backpressure subscriber did not receive subscribe.ack: {ack!r}")
-        accepted: list[str] = []
-        body = "B" * 16384
-        for index in range(768):
-            response = await asyncio.to_thread(
-                self.http.request,
-                "POST",
-                "/api/v1/messages",
-                {
-                    "to": {"verb": "post", "thread": thread},
-                    "body": f"{index:04d}:{body}",
-                    "idempotencyKey": f"{thread}-{index}",
-                },
-            )
-            response.pop("_headers", None)
-            message_id = self.core["recursive_string"](response, ("messageId", "message_id"))
-            if not message_id:
-                raise AcceptanceFailure("backpressure post returned no messageId")
-            accepted.append(message_id)
-            if socket.close_code is not None:
-                break
-        if socket.close_code is None:
-            try:
-                await asyncio.wait_for(socket.wait_closed(), 10)
-            except asyncio.TimeoutError as error:
-                await socket.close()
-                raise AcceptanceFailure(
-                    "developer slow-reader load did not reach the bounded 1013 backpressure path"
-                ) from error
-        first: list[str] = []
+        socket: Any = None
+        resumed: Any = None
+        transport: Any = None
+        reads_paused = False
         try:
+            socket = await self.soak.developer._open(
+                self.http.ws_url("/api/agui/ws"),
+                self.http.cookie,
+                self.http.csrf,
+            )
+            await socket.send(json.dumps(
+                {"t": "subscribe", "topic": topic, "afterSeq": 0},
+                separators=(",", ":"),
+            ))
+            ack = json.loads(str(await asyncio.wait_for(socket.recv(), 30)))
+            if ack.get("t") != "subscribe.ack" or ack.get("topic") != topic:
+                raise AcceptanceFailure(
+                    f"backpressure subscriber did not receive subscribe.ack: {ack!r}"
+                )
+
+            frame_floor_bytes = len(thread.encode("utf-8")) * 2
+            receive_max = tcp_buffer_max(TCP_RECEIVE_LIMITS, "receive")
+            send_max = tcp_buffer_max(TCP_SEND_LIMITS, "send")
+            load_count = developer_backpressure_post_count(
+                frame_floor_bytes,
+                receive_max=receive_max,
+                send_max=send_max,
+            )
+            transport = pause_websocket_reads(socket)
+            reads_paused = True
+            accepted: list[str] = []
+            for index in range(load_count):
+                response = await asyncio.to_thread(
+                    self.http.request,
+                    "POST",
+                    "/api/v1/messages",
+                    {
+                        "to": {"verb": "post", "thread": thread},
+                        "body": f"developer-backpressure:{index}",
+                        "idempotencyKey": f"v015-bp-{nonce}-{index}",
+                    },
+                )
+                response.pop("_headers", None)
+                message_id = self.core["recursive_string"](
+                    response,
+                    ("messageId", "message_id"),
+                )
+                if not message_id:
+                    raise AcceptanceFailure("backpressure post returned no messageId")
+                accepted.append(message_id)
+
+            resume_websocket_reads(transport)
+            reads_paused = False
+            first: list[str] = []
+            close_deadline = time.monotonic() + 30
             while True:
-                raw = await asyncio.wait_for(socket.recv(), 30)
+                remaining = close_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AcceptanceFailure(
+                        "developer slow-reader load did not reach the bounded 1013 backpressure path"
+                    )
+                try:
+                    raw = await asyncio.wait_for(socket.recv(), remaining)
+                except ConnectionClosed:
+                    break
+                except asyncio.TimeoutError as error:
+                    raise AcceptanceFailure(
+                        "developer slow-reader load did not reach the bounded 1013 backpressure path"
+                    ) from error
                 frame = json.loads(str(raw))
                 event = frame.get("event") if isinstance(frame, dict) else None
                 if isinstance(event, dict) and isinstance(event.get("messageId"), str):
                     first.append(event["messageId"])
-        except ConnectionClosed:
-            pass
-        except asyncio.TimeoutError as error:
-            await socket.close()
-            raise AcceptanceFailure("developer backpressure socket did not close within 30 seconds") from error
-        code = socket.close_code or 0
-        reason = socket.close_reason or ""
-        cursor = parse_developer_backpressure(code, reason)
-        await socket.close()
-        resumed = self.core["DeveloperLane"](self.capture, self.soak.ledger, self.http, (topic,))
-        resumed.cursors[topic] = cursor
-        await resumed.connect(reconnect=True)
-        deadline = time.monotonic() + 120
-        while time.monotonic() < deadline:
-            observed = first + [
-                row.get("event", {}).get("messageId")
-                for row in resumed.frames
-                if row.get("type") == "developer.event" and isinstance(row.get("event"), dict)
-            ]
-            if all(observed.count(message_id) == 1 for message_id in accepted):
-                break
-            await asyncio.sleep(0.1)
-        else:
-            raise AcceptanceFailure("developer 1013 replay did not recover every accepted message exactly once")
-        await resumed.close()
-        return {
-            "topic": topic,
-            "accepted": len(accepted),
-            "closeCode": code,
-            "closeReason": reason,
-            "resumeAfter": cursor,
-            "beforeClose": len(first),
-            "replayed": len(accepted) - len(first),
-            "exactOnce": True,
-        }
+
+            code = socket.close_code or 0
+            reason = socket.close_reason or ""
+            cursor = parse_developer_backpressure(code, reason)
+            resumed = await self.soak.developer._open(
+                self.http.ws_url("/api/agui/ws"),
+                self.http.cookie,
+                self.http.csrf,
+            )
+            await resumed.send(json.dumps(
+                {"t": "subscribe", "topic": topic, "afterSeq": cursor},
+                separators=(",", ":"),
+            ))
+            resumed_ack = json.loads(str(await asyncio.wait_for(resumed.recv(), 30)))
+            if (
+                resumed_ack.get("t") != "subscribe.ack"
+                or resumed_ack.get("topic") != topic
+                or resumed_ack.get("afterSeq") != cursor
+            ):
+                raise AcceptanceFailure(
+                    f"developer backpressure resume did not acknowledge its cursor: {resumed_ack!r}"
+                )
+
+            replayed: list[str] = []
+            replay_deadline = time.monotonic() + 120
+            while True:
+                observed = first + replayed
+                duplicates = {
+                    message_id
+                    for message_id in accepted
+                    if observed.count(message_id) > 1
+                }
+                if duplicates:
+                    raise AcceptanceFailure(
+                        "developer 1013 replay duplicated an accepted message"
+                    )
+                if all(observed.count(message_id) == 1 for message_id in accepted):
+                    break
+                remaining = replay_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AcceptanceFailure(
+                        "developer 1013 replay did not recover every accepted message exactly once"
+                    )
+                try:
+                    raw = await asyncio.wait_for(resumed.recv(), remaining)
+                except (ConnectionClosed, asyncio.TimeoutError) as error:
+                    raise AcceptanceFailure(
+                        "developer 1013 replay did not recover every accepted message exactly once"
+                    ) from error
+                frame = json.loads(str(raw))
+                event = frame.get("event") if isinstance(frame, dict) else None
+                if isinstance(event, dict) and isinstance(event.get("messageId"), str):
+                    replayed.append(event["messageId"])
+
+            return {
+                "topicSha256": sha256_bytes(topic.encode("utf-8")),
+                "topicBytes": len(topic.encode("utf-8")),
+                "accepted": len(accepted),
+                "loadFrameFloorBytes": frame_floor_bytes,
+                "loadBytesLowerBound": frame_floor_bytes * load_count,
+                "kernelReceiveMax": receive_max,
+                "kernelSendMax": send_max,
+                "closeCode": code,
+                "closeReason": reason,
+                "resumeAfter": cursor,
+                "beforeClose": len(first),
+                "replayed": len(replayed),
+                "exactOnce": True,
+            }
+        finally:
+            if reads_paused and transport is not None:
+                try:
+                    resume_websocket_reads(transport)
+                except BaseException:
+                    pass
+            for active_socket in (socket, resumed):
+                if active_socket is not None:
+                    try:
+                        await active_socket.close()
+                    except BaseException:
+                        pass
 
     async def agent_session_backpressure_and_queue_full(self) -> dict[str, Any]:
         try:
@@ -3957,6 +4603,9 @@ class BackendAcceptance:
             "/events?view=agui"
         )
         slow: Any = None
+        slow_transport: Any = None
+        slow_reads_paused = False
+        control: Any = None
         resumed: Any = None
 
         async def open_raw(raw_path: str, max_queue: int) -> Any:
@@ -3966,6 +4615,7 @@ class BackendAcceptance:
                 "close_timeout": 5,
                 "ping_interval": None,
                 "max_queue": max_queue,
+                "max_size": self.core["MAX_INBOUND_FRAME_BYTES"],
             }
             try:
                 return await websockets.connect(
@@ -4013,91 +4663,122 @@ class BackendAcceptance:
             run_id = self.core["session_event"](started).get("runId")
             if not isinstance(run_id, str) or not run_id:
                 raise AcceptanceFailure("session backpressure run has no runId")
+            active_start_index = next(
+                index
+                for index in range(snapshot_start, len(lane.frames))
+                if lane.frames[index] is started
+            )
 
+            # The capacity producer must not also be the deliberately slow
+            # session subscriber. A fast session control socket proves that
+            # bounded batches reached the canonical queue projection while
+            # the raw session socket proves isolated outbound backpressure.
+            await lane.close()
             slow = await open_raw(path, 1)
-            first = json.loads(str(await asyncio.wait_for(slow.recv(), 30)))
-            require_queue_snapshot(first, self.live_agents[1].session_id)
+            await receive_queue_snapshot(
+                slow,
+                self.live_agents[1].session_id,
+                timeout=30,
+                label="isolated slow-reader queue snapshot",
+            )
+            slow_transport = pause_websocket_reads(slow)
+            slow_reads_paused = True
+            control = await open_raw(path, 512)
+            await receive_queue_snapshot(
+                control,
+                self.live_agents[1].session_id,
+                timeout=30,
+                label="fast capacity-control queue snapshot",
+            )
 
             accepted: list[dict[str, Any]] = []
             rejected: list[dict[str, Any]] = []
             payload = "Q" * 32768
             for index in range(128):
                 client_id = f"cm-bp-{index:03d}-{time.time_ns()}"
-                frame_start = len(lane.frames)
-                await lane.send({
+                await control.send(json.dumps({
                     "t": "input",
                     "mode": "session",
+                    "target": {
+                        "name": self.live_agents[1].name,
+                        "agentId": self.live_agents[1].agent_id,
+                    },
                     "text": f"{index:03d}:{payload}",
                     "clientMessageId": client_id,
-                })
-                result = await lane.wait_for(
-                    lambda frame, client_id=client_id: (
-                        frame.get("clientMessageId") == client_id
-                        and frame.get("t") in {"input.ack", "input.err"}
-                    ),
-                    after=frame_start,
+                }, separators=(",", ":")))
+                result = await receive_capacity_response(
+                    control,
+                    client_id,
+                    self.live_agents[1].session_id,
                     timeout=30,
                     label=f"queue capacity response {index}",
+                    require_projection=(index + 1) % 4 == 0,
                 )
                 if result.get("t") == "input.ack":
-                    if result.get("state") != "queued" or not isinstance(
-                        result.get("commandId"), str
+                    revision = result.get("revision")
+                    if (
+                        result.get("state") != "queued"
+                        or not isinstance(result.get("commandId"), str)
+                        or isinstance(revision, bool)
+                        or not isinstance(revision, int)
                     ):
                         raise AcceptanceFailure(
                             f"capacity probe escaped the bounded queue: {result!r}"
                         )
                     accepted.append(result)
                 else:
-                    if not result.get("error") and not result.get("code"):
+                    error_text = result.get("error")
+                    if (
+                        result.get("status") != 429
+                        or not isinstance(error_text, str)
+                        or "queue" not in error_text.lower()
+                        or "full" not in error_text.lower()
+                    ):
                         raise AcceptanceFailure(
                             f"queue capacity rejection was not typed: {result!r}"
                         )
                     rejected.append(result)
-                if slow.close_code == 1013:
+                if slow.close_code == 1013 and accepted and rejected:
                     break
-            try:
-                await asyncio.wait_for(slow.wait_closed(), 30)
-            except asyncio.TimeoutError as error:
+            if not accepted or not rejected:
                 raise AcceptanceFailure(
-                    "agent-session slow reader did not close with backpressure"
-                ) from error
+                    "capacity probe did not prove both queued acceptance and typed rejection"
+                )
+            resume_websocket_reads(slow_transport)
+            slow_reads_paused = False
+            await drain_websocket_until_closed(
+                slow,
+                timeout=30,
+                label="agent-session slow reader",
+            )
             code = slow.close_code or 0
             reason = slow.close_reason or ""
             resume_cursor = parse_session_backpressure(code, reason)
+            await control.close()
+            control = None
 
             cancelled: list[str] = []
             for ack in accepted:
                 command_id = ack["commandId"]
-                rest = await asyncio.to_thread(self.queue_snapshot, self.live_agents[1])
-                revision = rest.get("revision")
-                if isinstance(revision, bool) or not isinstance(revision, int):
-                    raise AcceptanceFailure("capacity cleanup snapshot has no revision")
-                if not any(
-                    row.get("commandId") == command_id for row in rest["commands"]
-                ):
-                    raise AcceptanceFailure(
-                        f"accepted queued command vanished before cancellation: {command_id}"
-                    )
                 mutation_id = f"mut-bp-{command_id}"
-                mutation_start = len(lane.frames)
-                await lane.send({
-                    "t": "queue.cancel",
-                    "clientMutationId": mutation_id,
-                    "commandId": command_id,
-                    "expectedRevision": revision,
-                })
-                mutation = await lane.wait_for(
-                    lambda frame, mutation_id=mutation_id: (
-                        frame.get("clientMutationId") == mutation_id
-                        and frame.get("t") in {"queue.mutation.ack", "queue.mutation.err"}
-                    ),
-                    after=mutation_start,
-                    timeout=30,
-                    label=f"backpressure cleanup {command_id}",
+                mutation = await asyncio.to_thread(
+                    self.http.request,
+                    "PATCH",
+                    "/api/conversation/prompt",
+                    {
+                        "name": self.live_agents[1].name,
+                        "agentId": self.live_agents[1].agent_id,
+                        "action": "cancel",
+                        "clientMutationId": mutation_id,
+                        "commandId": command_id,
+                        "expectedRevision": ack["revision"],
+                    },
                 )
+                mutation.pop("_headers", None)
                 if (
-                    mutation.get("t") != "queue.mutation.ack"
-                    or mutation.get("state") != "cancelled"
+                    mutation.get("state") != "cancelled"
+                    or mutation.get("clientMutationId") != mutation_id
+                    or mutation.get("commandId") != command_id
                 ):
                     raise AcceptanceFailure(
                         f"backpressure queue cleanup failed: {mutation!r}"
@@ -4106,26 +4787,27 @@ class BackendAcceptance:
             if len(cancelled) != len(accepted):
                 raise AcceptanceFailure("capacity probe did not cancel every accepted queue row")
 
-            steer_id = f"cm-bp-stop-{time.time_ns()}"
-            steer_start = len(lane.frames)
-            await lane.send({
-                "t": "steer",
-                "text": "Stop immediately and finish.",
-                "clientMessageId": steer_id,
-            })
-            await lane.wait_for(
-                lambda frame: frame.get("t") == "steer.ack"
-                and frame.get("clientMessageId") == steer_id,
-                after=steer_start,
+            reconnect_start = len(lane.frames)
+            await lane.connect(reconnect=True)
+            post_cleanup_snapshot = await lane.wait_for(
+                lambda frame: frame.get("t") == "queue.snapshot",
+                after=reconnect_start,
                 timeout=60,
-                label="backpressure active-turn interrupt",
+                label="capacity-probe post-cleanup queue snapshot",
             )
-            await lane.wait_for(
-                lambda frame: self.core["session_event"](frame).get("type") == "RUN_FINISHED"
-                and self.core["session_event"](frame).get("runId") == run_id,
-                after=steer_start,
+            require_queue_snapshot(
+                post_cleanup_snapshot,
+                self.live_agents[1].session_id,
+            )
+
+            await ensure_run_terminal(
+                self.core,
+                lane,
+                run_id=run_id,
+                after=active_start_index,
+                client_message_id=f"cm-bp-stop-{time.time_ns()}",
                 timeout=240,
-                label="backpressure active-turn terminal",
+                label="backpressure active-turn",
             )
 
             resume_path = path + "&" + urlencode({"after": resume_cursor})
@@ -4170,7 +4852,12 @@ class BackendAcceptance:
             }
         finally:
             await lane.close()
-            for socket in (slow, resumed):
+            if slow_reads_paused and slow_transport is not None:
+                try:
+                    resume_websocket_reads(slow_transport)
+                except BaseException:
+                    pass
+            for socket in (control, slow, resumed):
                 if socket is not None:
                     try:
                         await socket.close()

@@ -18,6 +18,11 @@ if grep -Eq 'vite\.pid|127\.0\.0\.1:1422|[,( ]1422[), ]' "$TARGET"; then
   exit 1
 fi
 grep -Fq 'cdp_runtime_probe(LENS_CDP_URL, "file://", "Lens")' "$TARGET"
+! grep -Fq 'WEBUI_CDP_URL' "$TARGET"
+! grep -Fq '("webui-browser.pid", "webuiBrowser")' "$TARGET"
+! grep -Fq '("webui-cdp-proxy.pid", "webuiCdpProxy")' "$TARGET"
+! grep -Fq 'required_tcp_ports = (4100, 4101, 4200, 9222, 9224)' "$TARGET"
+grep -Fq 'required_tcp_ports = (4100, 4101, 9222)' "$TARGET"
 
 python3 - "$TARGET" "$TMP/runner" "$TMP" <<'PY'
 from pathlib import Path
@@ -268,7 +273,17 @@ gateway_after = replace(
     gateway_discovery_sha256="d" * 64,
 )
 validate_restart_transition("daemon", base, daemon_after)
+validate_restart_transition(
+    "daemon",
+    base,
+    replace(daemon_after, daemon_ipc_inode=base.daemon_ipc_inode),
+)
 validate_restart_transition("gateway", base, gateway_after)
+validate_restart_transition(
+    "gateway",
+    base,
+    replace(gateway_after, gateway_discovery_inode=base.gateway_discovery_inode),
+)
 expect_failure(lambda: validate_restart_transition("daemon", base, base), "daemon restart")
 expect_failure(lambda: validate_restart_transition("gateway", base, base), "gateway restart")
 expect_failure(
@@ -777,8 +792,68 @@ class LaneHttp:
     csrf = "fixture"
 
 
+async def inbound_frame_limit_contract() -> None:
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    async def connect(url: str, **options: object) -> object:
+        captured["url"] = url
+        captured.update(options)
+        return sentinel
+
+    prior = sys.modules.get("websockets")
+    sys.modules["websockets"] = SimpleNamespace(connect=connect)
+    try:
+        lane = module["FrameLane"](
+            "frame-limit",
+            LaneEvidence(),
+            module["Ledger"](),
+        )
+        opened = await lane._open("ws://127.0.0.1/session", "cookie", "csrf")
+    finally:
+        if prior is None:
+            del sys.modules["websockets"]
+        else:
+            sys.modules["websockets"] = prior
+
+    require(opened is sentinel, "frame lane did not return the opened socket")
+    require(
+        captured.get("max_size") == module["MAX_INBOUND_FRAME_BYTES"],
+        "frame lane did not apply the explicit inbound-frame bound",
+    )
+    require(
+        module["MAX_INBOUND_FRAME_BYTES"] >= 8 * 1024 * 1024,
+        "inbound-frame bound cannot carry a maximum canonical queue snapshot",
+    )
+
+
+asyncio.run(inbound_frame_limit_contract())
+
+
+def progressive_reply_contract() -> None:
+    marker = "V015_PROGRESSIVE_MARKER_" + ("x" * 48)
+    reply = module["progressive_session_reply"](marker)
+    line_count = module["PROGRESSIVE_REPLY_LINES"]
+    require(
+        line_count >= 16,
+        "progressive session probe has too few semantic lines",
+    )
+    require(
+        len(reply.encode("utf-8")) > 512,
+        "progressive session probe must cross the Nexus text-delta boundary",
+    )
+    require(
+        reply.splitlines() == [marker] * line_count,
+        "progressive session reply must preserve every exact marker line",
+    )
+
+
+progressive_reply_contract()
+
+
 async def reject_single_frame_assistant_output() -> None:
     marker = "V015_PROGRESSIVE_MARKER"
+    reply = module["progressive_session_reply"](marker)
     lane = module["AgentSessionLane"](
         LaneEvidence(),
         module["Ledger"](),
@@ -792,8 +867,14 @@ async def reject_single_frame_assistant_output() -> None:
             client_message_id = request["clientMessageId"]
             frames = [
                 {"t": "input.ack", "clientMessageId": client_message_id, "commandId": "c-1"},
-                {"event": {"type": "TEXT_MESSAGE_END", "messageId": client_message_id}},
-                {"event": {"type": "RUN_STARTED", "runId": "run-progressive"}},
+                {
+                    "event": {"type": "RUN_STARTED", "runId": "run-progressive"},
+                    "cursor": "cursor-1",
+                },
+                {
+                    "event": {"type": "TEXT_MESSAGE_END", "messageId": client_message_id},
+                    "cursor": "cursor-1",
+                },
                 {
                     "event": {
                         "type": "TEXT_MESSAGE_START",
@@ -805,7 +886,7 @@ async def reject_single_frame_assistant_output() -> None:
                     "event": {
                         "type": "TEXT_MESSAGE_CONTENT",
                         "messageId": "assistant-progressive",
-                        "delta": marker,
+                        "delta": reply,
                     }
                 },
                 {"event": {"type": "TEXT_MESSAGE_END", "messageId": "assistant-progressive"}},
@@ -830,6 +911,8 @@ else:
 
 async def correlate_prompt_across_an_explicit_boundary() -> None:
     marker = "V015_CROSS_RESTART_MARKER"
+    reply = module["progressive_session_reply"](marker)
+    midpoint = len(reply) // 2
     lane = module["AgentSessionLane"](
         LaneEvidence(),
         module["Ledger"](),
@@ -856,8 +939,14 @@ async def correlate_prompt_across_an_explicit_boundary() -> None:
         "accepted session input was not recorded before the restart boundary",
     )
     post_restart = [
-        {"event": {"type": "TEXT_MESSAGE_END", "messageId": attempt.client_message_id}},
-        {"event": {"type": "RUN_STARTED", "runId": "run-cross-restart"}},
+        {
+            "event": {"type": "RUN_STARTED", "runId": "run-cross-restart"},
+            "cursor": "cursor-1",
+        },
+        {
+            "event": {"type": "TEXT_MESSAGE_END", "messageId": attempt.client_message_id},
+            "cursor": "cursor-1",
+        },
         {
             "event": {
                 "type": "TEXT_MESSAGE_START",
@@ -869,14 +958,14 @@ async def correlate_prompt_across_an_explicit_boundary() -> None:
             "event": {
                 "type": "TEXT_MESSAGE_CONTENT",
                 "messageId": "assistant-cross-restart",
-                "delta": "V015_CROSS_",
+                "delta": reply[:midpoint],
             }
         },
         {
             "event": {
                 "type": "TEXT_MESSAGE_CONTENT",
                 "messageId": "assistant-cross-restart",
-                "delta": "RESTART_MARKER",
+                "delta": reply[midpoint:],
             }
         },
         {"event": {"type": "TEXT_MESSAGE_END", "messageId": "assistant-cross-restart"}},
@@ -893,6 +982,242 @@ async def correlate_prompt_across_an_explicit_boundary() -> None:
 
 
 asyncio.run(correlate_prompt_across_an_explicit_boundary())
+
+
+async def correlate_prompt_to_its_run_when_backlog_arrives_after_send() -> None:
+    marker = "V015_BACKLOG_CORRELATION_MARKER"
+    reply = module["progressive_session_reply"](marker)
+    midpoint = len(reply) // 2
+    lane = module["AgentSessionLane"](
+        LaneEvidence(),
+        module["Ledger"](),
+        LaneHttp(),
+        agents[0],
+    )
+
+    class Socket:
+        async def send(self, raw: str) -> None:
+            request = json.loads(raw)
+            frame = {
+                "t": "input.ack",
+                "clientMessageId": request["clientMessageId"],
+                "commandId": "command-backlog-correlation",
+            }
+            lane.frames.append(frame)
+            lane.consume(frame)
+            lane.changed.set()
+
+    lane.socket = Socket()
+    attempt = await lane.begin_prompt(marker, timeout=1)
+    delayed_frames = [
+        {
+            "event": {"type": "RUN_STARTED", "runId": "run-stale"},
+            "cursor": "cursor-41",
+        },
+        {
+            "event": {"type": "RUN_FINISHED", "runId": "run-stale"},
+            "cursor": "cursor-42",
+        },
+        {
+            "event": {"type": "RUN_STARTED", "runId": "run-current"},
+            "cursor": "cursor-50",
+        },
+        {
+            "event": {"type": "TEXT_MESSAGE_END", "messageId": attempt.client_message_id},
+            "cursor": "cursor-50",
+        },
+        {
+            "event": {
+                "type": "TEXT_MESSAGE_START",
+                "role": "assistant",
+                "messageId": "assistant-backlog-correlation",
+            },
+            "cursor": "cursor-51",
+        },
+        {
+            "event": {
+                "type": "TEXT_MESSAGE_CONTENT",
+                "messageId": "assistant-backlog-correlation",
+                "delta": reply[:midpoint],
+            },
+            "cursor": "cursor-52",
+        },
+        {
+            "event": {
+                "type": "TEXT_MESSAGE_CONTENT",
+                "messageId": "assistant-backlog-correlation",
+                "delta": reply[midpoint:],
+            },
+            "cursor": "cursor-53",
+        },
+        {
+            "event": {
+                "type": "TEXT_MESSAGE_END",
+                "messageId": "assistant-backlog-correlation",
+            },
+            "cursor": "cursor-54",
+        },
+        {
+            "event": {"type": "RUN_FINISHED", "runId": "run-current"},
+            "cursor": "cursor-54",
+        },
+    ]
+    for frame in delayed_frames:
+        lane.frames.append(frame)
+        lane.consume(frame)
+    lane.changed.set()
+    proof = await lane.finish_prompt(attempt, timeout=0.05)
+    require(proof["completionCount"] == 1, "current prompt terminal was not exact-once")
+
+
+asyncio.run(correlate_prompt_to_its_run_when_backlog_arrives_after_send())
+
+
+async def reject_assistant_output_from_a_later_unrelated_run() -> None:
+    marker = "V015_EMPTY_TURN_MARKER"
+    lane = module["AgentSessionLane"](
+        LaneEvidence(),
+        module["Ledger"](),
+        LaneHttp(),
+        agents[1],
+    )
+
+    class Socket:
+        async def send(self, raw: str) -> None:
+            request = json.loads(raw)
+            frame = {
+                "t": "input.ack",
+                "clientMessageId": request["clientMessageId"],
+                "commandId": "command-empty-turn",
+            }
+            lane.frames.append(frame)
+            lane.consume(frame)
+            lane.changed.set()
+
+    lane.socket = Socket()
+    attempt = await lane.begin_prompt(marker, timeout=1)
+    delayed_frames = [
+        {
+            "event": {"type": "RUN_STARTED", "runId": "run-empty-current"},
+            "cursor": "cursor-70",
+        },
+        {
+            "event": {"type": "TEXT_MESSAGE_END", "messageId": attempt.client_message_id},
+            "cursor": "cursor-70",
+        },
+        {
+            "event": {"type": "RUN_FINISHED", "runId": "run-empty-current"},
+            "cursor": "cursor-71",
+        },
+        {
+            "event": {"type": "RUN_STARTED", "runId": "run-unrelated-later"},
+            "cursor": "cursor-80",
+        },
+        {
+            "event": {
+                "type": "TEXT_MESSAGE_START",
+                "role": "assistant",
+                "messageId": "assistant-unrelated-later",
+            },
+            "cursor": "cursor-81",
+        },
+        {
+            "event": {
+                "type": "TEXT_MESSAGE_CONTENT",
+                "messageId": "assistant-unrelated-later",
+                "delta": "Peer ack from another turn, ",
+            },
+            "cursor": "cursor-82",
+        },
+        {
+            "event": {
+                "type": "TEXT_MESSAGE_CONTENT",
+                "messageId": "assistant-unrelated-later",
+                "delta": "no action needed.",
+            },
+            "cursor": "cursor-83",
+        },
+        {
+            "event": {"type": "TEXT_MESSAGE_END", "messageId": "assistant-unrelated-later"},
+            "cursor": "cursor-84",
+        },
+        {
+            "event": {"type": "RUN_FINISHED", "runId": "run-unrelated-later"},
+            "cursor": "cursor-84",
+        },
+    ]
+    for frame in delayed_frames:
+        lane.frames.append(frame)
+        lane.consume(frame)
+    lane.changed.set()
+
+    try:
+        await lane.finish_prompt(attempt, timeout=0.05)
+    except SoakFailure as error:
+        require(
+            "current run" in str(error).lower(),
+            "later unrelated assistant output was misattributed to the submitted prompt",
+        )
+    else:
+        raise AssertionError("later unrelated assistant output satisfied the prompt gate")
+
+
+asyncio.run(reject_assistant_output_from_a_later_unrelated_run())
+
+
+class QueueSnapshotHttp:
+    def __init__(self, snapshot):
+        self.snapshot = snapshot
+
+    def request(self, method, path):
+        require(method == "GET", "queue-clear probe used a mutating method")
+        require(path.startswith("/api/conversation/prompt?"), "queue-clear probe used the wrong route")
+        return deepcopy(self.snapshot) | {"_headers": {}}
+
+
+queue_agent = SimpleNamespace(agent_id="agent-queue-contract")
+require(
+    module["queue_clear"](
+        QueueSnapshotHttp({
+            "turnActive": False,
+            "commands": [
+                {"commandId": "completed", "state": "completed"},
+                {"commandId": "cancelled", "state": "cancelled"},
+                {"commandId": "failed", "state": "failed"},
+            ],
+        }),
+        queue_agent,
+    ),
+    "terminal command history was misclassified as a queue wedge",
+)
+for nonterminal_state in ("queued", "claimed", "started"):
+    require(
+        not module["queue_clear"](
+            QueueSnapshotHttp({
+                "turnActive": False,
+                "commands": [{"commandId": "live", "state": nonterminal_state}],
+            }),
+            queue_agent,
+        ),
+        f"nonterminal {nonterminal_state} queue entry was treated as clear",
+    )
+require(
+    not module["queue_clear"](
+        QueueSnapshotHttp({
+            "turnActive": False,
+            "commands": [{"commandId": "unknown", "state": "future-state"}],
+        }),
+        queue_agent,
+    ),
+    "unknown queue state was treated as terminal",
+)
+require(
+    not module["queue_clear"](
+        QueueSnapshotHttp({"turnActive": True, "commands": []}),
+        queue_agent,
+    ),
+    "active turn was treated as a clear queue",
+)
 
 
 async def correlate_developer_message_across_an_explicit_boundary() -> None:
@@ -933,6 +1258,51 @@ async def correlate_developer_message_across_an_explicit_boundary() -> None:
 
 
 asyncio.run(correlate_developer_message_across_an_explicit_boundary())
+
+
+async def accept_both_canonical_dm_routes_without_waiving_cross_route_detection() -> None:
+    agent_topic = "sys.dm.fixture-codex"
+    human_topic = "sys.dm.fixture-human"
+    soak = object.__new__(module["Soak"])
+    soak.ledger = module["Ledger"]()
+    soak.dm_mirror_topic = human_topic
+
+    class Http:
+        def request(self, method, path, body):
+            require(method == "POST" and path == "/api/v1/messages", "wrong DM ingress")
+            require(body["to"] == {"verb": "dm", "name": "fixture-codex"}, "wrong DM target")
+            return {"messageId": "message-two-party-dm", "_headers": {}}
+
+    soak.http = Http()
+    soak.developer = SimpleNamespace(cursors={agent_topic: 11})
+    await soak.begin_message(
+        {"verb": "dm", "name": "fixture-codex"},
+        agent_topic,
+        "V015_TWO_PARTY_DM",
+    )
+    require(
+        soak.ledger.expected_message_routes == {
+            "message-two-party-dm": {agent_topic, human_topic},
+        },
+        "accepted DM did not bind both canonical participant routes",
+    )
+    soak.ledger.receive_message("message-two-party-dm", agent_topic)
+    soak.ledger.receive_message("message-two-party-dm", human_topic)
+    soak.ledger.finalize_delivery_counts()
+    require(
+        soak.ledger.failure["crossRouteDeliveries"] == 0
+        and soak.ledger.failure["lostAcceptedMessages"] == 0
+        and soak.ledger.failure["duplicateAcceptedMessages"] == 0,
+        "canonical two-party DM fanout was classified as a delivery failure",
+    )
+    soak.ledger.receive_message("message-two-party-dm", "sys.dm.unrelated")
+    require(
+        soak.ledger.failure["crossRouteDeliveries"] == 1,
+        "unrelated DM route escaped cross-route detection",
+    )
+
+
+asyncio.run(accept_both_canonical_dm_routes_without_waiving_cross_route_detection())
 
 
 # PASS is the literal conjunction of nine independently testable invariants.

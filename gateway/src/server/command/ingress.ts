@@ -629,10 +629,12 @@ function gatewayIpcError(error: unknown): unknown {
     ? 400
     : error.code === -32001
       ? 401
-      : error.code === -32003
-        ? 404
-        : error.code === -32004
-          ? 403
+    : error.code === -32003
+      ? 404
+      : error.code === -32004
+        ? 403
+        : error.code === -32010
+          ? 429
           : 502;
   return new GatewayError(status, error.message);
 }
