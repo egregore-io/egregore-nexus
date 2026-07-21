@@ -47,7 +47,8 @@ struct Inner {
     accepted_user_input_echoes: HashMap<String, VecDeque<AcceptedUserInputEcho>>,
     cancelled_user_input_echo_queue: HashMap<String, VecDeque<String>>,
     cancelled_user_input_echoes: HashMap<String, VecDeque<AcceptedUserInputEcho>>,
-    accepted_input_receipt_waiters: HashMap<AcceptedInputKey, Vec<oneshot::Sender<()>>>,
+    next_accepted_input_receipt_waiter_id: u64,
+    accepted_input_receipt_waiters: HashMap<AcceptedInputKey, Vec<AcceptedInputReceiptWaiter>>,
     accepted_input_receipts: HashMap<AcceptedInputKey, ()>,
     accepted_input_receipt_order: VecDeque<AcceptedInputKey>,
 }
@@ -73,6 +74,25 @@ struct AcceptedUserInputEcho {
 struct PendingAcceptedUserInputEcho {
     id: u64,
     text: String,
+}
+
+struct AcceptedInputReceiptWaiter {
+    id: u64,
+    tx: oneshot::Sender<()>,
+}
+
+struct AcceptedInputReceiptRegistration {
+    tracker: CodexTurnTracker,
+    key: AcceptedInputKey,
+    id: u64,
+    rx: oneshot::Receiver<()>,
+}
+
+impl Drop for AcceptedInputReceiptRegistration {
+    fn drop(&mut self) {
+        self.tracker
+            .remove_accepted_input_receipt_waiter(&self.key, self.id);
+    }
 }
 
 /// Shared tracker that lets the app-server transport wait for forwarder-observed turn completion.
@@ -638,7 +658,20 @@ impl CodexTurnTracker {
             }
         };
         for waiter in waiters {
-            let _ = waiter.send(());
+            let _ = waiter.tx.send(());
+        }
+    }
+
+    fn remove_accepted_input_receipt_waiter(&self, key: &AcceptedInputKey, id: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        let remove_key = if let Some(waiters) = inner.accepted_input_receipt_waiters.get_mut(key) {
+            waiters.retain(|waiter| waiter.id != id);
+            waiters.is_empty()
+        } else {
+            false
+        };
+        if remove_key {
+            inner.accepted_input_receipt_waiters.remove(key);
         }
     }
 
@@ -654,37 +687,37 @@ impl CodexTurnTracker {
         timeout: Duration,
     ) -> Result<(), CodexTurnWaitError> {
         let key = (thread_id.to_string(), turn_id.to_string(), text.to_string());
-        let rx = {
+        let registration = {
             let mut inner = self.inner.lock().unwrap();
             if inner.accepted_input_receipts.remove(&key).is_some() {
                 inner.accepted_input_receipt_order.retain(|row| row != &key);
                 return Ok(());
             }
             let (tx, rx) = oneshot::channel();
+            let id = inner.next_accepted_input_receipt_waiter_id;
+            inner.next_accepted_input_receipt_waiter_id =
+                inner.next_accepted_input_receipt_waiter_id.wrapping_add(1);
             inner
                 .accepted_input_receipt_waiters
                 .entry(key.clone())
                 .or_default()
-                .push(tx);
-            rx
-        };
-
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(())) | Ok(Err(_)) => Ok(()),
-            Err(_elapsed) => {
-                let mut inner = self.inner.lock().unwrap();
-                if let Some(waiters) = inner.accepted_input_receipt_waiters.get_mut(&key) {
-                    waiters.retain(|tx| !tx.is_closed());
-                    if waiters.is_empty() {
-                        inner.accepted_input_receipt_waiters.remove(&key);
-                    }
-                }
-                Err(CodexTurnWaitError::Timeout {
-                    thread_id: thread_id.to_string(),
-                    turn_id: turn_id.to_string(),
-                    timeout,
-                })
+                .push(AcceptedInputReceiptWaiter { id, tx });
+            AcceptedInputReceiptRegistration {
+                tracker: self.clone(),
+                key,
+                id,
+                rx,
             }
+        };
+        let mut registration = registration;
+
+        match tokio::time::timeout(timeout, &mut registration.rx).await {
+            Ok(Ok(())) | Ok(Err(_)) => Ok(()),
+            Err(_elapsed) => Err(CodexTurnWaitError::Timeout {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                timeout,
+            }),
         }
     }
 

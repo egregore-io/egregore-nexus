@@ -21,7 +21,8 @@ use nexus_dispatch::{
 };
 use nexus_harness_codex::app_server::spawn_codex_forwarder;
 use nexus_harness_codex::{
-    AutoApprove, CodexAppServer, CodexAppServerClient, CodexAppServerTransport, SupervisorOpts,
+    AutoApprove, CodexAppServer, CodexAppServerClient, CodexAppServerTransport, CodexTurnTracker,
+    SupervisorOpts,
 };
 use nexus_store::repos::Messages;
 use nexus_store::Store;
@@ -80,6 +81,49 @@ fn batch() -> NexusBatch {
         dm_message_ids: vec![],
         thread_message_ids: vec![MessageId("m_codex_wait".into())],
         message_ids: vec![MessageId("m_codex_wait".into())],
+    }
+}
+
+#[tokio::test]
+async fn cancelled_native_receipt_waits_unregister_before_late_receipts() {
+    let tracker = CodexTurnTracker::default();
+    let mut keys = Vec::new();
+
+    for index in 0..32 {
+        let thread_id = format!("thread-cancel-{index}");
+        let turn_id = format!("turn-cancel-{index}");
+        let text = format!("unique cancelled prompt {index}");
+        let mut wait = Box::pin(tracker.wait_for_accepted_user_input_echo(
+            &thread_id,
+            &turn_id,
+            &text,
+            Duration::from_secs(60),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut wait)
+                .await
+                .is_err(),
+            "receipt wait must be registered and pending before cancellation"
+        );
+        drop(wait);
+
+        tracker.observe_accepted_user_input_echo(&thread_id, &turn_id, &text);
+        keys.push((thread_id, turn_id, text));
+    }
+
+    for (thread_id, turn_id, text) in keys {
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tracker.wait_for_accepted_user_input_echo(
+                &thread_id,
+                &turn_id,
+                &text,
+                Duration::from_millis(25),
+            ),
+        )
+        .await
+        .expect("late receipt lookup must remain bounded")
+        .expect("late receipt must be buffered after the cancelled waiter unregisters");
     }
 }
 
