@@ -43,9 +43,7 @@ GATEWAY_LAUNCHER = Path("/tmp/nexus-lab-bin/nexus-gateway")
 LAB_PROCESS = Path("/tmp/nexus-lab-bin/lab-process")
 WS_ACCEPTANCE = Path("/tmp/nexus-lab-bin/nexus-v015-ws-acceptance")
 GATEWAY_URL = "http://127.0.0.1:4100"
-WEBCONSOLE_URL = "http://127.0.0.1:4200"
 LENS_CDP_URL = "http://127.0.0.1:9222"
-WEBUI_CDP_URL = "http://127.0.0.1:9224"
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 PROC_ROOT = Path("/proc")
 MEMORY_LIMIT_BYTES = 8 * 1024 * 1024 * 1024
@@ -2175,8 +2173,6 @@ class Soak:
             ("xvfb.pid", "xvfb"),
             ("lens.pid", "lens"),
             ("lens-cdp-proxy.pid", "lensCdpProxy"),
-            ("webui-browser.pid", "webuiBrowser"),
-            ("webui-cdp-proxy.pid", "webuiCdpProxy"),
         ):
             raw = read_bytes_no_symlink(self.lab_root / "lab" / leaf, f"{label} pid")
             try:
@@ -2189,11 +2185,9 @@ class Soak:
         }
         total_rss = sum(int(row["rssBytes"]) for row in process_rows.values())
         self.process_rss_totals.append(total_rss)
-        gateway_probe, webconsole_probe, lens_probe, webui_probe = await asyncio.gather(
+        gateway_probe, lens_probe = await asyncio.gather(
             asyncio.to_thread(plain_http_probe, GATEWAY_URL + "/api/v1/health", "Gateway"),
-            asyncio.to_thread(plain_http_probe, WEBCONSOLE_URL + "/health", "Webconsole"),
             cdp_runtime_probe(LENS_CDP_URL, "file://", "Lens"),
-            cdp_runtime_probe(WEBUI_CDP_URL, "127.0.0.1:4200", "WebUI"),
         )
         queue_rows: dict[str, object] = {}
         for agent in self.agents:
@@ -2284,9 +2278,7 @@ class Soak:
             "websockets": websocket,
             "probes": {
                 "gateway": gateway_probe,
-                "webconsole": webconsole_probe,
                 "lens": lens_probe,
-                "webui": webui_probe,
             },
         }
         self.resource_samples.append(resource)
@@ -2670,8 +2662,6 @@ def capture_final_artifacts(
         ("xvfb.pid", "xvfb"),
         ("lens.pid", "lens"),
         ("lens-cdp-proxy.pid", "lensCdpProxy"),
-        ("webui-browser.pid", "webuiBrowser"),
-        ("webui-cdp-proxy.pid", "webuiCdpProxy"),
     ):
         raw = read_bytes_no_symlink(lab_root / "lab" / leaf, f"{label} pid")
         try:
@@ -2694,7 +2684,7 @@ def capture_final_artifacts(
             raise SoakFailure(f"final process inventory omits {label} pid {pid}")
         if "Z" in state:
             raise SoakFailure(f"final process inventory reports zombie {label} pid {pid}")
-    required_tcp_ports = (4100, 4101, 4200, 9222, 9224)
+    required_tcp_ports = (4100, 4101, 9222)
     for port in required_tcp_ports:
         if not re.search(rf"(?:\[?::\]?|\b\d{{1,3}}(?:\.\d{{1,3}}){{3}}):{port}\b", tcp_listeners.stdout):
             raise SoakFailure(f"final listener inventory omits TCP port {port}")

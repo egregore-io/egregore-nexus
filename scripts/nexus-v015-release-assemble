@@ -770,11 +770,6 @@ def assemble(args: argparse.Namespace) -> None:
         readiness,
         digest,
     )
-    cases = {
-        case_id: load_case(run_root, case_id, str(run_id), readiness)
-        for case_id in ("W2", "W3", "W6", "W7", "W8")
-    }
-
     before = parse_snapshot(Path(args.host_before), "host-before snapshot")
     after = parse_snapshot(Path(args.host_after), "host-after snapshot")
     comparable_before = {key: value for key, value in before.items() if key != "capturedAt"}
@@ -841,45 +836,6 @@ def assemble(args: argparse.Namespace) -> None:
             ),
         },
     )
-    b3_doc, b3_files = result_document(
-        "B3",
-        str(run_id),
-        digest,
-        "B3-human-webconsole-attribution",
-        {
-            "attributionRows": pretty(
-                {
-                    "restartRebind": json.loads(b2["humanRebind"]),
-                    "lensLivePlugin": live_plugin["attributionRows"],
-                }
-            ),
-            "renderedAttribution": pretty(
-                {
-                    "thread": {"case": "W2", "artifacts": artifact_refs(cases["W2"])},
-                    "dm": {"case": "W3", "artifacts": artifact_refs(cases["W3"])},
-                    "lensLivePlugin": live_plugin,
-                }
-            ),
-            "principalTransitions": pretty(
-                {
-                    "rename": json.loads(b1["renameRegression"]),
-                    "rebind": json.loads(b2["humanRebind"]),
-                    "reload": {"case": "W6", "artifacts": artifact_refs(cases["W6"])},
-                    "gatewayReconnect": {"case": "W7", "artifacts": artifact_refs(cases["W7"])},
-                    "daemonRestart": {"case": "W8", "artifacts": artifact_refs(cases["W8"])},
-                    "lensReload": next(
-                        row for row in live_plugin["surfaces"] if row["surface"] == "reload-hydration"
-                    ),
-                    "lensGatewayReconnect": next(
-                        row for row in live_plugin["surfaces"] if row["surface"] == "gateway-reconnect"
-                    ),
-                    "lensDaemonReconnect": next(
-                        row for row in live_plugin["surfaces"] if row["surface"] == "daemon-reconnect"
-                    ),
-                }
-            ),
-        },
-    )
     diff_doc, diff_payloads = release_document(
         "DIFF",
         str(run_id),
@@ -898,7 +854,6 @@ def assemble(args: argparse.Namespace) -> None:
     targets = [
         run_root / "results/A1-candidate-identity",
         run_root / "results/A2-host-isolation",
-        run_root / "results/B3-human-webconsole-attribution",
         run_root / "release",
     ]
     if any(os.path.lexists(path) for path in targets):
@@ -908,7 +863,6 @@ def assemble(args: argparse.Namespace) -> None:
         for leaf, files in (
             ("A1-candidate-identity", a1_files),
             ("A2-host-isolation", a2_files),
-            ("B3-human-webconsole-attribution", b3_files),
         ):
             created.append(publish_directory(run_root / "results", leaf, files))
         release_files = {
@@ -925,7 +879,7 @@ def assemble(args: argparse.Namespace) -> None:
 
     print(
         f"v0.1.5 cross-producer evidence assembled: run={run_id} candidate={digest} "
-        f"gates={a1_doc['gate']},{a2_doc['gate']},{b3_doc['gate']},DIFF,REVIEW"
+        f"gates={a1_doc['gate']},{a2_doc['gate']},DIFF,REVIEW"
     )
 
 

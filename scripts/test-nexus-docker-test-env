@@ -36,7 +36,6 @@ grep -Fq "default: 4553" "$TMP/help"
 grep -Fq 'NEXUS_WEBUI_BIN=/tmp/nexus-lab-bin/nexus-webui' "$TARGET"
 grep -Fq 'pnpm webconsole:build' "$TARGET"
 grep -Fq 'webconsole start --host 127.0.0.1 --port 4200' "$TARGET"
-grep -Fq 'webconsole launch --no-open' "$TARGET"
 grep -Fq 'OCULAR_WEBUI_URL=http://127.0.0.1:4200' "$TARGET"
 grep -Fq 'http://127.0.0.1:4200/health' "$TARGET"
 grep -Fq '/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance --nexus-bin /tmp/nexus-lab-bin/nexus --run-id' "$TARGET"
@@ -133,7 +132,7 @@ def function_body(name: str, next_name: str) -> str:
 
 source_lens = function_body("start_source_lens", "start_packed_lens")
 packed_lens = function_body("start_packed_lens", "start_lab_stack")
-stack = function_body("start_lab_stack", "build_lab_candidate")
+stack = function_body("start_lab_stack", "start_optional_webui_stack")
 build = function_body("build_lab_candidate", "cmd_lab_up")
 
 required_source = (
@@ -170,6 +169,15 @@ for needle in (
 ):
     if needle not in stack:
         raise SystemExit(f"mode-aware Lens startup is missing {needle}")
+for forbidden in (
+    "nexus webconsole start",
+    "webui-cdp-proxy.pid",
+    "webui-browser.pid",
+    "127.0.0.1:4200/health",
+    "127.0.0.1:9224/json/version",
+):
+    if forbidden in stack:
+        raise SystemExit(f"default lab startup still requires deferred Webconsole state: {forbidden}")
 
 for needle in (
     "npm run build",
@@ -190,6 +198,22 @@ if 'if [ "$NEXUS_LAB_MODE" = source ]; then' not in status:
     raise SystemExit("lab-status does not make the Vite process mode-aware")
 if '"$NEXUS_LAB_ROOT/lab/vite.pid:vite"' not in status:
     raise SystemExit("source lab status lost its Vite process check")
+for forbidden in (
+    "webui-browser.pid",
+    "nexus webconsole status",
+    "127.0.0.1:4200/health",
+    "127.0.0.1:9224/json/version",
+):
+    if forbidden in status:
+        raise SystemExit(f"default lab status still requires deferred Webconsole state: {forbidden}")
+optional_webui = function_body("start_optional_webui_stack", "build_lab_candidate")
+for needle in (
+    "webui-cdp-proxy.pid",
+    "webui-browser.pid",
+    "127.0.0.1:9224/json/version",
+):
+    if needle not in optional_webui:
+        raise SystemExit(f"explicit WebUI diagnostic lost its optional setup: {needle}")
 PY
 for field in lensRendererMode lensApp lensMain lensTreeSha256; do
   grep -Fq "${field}=%s" "$TARGET"
@@ -207,6 +231,11 @@ if grep -Fq 'node tests/ocular/run.mjs --all' "$TARGET" \
 fi
 grep -Fq 'node tests/ocular/run.mjs' "$TARGET"
 grep -Fq 'node tests/ocular/webui-run.mjs' "$TARGET"
+grep -Fq -- '--all) requested_all=1; run_backend=1; shift ;;' "$TARGET"
+if grep -F -- '--all)' "$TARGET" | grep -Fq 'run_webui=1'; then
+  echo 'Nexus --all must not enable the deferred Webconsole/WebUI gate' >&2
+  exit 1
+fi
 if grep -Fq -- '--all) requested_all=1; run_backend=1; run_ocular=1' "$TARGET"; then
   echo 'Nexus --all must not enable the separate Lens/Pactree product catalog' >&2
   exit 1
@@ -328,8 +357,6 @@ for spec in \
   C3:C3-agent-session-websocket \
   C4:C4-rest-websocket-agreement \
   D1:D1-clean-packed-install \
-  D2:D2-webconsole-cli \
-  D3:D3-webui-browser \
   E2:E2-lens-ocular \
   F1:F1-live-codex-claude \
   F2:F2-message-hooks; do
@@ -1280,6 +1307,8 @@ printf '%s\n' \
   '  exec*"nexus-v015-webconsole-acceptance"*) echo webconsole-complete ;;' \
   '  exec*"webconsole start --host 127.0.0.1 --port 4200"*) echo webconsole-started ;;' \
   '  exec*"curl -fsS '\''http://127.0.0.1:4200/health'\''"*) echo healthy ;;' \
+  '  exec*"webui-cdp-proxy.pid"*"webui-browser.pid"*) echo optional-webui-stack-ready ;;' \
+  '  exec*"curl -fsS '\''http://127.0.0.1:9224/json/version'\''"*) echo healthy ;;' \
   '  exec*"tests/ocular/webui-run.mjs --release"*) echo webui-complete ;;' \
   '  *) echo "unexpected WebUI handoff Docker call: $*" >&2; exit 97 ;;' \
   'esac' >"$TMP/webui-handoff-bin/docker"
@@ -1340,8 +1369,8 @@ for mode in packed; do
 done
 
 # The canonical --all handoff must include the visible Lens plugin gate and
-# the Nexus-only W/LP aggregate before the soak/final seal. The Lens/Pactree O
-# catalog remains an explicit separate tool and cannot veto Nexus. The
+# the Nexus-only LP aggregate before the soak/final seal. Webconsole/WebUI and
+# the Lens/Pactree O catalog remain explicit separate tools and cannot veto Nexus. The
 # candidate digest is derived by the bound release assembler from this run's
 # manifest; neither runner may invent it. Exercise the complete Docker
 # argv/order instead of accepting source tokens alone.
@@ -1365,11 +1394,7 @@ printf '%s\n' \
   '  exec*"lab-agent launch codex"*) echo codex-ready ;;' \
   '  exec*"lab-agent launch claude"*) echo claude-ready ;;' \
   '  exec*"tests/ocular/run.mjs --release"*) echo forbidden-ocular-product-gate; exit 95 ;;' \
-  '  exec*"webconsole stop --force"*) echo webconsole-stopped ;;' \
-  '  exec*"nexus-v015-webconsole-acceptance"*) echo webconsole-complete ;;' \
-  '  exec*"webconsole start --host 127.0.0.1 --port 4200"*) echo webconsole-started ;;' \
-  '  exec*"curl -fsS '\''http://127.0.0.1:4200/health'\''"*) echo healthy ;;' \
-  '  exec*"tests/ocular/webui-run.mjs --release"*) echo webui-complete ;;' \
+  '  exec*"nexus-v015-webconsole-acceptance"*|exec*"tests/ocular/webui-run.mjs --release"*) echo forbidden-webconsole-gate; exit 94 ;;' \
   '  exec*"nexus-v015-release-assemble"*"--print-candidate-digest"*) printf "sha256:"; printf "d%.0s" {1..64}; echo ;;' \
   '  exec*"tests/ocular/live-plugin.mjs --release"*) echo live-plugin-complete ;;' \
   '  exec*"tests/ocular/aggregate.mjs --nexus-release"*) echo aggregate-complete ;;' \
@@ -1429,13 +1454,12 @@ DOCKER_FAKE_LOG="$TMP/all-handoff.log" \
   "$TARGET" lab-gate --mode packed --all --soak 1800 \
   >"$TMP/all-handoff.out" 2>"$TMP/all-handoff.err"
 for marker in \
-  backend-complete hooks-complete webui-complete \
+  backend-complete hooks-complete \
   live-plugin-complete aggregate-complete assemble-complete; do
   grep -Fq "$marker" "$TMP/all-handoff.out"
 done
 candidate=$(printf 'd%.0s' {1..64})
 grep -Fq "NEXUS_V015_CANDIDATE_DIGEST=sha256:$candidate" "$TMP/all-handoff.log"
-grep -Fq "NEXUS_V015_CANDIDATE_SHA256=$candidate" "$TMP/all-handoff.log"
 grep -Fq 'env -i PATH=/tmp/nexus-lab-bin:/usr/local/bin:/usr/bin:/bin' \
   "$TMP/all-handoff.log"
 grep -Fq 'HOME=/tmp/nexus-lens-home/harness-home' "$TMP/all-handoff.log"
@@ -1453,10 +1477,16 @@ if grep -Fq 'tests/ocular/run.mjs --release' "$TMP/all-handoff.log"; then
   echo 'Nexus --all must not run the separate Lens/Pactree product catalog' >&2
   exit 1
 fi
+if grep -Fq '/tmp/nexus-lab-bin/nexus-v015-webconsole-acceptance --nexus-bin' \
+  "$TMP/all-handoff.log" \
+  || grep -Fq 'node tests/ocular/webui-run.mjs --release' \
+    "$TMP/all-handoff.log"; then
+  echo 'Nexus --all must not run the deferred Webconsole/WebUI gate' >&2
+  exit 1
+fi
 mapfile -t digest_lines < <(grep -n \
   'nexus-v015-release-assemble.*--print-candidate-digest' \
   "$TMP/all-handoff.log" | cut -d: -f1)
-webui_line=$(grep -n 'tests/ocular/webui-run.mjs --release' "$TMP/all-handoff.log" | cut -d: -f1)
 live_line=$(grep -n 'tests/ocular/live-plugin.mjs --release' "$TMP/all-handoff.log" | cut -d: -f1)
 aggregate_line=$(grep -n 'tests/ocular/aggregate.mjs --nexus-release' "$TMP/all-handoff.log" | cut -d: -f1)
 soak_line=$(grep -n 'export NEXUS_V015_SOAK_PASSWORD=' \
@@ -1466,13 +1496,10 @@ assemble_line=$(grep -n 'nexus-v015-release-assemble.*--host-before' \
 seal_line=$(grep -n 'nexus-v015-evidence-validate --seal' \
   "$TMP/all-handoff.log" | tail -n1 | cut -d: -f1)
 test "${#digest_lines[@]}" -ge 2
-test -n "$webui_line"
 test -n "$live_line" && test -n "$aggregate_line" && test -n "$soak_line"
 test -n "$assemble_line" && test -n "$seal_line"
-test "${digest_lines[0]}" -lt "$webui_line"
-test "$webui_line" -lt "${digest_lines[-1]}"
+test "${digest_lines[0]}" -lt "$live_line"
 test "${digest_lines[-1]}" -lt "$live_line"
-test "$webui_line" -lt "$live_line"
 test "$live_line" -lt "$aggregate_line"
 test "$aggregate_line" -lt "$soak_line"
 test "$soak_line" -lt "$assemble_line"

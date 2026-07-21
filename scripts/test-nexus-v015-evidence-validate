@@ -23,8 +23,7 @@ TARGET = SCRIPT_DIR / "nexus-v015-evidence-validate"
 RUN_ID = "v015-fixture-run"
 SOURCE_NAMES = ("nexus",)
 PACKAGE_NAMES = ("@egregore/nexus", "@egregore/nexus-cli", "@egregore/nexus-gateway")
-WEBUI_CASES = tuple(f"W{index}" for index in range(1, 9))
-EXPECTED_CASES = WEBUI_CASES
+EXPECTED_CASES: tuple[str, ...] = ()
 WEBUI_ARTIFACTS = (
     "preScreenshot",
     "postScreenshot",
@@ -51,14 +50,11 @@ RESULT_SPECS = {
     "A2": ("results/A2-host-isolation/result.json", ("beforeSnapshot", "afterSnapshot", "comparison")),
     "B1": ("results/B1-stable-identity/result.json", ("identityMatrix", "renameRegression", "agentIdResolution")),
     "B2": ("results/B2-restart-reconciliation/result.json", ("restartTimeline", "rosterComparison", "humanRebind")),
-    "B3": ("results/B3-human-webconsole-attribution/result.json", ("attributionRows", "renderedAttribution", "principalTransitions")),
     "C1": ("results/C1-browser-mutation-security/result.json", ("csrfMatrix", "packedHttp", "packedWebsocket")),
     "C2": ("results/C2-developer-event-websocket/result.json", ("upgrades", "frames", "cursorCheckpoints", "backpressure", "noPolling")),
     "C3": ("results/C3-agent-session-websocket/result.json", ("sessionFrames", "correlation", "reconnect", "backpressure", "laneIsolation")),
     "C4": ("results/C4-rest-websocket-agreement/result.json", ("restSnapshot", "websocketDeltas", "recovery")),
     "D1": ("results/D1-clean-packed-install/result.json", ("packedInventory", "installLog", "foreignCwd", "shutdown")),
-    "D2": ("results/D2-webconsole-cli/result.json", ("cliTranscript", "discoveryRecovery", "occupiedPort")),
-    "D3": ("results/D3-webui-browser/result.json", ("browserTranscript", "attribution", "reconnect")),
     "E2": ("results/E2-lens-ocular/result.json", ("ocularSummary", "affordanceCoverage", "artifactsIndex")),
     "F1": ("results/F1-live-codex-claude/result.json", ("codex", "claude", "deliveryMatrix")),
     "F2": ("results/F2-message-hooks/result.json", ("shell", "javascript", "python", "timing")),
@@ -78,8 +74,6 @@ RESULT_SPECS = {
     "DIFF": ("release/diff-disposition.json", ("trackedDiff", "untrackedInventory", "intendedChanges")),
     "REVIEW": ("release/review-disposition.json", ("reviewReport", "blockerDisposition")),
 }
-D2_RESULT_RELATIVE = Path(RESULT_SPECS["D2"][0])
-D2_SEAL_RELATIVE = Path("results/D2-webconsole-cli.result.sha256")
 RUN_SEAL_SUFFIX = ".run-committed.json"
 
 
@@ -420,29 +414,7 @@ class EvidenceFixture:
 
     def _build_results(self) -> None:
         for gate, (relative, artifact_names) in RESULT_SPECS.items():
-            if gate == "D2":
-                result_directory = Path(relative).parent
-                artifacts = {
-                    name: self.artifact(
-                        result_directory / f"{name}.jsonl",
-                        json.dumps({"owner": gate, "artifact": name}).encode("utf-8") + b"\n",
-                    )
-                    for name in artifact_names
-                }
-                self.artifact(result_directory / "version.stdout", b"nexus 0.1.5\n")
-                evidence_inventory = []
-                for absolute in sorted((self.root / result_directory).iterdir()):
-                    relative_path = absolute.relative_to(self.root).as_posix()
-                    evidence_inventory.append(
-                        {
-                            "path": relative_path,
-                            "sha256": sha256(absolute),
-                            "size": absolute.stat().st_size,
-                        }
-                    )
-            else:
-                artifacts = self.artifacts(f"results/{gate}", artifact_names)
-                evidence_inventory = None
+            artifacts = self.artifacts(f"results/{gate}", artifact_names)
             result = {
                 "schemaVersion": 1,
                 "runId": RUN_ID,
@@ -452,8 +424,6 @@ class EvidenceFixture:
                 "requiredArtifacts": list(artifact_names),
                 "artifacts": artifacts,
             }
-            if evidence_inventory is not None:
-                result["evidenceInventory"] = evidence_inventory
             if gate == "DIFF":
                 result["unexpectedChanges"] = 0
             elif gate == "REVIEW":
@@ -548,10 +518,8 @@ class EvidenceFixture:
                                 "xvfb": 104,
                                 "lens": 105,
                                 "lensCdpProxy": 106,
-                                "webuiBrowser": 107,
-                                "webuiCdpProxy": 108,
                             },
-                            "tcpPorts": [4100, 4101, 4200, 9222, 9224],
+                            "tcpPorts": [4100, 4101, 9222],
                             "unixSockets": ["/tmp/nexus.sock", "/tmp/gateway-stream.sock"],
                         },
                         "invariants": {
@@ -571,23 +539,6 @@ class EvidenceFixture:
             path = self.root / relative
             self.result_paths[gate] = path
             write_json(path, result)
-            if gate == "D2":
-                os.chmod(path, 0o400)
-                result_raw = path.read_bytes()
-                seal_path = self.root / D2_SEAL_RELATIVE
-                write_json(
-                    seal_path,
-                    {
-                        "schemaVersion": 1,
-                        "runId": RUN_ID,
-                        "candidateDigest": self.candidate_digest,
-                        "gate": "D2",
-                        "resultPath": D2_RESULT_RELATIVE.as_posix(),
-                        "resultSha256": hashlib.sha256(result_raw).hexdigest(),
-                        "resultSize": len(result_raw),
-                    },
-                )
-                os.chmod(seal_path, 0o400)
 
     def _harden_and_seal(self) -> None:
         candidate_directories = {
@@ -784,11 +735,13 @@ class EvidenceValidatorTests(unittest.TestCase):
         self.assertIn(f"{len(RESULT_SPECS)} canonical results", result.stdout)
         self.assertIn(fixture.candidate_digest, result.stdout)
 
-    def test_nexus_release_does_not_require_pactbin_or_the_O_catalog(self) -> None:
+    def test_nexus_release_excludes_product_catalogs_and_webconsole_gates(self) -> None:
         fixture = self.fixture("nexus-only-ocular-gate")
-        self.assertEqual(tuple(fixture.case_meta), WEBUI_CASES)
-        self.assertNotIn("E1", fixture.result_paths)
+        self.assertEqual(tuple(fixture.case_meta), ())
+        for gate in ("B3", "D2", "D3", "E1"):
+            self.assertNotIn(gate, fixture.result_paths)
         self.assertFalse(any("pactbin" in path.name.lower() for path in fixture.root.rglob("*")))
+        self.assertFalse(any(path.name.startswith("W") for path in fixture.root.iterdir()))
         result = self.run_validator(fixture.root)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -1190,114 +1143,6 @@ class EvidenceValidatorTests(unittest.TestCase):
         )
         self.assert_invalid(unexpected, "RESULT_UNEXPECTED")
 
-    def test_D2_exact_evidence_inventory_is_canonical_and_fail_closed(self) -> None:
-        missing_ledger = self.fixture("d2-inventory-missing-ledger")
-        document = read_json(missing_ledger.result_paths["D2"])
-        document.pop("evidenceInventory")
-        rewrite_readonly_json(missing_ledger.result_paths["D2"], document)
-        self.assert_invalid(missing_ledger, "D2_INVENTORY")
-
-        unexpected = self.fixture("d2-inventory-unexpected")
-        result_directory = unexpected.result_paths["D2"].parent
-        (result_directory / "unlisted.txt").write_text("unlisted\n", encoding="utf-8")
-        self.assert_invalid(unexpected, "D2_INVENTORY_UNEXPECTED")
-
-        linked = self.fixture("d2-inventory-symlink")
-        result_directory = linked.result_paths["D2"].parent
-        (result_directory / "unlisted-link").symlink_to("version.stdout")
-        self.assert_invalid(linked, "D2_INVENTORY_TYPE")
-
-        changed = self.fixture("d2-inventory-changed")
-        output = changed.result_paths["D2"].parent / "version.stdout"
-        output.write_text("nexus 0.1.4\n", encoding="utf-8")
-        self.assert_invalid(changed, "D2_INVENTORY_HASH")
-
-        reserved = self.fixture("d2-inventory-reserved")
-        document = read_json(reserved.result_paths["D2"])
-        document["evidenceInventory"][0]["path"] = reserved.result_paths["D2"].relative_to(
-            reserved.root
-        ).as_posix()
-        rewrite_readonly_json(reserved.result_paths["D2"], document)
-        self.assert_invalid(reserved, "D2_INVENTORY")
-
-    def test_D2_detached_seal_is_mandatory_and_candidate_bound(self) -> None:
-        missing = self.fixture("d2-seal-missing")
-        (missing.root / D2_SEAL_RELATIVE).unlink()
-        self.assert_invalid(missing, "D2_SEAL_MISSING")
-
-        mutations = (
-            ("run-id", "runId", "different-run"),
-            ("candidate", "candidateDigest", "sha256:" + "f" * 64),
-            ("gate", "gate", "D1"),
-            ("result-path", "resultPath", "results/D2-webconsole-cli/other.json"),
-            ("result-hash", "resultSha256", "0" * 64),
-            ("result-size", "resultSize", 1),
-        )
-        for name, field, value in mutations:
-            with self.subTest(name=name):
-                fixture = self.fixture(f"d2-seal-{name}")
-                seal_path = fixture.root / D2_SEAL_RELATIVE
-                document = read_json(seal_path)
-                document[field] = value
-                rewrite_readonly_json(seal_path, document)
-                self.assert_invalid(fixture, "D2_SEAL_MISMATCH")
-
-    def test_D2_detached_seal_requires_canonical_modes_and_strict_json(self) -> None:
-        wrong_result_mode = self.fixture("d2-seal-result-mode")
-        os.chmod(wrong_result_mode.result_paths["D2"], 0o600)
-        self.assert_invalid(wrong_result_mode, "D2_SEAL_MODE")
-
-        wrong_seal_mode = self.fixture("d2-seal-seal-mode")
-        os.chmod(wrong_seal_mode.root / D2_SEAL_RELATIVE, 0o600)
-        self.assert_invalid(wrong_seal_mode, "D2_SEAL_MODE")
-
-        invalid_documents = (
-            ("invalid", b"{not-json}\n"),
-            ("duplicate", b'{"schemaVersion":1,"schemaVersion":1}\n'),
-            ("nonfinite", b'{"schemaVersion":1,"resultSize":NaN}\n'),
-        )
-        for name, raw in invalid_documents:
-            with self.subTest(name=name):
-                fixture = self.fixture(f"d2-seal-json-{name}")
-                seal_path = fixture.root / D2_SEAL_RELATIVE
-                os.chmod(seal_path, 0o600)
-                seal_path.write_bytes(raw)
-                os.chmod(seal_path, 0o400)
-                self.assert_invalid(fixture, "D2_SEAL_INVALID")
-
-    def test_D2_detached_seal_rejects_symlink_and_hardlink_aliases(self) -> None:
-        symlink = self.fixture("d2-seal-symlink")
-        seal_path = symlink.root / D2_SEAL_RELATIVE
-        replacement = symlink.root / "detached-seal-copy"
-        replacement.write_bytes(seal_path.read_bytes())
-        seal_path.unlink()
-        seal_path.symlink_to(replacement)
-        self.assert_invalid(symlink, "D2_SEAL_TYPE")
-
-        hardlink = self.fixture("d2-seal-hardlink")
-        seal_path = hardlink.root / D2_SEAL_RELATIVE
-        os.link(seal_path, hardlink.root / "detached-seal-alias")
-        self.assert_invalid(hardlink, "D2_SEAL_TYPE")
-
-    def test_D2_detached_seal_rejects_coordinated_result_rewrite(self) -> None:
-        fixture = self.fixture("d2-seal-coordinated-rewrite")
-        result_path = fixture.result_paths["D2"]
-        output_path = result_path.parent / "version.stdout"
-        output_path.write_text("nexus 0.1.5 rewritten\n", encoding="utf-8")
-
-        result = read_json(result_path)
-        output_relative = output_path.relative_to(fixture.root).as_posix()
-        for record in result["evidenceInventory"]:
-            if record["path"] == output_relative:
-                record["sha256"] = sha256(output_path)
-                record["size"] = output_path.stat().st_size
-                break
-        else:
-            self.fail("fixture D2 inventory did not include version.stdout")
-        rewrite_readonly_json(result_path, result)
-
-        self.assert_invalid(fixture, "D2_SEAL_MISMATCH")
-
     def test_required_results_reject_nonfinal_outcomes(self) -> None:
         mutations = (
             ("status", "status", "SKIP", "OUTCOME_STATUS"),
@@ -1329,110 +1174,6 @@ class EvidenceValidatorTests(unittest.TestCase):
         write_json(review.result_paths["REVIEW"], document)
         self.assert_invalid(review, "REVIEW_DISPOSITION")
 
-    def test_exact_case_set_rejects_missing_duplicate_and_unexpected_cases(self) -> None:
-        missing = self.fixture("missing-case")
-        missing.case_meta["W8"].unlink()
-        self.assert_invalid(missing, "CASE_MISSING")
-
-        duplicate = self.fixture("duplicate-case")
-        duplicate_path = duplicate.root / "W1-copy" / "manifest.json"
-        duplicate_path.parent.mkdir(parents=True)
-        shutil.copy2(duplicate.case_meta["W1"], duplicate_path)
-        self.assert_invalid(duplicate, "CASE_DUPLICATE")
-
-        pseudo = self.fixture("unexpected-case")
-        document = read_json(pseudo.case_meta["W3"])
-        document["case"] = "W3a"
-        write_json(pseudo.case_meta["W3"], document)
-        self.assert_invalid(pseudo, "CASE_UNEXPECTED")
-
-    def test_case_manifest_v2_is_readiness_bound_and_directory_scoped(self) -> None:
-        stale = self.fixture("case-stale-readiness")
-        document = read_json(stale.case_meta["W1"])
-        document["readinessSha256"] = "f" * 64
-        write_json(stale.case_meta["W1"], document)
-        self.assert_invalid(stale, "READINESS_AUTHORITY")
-
-        obsolete = self.fixture("case-obsolete-schema")
-        document = read_json(obsolete.case_meta["W1"])
-        document["schema"] = "ocular-evidence/1"
-        write_json(obsolete.case_meta["W1"], document)
-        self.assert_invalid(obsolete, "CASE_SCHEMA")
-
-        wrong_version = self.fixture("case-wrong-schema-version")
-        document = read_json(wrong_version.case_meta["W1"])
-        document["schemaVersion"] = 2
-        write_json(wrong_version.case_meta["W1"], document)
-        self.assert_invalid(wrong_version, "SCHEMA_VERSION")
-
-        extra = self.fixture("case-extra-field")
-        document = read_json(extra.case_meta["W2"])
-        document["candidateDigest"] = "0" * 64
-        write_json(extra.case_meta["W2"], document)
-        self.assert_invalid(extra, "CASE_SCHEMA")
-
-        escaped = self.fixture("case-artifact-other-directory")
-        document = read_json(escaped.case_meta["W2"])
-        artifact_record = document["artifacts"]["dom"]
-        original = escaped.root / artifact_record["path"]
-        relocated = escaped.root / "other-case" / original.name
-        relocated.parent.mkdir()
-        original.rename(relocated)
-        artifact_record["path"] = relocated.relative_to(escaped.root).as_posix()
-        artifact_record["sha256"] = sha256(relocated)
-        write_json(escaped.case_meta["W2"], document)
-        self.assert_invalid(escaped, "ARTIFACT_PATH")
-
-    def test_case_artifact_contract_cannot_be_weakened_by_metadata(self) -> None:
-        fixture = self.fixture("case-artifacts")
-        document = read_json(fixture.case_meta["W4"])
-        document["requiredArtifacts"].remove("websocket")
-        document["artifacts"].pop("websocket")
-        write_json(fixture.case_meta["W4"], document)
-        self.assert_invalid(fixture, "ARTIFACT_REQUIRED")
-
-    def test_case_artifact_payloads_are_semantic_evidence_not_placeholders(self) -> None:
-        mutations = (
-            ("preScreenshot", b"not a jpeg\n", "SCREENSHOT_EVIDENCE"),
-            ("dom", b"plain text without markup\n", "DOM_EVIDENCE"),
-            ("console", b'{"messages":[],"violations":["boom"]}\n', "CONSOLE_EVIDENCE"),
-            ("network", b'{"not":"an array"}\n', "NETWORK_EVIDENCE"),
-            ("websocket", b'{"not":"an array"}\n', "WEBSOCKET_EVIDENCE"),
-            (
-                "processLogs",
-                b'{"capturedAt":"t","runnerPid":1,"rendererTarget":null,"logs":{"daemon":{"tail":"ok"},"gateway":{"absent":true},"lens":{"tail":"ok"}}}\n',
-                "PROCESS_LOG_EVIDENCE",
-            ),
-            (
-                "health",
-                b'{"capturedAt":"t","url":"http://127.0.0.1:4100/api/v1/health","status":503,"body":"down"}\n',
-                "HEALTH_EVIDENCE",
-            ),
-        )
-        for name, payload, code in mutations:
-            with self.subTest(name=name):
-                fixture = self.fixture(f"case-payload-{name}")
-                document = read_json(fixture.case_meta["W5"])
-                record = document["artifacts"][name]
-                artifact = fixture.root / record["path"]
-                artifact.write_bytes(payload)
-                record["sha256"] = sha256(artifact)
-                write_json(fixture.case_meta["W5"], document)
-                self.assert_invalid(fixture, code)
-
-    def test_textual_case_artifacts_reject_unredacted_credentials(self) -> None:
-        fixture = self.fixture("case-credential-leak")
-        document = read_json(fixture.case_meta["W2"])
-        record = document["artifacts"]["console"]
-        artifact = fixture.root / record["path"]
-        artifact.write_text(
-            '{"messages":[{"text":"nexus_ck_0123456789abcdef0123456789abcdef"}],"violations":[]}\n',
-            encoding="utf-8",
-        )
-        record["sha256"] = sha256(artifact)
-        write_json(fixture.case_meta["W2"], document)
-        self.assert_invalid(fixture, "EVIDENCE_REDACTION")
-
     def test_duplicate_JSON_keys_and_nonfinite_numbers_are_rejected(self) -> None:
         duplicate = self.fixture("duplicate-json-key")
         text = duplicate.manifest_path.read_text(encoding="utf-8")
@@ -1458,21 +1199,13 @@ class EvidenceValidatorTests(unittest.TestCase):
         path.write_text(text, encoding="utf-8")
         self.assert_invalid(overflow, "JSON_NONFINITE")
 
-    def test_parent_symlinks_are_rejected_for_documents_and_artifacts(self) -> None:
+    def test_parent_symlinks_are_rejected_for_documents_and_run_roots(self) -> None:
         document_link = self.fixture("document-parent-link")
         original_parent = document_link.result_paths["B1"].parent
         real_parent = original_parent.with_name(original_parent.name + "-real")
         original_parent.rename(real_parent)
         original_parent.symlink_to(real_parent.name, target_is_directory=True)
         self.assert_invalid(document_link, "DOCUMENT_SYMLINK")
-
-        artifact_link = self.fixture("artifact-parent-link")
-        document = read_json(artifact_link.case_meta["W5"])
-        artifact = artifact_link.root / document["artifacts"]["dom"]["path"]
-        real_artifact = artifact.with_name(artifact.name + "-real")
-        artifact.rename(real_artifact)
-        artifact.symlink_to(real_artifact.name)
-        self.assert_invalid(artifact_link, "ARTIFACT_SYMLINK")
 
         root_link = self.fixture("run-parent-link")
         real_base = self.base / "real-parent"
@@ -1485,36 +1218,12 @@ class EvidenceValidatorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn("EVIDENCE_RUN_DIR_SYMLINK:", result.stderr)
 
-    def test_cross_case_hardlink_reuse_is_rejected(self) -> None:
-        fixture = self.fixture("hardlink-reuse")
-        first = read_json(fixture.case_meta["W1"])
-        second = read_json(fixture.case_meta["W2"])
-        first_path = fixture.root / first["artifacts"]["dom"]["path"]
-        second_path = fixture.root / second["artifacts"]["dom"]["path"]
-        second_path.unlink()
-        os.link(first_path, second_path)
-        second["artifacts"]["dom"]["sha256"] = sha256(first_path)
-        write_json(fixture.case_meta["W2"], second)
-        self.assert_invalid(fixture, "HARDLINK_REUSE")
-
-    def test_artifact_missing_tamper_and_traversal_fail_closed(self) -> None:
-        missing = self.fixture("missing-artifact")
-        document = read_json(missing.case_meta["W2"])
-        artifact = missing.root / document["artifacts"]["dom"]["path"]
-        artifact.unlink()
-        self.assert_invalid(missing, "ARTIFACT_MISSING")
-
+    def test_result_artifact_tamper_fails_closed(self) -> None:
         tampered = self.fixture("tampered-artifact")
         document = read_json(tampered.result_paths["D1"])
         artifact = tampered.root / document["artifacts"]["installLog"]["path"]
         artifact.write_text("tampered\n", encoding="utf-8")
         self.assert_invalid(tampered, "ARTIFACT_HASH")
-
-        traversal = self.fixture("artifact-traversal")
-        document = read_json(traversal.case_meta["W4"])
-        document["artifacts"]["console"]["path"] = "../outside.json"
-        write_json(traversal.case_meta["W4"], document)
-        self.assert_invalid(traversal, "ARTIFACT_PATH")
 
     def test_soak_requires_finite_correlated_thirty_minute_timestamps(self) -> None:
         short = self.fixture("short-soak")
@@ -1637,7 +1346,7 @@ class EvidenceValidatorTests(unittest.TestCase):
 
         topology = self.fixture("soak-topology")
         document = read_json(topology.result_paths["F3"])
-        document["topology"]["tcpPorts"].remove(4200)
+        document["topology"]["tcpPorts"].remove(4101)
         write_json(topology.result_paths["F3"], document)
         self.assert_invalid(topology, "SOAK_TOPOLOGY")
 

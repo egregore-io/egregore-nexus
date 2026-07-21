@@ -227,9 +227,9 @@
 ### Task 5: Run all packed functional gates
 
 **Files:**
-- Execute: packed CLI/Gateway/Webconsole/WebUI/hook producers
+- Execute: packed Nexus CLI/Gateway/WebSocket/hook producers
 - Execute: the existing Lens LP1–LP16 ocular validator against the ready candidate
-- Produce: canonical Nexus evidence, W1–W8 WebUI evidence, and candidate-bound Lens ocular evidence without grading Lens/Egregore/Pactree source revisions
+- Produce: canonical Nexus evidence and candidate-bound Lens LP1–LP16 ocular evidence without grading Lens/Egregore/Pactree source revisions; Webconsole/W1–W8/D2/D3 and PACTBIN2 E1 are deferred
 
 - [ ] **Step 1: Run the complete packed gate without soak.**
 
@@ -238,7 +238,7 @@
   scripts/nexus-docker-test-env lab-gate --mode packed
   ```
 
-  Expected: backend, D2, F2, W1–W8, Lens LP1–LP16, and pre-soak sealing producers all report PASS for Nexus behavior. The gate records the actual Lens ocular bytes that ran but does not require clean/committed Lens, Egregore, or Pactree repositories and does not run their separate product suites.
+  Expected: packed backend/WebSocket, F2, Lens LP1–LP16, and pre-soak producers all report PASS for Nexus behavior. The gate records the actual Lens ocular bytes that ran but does not require clean/committed Lens, Egregore, or Pactree repositories and does not run their separate product suites or deferred Webconsole gate.
 
 - [ ] **Step 2: Verify every chat surface explicitly.**
 
@@ -284,7 +284,7 @@
   scripts/nexus-v015-release-assemble --run-root "$NEXUS_LAB_ROOT/evidence/$NEXUS_V015_RUN_ID"
   ```
 
-  Expected: canonical A1–F3 plus DIFF/REVIEW results, with no missing/extra result or artifact.
+  Expected: the canonical required Nexus results, including E2/F3 plus DIFF/REVIEW, with no missing/extra result or artifact. Deferred B3/D2/D3/E1 results are neither produced nor required.
 
 - [ ] **Step 2: Validate without mutation.**
 

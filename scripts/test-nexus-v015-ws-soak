@@ -18,6 +18,11 @@ if grep -Eq 'vite\.pid|127\.0\.0\.1:1422|[,( ]1422[), ]' "$TARGET"; then
   exit 1
 fi
 grep -Fq 'cdp_runtime_probe(LENS_CDP_URL, "file://", "Lens")' "$TARGET"
+! grep -Fq 'WEBUI_CDP_URL' "$TARGET"
+! grep -Fq '("webui-browser.pid", "webuiBrowser")' "$TARGET"
+! grep -Fq '("webui-cdp-proxy.pid", "webuiCdpProxy")' "$TARGET"
+! grep -Fq 'required_tcp_ports = (4100, 4101, 4200, 9222, 9224)' "$TARGET"
+grep -Fq 'required_tcp_ports = (4100, 4101, 9222)' "$TARGET"
 
 python3 - "$TARGET" "$TMP/runner" "$TMP" <<'PY'
 from pathlib import Path

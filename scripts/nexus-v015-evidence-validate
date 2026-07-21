@@ -21,8 +21,7 @@ from typing import Any, NoReturn
 VERSION = "0.1.5"
 SOURCE_NAMES = ("nexus",)
 PACKAGE_NAMES = ("@egregore/nexus", "@egregore/nexus-cli", "@egregore/nexus-gateway")
-WEBUI_CASES = tuple(f"W{index}" for index in range(1, 9))
-EXPECTED_CASES = WEBUI_CASES
+EXPECTED_CASES: tuple[str, ...] = ()
 EXPECTED_CASE_SET = frozenset(EXPECTED_CASES)
 WEBUI_ARTIFACTS = (
     "preScreenshot",
@@ -64,8 +63,6 @@ SOAK_PROCESS_ROLES = (
     "xvfb",
     "lens",
     "lensCdpProxy",
-    "webuiBrowser",
-    "webuiCdpProxy",
 )
 RESULT_SPECS: dict[str, tuple[Path, tuple[str, ...]]] = {
     "A1": (
@@ -83,10 +80,6 @@ RESULT_SPECS: dict[str, tuple[Path, tuple[str, ...]]] = {
     "B2": (
         Path("results/B2-restart-reconciliation/result.json"),
         ("restartTimeline", "rosterComparison", "humanRebind"),
-    ),
-    "B3": (
-        Path("results/B3-human-webconsole-attribution/result.json"),
-        ("attributionRows", "renderedAttribution", "principalTransitions"),
     ),
     "C1": (
         Path("results/C1-browser-mutation-security/result.json"),
@@ -107,14 +100,6 @@ RESULT_SPECS: dict[str, tuple[Path, tuple[str, ...]]] = {
     "D1": (
         Path("results/D1-clean-packed-install/result.json"),
         ("packedInventory", "installLog", "foreignCwd", "shutdown"),
-    ),
-    "D2": (
-        Path("results/D2-webconsole-cli/result.json"),
-        ("cliTranscript", "discoveryRecovery", "occupiedPort"),
-    ),
-    "D3": (
-        Path("results/D3-webui-browser/result.json"),
-        ("browserTranscript", "attribution", "reconnect"),
     ),
     "E2": (
         Path("results/E2-lens-ocular/result.json"),
@@ -151,8 +136,6 @@ RESULT_SPECS: dict[str, tuple[Path, tuple[str, ...]]] = {
     ),
 }
 EXPECTED_RESULT_PATHS = frozenset(path.as_posix() for path, _ in RESULT_SPECS.values())
-D2_RESULT_PATH = RESULT_SPECS["D2"][0]
-D2_SEAL_PATH = Path("results/D2-webconsole-cli.result.sha256")
 CANDIDATE_SEAL_PATH = Path(".candidate-committed")
 CANONICAL_LAB_ROOT = Path("/tmp/nexus-lens-home")
 CANONICAL_RUN_SEAL_ROOT = Path("/tmp/nexus-v015-evidence")
@@ -185,8 +168,8 @@ USAGE = """Usage: scripts/nexus-v015-evidence-validate [--seal] RUN_DIR
 
 Validate one immutable v0.1.5 evidence ledger containing:
   manifest.json (packed candidate, Nexus source ledger, three npm tarballs, native hash)
-  all canonical Nexus A1-F3 results plus clean diff and review dispositions
-  exactly W1-W8 ocular-evidence/2 WebUI case manifests and bound LP evidence
+  canonical Nexus results plus clean diff and review dispositions
+  candidate-bound LP1-LP16 Lens plugin evidence (Webconsole/WebUI excluded)
   a finite, correlated, zero-failure soak of at least 1800 seconds
 
 Documents and artifacts must be regular in-tree files, may not traverse
@@ -1338,147 +1321,6 @@ class Validator:
             payloads[name] = raw
         return payloads
 
-    def validate_d2_inventory(
-        self,
-        document: dict[str, Any],
-        metadata_path: Path,
-    ) -> None:
-        inventory = document.get("evidenceInventory")
-        if not isinstance(inventory, list) or not inventory:
-            self.error("D2_INVENTORY", metadata_path, "D2 exact evidence inventory is required")
-        expected: dict[str, tuple[str, int]] = {}
-        for record in inventory:
-            if not isinstance(record, dict) or set(record) != {"path", "sha256", "size"}:
-                self.error("D2_INVENTORY", metadata_path, "D2 inventory records have an invalid schema")
-            relative = self.artifact_relative(record.get("path"), metadata_path)
-            relative_raw = relative.as_posix()
-            expected_sha = record.get("sha256")
-            expected_size = record.get("size")
-            if (
-                relative.parent != metadata_path.parent
-                or relative == metadata_path
-                or relative_raw in expected
-                or not self.valid_sha256(expected_sha)
-                or not is_int(expected_size)
-                or expected_size < 0
-            ):
-                self.error("D2_INVENTORY", metadata_path, "D2 inventory is not canonical")
-            expected[relative_raw] = (expected_sha, expected_size)
-
-        directory_fd = self.open_directory_relative(
-            metadata_path.parent,
-            "D2_INVENTORY_TYPE",
-            "D2_INVENTORY_MISSING",
-        )
-        actual: set[str] = set()
-        try:
-            with os.scandir(directory_fd) as entries:
-                for entry in entries:
-                    relative = (metadata_path.parent / entry.name).as_posix()
-                    try:
-                        info = entry.stat(follow_symlinks=False)
-                    except OSError as exc:
-                        self.error("FILE_IO", relative, f"cannot inspect D2 evidence: {exc}")
-                    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                        self.error(
-                            "D2_INVENTORY_TYPE",
-                            relative,
-                            "D2 evidence must be a single regular file",
-                        )
-                    actual.add(relative)
-        finally:
-            os.close(directory_fd)
-
-        expected_paths = set(expected) | {metadata_path.as_posix()}
-        unexpected = sorted(actual - expected_paths)
-        missing = sorted(expected_paths - actual)
-        if unexpected:
-            self.error(
-                "D2_INVENTORY_UNEXPECTED",
-                unexpected[0],
-                "D2 evidence directory contains an unlisted path",
-            )
-        if missing:
-            self.error(
-                "D2_INVENTORY_MISSING",
-                missing[0],
-                "D2 evidence inventory lists a missing path",
-            )
-
-        for relative_raw, (expected_sha, expected_size) in expected.items():
-            self.declared_files.add(Path(relative_raw))
-            raw, info = self.read_same_fd(
-                Path(relative_raw),
-                symlink_code="D2_INVENTORY_TYPE",
-                missing_code="D2_INVENTORY_MISSING",
-            )
-            if info.st_nlink != 1:
-                self.error(
-                    "D2_INVENTORY_TYPE",
-                    relative_raw,
-                    "D2 evidence must not reuse hardlinks",
-                )
-            if len(raw) != expected_size or hashlib.sha256(raw).hexdigest() != expected_sha:
-                self.error(
-                    "D2_INVENTORY_HASH",
-                    relative_raw,
-                    "D2 inventoried evidence changed after PASS",
-                )
-
-    def validate_d2_seal(self) -> None:
-        seal_raw, seal_info = self.read_same_fd(
-            D2_SEAL_PATH,
-            symlink_code="D2_SEAL_TYPE",
-            missing_code="D2_SEAL_MISSING",
-        )
-        if seal_info.st_nlink != 1:
-            self.error(
-                "D2_SEAL_TYPE",
-                D2_SEAL_PATH,
-                "D2 result seal must be a single regular file",
-            )
-        if stat.S_IMODE(seal_info.st_mode) != 0o400:
-            self.error("D2_SEAL_MODE", D2_SEAL_PATH, "D2 result seal mode must be exactly 0400")
-        try:
-            seal = json.loads(
-                seal_raw.decode("utf-8"),
-                object_pairs_hook=reject_duplicate_keys,
-                parse_constant=reject_nonfinite_constant,
-            )
-        except (DuplicateJsonKey, NonfiniteJson, UnicodeError, json.JSONDecodeError) as exc:
-            self.error("D2_SEAL_INVALID", D2_SEAL_PATH, f"D2 result seal is invalid JSON: {exc}")
-        if not isinstance(seal, dict) or contains_nonfinite(seal):
-            self.error("D2_SEAL_INVALID", D2_SEAL_PATH, "D2 result seal must be a finite JSON object")
-
-        result_raw, result_info = self.read_same_fd(
-            D2_RESULT_PATH,
-            symlink_code="D2_SEAL_TYPE",
-            missing_code="D2_SEAL_MISSING",
-        )
-        if result_info.st_nlink != 1:
-            self.error(
-                "D2_SEAL_TYPE",
-                D2_RESULT_PATH,
-                "sealed D2 result must be a single regular file",
-            )
-        if stat.S_IMODE(result_info.st_mode) != 0o400:
-            self.error("D2_SEAL_MODE", D2_RESULT_PATH, "sealed D2 result mode must be exactly 0400")
-        expected = {
-            "schemaVersion": 1,
-            "runId": self.run_id,
-            "candidateDigest": self.candidate_digest,
-            "gate": "D2",
-            "resultPath": D2_RESULT_PATH.as_posix(),
-            "resultSha256": hashlib.sha256(result_raw).hexdigest(),
-            "resultSize": len(result_raw),
-        }
-        if seal != expected:
-            self.error(
-                "D2_SEAL_MISMATCH",
-                D2_SEAL_PATH,
-                "D2 result seal does not match the current candidate and result bytes",
-            )
-
     def validate_candidate_commit_seal(self, run_id: str) -> None:
         root_info = os.fstat(self.root_fd)
         if stat.S_IMODE(root_info.st_mode) != 0o700:
@@ -2290,9 +2132,6 @@ class Validator:
                     self.error("REVIEW_DISPOSITION", path, "unresolvedBlockers must be integer zero")
             elif gate == "F3":
                 self.validate_soak(document, path)
-            if gate == "D2":
-                self.validate_d2_inventory(document, path)
-                self.validate_d2_seal()
             self.validate_artifacts(document, path, f"result:{gate}", artifacts)
 
     def validate_soak(self, document: dict[str, Any], path: Path) -> None:
@@ -2530,7 +2369,7 @@ class Validator:
             or set(processes) != set(SOAK_PROCESS_ROLES)
             or any(not is_int(value) or value <= 0 for value in processes.values())
             or len(set(processes.values())) != len(processes)
-            or tcp_ports != [4100, 4101, 4200, 9222, 9224]
+            or tcp_ports != [4100, 4101, 9222]
             or not isinstance(unix_sockets, list)
             or len(unix_sockets) != 2
             or any(not isinstance(value, str) or not value.startswith("/") for value in unix_sockets)
@@ -2549,7 +2388,7 @@ class Validator:
         self.artifact_inodes.clear()
         self.declared_files = set(CANDIDATE_PAYLOAD_PATHS)
         self.declared_files.update(path for path, _ in RESULT_SPECS.values())
-        self.declared_files.update({CANDIDATE_SEAL_PATH, D2_SEAL_PATH})
+        self.declared_files.add(CANDIDATE_SEAL_PATH)
         self.validate_manifest()
         self.validate_results()
         self.validate_cases()

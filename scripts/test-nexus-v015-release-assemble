@@ -360,16 +360,14 @@ class ReleaseAssemblerContract(unittest.TestCase):
                 "E2-lens-ocular",
                 candidate,
                 {
-                    "ocularSummary": {"status": "PASS", "cases": [f"O{index}" for index in range(1, 19)]},
+                    "ocularSummary": {"status": "PASS", "surfaces": [f"LP{index}" for index in range(1, 17)]},
                     "affordanceCoverage": {
                         "status": "PASS",
                         "livePlugin": live_plugin_doc(RUN_ID, readiness, candidate),
                     },
-                    "artifactsIndex": {"status": "PASS", "cases": ["O1", "O18"]},
+                    "artifactsIndex": {"status": "PASS", "surfaces": ["LP1", "LP16"]},
                 },
             )
-            for case_id in ("W2", "W3", "W6", "W7", "W8"):
-                case_doc(run_root, case_id, readiness)
 
             snapshot = {
                 "daemon": {"pid": 10, "bootId": "boot", "executable": "/host/nexus", "sha256": "1" * 64},
@@ -414,7 +412,7 @@ class ReleaseAssemblerContract(unittest.TestCase):
                     },
                     "review": {
                         "unresolvedBlockers": 0,
-                        "reviewReport": ["B1", "D2", "Lens"],
+                        "reviewReport": ["B1", "Nexus", "Lens plugin"],
                         "blockerDisposition": ["closed"],
                     },
                 },
@@ -443,7 +441,6 @@ class ReleaseAssemblerContract(unittest.TestCase):
             expected = {
                 "A1": run_root / "results/A1-candidate-identity/result.json",
                 "A2": run_root / "results/A2-host-isolation/result.json",
-                "B3": run_root / "results/B3-human-webconsole-attribution/result.json",
                 "DIFF": run_root / "release/diff-disposition.json",
                 "REVIEW": run_root / "release/review-disposition.json",
             }
@@ -463,16 +460,9 @@ class ReleaseAssemblerContract(unittest.TestCase):
             for directory in (
                 run_root / "results/A1-candidate-identity",
                 run_root / "results/A2-host-isolation",
-                run_root / "results/B3-human-webconsole-attribution",
                 run_root / "release",
             ):
                 self.assertEqual(directory.stat().st_mode & 0o777, 0o555)
-
-            b3_result = json.loads(expected["B3"].read_text(encoding="utf-8"))
-            rendered_path = run_root / b3_result["artifacts"]["renderedAttribution"]["path"]
-            rendered = json.loads(rendered_path.read_text(encoding="utf-8"))
-            self.assertEqual(rendered["lensLivePlugin"]["surfaces"][3]["surface"], "thread-post")
-            self.assertTrue(rendered["lensLivePlugin"]["candidateBound"])
 
             # A same-before/after document with an unrecognized field is not a
             # host-isolation proof. Refusal must happen before any target is
@@ -480,7 +470,6 @@ class ReleaseAssemblerContract(unittest.TestCase):
             for target in (
                 run_root / "results/A1-candidate-identity",
                 run_root / "results/A2-host-isolation",
-                run_root / "results/B3-human-webconsole-attribution",
                 run_root / "release",
             ):
                 if target.exists():
@@ -496,7 +485,7 @@ class ReleaseAssemblerContract(unittest.TestCase):
             # A roster-derived caller id is not durable mutation evidence. A
             # coordinated producer rewrite that leaves the expected human id
             # but removes the canonical Gateway receipt/action/message row
-            # must fail before B3 or the final release inventory is written.
+            # must fail before the final release inventory is written.
             unbound_live = live_plugin_doc(RUN_ID, readiness, candidate)
             session_row = next(
                 row
@@ -519,13 +508,11 @@ class ReleaseAssemblerContract(unittest.TestCase):
             )
             self.assertNotEqual(missing_receipt.returncode, 0)
             self.assertIn("canonical evidence", missing_receipt.stderr)
-            self.assertFalse((run_root / "results/B3-human-webconsole-attribution").exists())
+            self.assertFalse((run_root / "results/A1-candidate-identity").exists())
             self.assertFalse((run_root / "release").exists())
 
-            # B3 must not be synthesizable from WebUI cases alone. Even a
-            # coordinated E2 payload+hash rewrite that drops the live Lens
-            # surface proof must fail before publishing any cross-producer
-            # PASS document.
+            # A coordinated E2 payload+hash rewrite that drops the live Lens
+            # surface proof must fail before publishing any cross-producer PASS.
             write_json(coverage_path, {"status": "PASS", "livePlugin": {"surfaces": []}})
             e2_result["artifacts"]["affordanceCoverage"]["sha256"] = sha(coverage_path.read_bytes())
             write_json(e2_result_path, e2_result)
@@ -585,13 +572,13 @@ class ReleaseAssemblerContract(unittest.TestCase):
             ):
                 os.chmod(directory, 0o700)
             fixture.run_seal_path.unlink()
-            for gate in ("A1", "A2", "B3"):
+            for gate in ("A1", "A2"):
                 result_directory = fixture.result_paths[gate].parent
                 os.chmod(result_directory, 0o700)
                 shutil.rmtree(result_directory)
             os.chmod(fixture.root / "release", 0o700)
             shutil.rmtree(fixture.root / "release")
-            for gate in ("A1", "A2", "B3", "DIFF", "REVIEW"):
+            for gate in ("A1", "A2", "DIFF", "REVIEW"):
                 old_artifacts = fixture.root / "artifacts/results" / gate
                 if old_artifacts.exists():
                     os.chmod(old_artifacts, 0o700)
