@@ -142,6 +142,13 @@ class WsAcceptanceContracts(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("packed", result.stderr)
 
+    def test_backend_binds_the_authenticated_human_dm_mirror_route(self) -> None:
+        source = TARGET.read_text(encoding="utf-8")
+        self.assertIn(
+            'self.soak.dm_mirror_topic = f"sys.dm.{self.human_name}"',
+            source,
+        )
+
     def test_module_contracts_are_candidate_bound_and_fail_closed(self) -> None:
         module = runpy.run_path(str(TARGET))
         expected_gates = {

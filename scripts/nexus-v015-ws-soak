@@ -942,6 +942,7 @@ class Ledger:
     def __init__(self) -> None:
         self.failure = {name: 0 for name in FAILURE_COUNTERS}
         self.expected_messages: dict[str, str] = {}
+        self.expected_message_routes: dict[str, set[str]] = {}
         self.received_messages: dict[str, list[str]] = defaultdict(list)
         self.session_accepted: set[str] = set()
         self.session_completed: set[str] = set()
@@ -958,23 +959,34 @@ class Ledger:
             self.session_frame_fingerprints.discard(expired)
         return True
 
-    def accept_message(self, message_id: str, topic: str) -> None:
+    def accept_message(
+        self,
+        message_id: str,
+        topic: str,
+        *additional_topics: str,
+    ) -> None:
         self.expected_messages[message_id] = topic
+        self.expected_message_routes[message_id] = {topic, *additional_topics}
 
     def receive_message(self, message_id: str, topic: str) -> None:
         self.received_messages[message_id].append(topic)
         expected = self.expected_messages.get(message_id)
-        if expected is not None and expected != topic:
+        expected_routes = self.expected_message_routes.get(message_id)
+        if expected_routes is None and expected is not None:
+            expected_routes = {expected}
+        if expected_routes is not None and topic not in expected_routes:
             self.failure["crossRouteDeliveries"] += 1
 
     def finalize_delivery_counts(self) -> None:
         for message_id, expected in self.expected_messages.items():
             topics = self.received_messages.get(message_id, [])
-            matching = sum(topic == expected for topic in topics)
-            if matching == 0:
-                self.failure["lostAcceptedMessages"] += 1
-            elif matching > 1:
-                self.failure["duplicateAcceptedMessages"] += matching - 1
+            expected_routes = self.expected_message_routes.get(message_id, {expected})
+            for expected_route in expected_routes:
+                matching = sum(topic == expected_route for topic in topics)
+                if matching == 0:
+                    self.failure["lostAcceptedMessages"] += 1
+                elif matching > 1:
+                    self.failure["duplicateAcceptedMessages"] += matching - 1
         missing_sessions = self.session_accepted - self.session_completed
         self.failure["lostAcceptedMessages"] += len(missing_sessions)
 
@@ -1722,7 +1734,13 @@ def queue_clear(http: HttpClient, agent: Agent) -> bool:
     value = http.request("GET", f"/api/conversation/prompt?{query}")
     value.pop("_headers", None)
     commands = value.get("commands")
-    return value.get("turnActive") is not True and isinstance(commands, list) and len(commands) == 0
+    if value.get("turnActive") is True or not isinstance(commands, list):
+        return False
+    terminal_states = {"completed", "failed", "cancelled"}
+    return all(
+        isinstance(command, dict) and command.get("state") in terminal_states
+        for command in commands
+    )
 
 
 def wait_health(http: HttpClient, timeout: float = 90) -> None:
@@ -2080,6 +2098,7 @@ class Soak:
             agent.agent_id: f"sys.dm.{agent.name}"
             for agent in agents
         }
+        self.dm_mirror_topic: str | None = None
         self.developer = DeveloperLane(
             evidence,
             self.ledger,
@@ -2316,7 +2335,12 @@ class Soak:
         message_id = recursive_string(response, ("messageId", "message_id"))
         if not message_id:
             raise SoakFailure(f"accepted message has no messageId: {response!r}")
-        self.ledger.accept_message(message_id, topic)
+        mirror_topic = self.dm_mirror_topic if target.get("verb") == "dm" else None
+        self.ledger.accept_message(
+            message_id,
+            topic,
+            *((mirror_topic,) if mirror_topic else ()),
+        )
         return DeveloperAttempt(message_id, topic, cursor_before)
 
     async def finish_message(

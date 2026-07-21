@@ -1160,6 +1160,61 @@ async def reject_assistant_output_from_a_later_unrelated_run() -> None:
 asyncio.run(reject_assistant_output_from_a_later_unrelated_run())
 
 
+class QueueSnapshotHttp:
+    def __init__(self, snapshot):
+        self.snapshot = snapshot
+
+    def request(self, method, path):
+        require(method == "GET", "queue-clear probe used a mutating method")
+        require(path.startswith("/api/conversation/prompt?"), "queue-clear probe used the wrong route")
+        return deepcopy(self.snapshot) | {"_headers": {}}
+
+
+queue_agent = SimpleNamespace(agent_id="agent-queue-contract")
+require(
+    module["queue_clear"](
+        QueueSnapshotHttp({
+            "turnActive": False,
+            "commands": [
+                {"commandId": "completed", "state": "completed"},
+                {"commandId": "cancelled", "state": "cancelled"},
+                {"commandId": "failed", "state": "failed"},
+            ],
+        }),
+        queue_agent,
+    ),
+    "terminal command history was misclassified as a queue wedge",
+)
+for nonterminal_state in ("queued", "claimed", "started"):
+    require(
+        not module["queue_clear"](
+            QueueSnapshotHttp({
+                "turnActive": False,
+                "commands": [{"commandId": "live", "state": nonterminal_state}],
+            }),
+            queue_agent,
+        ),
+        f"nonterminal {nonterminal_state} queue entry was treated as clear",
+    )
+require(
+    not module["queue_clear"](
+        QueueSnapshotHttp({
+            "turnActive": False,
+            "commands": [{"commandId": "unknown", "state": "future-state"}],
+        }),
+        queue_agent,
+    ),
+    "unknown queue state was treated as terminal",
+)
+require(
+    not module["queue_clear"](
+        QueueSnapshotHttp({"turnActive": True, "commands": []}),
+        queue_agent,
+    ),
+    "active turn was treated as a clear queue",
+)
+
+
 async def correlate_developer_message_across_an_explicit_boundary() -> None:
     topic = "sys.message.thread.contract"
     soak = object.__new__(module["Soak"])
@@ -1198,6 +1253,51 @@ async def correlate_developer_message_across_an_explicit_boundary() -> None:
 
 
 asyncio.run(correlate_developer_message_across_an_explicit_boundary())
+
+
+async def accept_both_canonical_dm_routes_without_waiving_cross_route_detection() -> None:
+    agent_topic = "sys.dm.fixture-codex"
+    human_topic = "sys.dm.fixture-human"
+    soak = object.__new__(module["Soak"])
+    soak.ledger = module["Ledger"]()
+    soak.dm_mirror_topic = human_topic
+
+    class Http:
+        def request(self, method, path, body):
+            require(method == "POST" and path == "/api/v1/messages", "wrong DM ingress")
+            require(body["to"] == {"verb": "dm", "name": "fixture-codex"}, "wrong DM target")
+            return {"messageId": "message-two-party-dm", "_headers": {}}
+
+    soak.http = Http()
+    soak.developer = SimpleNamespace(cursors={agent_topic: 11})
+    await soak.begin_message(
+        {"verb": "dm", "name": "fixture-codex"},
+        agent_topic,
+        "V015_TWO_PARTY_DM",
+    )
+    require(
+        soak.ledger.expected_message_routes == {
+            "message-two-party-dm": {agent_topic, human_topic},
+        },
+        "accepted DM did not bind both canonical participant routes",
+    )
+    soak.ledger.receive_message("message-two-party-dm", agent_topic)
+    soak.ledger.receive_message("message-two-party-dm", human_topic)
+    soak.ledger.finalize_delivery_counts()
+    require(
+        soak.ledger.failure["crossRouteDeliveries"] == 0
+        and soak.ledger.failure["lostAcceptedMessages"] == 0
+        and soak.ledger.failure["duplicateAcceptedMessages"] == 0,
+        "canonical two-party DM fanout was classified as a delivery failure",
+    )
+    soak.ledger.receive_message("message-two-party-dm", "sys.dm.unrelated")
+    require(
+        soak.ledger.failure["crossRouteDeliveries"] == 1,
+        "unrelated DM route escaped cross-route detection",
+    )
+
+
+asyncio.run(accept_both_canonical_dm_routes_without_waiving_cross_route_detection())
 
 
 # PASS is the literal conjunction of nine independently testable invariants.

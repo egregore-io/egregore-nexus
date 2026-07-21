@@ -3111,6 +3111,7 @@ class BackendAcceptance:
             self.http,
             (f"sys.dm.{self.human_name}",),
         )
+        self.soak.dm_mirror_topic = f"sys.dm.{self.human_name}"
         snapshot_starts = {
             kind: len(lane.frames) for kind, lane in self.soak.sessions.items()
         }
