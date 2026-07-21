@@ -205,7 +205,7 @@
 
   Expected: the disposable validator is absent; host isolation checks remain unchanged.
 
-- [ ] **Step 2: Build and create the packed lab.**
+- [x] **Step 2: Build and create the packed lab.**
 
   ```bash
   scripts/nexus-docker-test-env build
@@ -216,7 +216,7 @@
 
   Expected: one 6-CPU/8-GiB/1,024-PID validator, candidate-bound readiness, healthy daemon/Gateway/Lens ocular client, and no host runtime mutation. The Nexus source ledger is independent of the Lens/Egregore/Pactree working-tree state; any Egregore/Pactree packages present support the Lens shell only and no Egregore chat/product gate runs.
 
-- [ ] **Step 3: Freeze the candidate identity.**
+- [x] **Step 3: Freeze the candidate identity.**
 
   ```bash
   scripts/nexus-docker-test-env lab-evidence --mode packed
@@ -263,7 +263,7 @@
 
   Expected: 30 minutes of correlated thread/DM/session traffic with repeated independent daemon/Gateway restarts, zero lost/duplicate accepted messages, zero dead letters, bounded resources, and final healthy topology.
 
-- [ ] **Step 2: Run Windows package/launcher validation.**
+- [x] **Step 2: Run Windows package/launcher validation.**
 
   ```bash
   scripts/test-nexus-windows-validation
