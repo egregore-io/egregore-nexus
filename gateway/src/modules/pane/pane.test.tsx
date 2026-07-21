@@ -230,7 +230,7 @@ describe("PubView", () => {
 
 describe("AdminView", () => {
   const agents: AdminRow[] = [
-    { name: "ben", presence: "online", harness: "claude", role: "admin agent", tier: "agent", status: "online · token.rs" },
+    { name: "ben", presence: "online", harness: "claude", tier: "agent", status: "online · token.rs" },
   ];
 
   it("renders the admin agents table from live rows", () => {
@@ -238,7 +238,6 @@ describe("AdminView", () => {
     expect(screen.getByRole("heading", { name: "Admin" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "+ Launch agent" })).toBeInTheDocument();
     const table = screen.getByRole("table");
-    expect(within(table).getByText("admin agent")).toBeInTheDocument();
     expect(within(table).getByText("ben")).toBeInTheDocument();
   });
 
@@ -247,26 +246,11 @@ describe("AdminView", () => {
     expect(screen.getByText("No agents yet")).toBeInTheDocument();
   });
 
-  it("calls onAssignProject when a different project is selected", () => {
-    const fn = vi.fn();
-    render(
-      <AdminView
-        agents={[{ name: "ben", presence: "online", harness: "claude", role: "agent", tier: "agent", status: "online" }]}
-        projects={["nexus", "lens"]}
-        activeProject="nexus"
-        onAssignProject={fn}
-      />,
-    );
-    const select = screen.getByRole("combobox", { name: /project/i });
-    fireEvent.change(select, { target: { value: "lens" } });
-    expect(fn).toHaveBeenCalledWith("ben", "lens");
-  });
-
   it("grants and revokes admin tier from the agents table", () => {
     const onGrantTier = vi.fn();
     const rows: AdminRow[] = [
-      { name: "ben", presence: "online", harness: "claude", role: "agent", tier: "agent", status: "online" },
-      { name: "ada", presence: "online", harness: "codex", role: "agent", tier: "admin", status: "online" },
+      { name: "ben", presence: "online", harness: "claude", tier: "agent", status: "online" },
+      { name: "ada", presence: "online", harness: "codex", tier: "admin", status: "online" },
     ];
 
     render(<AdminView agents={rows} onGrantTier={onGrantTier} />);

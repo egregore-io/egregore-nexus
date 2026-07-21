@@ -1,6 +1,6 @@
-// AdminView — agents · roles · launch (prototype `.admin`). Pane head + a bar
-// with a launch action over an agents table (name w/ presence, harness, role
-// tag, status, project, evict/kill). Presentational: the live agent rows are
+// AdminView — agents · launch (prototype `.admin`). Pane head + a bar
+// with a launch action over an agents table (name w/ presence, harness,
+// status, evict/kill). Presentational: the live agent rows are
 // fetched at the route (`useAdminAgents`) and passed in; with none, the table
 // shows an honest empty state. Tokens only.
 import { useState } from "react";
@@ -22,12 +22,6 @@ type AgentKind = (typeof AGENT_KINDS)[number];
 
 interface AdminViewProps {
   agents?: AdminRow[];
-  /** All live project names (for the per-row project selector). */
-  projects?: string[];
-  /** The currently active project (pre-selects the dropdown). */
-  activeProject?: string;
-  /** Called when a different project is chosen for an agent. */
-  onAssignProject?: (name: string, project: string) => void;
   /** Grant/revoke the durable admin tier for an agent. Backend enforces human-only access. */
   onGrantTier?: (name: string, tier: "agent" | "admin") => void;
   /** Called when the Launch modal is submitted. */
@@ -175,9 +169,6 @@ function LaunchModal({ open, onOpenChange, onLaunch }: LaunchModalProps) {
 
 export function AdminView({
   agents = [],
-  projects,
-  activeProject,
-  onAssignProject,
   onGrantTier,
   onLaunch,
   onEvict,
@@ -188,13 +179,11 @@ export function AdminView({
   // A destructive op awaiting confirmation: kill or delete (evict is non-destructive, no confirm).
   const [pending, setPending] = useState<{ name: string; op: "kill" | "delete" } | null>(null);
 
-  const showProjectCol = !!projects?.length;
   const headers = [
     "Name",
     "Harness",
-    "Role",
+    "Tier",
     "Status",
-    ...(showProjectCol ? ["Project"] : []),
     "",
   ];
 
@@ -207,7 +196,7 @@ export function AdminView({
 
   return (
     <section className="flex min-h-0 flex-1 flex-col">
-      <PaneHead title="Admin" glyph="⌥" topic="agents · roles · launch" />
+      <PaneHead title="Admin" glyph="⌥" topic="agents · launch" />
       <div className="mx-auto w-full max-w-[70rem] flex-1 overflow-y-auto px-6 py-[18px] lens-scroll">
         <div className="mb-3.5 flex items-center justify-between">
           <h2 className="text-[15px] font-semibold text-text-normal">Agents</h2>
@@ -230,7 +219,7 @@ export function AdminView({
             <p className="max-w-[44ch] text-[13px]">
               Launch an agent (or run{" "}
               <code className="font-mono text-[12px]">nexus launch</code>) and it appears here
-              with live presence, role, and current work.
+              with live presence and current work.
             </p>
           </div>
         ) : (
@@ -268,47 +257,13 @@ export function AdminView({
                     </td>
                     <td className={cn(cell, !last && "border-b border-border-subtle")}>{a.harness}</td>
                     <td className={cn(cell, !last && "border-b border-border-subtle")}>
-                      <span className="flex flex-wrap items-center gap-1.5">
-                        <span className="rounded-2 border border-border-subtle px-[7px] py-px text-[11px] text-text-read">
-                          {a.role}
+                      {adminTier ? (
+                        <span className="rounded-2 border border-[color:var(--lens-focus-halo)]/60 px-[7px] py-px text-[11px] font-semibold text-text-normal">
+                          admin tier
                         </span>
-                        {adminTier && (
-                          <span className="rounded-2 border border-[color:var(--lens-focus-halo)]/60 px-[7px] py-px text-[11px] font-semibold text-text-normal">
-                            admin tier
-                          </span>
-                        )}
-                      </span>
+                      ) : a.tier}
                     </td>
                     <td className={cn(cell, !last && "border-b border-border-subtle")}>{a.status}</td>
-                    {showProjectCol && (
-                      <td className={cn(cell, !last && "border-b border-border-subtle")}>
-                        <label className="sr-only" htmlFor={`project-select-${a.name}`}>
-                          Project
-                        </label>
-                        <select
-                          id={`project-select-${a.name}`}
-                          aria-label="Project"
-                          value={activeProject ?? ""}
-                          className={cn(
-                            "rounded-2 border border-border-subtle bg-bg-tertiary px-[7px] py-px",
-                            "text-[11px] text-text-read outline-none transition-colors",
-                            "hover:border-[color:var(--lens-focus-halo)] focus-visible:ring-2 focus-visible:ring-white/20",
-                          )}
-                          onChange={(e) => {
-                            const chosen = e.target.value;
-                            if (chosen && chosen !== activeProject) {
-                              onAssignProject?.(a.name, chosen);
-                            }
-                          }}
-                        >
-                          {projects!.map((p) => (
-                            <option key={p} value={p}>
-                              {p}
-                            </option>
-                          ))}
-                        </select>
-                      </td>
-                    )}
                     {/* Evict / Kill / Delete actions */}
                     <td
                       className={cn(

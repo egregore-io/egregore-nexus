@@ -8,7 +8,6 @@ import { useCreateThread } from "./projects";
 import {
   useAddThreadMember,
   useAgentOp,
-  useAssignProject,
   useGrantTier,
   useDisableSource,
   useEnableSource,
@@ -85,11 +84,6 @@ describe("UI REST parity", () => {
       await agentOp.result.current.mutateAsync({ name: "worker", op: "evict" });
     });
 
-    const assignProject = renderHook(() => useAssignProject(), { wrapper });
-    await act(async () => {
-      await assignProject.result.current.mutateAsync({ name: "worker", project: "nexus" });
-    });
-
     const grantTier = renderHook(() => useGrantTier(), { wrapper });
     await act(async () => {
       await grantTier.result.current.mutateAsync({ name: "worker", tier: "admin" });
@@ -135,7 +129,6 @@ describe("UI REST parity", () => {
       expect.objectContaining({ url: "/api/v1/threads", method: "POST" }),
       expect.objectContaining({ url: "/api/v1/agents", method: "POST" }),
       expect.objectContaining({ url: "/api/v1/agents/worker?evict=1", method: "DELETE" }),
-      expect.objectContaining({ url: "/api/v1/agents/worker/project", method: "POST" }),
       expect.objectContaining({
         url: "/api/v1/agents/worker/tier",
         method: "POST",

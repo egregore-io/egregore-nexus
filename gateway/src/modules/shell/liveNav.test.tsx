@@ -28,9 +28,9 @@ const THREADS = [
   { name: "design", members: ["ben"], lastAt: 2000 },
 ];
 const MEMBERS = [
-  { name: "ben", agent: "claude", role: "admin", presence: "online", currentWork: "gate" },
-  { name: "dylan", agent: "claude", role: "agent", presence: "busy" },
-  { name: "etan", agent: "other", kind: "human", role: "operator", presence: "online" },
+  { name: "ben", agent: "claude", presence: "online", currentWork: "gate" },
+  { name: "dylan", agent: "claude", presence: "busy" },
+  { name: "etan", agent: "other", kind: "human", presence: "online" },
 ];
 const PROJECTS = [
   { projectId: "p_nexus", name: "egregore-nexus" },
@@ -40,9 +40,7 @@ const WHOAMI = {
   name: "etan",
   sessionId: "s_etan",
   kind: "human",
-  role: "operator",
   tier: "admin",
-  project: "egregore-nexus",
   presence: "online",
 };
 
@@ -132,9 +130,9 @@ describe("shell — rendered from LIVE read-view data (no seed)", () => {
   it("renders the real 'me' footer from whoami", async () => {
     renderShell();
     const rail = await screen.findByRole("navigation", { name: "Primary" });
-    // The footer identity from whoami: "etan" (also a DM row) + "operator" role.
+    // The footer identity from whoami: "etan" (also a DM row) + typed tier.
     expect((await within(rail).findAllByText("etan")).length).toBeGreaterThan(0);
-    expect(within(rail).getAllByText("operator").length).toBeGreaterThan(0);
+    expect(within(rail).getAllByText("admin").length).toBeGreaterThan(0);
   });
 
   it("shares whoami as the shell and pane identity authority while ignoring stale browser identity", async () => {

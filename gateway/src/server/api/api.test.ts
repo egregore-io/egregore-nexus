@@ -1408,9 +1408,7 @@ describe("public API — reads go to the read-view (NOT the daemon)", () => {
       agent: {
         agentId: "a_ben",
         name: "ben",
-        project: "nexus",
         defaultHarness: "claude",
-        role: "admin",
         tier: "agent",
         disabled: false,
         activeRuntime: {
@@ -1716,7 +1714,7 @@ describe("public API — EXTENDED surface dispatches to command ingress", () => 
       req({
         method: "POST",
         path: "/api/v1/agents",
-        body: { kind: "claude", name: "worker-1", role: "agent" },
+        body: { kind: "claude", name: "worker-1" },
       }),
       deps(undefined, commands),
     );
@@ -1724,7 +1722,7 @@ describe("public API — EXTENDED surface dispatches to command ingress", () => 
     expect(commands.calls).toEqual([
       {
         kind: COMMAND_KINDS.adminSpawn,
-        req: { kind: "claude", name: "worker-1", role: "agent" },
+        req: { kind: "claude", name: "worker-1" },
         caller: API_CALLER,
       },
     ]);
@@ -1928,26 +1926,22 @@ describe("public API — EXTENDED surface dispatches to command ingress", () => 
     ]);
   });
 
-  it("POST /api/v1/agents/:id/project → admin.assignProject with path-param name + body project", async () => {
+  it.each(["project", "role"])(
+    "does not expose the Lens-owned agent %s affordance as a command route",
+    async (field) => {
     const commands = makeCommandSpy();
     const res = await handle(
       req({
         method: "POST",
-        path: "/api/v1/agents/ben/project",
-        body: { project: "lens" },
+        path: `/api/v1/agents/ben/${field}`,
+        body: { [field]: "lens" },
       }),
       deps(undefined, commands),
     );
-    expect(res.status).toBe(200);
-    expect(commands.calls).toEqual([
-      {
-        kind: COMMAND_KINDS.adminAssignProject,
-        req: { name: "ben", project: "lens" },
-        caller: API_CALLER,
-      },
-    ]);
-    expect(res.body).toMatchObject({ name: "ben", project: "lens" });
-  });
+    expect(res.status).toBe(404);
+    expect(commands.calls).toEqual([]);
+    },
+  );
 
   it("POST /api/v1/agents/:id/tier → admin.grantTier with path-param name + body tier", async () => {
     const commands = makeCommandSpy();
@@ -2043,14 +2037,6 @@ describe("public API — EXTENDED surface dispatches to command ingress", () => 
     await handle(
       req({
         method: "POST",
-        path: "/api/v1/agents/a_ben/project",
-        body: { project: "lens" },
-      }),
-      deps(undefined, commands),
-    );
-    await handle(
-      req({
-        method: "POST",
         path: "/api/v1/agents/a_ben/tier",
         body: { tier: Tier.Admin },
       }),
@@ -2085,11 +2071,6 @@ describe("public API — EXTENDED surface dispatches to command ingress", () => 
       {
         kind: COMMAND_KINDS.adminRemove,
         req: { name: "a_ben", agentId: "a_ben", kill: true },
-        caller: API_CALLER,
-      },
-      {
-        kind: COMMAND_KINDS.adminAssignProject,
-        req: { name: "a_ben", agentId: "a_ben", project: "lens" },
         caller: API_CALLER,
       },
       {

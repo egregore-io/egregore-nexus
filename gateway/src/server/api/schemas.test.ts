@@ -15,4 +15,12 @@ describe("spawnSchema harness ids", () => {
       expect(spawnSchema.safeParse({ kind }).success).toBe(false);
     },
   );
+
+  it.each(["project", "role"])(
+    "rejects the Lens-owned affordance field %s",
+    (field) => {
+      expect(spawnSchema.safeParse({ kind: "codex", [field]: "review" }).success)
+        .toBe(false);
+    },
+  );
 });

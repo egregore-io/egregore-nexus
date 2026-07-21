@@ -135,10 +135,7 @@ describe("canonical Gateway REST reads", () => {
       owner: expect.objectContaining({
         agentId: "a_codex",
         name: "codex",
-        project: "default",
         ownerName: "alex",
-        ownerProject: "default",
-        role: "lead",
         tier: "admin",
       }),
     });
@@ -348,6 +345,30 @@ describe("canonical Gateway REST reads", () => {
       expect.objectContaining({ runtimeId: "r_live", name: "ada", active: true }),
       expect.objectContaining({ runtimeId: "r_old", name: "ada", active: false }),
     ]);
+    db.close();
+  });
+
+  it("keeps project and display role inside metadata instead of agent.show", async () => {
+    const db = createClient({ url: ":memory:" });
+    await migrateGatewayStore(db);
+    await db.execute(`INSERT INTO identities VALUES
+      ('a_ada','ada','alex','reviewer','agent',
+       '{"project":"lens","lens":{"project":"workbench","role":"reviewer"}}',1)`);
+
+    const shown = await canonicalAgentShow(db, "a_ada");
+    expect(shown?.agent).toMatchObject({
+      agentId: "a_ada",
+      name: "ada",
+      disabled: false,
+    });
+    expect(shown?.agent).not.toHaveProperty("project");
+    expect(shown?.agent).not.toHaveProperty("role");
+    expect(await canonicalMetadata(db, "agent", "a_ada")).toMatchObject({
+      metadata: {
+        project: "lens",
+        lens: { project: "workbench", role: "reviewer" },
+      },
+    });
     db.close();
   });
 });

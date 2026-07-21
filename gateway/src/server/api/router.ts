@@ -55,7 +55,7 @@ type ProjectedRoute = Omit<Route, "handler">;
 // Breadth is cheap here: adding a daemon capability is one row + one thin
 // handler. Order matters only for overlap; patterns are
 // disjoint by design (static segments distinguish e.g. `/agents/:id` from
-// `/agents/:id/role`, longest-static wins via specificity sort below).
+// `/agents/:id/metadata`, longest-static wins via specificity sort below).
 const ROUTES: Route[] = [
   // health (unauthenticated probe)
   // Health exercises the canonical Gateway store. Legacy fixtures may still inject the old read
@@ -115,8 +115,6 @@ const ROUTES: Route[] = [
   { method: "POST", pattern: "/agents/:id/credentials", projection: { command: COMMAND_KINDS.agentCredentialCreate, status: 201 }, handler: h.postAgentCredential },
   { method: "DELETE", pattern: "/agents/:id/credentials/:credentialId", projection: { command: COMMAND_KINDS.agentCredentialRevoke }, handler: h.deleteAgentCredential },
   { method: "DELETE", pattern: "/agents/:id", projection: { commands: [COMMAND_KINDS.adminRemove, COMMAND_KINDS.adminEvict, COMMAND_KINDS.adminDelete] }, handler: h.deleteAgent },
-  { method: "POST", pattern: "/agents/:id/role", projection: { command: COMMAND_KINDS.adminAssignRole }, handler: h.postAgentRole },
-  { method: "POST", pattern: "/agents/:id/project", projection: { command: COMMAND_KINDS.adminAssignProject }, handler: h.postAgentProject },
   { method: "POST", pattern: "/agents/:id/tier", projection: { command: COMMAND_KINDS.adminGrantTier }, handler: h.postAgentTier },
   { method: "POST", pattern: "/agents/:id/access", projection: { command: COMMAND_KINDS.agentGrantAccess }, handler: h.postAgentAccess },
   { method: "DELETE", pattern: "/agents/:id/access/:principal", projection: { command: COMMAND_KINDS.agentRevokeAccess }, handler: h.deleteAgentAccess },

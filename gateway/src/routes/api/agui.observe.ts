@@ -153,17 +153,11 @@ function warmSession(
   ).catch(() => {});
 }
 
-function isLeadRole(role: string | undefined): boolean {
-  return role?.toLowerCase() === "lead";
-}
-
 function isProtectedAgentObserveTarget(agent: AgentOwnerRow): boolean {
   return (
     agent.tier === Tier.Admin ||
-    isLeadRole(agent.role) ||
     agent.sessionKind === Kind.Human ||
-    agent.sessionTier === Tier.Admin ||
-    isLeadRole(agent.sessionRole)
+    agent.sessionTier === Tier.Admin
   );
 }
 

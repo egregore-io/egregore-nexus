@@ -21,8 +21,6 @@ import {
   sendSchema,
   spawnSchema,
   agentCredentialCreateSchema,
-  assignRoleSchema,
-  assignProjectSchema,
   grantTierSchema,
   agentAccessGrantSchema,
   agentOwnerTransferSchema,
@@ -538,7 +536,7 @@ export const patchThreadMetadata: Handler = async (ctx) =>
 export const patchAgentMetadata: Handler = async (ctx) =>
   patchMetadata(ctx, "agent", ctx.params.id!);
 
-// --- agents (admin spawn/remove/assign-role) ---
+// --- agents (admin spawn/remove; presentation labels use opaque metadata) ---
 
 export const getAgent: Handler = async ({ deps, params, req }) => {
   const row = deps.canonicalDb ? await canonicalAgentShow(await deps.canonicalDb(), params.id!, {
@@ -634,30 +632,6 @@ export const deleteAgent: Handler = async ({ deps, params, req }) => {
       COMMAND_KINDS.adminRemove,
       { ...target, kill },
       req.caller,
-    ),
-  );
-};
-
-export const postAgentRole: Handler = async ({ deps, params, ...rest }) => {
-  const { role } = parseBody({ deps, params, ...rest }, assignRoleSchema);
-  const target = agentCommandTarget(params.id!);
-  return ok(
-    await requireCommands(deps).submit(
-      COMMAND_KINDS.adminAssignRole,
-      { ...target, role },
-      rest.req.caller,
-    ),
-  );
-};
-
-export const postAgentProject: Handler = async ({ deps, params, ...rest }) => {
-  const { project } = parseBody({ deps, params, ...rest }, assignProjectSchema);
-  const target = agentCommandTarget(params.id!);
-  return ok(
-    await requireCommands(deps).submit(
-      COMMAND_KINDS.adminAssignProject,
-      { ...target, project },
-      rest.req.caller,
     ),
   );
 };
