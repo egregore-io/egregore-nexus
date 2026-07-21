@@ -26,7 +26,9 @@ use nexus_contracts::{
     PromptRequest, Request, SessionId, Tier, JSONRPC_VERSION,
 };
 use nexus_store::command_kinds;
-use nexus_store::repos::{AgentRef, Agents, CommandIntentRow, CommandIntents, Inbox, Sessions};
+use nexus_store::repos::{
+    AgentRef, Agents, CommandIntentRow, CommandIntents, DaemonState, Inbox, Sessions,
+};
 use nexus_store::types::SessionRow;
 
 use crate::daemon::app::{AppState, PROMPT_DEFERRED_FOR_SHUTDOWN};
@@ -1236,6 +1238,9 @@ async fn resolve_command_caller(
         .await
         .map_err(|e| e.to_contract_error())?
     else {
+        if let Some(caller) = resolve_restart_validated_human_caller(state, row).await? {
+            return Ok(caller);
+        }
         return Err(unauthorized_command_caller(
             "command intent caller client key is not registered",
         ));
@@ -1291,6 +1296,59 @@ async fn resolve_command_caller(
         .map_err(|e| e.to_contract_error())?;
 
     Ok(caller)
+}
+
+async fn resolve_restart_validated_human_caller(
+    state: &AppState,
+    row: &CommandIntentRow,
+) -> Result<Option<Caller>, ContractError> {
+    let Some(validated_boot_epoch) = row
+        .caller_validated_boot_epoch
+        .as_deref()
+        .filter(|epoch| !epoch.is_empty())
+    else {
+        return Ok(None);
+    };
+    let current_boot_epoch = DaemonState::new(&state.store)
+        .boot_epoch()
+        .await
+        .map_err(|error| error.to_contract_error())?;
+    if current_boot_epoch
+        .as_deref()
+        .is_none_or(|epoch| epoch.is_empty() || epoch == validated_boot_epoch)
+    {
+        return Ok(None);
+    }
+    if row.caller_kind.as_deref() != Some("human")
+        || row.caller_agent_id.is_some()
+        || row.caller_client_key.as_deref().is_none_or(str::is_empty)
+        || row.caller_name.is_empty()
+        || row.project.is_empty()
+    {
+        return Ok(None);
+    }
+    let Some(session_id) = row
+        .caller_session_id
+        .as_deref()
+        .filter(|session_id| !session_id.is_empty())
+    else {
+        return Ok(None);
+    };
+    if row.caller_runtime_id.as_deref() != Some(session_id) {
+        return Ok(None);
+    }
+    let tier = match row.caller_tier.as_deref() {
+        Some("admin") => Tier::Admin,
+        Some("agent") => Tier::Agent,
+        _ => return Ok(None),
+    };
+    Ok(Some(Caller {
+        agent_id: None,
+        session: SessionId(session_id.to_string()),
+        name: row.caller_name.clone(),
+        project: row.project.clone(),
+        tier,
+    }))
 }
 
 fn is_local_operator(row: &CommandIntentRow) -> bool {

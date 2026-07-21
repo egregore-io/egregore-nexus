@@ -6,16 +6,17 @@ use tokio::sync::Notify;
 
 use nexus_common::{Config, HookGatewayMode};
 use nexus_contracts::{
-    AgentTurnExecutionPort, InterruptRequest, Kind, NexusBatch, NotifySendRequest, NotifyTarget,
-    PortResult, PromptRequest, RegisterRequest, RemoveRequest, RemoveResponse, SessionId,
-    SpawnRequest, SpawnResponse, SteerRequest, Tier,
+    AgentTurnExecutionPort, DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, InterruptRequest,
+    Kind, NexusBatch, NotifySendRequest, NotifyTarget, PortResult, PromptRequest, RegisterRequest,
+    RemoveRequest, RemoveResponse, SessionId, SpawnRequest, SpawnResponse, SteerRequest, Tier,
+    DAEMON_IPC_PROTOCOL_VERSION,
 };
 use nexus_store::command_kinds;
 use nexus_store::repos::{
-    Agents, CommandIntents, InboxSubscriptions, NewAgent, NewCommandIntent, NewInboxSubscription,
-    NewSession, Sessions,
+    Agents, CommandIntents, DaemonState, InboxSubscriptions, NewAgent, NewCommandIntent,
+    NewInboxSubscription, NewSession, Sessions,
 };
-use nexus_store::Store;
+use nexus_store::{DaemonStore, Store};
 
 use super::*;
 
@@ -1170,6 +1171,203 @@ async fn human_command_auth_never_resolves_its_display_name_as_an_agent() {
     assert_eq!(caller.session, human.session_id);
     assert_eq!(caller.name, "browser-user");
     assert_eq!(caller.agent_id, None);
+}
+
+#[tokio::test]
+async fn daemon_accepted_human_command_survives_only_a_real_boot_change() {
+    let state = test_state().await;
+    DaemonState::new(&state.store)
+        .set_boot_epoch("boot_accept", 1)
+        .await
+        .unwrap();
+    let human = state
+        .identity
+        .register(human_register("restart-human", "ck_restart_human"))
+        .await
+        .unwrap();
+    let response = crate::daemon::daemon_ipc::handle_request(
+        &state,
+        "boot-token",
+        DaemonIpcRequest {
+            version: DAEMON_IPC_PROTOCOL_VERSION,
+            token: "boot-token".into(),
+            request_id: "rpc-restart-human".into(),
+            caller: Some(DaemonIpcCaller {
+                name: Some("restart-human".into()),
+                project: "default".into(),
+                session_id: Some(human.session_id.0.clone()),
+                agent_id: None,
+                runtime_id: Some(human.session_id.0.clone()),
+                client_key: Some("ck_restart_human".into()),
+                kind: Kind::Human,
+                tier: Tier::Admin,
+            }),
+            call: DaemonIpcCall::Enqueue {
+                command_id: "cmd-restart-human".into(),
+                kind: command_kinds::thread::CREATE.into(),
+                params: serde_json::json!({"name": "restart-boundary", "members": []}),
+                idempotency_key: None,
+            },
+        },
+    )
+    .await;
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let row = CommandIntents::new(&state.store)
+        .get("cmd-restart-human")
+        .await
+        .unwrap()
+        .expect("daemon-accepted command");
+
+    state
+        .store
+        .conn
+        .execute(
+            "DELETE FROM sessions WHERE session_id = ?1",
+            libsql::params![human.session_id.0.clone()],
+        )
+        .await
+        .unwrap();
+    let same_boot = resolve_command_caller(&state, &row)
+        .await
+        .expect_err("same-boot session loss must remain unauthorized");
+    assert_eq!(same_boot.code, nexus_contracts::codes::UNAUTHORIZED);
+
+    DaemonState::new(&state.store)
+        .set_boot_epoch("boot_restarted", 2)
+        .await
+        .unwrap();
+    let caller = resolve_command_caller(&state, &row)
+        .await
+        .expect("daemon-validated human authority must survive a boot change");
+    assert_eq!(caller.name, "restart-human");
+    assert_eq!(caller.session, human.session_id);
+    assert_eq!(caller.agent_id, None);
+    assert_eq!(caller.project, "default");
+    assert_eq!(caller.tier, Tier::Admin);
+
+    let forged = NewCommandIntent {
+        command_id: "cmd-forged-restart-human".into(),
+        kind: command_kinds::thread::CREATE.into(),
+        project: "default".into(),
+        caller_name: "restart-human".into(),
+        caller_session_id: Some(human.session_id.0.clone()),
+        caller_agent_id: None,
+        caller_runtime_id: Some(human.session_id.0.clone()),
+        caller_client_key: Some("ck_restart_human".into()),
+        caller_kind: Some("human".into()),
+        caller_tier: Some("admin".into()),
+        idempotency_key: None,
+        request_json: serde_json::json!({"name": "forged-restart", "members": []}).to_string(),
+        created_at: 2,
+    };
+    CommandIntents::new(&state.store)
+        .insert_pending(forged)
+        .await
+        .unwrap();
+    let forged = CommandIntents::new(&state.store)
+        .get("cmd-forged-restart-human")
+        .await
+        .unwrap()
+        .unwrap();
+    let error = resolve_command_caller(&state, &forged)
+        .await
+        .expect_err("an unattested durable row must not gain restart authority");
+    assert_eq!(error.code, nexus_contracts::codes::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn split_daemon_restart_executes_the_pre_restart_validated_human_command() {
+    let path = std::env::temp_dir().join(format!(
+        "nexus-command-caller-restart-{}-{}.db",
+        std::process::id(),
+        now()
+    ));
+    let human_session;
+    {
+        let daemon = DaemonStore::open(path.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        let state = AppState::wire(Arc::new(daemon.compatibility_store()), &Config::default());
+        DaemonState::new(&state.store)
+            .set_boot_epoch("boot_split_accept", 1)
+            .await
+            .unwrap();
+        let human = state
+            .identity
+            .register(human_register(
+                "split-restart-human",
+                "ck_split_restart_human",
+            ))
+            .await
+            .unwrap();
+        human_session = human.session_id.0.clone();
+        let response = crate::daemon::daemon_ipc::handle_request(
+            &state,
+            "boot-token",
+            DaemonIpcRequest {
+                version: DAEMON_IPC_PROTOCOL_VERSION,
+                token: "boot-token".into(),
+                request_id: "rpc-split-restart-human".into(),
+                caller: Some(DaemonIpcCaller {
+                    name: Some("split-restart-human".into()),
+                    project: "default".into(),
+                    session_id: Some(human_session.clone()),
+                    agent_id: None,
+                    runtime_id: Some(human_session.clone()),
+                    client_key: Some("ck_split_restart_human".into()),
+                    kind: Kind::Human,
+                    tier: Tier::Admin,
+                }),
+                call: DaemonIpcCall::Enqueue {
+                    command_id: "cmd-split-restart-human".into(),
+                    kind: command_kinds::thread::CREATE.into(),
+                    params: serde_json::json!({
+                        "name": "split-restart-boundary",
+                        "members": []
+                    }),
+                    idempotency_key: None,
+                },
+            },
+        )
+        .await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let row = CommandIntents::new(&state.store)
+            .get("cmd-split-restart-human")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.caller_validated_boot_epoch.as_deref(),
+            Some("boot_split_accept")
+        );
+    }
+
+    {
+        let daemon = DaemonStore::open(path.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        let state = AppState::wire(Arc::new(daemon.compatibility_store()), &Config::default());
+        DaemonState::new(&state.store)
+            .set_boot_epoch("boot_split_restarted", 2)
+            .await
+            .unwrap();
+        assert!(Sessions::new(&state.store)
+            .find_by_session_id(&SessionId(human_session.clone()))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(process_next(&state).await.unwrap());
+        let row = CommandIntents::new(&state.store)
+            .get("cmd-split-restart-human")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done", "{:?}", row.error_json);
+    }
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(path.with_extension("db-shm"));
 }
 
 #[tokio::test]

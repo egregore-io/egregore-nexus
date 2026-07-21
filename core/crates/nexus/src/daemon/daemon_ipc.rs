@@ -12,7 +12,9 @@ use nexus_contracts::{
     DaemonIpcCaller, DaemonIpcRequest, DaemonIpcResponse, Kind, MessageId, Presence, Request,
     RpcError, SessionId, Tier, Whoami, DAEMON_IPC_PROTOCOL_VERSION, JSONRPC_VERSION,
 };
-use nexus_store::repos::{Agents, CommandIntents, CommandQueue, Inbox, NewCommandIntent, Sessions};
+use nexus_store::repos::{
+    Agents, CommandIntents, CommandQueue, DaemonState, Inbox, NewCommandIntent, Sessions,
+};
 use nexus_store::types::SessionRow;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -483,9 +485,21 @@ async fn handle_enqueue(
     params: Value,
     idempotency_key: Option<String>,
 ) -> DaemonIpcResponse {
-    let row = command_row(caller, command_id, kind, params, idempotency_key);
+    let (row, caller_validated_boot_epoch) =
+        match command_row_for_acceptance(state, caller, command_id, kind, params, idempotency_key)
+            .await
+        {
+            Ok(row) => row,
+            Err(error) => return store_failure(request_id, error),
+        };
     let commands = CommandIntents::new(&state.store);
-    let durable_command_id = match insert_before_shutdown_fence(state, row).await {
+    let durable_command_id = match insert_before_shutdown_fence(
+        state,
+        row,
+        caller_validated_boot_epoch.as_deref(),
+    )
+    .await
+    {
         Ok(command_id) => command_id,
         Err(error) => return store_failure(request_id, error),
     };
@@ -1276,6 +1290,15 @@ async fn resolve_registered_query_caller(
     state: &AppState,
     evidence: &DaemonIpcCaller,
 ) -> Result<Caller, ContractError> {
+    resolve_registered_query_caller_with_session(state, evidence)
+        .await
+        .map(|(caller, _)| caller)
+}
+
+async fn resolve_registered_query_caller_with_session(
+    state: &AppState,
+    evidence: &DaemonIpcCaller,
+) -> Result<(Caller, SessionRow), ContractError> {
     let client_key = evidence
         .client_key
         .as_deref()
@@ -1315,7 +1338,7 @@ async fn resolve_registered_query_caller(
         },
     };
     validate_query_caller(evidence, &session, &caller)?;
-    Ok(caller)
+    Ok((caller, session))
 }
 
 fn validate_query_caller(
@@ -1397,15 +1420,27 @@ async fn handle_command(
     params: Value,
     idempotency_key: Option<String>,
 ) -> DaemonIpcResponse {
-    let row = command_row(
+    let (row, caller_validated_boot_epoch) = match command_row_for_acceptance(
+        state,
         caller,
         command_id.clone(),
         kind.clone(),
         params,
         idempotency_key,
-    );
+    )
+    .await
+    {
+        Ok(row) => row,
+        Err(error) => return store_failure(request_id, error),
+    };
     let commands = CommandIntents::new(&state.store);
-    let durable_command_id = match insert_before_shutdown_fence(state, row).await {
+    let durable_command_id = match insert_before_shutdown_fence(
+        state,
+        row,
+        caller_validated_boot_epoch.as_deref(),
+    )
+    .await
+    {
         Ok(command_id) => command_id,
         Err(error) => return store_failure(request_id, error),
     };
@@ -1466,6 +1501,7 @@ async fn handle_command(
 async fn insert_before_shutdown_fence(
     state: &AppState,
     row: NewCommandIntent,
+    caller_validated_boot_epoch: Option<&str>,
 ) -> Result<String, ContractError> {
     let _ingress_guard = state.store.write_lock().lock_owned().await;
     if state.command_worker_is_shutting_down() {
@@ -1475,14 +1511,96 @@ async fn insert_before_shutdown_fence(
         });
     }
     let commands = CommandIntents::new(&state.store);
-    if row.kind == nexus_store::command_kinds::harness::PROMPT {
-        commands
-            .insert_pending_or_resume_bounded_session_prompt(row, MAX_PENDING_SESSION_PROMPTS)
-            .await
-    } else {
-        commands.insert_pending_or_resume(row).await
+    match (row.kind.as_str(), caller_validated_boot_epoch) {
+        (nexus_store::command_kinds::harness::PROMPT, Some(boot_epoch)) => {
+            commands
+                .insert_pending_or_resume_bounded_session_prompt_with_validated_caller(
+                    row,
+                    MAX_PENDING_SESSION_PROMPTS,
+                    boot_epoch,
+                )
+                .await
+        }
+        (nexus_store::command_kinds::harness::PROMPT, None) => {
+            commands
+                .insert_pending_or_resume_bounded_session_prompt(row, MAX_PENDING_SESSION_PROMPTS)
+                .await
+        }
+        (_, Some(boot_epoch)) => {
+            commands
+                .insert_pending_or_resume_with_validated_caller(row, boot_epoch)
+                .await
+        }
+        (_, None) => commands.insert_pending_or_resume(row).await,
     }
     .map_err(|error| error.to_contract_error())
+}
+
+async fn command_row_for_acceptance(
+    state: &AppState,
+    caller: Option<DaemonIpcCaller>,
+    command_id: String,
+    kind: String,
+    params: Value,
+    idempotency_key: Option<String>,
+) -> Result<(NewCommandIntent, Option<String>), ContractError> {
+    let Some(evidence) = caller else {
+        return Ok((
+            command_row(None, command_id, kind, params, idempotency_key),
+            None,
+        ));
+    };
+    if !command_requires_registered_caller(&kind)
+        || is_local_operator(&evidence)
+        || is_source_push_caller(&kind, &evidence)
+    {
+        return Ok((
+            command_row(Some(evidence), command_id, kind, params, idempotency_key),
+            None,
+        ));
+    }
+
+    let evidence_kind = evidence.kind;
+    let evidence_tier = evidence.tier;
+    let (caller, session) = resolve_registered_query_caller_with_session(state, &evidence).await?;
+    let boot_epoch = DaemonState::new(&state.store)
+        .boot_epoch()
+        .await
+        .map_err(|error| error.to_contract_error())?
+        .filter(|epoch| !epoch.is_empty())
+        .ok_or_else(|| ContractError {
+            code: codes::INTERNAL_ERROR,
+            message: "daemon boot epoch is unavailable at command acceptance".into(),
+        })?;
+    let canonical = DaemonIpcCaller {
+        name: Some(caller.name),
+        project: caller.project,
+        session_id: Some(caller.session.0.clone()),
+        agent_id: caller.agent_id.map(|agent_id| agent_id.0),
+        runtime_id: Some(caller.session.0),
+        client_key: session.client_key,
+        kind: evidence_kind,
+        tier: evidence_tier,
+    };
+    Ok((
+        command_row(Some(canonical), command_id, kind, params, idempotency_key),
+        Some(boot_epoch),
+    ))
+}
+
+fn command_requires_registered_caller(kind: &str) -> bool {
+    !matches!(
+        kind,
+        nexus_store::command_kinds::identity::REGISTER
+            | nexus_store::command_kinds::notification::NOTIFY
+    )
+}
+
+fn is_source_push_caller(kind: &str, caller: &DaemonIpcCaller) -> bool {
+    kind == nexus_store::command_kinds::source::PUSH
+        && caller.kind == Kind::Notification
+        && caller.tier == Tier::Agent
+        && caller.client_key.is_none()
 }
 
 fn command_row(

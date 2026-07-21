@@ -70,6 +70,7 @@ async fn fresh_store_creates_one_complete_named_baseline_and_reopens_idempotentl
             (1, "v0.1.0_baseline".into()),
             (2, "v0.1.5_message_hooks".into()),
             (3, "v0.1.5_delivery_timing".into()),
+            (4, "v0.1.5_caller_validation".into()),
         ]
     );
 }
@@ -120,6 +121,7 @@ async fn baseline_contains_current_identity_routing_and_delivery_columns() {
         ("producer_identities", "producer_id"),
         ("transcript_archive", "archive_offset"),
         ("reply_contexts", "recipient_key"),
+        ("command_intents", "caller_validated_boot_epoch"),
     ] {
         assert!(
             column_exists(&store, table, column).await,
@@ -145,6 +147,14 @@ async fn public_v010_baseline_upgrades_to_message_hook_schema_without_losing_row
         .await
         .unwrap();
     store.conn.execute_batch(PUBLIC_V010_SCHEMA).await.unwrap();
+    store
+        .conn
+        .execute(
+            "ALTER TABLE command_intents DROP COLUMN caller_validated_boot_epoch",
+            (),
+        )
+        .await
+        .unwrap();
     store
         .conn
         .execute(
@@ -175,12 +185,14 @@ async fn public_v010_baseline_upgrades_to_message_hook_schema_without_losing_row
             (1, "v0.1.0_baseline".into()),
             (2, "v0.1.5_message_hooks".into()),
             (3, "v0.1.5_delivery_timing".into()),
+            (4, "v0.1.5_caller_validation".into()),
         ]
     );
     assert!(column_exists(&store, "messages", "mention_json").await);
     assert!(view_column_exists(&store, "nexus_broadcast_ingress", "metadata_json").await);
     assert!(view_column_exists(&store, "nexus_broadcast_ingress", "mention_json").await);
     assert!(view_column_exists(&store, "nexus_broadcast_ingress", "delivery_timing").await);
+    assert!(column_exists(&store, "command_intents", "caller_validated_boot_epoch").await);
     assert_eq!(
         single_text(
             &store,
