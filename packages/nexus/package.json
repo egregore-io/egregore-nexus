@@ -1,6 +1,6 @@
 {
   "name": "@egregore/nexus",
-  "version": "0.1.5",
+  "version": "0.1.5-beta.1",
   "private": false,
   "license": "Apache-2.0",
   "description": "The complete Egregore Nexus CLI, transport daemon, Gateway, and WebUI.",
@@ -26,8 +26,8 @@
     "access": "public"
   },
   "dependencies": {
-    "@egregore/nexus-cli": "0.1.5",
-    "@egregore/nexus-gateway": "0.1.5"
+    "@egregore/nexus-cli": "0.1.5-beta.1",
+    "@egregore/nexus-gateway": "0.1.5-beta.1"
   },
   "repository": {
     "type": "git",
