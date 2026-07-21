@@ -931,10 +931,8 @@ if not isinstance(manifest.get("runId"), str) or not manifest["runId"].strip():
     raise SystemExit("packed candidate manifest runId is invalid")
 if manifest.get("mode") != "packed":
     raise SystemExit("Webconsole acceptance requires a packed candidate manifest")
-if set(manifest.get("sources", {})) != {
-    "nexus", "lens", "egregore", "pactree", "pactreePython", "pactreeFs",
-}:
-    raise SystemExit("packed candidate source ledger is incomplete")
+if set(manifest.get("sources", {})) != {"nexus"}:
+    raise SystemExit("packed candidate source ledger must contain only Nexus")
 if manifest.get("container", {}).get("limits") != {
     "cpus": 6, "memoryBytes": 8589934592, "pids": 1024,
 }:

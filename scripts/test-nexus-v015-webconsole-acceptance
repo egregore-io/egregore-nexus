@@ -793,9 +793,9 @@ artifact = lambda name: {
     "path": f"artifacts/{name}",
     "sha256": digest(root / "artifacts" / name),
 }
-sources = {}
-for index, name in enumerate(("nexus", "lens", "egregore", "pactree", "pactreePython", "pactreeFs"), 1):
-    sources[name] = {"revision": f"{index:x}" * 40, "dirty": False, "dirtyPaths": []}
+sources = {
+    "nexus": {"revision": "1" * 40, "dirty": False, "dirtyPaths": []},
+}
 manifest = {
     "schemaVersion": 1,
     "runId": "fixture",
