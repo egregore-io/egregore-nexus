@@ -2076,6 +2076,117 @@ class WsAcceptanceContracts(unittest.TestCase):
             body,
         )
 
+    def test_backpressure_cleanup_does_not_steer_an_already_finished_run(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        helper = module.get("ensure_run_terminal")
+        self.assertIsNotNone(
+            helper,
+            "the backpressure cleanup must observe the original run terminal before steering",
+        )
+
+        frames = [
+            {"event": {"type": "RUN_STARTED", "runId": "run-active"}},
+            {"event": {"type": "RUN_FINISHED", "runId": "run-active"}},
+        ]
+
+        class Lane:
+            def __init__(self) -> None:
+                self.frames = list(frames)
+                self.sent: list[dict[str, object]] = []
+                self.waits: list[tuple[int, str]] = []
+
+            async def send(self, frame: dict[str, object]) -> None:
+                self.sent.append(frame)
+
+            async def wait_for(
+                self,
+                predicate: object,
+                *,
+                after: int,
+                timeout: float,
+                label: str,
+            ) -> dict[str, object]:
+                del timeout
+                self.waits.append((after, label))
+                for frame in self.frames[after:]:
+                    if predicate(frame):
+                        return frame
+                raise module["AcceptanceFailure"](f"{label}: timed out")
+
+        lane = Lane()
+        terminal = asyncio.run(
+            helper(
+                {"session_event": lambda frame: frame["event"]},
+                lane,
+                run_id="run-active",
+                after=0,
+                client_message_id="cm-stop",
+                timeout=1,
+                label="backpressure active-turn",
+            )
+        )
+
+        self.assertIs(terminal, frames[1])
+        self.assertEqual(lane.sent, [])
+        self.assertEqual(lane.waits, [])
+
+    def test_backpressure_cleanup_accepts_terminal_racing_the_steer_response(self) -> None:
+        module = runpy.run_path(str(TARGET))
+        helper = module["ensure_run_terminal"]
+        frames = [
+            {"event": {"type": "RUN_STARTED", "runId": "run-active"}},
+        ]
+
+        class Lane:
+            def __init__(self) -> None:
+                self.frames = list(frames)
+                self.sent: list[dict[str, object]] = []
+
+            async def send(self, frame: dict[str, object]) -> None:
+                self.sent.append(frame)
+                self.frames.extend([
+                    {"event": {"type": "RUN_FINISHED", "runId": "run-active"}},
+                    {
+                        "t": "steer.err",
+                        "clientMessageId": "cm-stop",
+                        "status": 409,
+                        "error": "turn already terminal",
+                    },
+                ])
+
+            async def wait_for(
+                self,
+                predicate: object,
+                *,
+                after: int,
+                timeout: float,
+                label: str,
+            ) -> dict[str, object]:
+                del timeout
+                for frame in self.frames[after:]:
+                    if predicate(frame):
+                        return frame
+                raise module["AcceptanceFailure"](f"{label}: timed out")
+
+        lane = Lane()
+        try:
+            terminal = asyncio.run(
+                helper(
+                    {"session_event": lambda frame: frame.get("event", frame)},
+                    lane,
+                    run_id="run-active",
+                    after=0,
+                    client_message_id="cm-stop",
+                    timeout=1,
+                    label="race",
+                )
+            )
+        except module["AcceptanceFailure"] as error:
+            self.fail(f"the original terminal must win the steer-response race: {error}")
+
+        self.assertIs(terminal, lane.frames[1])
+        self.assertEqual(len(lane.sent), 1)
+
     def test_capacity_flood_isolates_the_slow_subscriber_from_control(self) -> None:
         source = TARGET.read_text(encoding="utf-8")
         body = source.split(

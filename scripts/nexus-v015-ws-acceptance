@@ -2878,6 +2878,60 @@ async def wait_correlated_assistant_reply(
     }
 
 
+async def ensure_run_terminal(
+    core: dict[str, Any],
+    lane: Any,
+    *,
+    run_id: str,
+    after: int,
+    client_message_id: str,
+    timeout: float,
+    label: str,
+    ack_timeout: float = 60,
+) -> dict[str, Any]:
+    session_event = core["session_event"]
+
+    def is_terminal(frame: dict[str, Any]) -> bool:
+        event = session_event(frame)
+        return event.get("type") == "RUN_FINISHED" and event.get("runId") == run_id
+
+    for frame in lane.frames[after:]:
+        if is_terminal(frame):
+            return frame
+
+    steer_start = len(lane.frames)
+    await lane.send({
+        "t": "steer",
+        "text": "Stop immediately and finish.",
+        "clientMessageId": client_message_id,
+    })
+    outcome = await lane.wait_for(
+        lambda frame: is_terminal(frame)
+        or (
+            frame.get("t") in {"steer.ack", "steer.err"}
+            and frame.get("clientMessageId") == client_message_id
+        ),
+        after=steer_start,
+        timeout=ack_timeout,
+        label=f"{label} interrupt response",
+    )
+    if is_terminal(outcome):
+        return outcome
+    for frame in lane.frames[after:]:
+        if is_terminal(frame):
+            return frame
+    if outcome.get("t") == "steer.err":
+        raise AcceptanceFailure(
+            f"{label} interrupt failed before the original run terminal: {outcome!r}"
+        )
+    return await lane.wait_for(
+        is_terminal,
+        after=after,
+        timeout=timeout,
+        label=f"{label} terminal",
+    )
+
+
 class BackendAcceptance:
     def __init__(
         self,
@@ -4456,6 +4510,11 @@ class BackendAcceptance:
             run_id = self.core["session_event"](started).get("runId")
             if not isinstance(run_id, str) or not run_id:
                 raise AcceptanceFailure("session backpressure run has no runId")
+            active_start_index = next(
+                index
+                for index in range(snapshot_start, len(lane.frames))
+                if lane.frames[index] is started
+            )
 
             # The capacity producer must not also be the deliberately slow
             # session subscriber. A fast session control socket proves that
@@ -4588,26 +4647,14 @@ class BackendAcceptance:
                 self.live_agents[1].session_id,
             )
 
-            steer_id = f"cm-bp-stop-{time.time_ns()}"
-            steer_start = len(lane.frames)
-            await lane.send({
-                "t": "steer",
-                "text": "Stop immediately and finish.",
-                "clientMessageId": steer_id,
-            })
-            await lane.wait_for(
-                lambda frame: frame.get("t") == "steer.ack"
-                and frame.get("clientMessageId") == steer_id,
-                after=steer_start,
-                timeout=60,
-                label="backpressure active-turn interrupt",
-            )
-            await lane.wait_for(
-                lambda frame: self.core["session_event"](frame).get("type") == "RUN_FINISHED"
-                and self.core["session_event"](frame).get("runId") == run_id,
-                after=steer_start,
+            await ensure_run_terminal(
+                self.core,
+                lane,
+                run_id=run_id,
+                after=active_start_index,
+                client_message_id=f"cm-bp-stop-{time.time_ns()}",
                 timeout=240,
-                label="backpressure active-turn terminal",
+                label="backpressure active-turn",
             )
 
             resume_path = path + "&" + urlencode({"after": resume_cursor})
