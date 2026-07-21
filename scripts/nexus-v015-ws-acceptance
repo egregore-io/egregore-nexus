@@ -24,6 +24,7 @@ from pathlib import PurePosixPath
 import re
 import runpy
 import shutil
+import socket as socket_module
 import stat
 import subprocess
 import sys
@@ -637,6 +638,29 @@ async def receive_queue_snapshot(
             continue
         require_queue_snapshot(frame, session_id)
         return frame
+
+
+def pause_websocket_reads(websocket: Any) -> Any:
+    """Stop the client transport from draining bytes during a slow-reader probe."""
+    transport = getattr(websocket, "transport", None)
+    if transport is None:
+        raise AcceptanceFailure("slow-reader websocket exposes no transport")
+    raw_socket = transport.get_extra_info("socket")
+    if raw_socket is None:
+        raise AcceptanceFailure("slow-reader websocket exposes no raw socket")
+    try:
+        raw_socket.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_RCVBUF, 4096)
+        transport.pause_reading()
+    except (AttributeError, OSError) as error:
+        raise AcceptanceFailure("slow-reader websocket transport cannot pause reads") from error
+    return transport
+
+
+def resume_websocket_reads(transport: Any) -> None:
+    try:
+        transport.resume_reading()
+    except (AttributeError, OSError) as error:
+        raise AcceptanceFailure("slow-reader websocket transport cannot resume reads") from error
 
 
 class ExactRosterPending(AcceptanceFailure):
@@ -4277,6 +4301,8 @@ class BackendAcceptance:
             "/events?view=agui"
         )
         slow: Any = None
+        slow_transport: Any = None
+        slow_reads_paused = False
         control: Any = None
         resumed: Any = None
 
@@ -4348,6 +4374,8 @@ class BackendAcceptance:
                 timeout=30,
                 label="isolated slow-reader queue snapshot",
             )
+            slow_transport = pause_websocket_reads(slow)
+            slow_reads_paused = True
             control = await open_raw("/api/agui/ws", 512)
 
             accepted: list[dict[str, Any]] = []
@@ -4421,6 +4449,8 @@ class BackendAcceptance:
                 raise AcceptanceFailure(
                     "capacity probe did not prove both queued acceptance and typed rejection"
                 )
+            resume_websocket_reads(slow_transport)
+            slow_reads_paused = False
             try:
                 await asyncio.wait_for(slow.wait_closed(), 30)
             except asyncio.TimeoutError as error:
@@ -4540,6 +4570,11 @@ class BackendAcceptance:
             }
         finally:
             await lane.close()
+            if slow_reads_paused and slow_transport is not None:
+                try:
+                    resume_websocket_reads(slow_transport)
+                except BaseException:
+                    pass
             for socket in (control, slow, resumed):
                 if socket is not None:
                     try:
