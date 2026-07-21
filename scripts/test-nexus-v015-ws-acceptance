@@ -2085,7 +2085,7 @@ class WsAcceptanceContracts(unittest.TestCase):
         lane_close = body.index("await lane.close()")
         slow_open = body.index("slow = await open_raw(path, 1)")
         control_open = body.index('control = await open_raw("/api/agui/ws", 512)')
-        flood_end = body.index("await asyncio.wait_for(slow.wait_closed(), 30)")
+        flood_end = body.index("await drain_websocket_until_closed(")
         flood = body[control_open:flood_end]
 
         self.assertLess(lane_close, slow_open)
@@ -2093,6 +2093,40 @@ class WsAcceptanceContracts(unittest.TestCase):
         self.assertIn("await control.send", flood)
         self.assertNotIn("await lane.send", flood)
         self.assertIn('self.http.request,\n                    "PATCH"', body)
+
+    def test_close_observation_drains_the_bounded_application_queue(self) -> None:
+        module = runpy.run_path(str(TARGET))
+
+        class Closed(Exception):
+            pass
+
+        class Socket:
+            def __init__(self) -> None:
+                self.close_code: int | None = None
+                self.recv_calls = 0
+                self.wait_closed_calls = 0
+
+            async def recv(self) -> str:
+                self.recv_calls += 1
+                if self.recv_calls == 1:
+                    return '{"t":"queue.snapshot"}'
+                self.close_code = 1013
+                raise Closed("retry later")
+
+            async def wait_closed(self) -> None:
+                self.wait_closed_calls += 1
+                if self.close_code is None:
+                    await asyncio.Future()
+
+        socket = Socket()
+        asyncio.run(module["drain_websocket_until_closed"](
+            socket,
+            timeout=1,
+            label="bounded close probe",
+        ))
+        self.assertEqual(socket.close_code, 1013)
+        self.assertEqual(socket.recv_calls, 2)
+        self.assertEqual(socket.wait_closed_calls, 1)
 
     def test_capacity_probe_pauses_the_real_transport_until_after_the_flood(self) -> None:
         module = runpy.run_path(str(TARGET))
@@ -2138,10 +2172,10 @@ class WsAcceptanceContracts(unittest.TestCase):
         pause = body.index("slow_transport = pause_websocket_reads(slow)")
         control_open = body.index('control = await open_raw("/api/agui/ws", 512)')
         resume = body.index("resume_websocket_reads(slow_transport)")
-        wait_closed = body.index("await asyncio.wait_for(slow.wait_closed(), 30)")
+        drain_closed = body.index("await drain_websocket_until_closed(")
         self.assertLess(pause, control_open)
         self.assertLess(control_open, resume)
-        self.assertLess(resume, wait_closed)
+        self.assertLess(resume, drain_closed)
 
     def test_exact_roster_rejects_stale_or_duplicate_rows(self) -> None:
         module = runpy.run_path(str(TARGET))

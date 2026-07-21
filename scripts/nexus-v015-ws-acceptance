@@ -663,6 +663,37 @@ def resume_websocket_reads(transport: Any) -> None:
         raise AcceptanceFailure("slow-reader websocket transport cannot resume reads") from error
 
 
+async def drain_websocket_until_closed(
+    websocket: Any,
+    *,
+    timeout: float,
+    label: str,
+) -> None:
+    """Consume queued application frames so a bounded client can observe the peer close."""
+    deadline = time.monotonic() + timeout
+    while getattr(websocket, "close_code", None) is None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AcceptanceFailure(f"{label}: timed out waiting for close")
+        try:
+            await asyncio.wait_for(websocket.recv(), remaining)
+        except asyncio.TimeoutError as error:
+            raise AcceptanceFailure(f"{label}: timed out waiting for close") from error
+        except Exception as error:
+            if getattr(websocket, "close_code", None) is None:
+                raise AcceptanceFailure(f"{label}: receive failed before close") from error
+            break
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise AcceptanceFailure(f"{label}: timed out waiting for close")
+    try:
+        await asyncio.wait_for(websocket.wait_closed(), remaining)
+    except asyncio.TimeoutError as error:
+        raise AcceptanceFailure(f"{label}: timed out waiting for close") from error
+    if getattr(websocket, "close_code", None) is None:
+        raise AcceptanceFailure(f"{label}: closed without a close code")
+
+
 class ExactRosterPending(AcceptanceFailure):
     """The exact stable roster exists but has not returned fully online yet."""
 
@@ -4451,12 +4482,11 @@ class BackendAcceptance:
                 )
             resume_websocket_reads(slow_transport)
             slow_reads_paused = False
-            try:
-                await asyncio.wait_for(slow.wait_closed(), 30)
-            except asyncio.TimeoutError as error:
-                raise AcceptanceFailure(
-                    "agent-session slow reader did not close with backpressure"
-                ) from error
+            await drain_websocket_until_closed(
+                slow,
+                timeout=30,
+                label="agent-session slow reader",
+            )
             code = slow.close_code or 0
             reason = slow.close_reason or ""
             resume_cursor = parse_session_backpressure(code, reason)
