@@ -52,6 +52,36 @@ async function makeCommandDb(): Promise<Client> {
 }
 
 describe("POST /api/conversation/steer", () => {
+  it("gives native steer acceptance longer than the generic daemon IPC deadline", async () => {
+    const calls: Array<{ kind: string; timeoutMs: number | undefined }> = [];
+    const res = await handleConversationSteerPost(
+      new Request("http://localhost/api/conversation/steer", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "ellie",
+          text: "redirect the active turn",
+          clientMessageId: "cm_steer_slow_acceptance",
+        }),
+      }),
+      {
+        env: { NEXUS_WEB_AUTH_MODE: "local" },
+        commandIngress: {
+          nexusHome: "/tmp/nexus-steer-timeout-contract",
+          daemonBootId: async () => "boot_steer_timeout_contract",
+          daemonCommand: async (kind, _request, _caller, options) => {
+            calls.push({ kind, timeoutMs: options.timeoutMs });
+            if (kind === "identity.register") return { sessionId: "s_local_operator" };
+            return { accepted: true, delivery: "steered", turnId: "turn_slow" };
+          },
+        },
+      },
+    );
+
+    expect(res.status).toBe(201);
+    expect(calls.find((call) => call.kind === "harness.steer")?.timeoutMs).toBe(30_000);
+  });
+
   it("waits for done and returns the native steer result with an idempotent command", async () => {
     const db = await makeCommandDb();
     const clock = [1_000, 1_000, 2_000];

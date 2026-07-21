@@ -25,6 +25,10 @@ import {
 
 // Stable Nexus application error for an active-turn operation that raced with completion.
 const ACTIVE_TURN_REQUIRED = -32006;
+// Interrupt-and-send adapters may need to settle the active provider turn before they can
+// confirm that the replacement input was accepted. Give that bounded control operation its
+// own deadline instead of reporting the generic 10-second IPC timeout just before completion.
+const STEER_COMMAND_TIMEOUT_MS = 30_000;
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -94,7 +98,10 @@ export async function handleConversationSteerPost(
         ...(body.clientMessageId ? { clientMessageId: body.clientMessageId } : {}),
       },
       identity,
-      deps.commandIngress,
+      {
+        ...deps.commandIngress,
+        timeoutMs: deps.commandIngress?.timeoutMs ?? STEER_COMMAND_TIMEOUT_MS,
+      },
       body.clientMessageId,
     );
     return json({ ok: true, result }, 201);
