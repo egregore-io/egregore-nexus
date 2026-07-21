@@ -640,6 +640,75 @@ async def receive_queue_snapshot(
         return frame
 
 
+async def receive_capacity_response(
+    socket: Any,
+    client_id: str,
+    session_id: str,
+    *,
+    timeout: float,
+    label: str,
+    require_projection: bool = True,
+) -> dict[str, Any]:
+    """Await one input result and, when accepted, its exact fast-lane queue projection."""
+    deadline = time.monotonic() + timeout
+    response: dict[str, Any] | None = None
+    projected_command_ids: set[str] = set()
+    while True:
+        if response is not None:
+            if response.get("t") == "input.err" or not require_projection:
+                return response
+            command_id = response.get("commandId")
+            if not isinstance(command_id, str) or not command_id:
+                return response
+            if command_id in projected_command_ids:
+                return response
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if response is not None:
+                raise AcceptanceFailure(
+                    f"{label}: accepted command was not projected before timeout"
+                )
+            raise AcceptanceFailure(f"{label}: timed out")
+        try:
+            raw = await asyncio.wait_for(socket.recv(), remaining)
+        except asyncio.TimeoutError as error:
+            if response is not None:
+                raise AcceptanceFailure(
+                    f"{label}: accepted command was not projected before timeout"
+                ) from error
+            raise AcceptanceFailure(f"{label}: timed out") from error
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        try:
+            frame = json.loads(str(raw))
+        except (TypeError, ValueError) as error:
+            raise AcceptanceFailure(f"{label}: emitted invalid JSON") from error
+        if not isinstance(frame, dict):
+            raise AcceptanceFailure(f"{label}: emitted a non-object frame")
+
+        if frame.get("t") == "queue.snapshot":
+            require_queue_snapshot(frame, session_id)
+            commands = frame.get("commands")
+            if not isinstance(commands, list) or any(
+                not isinstance(command, dict) for command in commands
+            ):
+                raise AcceptanceFailure(f"{label}: queue.snapshot commands are invalid")
+            for command in commands:
+                command_id = command.get("commandId")
+                if not isinstance(command_id, str) or not command_id:
+                    raise AcceptanceFailure(
+                        f"{label}: queue.snapshot command has no commandId"
+                    )
+                projected_command_ids.add(command_id)
+
+        if (
+            frame.get("clientMessageId") == client_id
+            and frame.get("t") in {"input.ack", "input.err"}
+        ):
+            response = frame
+
+
 def pause_websocket_reads(websocket: Any) -> Any:
     """Stop the client transport from draining bytes during a slow-reader probe."""
     transport = getattr(websocket, "transport", None)
@@ -4394,9 +4463,9 @@ class BackendAcceptance:
                 raise AcceptanceFailure("session backpressure run has no runId")
 
             # The capacity producer must not also be the deliberately slow
-            # session subscriber. A bare control socket receives only its
-            # input receipts while the raw session socket proves isolated
-            # outbound backpressure.
+            # session subscriber. A fast session control socket proves that
+            # bounded batches reached the canonical queue projection while
+            # the raw session socket proves isolated outbound backpressure.
             await lane.close()
             slow = await open_raw(path, 1)
             await receive_queue_snapshot(
@@ -4407,7 +4476,13 @@ class BackendAcceptance:
             )
             slow_transport = pause_websocket_reads(slow)
             slow_reads_paused = True
-            control = await open_raw("/api/agui/ws", 512)
+            control = await open_raw(path, 512)
+            await receive_queue_snapshot(
+                control,
+                self.live_agents[1].session_id,
+                timeout=30,
+                label="fast capacity-control queue snapshot",
+            )
 
             accepted: list[dict[str, Any]] = []
             rejected: list[dict[str, Any]] = []
@@ -4424,32 +4499,14 @@ class BackendAcceptance:
                     "text": f"{index:03d}:{payload}",
                     "clientMessageId": client_id,
                 }, separators=(",", ":")))
-                deadline = time.monotonic() + 30
-                while True:
-                    try:
-                        raw = await asyncio.wait_for(
-                            control.recv(),
-                            deadline - time.monotonic(),
-                        )
-                    except asyncio.TimeoutError as error:
-                        raise AcceptanceFailure(
-                            f"queue capacity response {index} timed out"
-                        ) from error
-                    try:
-                        result = json.loads(str(raw))
-                    except json.JSONDecodeError as error:
-                        raise AcceptanceFailure(
-                            f"queue capacity response {index} was not JSON"
-                        ) from error
-                    if not isinstance(result, dict):
-                        raise AcceptanceFailure(
-                            f"queue capacity response {index} was not an object"
-                        )
-                    if (
-                        result.get("clientMessageId") == client_id
-                        and result.get("t") in {"input.ack", "input.err"}
-                    ):
-                        break
+                result = await receive_capacity_response(
+                    control,
+                    client_id,
+                    self.live_agents[1].session_id,
+                    timeout=30,
+                    label=f"queue capacity response {index}",
+                    require_projection=(index + 1) % 4 == 0,
+                )
                 if result.get("t") == "input.ack":
                     revision = result.get("revision")
                     if (

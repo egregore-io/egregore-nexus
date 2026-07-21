@@ -2084,13 +2084,15 @@ class WsAcceptanceContracts(unittest.TestCase):
 
         lane_close = body.index("await lane.close()")
         slow_open = body.index("slow = await open_raw(path, 1)")
-        control_open = body.index('control = await open_raw("/api/agui/ws", 512)')
+        control_open = body.index("control = await open_raw(path, 512)")
         flood_end = body.index("await drain_websocket_until_closed(")
         flood = body[control_open:flood_end]
 
         self.assertLess(lane_close, slow_open)
         self.assertLess(slow_open, control_open)
         self.assertIn("await control.send", flood)
+        self.assertIn("await receive_capacity_response(", flood)
+        self.assertIn("require_projection=(index + 1) % 4 == 0", flood)
         self.assertNotIn("await lane.send", flood)
         self.assertIn('self.http.request,\n                    "PATCH"', body)
 
@@ -2127,6 +2129,49 @@ class WsAcceptanceContracts(unittest.TestCase):
         self.assertEqual(socket.close_code, 1013)
         self.assertEqual(socket.recv_calls, 2)
         self.assertEqual(socket.wait_closed_calls, 1)
+
+    def test_capacity_response_waits_for_exact_queue_projection(self) -> None:
+        module = runpy.run_path(str(TARGET))
+
+        class Socket:
+            def __init__(self) -> None:
+                self.frames = [
+                    {
+                        "t": "input.ack",
+                        "clientMessageId": "cm-exact",
+                        "commandId": "cmd-exact",
+                        "state": "queued",
+                        "revision": 1,
+                    },
+                    {
+                        "t": "queue.snapshot",
+                        "sessionId": "s-exact",
+                        "seq": 1,
+                        "commands": [{"commandId": "cmd-other"}],
+                    },
+                    {
+                        "t": "queue.snapshot",
+                        "sessionId": "s-exact",
+                        "seq": 2,
+                        "commands": [{"commandId": "cmd-exact"}],
+                    },
+                ]
+                self.recv_calls = 0
+
+            async def recv(self) -> str:
+                self.recv_calls += 1
+                return json.dumps(self.frames.pop(0))
+
+        socket = Socket()
+        result = asyncio.run(module["receive_capacity_response"](
+            socket,
+            "cm-exact",
+            "s-exact",
+            timeout=1,
+            label="capacity projection",
+        ))
+        self.assertEqual(result["commandId"], "cmd-exact")
+        self.assertEqual(socket.recv_calls, 3)
 
     def test_capacity_probe_pauses_the_real_transport_until_after_the_flood(self) -> None:
         module = runpy.run_path(str(TARGET))
@@ -2170,10 +2215,13 @@ class WsAcceptanceContracts(unittest.TestCase):
             "    async def agent_session_backpressure_and_queue_full", 1
         )[1].split("    async def run(self)", 1)[0]
         pause = body.index("slow_transport = pause_websocket_reads(slow)")
-        control_open = body.index('control = await open_raw("/api/agui/ws", 512)')
+        control_open = body.index("control = await open_raw(path, 512)")
+        control_snapshot = body.index('label="fast capacity-control queue snapshot"')
         resume = body.index("resume_websocket_reads(slow_transport)")
         drain_closed = body.index("await drain_websocket_until_closed(")
         self.assertLess(pause, control_open)
+        self.assertLess(control_open, control_snapshot)
+        self.assertLess(control_snapshot, resume)
         self.assertLess(control_open, resume)
         self.assertLess(resume, drain_closed)
 
