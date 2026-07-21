@@ -2205,7 +2205,12 @@ class WsAcceptanceContracts(unittest.TestCase):
         self.assertIs(held, transport)
         self.assertTrue(transport.paused)
         self.assertFalse(transport.resumed)
-        self.assertTrue(transport.raw.options)
+        self.assertEqual(
+            transport.raw.options,
+            [],
+            "the slow-reader probe must preserve the kernel receive window so the "
+            "typed close can drain after reads resume",
+        )
 
         module["resume_websocket_reads"](held)
         self.assertTrue(transport.resumed)

@@ -24,7 +24,6 @@ from pathlib import PurePosixPath
 import re
 import runpy
 import shutil
-import socket as socket_module
 import stat
 import subprocess
 import sys
@@ -710,15 +709,11 @@ async def receive_capacity_response(
 
 
 def pause_websocket_reads(websocket: Any) -> Any:
-    """Stop the client transport from draining bytes during a slow-reader probe."""
+    """Pause reads without shrinking the receive window needed to drain the typed close."""
     transport = getattr(websocket, "transport", None)
     if transport is None:
         raise AcceptanceFailure("slow-reader websocket exposes no transport")
-    raw_socket = transport.get_extra_info("socket")
-    if raw_socket is None:
-        raise AcceptanceFailure("slow-reader websocket exposes no raw socket")
     try:
-        raw_socket.setsockopt(socket_module.SOL_SOCKET, socket_module.SO_RCVBUF, 4096)
         transport.pause_reading()
     except (AttributeError, OSError) as error:
         raise AcceptanceFailure("slow-reader websocket transport cannot pause reads") from error
