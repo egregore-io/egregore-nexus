@@ -4150,9 +4150,12 @@ class BackendAcceptance:
         lanes = [self.soak.developer, self.human_dm, *self.soak.sessions.values()]
         if any(lane.reader is None or lane.reader.done() for lane in lanes):
             self.soak.ledger.failure["crashLoops"] += 1
-        rows = await asyncio.to_thread(self.core["identity_rows"], str(NEXUS_BIN))
+        rows = await wait_for_exact_roster(
+            self.core["identity_rows"],
+            str(NEXUS_BIN),
+            self.live_agents,
+        )
         self.core["check_identities"](rows, self.soak.agents, self.soak.ledger)
-        require_exact_roster(rows, self.live_agents)
 
     async def lane_isolation(self) -> dict[str, Any]:
         probe_ledger = self.core["Ledger"]()
