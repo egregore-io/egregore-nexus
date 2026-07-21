@@ -240,7 +240,9 @@ pub fn spawn_codex_forwarder_with_tool_observations(
                             &n.method,
                             &n.params,
                             &ev,
-                        ) {
+                        )
+                        .await
+                        {
                             flush_text_buffer(
                                 &session,
                                 events.as_ref(),
@@ -348,7 +350,8 @@ pub fn spawn_codex_forwarder_with_tool_observations(
                         continue;
                     }
                 }
-                if suppress_accepted_user_input_echo(&turn_tracker, &n.method, &n.params, &ev) {
+                if suppress_accepted_user_input_echo(&turn_tracker, &n.method, &n.params, &ev).await
+                {
                     continue;
                 }
 
@@ -541,10 +544,9 @@ async fn emit_accepted_if_turn_notification(
     tracker
         .emit_next_accepted_event_for_thread(thread_id, Some(turn_id))
         .await;
-    tracker.record_next_accepted_user_input_echo_for_thread(thread_id, turn_id);
 }
 
-fn suppress_accepted_user_input_echo(
+async fn suppress_accepted_user_input_echo(
     tracker: &CodexTurnTracker,
     method: &str,
     params: &Value,
@@ -570,5 +572,18 @@ fn suppress_accepted_user_input_echo(
     // accepted batch above the projection ceiling wait until the delivery timeout and then false-
     // dead-letter even though the full input is already present in Codex's rollout.
     let text = user_message_text(item);
-    !text.is_empty() && tracker.take_accepted_user_input_echo(thread_id, turn_id, &text)
+    if text.is_empty() {
+        return false;
+    }
+    if tracker.take_cancelled_user_input_echo(thread_id, turn_id, &text) {
+        return true;
+    }
+    if !tracker.take_accepted_user_input_echo(thread_id, turn_id, &text) {
+        return false;
+    }
+    tracker
+        .emit_native_user_input_accepted_event(thread_id, turn_id, &text)
+        .await;
+    tracker.observe_accepted_user_input_echo(thread_id, turn_id, &text);
+    true
 }

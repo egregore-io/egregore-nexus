@@ -148,6 +148,37 @@ async fn fresh_headed_codex_launch_persists_discovered_thread_in_resurrection_ca
     );
     let _path = EnvGuard::set("PATH", path);
     let _home = EnvGuard::set("HOME", &home);
+    let initial_prompt_script = serde_json::json!([
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "THREAD_ID",
+                "turnId": "t1",
+                "item": {
+                    "type": "userMessage",
+                    "id": "um1",
+                    "content": [{"type": "text", "text": "boot"}]
+                }
+            }
+        },
+        {
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "THREAD_ID",
+                "turnId": "t1",
+                "itemId": "am1",
+                "delta": "boot acknowledged"
+            }
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "THREAD_ID",
+                "turnId": "t1"
+            }
+        }
+    ]);
+    let _script = EnvGuard::set("FAKE_CODEX_SCRIPT", initial_prompt_script.to_string());
 
     let store_path = root.join("nexus.db");
     let daemon = DaemonStore::open(store_path.to_string_lossy().as_ref())

@@ -908,6 +908,117 @@ async fn observed_prompt_emits_initial_prompt_before_codex_stream_and_suppresses
 }
 
 #[tokio::test]
+async fn observed_prompt_requires_native_user_message_receipt_before_success() {
+    let dir = tempdir("observed-prompt-native-receipt");
+    let script = serde_json::to_string(&serde_json::json!([
+        {
+            "method": "turn/started",
+            "params": {
+                "threadId": "THREAD_ID",
+                "turn": {"id": "t1"}
+            }
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "THREAD_ID",
+                "turnId": "t1",
+                "item": {
+                    "type": "userMessage",
+                    "id": "um1",
+                    "content": [{"type": "text", "text": "must reach native context"}]
+                }
+            }
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "THREAD_ID",
+                "turn": {"id": "t1"}
+            }
+        }
+    ]))
+    .expect("script serializes");
+    let srv = CodexAppServer::start(SupervisorOpts {
+        codex_exe: FAKE_BIN.to_string(),
+        session_dir: dir.clone(),
+        codex_home: None,
+        model: None,
+        bus_mcp: None,
+        cwd: None,
+        env: vec![
+            ("FAKE_CODEX_SCRIPT".into(), script),
+            ("FAKE_CODEX_REPLY_BEFORE_NOTIFICATIONS".into(), "1".into()),
+            ("FAKE_CODEX_NOTIFICATION_DELAY_MS".into(), "400".into()),
+        ],
+    })
+    .await
+    .expect("fake app-server should start");
+
+    let client = Arc::new(
+        CodexAppServerClient::connect(srv.socket(), "nexus")
+            .await
+            .expect("nexus client should connect"),
+    );
+    let thread = client
+        .thread_start()
+        .await
+        .expect("thread_start should succeed");
+
+    let session = SessionId("s_codex_observed_prompt_native_receipt".into());
+    let transport = CodexAppServerTransport::new();
+    transport.bind(session.clone(), client.clone(), thread);
+    let sink = Arc::new(RecSink::default());
+    let forwarder = spawn_codex_forwarder(
+        session.clone(),
+        client,
+        sink.clone(),
+        Arc::new(AutoApprove),
+        transport.turn_tracker(),
+    );
+
+    let accepted_event = WsEvent::AgentUpdate {
+        session_id: session.clone(),
+        kind: AgentUpdateKind::UserInput,
+        data: serde_json::json!({
+            "text": "must reach native context",
+            "source": "session_prompt",
+            "clientMessageId": "cm-native-receipt",
+        }),
+    };
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(250),
+        transport.prompt_observed(
+            &session,
+            "must reach native context".to_string(),
+            sink.clone(),
+            accepted_event,
+        ),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "turn/start acknowledgement without item/completed userMessage must not complete an observed prompt"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        sink.0.lock().await.iter().all(|event| !matches!(
+            event,
+            WsEvent::AgentUpdate {
+                kind: AgentUpdateKind::UserInput,
+                ..
+            }
+        )),
+        "a native receipt arriving after prompt cancellation must not publish stale user input"
+    );
+
+    forwarder.abort();
+    srv.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn prompt_returns_after_acceptance_and_holds_boundary_until_turn_completion() {
     let dir = tempdir("prompt-accepted");
     let srv = CodexAppServer::start(SupervisorOpts {

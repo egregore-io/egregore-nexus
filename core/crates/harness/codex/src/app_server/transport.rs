@@ -33,10 +33,30 @@ use nexus_contracts::{
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::provider_limit::{classify_rpc_error, classify_turn_error};
-use super::turn_completion::CodexTurnTracker;
+use super::turn_completion::{CodexTurnTracker, QueuedAcceptedEvent, QueuedAcceptedUserInputEcho};
 use super::{CodexAppServerClient, CodexRpcError};
 
 const TURN_COMPLETION_TIMEOUT: Duration = Duration::from_secs(600);
+const PROMPT_INPUT_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct PromptAcceptanceCleanup {
+    tracker: CodexTurnTracker,
+    accepted_event: QueuedAcceptedEvent,
+    accepted_echo: QueuedAcceptedUserInputEcho,
+    text: String,
+    turn_id: Option<String>,
+}
+
+impl Drop for PromptAcceptanceCleanup {
+    fn drop(&mut self) {
+        self.tracker.cancel_accepted_event(&self.accepted_event);
+        self.tracker.tombstone_cancelled_user_input_echo(
+            &self.accepted_echo,
+            self.turn_id.as_deref(),
+            &self.text,
+        );
+    }
+}
 
 /// Delivers injected turns / operator prompts to a headed codex app-server session
 /// by calling `turn/start` on a dedicated inject client. Each session is bound with
@@ -273,12 +293,21 @@ impl CodexAppServerTransport {
         let turn_start_lock = self.turn_start_lock(recipient);
         let _turn_start_guard = turn_start_lock.lock().await;
         self.wait_for_prior_turn_boundary(&thread_id).await?;
-        let queued_event =
-            self.turn_tracker
-                .queue_accepted_event(&thread_id, events, accepted_event);
+        let queued_event = self.turn_tracker.queue_accepted_event_on_native_user_input(
+            &thread_id,
+            events,
+            accepted_event,
+        );
         let accepted_echo = self
             .turn_tracker
             .queue_accepted_user_input_echo(&thread_id, text.clone());
+        let mut acceptance_cleanup = PromptAcceptanceCleanup {
+            tracker: self.turn_tracker.clone(),
+            accepted_event: queued_event.clone(),
+            accepted_echo: accepted_echo.clone(),
+            text: text.clone(),
+            turn_id: None,
+        };
         let turn_id = match client.turn_start_id(&thread_id, &text).await {
             Ok(turn_id) => turn_id,
             Err(e) => {
@@ -291,14 +320,33 @@ impl CodexAppServerTransport {
                 });
             }
         };
+        let Some(turn_id) = turn_id else {
+            return Err(ContractError {
+                code: -32004,
+                message: "codex turn/start response missing native turn id".into(),
+            });
+        };
+        acceptance_cleanup.turn_id = Some(turn_id.clone());
         self.turn_tracker
-            .emit_accepted_event(&queued_event, turn_id.as_deref())
-            .await;
-        if let Some(turn_id) = turn_id {
-            self.turn_tracker
-                .record_turn_start_acceptance(&thread_id, &turn_id);
-            self.turn_tracker
-                .record_accepted_user_input_echo_for_queued(&accepted_echo, &turn_id);
+            .record_turn_start_acceptance(&thread_id, &turn_id);
+        self.turn_tracker
+            .record_accepted_user_input_echo_for_queued(&accepted_echo, &turn_id);
+        if let Err(error) = self
+            .turn_tracker
+            .wait_for_accepted_user_input_echo(
+                &thread_id,
+                &turn_id,
+                &text,
+                PROMPT_INPUT_RECEIPT_TIMEOUT,
+            )
+            .await
+        {
+            return Err(ContractError {
+                code: -32004,
+                message: format!(
+                    "timed out waiting for codex native prompt context receipt: {error}"
+                ),
+            });
         }
         Ok(())
     }

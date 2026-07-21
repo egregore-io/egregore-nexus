@@ -22,6 +22,8 @@
 //! turn notifications, and `FAKE_CODEX_NOTIFICATION_DELAY_MS=<ms>` delays that broadcast. Together
 //! they model the real app-server race where a `turn/start` request can return before the turn has
 //! completed.
+//! `FAKE_CODEX_RESUME_RESPONSE=<json>` overrides the `thread/resume` result so restart tests can
+//! model a persisted in-progress native turn.
 //!
 //! # Test probes
 //! If `FAKE_CODEX_CWD_PROBE` is set, the fake writes its process current directory to that path at
@@ -203,7 +205,14 @@ where
                         tx: out_tx.clone(),
                     });
                 }
-                let _ = out_tx.send(response_frame(&id, json!({})));
+                let resume_result = std::env::var("FAKE_CODEX_RESUME_RESPONSE")
+                    .ok()
+                    .map(|raw| {
+                        serde_json::from_str::<Value>(&raw)
+                            .expect("FAKE_CODEX_RESUME_RESPONSE: invalid JSON")
+                    })
+                    .unwrap_or_else(|| json!({}));
+                let _ = out_tx.send(response_frame(&id, resume_result));
             }
             "turn/start" => {
                 // Get the threadId from the request params.

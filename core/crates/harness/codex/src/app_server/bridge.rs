@@ -27,6 +27,7 @@ use nexus_common::RuntimeProcessIds;
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::EventSink;
 use nexus_store::Store;
+use serde_json::Value;
 
 use super::approvals::AutoApprove;
 use super::client::CodexAppServerClient;
@@ -394,7 +395,6 @@ async fn create_and_bind_thread(
         .thread_start_in(cwd.as_deref().and_then(Path::to_str))
         .await?;
 
-    transport.bind(session.clone(), client.clone(), thread_id.clone());
     if let Some(store) = &runtime_store {
         CodexRuntimeStateRepo::new(store)
             .set_thread(&session, &thread_id, None)
@@ -410,7 +410,7 @@ async fn create_and_bind_thread(
     }
     let forwarder = spawn_codex_forwarder_with_tool_observations(
         session.clone(),
-        client,
+        client.clone(),
         events,
         Arc::new(AutoApprove),
         transport.turn_tracker(),
@@ -428,6 +428,7 @@ async fn create_and_bind_thread(
         previous.abort();
     }
     handle.thread_id = Some(thread_id.clone());
+    transport.bind(session, client, thread_id.clone());
     Ok(thread_id)
 }
 
@@ -488,25 +489,37 @@ fn spawn_binding_task(
             cwd = resume_cwd.as_deref().unwrap_or(""),
             "codex bridge: resuming thread for transport bind"
         );
-        if let Err(e) = client
+        let resume = match client
             .thread_resume_in(&thread_id, resume_cwd.as_deref())
             .await
         {
-            tracing::warn!(
-                session = %discovery_session.0,
-                thread_id = %thread_id,
-                "codex bridge: thread_resume after discovery failed: {e}"
-            );
-            return;
+            Ok(resume) => resume,
+            Err(e) => {
+                tracing::warn!(
+                    session = %discovery_session.0,
+                    thread_id = %thread_id,
+                    "codex bridge: thread_resume after discovery failed: {e}"
+                );
+                return;
+            }
+        };
+        let resumed_active_turn = match resumed_active_turn_id(&resume, &thread_id) {
+            Ok(turn_id) => turn_id,
+            Err(error) => {
+                tracing::warn!(
+                    session = %discovery_session.0,
+                    thread_id = %thread_id,
+                    error = %error,
+                    "codex bridge: refusing ambiguous thread_resume turn authority"
+                );
+                return;
+            }
+        };
+        if let Some(turn_id) = resumed_active_turn.as_deref() {
+            transport
+                .turn_tracker()
+                .observe_active_turn(&thread_id, turn_id);
         }
-
-        transport.bind(discovery_session.clone(), client.clone(), thread_id.clone());
-        tracing::info!(
-            target: "nexus::codex_bridge",
-            session = %discovery_session,
-            thread_id = %thread_id,
-            "codex bridge: transport bound"
-        );
         if let Some(store) = &runtime_store {
             if let Err(e) = CodexRuntimeStateRepo::new(store)
                 .set_thread(&discovery_session, &thread_id, rollout_path.clone())
@@ -525,7 +538,7 @@ fn spawn_binding_task(
         }
         let forwarder = spawn_codex_forwarder_with_tool_observations(
             discovery_session.clone(),
-            client,
+            client.clone(),
             events,
             Arc::new(AutoApprove),
             transport.turn_tracker(),
@@ -538,12 +551,65 @@ fn spawn_binding_task(
                 old_forwarder.abort();
             }
             handle.forwarder = Some(forwarder);
-            handle.thread_id = Some(thread_id);
+            handle.thread_id = Some(thread_id.clone());
+            // Binding is the final readiness publication. Once routing can observe this session,
+            // the resume snapshot has seeded any in-progress turn and the sole forwarder is owned
+            // by the live handle, so a recovered prompt cannot race the old native boundary.
+            transport.bind(discovery_session.clone(), client, thread_id.clone());
+            tracing::info!(
+                target: "nexus::codex_bridge",
+                session = %discovery_session,
+                thread_id = %thread_id,
+                resumed_active_turn = resumed_active_turn.as_deref().unwrap_or(""),
+                "codex bridge: transport bound"
+            );
         } else {
-            transport.unbind(&discovery_session);
             forwarder.abort();
         }
     });
+}
+
+fn resumed_active_turn_id(
+    resume: &Value,
+    expected_thread_id: &str,
+) -> Result<Option<String>, CodexRpcError> {
+    let Some(thread) = resume.get("thread") else {
+        // Older/fake app-servers returned an empty object. They provide no resume authority, but
+        // they also cannot claim an active turn.
+        return Ok(None);
+    };
+    let actual_thread_id = thread
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CodexRpcError::Decode("thread/resume response missing thread.id".into()))?;
+    if actual_thread_id != expected_thread_id {
+        return Err(CodexRpcError::Decode(format!(
+            "thread/resume returned thread {actual_thread_id}, expected {expected_thread_id}"
+        )));
+    }
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CodexRpcError::Decode("thread/resume response missing thread.turns".into())
+        })?;
+    let mut active = Vec::new();
+    for turn in turns {
+        if turn.get("status").and_then(Value::as_str) != Some("inProgress") {
+            continue;
+        }
+        active.push(turn.get("id").and_then(Value::as_str).ok_or_else(|| {
+            CodexRpcError::Decode("thread/resume in-progress turn missing id".into())
+        })?);
+    }
+    match active.as_slice() {
+        [] => Ok(None),
+        [turn_id] => Ok(Some((*turn_id).to_string())),
+        _ => Err(CodexRpcError::Decode(format!(
+            "thread/resume returned {} in-progress turns for {expected_thread_id}",
+            active.len()
+        ))),
+    }
 }
 
 fn codex_home_with_thread(
