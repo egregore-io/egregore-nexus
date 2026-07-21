@@ -500,6 +500,44 @@ async fn stale_claim_cannot_complete_after_reclaim() {
 }
 
 #[tokio::test]
+async fn shutdown_retry_releases_only_the_current_unfinished_claim() {
+    let store = migrated().await;
+    let repo = CommandIntents::new(&store);
+    let mut prompt = pending("cmd_shutdown_retry", 1);
+    prompt.kind = command_kinds::harness::PROMPT.into();
+    repo.insert_pending(prompt).await.unwrap();
+
+    let claimed = repo.claim_next(100, 1_000).await.unwrap().unwrap();
+    let claimed_at = claimed.claimed_at.expect("claim timestamp");
+    assert!(repo
+        .mark_started_for_claim("cmd_shutdown_retry", claimed_at, 101)
+        .await
+        .unwrap());
+    assert!(repo
+        .release_claim_for_shutdown_retry("cmd_shutdown_retry", claimed_at)
+        .await
+        .unwrap());
+
+    let released = repo.get("cmd_shutdown_retry").await.unwrap().unwrap();
+    assert_eq!(released.status, "pending");
+    assert_eq!(released.claimed_at, None);
+    assert_eq!(released.started_at, None);
+    assert_eq!(released.lease_until, None);
+    assert_eq!(released.attempts, 1);
+
+    let reclaimed = repo.claim_next(200, 1_000).await.unwrap().unwrap();
+    assert_eq!(reclaimed.claimed_at, Some(200));
+    assert!(!repo
+        .release_claim_for_shutdown_retry("cmd_shutdown_retry", claimed_at)
+        .await
+        .unwrap());
+    let still_reclaimed = repo.get("cmd_shutdown_retry").await.unwrap().unwrap();
+    assert_eq!(still_reclaimed.status, "claimed");
+    assert_eq!(still_reclaimed.claimed_at, Some(200));
+    assert_eq!(still_reclaimed.attempts, 2);
+}
+
+#[tokio::test]
 async fn stale_heartbeat_inbox_consume_claims_are_expired() {
     let store = migrated().await;
     store

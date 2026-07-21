@@ -849,6 +849,34 @@ impl<'a> CommandIntents<'a> {
         Ok(updated > 0)
     }
 
+    /// Return one current, unfinished claim to the durable pending queue when daemon shutdown
+    /// wins before the command crosses its external acceptance boundary.
+    ///
+    /// The claim timestamp is the ownership token: a stale worker cannot release a row that a
+    /// newer daemon has already reclaimed. Keep `attempts` unchanged so the durable row records
+    /// that this daemon owned the claim even though it never reached the external provider.
+    pub async fn release_claim_for_shutdown_retry(
+        &self,
+        command_id: &str,
+        claimed_at: i64,
+    ) -> Result<bool, NexusError> {
+        let updated = self
+            .store
+            .identity_conn()
+            .execute(
+                "UPDATE command_intents SET status = 'pending', revision = revision + 1, \
+                 claimed_at = NULL, started_at = NULL, lease_until = NULL \
+                 WHERE command_id = ?1 AND status = 'claimed' AND claimed_at = ?2",
+                params![command_id, claimed_at],
+            )
+            .await
+            .map_err(store_err)?;
+        if updated > 0 {
+            self.store.events().command_intent_inserted().signal();
+        }
+        Ok(updated > 0)
+    }
+
     /// Atomically promote one still-pending boundary prompt into the redirect lane.
     ///
     /// The same row, command id, client idempotency key, and request JSON survive. A concurrent

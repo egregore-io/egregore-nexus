@@ -29,7 +29,7 @@ use nexus_store::command_kinds;
 use nexus_store::repos::{AgentRef, Agents, CommandIntentRow, CommandIntents, Inbox, Sessions};
 use nexus_store::types::SessionRow;
 
-use crate::daemon::app::AppState;
+use crate::daemon::app::{AppState, PROMPT_DEFERRED_FOR_SHUTDOWN};
 use crate::daemon::retention_policy::{maybe_reap_operational_tables, RetentionPolicyState};
 use crate::daemon::routing;
 use crate::local_operator::LOCAL_OPERATOR_SESSION_ID;
@@ -315,18 +315,7 @@ async fn run_harness_prompt_worker_loop(state: AppState) {
             Ok(None) if state.command_worker_is_shutting_down() => {
                 actors.wait_for_shutdown().await;
                 wait_for_active_turns(&state).await;
-                match lane_has_unsettled_commands(&state, WorkerLane::HarnessPrompt).await {
-                    Ok(false) => return,
-                    Ok(true) => continue,
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            lane = ?WorkerLane::HarnessPrompt,
-                            "failed to verify prompt lane drain during shutdown"
-                        );
-                        wait_for_command_intent_or_poll(&state, idle_epoch).await;
-                    }
-                }
+                return;
             }
             Ok(None) => wait_for_command_intent_or_poll(&state, idle_epoch).await,
             Err(err) => {
@@ -583,6 +572,9 @@ async fn claim_next_harness_prompt(
     state: &AppState,
     actor_sessions: &[String],
 ) -> Result<Option<CommandIntentRow>, NexusError> {
+    if state.command_worker_is_shutting_down() {
+        return Ok(None);
+    }
     let mut busy_sessions = state
         .agent
         .active_turn_sessions()
@@ -610,6 +602,9 @@ async fn claim_next_harness_prompt_for_session(
     session_id: &str,
 ) -> Result<Option<CommandIntentRow>, NexusError> {
     let _claim_guard = state.store.write_lock().lock_owned().await;
+    if state.command_worker_is_shutting_down() {
+        return Ok(None);
+    }
     CommandIntents::new(&state.store)
         .claim_next_ready_harness_prompt_for_session(now(), HARNESS_PROMPT_LEASE_MS, session_id)
         .await
@@ -655,6 +650,24 @@ async fn complete_claimed_row(
             }
         }
         Err(error) => {
+            if matches!(lane, WorkerLane::HarnessPrompt)
+                && error.code == codes::INTERNAL_ERROR
+                && error.message == PROMPT_DEFERRED_FOR_SHUTDOWN
+            {
+                if let Some(claimed_at) = claimed_at {
+                    if !repo
+                        .release_claim_for_shutdown_retry(&command_id, claimed_at)
+                        .await?
+                    {
+                        tracing::warn!(
+                            command_id = %command_id,
+                            claimed_at,
+                            "skipped shutdown retry release because its claim was no longer current"
+                        );
+                    }
+                    return Ok(());
+                }
+            }
             if let Some(claimed_at) = claimed_at {
                 if !repo
                     .mark_error_for_claim(&command_id, claimed_at, &json_string(&error)?, now())

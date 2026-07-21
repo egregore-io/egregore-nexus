@@ -595,7 +595,7 @@ async fn harness_prompt_claim_lease_outlives_execution_timeout() {
 }
 
 #[tokio::test]
-async fn graceful_shutdown_drains_the_active_prompt_and_pre_fence_backlog() {
+async fn graceful_shutdown_drains_the_active_prompt_and_defers_pre_fence_backlog() {
     let exec = Arc::new(PromptDispatchBarrier::default());
     let state = test_state_with_turn_exec(exec.clone()).await;
     let operator = state
@@ -636,27 +636,24 @@ async fn graceful_shutdown_drains_the_active_prompt_and_pre_fence_backlog() {
         .expect("the active prompt must enter the transport boundary");
 
     begin_shutdown(&state).await;
-
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(
         !worker.is_finished(),
         "shutdown must wait for the active dispatch boundary"
     );
     exec.release.notify_one();
-    tokio::time::timeout(Duration::from_secs(1), exec.entered.notified())
-        .await
-        .expect("the pre-fence prompt must drain before shutdown finishes");
-    exec.release.notify_one();
     tokio::time::timeout(Duration::from_secs(1), worker)
         .await
-        .expect("the command worker should drain after the active prompt settles")
+        .expect("the command worker should stop after the active prompt settles")
         .expect("the command worker must not panic during shutdown");
 
     let active = repo.get("cmd_shutdown_active").await.unwrap().unwrap();
     assert_eq!(active.status, "done");
     let pre_fence = repo.get("cmd_shutdown_pre_fence").await.unwrap().unwrap();
-    assert_eq!(pre_fence.status, "done");
-    assert_eq!(exec.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(pre_fence.status, "pending");
+    assert_eq!(pre_fence.claimed_at, None);
+    assert_eq!(pre_fence.started_at, None);
+    assert_eq!(exec.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -707,7 +704,56 @@ async fn graceful_shutdown_waits_for_a_fire_and_forget_provider_turn() {
 }
 
 #[tokio::test]
-async fn graceful_shutdown_finishes_a_prompt_claimed_before_its_actor_starts() {
+async fn prompt_acceptance_permit_linearizes_before_shutdown_fence() {
+    let exec = Arc::new(PromptDispatchBarrier::default());
+    let state = test_state_with_turn_exec(exec.clone()).await;
+    let operator = state
+        .identity
+        .register(human_register("Alex Morgan", "ck_prompt_fence_operator"))
+        .await
+        .unwrap();
+    state
+        .identity
+        .register(human_register("Target Human", "ck_prompt_fence_target"))
+        .await
+        .unwrap();
+    CommandIntents::new(&state.store)
+        .insert_pending(prompt_intent(
+            "cmd_prompt_fence",
+            &operator,
+            "Alex Morgan",
+            "ck_prompt_fence_operator",
+            "accept before shutdown",
+            1,
+        ))
+        .await
+        .unwrap();
+
+    let worker_state = state.clone();
+    let worker = tokio::spawn(async move {
+        process_next_for_lane(&worker_state, WorkerLane::HarnessPrompt).await
+    });
+    tokio::time::timeout(Duration::from_secs(1), exec.entered.notified())
+        .await
+        .expect("prompt must enter its external acceptance boundary");
+
+    begin_shutdown(&state).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !worker.is_finished(),
+        "a prompt permitted before shutdown must retain its accepted-boundary task"
+    );
+
+    exec.release.notify_one();
+    assert!(tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("prompt worker should finish")
+        .expect("prompt worker task must not panic")
+        .unwrap());
+}
+
+#[tokio::test]
+async fn graceful_shutdown_defers_a_prompt_claimed_before_its_actor_starts() {
     let exec = Arc::new(PromptDispatchBarrier::default());
     let state = test_state_with_turn_exec(exec.clone()).await;
     let operator = state
@@ -737,12 +783,13 @@ async fn graceful_shutdown_finishes_a_prompt_claimed_before_its_actor_starts() {
         .expect("the prompt should be owned before shutdown starts");
 
     begin_shutdown(&state).await;
-    exec.release.notify_one();
     run_harness_prompt_session_actor(state.clone(), target.session_id.0, row).await;
 
     let row = repo.get("cmd_shutdown_claimed").await.unwrap().unwrap();
-    assert_eq!(row.status, "done");
-    assert_eq!(exec.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.claimed_at, None);
+    assert_eq!(row.started_at, None);
+    assert_eq!(exec.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
