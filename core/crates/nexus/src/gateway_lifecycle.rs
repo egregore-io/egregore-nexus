@@ -13,10 +13,15 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::daemon::lifecycle::{self, DaemonPaths};
+use crate::lifecycle_process::{self, BoundedProcessError};
 
 pub const GATEWAY_INSTALL_HINT: &str = "Install it with npm install -g @egregore/nexus-gateway";
 const GATEWAY_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const GATEWAY_HEALTH_IO_TIMEOUT: Duration = Duration::from_secs(3);
+const GATEWAY_MIGRATION_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(windows)]
+const OS_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
+const HELPER_OUTPUT_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayInstallation {
@@ -287,16 +292,7 @@ impl GatewayBackend for SystemGatewayBackend {
             .arg("--migrate-only")
             .env("NEXUS_HOME", &self.paths.home)
             .stdin(Stdio::null());
-        let output = command.output()?;
-        if output.status.success() {
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(GatewayLifecycleError::lifecycle(if stderr.is_empty() {
-            format!("Gateway store migration failed with {}", output.status)
-        } else {
-            format!("Gateway store migration failed: {stderr}")
-        }))
+        run_gateway_store_migration(&mut command, GATEWAY_MIGRATION_TIMEOUT)
     }
 
     fn status(&self) -> GatewayRuntimeStatus {
@@ -331,8 +327,9 @@ impl GatewayBackend for SystemGatewayBackend {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));
-        detach_command(&mut command);
-        command.spawn().map(|_| ()).map_err(Into::into)
+        lifecycle_process::spawn_detached(&mut command)
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
     async fn wait_ready(&self) -> Result<GatewayRuntimeStatus, GatewayLifecycleError> {
@@ -477,6 +474,29 @@ fn gateway_command(installation: &GatewayInstallation) -> Command {
     }
 }
 
+fn run_gateway_store_migration(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<(), GatewayLifecycleError> {
+    match lifecycle_process::run_bounded(
+        command,
+        "Gateway store migration",
+        timeout,
+        HELPER_OUTPUT_LIMIT,
+    ) {
+        Ok(_) => Ok(()),
+        Err(BoundedProcessError::Exit { status, stderr, .. }) => {
+            let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
+            Err(GatewayLifecycleError::lifecycle(if stderr.is_empty() {
+                format!("Gateway store migration failed with {status}")
+            } else {
+                format!("Gateway store migration failed: {stderr}")
+            }))
+        }
+        Err(error) => Err(GatewayLifecycleError::lifecycle(error.to_string())),
+    }
+}
+
 fn health_ok(base_url: &str) -> bool {
     let Some(authority) = base_url.strip_prefix("http://") else {
         return false;
@@ -519,52 +539,51 @@ fn process_alive(pid: u32) -> bool {
     }
     #[cfg(unix)]
     {
-        Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(windows)]
     {
         let filter = format!("PID eq {pid}");
-        Command::new("tasklist.exe")
-            .args(["/FI", filter.as_str()])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .map(|output| {
-                output.status.success()
-                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
-            })
-            .unwrap_or(false)
+        let mut command = Command::new("tasklist.exe");
+        command.args(["/FI", filter.as_str()]);
+        lifecycle_process::run_bounded(
+            &mut command,
+            "Gateway process liveness probe",
+            OS_HELPER_TIMEOUT,
+            HELPER_OUTPUT_LIMIT,
+        )
+        .map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
+        .unwrap_or(false)
     }
 }
 
 fn signal_process(pid: u32, force: bool) -> io::Result<()> {
     #[cfg(unix)]
-    let status = Command::new("kill")
-        .arg(if force { "-KILL" } else { "-TERM" })
-        .arg(pid.to_string())
-        .status()?;
+    {
+        let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+        let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
+        return if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        };
+    }
     #[cfg(windows)]
-    let status = {
+    {
         let mut command = Command::new("taskkill.exe");
         command.arg("/PID").arg(pid.to_string()).arg("/T");
         if force {
             command.arg("/F");
         }
-        command.status()?
-    };
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "failed to terminate gateway pid {pid}"
-        )))
+        return lifecycle_process::run_bounded(
+            &mut command,
+            "Gateway process termination",
+            OS_HELPER_TIMEOUT,
+            HELPER_OUTPUT_LIMIT,
+        )
+        .map(|_| ())
+        .map_err(io::Error::other);
     }
 }
 
@@ -577,26 +596,6 @@ fn wait_pid_down(pid: u32, timeout: Duration) -> bool {
         thread::sleep(Duration::from_millis(100));
     }
     false
-}
-
-fn detach_command(command: &mut Command) {
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
-    }
 }
 
 fn print_file_tail(path: &Path, lines: usize) -> io::Result<()> {

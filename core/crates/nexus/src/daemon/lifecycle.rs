@@ -22,6 +22,8 @@ use nexus_store::repos::CommandIntents;
 use nexus_store::{DaemonStore, Store};
 use sha2::{Digest, Sha256};
 
+use crate::lifecycle_process;
+
 #[cfg(target_os = "linux")]
 const SYSTEMD_SERVICE: &str = "nexus-daemon.service";
 #[cfg(target_os = "linux")]
@@ -641,8 +643,7 @@ impl Supervisor for SelfDaemonSupervisor {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err));
-        detach_command(&mut command);
-        let child = command.spawn()?;
+        let child = lifecycle_process::spawn_detached(&mut command)?;
         wait_for_pidfile(&self.paths.pid_file, child.id(), Duration::from_secs(3));
         Ok(())
     }
@@ -1696,26 +1697,6 @@ fn signal_process(pid: u32, kill: bool) -> io::Result<()> {
         } else {
             Err(io::Error::other(format!("taskkill {pid} failed")))
         }
-    }
-}
-
-fn detach_command(command: &mut Command) {
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
     }
 }
 

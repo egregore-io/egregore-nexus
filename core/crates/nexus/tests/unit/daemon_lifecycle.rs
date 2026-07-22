@@ -202,3 +202,11 @@ fn db_url_preflight_is_a_noop_after_embedded_store_cutover() {
 
     preflight_configured_db_url(&config).expect("legacy db_url must not gate daemon startup");
 }
+
+#[test]
+fn self_daemon_supervisor_uses_the_shared_detach_boundary() {
+    let source = include_str!("../../src/daemon/lifecycle.rs");
+
+    assert!(source.contains("lifecycle_process::spawn_detached"));
+    assert!(!source.contains("fn detach_command("));
+}

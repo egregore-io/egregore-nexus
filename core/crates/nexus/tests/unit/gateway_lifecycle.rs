@@ -114,6 +114,29 @@ fn gateway_health_tolerates_one_loaded_event_loop_delay() {
     server.join().unwrap();
 }
 
+#[test]
+fn gateway_uses_shared_detach_and_bounded_migration_boundaries() {
+    let source = include_str!("../../src/gateway_lifecycle.rs");
+
+    assert!(source.contains("lifecycle_process::spawn_detached"));
+    assert!(source.contains("GATEWAY_MIGRATION_TIMEOUT"));
+    assert!(source.contains("run_gateway_store_migration"));
+    assert!(!source.contains("fn detach_command("));
+}
+
+#[cfg(unix)]
+#[test]
+fn gateway_store_migration_timeout_is_typed_and_bounded() {
+    let mut command = std::process::Command::new("sh");
+    command.args(["-c", "sleep 60"]);
+    let started = std::time::Instant::now();
+
+    let error = run_gateway_store_migration(&mut command, Duration::from_millis(150)).unwrap_err();
+
+    assert!(error.message().contains("timed out"));
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
 struct FakeBackend {
     installed: bool,
     migration_fails: bool,
