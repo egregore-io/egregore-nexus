@@ -407,7 +407,3 @@ impl Drop for ProcessBoundary {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "../tests/unit/lifecycle_process.rs"]
-mod lifecycle_process_contracts;

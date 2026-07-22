@@ -1,9 +1,14 @@
+//! Behavioral contracts for the shared CLI process boundary.
+
+#[path = "../src/lifecycle_process.rs"]
+mod lifecycle_process;
+
 use std::fs;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::*;
+use lifecycle_process::*;
 
 #[cfg(unix)]
 fn shell(script: &str) -> Command {

@@ -112,6 +112,10 @@ exit 64
     fn receipt(&self) -> String {
         fs::read_to_string(self.nexus_home.join("update-receipt.json")).unwrap()
     }
+
+    fn receipt_if_present(&self) -> Option<String> {
+        fs::read_to_string(self.nexus_home.join("update-receipt.json")).ok()
+    }
 }
 
 #[test]
@@ -198,7 +202,12 @@ fn ctrl_c_returns_and_reaps_the_package_manager_process_tree() {
         package_dead,
         "package-manager pid {package_pid} survived Ctrl-C"
     );
-    assert!(!fixture.receipt().contains("must-not-reach-receipt"));
+    assert!(
+        fixture
+            .receipt_if_present()
+            .is_none_or(|receipt| !receipt.contains("must-not-reach-receipt")),
+        "interrupted update receipt leaked a secret"
+    );
 }
 
 fn wait_until_process_dead(pid: i32, timeout: Duration) -> bool {

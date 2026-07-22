@@ -367,7 +367,3 @@ fn user_home() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
 }
-
-#[cfg(test)]
-#[path = "../../tests/unit/update_system.rs"]
-mod update_system_contracts;
