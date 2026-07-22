@@ -129,3 +129,37 @@ fn missing_gateway_error_has_human_hint() {
         .unwrap()
         .contains("@egregore/nexus-gateway"));
 }
+
+#[test]
+fn only_explicit_follow_keeps_gateway_and_webconsole_logs_attached() {
+    let gateway = include_str!("../src/gateway_lifecycle.rs");
+    let webconsole = include_str!("../src/webconsole_lifecycle.rs");
+
+    assert!(gateway.contains(
+        "if follow {\n        follow_file_tail(&backend.paths.log, lines)?;\n    } else {\n        print_file_tail(&backend.paths.log, lines)?;"
+    ));
+    assert!(webconsole
+        .contains("if follow {\n        follow_file_tail(&path, lines)\n            .map_err"));
+    assert!(webconsole
+        .contains("} else {\n        print_file_tail(&path, lines)\n            .map_err"));
+}
+
+#[test]
+fn lifecycle_and_update_subprocesses_use_shared_bounded_or_detached_boundaries() {
+    for source in [
+        include_str!("../src/gateway_lifecycle.rs"),
+        include_str!("../src/gateway_service.rs"),
+        include_str!("../src/webconsole_lifecycle.rs"),
+        include_str!("../src/update/system.rs"),
+        include_str!("../src/update/lock.rs"),
+    ] {
+        assert!(!source.contains(".output()"));
+    }
+
+    assert!(
+        include_str!("../src/gateway_lifecycle.rs").contains("lifecycle_process::spawn_detached")
+    );
+    assert!(include_str!("../src/webconsole_lifecycle.rs")
+        .contains("lifecycle_process::spawn_detached"));
+    assert!(include_str!("../src/update/system.rs").contains("lifecycle_process::run_bounded"));
+}
