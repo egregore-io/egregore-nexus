@@ -99,7 +99,7 @@ fn daemon_install_enables_and_starts_the_systemd_user_service() {
     let systemctl = fake_bin.join("systemctl");
     fs::write(
         &systemctl,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$NEXUS_TEST_SYSTEMCTL_LOG\"\nif [ \"$*\" = \"--user start nexus-daemon.service\" ]; then\n  nohup /bin/sleep 30 </dev/null >/dev/null 2>&1 &\n  printf '%s\\n' \"$!\" > \"$NEXUS_HOME/daemon.pid\"\nfi\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$NEXUS_TEST_SYSTEMCTL_LOG\"\nif [ \"$*\" = \"--user start nexus-daemon.service\" ]; then\n  setsid /bin/sleep 30 </dev/null >/dev/null 2>&1 &\n  printf '%s\\n' \"$!\" > \"$NEXUS_HOME/daemon.pid\"\nfi\n",
     )
     .unwrap();
     fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
@@ -301,7 +301,7 @@ fn wsl_install_transfers_a_running_self_daemon_to_systemd() {
     let systemctl = fake_bin.join("systemctl");
     fs::write(
         &systemctl,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$NEXUS_TEST_SYSTEMCTL_LOG\"\nif [ \"$*\" = \"--user start nexus-daemon.service\" ]; then\n  nohup /bin/sleep 30 </dev/null >/dev/null 2>&1 &\n  printf '%s\\n' \"$!\" > \"$NEXUS_HOME/daemon.pid\"\nfi\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$NEXUS_TEST_SYSTEMCTL_LOG\"\nif [ \"$*\" = \"--user start nexus-daemon.service\" ]; then\n  setsid /bin/sleep 30 </dev/null >/dev/null 2>&1 &\n  printf '%s\\n' \"$!\" > \"$NEXUS_HOME/daemon.pid\"\nfi\n",
     )
     .unwrap();
     fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
