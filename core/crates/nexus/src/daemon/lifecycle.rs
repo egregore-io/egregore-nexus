@@ -36,6 +36,8 @@ const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(45);
 const FORCE_STOP_GRACE: Duration = Duration::from_secs(10);
 const SERVICE_START_GRACE: Duration = Duration::from_secs(5);
 const SERVICE_STABILITY_GRACE: Duration = Duration::from_millis(500);
+const SERVICE_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVICE_HELPER_OUTPUT_LIMIT: usize = 64 * 1024;
 
 /// Parser for the daemon arm of the `nexus` binary.
 #[derive(Parser, Debug)]
@@ -1038,12 +1040,28 @@ impl CommandSpec {
     }
 
     fn run_capture(&self) -> Result<CommandOutput, LifecycleError> {
-        let output = Command::new(&self.program).args(&self.args).output()?;
-        Ok(CommandOutput {
-            success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        })
+        let mut command = Command::new(&self.program);
+        command.args(&self.args);
+        match lifecycle_process::run_bounded(
+            &mut command,
+            "daemon service-manager command",
+            SERVICE_HELPER_TIMEOUT,
+            SERVICE_HELPER_OUTPUT_LIMIT,
+        ) {
+            Ok(output) => Ok(CommandOutput {
+                success: true,
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            }),
+            Err(lifecycle_process::BoundedProcessError::Exit { stdout, stderr, .. }) => {
+                Ok(CommandOutput {
+                    success: false,
+                    stdout: String::from_utf8_lossy(&stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&stderr).to_string(),
+                })
+            }
+            Err(error) => Err(LifecycleError::Command(error.to_string())),
+        }
     }
 
     fn run_checked(&self) -> Result<(), LifecycleError> {

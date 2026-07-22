@@ -210,3 +210,11 @@ fn self_daemon_supervisor_uses_the_shared_detach_boundary() {
     assert!(source.contains("lifecycle_process::spawn_detached"));
     assert!(!source.contains("fn detach_command("));
 }
+
+#[test]
+fn daemon_service_manager_commands_use_the_shared_bounded_process_boundary() {
+    let source = include_str!("../../src/daemon/lifecycle.rs");
+
+    assert!(source.contains("lifecycle_process::run_bounded"));
+    assert!(!source.contains(".args(&self.args).output()"));
+}

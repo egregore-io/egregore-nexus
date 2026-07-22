@@ -139,6 +139,15 @@ fn windows_task_uses_native_action_fields() {
     assert!(rendered.contains("EgregoreNexusGateway"));
 }
 
+#[test]
+fn native_service_manager_commands_use_the_shared_bounded_process_boundary() {
+    let source = include_str!("../../src/gateway_service.rs");
+
+    assert!(source.contains("lifecycle_process::run_bounded"));
+    assert!(!source.contains(".output()"));
+    assert!(!source.contains(".status()"));
+}
+
 fn spec() -> GatewayServiceSpec {
     GatewayServiceSpec {
         executable: PathBuf::from("/opt/egregore gateway/nexus-gateway"),

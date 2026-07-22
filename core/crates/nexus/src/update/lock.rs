@@ -10,6 +10,9 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(windows)]
+use crate::lifecycle_process;
+
 use super::install_context::InstallMethod;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,14 +181,16 @@ fn process_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn process_alive(pid: u32) -> bool {
-    Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-        .output()
-        .map(|output| {
-            output.status.success()
-                && !String::from_utf8_lossy(&output.stdout).contains("No tasks are running")
-        })
-        .unwrap_or(false)
+    let mut command = Command::new("tasklist");
+    command.args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"]);
+    lifecycle_process::run_bounded(
+        &mut command,
+        "Windows update-lock process probe",
+        Duration::from_secs(5),
+        64 * 1024,
+    )
+    .map(|output| !String::from_utf8_lossy(&output.stdout).contains("No tasks are running"))
+    .unwrap_or(false)
 }
 
 #[cfg(not(any(unix, windows)))]

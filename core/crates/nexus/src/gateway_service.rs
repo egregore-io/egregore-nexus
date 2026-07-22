@@ -3,7 +3,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -14,11 +14,14 @@ use crate::gateway_lifecycle::{
     gateway_status, resolve_installed_gateway, GatewayInvocation, GatewayLifecycleError,
     GatewayPaths, GatewayRuntimeStatus,
 };
+use crate::lifecycle_process;
 
 const SYSTEMD_SERVICE: &str = "nexus-gateway.service";
 const LAUNCHD_LABEL: &str = "io.egregore.nexus.gateway";
 const WINDOWS_TASK_NAME: &str = "EgregoreNexusGateway";
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
+const SERVICE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVICE_COMMAND_OUTPUT_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayServiceSpec {
@@ -169,16 +172,16 @@ impl SystemGatewayServiceBackend {
     }
 
     fn command_checked(&self, program: &str, args: &[String]) -> Result<(), String> {
-        let output = Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| error.to_string())?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(format!("{program} service command failed"))
-        }
+        let mut command = Command::new(program);
+        command.args(args);
+        lifecycle_process::run_bounded(
+            &mut command,
+            "Gateway service-manager command",
+            SERVICE_COMMAND_TIMEOUT,
+            SERVICE_COMMAND_OUTPUT_LIMIT,
+        )
+        .map(|_| ())
+        .map_err(|error| format!("{program} service command failed: {error}"))
     }
 }
 
@@ -355,13 +358,14 @@ impl GatewayServiceBackend for SystemGatewayServiceBackend {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         return self.definition_path().is_file();
         #[cfg(target_os = "windows")]
-        return Command::new("schtasks.exe")
-            .args(["/Query", "/TN", WINDOWS_TASK_NAME])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
+        {
+            return self
+                .command_checked(
+                    "schtasks.exe",
+                    &["/Query".into(), "/TN".into(), WINDOWS_TASK_NAME.into()],
+                )
+                .is_ok();
+        }
         #[allow(unreachable_code)]
         false
     }

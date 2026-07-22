@@ -109,6 +109,14 @@ fn dropping_an_old_guard_does_not_delete_a_successor_lock() {
     assert_eq!(read_record(&path).owner_token, "new");
 }
 
+#[test]
+fn windows_process_inspection_uses_the_shared_bounded_process_boundary() {
+    let source = include_str!("../../src/update/lock.rs");
+
+    assert!(source.contains("lifecycle_process::run_bounded"));
+    assert!(!source.contains(".output()"));
+}
+
 fn record(pid: u32, started_at_ms: i64, token: &str) -> UpdateLockRecord {
     UpdateLockRecord {
         pid,
