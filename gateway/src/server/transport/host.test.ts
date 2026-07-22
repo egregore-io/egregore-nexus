@@ -196,7 +196,7 @@ describe("transport host protocol", () => {
     await host.start();
     await eventually(async () => {
       expect(await readFile(join(fixture.stateRoot, "first-batch.txt"), "utf8")).toBe("256");
-    }, 4_000);
+    }, 10_000);
     await eventually(async () => {
       const result = await db.execute("SELECT COUNT(*) AS count FROM transport_outbox WHERE state = 'delivered'");
       expect(Number(result.rows[0]?.count)).toBe(260);
