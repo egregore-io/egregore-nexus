@@ -112,4 +112,3 @@
 - [ ] Run the target-specific lifecycle test set in Linux, macOS, and Windows CI. Treat platform compilation as necessary but insufficient: each runner must execute its native process/tree and opener tests.
 - [ ] Confirm no unrelated worktree file was staged, especially `docs/superpowers/specs/2026-07-22-gateway-durable-projections-design.md`.
 - [ ] Request a bounded independent review of the final diff, address only demonstrated blockers, then commit any final correction separately.
-
