@@ -192,6 +192,7 @@ impl CodexBridge {
             create_thread_if_missing,
             tool_observations,
         } = options;
+        let await_binding = known_thread_id.is_some();
 
         let canonical_home = match opts.codex_home.clone() {
             Some(home) => home,
@@ -270,19 +271,36 @@ impl CodexBridge {
                     )
                     .await?;
                 } else {
-                    spawn_binding_task(
-                        self.handles.clone(),
-                        self.transport(),
-                        session.clone(),
-                        sock_path.clone(),
-                        rollout_root,
-                        desired_thread_id,
-                        resume_cwd,
-                        on_thread_discovered,
-                        runtime_store,
-                        events,
-                        tool_observations,
-                    );
+                    if await_binding {
+                        bind_thread(
+                            self.handles.clone(),
+                            self.transport(),
+                            session.clone(),
+                            sock_path.clone(),
+                            rollout_root,
+                            desired_thread_id,
+                            resume_cwd,
+                            on_thread_discovered,
+                            runtime_store,
+                            events,
+                            tool_observations,
+                        )
+                        .await?;
+                    } else {
+                        spawn_binding_task(
+                            self.handles.clone(),
+                            self.transport(),
+                            session.clone(),
+                            sock_path.clone(),
+                            rollout_root,
+                            desired_thread_id,
+                            resume_cwd,
+                            on_thread_discovered,
+                            runtime_store,
+                            events,
+                            tool_observations,
+                        );
+                    }
                 }
             }
             return Ok(sock_path);
@@ -364,6 +382,25 @@ impl CodexBridge {
                 self.transport(),
                 session.clone(),
                 sock_path.clone(),
+                resume_cwd,
+                on_thread_discovered,
+                runtime_store,
+                events,
+                tool_observations,
+            )
+            .await
+            {
+                self.kill(&session);
+                return Err(error);
+            }
+        } else if await_binding {
+            if let Err(error) = bind_thread(
+                self.handles.clone(),
+                self.transport(),
+                session.clone(),
+                sock_path.clone(),
+                rollout_root,
+                known_thread_id,
                 resume_cwd,
                 on_thread_discovered,
                 runtime_store,
@@ -463,127 +500,139 @@ fn spawn_binding_task(
     tool_observations: Option<Arc<dyn CodexToolObservationSink>>,
 ) {
     tokio::spawn(async move {
-        let (thread_id, rollout_path) = match known_thread_id {
-            Some(id) => {
-                let rollout_path = rollout_with_thread_id(&rollout_root, &id);
-                (id, rollout_path)
-            }
-            None => {
-                let Some(discovered) =
-                    wait_for_thread_id(&rollout_root, Duration::from_secs(900)).await
-                else {
-                    tracing::warn!(
-                        session = %discovery_session.0,
-                        rollout_root = %rollout_root.display(),
-                        "no thread discovered"
-                    );
-                    return;
-                };
-                discovered
-            }
-        };
+        if let Err(error) = bind_thread(
+            handles,
+            transport,
+            discovery_session.clone(),
+            discovery_sock,
+            rollout_root,
+            known_thread_id,
+            resume_cwd,
+            on_thread_discovered,
+            runtime_store,
+            events,
+            tool_observations,
+        )
+        .await
+        {
+            tracing::warn!(
+                session = %discovery_session,
+                error = %error,
+                "codex bridge: asynchronous thread binding failed"
+            );
+        }
+    });
+}
 
-        let client = match CodexAppServerClient::connect(&discovery_sock, "nexus-bridge").await {
-            Ok(client) => Arc::new(client),
-            Err(e) => {
+#[allow(clippy::too_many_arguments)]
+async fn bind_thread(
+    handles: Arc<Mutex<HashMap<SessionId, Handle>>>,
+    transport: CodexAppServerTransport,
+    discovery_session: SessionId,
+    discovery_sock: PathBuf,
+    rollout_root: PathBuf,
+    known_thread_id: Option<String>,
+    resume_cwd: Option<PathBuf>,
+    on_thread_discovered: Option<ThreadDiscovered>,
+    runtime_store: Option<Arc<Store>>,
+    events: Arc<dyn EventSink>,
+    tool_observations: Option<Arc<dyn CodexToolObservationSink>>,
+) -> Result<String, CodexRpcError> {
+    let (thread_id, rollout_path) = match known_thread_id {
+        Some(id) => {
+            let rollout_path = rollout_with_thread_id(&rollout_root, &id);
+            (id, rollout_path)
+        }
+        None => {
+            let Some(discovered) =
+                wait_for_thread_id(&rollout_root, Duration::from_secs(900)).await
+            else {
                 tracing::warn!(
                     session = %discovery_session.0,
-                    socket = %discovery_sock.display(),
-                    "codex bridge: connect after thread discovery failed: {e}"
+                    rollout_root = %rollout_root.display(),
+                    "no thread discovered"
                 );
-                return;
-            }
-        };
+                return Err(CodexRpcError::Connect(format!(
+                    "no codex thread discovered for session {discovery_session} under {}",
+                    rollout_root.display()
+                )));
+            };
+            discovered
+        }
+    };
 
-        let resume_cwd = resume_cwd
-            .as_deref()
-            .and_then(|path| path.to_str())
-            .map(str::to_owned);
+    let client = Arc::new(CodexAppServerClient::connect(&discovery_sock, "nexus-bridge").await?);
+
+    let resume_cwd = resume_cwd
+        .as_deref()
+        .and_then(|path| path.to_str())
+        .map(str::to_owned);
+    tracing::info!(
+        target: "nexus::codex_bridge",
+        session = %discovery_session,
+        thread_id = %thread_id,
+        cwd = resume_cwd.as_deref().unwrap_or(""),
+        "codex bridge: resuming thread for transport bind"
+    );
+    let resume = client
+        .thread_resume_in(&thread_id, resume_cwd.as_deref())
+        .await?;
+    let resumed_active_turn = resumed_active_turn_id(&resume, &thread_id)?;
+    if let Some(turn_id) = resumed_active_turn.as_deref() {
+        transport
+            .turn_tracker()
+            .observe_active_turn(&thread_id, turn_id);
+    }
+    if let Some(store) = &runtime_store {
+        if let Err(e) = CodexRuntimeStateRepo::new(store)
+            .set_thread(&discovery_session, &thread_id, rollout_path.clone())
+            .await
+        {
+            tracing::warn!(
+                session = %discovery_session.0,
+                thread_id = %thread_id,
+                error = %e,
+                "codex bridge: failed to persist runtime thread state"
+            );
+        }
+    }
+    if let Some(callback) = &on_thread_discovered {
+        callback(discovery_session.clone(), thread_id.clone());
+    }
+    let forwarder = spawn_codex_forwarder_with_tool_observations(
+        discovery_session.clone(),
+        client.clone(),
+        events,
+        Arc::new(AutoApprove),
+        transport.turn_tracker(),
+        tool_observations,
+    );
+
+    let mut map = handles.lock().unwrap();
+    if let Some(handle) = map.get_mut(&discovery_session) {
+        if let Some(old_forwarder) = handle.forwarder.take() {
+            old_forwarder.abort();
+        }
+        handle.forwarder = Some(forwarder);
+        handle.thread_id = Some(thread_id.clone());
+        // Binding is the final readiness publication. Once routing can observe this session,
+        // the resume snapshot has seeded any in-progress turn and the sole forwarder is owned
+        // by the live handle, so a recovered prompt cannot race the old native boundary.
+        transport.bind(discovery_session.clone(), client, thread_id.clone());
         tracing::info!(
             target: "nexus::codex_bridge",
             session = %discovery_session,
             thread_id = %thread_id,
-            cwd = resume_cwd.as_deref().unwrap_or(""),
-            "codex bridge: resuming thread for transport bind"
+            resumed_active_turn = resumed_active_turn.as_deref().unwrap_or(""),
+            "codex bridge: transport bound"
         );
-        let resume = match client
-            .thread_resume_in(&thread_id, resume_cwd.as_deref())
-            .await
-        {
-            Ok(resume) => resume,
-            Err(e) => {
-                tracing::warn!(
-                    session = %discovery_session.0,
-                    thread_id = %thread_id,
-                    "codex bridge: thread_resume after discovery failed: {e}"
-                );
-                return;
-            }
-        };
-        let resumed_active_turn = match resumed_active_turn_id(&resume, &thread_id) {
-            Ok(turn_id) => turn_id,
-            Err(error) => {
-                tracing::warn!(
-                    session = %discovery_session.0,
-                    thread_id = %thread_id,
-                    error = %error,
-                    "codex bridge: refusing ambiguous thread_resume turn authority"
-                );
-                return;
-            }
-        };
-        if let Some(turn_id) = resumed_active_turn.as_deref() {
-            transport
-                .turn_tracker()
-                .observe_active_turn(&thread_id, turn_id);
-        }
-        if let Some(store) = &runtime_store {
-            if let Err(e) = CodexRuntimeStateRepo::new(store)
-                .set_thread(&discovery_session, &thread_id, rollout_path.clone())
-                .await
-            {
-                tracing::warn!(
-                    session = %discovery_session.0,
-                    thread_id = %thread_id,
-                    error = %e,
-                    "codex bridge: failed to persist runtime thread state"
-                );
-            }
-        }
-        if let Some(callback) = &on_thread_discovered {
-            callback(discovery_session.clone(), thread_id.clone());
-        }
-        let forwarder = spawn_codex_forwarder_with_tool_observations(
-            discovery_session.clone(),
-            client.clone(),
-            events,
-            Arc::new(AutoApprove),
-            transport.turn_tracker(),
-            tool_observations,
-        );
-
-        let mut map = handles.lock().unwrap();
-        if let Some(handle) = map.get_mut(&discovery_session) {
-            if let Some(old_forwarder) = handle.forwarder.take() {
-                old_forwarder.abort();
-            }
-            handle.forwarder = Some(forwarder);
-            handle.thread_id = Some(thread_id.clone());
-            // Binding is the final readiness publication. Once routing can observe this session,
-            // the resume snapshot has seeded any in-progress turn and the sole forwarder is owned
-            // by the live handle, so a recovered prompt cannot race the old native boundary.
-            transport.bind(discovery_session.clone(), client, thread_id.clone());
-            tracing::info!(
-                target: "nexus::codex_bridge",
-                session = %discovery_session,
-                thread_id = %thread_id,
-                resumed_active_turn = resumed_active_turn.as_deref().unwrap_or(""),
-                "codex bridge: transport bound"
-            );
-        } else {
-            forwarder.abort();
-        }
-    });
+    } else {
+        forwarder.abort();
+        return Err(CodexRpcError::Connect(format!(
+            "codex bridge session {discovery_session} disappeared while binding thread {thread_id}"
+        )));
+    }
+    Ok(thread_id)
 }
 
 fn resumed_active_turn_id(

@@ -384,17 +384,13 @@ impl AppState {
                 message: format!("codex app-server respawn failed: {e}"),
             })?;
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while transport.bound_thread_id(&session).as_deref() != Some(thread_id.as_str()) {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(nexus_contracts::ContractError {
-                    code: -32004,
-                    message: format!(
-                        "timed out rebinding codex app-server session {session} to thread {thread_id}"
-                    ),
-                });
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if transport.bound_thread_id(&session).as_deref() != Some(thread_id.as_str()) {
+            return Err(nexus_contracts::ContractError {
+                code: -32004,
+                message: format!(
+                    "codex app-server respawn returned without binding session {session} to thread {thread_id}"
+                ),
+            });
         }
 
         self.finish_codex_appserver_resume(&name, &session, &project, row.paused)

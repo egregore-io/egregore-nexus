@@ -255,7 +255,7 @@ async fn resume_refuses_mismatched_or_ambiguous_native_turn_authority() {
 
         let bridge = CodexBridge::new();
         let session = SessionId(format!("s_{tag}"));
-        bridge
+        let error = bridge
             .launch_with_options(
                 session.clone(),
                 SupervisorOpts {
@@ -278,15 +278,21 @@ async fn resume_refuses_mismatched_or_ambiguous_native_turn_authority() {
                 },
             )
             .await
-            .expect("bridge launch should start fake app-server");
+            .expect_err("invalid resume authority must fail the known-thread launch");
 
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(
+            error.to_string().contains("thread/resume"),
+            "{tag} should report the rejected thread/resume authority: {error}"
+        );
         assert!(
             !bridge.transport().is_bound(&session),
             "{tag} resume authority must fail closed before transport publication"
         );
+        assert!(
+            !bridge.has(&session),
+            "{tag} failed launch must clean up the app-server handle"
+        );
 
-        assert!(bridge.kill(&session));
         let _ = std::fs::remove_dir_all(state_root);
     }
 }

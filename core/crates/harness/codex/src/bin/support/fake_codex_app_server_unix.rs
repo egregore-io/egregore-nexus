@@ -24,6 +24,8 @@
 //! completed.
 //! `FAKE_CODEX_RESUME_RESPONSE=<json>` overrides the `thread/resume` result so restart tests can
 //! model a persisted in-progress native turn.
+//! `FAKE_CODEX_RESUME_DELAY_MS=<ms>` delays the `thread/resume` response so readiness tests can
+//! prove a known-thread launch does not return before the transport is actually bound.
 //!
 //! # Test probes
 //! If `FAKE_CODEX_CWD_PROBE` is set, the fake writes its process current directory to that path at
@@ -212,6 +214,12 @@ where
                             .expect("FAKE_CODEX_RESUME_RESPONSE: invalid JSON")
                     })
                     .unwrap_or_else(|| json!({}));
+                if let Some(delay_ms) = std::env::var("FAKE_CODEX_RESUME_DELAY_MS")
+                    .ok()
+                    .and_then(|raw| raw.parse::<u64>().ok())
+                {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
                 let _ = out_tx.send(response_frame(&id, resume_result));
             }
             "turn/start" => {
