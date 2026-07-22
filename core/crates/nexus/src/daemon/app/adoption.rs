@@ -41,11 +41,12 @@ impl AppState {
                     continue;
                 }
             };
+            let headed_runtime = headed_runtime_from_agent_token(Some(runtime.harness.as_str()));
             if let Some(supervisor) = &self.pty {
                 let cwd = row.cwd.clone().or(runtime.cwd.clone()).unwrap_or_else(|| {
                     default_agent_cwd_for(row.agent_id.as_deref(), &row.display_name())
                 });
-                if let Err(error) = supervisor.adopt_pty_backend(&session, &cwd) {
+                if let Err(error) = supervisor.adopt_pty_backend(&session, &cwd, headed_runtime) {
                     tracing::warn!(
                         target: "nexus::revive",
                         session = %session,
@@ -56,7 +57,7 @@ impl AppState {
                     continue;
                 }
             }
-            match headed_runtime_from_agent_token(Some(runtime.harness.as_str())) {
+            match headed_runtime {
                 HeadedRuntimeKind::ClaudeNative => {
                     self.spawn_claude_native_forwarder_if_needed(&session).await;
                 }

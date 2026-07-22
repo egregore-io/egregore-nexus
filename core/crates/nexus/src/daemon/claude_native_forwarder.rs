@@ -6,14 +6,17 @@
 //! forwards newly appended hook JSONL into the shared [`EventSink`]. That keeps `/agent/<name>`
 //! observe streams live without scraping the full-screen Claude TUI.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use nexus_common::NexusError;
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::EventSink;
+use nexus_contracts::{AgentUpdateKind, GatewayProjectionEffect, WsEvent};
 use nexus_dispatch::Bell;
 use nexus_harness_claude::native::bridge::ClaudeNativeBridgePaths;
 use nexus_harness_claude::native::forwarder::{
@@ -21,6 +24,7 @@ use nexus_harness_claude::native::forwarder::{
 };
 use nexus_harness_claude::native::hooks::{hook_log_path, message_delta_log_path};
 use nexus_harness_claude::storage::ClaudeRuntimeStateRepo;
+use nexus_pty::TurnAcceptanceObserver;
 use nexus_store::Store;
 use nexus_transcript::ToolCallObservation;
 
@@ -39,6 +43,36 @@ pub struct ClaudeTurnCompletion {
     notify: tokio::sync::Notify,
     submission_generation: AtomicU64,
     submission_notify: tokio::sync::Notify,
+    next_accepted_input_id: AtomicU64,
+    accepted_inputs: Mutex<VecDeque<PendingAcceptedInput>>,
+}
+
+struct PendingAcceptedInput {
+    id: u64,
+    text: String,
+    observer: Arc<dyn TurnAcceptanceObserver>,
+    accepted: Arc<AtomicBool>,
+}
+
+/// RAII ownership for one programmatic input awaiting its native `UserPromptSubmit` fact.
+/// Dropping a cancelled/failed send removes only that registration, so a later manual prompt is
+/// never mistaken for the abandoned caller-bound input.
+pub struct ClaudeAcceptedInputRegistration {
+    completion: Arc<ClaudeTurnCompletion>,
+    id: u64,
+    accepted: Arc<AtomicBool>,
+}
+
+impl ClaudeAcceptedInputRegistration {
+    pub fn was_accepted(&self) -> bool {
+        self.accepted.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for ClaudeAcceptedInputRegistration {
+    fn drop(&mut self) {
+        self.completion.remove_accepted_input(self.id);
+    }
 }
 
 impl ClaudeTurnCompletion {
@@ -100,6 +134,80 @@ impl ClaudeTurnCompletion {
                 .map_err(|_| "Claude native prompt submission timed out".to_string())?;
         }
     }
+
+    /// Register the exact programmatic input whose native echo must be replaced by the
+    /// caller-bound accepted event carried by `observer`.
+    pub fn register_accepted_input(
+        self: &Arc<Self>,
+        text: impl Into<String>,
+        observer: Arc<dyn TurnAcceptanceObserver>,
+    ) -> ClaudeAcceptedInputRegistration {
+        let id = self.next_accepted_input_id.fetch_add(1, Ordering::SeqCst);
+        let accepted = Arc::new(AtomicBool::new(false));
+        self.accepted_inputs
+            .lock()
+            .unwrap()
+            .push_back(PendingAcceptedInput {
+                id,
+                text: text.into(),
+                observer,
+                accepted: accepted.clone(),
+            });
+        ClaudeAcceptedInputRegistration {
+            completion: self.clone(),
+            id,
+            accepted,
+        }
+    }
+
+    fn remove_accepted_input(&self, id: u64) {
+        self.accepted_inputs
+            .lock()
+            .unwrap()
+            .retain(|pending| pending.id != id);
+    }
+
+    pub(crate) async fn accept_native_user_input(&self, text: &str) -> bool {
+        let pending = {
+            let mut inputs = self.accepted_inputs.lock().unwrap();
+            let Some(index) = inputs.iter().position(|pending| pending.text == text) else {
+                return false;
+            };
+            inputs.remove(index).expect("matched accepted input exists")
+        };
+        pending.observer.accepted().await;
+        pending.accepted.store(true, Ordering::SeqCst);
+        true
+    }
+}
+
+struct ClaudeAcceptedInputSink {
+    upstream: Arc<dyn EventSink>,
+    completion: Arc<ClaudeTurnCompletion>,
+}
+
+#[async_trait]
+impl EventSink for ClaudeAcceptedInputSink {
+    async fn emit(&self, event: WsEvent) {
+        let native_user_text = match &event {
+            WsEvent::AgentUpdate {
+                kind: AgentUpdateKind::UserInput,
+                data,
+                ..
+            } => data.get("text").and_then(serde_json::Value::as_str),
+            _ => None,
+        };
+        if let Some(text) = native_user_text {
+            if self.completion.accept_native_user_input(text).await {
+                return;
+            }
+        }
+        self.upstream.emit(event).await;
+    }
+
+    async fn project(&self, effect: GatewayProjectionEffect) {
+        self.upstream.project(effect).await;
+    }
 }
 
 /// Resolve the bridge paths for a runtime from Claude-owned sidecar state, falling back to the
@@ -150,11 +258,18 @@ pub fn spawn_claude_native_forwarder_with_tool_events(
     tokio::spawn(async move {
         let delay = Duration::from_millis(poll_ms.max(1));
         loop {
+            let forward_events: Arc<dyn EventSink> = match completion.as_ref() {
+                Some(completion) => Arc::new(ClaudeAcceptedInputSink {
+                    upstream: events.clone(),
+                    completion: completion.clone(),
+                }),
+                None => events.clone(),
+            };
             match forward_once_with_tool_observations(
                 store.clone(),
                 session.clone(),
                 paths.clone(),
-                events.clone(),
+                forward_events,
                 tool_events.clone(),
             )
             .await

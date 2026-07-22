@@ -1,4 +1,6 @@
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use async_trait::async_trait;
 use nexus_contracts::batch::{BatchCounts, NexusBatch};
 use nexus_contracts::ports::AgentTurnExecutionPort;
@@ -11,6 +13,34 @@ struct LivenessProbeInput {
 struct SubmissionSignalWriter {
     completion: Arc<ClaudeTurnCompletion>,
     writes: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+struct StructuredAcceptedInput {
+    completion: Arc<ClaudeTurnCompletion>,
+    emit_native_receipt: bool,
+}
+
+#[async_trait]
+impl HarnessInput for StructuredAcceptedInput {
+    async fn send_turn(&self, text: &str) -> Result<(), String> {
+        if self.emit_native_receipt {
+            self.completion.accept_native_user_input(text).await;
+        }
+        self.completion.signal();
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct CountAcceptance {
+    count: AtomicUsize,
+}
+
+#[async_trait]
+impl TurnAcceptanceObserver for CountAcceptance {
+    async fn accepted(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl nexus_pty::TerminalWriter for SubmissionSignalWriter {
@@ -153,6 +183,47 @@ async fn claude_raw_submit_accepts_structured_hook_evidence_while_queue_preview_
     .expect("Claude raw PTY submission should succeed");
 
     assert!(writes.lock().unwrap().iter().any(|bytes| bytes == b"\r"));
+}
+
+#[tokio::test]
+async fn claude_observed_turn_uses_exact_native_input_as_its_only_acceptance_boundary() {
+    let completion = Arc::new(ClaudeTurnCompletion::default());
+    let input = ClaudeNativeHarness {
+        input: Arc::new(StructuredAcceptedInput {
+            completion: completion.clone(),
+            emit_native_receipt: true,
+        }),
+        completion,
+    };
+    let observer = Arc::new(CountAcceptance::default());
+
+    input
+        .send_turn_observed("one canonical input", observer.clone())
+        .await
+        .expect("the matching native receipt should settle the observed turn");
+
+    assert_eq!(observer.count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn claude_observed_turn_rejects_terminal_without_exact_native_input_receipt() {
+    let completion = Arc::new(ClaudeTurnCompletion::default());
+    let input = ClaudeNativeHarness {
+        input: Arc::new(StructuredAcceptedInput {
+            completion: completion.clone(),
+            emit_native_receipt: false,
+        }),
+        completion,
+    };
+    let observer = Arc::new(CountAcceptance::default());
+
+    let error = input
+        .send_turn_observed("missing native receipt", observer.clone())
+        .await
+        .expect_err("a terminal hook alone cannot prove which prompt Claude admitted");
+
+    assert!(error.contains("without its exact UserPromptSubmit receipt"));
+    assert_eq!(observer.count.load(Ordering::SeqCst), 0);
 }
 
 #[test]

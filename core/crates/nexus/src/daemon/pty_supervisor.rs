@@ -41,7 +41,7 @@ use nexus_pty::command::{
 use nexus_pty::ConPtyBackend;
 use nexus_pty::{
     bracketed_paste, HarnessInput, PtyError, PtySession, ScreenModelBackend, TerminalBackend,
-    TmuxHarness, TurnCompletionEvidence,
+    TmuxHarness, TurnAcceptanceObserver, TurnCompletionEvidence,
 };
 use nexus_store::Store;
 use nexus_transcript::ToolCallObservation;
@@ -402,6 +402,19 @@ impl HarnessInput for ClaudeNativeHarness {
         self.completion
             .wait_after(observed, Duration::from_secs(600))
             .await
+    }
+
+    async fn send_turn_observed(
+        &self,
+        text: &str,
+        observer: Arc<dyn TurnAcceptanceObserver>,
+    ) -> Result<(), String> {
+        let accepted = self.completion.register_accepted_input(text, observer);
+        self.send_turn(text).await?;
+        if !accepted.was_accepted() {
+            return Err("native turn completed without its exact UserPromptSubmit receipt".into());
+        }
+        Ok(())
     }
 
     fn turn_completion_evidence(&self) -> TurnCompletionEvidence {
@@ -1105,8 +1118,18 @@ impl PtySupervisor {
                 .await?;
         }
         self.bind_tmux_backend(session, harness.clone())?;
-        self.transport
-            .bind(session.clone(), harness.clone() as Arc<dyn HarnessInput>);
+        if runtime == HeadedRuntimeKind::ClaudeNative {
+            self.transport.bind(
+                session.clone(),
+                Arc::new(ClaudeNativeHarness {
+                    input: harness.clone() as Arc<dyn HarnessInput>,
+                    completion: self.claude_turn_completion(session),
+                }),
+            );
+        } else {
+            self.transport
+                .bind(session.clone(), harness.clone() as Arc<dyn HarnessInput>);
+        }
         Ok(())
     }
 
@@ -1256,14 +1279,29 @@ impl PtySupervisor {
     /// such as OpenCode's native-plugin bridge must relaunch their bridge instead of adopting tmux
     /// as the turn input, otherwise a daemon restart leaves delivery pointed at a stale pane while
     /// the completion callback belongs to the dead daemon.
-    pub fn adopt_pty_backend(&self, session: &SessionId, cwd: &str) -> Result<(), PtyError> {
+    pub fn adopt_pty_backend(
+        &self,
+        session: &SessionId,
+        cwd: &str,
+        runtime: HeadedRuntimeKind,
+    ) -> Result<(), PtyError> {
         if self.pty_backends.lock().unwrap().contains_key(session) {
             return Ok(());
         }
         let harness = self.tmux_backend.adopt(session, cwd)?;
         self.bind_tmux_backend(session, harness.clone())?;
-        self.transport
-            .bind(session.clone(), harness.clone() as Arc<dyn HarnessInput>);
+        if runtime == HeadedRuntimeKind::ClaudeNative {
+            self.transport.bind(
+                session.clone(),
+                Arc::new(ClaudeNativeHarness {
+                    input: harness.clone() as Arc<dyn HarnessInput>,
+                    completion: self.claude_turn_completion(session),
+                }),
+            );
+        } else {
+            self.transport
+                .bind(session.clone(), harness.clone() as Arc<dyn HarnessInput>);
+        }
         Ok(())
     }
 

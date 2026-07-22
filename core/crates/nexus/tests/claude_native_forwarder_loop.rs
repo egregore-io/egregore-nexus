@@ -9,18 +9,48 @@ use nexus::daemon::claude_native_forwarder::{
 };
 use nexus::daemon::{AppState, WsSink};
 use nexus_common::Config;
+use nexus_contracts::ports::EventSink;
 use nexus_contracts::{
-    AgentTurnExecutionPort, Kind, Message, NexusBatch, PortResult, ProjectId, Provenance,
-    RemoveRequest, RemoveResponse, Scope, SessionId, SpawnRequest, SpawnResponse,
+    AgentTurnExecutionPort, AgentUpdateKind, Kind, Message, NexusBatch, PortResult, ProjectId,
+    Provenance, RemoveRequest, RemoveResponse, Scope, SessionId, SpawnRequest, SpawnResponse,
+    WsEvent,
 };
 use nexus_dispatch::Bell;
 use nexus_harness_claude::native::bridge::{write_launch_settings, ClaudeNativeBridgePaths};
 use nexus_harness_claude::storage::{ClaudeRuntimeLaunch, ClaudeRuntimeStateRepo};
+use nexus_pty::TurnAcceptanceObserver;
 use nexus_store::repos::{
     AgentRuntimes, Agents, Inbox, Messages, NewAgent, NewAgentRuntime, NewSession, Sessions,
     StreamEvents, TranscriptArchive,
 };
 use nexus_store::Store;
+
+#[derive(Clone, Default)]
+struct CaptureSink {
+    events: Arc<Mutex<Vec<WsEvent>>>,
+}
+
+#[async_trait]
+impl nexus_contracts::ports::EventSink for CaptureSink {
+    async fn emit(&self, event: WsEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+struct EmitAcceptedEvent {
+    sink: CaptureSink,
+    event: Mutex<Option<WsEvent>>,
+}
+
+#[async_trait]
+impl TurnAcceptanceObserver for EmitAcceptedEvent {
+    async fn accepted(&self) {
+        let event = self.event.lock().unwrap().take();
+        if let Some(event) = event {
+            self.sink.emit(event).await;
+        }
+    }
+}
 
 fn temp_dir(label: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -112,6 +142,129 @@ async fn claude_forwarder_signals_a_structured_user_prompt_submission() {
         .await
         .expect("Claude UserPromptSubmit should prove input acceptance");
     handle.abort();
+}
+
+#[tokio::test]
+async fn claude_programmatic_prompt_emits_one_caller_bound_user_input() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let session = unique_session("claude_caller_bound_input");
+    let paths = seed_active_claude_runtime(store.clone(), session.clone()).await;
+    let completion = Arc::new(ClaudeTurnCompletion::default());
+    let sink = CaptureSink::default();
+    let accepted = WsEvent::AgentUpdate {
+        session_id: session.clone(),
+        kind: AgentUpdateKind::UserInput,
+        data: serde_json::json!({
+            "text": "typed once",
+            "clientMessageId": "cm_lens_once",
+            "name": "human",
+            "kind": "human",
+        }),
+    };
+    let registration = completion.register_accepted_input(
+        "typed once",
+        Arc::new(EmitAcceptedEvent {
+            sink: sink.clone(),
+            event: Mutex::new(Some(accepted.clone())),
+        }),
+    );
+    let handle = spawn_claude_native_forwarder_with_tool_events(
+        store,
+        session,
+        paths.clone(),
+        Arc::new(sink.clone()),
+        Bell::new(),
+        10,
+        None,
+        Some(completion),
+    );
+
+    std::fs::write(
+        &paths.hook_log_path,
+        r#"{"event":"UserPromptSubmit","payload":{"hook_event_name":"UserPromptSubmit","session_id":"claude-real","prompt_id":"p_once","prompt":"typed once"}}"#,
+    )
+    .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while sink.events.lock().unwrap().is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    handle.abort();
+
+    assert!(registration.was_accepted());
+    assert_eq!(sink.events.lock().unwrap().as_slice(), &[accepted]);
+}
+
+#[tokio::test]
+async fn claude_manual_prompt_does_not_consume_a_different_programmatic_receipt() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let session = unique_session("claude_manual_input");
+    let paths = seed_active_claude_runtime(store.clone(), session.clone()).await;
+    let completion = Arc::new(ClaudeTurnCompletion::default());
+    let sink = CaptureSink::default();
+    let accepted = WsEvent::AgentUpdate {
+        session_id: session.clone(),
+        kind: AgentUpdateKind::UserInput,
+        data: serde_json::json!({
+            "text": "programmatic input",
+            "clientMessageId": "cm_programmatic",
+        }),
+    };
+    let registration = completion.register_accepted_input(
+        "programmatic input",
+        Arc::new(EmitAcceptedEvent {
+            sink: sink.clone(),
+            event: Mutex::new(Some(accepted.clone())),
+        }),
+    );
+    let handle = spawn_claude_native_forwarder_with_tool_events(
+        store,
+        session.clone(),
+        paths.clone(),
+        Arc::new(sink.clone()),
+        Bell::new(),
+        10,
+        None,
+        Some(completion),
+    );
+
+    std::fs::write(
+        &paths.hook_log_path,
+        r#"{"event":"UserPromptSubmit","payload":{"hook_event_name":"UserPromptSubmit","session_id":"claude-real","prompt_id":"p_manual","prompt":"manual input"}}
+"#,
+    )
+    .unwrap();
+    let first_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while sink.events.lock().unwrap().is_empty() && tokio::time::Instant::now() < first_deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!registration.was_accepted());
+    assert!(matches!(
+        sink.events.lock().unwrap().first(),
+        Some(WsEvent::AgentUpdate { data, .. })
+            if data.get("text").and_then(serde_json::Value::as_str) == Some("manual input")
+                && data.get("clientMessageId").is_none()
+    ));
+
+    use std::io::Write;
+    writeln!(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&paths.hook_log_path)
+            .unwrap(),
+        r#"{{"event":"UserPromptSubmit","payload":{{"hook_event_name":"UserPromptSubmit","session_id":"claude-real","prompt_id":"p_programmatic","prompt":"programmatic input"}}}}"#,
+    )
+    .unwrap();
+    let second_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while sink.events.lock().unwrap().len() < 2 && tokio::time::Instant::now() < second_deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    handle.abort();
+
+    assert!(registration.was_accepted());
+    assert_eq!(sink.events.lock().unwrap().get(1), Some(&accepted));
 }
 
 #[tokio::test]

@@ -25,7 +25,7 @@ use nexus_contracts::ports::{
 use nexus_contracts::{
     RemoveRequest, RemoveResponse, SpawnRequest, SpawnResponse, SteerCapability, WsEvent,
 };
-use nexus_pty::{HarnessInput, TurnCompletionEvidence};
+use nexus_pty::{HarnessInput, TurnAcceptanceObserver, TurnCompletionEvidence};
 use serde_json::Value;
 
 use super::opencode_plugin_bridge::OPENCODE_PROVIDER_ERROR_PREFIX;
@@ -118,6 +118,49 @@ async fn send_turn_with_prompt_retries(
     Err(last_error.unwrap_or_else(|| "prompt readiness retry exhausted".to_string()))
 }
 
+async fn send_turn_observed_with_prompt_retries(
+    input: Arc<dyn HarnessInput>,
+    text: &str,
+    observer: Arc<dyn TurnAcceptanceObserver>,
+) -> Result<(), String> {
+    let mut last_error = None;
+    for attempt in 0..=PROMPT_READY_RETRY_DELAYS.len() {
+        match input.send_turn_observed(text, observer.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(error) if prompt_readiness_error(&error) => {
+                last_error = Some(error);
+                if let Some(delay) = PROMPT_READY_RETRY_DELAYS.get(attempt) {
+                    tokio::time::sleep(*delay).await;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "prompt readiness retry exhausted".to_string()))
+}
+
+struct EmitAcceptedEvent {
+    pending: Mutex<Option<(Arc<dyn EventSink>, WsEvent)>>,
+}
+
+impl EmitAcceptedEvent {
+    fn new(events: Arc<dyn EventSink>, event: WsEvent) -> Self {
+        Self {
+            pending: Mutex::new(Some((events, event))),
+        }
+    }
+}
+
+#[async_trait]
+impl TurnAcceptanceObserver for EmitAcceptedEvent {
+    async fn accepted(&self) {
+        let pending = self.pending.lock().unwrap().take();
+        if let Some((events, event)) = pending {
+            events.emit(event).await;
+        }
+    }
+}
+
 async fn compact_with_prompt_retries(input: Arc<dyn HarnessInput>) -> Result<(), String> {
     let mut last_error = None;
     for attempt in 0..=PROMPT_READY_RETRY_DELAYS.len() {
@@ -186,10 +229,13 @@ impl AgentTurnExecutionPort for PtyTransport {
             }));
         }
         let _active_turn = self.active_turns.begin(recipient);
-        send_turn_with_prompt_retries(input, &render_injected_turn_for(batch, &recipient.0))
-            .await
-            .map_err(|error| inject_harness_error(recipient, error))?;
-        events.emit(accepted_event).await;
+        send_turn_observed_with_prompt_retries(
+            input,
+            &render_injected_turn_for(batch, &recipient.0),
+            Arc::new(EmitAcceptedEvent::new(events, accepted_event)),
+        )
+        .await
+        .map_err(|error| inject_harness_error(recipient, error))?;
         Ok(())
     }
 
@@ -221,13 +267,16 @@ impl AgentTurnExecutionPort for PtyTransport {
     ) -> PortResult<()> {
         let input = self.harness_for(recipient)?;
         let _active_turn = self.active_turns.begin(recipient);
-        send_turn_with_prompt_retries(input, &text)
-            .await
-            .map_err(|e| ContractError {
-                code: -32004,
-                message: e,
-            })?;
-        events.emit(accepted_event).await;
+        send_turn_observed_with_prompt_retries(
+            input,
+            &text,
+            Arc::new(EmitAcceptedEvent::new(events, accepted_event)),
+        )
+        .await
+        .map_err(|e| ContractError {
+            code: -32004,
+            message: e,
+        })?;
         Ok(())
     }
 
