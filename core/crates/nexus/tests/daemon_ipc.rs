@@ -14,7 +14,7 @@ use nexus_contracts::{
     ThreadId, Tier, Whoami, DAEMON_IPC_PROTOCOL_VERSION,
 };
 use nexus_store::repos::{
-    Agents, CommandIntents, NewAgent, NewSession, Sessions, Sources, Threads,
+    Agents, CommandIntents, DaemonState, NewAgent, NewSession, Sessions, Sources, Threads,
 };
 use nexus_store::Store;
 
@@ -1276,6 +1276,98 @@ async fn registered_query_caller_is_canonicalized_by_client_key_after_rename() {
     let whoami: Whoami = serde_json::from_value(response.result.unwrap()).unwrap();
     assert_eq!(whoami.name.as_deref(), Some("ipc-agent"));
     assert_eq!(whoami.session_id, registered.session_id);
+}
+
+#[tokio::test]
+async fn registered_human_command_caller_does_not_resolve_through_same_name_agent() {
+    let state = state().await;
+    DaemonState::new(&state.store)
+        .set_boot_epoch("boot_same_name_human", 1)
+        .await
+        .unwrap();
+    Agents::new(&state.store)
+        .create(NewAgent {
+            agent_id: "a_same_name_agent".into(),
+            project: "default".into(),
+            name: Some("Earl".into()),
+            default_harness: Some("other".into()),
+            role: None,
+            tier: Some("admin".into()),
+            owner: None,
+        })
+        .await
+        .unwrap();
+    let registered = state
+        .identity
+        .register(RegisterRequest {
+            agent_id: None,
+            name: Some("Earl".into()),
+            harness: hid("other"),
+            harness_session_id: "hs_gateway_human".into(),
+            project: "default".into(),
+            client_key: "gateway-human-client".into(),
+            runtime_credential: None,
+            tier: Tier::Admin,
+            kind: Some(Kind::Human),
+            locality: Locality::Local,
+            access: Some("admin".into()),
+            role: None,
+            cwd: None,
+        })
+        .await
+        .unwrap();
+
+    let response = daemon_ipc::handle_request(
+        &state,
+        "boot-token",
+        DaemonIpcRequest {
+            version: DAEMON_IPC_PROTOCOL_VERSION,
+            token: "boot-token".into(),
+            request_id: "rpc-same-name-human".into(),
+            caller: Some(DaemonIpcCaller {
+                name: Some("Earl".into()),
+                project: "default".into(),
+                session_id: Some(registered.session_id.0.clone()),
+                agent_id: None,
+                runtime_id: Some(registered.session_id.0.clone()),
+                client_key: Some("gateway-human-client".into()),
+                kind: Kind::Human,
+                locality: Locality::Local,
+                access: Some("admin".into()),
+                principal_id: Some("h_gateway_human".into()),
+                tier: Tier::Admin,
+            }),
+            call: DaemonIpcCall::Enqueue {
+                command_id: "cmd-same-name-human".into(),
+                kind: nexus_store::command_kinds::message_post::SEND.into(),
+                params: serde_json::json!({
+                    "to": {"verb": "dm", "name": "ipc-agent"},
+                    "body": "human caller remains bound to its exact client-key session"
+                }),
+                idempotency_key: None,
+            },
+        },
+    )
+    .await;
+
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let row = CommandIntents::new(&state.store)
+        .get("cmd-same-name-human")
+        .await
+        .unwrap()
+        .expect("durable human command row");
+    assert_eq!(row.caller_name, "Earl");
+    assert_eq!(
+        row.caller_session_id.as_deref(),
+        Some(registered.session_id.0.as_str())
+    );
+    assert_eq!(row.caller_agent_id, None);
+    assert_eq!(
+        row.caller_client_key.as_deref(),
+        Some("gateway-human-client")
+    );
+    assert_eq!(row.caller_principal_id.as_deref(), Some("h_gateway_human"));
+    assert_eq!(row.caller_kind.as_deref(), Some("local.human"));
 }
 
 #[tokio::test]

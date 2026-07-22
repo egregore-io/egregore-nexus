@@ -1339,6 +1339,33 @@ async fn resolve_registered_query_caller_with_session(
                 principal_id: evidence.principal_id.clone(),
             }
         }
+        None if session
+            .entity_kind()
+            .map_err(|error| error.to_contract_error())?
+            .1
+            == Kind::Human =>
+        {
+            Caller {
+                agent_id: None,
+                session: session.session_id.clone(),
+                name: session.name.clone().ok_or_else(|| {
+                    unauthorized("daemon IPC human caller session has no canonical name")
+                })?,
+                project: session.project.clone(),
+                tier: match session.tier.as_str() {
+                    "admin" => Tier::Admin,
+                    _ => Tier::Agent,
+                },
+                locality: session
+                    .entity_kind()
+                    .map_err(|error| error.to_contract_error())?
+                    .0,
+                access: session
+                    .access()
+                    .map_err(|error| error.to_contract_error())?,
+                principal_id: evidence.principal_id.clone(),
+            }
+        }
         None => match session.name.as_deref() {
             Some(name) => state.identity.resolve(&session.project, name).await?,
             None => {
