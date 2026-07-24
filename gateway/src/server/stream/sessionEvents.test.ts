@@ -25,6 +25,45 @@ describe("canonical agent-session events endpoint", () => {
     await reader.cancel();
   });
 
+  it("keeps an idle session stream alive with an inert SSE comment heartbeat", async () => {
+    // An idle session emits no frames, so without a keep-alive the connection is
+    // silent until some proxy's idle timeout kills it (undici's is 300s).
+    const fanout = new SessionFanoutHub(() => ({ ready: Promise.resolve(), close() {} }));
+    const response = handleSessionEvents(
+      new Request("http://localhost/api/v1/agent-sessions/s_ada/events?view=nexus"),
+      "s_ada",
+      { fanout, heartbeatIntervalMs: 5 },
+    );
+
+    const reader = response.body!.getReader();
+    const chunk = await reader.read();
+    // Must be a `:` comment, NOT a `data:` frame — comments are discarded by
+    // EventSource and by the WS relay, so they never reach a consumer.
+    expect(new TextDecoder().decode(chunk.value)).toBe(": ping\n\n");
+    await reader.cancel();
+  });
+
+  it("stops the heartbeat and the fanout subscription when the client disconnects", async () => {
+    let closed = false;
+    const fanout = new SessionFanoutHub(() => ({
+      ready: Promise.resolve(),
+      close() {
+        closed = true;
+      },
+    }));
+    const response = handleSessionEvents(
+      new Request("http://localhost/api/v1/agent-sessions/s_ada/events?view=nexus"),
+      "s_ada",
+      { fanout, heartbeatIntervalMs: 5 },
+    );
+
+    const reader = response.body!.getReader();
+    await reader.read();
+    await reader.cancel();
+
+    expect(closed).toBe(true);
+  });
+
   it("surfaces malformed opaque cursors as a typed Nexus resync", async () => {
     const fanout = preloadedFanout([], "boot-a");
     const response = handleSessionEvents(

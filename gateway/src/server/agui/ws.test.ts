@@ -104,6 +104,38 @@ describe("AG-UI WebSocket server transport", () => {
     ]);
   });
 
+  it("drops session keep-alive heartbeats instead of relaying them downstream", async () => {
+    // `sessionEvents` emits `: ping` every 20s to defeat proxy idle timeouts.
+    // Those comment frames must die at the relay: forwarding them would push
+    // junk into every consumer of this socket.
+    const { handleWs } = await loadWs();
+    const socket = new FakeSocket();
+    const observe = vi.fn(async () => new Response(
+      textStream([
+        ": ping\n\n",
+        "data: {\"type\":\"RUN_STARTED\",\"runId\":\"r1\"}\n\n",
+        ": ping\n\n",
+        ": ping\n\n",
+        "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r1\"}\n\n",
+        ": ping\n\n",
+      ]),
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    ));
+
+    const control = handleWs(
+      socket,
+      new Request("http://localhost/api/agui/ws?session=otto"),
+      { observe },
+    );
+    await control.closed;
+
+    expect(socket.sent).toEqual([
+      "{\"type\":\"RUN_STARTED\",\"runId\":\"r1\"}",
+      "{\"type\":\"RUN_FINISHED\",\"runId\":\"r1\"}",
+    ]);
+    expect(socket.sent.join("")).not.toContain("ping");
+  });
+
   it("handles ping envelopes without touching the observe stream", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();

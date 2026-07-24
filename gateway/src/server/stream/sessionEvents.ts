@@ -5,8 +5,13 @@ import { nexusView } from "./nexusView";
 import { sessionFanout, type SessionFanoutHub, type SessionStreamView } from "./sessionFanout";
 import { terminalView } from "./terminalView";
 
+/** Idle keep-alive cadence, matching the legacy AG-UI SSE paths (`_sseCore`). */
+const DEFAULT_HEARTBEAT_MS = 20_000;
+
 export interface SessionEventsDeps {
   fanout?: SessionFanoutHub;
+  /** Heartbeat cadence in ms. Test seam; production uses the 20s default. */
+  heartbeatIntervalMs?: number;
 }
 
 export function handleSessionEvents(
@@ -25,7 +30,18 @@ export function handleSessionEvents(
   const text = new TextEncoder();
   const agui = view === "agui" ? new AguiSessionView(sessionId) : undefined;
   const encoder = view === "agui" ? new EventEncoder() : undefined;
+  const heartbeatIntervalMs = Math.max(1, deps.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_MS);
   let subscription: { close(): void } | undefined;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let closed = false;
+  // Tear down both the fanout subscription and the keep-alive timer exactly once,
+  // so a disconnected client can never leave an interval running.
+  const stop = () => {
+    closed = true;
+    if (heartbeat !== undefined) clearInterval(heartbeat);
+    heartbeat = undefined;
+    subscription?.close();
+  };
   const body = new ReadableStream<Uint8Array>({
     start(controller) {
       const send = (payload: unknown) => {
@@ -60,13 +76,26 @@ export function handleSessionEvents(
           send({ type: "stream.error", message: error instanceof Error ? error.message : String(error) });
         },
       });
+      // An idle session emits no frames at all, so without this the connection
+      // goes silent and dies on the first idle timeout in the path (undici's
+      // 300s body timeout in the WebUI proxy, and any intermediary's own limit).
+      // A `:` comment frame is inert: EventSource discards it, and the WebSocket
+      // relay drops it in `ssePayload` because it does not start with `data:`.
+      heartbeat = setInterval(() => {
+        if (closed) return;
+        try {
+          controller.enqueue(text.encode(": ping\n\n"));
+        } catch {
+          stop();
+        }
+      }, heartbeatIntervalMs);
       request.signal.addEventListener("abort", () => {
-        subscription?.close();
+        stop();
         controller.close();
       }, { once: true });
     },
     cancel() {
-      subscription?.close();
+      stop();
     },
   });
   return new Response(body, {
