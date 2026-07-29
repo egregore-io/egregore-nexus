@@ -131,6 +131,42 @@ fn status_exit_codes_are_scriptable() {
     assert_eq!(down.exit_code(), ExitCode::from(2));
 }
 
+#[test]
+fn service_path_preserves_install_path_and_adds_stable_fallbacks_once() {
+    let rendered = build_service_execution_path(
+        Path::new("/opt/nexus/bin/nexus"),
+        [
+            PathBuf::from("/home/e/.local/bin"),
+            PathBuf::new(),
+            PathBuf::from("/custom/bin"),
+            PathBuf::from("/home/e/.local/bin"),
+        ],
+        [
+            PathBuf::from("/home/e/.local/bin"),
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/usr/bin"),
+        ],
+        ':',
+    );
+
+    assert_eq!(
+        rendered,
+        "/opt/nexus/bin:/home/e/.local/bin:/custom/bin:/usr/local/bin:/usr/bin"
+    );
+}
+
+#[test]
+fn service_path_falls_back_when_install_path_is_missing() {
+    let rendered = build_service_execution_path(
+        Path::new("/opt/nexus/bin/nexus"),
+        Vec::<PathBuf>::new(),
+        [PathBuf::from("/usr/local/bin"), PathBuf::from("/usr/bin")],
+        ':',
+    );
+
+    assert_eq!(rendered, "/opt/nexus/bin:/usr/local/bin:/usr/bin");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn running_current_binary_uses_fast_file_identity() {
@@ -170,6 +206,51 @@ fn systemd_unit_records_run_command_and_nexus_home() {
     assert!(unit.contains("Restart=on-failure"));
     assert!(unit.contains("Environment=NEXUS_HOME=/home/e/.nexus"));
     assert!(!unit.contains("NEXUS_GATEWAY_DIR"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn systemd_unit_pins_the_install_time_service_path() {
+    let paths = DaemonPaths {
+        home: PathBuf::from("/home/e/.nexus"),
+        pid_file: PathBuf::from("/home/e/.nexus/daemon.pid"),
+        lock_file: PathBuf::from("/home/e/.nexus/daemon.lock"),
+        log_file: PathBuf::from("/home/e/.nexus/daemon.log"),
+        gateway_file: PathBuf::from("/home/e/.nexus/gateway.json"),
+        shutdown_attribution_file: PathBuf::from("/home/e/.nexus/shutdown.json"),
+    };
+    let unit = systemd_unit_with_path(
+        Path::new("/opt/nexus/bin/nexus"),
+        &paths,
+        "/opt/nexus/bin:/home/e/.local/bin:/usr/bin",
+    );
+
+    assert!(unit.contains("Environment=\"PATH=/opt/nexus/bin:/home/e/.local/bin:/usr/bin\""));
+}
+
+#[test]
+fn launchd_plist_pins_and_xml_escapes_the_service_path() {
+    let plist = launchd_service_plist_with_path(
+        Path::new("/Applications/Nexus/nexus"),
+        Path::new("/Users/e/.nexus"),
+        Path::new("/Users/e/.nexus/daemon.log"),
+        "/Users/e/a&b:/usr/bin",
+    );
+
+    assert!(plist.contains("<key>PATH</key><string>/Users/e/a&amp;b:/usr/bin</string>"));
+}
+
+#[test]
+fn windows_wrapper_pins_and_powershell_escapes_the_service_path() {
+    let script = windows_task_registration_script_with_path(
+        Path::new(r"C:\Tools\nexus.exe"),
+        Path::new(r"C:\Users\e\.nexus"),
+        r"C:\Users\e\AppData\Roaming\npm;C:\Program Files\Tool's Bin",
+    );
+
+    assert!(script.contains(
+        "$env:Path = 'C:\\Users\\e\\AppData\\Roaming\\npm;C:\\Program Files\\Tool''s Bin'"
+    ));
 }
 
 #[cfg(target_os = "linux")]

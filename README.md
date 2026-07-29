@@ -35,7 +35,10 @@ nexus webconsole launch     # start dependencies and open the browser
 ```
 
 Installing the complete package lets `nexus daemon install` register both daemon and Gateway in
-dependency order. Webconsole remains on demand.
+dependency order. The daemon service preserves the executable search path present during
+installation and adds stable platform fallbacks, so user-installed harnesses remain discoverable
+after login or reboot. Rerun `nexus daemon install` to refresh an existing service definition.
+Webconsole remains on demand.
 
 Check or update the exact npm/Cargo installation that launched the command:
 

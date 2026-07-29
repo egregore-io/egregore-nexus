@@ -76,9 +76,12 @@ nexus daemon status
 native service manager: systemd on Linux and WSL, launchd on macOS, or Task Scheduler on Windows.
 It waits for the daemon to become healthy before reporting success; a failed start exits nonzero
 and points to `nexus daemon logs`. Use `nexus daemon uninstall` to stop and remove that
-registration. When the current npm installation includes the Gateway, daemon installation also
-registers and starts the Gateway after daemon health succeeds. It never downloads a missing
-package. For a one-off detached run, use `nexus daemon start`.
+registration. The generated service preserves the executable search path present during
+installation and adds stable user/system fallbacks, so harnesses installed through npm, Homebrew,
+or a user-local package manager remain discoverable after login and reboot. Rerunning
+`nexus daemon install` refreshes that environment. When the current npm installation includes the
+Gateway, daemon installation also registers and starts the Gateway after daemon health succeeds.
+It never downloads a missing package. For a one-off detached run, use `nexus daemon start`.
 
 For foreground development, use:
 

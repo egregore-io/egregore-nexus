@@ -51,8 +51,8 @@ Stable fallbacks are:
 
 - Linux: `~/.local/bin`, `~/bin`, `/usr/local/bin`, `/usr/bin`, and `/bin`;
 - macOS: `~/.local/bin`, `~/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, and `/bin`;
-- Windows: `%APPDATA%\npm`, `%LOCALAPPDATA%\Microsoft\WindowsApps`, the Nexus binary directory,
-  and the ambient user/system path captured by the installer.
+- Windows: `%APPDATA%\npm`, `%LOCALAPPDATA%\Microsoft\WindowsApps`,
+  `%SystemRoot%\System32`, and `%SystemRoot%`.
 
 Unavailable platform-specific user directories are omitted rather than guessed from another
 user's environment.

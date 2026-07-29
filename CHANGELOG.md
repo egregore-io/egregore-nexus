@@ -107,6 +107,9 @@ All notable public changes to Egregore Nexus are documented here. This project f
 - Gateway lifecycle commands report missing installation and unhealthy runtime states explicitly.
 - Gateway startup does not signal a stale discovery PID that may have been reused after reboot;
   destructive recovery from a degraded PID requires explicit operator force.
+- Daemon service definitions preserve the install-time executable search path with stable
+  Linux, macOS, and Windows fallbacks, preventing post-login harness revival from requiring a
+  manual daemon restart.
 
 ### Security
 

@@ -147,6 +147,17 @@ fn daemon_install_enables_and_starts_the_systemd_user_service() {
     )));
     assert!(unit.contains("Restart=on-failure"));
     assert!(unit.contains(&format!("Environment=NEXUS_HOME={}", home.display())));
+    assert!(unit.contains(&format!(
+        "Environment=\"PATH={}:",
+        env!("CARGO_BIN_EXE_nexus")
+            .rsplit_once('/')
+            .map(|(directory, _)| directory)
+            .unwrap()
+    )));
+    assert!(
+        unit.contains(&fake_bin.display().to_string()),
+        "install-time PATH missing from unit: {unit}"
+    );
 }
 
 #[cfg(target_os = "linux")]
