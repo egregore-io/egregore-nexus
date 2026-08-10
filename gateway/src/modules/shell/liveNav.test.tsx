@@ -28,9 +28,10 @@ const THREADS = [
   { name: "design", members: ["ben"], lastAt: 2000 },
 ];
 const MEMBERS = [
-  { name: "ben", agent: "claude", presence: "online", currentWork: "gate" },
-  { name: "dylan", agent: "claude", presence: "busy" },
-  { name: "etan", agent: "other", kind: "human", presence: "online" },
+  { name: "ben", agentId: "a_ben", sessionId: "s_ben", agent: "claude", presence: "online", currentWork: "gate" },
+  { name: "dylan", agentId: "a_dylan", sessionId: "s_dylan", agent: "claude", presence: "busy" },
+  { name: "legacy", sessionId: "s_legacy", kind: "app", presence: "online" },
+  { name: "etan", agentId: "a_etan", sessionId: "s_etan", agent: "other", kind: "human", presence: "online" },
 ];
 const PROJECTS = [
   { projectId: "p_nexus", name: "egregore-nexus" },
@@ -125,6 +126,7 @@ describe("shell — rendered from LIVE read-view data (no seed)", () => {
     expect(within(rail).getByText("dylan")).toBeInTheDocument();
     // The agent's kind label is its brain ("claude"), shown on the DM row.
     expect(within(rail).getAllByText("claude").length).toBeGreaterThan(0);
+    expect(within(rail).queryByText("legacy")).not.toBeInTheDocument();
   });
 
   it("renders the real 'me' footer from whoami", async () => {

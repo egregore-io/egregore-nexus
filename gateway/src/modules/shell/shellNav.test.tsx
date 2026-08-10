@@ -35,8 +35,8 @@ const FX_CHANNELS: ChannelNavItem[] = [
   { id: "ops", name: "ops", count: 7, alert: true },
 ];
 const FX_DMS: DmNavItem[] = [
-  { id: "ben", name: "ben", sessionId: "s_ben", kind: "agent", presence: "online", kindLabel: "agent" },
-  { id: "dylan", name: "dylan", sessionId: "s_dylan", kind: "agent", presence: "busy", kindLabel: "agent" },
+  { id: "a_ben", agentId: "a_ben", name: "ben", kind: "agent", presence: "online", kindLabel: "agent" },
+  { id: "a_dylan", agentId: "a_dylan", name: "dylan", kind: "agent", presence: "busy", kindLabel: "agent" },
 ];
 const FX_TEAMS: TeamNavItem[] = [{ id: "core", name: "core" }];
 const FX_ME: MeIdentity = { name: "etan", role: "operator", presence: "online" };
@@ -95,6 +95,16 @@ describe("Sidebar — prototype rows from seed fixtures (props)", () => {
     expect(within(rail).getByText("No channels yet")).toBeInTheDocument();
     expect(within(rail).getByText("No members online")).toBeInTheDocument();
     expect(within(rail).getByText("No teams")).toBeInTheDocument();
+  });
+
+  it("opens a durable DM by stable agent id", async () => {
+    renderRouted(
+      <Sidebar channels={[]} dms={FX_DMS} teams={[]} />,
+    );
+
+    const link = await screen.findByRole("link", { name: /ben/i });
+    expect(link).toHaveAttribute("href", "/dm/a_ben");
+    expect(link).not.toHaveAttribute("href", "/agent/ben:s_ben");
   });
 });
 

@@ -7,6 +7,7 @@ import { qk } from "@server/read/keys";
 
 import {
   useAddThreadMember,
+  useAgentFacts,
   useDmView,
   usePubFeed,
   usePubRuleFacts,
@@ -56,6 +57,45 @@ describe("liveData polling", () => {
         verb: "dm",
         name: "ben",
         agentId: "a_ben",
+      });
+    });
+  });
+
+  it("resolves an id-addressed DM to its display name and stable send target", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify([
+          {
+            name: "ben",
+            agentId: "a_ben",
+            sessionId: "s_ben",
+            presence: "online",
+            agent: "claude",
+          },
+        ]), { status: 200 }),
+      ),
+    );
+
+    const hook = renderHook(() => ({
+      view: useDmView("a_ben"),
+      facts: useAgentFacts("a_ben"),
+    }), { wrapper });
+
+    await waitFor(() => {
+      expect(hook.result.current.view.title).toBe("ben");
+      expect(hook.result.current.view.target).toEqual({
+        verb: "dm",
+        name: "ben",
+        agentId: "a_ben",
+      });
+      expect(hook.result.current.facts).toMatchObject({
+        found: true,
+        facts: [
+          { dt: "Name", dd: "ben" },
+          { dt: "Harness", dd: "claude" },
+          { dt: "Status", dd: "online" },
+        ],
       });
     });
   });

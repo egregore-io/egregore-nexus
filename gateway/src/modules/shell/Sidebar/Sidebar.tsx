@@ -294,16 +294,14 @@ function KebabIcon() {
 }
 
 function DmRow({ dm, matchRoute }: { dm: DmNavItem; matchRoute: MatchRoute }) {
-  // The operator's view onto this agent's daemon-owned session: `/agent/<name>:<session_id>`.
-  const handle = dm.sessionId ? `${dm.name}:${dm.sessionId}` : dm.name;
   const active = Boolean(
-    matchRoute({ to: "/agent/$handle", params: { handle } }),
+    matchRoute({ to: "/dm/$agent", params: { agent: dm.agentId } }),
   );
   return (
     <li>
       <Link
-        to="/agent/$handle"
-        params={{ handle }}
+        to="/dm/$agent"
+        params={{ agent: dm.agentId }}
         className={cn(rowBase, active && rowActive)}
         aria-current={active ? "page" : undefined}
       >

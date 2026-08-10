@@ -64,11 +64,17 @@ function toChannel(t: ThreadRow): ChannelNavItem {
   return { id: t.name, name: t.name };
 }
 
-function toDm(m: MemberRow): DmNavItem {
+type AddressableMember = MemberRow & { agentId: string };
+
+function isAddressableMember(m: MemberRow): m is AddressableMember {
+  return typeof m.agentId === "string" && m.agentId.trim().length > 0;
+}
+
+function toDm(m: AddressableMember): DmNavItem {
   return {
-    id: m.name,
+    id: m.agentId,
+    agentId: m.agentId,
     name: m.name,
-    sessionId: m.sessionId,
     kind: memberKind(m),
     presence: presence(m.presence),
     kindLabel: m.agent,
@@ -117,7 +123,10 @@ export function useDms() {
     queryKey: qk.members("all"),
     queryFn: () => getJson<MemberRow[]>("/api/v1/members?includeOffline=true"),
     select: (rows) => rows
-      .filter((m) => m.kind !== "human" && presence(m.presence) !== "offline")
+      .filter((m): m is AddressableMember =>
+        m.kind !== "human"
+          && presence(m.presence) !== "offline"
+          && isAddressableMember(m))
       .map(toDm),
     staleTime: STALE,
   });

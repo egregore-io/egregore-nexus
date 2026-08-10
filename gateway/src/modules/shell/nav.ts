@@ -26,9 +26,9 @@ export interface ChannelNavItem {
 /** A direct-message row ("• name agent"). */
 export interface DmNavItem {
   id: string;
+  /** Stable daemon identity used by the canonical DM route. */
+  agentId: string;
   name: string;
-  /** The daemon-owned session this agent is bound to — addresses `/agent/<name>:<session_id>`. */
-  sessionId: string;
   kind: AgentKind;
   presence: PresenceValue;
   /** The kind label shown faint on the right (e.g. "agent"). */
