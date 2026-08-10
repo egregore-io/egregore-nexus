@@ -67,6 +67,62 @@ describe("public canonical Gateway reads", () => {
     db.close();
   });
 
+  it("scopes DM history to the authenticated human and exact agent", async () => {
+    const db = createClient({ url: ":memory:" });
+    await migrateGatewayStore(db);
+    await db.batch([
+      `INSERT INTO identities VALUES
+        ('a_bob','Bob',NULL,'agent','agent','{}',1),
+        ('a_paul','paul',NULL,'agent','agent','{}',1)`,
+      `INSERT INTO bus_messages
+        (message_id, kind, from_name, from_agent_id, to_name, to_agent_id,
+         body, provenance_json, created_at) VALUES
+        ('m_agent_only','dm','paul','a_paul','Bob','a_bob',
+         'private agent traffic','{}',10)`,
+    ], "write");
+    const deps = { db: vi.fn(), canonicalDb: () => db };
+    const caller = {
+      name: "Earl Tan",
+      project: "default",
+      sessionId: "local-operator",
+    };
+
+    const empty = await handle({
+      method: "GET",
+      path: "/api/v1/dms/a_bob/history",
+      query: {},
+      headers: {},
+      caller,
+    }, deps);
+
+    expect(empty.status).toBe(200);
+    expect(empty.body).toEqual([]);
+
+    await db.execute(`INSERT INTO bus_messages
+      (message_id, kind, from_name, from_agent_id, to_name, to_agent_id,
+       body, provenance_json, created_at) VALUES
+      ('m_human_pair','dm','Bob','a_bob','Earl Tan',NULL,
+       'reply to the signed-in human','{}',11)`);
+
+    const paired = await handle({
+      method: "GET",
+      path: "/api/v1/dms/a_bob/history",
+      query: {},
+      headers: {},
+      caller,
+    }, deps);
+
+    expect(paired.status).toBe(200);
+    expect(paired.body).toMatchObject([
+      {
+        messageId: "m_human_pair",
+        from: "Bob",
+        body: "reply to the signed-in human",
+      },
+    ]);
+    db.close();
+  });
+
   it("serves a projected thread message even when the Gateway missed the earlier thread registry event", async () => {
     const db = createClient({ url: ":memory:" });
     await migrateGatewayStore(db);

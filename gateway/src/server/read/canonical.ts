@@ -480,12 +480,13 @@ export async function canonicalThreadHistory(
 export async function canonicalDmHistory(
   db: Client,
   nameOrAgentId: string,
+  callerName: string,
   options: MessagePageOptions,
 ): Promise<CanonicalHistoryPage> {
   const identity = await canonicalIdentity(db, nameOrAgentId);
   const target = !identity
-    ? { dmName: nameOrAgentId }
-    : { dmAgentId: identity.agentId };
+    ? { dmName: nameOrAgentId, callerName }
+    : { dmAgentId: identity.agentId, callerName };
   return mapHistory(await pageCanonicalMessages(db, target, options));
 }
 
