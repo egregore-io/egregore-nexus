@@ -97,8 +97,19 @@ async function proxyGateway(request, response, incoming) {
     duplex: body ? "half" : undefined,
   });
   response.writeHead(upstream.status, Object.fromEntries(upstream.headers));
-  if (upstream.body) Readable.fromWeb(upstream.body).pipe(response);
-  else response.end();
+  if (!upstream.body) {
+    response.end();
+    return;
+  }
+  // Pipe upstream → client, but NEVER let a stream error crash the process. If
+  // the upstream body resets (idle timeout, gateway restart) or the client
+  // disconnects, tear down cleanly; the browser reconnects on its own.
+  const source = Readable.fromWeb(upstream.body);
+  source.on("error", () => {
+    if (!response.writableEnded) response.end();
+  });
+  response.on("close", () => source.destroy());
+  source.pipe(response);
 }
 
 async function regularFile(path) {
