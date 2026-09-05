@@ -31,6 +31,25 @@ pub struct PromptRequest {
     pub client_message_id: Option<String>,
 }
 
+impl PromptRequest {
+    /// Reject unsupported intent before serde's forward-compatible field handling can discard
+    /// it. This candidate supports boundary prompts only; automatic native admission and model
+    /// selection must not be downgraded to an ordinary prompt while their capability is absent.
+    pub fn validate_supported_options(
+        params: &serde_json::Value,
+    ) -> Result<(), crate::ContractError> {
+        for field in ["delivery", "modelSelection"] {
+            if params.get(field).is_some_and(|value| !value.is_null()) {
+                return Err(crate::ContractError {
+                    code: crate::codes::INVALID_PARAMS,
+                    message: format!("{field} is not supported by this prompt endpoint"),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Response: whether the turn was injected (the reply itself streams over the WS).
 #[typeshare]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

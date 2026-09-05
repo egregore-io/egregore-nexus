@@ -1584,6 +1584,9 @@ async fn command_row_for_acceptance(
     params: Value,
     idempotency_key: Option<String>,
 ) -> Result<(NewCommandIntent, Option<String>), ContractError> {
+    if kind == nexus_store::command_kinds::harness::PROMPT {
+        nexus_contracts::PromptRequest::validate_supported_options(&params)?;
+    }
     let Some(evidence) = caller else {
         return Ok((
             command_row(None, command_id, kind, params, idempotency_key),

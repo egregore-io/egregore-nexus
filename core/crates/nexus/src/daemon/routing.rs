@@ -847,6 +847,10 @@ async fn route_request_inner(
         // reply is captured as `agent.update` rows (the gateway formats them to AG-UI via observe).
         "prompt" => {
             let c = require(caller)?;
+            if let Some(params) = p {
+                nexus_contracts::PromptRequest::validate_supported_options(params)
+                    .map_err(|error| contract_to_rpc(&error))?;
+            }
             let r: nexus_contracts::PromptRequest = parse(p)?;
             // Revive the agent via the correct backend for its transport (pty or acp), then inject.
             let session = match r.agent_id.as_ref() {

@@ -29,7 +29,8 @@ use nexus_contracts::{
 };
 use nexus_store::command_kinds;
 use nexus_store::repos::{
-    AgentRef, Agents, CommandIntentRow, CommandIntents, DaemonState, Inbox, Sessions,
+    AgentRef, Agents, AutoCommandOutcome, CommandIntentRow, CommandIntents, DaemonState, Inbox,
+    Sessions,
 };
 use nexus_store::types::SessionRow;
 
@@ -516,6 +517,9 @@ async fn claim_next_for_lane(
     // isolated by lane.
     let _claim_guard = state.store.write_lock().lock_owned().await;
     let repo = CommandIntents::new(&state.store);
+    if matches!(lane, WorkerLane::Any | WorkerLane::Control) {
+        repo.expire_started_auto_claims(now()).await?;
+    }
     let row = match lane {
         WorkerLane::Any => repo.claim_next(now(), LEASE_MS).await?,
         WorkerLane::Control => {
@@ -622,6 +626,28 @@ async fn complete_claimed_row(
     let repo = CommandIntents::new(&state.store);
     let command_id = row.command_id.clone();
     let claimed_at = row.claimed_at;
+    if row.kind == command_kinds::harness::PROMPT {
+        let params: Value = serde_json::from_str(&row.request_json).unwrap_or(Value::Null);
+        if params.get("delivery").and_then(Value::as_str) == Some("auto") {
+            // Ingress does not advertise/accept auto yet. Settle a pre-existing/direct-store
+            // row explicitly rather than downgrading it or wedging behind legacy settlement.
+            // No native call occurs. A previously armed row is instead handled by uncertainty
+            // recovery and can never reach this claim path again.
+            if repo.mark_auto_started_for_claim(&row, now()).await? {
+                let error = ContractError {
+                    code: codes::INVALID_PARAMS,
+                    message: "delivery is not supported by this prompt endpoint".into(),
+                };
+                repo.settle_auto_claim(
+                    &row,
+                    AutoCommandOutcome::Rejected(&json_string(&error)?),
+                    now(),
+                )
+                .await?;
+            }
+            return Ok(());
+        }
+    }
     if let Some(claimed_at) = claimed_at {
         if !repo
             .mark_started_for_claim(&command_id, claimed_at, now())

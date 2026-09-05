@@ -137,4 +137,7 @@ pub mod codes {
     pub const DELIVERY_TIMING_UNSUPPORTED: i32 = -32009;
     /// The durable per-session prompt queue reached its bounded pending-row capacity.
     pub const COMMAND_QUEUE_FULL: i32 = -32010;
+    /// Native delivery may have occurred. Do not automatically retry this command: a timeout,
+    /// lost response, or daemon restart cannot establish that the agent received nothing.
+    pub const DELIVERY_UNCERTAIN: i32 = -32011;
 }

@@ -24,6 +24,56 @@ async fn state() -> AppState {
     AppState::wire(store, &Config::default())
 }
 
+#[tokio::test]
+async fn unsupported_prompt_options_are_rejected_before_durable_enqueue() {
+    let state = state().await;
+    for (index, options) in [
+        serde_json::json!({"delivery": "auto"}),
+        serde_json::json!({"modelSelection": {"modelId": "target-model"}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut params =
+            serde_json::json!({"agentId": "a_target", "name": "target", "text": "preserve intent"});
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(options.as_object().unwrap().clone());
+        let command_id = format!("cmd-unsupported-options-{index}");
+        let response = daemon_ipc::handle_request(
+            &state,
+            "boot-token",
+            DaemonIpcRequest {
+                version: DAEMON_IPC_PROTOCOL_VERSION,
+                token: "boot-token".into(),
+                request_id: format!("rpc-options-{index}"),
+                caller: None,
+                call: DaemonIpcCall::Enqueue {
+                    command_id: command_id.clone(),
+                    kind: nexus_store::command_kinds::harness::PROMPT.into(),
+                    params,
+                    idempotency_key: None,
+                },
+            },
+        )
+        .await;
+        assert!(
+            response.error.is_some(),
+            "unsupported options must not silently become ordinary delivery"
+        );
+        assert_eq!(
+            response.error.unwrap().code,
+            nexus_contracts::codes::INVALID_PARAMS
+        );
+        assert!(CommandIntents::new(&state.store)
+            .get(&command_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
 fn register_request() -> RegisterRequest {
     RegisterRequest {
         agent_id: None,

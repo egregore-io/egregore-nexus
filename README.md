@@ -49,6 +49,10 @@ Successful agent resumes republish canonical identity/runtime snapshots even whe
 already appears online to the daemon. In buffered projection mode, a separately started Gateway
 can replay those updates after connecting; Gateway startup remains explicit.
 
+Session composers should use queued prompts for ordinary Send, not infer strict steer from
+displayed activity. Unsupported delivery/model options are rejected rather than discarded.
+See [composer delivery and retry safety](docs/composer-delivery.md).
+
 Check or update the exact npm/Cargo installation that launched the command:
 
 ```bash

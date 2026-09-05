@@ -406,6 +406,374 @@ async fn expired_claim_can_be_reclaimed() {
     assert_eq!(second.lease_until, Some(121));
 }
 
+fn auto_prompt_pending(id: &str) -> NewCommandIntent {
+    let mut row = prompt_pending(id, "recipient", 1);
+    row.request_json = serde_json::json!({
+        "agentId": "a_recipient", "name": "recipient", "text": "hello",
+        "clientMessageId": id, "expectedSessionId": "s_recipient", "delivery": "auto"
+    })
+    .to_string();
+    row
+}
+
+async fn arm_auto(repo: &CommandIntents<'_>, id: &str, now: i64) -> bool {
+    let claim = repo.get(id).await.unwrap().unwrap();
+    repo.mark_auto_started_for_claim(&claim, now).await.unwrap()
+}
+
+#[tokio::test]
+async fn started_auto_prompt_is_not_reclaimed_after_lease_expiry_by_any_claim_path() {
+    let store = migrated().await;
+    insert_session_with_agent_id(&store, "s_recipient", "recipient", "a_recipient").await;
+    let repo = CommandIntents::new(&store);
+    repo.insert_pending(auto_prompt_pending("cmd_auto"))
+        .await
+        .unwrap();
+    let claim = repo.claim_next(100, 10).await.unwrap().unwrap();
+    assert!(repo.mark_auto_started_for_claim(&claim, 101).await.unwrap());
+
+    assert!(
+        repo.claim_next(111, 10).await.unwrap().is_none(),
+        "lease expiry is not evidence that native delivery had no effect"
+    );
+    assert!(repo
+        .claim_next_kind(111, 10, command_kinds::harness::PROMPT)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(repo
+        .claim_next_ready_harness_prompt(111, 10, &[])
+        .await
+        .unwrap()
+        .is_none());
+    assert!(repo
+        .claim_next_ready_harness_prompt_for_session(111, 10, "s_recipient")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(repo
+        .claim_next_ready_harness_command(111, 10, command_kinds::harness::PROMPT)
+        .await
+        .unwrap()
+        .is_none());
+    let unchanged = repo.get("cmd_auto").await.unwrap().unwrap();
+    assert_eq!(unchanged.attempts, 1);
+    assert_eq!(unchanged.started_at, Some(101));
+}
+
+#[tokio::test]
+async fn auto_prompt_uncertainty_survives_a_split_daemon_store_restart() {
+    let path = std::env::temp_dir().join(format!(
+        "nexus-auto-restart-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let daemon = DaemonStore::open(path.to_str().unwrap()).await.unwrap();
+        let store = daemon.compatibility_store();
+        let repo = CommandIntents::new(&store);
+        repo.insert_pending(auto_prompt_pending("cmd_restart_auto"))
+            .await
+            .unwrap();
+        repo.claim_next(100, 10).await.unwrap().unwrap();
+        assert!(arm_auto(&repo, "cmd_restart_auto", 101).await);
+        // Simulate process death after admission was armed but before its result was recorded.
+    }
+    {
+        let daemon = DaemonStore::open(path.to_str().unwrap()).await.unwrap();
+        let store = daemon.compatibility_store();
+        let repo = CommandIntents::new(&store);
+        assert!(
+            repo.claim_next(1_000, 10).await.unwrap().is_none(),
+            "restart must not redeliver a potentially accepted automatic send"
+        );
+        assert_eq!(
+            repo.get("cmd_restart_auto")
+                .await
+                .unwrap()
+                .unwrap()
+                .attempts,
+            1
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(path.with_extension("db-shm"));
+}
+
+#[tokio::test]
+async fn auto_prompt_without_a_started_boundary_remains_reclaimable() {
+    let store = migrated().await;
+    let repo = CommandIntents::new(&store);
+    repo.insert_pending(auto_prompt_pending("cmd_unstarted_auto"))
+        .await
+        .unwrap();
+    repo.claim_next(100, 10).await.unwrap().unwrap();
+    let reclaimed = repo.claim_next(111, 10).await.unwrap().unwrap();
+    assert_eq!(reclaimed.command_id, "cmd_unstarted_auto");
+    assert_eq!(reclaimed.attempts, 2);
+}
+
+#[tokio::test]
+async fn shutdown_retry_does_not_clear_an_armed_auto_prompt() {
+    let store = migrated().await;
+    let repo = CommandIntents::new(&store);
+    repo.insert_pending(auto_prompt_pending("cmd_auto_shutdown"))
+        .await
+        .unwrap();
+    repo.claim_next(100, 10).await.unwrap().unwrap();
+    assert!(arm_auto(&repo, "cmd_auto_shutdown", 101).await);
+    assert!(
+        !repo
+            .release_claim_for_shutdown_retry("cmd_auto_shutdown", 100)
+            .await
+            .unwrap(),
+        "generic shutdown retry has no native evidence permitting an armed auto send to replay"
+    );
+    assert!(repo.claim_next(200, 10).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn expired_auto_owner_cannot_arm_admission() {
+    let store = migrated().await;
+    let repo = CommandIntents::new(&store);
+    repo.insert_pending(auto_prompt_pending("cmd_expired_auto"))
+        .await
+        .unwrap();
+    repo.claim_next(100, 10).await.unwrap().unwrap();
+    assert!(
+        !arm_auto(&repo, "cmd_expired_auto", 110).await,
+        "an owner whose lease already expired cannot cross native admission"
+    );
+    assert_eq!(repo.claim_next(111, 10).await.unwrap().unwrap().attempts, 2);
+}
+
+#[tokio::test]
+async fn armed_auto_prompt_blocks_a_later_prompt_in_its_lane_after_lease_expiry() {
+    let store = migrated().await;
+    insert_session_with_agent_id(&store, "s_recipient", "recipient", "a_recipient").await;
+    insert_session(&store, "s_other", "other").await;
+    let repo = CommandIntents::new(&store);
+    repo.insert_pending(auto_prompt_pending("cmd_auto_first"))
+        .await
+        .unwrap();
+    repo.claim_next(100, 10).await.unwrap().unwrap();
+    assert!(arm_auto(&repo, "cmd_auto_first", 101).await);
+    repo.insert_pending(prompt_pending("cmd_same_lane", "recipient", 2))
+        .await
+        .unwrap();
+    repo.insert_pending(prompt_pending("cmd_other_lane", "other", 3))
+        .await
+        .unwrap();
+    let other = repo
+        .claim_next_ready_harness_prompt(111, 10, &[])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        other.command_id, "cmd_other_lane",
+        "an expired native attempt is still unresolved; unrelated lanes must keep progressing"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_reports_armed_auto_delivery_as_uncertain_and_retains_its_replay_fence() {
+    let store = migrated().await;
+    let repo = CommandIntents::new(&store);
+    repo.insert_pending(auto_prompt_pending("cmd_uncertain_shutdown"))
+        .await
+        .unwrap();
+    repo.claim_next(100, 10).await.unwrap().unwrap();
+    assert!(arm_auto(&repo, "cmd_uncertain_shutdown", 101).await);
+    assert_eq!(repo.reap_claimed_for_shutdown(111).await.unwrap(), 1);
+    let row = repo.get("cmd_uncertain_shutdown").await.unwrap().unwrap();
+    let error: serde_json::Value =
+        serde_json::from_str(row.error_json.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        error["code"], -32011,
+        "uncertainty must not look like a known rejected send"
+    );
+    assert!(
+        !repo
+            .mark_done_for_claim("cmd_uncertain_shutdown", 100, "{}", 112)
+            .await
+            .unwrap(),
+        "late native callbacks cannot replace an uncertainty terminal"
+    );
+    repo.reap_terminal_older_than(1_000).await.unwrap();
+    assert!(
+        repo.get("cmd_uncertain_shutdown").await.unwrap().is_some(),
+        "unresolved uncertainty is an outstanding delivery obligation, not expirable history"
+    );
+    assert!(repo.claim_next(1_001, 10).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn auto_admission_requires_the_current_attempt_and_has_one_winner() {
+    let store = migrated().await;
+    let repo = CommandIntents::new(&store);
+    repo.insert_pending(auto_prompt_pending("cmd_auto_cas"))
+        .await
+        .unwrap();
+    let old = repo.claim_next(100, 10).await.unwrap().unwrap();
+    let current = repo.claim_next(111, 10).await.unwrap().unwrap();
+    let mut forged = old.clone();
+    forged.claimed_at = current.claimed_at;
+    assert!(
+        !repo
+            .mark_auto_started_for_claim(&forged, 112)
+            .await
+            .unwrap(),
+        "the claim timestamp alone must not authorize an older attempt"
+    );
+    let (left, right) = tokio::join!(
+        repo.mark_auto_started_for_claim(&current, 112),
+        repo.mark_auto_started_for_claim(&current, 112)
+    );
+    assert_ne!(
+        left.unwrap(),
+        right.unwrap(),
+        "only one worker may arm native admission"
+    );
+}
+
+#[tokio::test]
+async fn auto_only_current_known_nonacceptance_may_defer_and_old_callbacks_cannot_settle() {
+    use nexus_store::repos::AutoCommandOutcome;
+    let store = migrated().await;
+    let repo = CommandIntents::new(&store);
+    repo.insert_pending(auto_prompt_pending("cmd_auto_deferred"))
+        .await
+        .unwrap();
+    let first = repo.claim_next(100, 10).await.unwrap().unwrap();
+    assert!(repo.mark_auto_started_for_claim(&first, 101).await.unwrap());
+    assert!(repo
+        .defer_auto_claim_known_not_accepted(&first)
+        .await
+        .unwrap());
+    let second = repo.claim_next(102, 10).await.unwrap().unwrap();
+    assert!(repo
+        .mark_auto_started_for_claim(&second, 103)
+        .await
+        .unwrap());
+    assert!(!repo
+        .defer_auto_claim_known_not_accepted(&first)
+        .await
+        .unwrap());
+    assert!(!repo
+        .settle_auto_claim(&first, AutoCommandOutcome::Completed("{}"), 104)
+        .await
+        .unwrap());
+    assert_eq!(repo.expire_started_auto_claims(112).await.unwrap(), 1);
+    assert!(
+        !repo
+            .settle_auto_claim(&second, AutoCommandOutcome::Completed("{}"), 113)
+            .await
+            .unwrap(),
+        "an old detached task cannot overwrite the unknown terminal with a late response"
+    );
+    assert!(!repo
+        .defer_auto_claim_known_not_accepted(&second)
+        .await
+        .unwrap());
+    let row = repo.get("cmd_auto_deferred").await.unwrap().unwrap();
+    assert_eq!(row.status, "error");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(row.error_json.as_deref().unwrap()).unwrap()
+            ["code"],
+        -32011
+    );
+    assert!(repo.claim_next(200, 10).await.unwrap().is_none());
+    let resumed = repo
+        .insert_pending_or_resume(auto_prompt_pending("cmd_auto_deferred"))
+        .await
+        .unwrap();
+    assert_eq!(resumed, "cmd_auto_deferred");
+    assert!(repo.claim_next(201, 10).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn auto_known_outcomes_settle_once_and_keep_normal_retention() {
+    use nexus_store::repos::AutoCommandOutcome;
+    for outcome in [
+        AutoCommandOutcome::Completed(r#"{"delivered":true}"#),
+        AutoCommandOutcome::Rejected(r#"{"code":-32602,"message":"wrong session"}"#),
+    ] {
+        let store = migrated().await;
+        let repo = CommandIntents::new(&store);
+        repo.insert_pending(auto_prompt_pending("cmd_auto_settle"))
+            .await
+            .unwrap();
+        let claim = repo.claim_next(100, 10).await.unwrap().unwrap();
+        assert!(repo.mark_auto_started_for_claim(&claim, 101).await.unwrap());
+        assert!(repo.settle_auto_claim(&claim, outcome, 102).await.unwrap());
+        assert!(!repo
+            .settle_auto_claim(&claim, AutoCommandOutcome::Uncertain, 103)
+            .await
+            .unwrap());
+        assert_eq!(repo.reap_terminal_older_than(200).await.unwrap(), 1);
+    }
+}
+
+#[tokio::test]
+async fn auto_fence_cannot_be_bypassed_by_legacy_settlement_helpers() {
+    let store = migrated().await;
+    let repo = CommandIntents::new(&store);
+    repo.insert_pending(auto_prompt_pending("cmd_auto_legacy"))
+        .await
+        .unwrap();
+    let claim = repo.claim_next(100, 10).await.unwrap().unwrap();
+    assert!(
+        !repo
+            .mark_started_for_claim("cmd_auto_legacy", 100, 101)
+            .await
+            .unwrap(),
+        "automatic admission requires attempt-scoped ownership, not the legacy timestamp helper"
+    );
+    assert!(repo.mark_auto_started_for_claim(&claim, 101).await.unwrap());
+    assert!(!repo
+        .mark_done_for_claim("cmd_auto_legacy", 100, "{}", 102)
+        .await
+        .unwrap());
+    assert!(!repo
+        .mark_error_for_claim("cmd_auto_legacy", 100, "{}", 102)
+        .await
+        .unwrap());
+    assert_eq!(repo.expire_started_auto_claims(111).await.unwrap(), 1);
+    let before = repo.get("cmd_auto_legacy").await.unwrap().unwrap();
+    repo.mark_done("cmd_auto_legacy", "{}", 112).await.unwrap();
+    repo.mark_error("cmd_auto_legacy", "{}", 113).await.unwrap();
+    assert_eq!(
+        repo.get("cmd_auto_legacy").await.unwrap().unwrap(),
+        before,
+        "unscoped legacy writes must not overwrite the auto uncertainty terminal"
+    );
+}
+
+#[tokio::test]
+async fn auto_guards_do_not_poison_legacy_claims_with_malformed_payloads() {
+    let store = migrated().await;
+    let repo = CommandIntents::new(&store);
+    // Non-session commands can carry malformed payloads until their own dispatch validation.
+    // Session prompts already have JSON-expression indexes that reject malformed insertion.
+    let mut invalid = pending("cmd_bad_payload", 1);
+    invalid.request_json = "{invalid json".into();
+    repo.insert_pending(invalid).await.unwrap();
+    let row = repo.claim_next(100, 10).await.unwrap().unwrap();
+    assert_eq!(row.command_id, "cmd_bad_payload");
+    assert!(repo
+        .mark_started_for_claim(&row.command_id, 100, 101)
+        .await
+        .unwrap());
+    repo.mark_error(&row.command_id, "legacy unstructured error", 102)
+        .await
+        .unwrap();
+    assert_eq!(repo.reap_terminal_older_than(200).await.unwrap(), 1);
+}
+
 #[tokio::test]
 async fn lane_depths_and_shutdown_reap_claimed_rows_only() {
     let store = migrated().await;

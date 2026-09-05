@@ -58,16 +58,25 @@ export async function handleConversationPromptPost(
   request: Request,
   deps: ConversationPromptDeps = {},
 ): Promise<Response> {
-  let body: { name?: string; agentId?: string; text?: string; clientMessageId?: string };
+  let body: { name?: string; agentId?: string; text?: string; clientMessageId?: string; delivery?: unknown; modelSelection?: unknown };
   try {
     body = (await request.json()) as {
       name?: string;
       agentId?: string;
       text?: string;
       clientMessageId?: string;
+      delivery?: unknown;
+      modelSelection?: unknown;
     };
   } catch {
     return json({ error: "body must be JSON" }, 400);
+  }
+  // This daemon candidate exposes only legacy boundary delivery. Never discard an explicit
+  // model selection or delivery policy and enqueue a different operation on the user's behalf.
+  for (const option of ["delivery", "modelSelection"] as const) {
+    if (body[option] != null) {
+      return json({ error: `${option} is not supported by this prompt endpoint` }, 400);
+    }
   }
   const targetName = body.name ?? body.agentId;
   if (!targetName || !body.text) return json({ error: "name and text are required" }, 400);

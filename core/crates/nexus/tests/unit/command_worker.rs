@@ -601,6 +601,81 @@ async fn harness_prompt_claim_lease_outlives_execution_timeout() {
 }
 
 #[tokio::test]
+async fn persisted_unsupported_auto_prompt_is_rejected_without_native_delivery() {
+    let exec = Arc::new(PromptDispatchBarrier::default());
+    let state = test_state_with_turn_exec(exec.clone()).await;
+    let operator = state
+        .identity
+        .register(human_register("operator", "ck_auto_reject"))
+        .await
+        .unwrap();
+    let mut intent = prompt_intent(
+        "cmd_auto_reject",
+        &operator,
+        "operator",
+        "ck_auto_reject",
+        "hello",
+        1,
+    );
+    let mut params: serde_json::Value = serde_json::from_str(&intent.request_json).unwrap();
+    params["delivery"] = serde_json::json!("auto");
+    intent.request_json = params.to_string();
+    let repo = CommandIntents::new(&state.store);
+    repo.insert_pending(intent).await.unwrap();
+    assert!(process_next(&state).await.unwrap());
+    let row = repo.get("cmd_auto_reject").await.unwrap().unwrap();
+    assert_eq!(
+        row.status, "error",
+        "unsupported durable rows must settle, not remain wedged"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(row.error_json.as_deref().unwrap()).unwrap()
+            ["code"],
+        nexus_contracts::codes::INVALID_PARAMS
+    );
+    assert_eq!(exec.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn worker_settles_expired_armed_auto_as_unknown_without_native_redelivery() {
+    let exec = Arc::new(PromptDispatchBarrier::default());
+    let state = test_state_with_turn_exec(exec.clone()).await;
+    let operator = state
+        .identity
+        .register(human_register("operator", "ck_auto_expired"))
+        .await
+        .unwrap();
+    let mut intent = prompt_intent(
+        "cmd_auto_expired",
+        &operator,
+        "operator",
+        "ck_auto_expired",
+        "hello",
+        1,
+    );
+    let mut params: serde_json::Value = serde_json::from_str(&intent.request_json).unwrap();
+    params["delivery"] = serde_json::json!("auto");
+    intent.request_json = params.to_string();
+    let repo = CommandIntents::new(&state.store);
+    repo.insert_pending(intent).await.unwrap();
+    let old_claim = repo.claim_next(100, 10).await.unwrap().unwrap();
+    assert!(repo
+        .mark_auto_started_for_claim(&old_claim, 101)
+        .await
+        .unwrap());
+    assert!(!process_next(&state).await.unwrap());
+    let row = repo.get("cmd_auto_expired").await.unwrap().unwrap();
+    assert_eq!(row.status, "error");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(row.error_json.as_deref().unwrap()).unwrap()
+            ["code"],
+        nexus_contracts::codes::DELIVERY_UNCERTAIN
+    );
+    assert_eq!(row.attempts, 1);
+    assert_eq!(exec.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn graceful_shutdown_drains_the_active_prompt_and_defers_pre_fence_backlog() {
     let exec = Arc::new(PromptDispatchBarrier::default());
     let state = test_state_with_turn_exec(exec.clone()).await;

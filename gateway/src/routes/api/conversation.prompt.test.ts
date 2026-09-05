@@ -53,6 +53,25 @@ async function makeCommandDb(): Promise<Client> {
 }
 
 describe("POST /api/conversation/prompt", () => {
+  it.each([
+    { delivery: "auto" },
+    { modelSelection: { modelId: "target-model", expectedSessionId: "s_target" } },
+  ])("rejects unsupported delivery options instead of silently downgrading: %j", async (options) => {
+    const db = await makeCommandDb();
+    const response = await handleConversationPromptPost(new Request("http://localhost/api/conversation/prompt", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agentId: "a_target", name: "target", text: "keep my intent", clientMessageId: "cm_options", ...options }),
+    }), {
+      env: { NEXUS_WEB_AUTH_MODE: "local" },
+      commandIngress: { db, genCommandId: () => "cmd_options", now: () => 1_000 },
+    });
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: expect.stringContaining("not supported") });
+    expect((await db.execute("SELECT * FROM command_intents")).rows).toHaveLength(0);
+    db.close();
+  });
+
   it("returns a stable durable queued receipt without claiming delivery", async () => {
     const db = await makeCommandDb();
 
