@@ -181,6 +181,19 @@ impl CodexTurnTracker {
             .cloned()
     }
 
+    /// Apply consumed native terminal evidence to routing authority without settling receipts.
+    /// Display/storage I/O may still be pending; it must not keep this exact turn busy or allow
+    /// a late start response to resurrect it. A newer active turn is never cleared here.
+    pub(super) fn observe_terminal_turn(&self, thread_id: &str, turn_id: &str) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.active_turn_ids.get(thread_id).map(String::as_str) == Some(turn_id) {
+            inner.active_turn_ids.remove(thread_id);
+        }
+        inner
+            .last_finished_turn_ids
+            .insert(thread_id.to_string(), turn_id.to_string());
+    }
+
     /// Record runtime evidence that `turn_id` is active for `thread_id`.
     ///
     /// `turn/started` is the primary source. Non-terminal item/delta notifications also call this

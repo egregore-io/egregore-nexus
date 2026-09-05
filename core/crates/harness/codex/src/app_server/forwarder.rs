@@ -207,7 +207,7 @@ pub fn spawn_codex_forwarder_with_tool_observations(
                             &n.method,
                             &n.params,
                         );
-                        observe_active_turn_if_needed(&turn_tracker, &n.method, &n.params);
+                        observe_turn_authority(&turn_tracker, &n.method, &n.params);
 
                         let Some(ev) = translate_codex(&n.method, &n.params) else {
                             emit_accepted_if_turn_notification(&turn_tracker, &n.method, &n.params)
@@ -329,7 +329,7 @@ pub fn spawn_codex_forwarder_with_tool_observations(
                     &n.method,
                     &n.params,
                 );
-                observe_active_turn_if_needed(&turn_tracker, &n.method, &n.params);
+                observe_turn_authority(&turn_tracker, &n.method, &n.params);
 
                 let Some(ev) = translate_codex(&n.method, &n.params) else {
                     emit_accepted_if_turn_notification(&turn_tracker, &n.method, &n.params).await;
@@ -515,19 +515,22 @@ fn mark_delivery_receipt_if_needed(
     tracker.observe_delivery_receipt(thread_id, turn_id);
 }
 
-fn observe_active_turn_if_needed(tracker: &CodexTurnTracker, method: &str, params: &Value) {
-    if method == method::TURN_COMPLETED
-        || (method == method::TURN_FAILED && !turn_error_will_retry(params))
-    {
-        return;
-    }
+fn observe_turn_authority(tracker: &CodexTurnTracker, method: &str, params: &Value) {
     let (Some(thread_id), Some(turn_id)) = (
         params.get("threadId").and_then(Value::as_str),
         notification_turn_id(params),
     ) else {
         return;
     };
-    tracker.observe_active_turn(thread_id, turn_id);
+    if method == method::TURN_COMPLETED
+        || (method == method::TURN_FAILED && !turn_error_will_retry(params))
+    {
+        // Routing truth follows the consumed native terminal, not the completion of display
+        // writes. Receipt/waiter settlement remains after accepted events and ordered output.
+        tracker.observe_terminal_turn(thread_id, turn_id);
+    } else {
+        tracker.observe_active_turn(thread_id, turn_id);
+    }
 }
 
 async fn emit_accepted_if_turn_notification(

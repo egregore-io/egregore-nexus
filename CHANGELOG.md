@@ -12,6 +12,8 @@ All notable public changes to Egregore Nexus are documented here. This project f
 
 ### Fixed
 
+- Clear completed Codex turns from routing activity before waiting on their display writes,
+  without reordering output/receipts or clearing a newer active turn.
 - Reject unsupported session-prompt delivery/model options instead of silently sending a
   different operation, including after queued prompts are redirected to Steer. Add restart-safe
   automatic-delivery journal guards without enabling native auto-delivery; uncertain attempts

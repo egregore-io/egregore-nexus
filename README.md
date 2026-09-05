@@ -52,6 +52,7 @@ can replay those updates after connecting; Gateway startup remains explicit.
 Session composers should use queued prompts for ordinary Send, not infer strict steer from
 displayed activity. Unsupported delivery/model options are rejected rather than discarded,
 including on redirected queued prompts.
+Consumed Codex completion clears native busy state independently of its display write.
 See [composer delivery and retry safety](docs/composer-delivery.md).
 
 Check or update the exact npm/Cargo installation that launched the command:

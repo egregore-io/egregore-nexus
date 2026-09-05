@@ -18,6 +18,19 @@ Queue redirection preserves the original request JSON, so converted pending rows
 command kind. Ordinary explicit steer and redirects with omitted/null options
 retain their existing behavior.
 
+## Codex completion and display writes
+
+Once the Codex forwarder consumes a terminal native notification, it clears that
+exact turn's routing activity before awaiting display/storage I/O. Late start
+acceptance cannot resurrect that terminal turn, and a newer active turn is not
+cleared. Accepted events, ordered text/terminal output, and receipt/completion
+waiters retain their existing ordering; retriable native errors remain active.
+
+This closes the consumed-terminal stale-activity window only. A terminal still
+unread behind earlier blocked output, an actor waiting on acceptance, or a held
+native admission lock can still delay a queued prompt. It is not proof that every
+queue stall is fixed, nor proof of the cause of any particular historical stall.
+
 ## Automatic-delivery safety foundation
 
 The durable `command_intents` identity-store journal now protects automatic rows
