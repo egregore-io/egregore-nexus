@@ -30,6 +30,20 @@ pnpm --dir gateway build
 The public hygiene gate rejects private plans, operator paths, internal personas, secret-like state,
 assistant workflow artifacts, and attribution trailers from the public tree.
 
+## Resumed registration projections
+
+Before release, run `cargo test -p egregore-nexus --test registration_projection` from `core/`
+and the Gateway `src/server/projection/apply.test.ts` suite. The producer regression uses
+split-authority temporary stores, the real registration paths and projection sink, and a late
+Gateway protocol connection. It covers stopped/missing runtimes, missing compatibility agent IDs,
+invalid identity rejection before liveness/publication, and replay of the final online snapshot.
+The Gateway suite separately verifies snapshot application into missing/stopped descriptors.
+
+These are composed automated projection checks, not evidence of an instant Lens repaint or a
+live provider restart. Do not auto-start Gateway, fabricate Lens presence, or edit the operator's
+databases to pass them. Coordinate any installed-daemon restart and live Lens verification
+separately after source review.
+
 ## v0.1.5 host-isolation evidence
 
 Freeze the live host runtime before an isolated validation run, then compare it afterward:

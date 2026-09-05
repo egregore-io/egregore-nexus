@@ -714,4 +714,9 @@ pub trait EventSink: Send + Sync {
     /// existing event-sink contract. The production daemon overrides it with the bounded
     /// same-epoch Gateway projection publisher.
     async fn project(&self, _effect: crate::GatewayProjectionEffect) {}
+
+    /// Refresh canonical Gateway identity/runtime snapshots after a successful exact binding.
+    /// This is not a new spawn or a compatibility presence transition. The production sink
+    /// re-reads and validates both identities; embedders without projections remain unchanged.
+    async fn project_runtime_binding(&self, _session: &SessionId, _agent: &AgentId) {}
 }

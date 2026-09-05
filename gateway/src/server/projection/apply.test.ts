@@ -238,4 +238,36 @@ describe("canonical Gateway projection application", () => {
       { agent_id: "a_stale" },
     ]);
   });
+
+  it("replays post-resume snapshots into missing and stopped descriptors without a spawn event", async () => {
+    // Consumer-side composition guard. Producer registration + actual late connection replay
+    // are exercised in core/crates/nexus/tests/registration_projection.rs.
+    let seq = 0;
+    for (const prior of ["missing", "stopped"] as const) {
+      const agentId = `a_${prior}`;
+      const runtimeId = `s_${prior}`;
+      const apply = async (kind: "identity.upserted" | "runtime.upserted", payload: Record<string, unknown>) => {
+        seq += 1;
+        return applyCanonicalProjection(db, {
+          eventId: `resume:${seq}`, daemonEpoch: "same-boot", seq, occurredAt: seq,
+          kind, version: 1, payload,
+        });
+      };
+      if (prior === "stopped") {
+        await apply("identity.upserted", { agentId, name: prior, project: "default" });
+        await apply("runtime.upserted", { agentId, runtimeId, sessionId: runtimeId, presence: "offline", active: false });
+      }
+      await apply("identity.upserted", { agentId, name: prior, project: "default", defaultHarness: "codex" });
+      await apply("runtime.upserted", {
+        agentId, runtimeId, sessionId: runtimeId, harness: "codex",
+        presence: "online", active: true, stoppedAt: null,
+      });
+      expect((await db.execute({
+        sql: "SELECT agent_id, session_id, status FROM runtime_descriptors WHERE runtime_id = ?",
+        args: [runtimeId],
+      })).rows).toMatchObject([{ agent_id: agentId, session_id: runtimeId, status: "online" }]);
+    }
+    expect((await db.execute("SELECT through_seq FROM projection_cursors WHERE daemon_epoch = 'same-boot'")).rows)
+      .toMatchObject([{ through_seq: seq }]);
+  });
 });

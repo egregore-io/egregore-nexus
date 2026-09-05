@@ -617,9 +617,14 @@ impl AppState {
         if let Some(name) = name {
             if let Some(existing) = repo.find_by_name_any_project(name).await? {
                 if existing.session_id == *session {
-                    self.presence.materialize_online(session).await?;
-                    repo.set_transport(session, transport).await?;
-                    repo.set_agent_id(session, agent_id).await?;
+                    if let Some(bound_id) = existing.agent_id.as_deref() {
+                        if bound_id != agent_id {
+                            return Err(NexusError::Invalid(format!(
+                                "session {} is bound to {}, not {}",
+                                session, bound_id, agent_id
+                            )));
+                        }
+                    }
                     self.bind_stable_agent_runtime(
                         session,
                         agent_id,
@@ -632,6 +637,12 @@ impl AppState {
                         owner,
                     )
                     .await?;
+                    repo.set_transport(session, transport).await?;
+                    repo.set_agent_id(session, agent_id).await?;
+                    self.presence.materialize_online(session).await?;
+                    self.ws
+                        .project_runtime_binding(session, &AgentId(agent_id.to_string()))
+                        .await;
                     self.append_agent_lifecycle_best_effort(
                         name,
                         session,
@@ -675,6 +686,7 @@ impl AppState {
                     "dead-name bind_member",
                 )
                 .await;
+                self.presence.materialize_online(session).await?;
                 self.ws
                     .emit(WsEvent::AgentSpawned {
                         session_id: SessionId(session.0.clone()),
@@ -768,7 +780,6 @@ impl AppState {
                     session.0, existing_runtime.agent_id, agent_id
                 )));
             }
-            self.presence.materialize_online(session).await?;
         } else {
             runtimes
                 .create(NewAgentRuntime {
@@ -777,8 +788,10 @@ impl AppState {
                     harness: Self::harness_to_store(kind),
                     cwd,
                     transport: Some(transport.to_string()),
-                    presence: Some("online".to_string()),
-                    active: true,
+                    // Binding is prepared first; bind_member stamps session identity and
+                    // materializes liveness only after this succeeds.
+                    presence: Some("offline".to_string()),
+                    active: false,
                 })
                 .await?;
         }

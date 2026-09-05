@@ -117,7 +117,7 @@ impl Identity {
     }
 
     /// Rebind a resumed session to a possibly-new `harness_session_id` (and refresh its
-    /// `client_key`) and bring it back `online` (backend §5.1: resume rebinds, no duplicate).
+    /// `client_key`). Liveness is finalized only after the stable runtime binding succeeds.
     async fn rebind_resume(
         &self,
         row: &SessionRow,
@@ -128,16 +128,14 @@ impl Identity {
         let requested_is_agent = req.kind.unwrap_or(Kind::Agent) == Kind::Agent;
         let metadata_json =
             metadata_with_access(row.metadata_json.as_deref(), req.access.as_deref())?;
-        // Persist the (possibly new) harness binding + client_key + back-online presence in one
-        // statement via the store connection (the daemon is the sole writer).
+        // Stage metadata without announcing liveness before canonical runtime ownership exists.
         self.store
             .conn
             .execute(
                 "UPDATE sessions SET harness_session_id = ?2, client_key = ?3, agent = ?4, \
-                 tier = ?5, presence = 'online', last_heartbeat = ?6, \
-                 kind = ?7, metadata_json = ?8, \
-                 agent_id = CASE WHEN ?9 = 1 THEN agent_id ELSE NULL END, \
-                 name = CASE WHEN ?10 IS NULL THEN name ELSE ?10 END \
+                 tier = ?5, kind = ?6, metadata_json = ?7, \
+                 agent_id = CASE WHEN ?8 = 1 THEN agent_id ELSE NULL END, \
+                 name = CASE WHEN ?9 IS NULL THEN name ELSE ?9 END \
                  WHERE session_id = ?1",
                 libsql::params![
                     row.session_id.0.clone(),
@@ -145,7 +143,6 @@ impl Identity {
                     req.client_key.clone(),
                     req.harness.as_str().to_string(),
                     tier_str(req.tier).to_string(),
-                    now(),
                     requested_kind,
                     metadata_json,
                     i64::from(requested_is_agent),
@@ -182,6 +179,7 @@ impl Identity {
         row: &SessionRow,
         req: &RegisterRequest,
         credential_verified: bool,
+        resuming: bool,
     ) -> Result<(AgentId, Option<String>), NexusError> {
         let agents = Agents::new(&self.store);
         let row_name = row.require_name("agent runtime binding")?;
@@ -276,17 +274,19 @@ impl Identity {
                     row.session_id.0, existing_runtime.agent_id, agent_id
                 )));
             }
-            runtimes.set_active(&row.session_id.0, true).await?;
-            runtimes
-                .set_presence(
-                    &row.session_id.0,
-                    // Preserve the row's current presence; an unset presence revives as online.
-                    row.presence
-                        .as_deref()
-                        .map(|p| presence_from_str(Some(p)))
-                        .unwrap_or(Presence::Online),
-                )
-                .await?;
+            if !resuming {
+                runtimes.set_active(&row.session_id.0, true).await?;
+                runtimes
+                    .set_presence(
+                        &row.session_id.0,
+                        // Preserve the row's current presence; an unset presence revives as online.
+                        row.presence
+                            .as_deref()
+                            .map(|p| presence_from_str(Some(p)))
+                            .unwrap_or(Presence::Online),
+                    )
+                    .await?;
+            }
         } else {
             runtimes
                 .create(NewAgentRuntime {
@@ -295,8 +295,12 @@ impl Identity {
                     harness: row.agent.clone().unwrap_or_else(|| "unknown".into()),
                     cwd: row.cwd.clone(),
                     transport: row.transport.clone(),
-                    presence: Some(row.presence.clone().unwrap_or_else(|| "online".into())),
-                    active: true,
+                    presence: Some(if resuming {
+                        "offline".into()
+                    } else {
+                        row.presence.clone().unwrap_or_else(|| "online".into())
+                    }),
+                    active: !resuming,
                 })
                 .await?;
         }
@@ -1086,7 +1090,7 @@ impl IdentityPort for Identity {
                 .ok_or_else(|| NexusError::NotFound(session_id.0.clone()))?;
             let (agent_id, bound_credential_id) = if row.is_agent() {
                 let (agent_id, credential_id) = self
-                    .bind_agent_runtime(&row, &req, credential_verified)
+                    .bind_agent_runtime(&row, &req, credential_verified, !publish_spawn)
                     .await?;
                 // Stamp the durable identity on an agent session itself. Human principals are
                 // durable session identities, but never become agent identities or runtimes.
@@ -1099,6 +1103,17 @@ impl IdentityPort for Identity {
             } else {
                 (None, None)
             };
+            if !publish_spawn {
+                // The exact stable binding is committed before either representation becomes
+                // live. Human resumes refresh only their session, never an agent runtime.
+                Sessions::new(&self.store).touch_heartbeat(&session_id).await?;
+                Sessions::new(&self.store).set_presence(&session_id, Presence::Online).await?;
+                if agent_id.is_some() {
+                    let runtimes = AgentRuntimes::new(&self.store);
+                    runtimes.set_active(&session_id.0, true).await?;
+                    runtimes.set_presence(&session_id.0, Presence::Online).await?;
+                }
+            }
             if publish_spawn {
                 if let Err(error) = Sessions::new(&self.store)
                     .finalize_staged_registration(&row)
@@ -1134,6 +1149,11 @@ impl IdentityPort for Identity {
                         paused: row.paused,
                     })
                     .await;
+            }
+            if !publish_spawn {
+                if let Some(agent_id) = &agent_id {
+                    self.events.project_runtime_binding(&session_id, agent_id).await;
+                }
             }
             Ok((
                 RegisterResponse {

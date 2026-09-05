@@ -45,6 +45,10 @@ polling, and the sidebar roster refreshes every 30 seconds while visible. Existi
 streaming views remain available, including route-specific WebSocket support forwarded by the
 packaged Webconsole.
 
+Successful agent resumes republish canonical identity/runtime snapshots even when the session
+already appears online to the daemon. In buffered projection mode, a separately started Gateway
+can replay those updates after connecting; Gateway startup remains explicit.
+
 Check or update the exact npm/Cargo installation that launched the command:
 
 ```bash

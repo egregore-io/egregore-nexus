@@ -12,6 +12,9 @@ All notable public changes to Egregore Nexus are documented here. This project f
 
 ### Fixed
 
+- Refresh canonical Gateway identity/runtime snapshots after same-session daemon binds and
+  resumed registrations, so restored agents do not remain missing or offline in the directory.
+  Reject mismatched bindings before changing liveness; preserve idempotent spawn notifications.
 - Forward Gateway WebSocket upgrades through the packaged Webconsole so fleet updates and
   existing agent-session connections no longer fail with HTTP 502.
 
