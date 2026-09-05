@@ -3,6 +3,13 @@
 All notable public changes to Egregore Nexus are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and uses semantic versioning.
 
+## [0.1.6-beta.2] - Unreleased
+
+### Fixed
+
+- Forward Gateway WebSocket upgrades through the packaged Webconsole so fleet updates and
+  existing agent-session connections no longer fail with HTTP 502.
+
 ## [0.1.5] - Unreleased
 
 ### Added

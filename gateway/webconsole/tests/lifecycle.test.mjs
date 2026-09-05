@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtemp, mkdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
+import { once } from "node:events";
+import { WebSocket, WebSocketServer } from "ws";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -140,6 +143,48 @@ test("umbrella package launcher records the executable that Core spawned", async
     await new Promise((resolve) => child.once("exit", resolve));
   }
   await assert.rejects(readFile(discovery, "utf8"), { code: "ENOENT" });
+});
+
+test("packaged WebUI proxies bidirectional Gateway WebSocket upgrades", { timeout: 10000 }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "nexus-webconsole-ws-"));
+  const dist = join(home, "dist");
+  const discovery = join(home, "webconsole.json");
+  await mkdir(dist);
+  await writeFile(join(dist, "index.html"), "<!doctype html><title>Nexus</title>");
+  const upstream = createHttpServer((_req, res) => { res.writeHead(426); res.end(); });
+  const wss = new WebSocketServer({ server: upstream });
+  const paths = [];
+  wss.on("connection", (ws, req) => {
+    paths.push(req.url);
+    ws.on("message", (data) => ws.send(`ack:${data}`));
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const port = await reservePort();
+  const child = spawn(process.execPath, [
+    new URL("../bin/nexus-webui.mjs", import.meta.url).pathname,
+    "--port", String(port), "--gateway-url", `http://127.0.0.1:${upstream.address().port}`,
+    "--discovery", discovery,
+  ], { env: { ...process.env, NEXUS_WEBUI_DIST: dist }, stdio: "ignore" });
+  let socket;
+  try {
+    await waitForDiscovery(discovery);
+    socket = new WebSocket(`ws://127.0.0.1:${port}/api/agui/ws?agentId=a_test`);
+    await once(socket, "open");
+    const reply = once(socket, "message");
+    socket.send("browser-message");
+    assert.equal(String((await reply)[0]), "ack:browser-message");
+    assert.deepEqual(paths, ["/api/agui/ws?agentId=a_test"]);
+    socket.close();
+    await once(socket, "close");
+  } finally {
+    socket?.terminate();
+    for (const client of wss.clients) client.terminate();
+    wss.close();
+    await new Promise((resolve) => upstream.close(resolve));
+    const exit = once(child, "exit");
+    child.kill("SIGTERM");
+    await exit;
+  }
 });
 
 async function reservePort() {

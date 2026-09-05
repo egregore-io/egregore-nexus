@@ -40,6 +40,10 @@ installation and adds stable platform fallbacks, so user-installed harnesses rem
 after login or reboot. Rerun `nexus daemon install` to refresh an existing service definition.
 Webconsole remains on demand.
 
+The packaged Webconsole forwards HTTP and WebSocket connections to the Gateway. Direct messages
+use caller-scoped HTTP history; fleet updates and existing agent-session views retain their
+WebSocket connections.
+
 Check or update the exact npm/Cargo installation that launched the command:
 
 ```bash
