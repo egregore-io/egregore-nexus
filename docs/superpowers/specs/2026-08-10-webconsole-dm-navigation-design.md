@@ -15,6 +15,9 @@ agent's DM conversation instead of the live harness-session observer.
 - The DM page loads history and new messages through the existing HTTP cursor
   long-poll and sends through the existing Nexus message endpoint. It opens no
   WebSocket or EventSource.
+- The shared application shell also opens no WebSocket. Its member list and
+  live-agent count refresh through HTTP every 30 seconds while visible, pause
+  periodic reads in hidden tabs, and refresh stale data on return.
 - Agent thoughts, tool activity, terminal output, and unrelated session events
   never appear in the DM page.
 
@@ -52,3 +55,5 @@ id.
 - Existing agent-session WebSocket tests remain unchanged and green.
 - Existing DM history tests continue to prove that ordinary DM panes open no
   WebSocket/EventSource.
+- Provider tests mount the shell roster hooks and prove zero WebSockets, HTTP
+  roster updates, hidden-tab pause, return refresh, and unmount cleanup.

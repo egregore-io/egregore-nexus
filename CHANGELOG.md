@@ -5,6 +5,11 @@ All notable public changes to Egregore Nexus are documented here. This project f
 
 ## [0.1.6-beta.2] - Unreleased
 
+### Changed
+
+- Remove the shared Webconsole fleet WebSocket. DM navigation stays HTTP-only, with
+  visible-tab roster polling; existing agent-session streaming endpoints remain available.
+
 ### Fixed
 
 - Forward Gateway WebSocket upgrades through the packaged Webconsole so fleet updates and

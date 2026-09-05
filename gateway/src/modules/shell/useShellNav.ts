@@ -97,6 +97,13 @@ function toMe(w: WhoamiRow): MeIdentity {
 // ── query hooks (each a thin useQuery over the read-view) ─────────────────────
 
 const STALE = 15_000;
+// TanStack pauses intervals in hidden tabs and refetches stale data on return.
+// Both roster observers share the same cache/in-flight HTTP request.
+const ROSTER_REFRESH = {
+  refetchInterval: 30_000,
+  refetchIntervalInBackground: false,
+  refetchOnWindowFocus: true,
+};
 
 // Threads/members are read GLOBALLY now: a "project" is a console-only grouping (see
 // `@app/projects`), so the rail fetches every thread/member and `AppShell` filters channels to the
@@ -120,6 +127,7 @@ export function useChannels() {
  */
 export function useDms() {
   return useQuery({
+    ...ROSTER_REFRESH,
     queryKey: qk.members("all"),
     queryFn: () => getJson<MemberRow[]>("/api/v1/members?includeOffline=true"),
     select: (rows) => rows
@@ -135,6 +143,7 @@ export function useDms() {
 /** Real members → the live-agents count. */
 export function useAgentsLive() {
   return useQuery({
+    ...ROSTER_REFRESH,
     queryKey: qk.members("all"),
     queryFn: () => getJson<MemberRow[]>("/api/v1/members?includeOffline=true"),
     select: (rows) => rows.filter(

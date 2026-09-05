@@ -95,9 +95,8 @@ const presenceState = (m: MemberRow): string =>
 // daemon read-view would match no backend project and return nothing — which is what made the
 // Admin table / rosters go empty whenever a project was selected.
 
-// Fleet events invalidate the canonical member cache in providers.tsx. This is
-// only a bounded visible-tab fallback for missed push events and non-fleet read
-// views. Hidden tabs remain completely quiet.
+// Read views refresh over HTTP, without a shared shell WebSocket.
+// Periodic reads pause in hidden tabs; stale data refreshes on return.
 const FALLBACK_REFETCH_MS = 30_000;
 const visibleFallbackInterval = (): number | false =>
   typeof document !== "undefined" && document.hidden ? false : FALLBACK_REFETCH_MS;
