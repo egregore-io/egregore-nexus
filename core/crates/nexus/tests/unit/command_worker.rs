@@ -45,6 +45,41 @@ struct InterruptSpy {
     calls: AtomicUsize,
 }
 
+#[derive(Default)]
+struct SteerDispatchSpy {
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutionPort for SteerDispatchSpy {
+    async fn inject_turn(&self, _recipient: &SessionId, _batch: &NexusBatch) -> PortResult<()> {
+        panic!("steer must not fall back to bus injection")
+    }
+
+    async fn launch(&self, _req: SpawnRequest) -> PortResult<SpawnResponse> {
+        panic!("steer test must not launch a harness")
+    }
+
+    async fn remove(&self, _req: RemoveRequest) -> PortResult<RemoveResponse> {
+        panic!("steer test must not remove a harness")
+    }
+
+    async fn steer_observed(
+        &self,
+        _recipient: &SessionId,
+        _text: String,
+        _events: Arc<dyn nexus_contracts::EventSink>,
+        _accepted_event: nexus_contracts::WsEvent,
+    ) -> PortResult<nexus_contracts::SteerResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(nexus_contracts::SteerResponse {
+            accepted: true,
+            delivery: nexus_contracts::SteerDelivery::Steered,
+            turn_id: Some("native-steer-ack".into()),
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl AgentTurnExecutionPort for InterruptSpy {
     async fn inject_turn(&self, _recipient: &SessionId, _batch: &NexusBatch) -> PortResult<()> {
@@ -634,6 +669,92 @@ async fn persisted_unsupported_auto_prompt_is_rejected_without_native_delivery()
         nexus_contracts::codes::INVALID_PARAMS
     );
     assert_eq!(exec.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn redirected_persisted_intent_rejects_unsupported_options_before_native_steer() {
+    for path in ["promote", "redirect", "already-steer"] {
+        for extra in [
+            serde_json::json!({"delivery": "auto"}),
+            serde_json::json!({"modelSelection": {"modelId": "target-choice"}}),
+            serde_json::json!({}),
+            serde_json::json!({"delivery": null, "modelSelection": null}),
+        ] {
+            let unsupported = extra.as_object().unwrap().values().any(|v| !v.is_null());
+            let exec = Arc::new(SteerDispatchSpy::default());
+            let state = test_state_with_turn_exec(exec.clone()).await;
+            let operator = state
+                .identity
+                .register(human_register("operator", "ck_redirect_operator"))
+                .await
+                .unwrap();
+            let target = state
+                .identity
+                .register(human_register("Target Human", "ck_redirect_target"))
+                .await
+                .unwrap();
+            let repo = CommandIntents::new(&state.store);
+            let mut intent = prompt_intent(
+                "cmd_redirect",
+                &operator,
+                "operator",
+                "ck_redirect_operator",
+                "hello",
+                1,
+            );
+            let mut params: serde_json::Value = serde_json::from_str(&intent.request_json).unwrap();
+            params
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            intent.request_json = params.to_string();
+            if path == "already-steer" {
+                intent.kind = command_kinds::harness::STEER.into();
+            }
+            repo.insert_pending(intent).await.unwrap();
+            match path {
+                "promote" => assert!(repo
+                    .promote_pending_prompt_to_steer("cmd_redirect")
+                    .await
+                    .unwrap()),
+                "redirect" => {
+                    let request: nexus_contracts::CommandQueueMutationRequest = serde_json::from_value(serde_json::json!({
+                        "name": "Target Human", "action": "redirect_now", "clientMutationId": "mut_redirect",
+                        "commandId": "cmd_redirect", "expectedRevision": 1
+                    })).unwrap();
+                    let outcome = nexus_store::repos::CommandQueue::new(&state.store)
+                        .mutate_with_active_sessions("default", &request, 2, &[target.session_id])
+                        .await
+                        .unwrap();
+                    assert_eq!(outcome.status, 200, "{outcome:?}");
+                }
+                _ => {}
+            }
+            let converted = repo.get("cmd_redirect").await.unwrap().unwrap();
+            assert_eq!(converted.kind, command_kinds::harness::STEER);
+            assert_eq!(
+                converted.request_json,
+                params.to_string(),
+                "conversion must preserve intent"
+            );
+            assert!(process_next(&state).await.unwrap());
+            let terminal = repo.get("cmd_redirect").await.unwrap().unwrap();
+            if unsupported {
+                assert_eq!(terminal.status, "error", "{path}: {extra}");
+                let error: serde_json::Value =
+                    serde_json::from_str(terminal.error_json.as_deref().unwrap()).unwrap();
+                assert_eq!(error["code"], nexus_contracts::codes::INVALID_PARAMS);
+                assert_eq!(exec.calls.load(Ordering::SeqCst), 0);
+            } else {
+                assert_eq!(terminal.status, "done", "{path}: {extra}: {terminal:?}");
+                assert_eq!(
+                    exec.calls.load(Ordering::SeqCst),
+                    1,
+                    "ordinary explicit steer stays supported"
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]

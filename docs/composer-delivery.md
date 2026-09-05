@@ -12,6 +12,12 @@ must preserve configured intent or report unsupported operation. Omitted options
 retain the existing boundary-prompt behavior; no WebSocket activity is required
 to decide how ordinary Send is delivered.
 
+Steer dispatch applies the same validation before reviving or calling a harness.
+Queue redirection preserves the original request JSON, so converted pending rows
+(including previously persisted redirects) cannot bypass rejection by changing
+command kind. Ordinary explicit steer and redirects with omitted/null options
+retain their existing behavior.
+
 ## Automatic-delivery safety foundation
 
 The durable `command_intents` identity-store journal now protects automatic rows

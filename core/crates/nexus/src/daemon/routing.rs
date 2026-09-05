@@ -902,6 +902,12 @@ async fn route_request_inner(
         // its accepted boundary.
         "steer" => {
             let c = require(caller)?;
+            // Queue redirection preserves the original prompt JSON. Validate before decoding
+            // (and before revive) so retained delivery/model intent cannot disappear in serde.
+            if let Some(params) = p {
+                nexus_contracts::PromptRequest::validate_supported_options(params)
+                    .map_err(|error| contract_to_rpc(&error))?;
+            }
             let r: SteerRequest = parse(p)?;
             let session = match r.agent_id.as_ref() {
                 Some(agent_id) => ensure_alive_agent_by_id(state, agent_id).await,

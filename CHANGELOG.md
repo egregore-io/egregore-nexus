@@ -13,8 +13,9 @@ All notable public changes to Egregore Nexus are documented here. This project f
 ### Fixed
 
 - Reject unsupported session-prompt delivery/model options instead of silently sending a
-  different operation. Add restart-safe automatic-delivery journal guards without enabling
-  native auto-delivery; uncertain attempts cannot be replayed after lease expiry or shutdown.
+  different operation, including after queued prompts are redirected to Steer. Add restart-safe
+  automatic-delivery journal guards without enabling native auto-delivery; uncertain attempts
+  cannot be replayed after lease expiry or shutdown.
 - Refresh canonical Gateway identity/runtime snapshots after same-session daemon binds and
   resumed registrations, so restored agents do not remain missing or offline in the directory.
   Reject mismatched bindings before changing liveness; preserve idempotent spawn notifications.
