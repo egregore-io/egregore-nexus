@@ -1,10 +1,9 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use nexus::gateway_lifecycle::GatewayInvocation;
 use nexus::gateway_service::{
     install_gateway_service_with, launchd_plist, systemd_unit, uninstall_gateway_service_with,
-    windows_registration_script, GatewayServiceBackend, GatewayServiceSpec,
+    windows_registration_script, windows_runner_script, GatewayServiceBackend, GatewayServiceSpec,
 };
 
 #[derive(Default)]
@@ -129,7 +128,6 @@ fn launchd_uses_program_arguments_and_keepalive() {
 fn windows_task_uses_native_action_fields() {
     let rendered = windows_registration_script(&GatewayServiceSpec {
         executable: PathBuf::from(r"C:\Program Files\Egregore\nexus-gateway.cmd"),
-        invocation: GatewayInvocation::WindowsCommandShim,
         ..spec()
     });
 
@@ -137,6 +135,22 @@ fn windows_task_uses_native_action_fields() {
     assert!(rendered.contains("-Execute 'powershell.exe'"));
     assert!(rendered.contains("nexus-gateway.cmd"));
     assert!(rendered.contains("EgregoreNexusGateway"));
+}
+
+#[test]
+fn windows_runner_invokes_a_spaced_cmd_shim_without_a_cmd_exe_wrapper() {
+    // PowerShell passes hand-written quotes through literally, so `cmd.exe /S /C "<path>"` had
+    // its quotes stripped straight back off and a spaced installation path was split at the
+    // space. PowerShell executes a `.cmd` shim directly, so call it directly.
+    let rendered = windows_runner_script(&GatewayServiceSpec {
+        executable: PathBuf::from(r"C:\Program Files\Egregore\nexus-gateway.cmd"),
+        ..spec()
+    });
+
+    assert!(rendered.contains(r"& 'C:\Program Files\Egregore\nexus-gateway.cmd'"));
+    assert!(!rendered.contains("cmd.exe"));
+    assert!(!rendered.contains(r#"\""#));
+    assert!(rendered.contains("$env:NEXUS_GATEWAY_DISCOVERY = 'write'"));
 }
 
 #[test]
@@ -151,7 +165,6 @@ fn native_service_manager_commands_use_the_shared_bounded_process_boundary() {
 fn spec() -> GatewayServiceSpec {
     GatewayServiceSpec {
         executable: PathBuf::from("/opt/egregore gateway/nexus-gateway"),
-        invocation: GatewayInvocation::Direct,
         home: PathBuf::from("/home/ada/.nexus"),
         log: PathBuf::from("/home/ada/.nexus/gateway.log"),
     }

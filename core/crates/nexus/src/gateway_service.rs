@@ -11,8 +11,8 @@ use serde::Serialize;
 
 use crate::daemon::lifecycle;
 use crate::gateway_lifecycle::{
-    gateway_status, resolve_installed_gateway, GatewayInvocation, GatewayLifecycleError,
-    GatewayPaths, GatewayRuntimeStatus,
+    gateway_status, resolve_installed_gateway, GatewayLifecycleError, GatewayPaths,
+    GatewayRuntimeStatus,
 };
 use crate::lifecycle_process;
 
@@ -26,7 +26,6 @@ const SERVICE_COMMAND_OUTPUT_LIMIT: usize = 64 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayServiceSpec {
     pub executable: PathBuf,
-    pub invocation: GatewayInvocation,
     pub home: PathBuf,
     pub log: PathBuf,
 }
@@ -197,7 +196,6 @@ impl GatewayServiceBackend for SystemGatewayServiceBackend {
         let installation = resolve_installed_gateway().map_err(|error| error.to_string())?;
         Ok(GatewayServiceSpec {
             executable: installation.executable,
-            invocation: installation.invocation,
             home: self.paths.home.clone(),
             log: self.paths.log.clone(),
         })
@@ -402,18 +400,16 @@ pub fn windows_registration_script(spec: &GatewayServiceSpec) -> String {
     )
 }
 
-#[cfg(target_os = "windows")]
-fn windows_runner_script(spec: &GatewayServiceSpec) -> String {
-    let invocation = match spec.invocation {
-        GatewayInvocation::Direct => format!(
-            "& {}",
-            powershell_literal(&spec.executable.to_string_lossy())
-        ),
-        GatewayInvocation::WindowsCommandShim => format!(
-            "& 'cmd.exe' '/D' '/S' '/C' {}",
-            powershell_literal(&format!("\"{}\"", spec.executable.display()))
-        ),
-    };
+/// Render the PowerShell runner the scheduled task executes.
+///
+/// PowerShell runs a `.cmd`/`.bat` shim directly. Routing it through `cmd.exe /S /C` instead
+/// required hand-quoting the path, and PowerShell passes those quotes through literally, so `/S`
+/// stripped them back off and any installation path containing a space was split.
+pub fn windows_runner_script(spec: &GatewayServiceSpec) -> String {
+    let invocation = format!(
+        "& {}",
+        powershell_literal(&spec.executable.to_string_lossy())
+    );
     format!(
         "$env:NEXUS_HOME = {}\n$env:NEXUS_GATEWAY_DISCOVERY = 'write'\n{}\nexit $LASTEXITCODE\n",
         powershell_literal(&spec.home.to_string_lossy()),

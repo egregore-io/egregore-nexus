@@ -1,7 +1,7 @@
 //! On-demand Nexus Webconsole lifecycle.
 
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -24,16 +24,9 @@ const OS_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const HELPER_OUTPUT_LIMIT: usize = 64 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WebconsoleInvocation {
-    Direct,
-    WindowsCommandShim,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebconsoleInstallation {
     pub executable: PathBuf,
-    pub invocation: WebconsoleInvocation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -607,36 +600,13 @@ fn webconsole_installation(executable: PathBuf, windows: bool) -> WebconsoleInst
     } else {
         fs::canonicalize(&executable).unwrap_or(executable)
     };
-    let invocation = if windows
-        && executable
-            .extension()
-            .and_then(OsStr::to_str)
-            .is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
-            }) {
-        WebconsoleInvocation::WindowsCommandShim
-    } else {
-        WebconsoleInvocation::Direct
-    };
-    WebconsoleInstallation {
-        executable,
-        invocation,
-    }
+    WebconsoleInstallation { executable }
 }
 
 fn webconsole_command(installation: &WebconsoleInstallation) -> Command {
-    match installation.invocation {
-        WebconsoleInvocation::Direct => Command::new(&installation.executable),
-        WebconsoleInvocation::WindowsCommandShim => {
-            let mut command = Command::new("cmd.exe");
-            command
-                .arg("/D")
-                .arg("/S")
-                .arg("/C")
-                .arg(format!("\"{}\"", installation.executable.display()));
-            command
-        }
-    }
+    // Name the installed executable directly; the standard library builds the `cmd.exe` command
+    // line for a Windows `.cmd`/`.bat` shim. See the matching note in `gateway_lifecycle`.
+    Command::new(&installation.executable)
 }
 
 #[doc(hidden)]

@@ -27,7 +27,6 @@ fn explicit_gateway_binary_wins_over_path() {
     .unwrap();
 
     assert_eq!(installation.executable, explicit);
-    assert_eq!(installation.invocation, GatewayInvocation::Direct);
 }
 
 #[test]
@@ -56,7 +55,7 @@ fn path_resolution_finds_gateway_command() {
 }
 
 #[test]
-fn windows_path_resolution_marks_cmd_shim() {
+fn windows_path_resolution_finds_the_cmd_shim() {
     let temp = TempDir::new().unwrap();
     let executable = temp.path().join("nexus-gateway.cmd");
     fs::write(&executable, "@echo off").unwrap();
@@ -69,10 +68,64 @@ fn windows_path_resolution_marks_cmd_shim() {
     .unwrap();
 
     assert_eq!(installation.executable, executable);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_gateway_shim_migration_executes_the_batch_shim() {
+    // The regression this pins: gateway start died at store migration with
+    // `'\"C:\...\nexus-gateway.cmd\"' is not recognized as an internal or external command`,
+    // because the cmd.exe wrapper was hand-rolled and `Command::arg` escaped its quotes. Drive a
+    // real `.cmd` shim through the real migration boundary, from a path containing a space.
+    let temp = TempDir::new().unwrap();
+    let install_dir = temp.path().join("Program Files/Egregore Nexus");
+    fs::create_dir_all(&install_dir).unwrap();
+    let launcher = install_dir.join("nexus-gateway.cmd");
+    let capture = temp.path().join("argv.txt");
+    fs::write(
+        &launcher,
+        "@echo off\r\n:next\r\nif \"%~1\"==\"\" goto done\r\n>>\"%CAPTURE_ARGS%\" echo %~1\r\nshift\r\ngoto next\r\n:done\r\nexit /b 0\r\n",
+    )
+    .unwrap();
+
+    let installation =
+        resolve_gateway_installation(Some(launcher.clone().into_os_string()), None, true).unwrap();
+    let mut command = gateway_command(&installation);
+    command
+        .arg("--migrate-only")
+        .env("CAPTURE_ARGS", &capture)
+        .stdin(Stdio::null());
+
+    run_gateway_store_migration(&mut command, Duration::from_secs(30)).unwrap();
+
     assert_eq!(
-        installation.invocation,
-        GatewayInvocation::WindowsCommandShim
+        fs::read_to_string(&capture)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        vec!["--migrate-only"],
+        "the shim must receive its argv intact"
     );
+}
+
+#[test]
+fn windows_shims_are_never_wrapped_in_a_hand_rolled_cmd_invocation() {
+    // `Command::arg` escapes every `"` it is handed, so a manually quoted shim path reaches
+    // cmd.exe as a literal `\"C:\...\nexus-gateway.cmd\"` and fails with "is not recognized as an
+    // internal or external command". The standard library builds the batch command line
+    // correctly, so the executable must be named directly.
+    let source = include_str!("../../src/gateway_lifecycle.rs");
+    let code: String = source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        !code.contains("cmd.exe"),
+        "gateway spawning must not hand-roll a cmd.exe wrapper"
+    );
+    assert!(code.contains("Command::new(&installation.executable)"));
 }
 
 #[test]
@@ -182,7 +235,6 @@ impl GatewayBackend for FakeBackend {
         }
         Ok(GatewayInstallation {
             executable: PathBuf::from("nexus-gateway"),
-            invocation: GatewayInvocation::Direct,
         })
     }
 

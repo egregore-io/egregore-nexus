@@ -1,7 +1,7 @@
 //! Lifecycle ownership for the independently installed Nexus REST/WebSocket gateway.
 
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -26,13 +26,6 @@ const HELPER_OUTPUT_LIMIT: usize = 64 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayInstallation {
     pub executable: PathBuf,
-    pub invocation: GatewayInvocation,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GatewayInvocation {
-    Direct,
-    WindowsCommandShim,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -460,18 +453,12 @@ fn read_discovery(path: &Path) -> io::Result<GatewayDiscovery> {
 }
 
 fn gateway_command(installation: &GatewayInstallation) -> Command {
-    match installation.invocation {
-        GatewayInvocation::Direct => Command::new(&installation.executable),
-        GatewayInvocation::WindowsCommandShim => {
-            let mut command = Command::new("cmd.exe");
-            command
-                .arg("/D")
-                .arg("/S")
-                .arg("/C")
-                .arg(format!("\"{}\"", installation.executable.display()));
-            command
-        }
-    }
+    // Name the installed executable directly, including Windows `.cmd`/`.bat` npm shims. The
+    // standard library recognises a batch program and builds the `cmd.exe` command line itself.
+    // Hand-rolling that wrapper is what broke Windows: `Command::arg` escapes every `"` it is
+    // given, so a manually quoted path reached `cmd.exe` as a literal `\"C:\...\nexus-gateway.cmd\"`
+    // and was reported as an unrecognised command.
+    Command::new(&installation.executable)
 }
 
 fn run_gateway_store_migration(
@@ -648,7 +635,7 @@ pub fn resolve_gateway_installation(
     if let Some(explicit) = explicit.filter(|value| !value.is_empty()) {
         let executable = PathBuf::from(explicit);
         if is_runnable_file(&executable, windows) {
-            return Ok(installation_for(executable, windows));
+            return Ok(installation_for(executable));
         }
         return Err(GatewayLifecycleError::not_installed());
     }
@@ -668,7 +655,7 @@ pub fn resolve_gateway_installation(
             for name in names {
                 let candidate = directory.join(name);
                 if is_runnable_file(&candidate, windows) {
-                    return Ok(installation_for(candidate, windows));
+                    return Ok(installation_for(candidate));
                 }
             }
         }
@@ -676,22 +663,8 @@ pub fn resolve_gateway_installation(
     Err(GatewayLifecycleError::not_installed())
 }
 
-fn installation_for(executable: PathBuf, windows: bool) -> GatewayInstallation {
-    let is_shim = windows
-        && executable
-            .extension()
-            .and_then(OsStr::to_str)
-            .is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
-            });
-    GatewayInstallation {
-        executable,
-        invocation: if is_shim {
-            GatewayInvocation::WindowsCommandShim
-        } else {
-            GatewayInvocation::Direct
-        },
-    }
+fn installation_for(executable: PathBuf) -> GatewayInstallation {
+    GatewayInstallation { executable }
 }
 
 fn is_runnable_file(path: &Path, windows: bool) -> bool {
