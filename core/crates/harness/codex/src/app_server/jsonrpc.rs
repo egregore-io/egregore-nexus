@@ -18,8 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::SinkExt;
 use futures::StreamExt;
+use futures::{Sink, SinkExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -138,7 +138,20 @@ struct WireResponse<'a> {
 // JsonRpc — the public client handle
 // ---------------------------------------------------------------------------
 
-type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, CodexRpcError>>>>>;
+type PendingMap =
+    Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<Result<Value, CodexRpcError>>>>>;
+pub(super) type NativeIngress = Arc<dyn Fn(&Notification) + Send + Sync>;
+
+struct PendingRequest {
+    pending: PendingMap,
+    id: u64,
+}
+
+impl Drop for PendingRequest {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.id);
+    }
+}
 
 trait WebSocketIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -161,6 +174,14 @@ pub struct JsonRpc {
     /// Held so the channel stays open even when no receiver has been taken yet.
     _notif_tx: mpsc::UnboundedSender<Notification>,
     notif_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<Notification>>>,
+    ingress: Arc<std::sync::Mutex<Option<NativeIngress>>>,
+    reader: tokio::task::AbortHandle,
+}
+
+impl Drop for JsonRpc {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
 }
 
 impl JsonRpc {
@@ -170,16 +191,26 @@ impl JsonRpc {
     /// for numeric loopback addresses, which is the transport Codex exposes on
     /// Windows where Unix-domain sockets are unavailable.
     pub async fn connect(endpoint: &Path) -> Result<Self, CodexRpcError> {
+        Self::connect_with_ingress(endpoint, None).await
+    }
+
+    pub(super) async fn connect_with_ingress(
+        endpoint: &Path,
+        ingress: Option<NativeIngress>,
+    ) -> Result<Self, CodexRpcError> {
         let descriptor = endpoint.to_str().ok_or_else(|| {
             CodexRpcError::Connect(format!("app-server endpoint is not UTF-8: {endpoint:?}"))
         })?;
         if descriptor.starts_with("ws://") {
-            return Self::connect_websocket(descriptor).await;
+            return Self::connect_websocket(descriptor, ingress).await;
         }
 
         #[cfg(unix)]
         {
-            Self::connect_unix(endpoint).await
+            let stream = UnixStream::connect(endpoint)
+                .await
+                .map_err(|e| CodexRpcError::Connect(e.to_string()))?;
+            Self::connect_stream(UDS_WEBSOCKET_HANDSHAKE_URL, Box::new(stream), ingress).await
         }
         #[cfg(not(unix))]
         {
@@ -199,10 +230,13 @@ impl JsonRpc {
             .await
             .map_err(|e| CodexRpcError::Connect(e.to_string()))?;
 
-        Self::connect_stream(UDS_WEBSOCKET_HANDSHAKE_URL, Box::new(stream)).await
+        Self::connect_stream(UDS_WEBSOCKET_HANDSHAKE_URL, Box::new(stream), None).await
     }
 
-    async fn connect_websocket(endpoint: &str) -> Result<Self, CodexRpcError> {
+    async fn connect_websocket(
+        endpoint: &str,
+        ingress: Option<NativeIngress>,
+    ) -> Result<Self, CodexRpcError> {
         let address = endpoint
             .strip_prefix("ws://")
             .and_then(|value| value.parse::<SocketAddr>().ok())
@@ -216,12 +250,13 @@ impl JsonRpc {
             .await
             .map_err(|e| CodexRpcError::Connect(e.to_string()))?;
 
-        Self::connect_stream(endpoint, Box::new(stream)).await
+        Self::connect_stream(endpoint, Box::new(stream), ingress).await
     }
 
     async fn connect_stream(
         handshake_url: &str,
         stream: BoxedWebSocketIo,
+        ingress: Option<NativeIngress>,
     ) -> Result<Self, CodexRpcError> {
         let ws_config = WebSocketConfig {
             max_frame_size: Some(MAX_WS_MESSAGE_SIZE),
@@ -235,17 +270,20 @@ impl JsonRpc {
 
         let (sink, stream) = ws.split();
         let writer = Arc::new(Mutex::new(sink));
-        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let ingress = Arc::new(std::sync::Mutex::new(ingress));
         let (notif_tx, notif_rx) = mpsc::unbounded_channel();
 
         // Spawn the reader task.
-        {
+        let reader = {
             let pending = Arc::clone(&pending);
             let notif_tx = notif_tx.clone();
+            let ingress = ingress.clone();
             tokio::spawn(async move {
-                reader_task(stream, pending, notif_tx).await;
-            });
-        }
+                reader_task(stream, pending, notif_tx, ingress).await;
+            })
+            .abort_handle()
+        };
 
         Ok(Self {
             writer,
@@ -253,14 +291,37 @@ impl JsonRpc {
             pending,
             _notif_tx: notif_tx,
             notif_rx: std::sync::Mutex::new(Some(notif_rx)),
+            ingress,
+            reader,
         })
     }
 
     /// Send a request and await the correlated response (30 s timeout).
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, CodexRpcError> {
+        self.request_with_admission(method, params, |submit| submit())
+            .await
+    }
+
+    pub(super) fn install_ingress(&self, ingress: NativeIngress) {
+        let mut slot = self.ingress.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(ingress);
+        }
+    }
+
+    pub(super) async fn request_with_admission(
+        &self,
+        method: &str,
+        params: Value,
+        admit: impl FnOnce(&mut dyn FnMut() -> Result<(), CodexRpcError>) -> Result<(), CodexRpcError>,
+    ) -> Result<Value, CodexRpcError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().await.insert(id, tx);
+        self.pending.lock().unwrap().insert(id, tx);
+        let _pending = PendingRequest {
+            pending: self.pending.clone(),
+            id,
+        };
 
         let msg = serde_json::to_string(&WireRequest {
             jsonrpc: "2.0",
@@ -270,29 +331,25 @@ impl JsonRpc {
         })
         .map_err(|e| CodexRpcError::Decode(e.to_string()))?;
 
-        if let Err(_) = self
-            .writer
-            .lock()
-            .await
-            .send(Message::Text(msg.into()))
-            .await
         {
-            // Clean up the pending entry on write failure to avoid a leak.
-            self.pending.lock().await.remove(&id);
-            return Err(CodexRpcError::Closed);
+            let mut writer = self.writer.lock().await;
+            futures::future::poll_fn(|cx| std::pin::Pin::new(&mut *writer).poll_ready(cx))
+                .await
+                .map_err(|_| CodexRpcError::Closed)?;
+            let mut frame = Some(Message::Text(msg.into()));
+            admit(&mut || {
+                std::pin::Pin::new(&mut *writer)
+                    .start_send(frame.take().expect("one local admission"))
+                    .map_err(|_| CodexRpcError::Closed)
+            })?;
+            // Local admission cannot be retracted by cancellation. Keep writer ownership through
+            // flush, but the binding exclusion ends before this awaited I/O or any receipt wait.
+            writer.flush().await.map_err(|_| CodexRpcError::Closed)?;
         }
 
         tokio::time::timeout(REQUEST_TIMEOUT, rx)
             .await
-            .map_err(|_| {
-                // Timeout: clean up stale pending entry.
-                let pending = Arc::clone(&self.pending);
-                let id_clone = id;
-                tokio::spawn(async move {
-                    pending.lock().await.remove(&id_clone);
-                });
-                CodexRpcError::Timeout
-            })?
+            .map_err(|_| CodexRpcError::Timeout)?
             .map_err(|_| CodexRpcError::Closed)?
     }
 
@@ -351,6 +408,7 @@ async fn reader_task(
     mut stream: futures::stream::SplitStream<LocalWebSocket>,
     pending: PendingMap,
     notif_tx: mpsc::UnboundedSender<Notification>,
+    ingress: Arc<std::sync::Mutex<Option<NativeIngress>>>,
 ) {
     while let Some(msg_result) = stream.next().await {
         let text = match msg_result {
@@ -369,7 +427,7 @@ async fn reader_task(
             (Some(id_val), None) => {
                 // Try to extract a u64 id for pending lookup.
                 if let Some(id_u64) = id_val.as_u64() {
-                    let mut map = pending.lock().await;
+                    let mut map = pending.lock().unwrap();
                     if let Some(tx) = map.remove(&id_u64) {
                         let result = if let Some(err) = wire.error {
                             Err(CodexRpcError::Rpc {
@@ -391,6 +449,10 @@ async fn reader_task(
                     params: wire.params,
                     id: id_opt.cloned(),
                 };
+                let ingest = ingress.lock().unwrap().clone();
+                if let Some(ingest) = ingest {
+                    ingest(&notif);
+                }
                 // If the receiver is gone, stop the task.
                 if notif_tx.send(notif).is_err() {
                     break;
@@ -402,8 +464,12 @@ async fn reader_task(
     }
 
     // Connection closed: fail all pending requests.
-    let mut map = pending.lock().await;
+    let mut map = pending.lock().unwrap();
     for (_, tx) in map.drain() {
         let _ = tx.send(Err(CodexRpcError::Closed));
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/app_server_jsonrpc.rs"]
+mod cancellation_tests;

@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime};
 
 use nexus_common::RuntimeProcessIds;
@@ -28,6 +28,8 @@ use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::EventSink;
 use nexus_store::Store;
 use serde_json::Value;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio_util::sync::CancellationToken;
 
 use super::approvals::AutoApprove;
 use super::client::CodexAppServerClient;
@@ -35,11 +37,17 @@ use super::forwarder::{spawn_codex_forwarder_with_tool_observations, CodexToolOb
 use super::jsonrpc::CodexRpcError;
 use super::supervisor::{resolve_machine_codex_home_from_env, CodexAppServer, SupervisorOpts};
 use super::transport::CodexAppServerTransport;
+use super::turn_completion::CodexTurnTracker;
 use crate::storage::{CodexRuntimeLaunch, CodexRuntimeStateRepo};
 
-/// Synchronous notification fired after a Codex thread id has been discovered and successfully
-/// resumed/bound. Callers that need async persistence can spawn from this callback.
-pub type ThreadDiscovered = Arc<dyn Fn(SessionId, String) + Send + Sync + 'static>;
+/// Deferred persistence after successful thread discovery/binding. The bridge schedules the
+/// returned future without blocking launch-time registration and orders its writes with rebind.
+pub type ThreadDiscovered = Arc<
+    dyn Fn(SessionId, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 /// Optional behavior for [`CodexBridge::launch_with_options`].
 #[derive(Clone, Default)]
@@ -76,11 +84,136 @@ pub struct BridgeLaunchOptions {
 
 /// Live codex app-server resources for one headed session.
 struct Handle {
+    identity: Arc<()>,
+    lifecycle: Arc<Lifecycle>,
     server: CodexAppServer,
     forwarder: Option<tokio::task::JoinHandle<()>>,
     thread_id: Option<String>,
     #[allow(dead_code)]
     socket: PathBuf,
+}
+
+/// Serializes only setup, persisted binding writes, publication and physical retirement.
+/// Native controls continue to use the short owner admission guard, not this async mutex.
+#[derive(Default)]
+struct Lifecycle {
+    exclusion: Arc<AsyncMutex<()>>,
+    retirement: Mutex<Option<CancellationToken>>,
+}
+
+impl Lifecycle {
+    async fn enter(&self) -> OwnedMutexGuard<()> {
+        let guard = self.exclusion.clone().lock_owned().await;
+        let retirement = self.retirement.lock().unwrap().clone();
+        if let Some(retirement) = retirement {
+            retirement.cancelled().await;
+        }
+        guard
+    }
+
+    fn retire(self: &Arc<Self>, server: CodexAppServer) {
+        let done = CancellationToken::new();
+        *self.retirement.lock().unwrap() = Some(done.clone());
+        let lifecycle = self.clone();
+        tokio::spawn(async move {
+            let _lifecycle = lifecycle;
+            let _done = RetirementDone(done);
+            server.shutdown().await;
+        });
+    }
+}
+
+struct RetirementDone(CancellationToken);
+impl Drop for RetirementDone {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+#[derive(Clone)]
+struct BindingAttempt(Arc<AttemptInner>);
+
+struct AttemptInner {
+    transport: CodexAppServerTransport,
+    session: SessionId,
+    owner: CodexTurnTracker,
+    handle: Arc<()>,
+    lifecycle: Arc<Lifecycle>,
+}
+
+impl Drop for AttemptInner {
+    fn drop(&mut self) {
+        self.transport.cancel_binding(&self.session, &self.owner);
+    }
+}
+
+impl BindingAttempt {
+    fn new(
+        transport: CodexAppServerTransport,
+        session: SessionId,
+        handle: Arc<()>,
+        thread: Option<String>,
+        lifecycle: Arc<Lifecycle>,
+    ) -> Self {
+        let owner = transport.begin_binding(&session, thread);
+        Self(Arc::new(AttemptInner {
+            transport,
+            session,
+            owner,
+            handle,
+            lifecycle,
+        }))
+    }
+
+    fn is_current(&self) -> bool {
+        self.0
+            .transport
+            .binding_is_current(&self.0.session, &self.0.owner)
+    }
+
+    async fn enter(&self) -> Result<OwnedMutexGuard<()>, CodexRpcError> {
+        let guard = tokio::select! {
+            guard = self.0.lifecycle.enter() => guard,
+            _ = self.0.owner.revoked() => return Err(stale_binding()),
+        };
+        if !self.is_current() {
+            return Err(stale_binding());
+        }
+        Ok(guard)
+    }
+
+    async fn setup<T>(
+        &self,
+        future: impl std::future::Future<Output = Result<T, CodexRpcError>>,
+    ) -> Result<T, CodexRpcError> {
+        if self.0.owner.is_revoked() {
+            return Err(stale_binding());
+        }
+        tokio::select! {
+            result = future => result,
+            _ = self.0.owner.revoked() => Err(stale_binding()),
+        }
+    }
+}
+
+fn stale_binding() -> CodexRpcError {
+    CodexRpcError::Connect("captured Codex binding attempt was revoked or replaced".into())
+}
+
+fn defer_thread_persistence(attempt: BindingAttempt, callback: ThreadDiscovered, thread: String) {
+    tokio::spawn(async move {
+        let _guard = attempt.0.lifecycle.enter().await;
+        if !attempt
+            .0
+            .transport
+            .owns_binding(&attempt.0.session, &attempt.0.owner)
+        {
+            return;
+        }
+        // This task replaces the producer's detached spawn. Registration may follow launch;
+        // retain the existing bounded registration retry, and never cancel a started write.
+        callback(attempt.0.session.clone(), thread).await;
+    });
 }
 
 /// Owns app-server lifecycle, rollout discovery, notification forwarding, and inject binding for
@@ -89,6 +222,7 @@ struct Handle {
 pub struct CodexBridge {
     handles: Arc<Mutex<HashMap<SessionId, Handle>>>,
     transport: CodexAppServerTransport,
+    lifecycles: Arc<Mutex<HashMap<SessionId, Weak<Lifecycle>>>>,
 }
 
 impl Default for CodexBridge {
@@ -103,12 +237,24 @@ impl CodexBridge {
         CodexBridge {
             handles: Arc::new(Mutex::new(HashMap::new())),
             transport: CodexAppServerTransport::new(),
+            lifecycles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     /// Clone the inject transport so routing code can deliver turns to discovered codex threads.
     pub fn transport(&self) -> CodexAppServerTransport {
         self.transport.clone()
+    }
+
+    fn lifecycle(&self, session: &SessionId) -> Arc<Lifecycle> {
+        let mut lifecycles = self.lifecycles.lock().unwrap();
+        lifecycles.retain(|_, lifecycle| lifecycle.strong_count() != 0);
+        if let Some(lifecycle) = lifecycles.get(session).and_then(Weak::upgrade) {
+            return lifecycle;
+        }
+        let lifecycle = Arc::new(Lifecycle::default());
+        lifecycles.insert(session.clone(), Arc::downgrade(&lifecycle));
+        lifecycle
     }
 
     /// Whether `session` has a live app-server handle tracked by this bridge.
@@ -128,30 +274,31 @@ impl CodexBridge {
     /// Remove one session, abort its forwarder if present, unbind injection, and asynchronously
     /// shut down its app-server subprocess.
     pub fn kill(&self, session: &SessionId) -> bool {
-        let Some(mut handle) = self.handles.lock().unwrap().remove(session) else {
+        let mut handles = self.handles.lock().unwrap();
+        self.transport.unbind(session);
+        self.transport.unmark_live(session);
+        let Some(mut handle) = handles.remove(session) else {
             return false;
         };
         if let Some(forwarder) = handle.forwarder.take() {
             forwarder.abort();
         }
-        self.transport.unbind(session);
-        self.transport.unmark_live(session);
-        tokio::spawn(async move { handle.server.shutdown().await });
+        handle.lifecycle.retire(handle.server);
         true
     }
 
     /// Remove every tracked session, abort all forwarders, unbind injection, and asynchronously
     /// shut down every app-server subprocess. Returns the number of handles removed.
     pub fn kill_all(&self) -> usize {
-        let handles: Vec<_> = self.handles.lock().unwrap().drain().collect();
+        let mut handles = self.handles.lock().unwrap();
         let count = handles.len();
-        for (session, mut handle) in handles {
+        self.transport.unbind_all();
+        for (session, mut handle) in handles.drain() {
+            self.transport.unmark_live(&session);
             if let Some(forwarder) = handle.forwarder.take() {
                 forwarder.abort();
             }
-            self.transport.unbind(&session);
-            self.transport.unmark_live(&session);
-            tokio::spawn(async move { handle.server.shutdown().await });
+            handle.lifecycle.retire(handle.server);
         }
         count
     }
@@ -242,13 +389,23 @@ impl CodexBridge {
                     h.socket.clone(),
                     h.thread_id.clone(),
                     h.server.process_ledger().map(|ids| ids.os_pid),
+                    h.identity.clone(),
                 )
             })
         };
-        if let Some((sock_path, thread_id, known_pid)) = existing_handle {
-            match known_pid {
-                Some(pid) => self.transport.mark_live_with_pid(session.clone(), pid),
-                None => self.transport.mark_live(session.clone()),
+        if let Some((sock_path, thread_id, known_pid, identity)) = existing_handle {
+            {
+                let handles = self.handles.lock().unwrap();
+                if !handles
+                    .get(&session)
+                    .is_some_and(|handle| Arc::ptr_eq(&handle.identity, &identity))
+                {
+                    return Err(stale_binding());
+                }
+                match known_pid {
+                    Some(pid) => self.transport.mark_live_with_pid(session.clone(), pid),
+                    None => self.transport.mark_live(session.clone()),
+                }
             }
             let desired_thread_id = known_thread_id.clone().or(thread_id);
             let bound_thread_id = self.transport.bound_thread_id(&session);
@@ -257,10 +414,28 @@ impl CodexBridge {
                 None => bound_thread_id.is_none(),
             };
             if needs_bind {
+                let attempt = {
+                    let handles = self.handles.lock().unwrap();
+                    if !handles
+                        .get(&session)
+                        .is_some_and(|handle| Arc::ptr_eq(&handle.identity, &identity))
+                    {
+                        return Err(stale_binding());
+                    }
+                    BindingAttempt::new(
+                        self.transport(),
+                        session.clone(),
+                        identity.clone(),
+                        desired_thread_id.clone(),
+                        self.lifecycle(&session),
+                    )
+                };
+                let lifecycle_guard = attempt.enter().await?;
                 if create_thread_if_missing && desired_thread_id.is_none() {
                     create_and_bind_thread(
                         self.handles.clone(),
                         self.transport(),
+                        attempt.clone(),
                         session.clone(),
                         sock_path.clone(),
                         resume_cwd,
@@ -275,6 +450,7 @@ impl CodexBridge {
                         bind_thread(
                             self.handles.clone(),
                             self.transport(),
+                            attempt.clone(),
                             session.clone(),
                             sock_path.clone(),
                             rollout_root,
@@ -288,8 +464,10 @@ impl CodexBridge {
                         .await?;
                     } else {
                         spawn_binding_task(
+                            lifecycle_guard,
                             self.handles.clone(),
                             self.transport(),
+                            attempt.clone(),
                             session.clone(),
                             sock_path.clone(),
                             rollout_root,
@@ -303,6 +481,15 @@ impl CodexBridge {
                     }
                 }
             }
+            if !self
+                .handles
+                .lock()
+                .unwrap()
+                .get(&session)
+                .is_some_and(|handle| Arc::ptr_eq(&handle.identity, &identity))
+            {
+                return Err(stale_binding());
+            }
             return Ok(sock_path);
         }
 
@@ -312,6 +499,20 @@ impl CodexBridge {
             known_thread_id = known_thread_id.as_deref().unwrap_or(""),
             "codex bridge: starting app-server"
         );
+        let attempt = {
+            let handles = self.handles.lock().unwrap();
+            if handles.contains_key(&session) {
+                return Err(stale_binding());
+            }
+            BindingAttempt::new(
+                self.transport(),
+                session.clone(),
+                Arc::new(()),
+                known_thread_id.clone(),
+                self.lifecycle(&session),
+            )
+        };
+        let lifecycle_guard = attempt.enter().await?;
         if force_fresh_app_server {
             let stale_sock = opts.session_dir.join("codex.sock");
             if let Err(error) = std::fs::remove_file(&stale_sock) {
@@ -326,7 +527,14 @@ impl CodexBridge {
                 }
             }
         }
-        let server = CodexAppServer::start(opts).await?;
+        let server = tokio::select! {
+            server = CodexAppServer::start(opts) => server?,
+            _ = attempt.0.owner.revoked() => return Err(stale_binding()),
+        };
+        if !attempt.is_current() {
+            server.shutdown().await;
+            return Err(stale_binding());
+        }
         let sock_path = server.socket().to_path_buf();
         tracing::info!(
             target: "nexus::codex_bridge",
@@ -356,30 +564,45 @@ impl CodexBridge {
         }
 
         let app_server_pid = server.process_ledger().map(|ids| ids.os_pid);
-        self.handles.lock().unwrap().insert(
-            session.clone(),
-            Handle {
-                server,
-                forwarder: None,
-                thread_id: None,
-                socket: sock_path.clone(),
-            },
-        );
-        // Mark the session alive NOW (the app-server process is up) so the heartbeat keeper reads
-        // it "online" and it shows in the roster / web console immediately — the turn binding only
-        // lands after first-turn discovery, which would otherwise leave it "offline" until then.
-        // Pid-backed when this daemon spawned the process, so liveness stays TRUTHFUL (D9/N22:
-        // the keeper must not kill an idle pre-thread codex; a stale stamp must not mask a dead
-        // one). Adopted sockets stay stamp-only and rely on the fast turn binding.
-        match app_server_pid {
-            Some(pid) => self.transport.mark_live_with_pid(session.clone(), pid),
-            None => self.transport.mark_live(session.clone()),
+        let stale_server = {
+            let mut handles = self.handles.lock().unwrap();
+            if !attempt.is_current() {
+                Some(server)
+            } else {
+                handles.insert(
+                    session.clone(),
+                    Handle {
+                        identity: attempt.0.handle.clone(),
+                        lifecycle: attempt.0.lifecycle.clone(),
+                        server,
+                        forwarder: None,
+                        thread_id: None,
+                        socket: sock_path.clone(),
+                    },
+                );
+                // Mark the session alive NOW (the app-server process is up) so the heartbeat keeper reads
+                // it "online" and it shows in the roster / web console immediately — the turn binding only
+                // lands after first-turn discovery, which would otherwise leave it "offline" until then.
+                // Pid-backed when this daemon spawned the process, so liveness stays TRUTHFUL (D9/N22:
+                // the keeper must not kill an idle pre-thread codex; a stale stamp must not mask a dead
+                // one). Adopted sockets stay stamp-only and rely on the fast turn binding.
+                match app_server_pid {
+                    Some(pid) => self.transport.mark_live_with_pid(session.clone(), pid),
+                    None => self.transport.mark_live(session.clone()),
+                }
+                None
+            }
+        };
+        if let Some(server) = stale_server {
+            server.shutdown().await;
+            return Err(stale_binding());
         }
 
         if create_thread_if_missing && known_thread_id.is_none() {
             if let Err(error) = create_and_bind_thread(
                 self.handles.clone(),
                 self.transport(),
+                attempt.clone(),
                 session.clone(),
                 sock_path.clone(),
                 resume_cwd,
@@ -390,13 +613,14 @@ impl CodexBridge {
             )
             .await
             {
-                self.kill(&session);
+                self.kill_attempt(&session, &attempt);
                 return Err(error);
             }
         } else if await_binding {
             if let Err(error) = bind_thread(
                 self.handles.clone(),
                 self.transport(),
+                attempt.clone(),
                 session.clone(),
                 sock_path.clone(),
                 rollout_root,
@@ -409,13 +633,15 @@ impl CodexBridge {
             )
             .await
             {
-                self.kill(&session);
+                self.kill_attempt(&session, &attempt);
                 return Err(error);
             }
         } else {
             spawn_binding_task(
+                lifecycle_guard,
                 self.handles.clone(),
                 self.transport(),
+                attempt.clone(),
                 session.clone(),
                 sock_path.clone(),
                 rollout_root,
@@ -430,12 +656,32 @@ impl CodexBridge {
 
         Ok(sock_path)
     }
+
+    fn kill_attempt(&self, session: &SessionId, attempt: &BindingAttempt) {
+        let mut handles = self.handles.lock().unwrap();
+        if !handles
+            .get(session)
+            .is_some_and(|handle| Arc::ptr_eq(&handle.identity, &attempt.0.handle))
+            || !self.transport.owns_binding(session, &attempt.0.owner)
+        {
+            return;
+        }
+        self.transport.unbind(session);
+        self.transport.unmark_live(session);
+        if let Some(mut handle) = handles.remove(session) {
+            if let Some(forwarder) = handle.forwarder.take() {
+                forwarder.abort();
+            }
+            handle.lifecycle.retire(handle.server);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn create_and_bind_thread(
     handles: Arc<Mutex<HashMap<SessionId, Handle>>>,
     transport: CodexAppServerTransport,
+    attempt: BindingAttempt,
     session: SessionId,
     socket: PathBuf,
     cwd: Option<PathBuf>,
@@ -444,10 +690,25 @@ async fn create_and_bind_thread(
     events: Arc<dyn EventSink>,
     tool_observations: Option<Arc<dyn CodexToolObservationSink>>,
 ) -> Result<String, CodexRpcError> {
-    let client = Arc::new(CodexAppServerClient::connect(&socket, "nexus-bridge").await?);
-    let thread_id = client
-        .thread_start_in(cwd.as_deref().and_then(Path::to_str))
+    if !attempt.is_current() {
+        return Err(stale_binding());
+    }
+    let client = Arc::new(
+        attempt
+            .setup(CodexAppServerClient::connect_with_tracker(
+                &socket,
+                "nexus-bridge",
+                attempt.0.owner.clone(),
+            ))
+            .await?,
+    );
+    let thread_id = attempt
+        .setup(client.thread_start_in(cwd.as_deref().and_then(Path::to_str)))
         .await?;
+
+    if !attempt.is_current() {
+        return Err(stale_binding());
+    }
 
     if let Some(store) = &runtime_store {
         CodexRuntimeStateRepo::new(store)
@@ -459,36 +720,43 @@ async fn create_and_bind_thread(
                 ))
             })?;
     }
-    if let Some(callback) = &on_thread_discovered {
-        callback(session.clone(), thread_id.clone());
-    }
     let forwarder = spawn_codex_forwarder_with_tool_observations(
         session.clone(),
         client.clone(),
         events,
         Arc::new(AutoApprove),
-        transport.turn_tracker(),
+        attempt.0.owner.clone(),
         tool_observations,
     );
     let mut map = handles.lock().unwrap();
     let Some(handle) = map.get_mut(&session) else {
-        transport.unbind(&session);
         forwarder.abort();
         return Err(CodexRpcError::Connect(format!(
             "codex bridge session {session} disappeared while creating its thread"
         )));
     };
+    if !Arc::ptr_eq(&handle.identity, &attempt.0.handle)
+        || !transport.publish_binding(&session, &attempt.0.owner, client, thread_id.clone())
+    {
+        forwarder.abort();
+        return Err(stale_binding());
+    }
     if let Some(previous) = handle.forwarder.replace(forwarder) {
         previous.abort();
     }
     handle.thread_id = Some(thread_id.clone());
-    transport.bind(session, client, thread_id.clone());
+    drop(map);
+    if let Some(callback) = on_thread_discovered {
+        defer_thread_persistence(attempt, callback, thread_id.clone());
+    }
     Ok(thread_id)
 }
 
 fn spawn_binding_task(
+    lifecycle_guard: OwnedMutexGuard<()>,
     handles: Arc<Mutex<HashMap<SessionId, Handle>>>,
     transport: CodexAppServerTransport,
+    attempt: BindingAttempt,
     discovery_session: SessionId,
     discovery_sock: PathBuf,
     rollout_root: PathBuf,
@@ -500,9 +768,11 @@ fn spawn_binding_task(
     tool_observations: Option<Arc<dyn CodexToolObservationSink>>,
 ) {
     tokio::spawn(async move {
+        let _lifecycle_guard = lifecycle_guard;
         if let Err(error) = bind_thread(
             handles,
             transport,
+            attempt,
             discovery_session.clone(),
             discovery_sock,
             rollout_root,
@@ -528,6 +798,7 @@ fn spawn_binding_task(
 async fn bind_thread(
     handles: Arc<Mutex<HashMap<SessionId, Handle>>>,
     transport: CodexAppServerTransport,
+    attempt: BindingAttempt,
     discovery_session: SessionId,
     discovery_sock: PathBuf,
     rollout_root: PathBuf,
@@ -544,9 +815,10 @@ async fn bind_thread(
             (id, rollout_path)
         }
         None => {
-            let Some(discovered) =
-                wait_for_thread_id(&rollout_root, Duration::from_secs(900)).await
-            else {
+            let Some(discovered) = (tokio::select! {
+                discovered = wait_for_thread_id(&rollout_root, Duration::from_secs(900)) => discovered,
+                _ = attempt.0.owner.revoked() => return Err(stale_binding()),
+            }) else {
                 tracing::warn!(
                     session = %discovery_session.0,
                     rollout_root = %rollout_root.display(),
@@ -561,7 +833,18 @@ async fn bind_thread(
         }
     };
 
-    let client = Arc::new(CodexAppServerClient::connect(&discovery_sock, "nexus-bridge").await?);
+    if !attempt.is_current() || !attempt.0.owner.select_thread(&thread_id) {
+        return Err(stale_binding());
+    }
+    let client = Arc::new(
+        attempt
+            .setup(CodexAppServerClient::connect_with_tracker(
+                &discovery_sock,
+                "nexus-bridge",
+                attempt.0.owner.clone(),
+            ))
+            .await?,
+    );
 
     let resume_cwd = resume_cwd
         .as_deref()
@@ -574,15 +857,18 @@ async fn bind_thread(
         cwd = resume_cwd.as_deref().unwrap_or(""),
         "codex bridge: resuming thread for transport bind"
     );
-    let resume = client
-        .thread_resume_in(&thread_id, resume_cwd.as_deref())
+    let before_resume = attempt.0.owner.native_revision();
+    let resume = attempt
+        .setup(client.thread_resume_in(&thread_id, resume_cwd.as_deref()))
         .await?;
-    let resumed_active_turn = resumed_active_turn_id(&resume, &thread_id)?;
-    if let Some(turn_id) = resumed_active_turn.as_deref() {
-        transport
-            .turn_tracker()
-            .observe_active_turn(&thread_id, turn_id);
+    if !attempt.is_current() {
+        return Err(stale_binding());
     }
+    let resumed_active_turn = resumed_active_turn_id(&resume, &thread_id)?;
+    attempt
+        .0
+        .owner
+        .seed_resume(&thread_id, resumed_active_turn.as_deref(), before_resume);
     if let Some(store) = &runtime_store {
         if let Err(e) = CodexRuntimeStateRepo::new(store)
             .set_thread(&discovery_session, &thread_id, rollout_path.clone())
@@ -596,20 +882,28 @@ async fn bind_thread(
             );
         }
     }
-    if let Some(callback) = &on_thread_discovered {
-        callback(discovery_session.clone(), thread_id.clone());
-    }
     let forwarder = spawn_codex_forwarder_with_tool_observations(
         discovery_session.clone(),
         client.clone(),
         events,
         Arc::new(AutoApprove),
-        transport.turn_tracker(),
+        attempt.0.owner.clone(),
         tool_observations,
     );
 
     let mut map = handles.lock().unwrap();
     if let Some(handle) = map.get_mut(&discovery_session) {
+        if !Arc::ptr_eq(&handle.identity, &attempt.0.handle)
+            || !transport.publish_binding(
+                &discovery_session,
+                &attempt.0.owner,
+                client,
+                thread_id.clone(),
+            )
+        {
+            forwarder.abort();
+            return Err(stale_binding());
+        }
         if let Some(old_forwarder) = handle.forwarder.take() {
             old_forwarder.abort();
         }
@@ -618,7 +912,6 @@ async fn bind_thread(
         // Binding is the final readiness publication. Once routing can observe this session,
         // the resume snapshot has seeded any in-progress turn and the sole forwarder is owned
         // by the live handle, so a recovered prompt cannot race the old native boundary.
-        transport.bind(discovery_session.clone(), client, thread_id.clone());
         tracing::info!(
             target: "nexus::codex_bridge",
             session = %discovery_session,
@@ -631,6 +924,10 @@ async fn bind_thread(
         return Err(CodexRpcError::Connect(format!(
             "codex bridge session {discovery_session} disappeared while binding thread {thread_id}"
         )));
+    }
+    drop(map);
+    if let Some(callback) = on_thread_discovered {
+        defer_thread_persistence(attempt, callback, thread_id.clone());
     }
     Ok(thread_id)
 }

@@ -48,6 +48,118 @@ impl EventSink for NullSink {
 }
 
 #[derive(Default)]
+struct BlockThinkingSink {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    blocked: Option<nexus_contracts::AgentUpdateKind>,
+}
+
+#[async_trait]
+impl EventSink for BlockThinkingSink {
+    async fn emit(&self, event: WsEvent) {
+        if matches!(event, WsEvent::AgentUpdate { kind, .. } if kind == self.blocked.unwrap_or(nexus_contracts::AgentUpdateKind::Thinking))
+        {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_terminal_ingress_precedes_an_earlier_blocked_thinking_projection() {
+    assert_native_ingress_before_blocked_projection(nexus_contracts::AgentUpdateKind::Thinking)
+        .await;
+}
+
+#[tokio::test]
+async fn native_terminal_ingress_precedes_an_earlier_blocked_text_projection() {
+    assert_native_ingress_before_blocked_projection(nexus_contracts::AgentUpdateKind::Text).await;
+}
+
+#[tokio::test]
+async fn native_terminal_ingress_precedes_an_earlier_blocked_accepted_projection() {
+    assert_native_ingress_before_blocked_projection(nexus_contracts::AgentUpdateKind::UserInput)
+        .await;
+}
+
+async fn assert_native_ingress_before_blocked_projection(
+    blocked: nexus_contracts::AgentUpdateKind,
+) {
+    let dir = tempdir("blocked-earlier-thinking");
+    let script = json!([
+        {"method": "item/reasoning/textDelta", "params": {"threadId": "THREAD_ID", "turnId": "t1", "delta": "thinking"}},
+        {"method": "item/agentMessage/delta", "params": {"threadId": "THREAD_ID", "turnId": "t1", "itemId": "text", "delta": "text"}},
+        {"method": "turn/completed", "params": {"threadId": "THREAD_ID", "turn": {"id": "t1", "status": "completed"}}},
+        {"method": "turn/started", "params": {"threadId": "THREAD_ID", "turn": {"id": "t2"}}},
+        {"method": "turn/completed", "params": {"threadId": "THREAD_ID", "turn": {"id": "t2", "status": "completed"}}}
+    ]);
+    let srv = CodexAppServer::start(SupervisorOpts {
+        codex_exe: FAKE_BIN.into(),
+        session_dir: dir.clone(),
+        codex_home: Some(dir.join("codex-home")),
+        model: None,
+        bus_mcp: None,
+        cwd: None,
+        env: vec![("FAKE_CODEX_SCRIPT".into(), script.to_string())],
+    })
+    .await
+    .unwrap();
+    let client = Arc::new(
+        CodexAppServerClient::connect(srv.socket(), "nexus")
+            .await
+            .unwrap(),
+    );
+    let thread = client.thread_start().await.unwrap();
+    let transport = nexus_harness_codex::CodexAppServerTransport::new();
+    let session = SessionId("blocked-earlier-thinking".into());
+    transport.bind(session.clone(), client.clone(), thread.clone());
+    let tracker = transport.turn_tracker();
+    let sink = Arc::new(BlockThinkingSink {
+        blocked: Some(blocked),
+        ..Default::default()
+    });
+    if blocked == nexus_contracts::AgentUpdateKind::UserInput {
+        tracker.queue_accepted_event(
+            &thread,
+            sink.clone(),
+            WsEvent::AgentUpdate {
+                session_id: session.clone(),
+                kind: nexus_contracts::AgentUpdateKind::UserInput,
+                data: json!({"text": "accepted"}),
+            },
+        );
+    }
+    let forwarder = spawn_codex_forwarder(
+        session,
+        client.clone(),
+        sink.clone(),
+        Arc::new(AutoApprove),
+        tracker.clone(),
+    );
+    // The scripted server sends the terminal before this correlated response on the same socket.
+    client.turn_start(&thread, "go").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), sink.entered.notified())
+        .await
+        .unwrap();
+    let active = tracker.active_turn_id(&thread);
+    tracker.record_turn_start_acceptance(&thread, "t1");
+    tracker.record_turn_start_acceptance(&thread, "t2");
+    assert_eq!(tracker.active_turn_id(&thread), None);
+    let mut completion =
+        Box::pin(tracker.wait_for_completion(&thread, "t1", Duration::from_secs(3)));
+    assert!(futures::poll!(&mut completion).is_pending());
+    sink.release.notify_one();
+    completion.await.unwrap();
+    forwarder.abort();
+    srv.shutdown().await;
+    let _ = std::fs::remove_dir_all(dir);
+    assert_eq!(
+        active, None,
+        "native terminal cannot wait behind earlier projected thinking"
+    );
+}
+
+#[derive(Default)]
 struct BlockTerminalSink {
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,

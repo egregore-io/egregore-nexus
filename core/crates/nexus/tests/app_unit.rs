@@ -663,7 +663,7 @@ async fn codex_thread_discovery_callback_waits_for_session_registration() {
     let session = SessionId("s_codex_discovery_race".into());
     let thread_id = "codex-thread-race".to_string();
 
-    callback(session.clone(), thread_id.clone());
+    tokio::spawn(callback(session.clone(), thread_id.clone()));
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     Sessions::new(&store)
         .create(NewSession {
@@ -713,6 +713,210 @@ async fn codex_thread_discovery_callback_waits_for_session_registration() {
 }
 
 // ── revive_route truth table ─────────────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+#[tokio::test]
+async fn actual_codex_callback_cannot_rewind_replacement_resume_authority() {
+    use nexus_contracts::{EventSink, WsEvent};
+    use nexus_harness_codex::{BridgeLaunchOptions, CodexBridge, SupervisorOpts, ThreadDiscovered};
+    use nexus_store::repos::{Agents, IdentitySessions, NewAgent, NewIdentitySession};
+    struct Sink;
+    #[async_trait::async_trait]
+    impl EventSink for Sink {
+        async fn emit(&self, _: WsEvent) {}
+    }
+    let root = std::env::temp_dir().join(format!(
+        "codex-actual-callback-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let dir = root.join("session");
+    let home = root.join("home");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(home.join("sessions")).unwrap();
+    for thread in ["callback-old", "callback-new"] {
+        std::fs::write(
+            home.join("sessions")
+                .join(format!("rollout-{thread}.jsonl")),
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\"}}}}\n"),
+        )
+        .unwrap();
+    }
+    let daemon = nexus_store::DaemonStore::open(root.join("nexus.db").to_str().unwrap())
+        .await
+        .unwrap();
+    let store = Arc::new(daemon.compatibility_store());
+    let session = SessionId("s_callback_replacement".into());
+    Agents::new(&store)
+        .create(NewAgent {
+            agent_id: "a_callback".into(),
+            project: "default".into(),
+            name: Some("callback".into()),
+            default_harness: Some("codex".into()),
+            role: None,
+            tier: Some("agent".into()),
+            owner: None,
+        })
+        .await
+        .unwrap();
+    IdentitySessions::new(&store)
+        .upsert(NewIdentitySession {
+            runtime_id: session.0.clone(),
+            agent_id: "a_callback".into(),
+            project: "default".into(),
+            harness: "codex".into(),
+            mode: "headed".into(),
+            backend: Some("pty".into()),
+            cwd: None,
+            native_resume_key: None,
+            client_key: Some("callback-client".into()),
+        })
+        .await
+        .unwrap();
+    Sessions::new(&store)
+        .create(NewSession {
+            session_id: session.clone(),
+            name: Some("callback".into()),
+            agent: Some("codex".into()),
+            kind: "agent".into(),
+            role: None,
+            tier: "agent".into(),
+            harness_session_id: None,
+            client_key: Some("callback-client".into()),
+            cwd: None,
+            project: "default".into(),
+            transport: Some("pty".into()),
+        })
+        .await
+        .unwrap();
+    Sessions::new(&store)
+        .set_agent_id(&session, "a_callback")
+        .await
+        .unwrap();
+    let state = AppState::wire_with_registry(
+        store.clone(),
+        &Config::default(),
+        nexus_agent::AdapterRegistry::new(),
+    );
+    let actual = state.codex_thread_persistence_callback();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let new_written = Arc::new(tokio::sync::Notify::new());
+    let callback: ThreadDiscovered = Arc::new({
+        let entered = entered.clone();
+        let release = release.clone();
+        let new_written = new_written.clone();
+        move |session, thread| {
+            let future = actual(session, thread.clone());
+            let entered = entered.clone();
+            let release = release.clone();
+            let new_written = new_written.clone();
+            Box::pin(async move {
+                if thread == "callback-old" {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                future.await;
+                if thread == "callback-new" {
+                    new_written.notify_one();
+                }
+            })
+        }
+    });
+    let bridge = CodexBridge::new();
+    let opts = SupervisorOpts {
+        codex_exe: env!("CARGO_BIN_EXE_nexus_fake_codex_app_server").into(),
+        session_dir: dir,
+        codex_home: Some(home),
+        model: None,
+        bus_mcp: None,
+        cwd: None,
+        env: vec![],
+    };
+    bridge
+        .launch_with_options(
+            session.clone(),
+            opts.clone(),
+            Arc::new(Sink),
+            BridgeLaunchOptions {
+                known_thread_id: Some("callback-old".into()),
+                runtime_store: Some(store.clone()),
+                on_thread_discovered: Some(callback.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    entered.notified().await;
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let mut new = tokio::spawn({
+        let bridge = bridge.clone();
+        let store = store.clone();
+        let session = session.clone();
+        let ready = ready.clone();
+        async move {
+            ready.notify_one();
+            bridge
+                .launch_with_options(
+                    session,
+                    opts,
+                    Arc::new(Sink),
+                    BridgeLaunchOptions {
+                        known_thread_id: Some("callback-new".into()),
+                        runtime_store: Some(store),
+                        on_thread_discovered: Some(callback),
+                        ..Default::default()
+                    },
+                )
+                .await
+        }
+    });
+    ready.notified().await;
+    let early = tokio::time::timeout(std::time::Duration::from_millis(100), &mut new).await;
+    let overtook = early.is_ok();
+    release.notify_one();
+    if let Ok(result) = early {
+        result.unwrap().unwrap();
+    } else {
+        new.await.unwrap().unwrap();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(3), new_written.notified())
+        .await
+        .unwrap();
+    let row = Sessions::new(&store)
+        .find_by_session_id(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    let capsule = IdentitySessions::new(&store)
+        .find(&session.0)
+        .await
+        .unwrap()
+        .unwrap();
+    let native = NativeThreadBindings::new(&store)
+        .find("codex", "callback-new")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        bridge.transport().bound_thread_id(&session).as_deref(),
+        Some("callback-new")
+    );
+    bridge.kill(&session);
+    let _ = std::fs::remove_dir_all(root);
+    assert!(
+        !overtook,
+        "replacement published before the actual old callback completed"
+    );
+    assert_eq!(row.harness_session_id.as_deref(), Some("callback-new"));
+    assert_eq!(capsule.native_resume_key.as_deref(), Some("callback-new"));
+    assert_eq!(native.agent_id, "a_callback");
+    assert_eq!(native.last_runtime_id.as_deref(), Some(session.0.as_str()));
+}
+
 // Pure/hermetic — no I/O.
 
 #[test]

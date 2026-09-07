@@ -12,6 +12,13 @@ All notable public changes to Egregore Nexus are documented here. This project f
 
 ### Fixed
 
+- Ingest Codex native turn authority before awaited display processing and isolate it
+  by binding owner. Reject superseded prompt/control requests before local submission,
+  preserve newer native observations across delayed resume/projection responses, and
+  clean up cancelled request correlations without treating admitted frames as retracted.
+  Order setup persistence and deferred registration against replacement publication;
+  finish owned process cleanup before reusing its session endpoint. Existing receipt
+  ordering remains separate from native activity ingestion.
 - Carry exact agent/session identity through Gateway prompt, steer, interrupt, compact,
   queue mutations, and structured session WebSocket commands. Session sockets publish
   `session.bound` from canonical observe headers; the retained browser producer rejects

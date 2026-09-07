@@ -172,6 +172,22 @@ where
 
         match method {
             "initialize" => {
+                static PROBE_GATE_USED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if let Ok(entered) = std::env::var("FAKE_CODEX_PROBE_ENTERED") {
+                    if !PROBE_GATE_USED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        let release = std::env::var("FAKE_CODEX_PROBE_RELEASE")?;
+                        std::fs::write(entered, std::process::id().to_string())?;
+                        while !std::path::Path::new(&release).exists() {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    }
+                }
+                if let Ok(script) = std::env::var("FAKE_CODEX_INITIALIZE_SCRIPT") {
+                    for note in serde_json::from_str::<Vec<Value>>(&script)? {
+                        let _ = out_tx.send(note.to_string());
+                    }
+                }
                 let _ = out_tx.send(response_frame(&id, json!({})));
             }
             "thread/start" => {
@@ -214,6 +230,23 @@ where
                             .expect("FAKE_CODEX_RESUME_RESPONSE: invalid JSON")
                     })
                     .unwrap_or_else(|| json!({}));
+                if let Ok(script) = std::env::var("FAKE_CODEX_RESUME_SCRIPT") {
+                    for note in serde_json::from_str::<Vec<Value>>(&script)? {
+                        let _ = out_tx.send(note.to_string());
+                    }
+                }
+                if std::env::var("FAKE_CODEX_RESUME_GATE_THREAD")
+                    .ok()
+                    .as_deref()
+                    == Some(&thread_id)
+                {
+                    let entered = std::env::var("FAKE_CODEX_RESUME_ENTERED")?;
+                    let release = std::env::var("FAKE_CODEX_RESUME_RELEASE")?;
+                    std::fs::write(entered, b"entered")?;
+                    while !std::path::Path::new(&release).exists() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }
                 if let Some(delay_ms) = std::env::var("FAKE_CODEX_RESUME_DELAY_MS")
                     .ok()
                     .and_then(|raw| raw.parse::<u64>().ok())
@@ -332,6 +365,31 @@ where
 
 #[tokio::main]
 pub(super) async fn run() {
+    if let (Ok(entered), Ok(release)) = (
+        std::env::var("FAKE_CODEX_START_ENTERED"),
+        std::env::var("FAKE_CODEX_START_RELEASE"),
+    ) {
+        std::fs::write(entered, b"parked").unwrap();
+        while !std::path::Path::new(&release).exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    #[cfg(unix)]
+    if let (Ok(entered), Ok(release)) = (
+        std::env::var("FAKE_CODEX_TERM_ENTERED"),
+        std::env::var("FAKE_CODEX_TERM_RELEASE"),
+    ) {
+        let mut term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        tokio::spawn(async move {
+            term.recv().await;
+            let _ = std::fs::write(entered, b"retiring");
+            while !std::path::Path::new(&release).exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            std::process::exit(0);
+        });
+    }
     if let Ok(path) = std::env::var("FAKE_CODEX_CWD_PROBE") {
         if let Ok(cwd) = std::env::current_dir() {
             let _ = std::fs::write(path, cwd.to_string_lossy().as_bytes());

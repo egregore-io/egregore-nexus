@@ -140,6 +140,9 @@ pub fn spawn_codex_forwarder_with_tool_observations(
     turn_tracker: CodexTurnTracker,
     tool_observations: Option<Arc<dyn CodexToolObservationSink>>,
 ) -> tokio::task::JoinHandle<()> {
+    let origin = client.origin_tracker();
+    let native_ingress = origin.is_some();
+    let turn_tracker = origin.unwrap_or(turn_tracker);
     tokio::spawn(async move {
         let mut notes = client.notifications();
         // Accumulated Text delta — None means no text is buffered.
@@ -207,7 +210,9 @@ pub fn spawn_codex_forwarder_with_tool_observations(
                             &n.method,
                             &n.params,
                         );
-                        observe_turn_authority(&turn_tracker, &n.method, &n.params);
+                        if !native_ingress {
+                            observe_turn_authority(&turn_tracker, &n.method, &n.params);
+                        }
 
                         let Some(ev) = translate_codex(&n.method, &n.params) else {
                             emit_accepted_if_turn_notification(&turn_tracker, &n.method, &n.params)
@@ -329,7 +334,9 @@ pub fn spawn_codex_forwarder_with_tool_observations(
                     &n.method,
                     &n.params,
                 );
-                observe_turn_authority(&turn_tracker, &n.method, &n.params);
+                if !native_ingress {
+                    observe_turn_authority(&turn_tracker, &n.method, &n.params);
+                }
 
                 let Some(ev) = translate_codex(&n.method, &n.params) else {
                     emit_accepted_if_turn_notification(&turn_tracker, &n.method, &n.params).await;
@@ -485,11 +492,11 @@ fn mark_turn_complete_if_needed(tracker: &CodexTurnTracker, method: &str, params
             return;
         }
         if turn_error_is_structured_hold(params) {
-            tracker.fail(thread_id, turn_id, params.clone());
+            tracker.settle_failure(thread_id, turn_id, params.clone());
             return;
         }
     }
-    tracker.complete(thread_id, turn_id);
+    tracker.settle_completion(thread_id, turn_id);
 }
 
 fn mark_delivery_receipt_if_needed(

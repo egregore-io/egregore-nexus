@@ -39,6 +39,103 @@ async fn store() -> Arc<Store> {
     Arc::new(store)
 }
 
+#[tokio::test]
+async fn superseded_resume_cannot_overwrite_newer_same_handle_persisted_thread() {
+    let root = tempdir("superseded-resume-sidecar");
+    let home = root.join("home");
+    let old_rollout = write_rollout(&home);
+    std::fs::write(
+        old_rollout.with_file_name("rollout-new.jsonl"),
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"new-thread\"}}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("session")).unwrap();
+    let entered = root.join("entered");
+    let release = root.join("release");
+    let store = store().await;
+    let bridge = CodexBridge::new();
+    let session = SessionId("superseded-resume-sidecar".into());
+    let opts = SupervisorOpts {
+        codex_exe: FAKE_BIN.into(),
+        session_dir: root.join("session"),
+        codex_home: Some(home),
+        model: None,
+        bus_mcp: None,
+        cwd: None,
+        env: vec![
+            ("FAKE_CODEX_RESUME_GATE_THREAD".into(), THREAD_ID.into()),
+            (
+                "FAKE_CODEX_RESUME_ENTERED".into(),
+                entered.to_string_lossy().into(),
+            ),
+            (
+                "FAKE_CODEX_RESUME_RELEASE".into(),
+                release.to_string_lossy().into(),
+            ),
+        ],
+    };
+    let old = tokio::spawn({
+        let bridge = bridge.clone();
+        let store = store.clone();
+        let session = session.clone();
+        let opts = opts.clone();
+        async move {
+            bridge
+                .launch_with_options(
+                    session,
+                    opts,
+                    Arc::new(RecSink),
+                    BridgeLaunchOptions {
+                        known_thread_id: Some(THREAD_ID.into()),
+                        runtime_store: Some(store),
+                        ..Default::default()
+                    },
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !entered.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    bridge
+        .launch_with_options(
+            session.clone(),
+            opts,
+            Arc::new(RecSink),
+            BridgeLaunchOptions {
+                known_thread_id: Some("new-thread".into()),
+                runtime_store: Some(store.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let pid = bridge.process_ledger(&session).unwrap().os_pid;
+    std::fs::write(release, b"release").unwrap();
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(3), old)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    assert_eq!(bridge.process_ledger(&session).unwrap().os_pid, pid);
+    assert_eq!(
+        bridge.transport().bound_thread_id(&session).as_deref(),
+        Some("new-thread")
+    );
+    let row = CodexRuntimeStateRepo::new(&store)
+        .find_by_runtime_id(&session)
+        .await
+        .unwrap()
+        .unwrap();
+    bridge.kill(&session);
+    let _ = std::fs::remove_dir_all(root);
+    assert_eq!(row.codex_thread_id.as_deref(), Some("new-thread"));
+}
+
 fn write_rollout(codex_home: &std::path::Path) -> std::path::PathBuf {
     let rollout_dir = codex_home
         .join("sessions")
@@ -53,6 +150,87 @@ fn write_rollout(codex_home: &std::path::Path) -> std::path::PathBuf {
     });
     std::fs::write(&rollout, format!("{first_line}\n")).expect("write rollout");
     rollout
+}
+
+#[tokio::test]
+async fn resume_native_terminal_before_response_wins_over_stale_seed() {
+    assert_native_terminal_before_resume_seed("FAKE_CODEX_RESUME_SCRIPT").await;
+}
+
+#[tokio::test]
+async fn initialize_terminal_cannot_be_resurrected_by_resume_seed() {
+    assert_native_terminal_before_resume_seed("FAKE_CODEX_INITIALIZE_SCRIPT").await;
+}
+
+async fn assert_native_terminal_before_resume_seed(script_env: &str) {
+    let root = tempdir("native-before-resume-seed");
+    let home = root.join("home");
+    write_rollout(&home);
+    std::fs::create_dir_all(root.join("session")).unwrap();
+    let bridge = CodexBridge::new();
+    let session = SessionId("native-before-seed".into());
+    let notes = serde_json::json!([
+        {"method": "turn/completed", "params": {"threadId": THREAD_ID, "turn": {"id": "old", "status": "completed"}}}
+    ]);
+    bridge.launch_with_options(session.clone(), SupervisorOpts {
+        codex_exe: FAKE_BIN.into(), session_dir: root.join("session"),
+        codex_home: Some(home), model: None, bus_mcp: None, cwd: None,
+        env: vec![
+            (script_env.into(), notes.to_string()),
+            ("FAKE_CODEX_RESUME_RESPONSE".into(), serde_json::json!({"thread": {"id": THREAD_ID, "turns": [{"id": "old", "status": "inProgress"}]}}).to_string()),
+        ],
+    }, Arc::new(RecSink), BridgeLaunchOptions { known_thread_id: Some(THREAD_ID.into()), ..Default::default() }).await.unwrap();
+    let active = bridge.transport().active_turn_sessions();
+    bridge.kill(&session);
+    let _ = std::fs::remove_dir_all(root);
+    assert!(
+        active.is_empty(),
+        "resume response rewound a terminal ingested during that request"
+    );
+}
+
+#[tokio::test]
+async fn fresh_bridge_retains_initialize_ingress_only_for_thread_start_result() {
+    let root = tempdir("fresh-initialize-ingress");
+    std::fs::create_dir_all(root.join("session")).unwrap();
+    let bridge = CodexBridge::new();
+    let session = SessionId("fresh-initialize-ingress".into());
+    let notes = serde_json::json!([
+        {"method": "turn/started", "params": {"threadId": "foreign", "turn": {"id": "foreign-turn"}}},
+        {"method": "turn/started", "params": {"threadId": "fake-thread", "turn": {"id": "selected-turn"}}}
+    ]);
+    bridge
+        .launch_with_options(
+            session.clone(),
+            SupervisorOpts {
+                codex_exe: FAKE_BIN.into(),
+                session_dir: root.join("session"),
+                codex_home: Some(root.join("home")),
+                model: None,
+                bus_mcp: None,
+                cwd: None,
+                env: vec![("FAKE_CODEX_INITIALIZE_SCRIPT".into(), notes.to_string())],
+            },
+            Arc::new(RecSink),
+            BridgeLaunchOptions {
+                create_thread_if_missing: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let tracker = bridge.transport().turn_tracker();
+    assert_eq!(
+        bridge.transport().bound_thread_id(&session).as_deref(),
+        Some("fake-thread")
+    );
+    assert_eq!(
+        tracker.active_turn_id("fake-thread").as_deref(),
+        Some("selected-turn")
+    );
+    assert_eq!(tracker.active_turn_id("foreign"), None);
+    bridge.kill(&session);
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]

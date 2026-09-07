@@ -64,18 +64,60 @@ selector; it cannot retrofit exact authority into an unbound command. Omitted le
 redirect remains compatible. Unsupported delivery/model intent is still rejected at
 dispatch, including converted rows, without a native operation.
 
-## Codex completion and display writes
+## Codex native activity and request ownership
 
-Once the Codex forwarder consumes a terminal native notification, it clears that
-exact turn's routing activity before awaiting display/storage I/O. Late start
-acceptance cannot resurrect that terminal turn, and a newer active turn is not
-cleared. Accepted events, ordered text/terminal output, and receipt/completion
-waiters retain their existing ordering; retriable native errors remain active.
+The existing JSON-RPC reader updates native turn authority before forwarding a
+notification to display processing. An earlier blocked display write therefore
+does not prevent a subsequently read terminal notification from clearing its
+turn's activity. Accepted events, ordered output and receipt/completion settlement
+remain on the serial forwarder; native activity ingestion is not a receipt.
+Retryable native errors retain activity. Bounded terminal facts prevent delayed
+acceptance responses for recently completed turns from reopening them, and delayed
+projection settlement cannot overwrite a newer turn's native state.
 
-This closes the consumed-terminal stale-activity window only. A terminal still
-unread behind earlier blocked output, an actor waiting on acceptance, or a held
-native admission lock can still delay a queued prompt. It is not proof that every
-queue stall is fixed, nor proof of the cause of any particular historical stall.
+Each binding attempt captures a private owner before asynchronous setup. Its
+provisional observations cannot replace a published binding; publication validates
+the captured attempt, and teardown revokes it. Resume-response seeding cannot
+overwrite newer native observations received during the request. Captured receipt
+and projection work stays with its original owner after replacement.
+Provisional thread summaries are bounded; exceeding that bound revokes the setup
+attempt rather than turning discarded native-open evidence into an idle binding.
+
+Setup requests use provisional-owner admission checks too. A private per-session
+setup/persistence gate orders sidecar writes, publication and the existing deferred
+thread-registration callback. An old write already in progress finishes before
+the replacement persists and publishes; an old callback starting afterward fails
+its captured-owner check. Registration remains deferred until after launch. Its
+existing bounded retry can delay replacement setup, but holds no native request
+admission or receipt lock. This is ordering across existing stores, not a new
+cross-database transaction or an exactly-once external-effects guarantee.
+
+Construction and retirement also coordinate use of the deterministic session
+endpoint. Replacement setup waits for previous owned-child cleanup before
+starting or adopting at that path. Revocation remains immediate; a stalled setup
+can be cancelled without leaving its child for the replacement to adopt and then
+lose. Normal daemon-restart adoption remains available.
+The same-path process-exit regressions exercise Unix. Non-Unix abnormal-drop
+cleanup retains its existing direct-child kill behavior; these tests do not
+certify a synchronous Windows process-exit boundary.
+
+Prompt, steer (including its expected-turn retry), compact and interrupt capture
+that owner before waiting. Writer readiness precedes a short shared ownership
+check and local `SplitSink::start_send` admission. If replacement wins first, the
+old request cannot enter that slot. This is local admission, not proof that bytes
+were written or that Codex accepted them. The ownership guard is released before
+flush and response waits; a backpressured writer can still delay a control request.
+
+Cancellation removes only the original pending response correlation. Before local
+admission it leaves no request frame; afterward it does not retract an admitted
+frame or establish retry-safe rejection. A later flush may deliver that original
+frame. These native boundaries do not by themselves extend the durable journal's
+ordinary-prompt timeout/restart policy described below.
+
+This reuses the existing reader, tracker and serial notification channel. It does
+not bound that channel during an indefinitely stalled sink, guarantee progress
+when native input itself is unavailable, or prove the cause of a historical
+stall. No new automatic-delivery mode is enabled.
 
 ## Automatic-delivery safety foundation
 

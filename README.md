@@ -61,7 +61,10 @@ legacy HTTP/IPC/CLI routing. Agent-session WebSocket commands require the captur
 pair, supplied by the retained browser producer only after `session.bound`; missing or
 foreign response bindings are not reported as success. Binding is transport/routing
 evidence, not native admission proof. Lens carrier integration remains a separate step.
-Consumed Codex completion clears native busy state independently of its display write.
+Codex native activity is ingested before display processing, so a blocked display write
+does not hold a subsequently read completed turn busy. Private binding ownership also
+prevents a superseded request from entering native submission; an already admitted request
+remains potentially accepted after cancellation, not safe to resend automatically.
 See [composer delivery and retry safety](docs/composer-delivery.md).
 
 Check or update the exact npm/Cargo installation that launched the command:
