@@ -12,6 +12,12 @@ All notable public changes to Egregore Nexus are documented here. This project f
 
 ### Fixed
 
+- Add opt-in daemon exact-session dispatch for prompt, steer, interrupt, and queue
+  mutations using `agentId` plus `expectedSessionId`. Reject stale bindings without
+  revive, validate explicit malformed selectors before enqueue, preserve immutable
+  redirect/retry identity, and resolve new mutations under the identity write gate.
+  Legacy omission remains compatible; Gateway/Lens carrier wiring and native
+  admission/lifecycle exclusion are not enabled by this change.
 - Preserve every unacknowledged Gateway projection sequence, including superseded snapshots,
   so a late Gateway can replay registrations without stalling on silent sequence gaps.
 - Clear completed Codex turns from routing activity before waiting on their display writes,

@@ -93,6 +93,121 @@ fn register_request() -> RegisterRequest {
 }
 
 #[tokio::test]
+async fn malformed_exact_selector_is_rejected_before_any_durable_enqueue() {
+    let state = state().await;
+    for kind in [
+        nexus_store::command_kinds::harness::PROMPT,
+        nexus_store::command_kinds::harness::STEER,
+        nexus_store::command_kinds::harness::INTERRUPT,
+    ] {
+        for (index, options) in [
+            serde_json::json!({"agentId":"a_target", "expectedSessionId":null}),
+            serde_json::json!({"agentId":"a_target", "expectedSessionId":""}),
+            serde_json::json!({"agentId":"a_target", "expectedSessionId":"  "}),
+            serde_json::json!({"agentId":"a_target", "expectedSessionId":{}}),
+            serde_json::json!({"expectedSessionId":"s_target"}),
+            serde_json::json!({"agentId":null, "expectedSessionId":"s_target"}),
+            serde_json::json!({"agentId":" ", "expectedSessionId":"s_target"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut params = serde_json::json!({"name":"target", "text":"no side effects"});
+            params
+                .as_object_mut()
+                .unwrap()
+                .extend(options.as_object().unwrap().clone());
+            let command_id = format!("malformed-{kind}-{index}");
+            let response = daemon_ipc::handle_request(
+                &state,
+                "test-token",
+                DaemonIpcRequest {
+                    version: DAEMON_IPC_PROTOCOL_VERSION,
+                    token: "test-token".into(),
+                    request_id: command_id.clone(),
+                    caller: None,
+                    call: DaemonIpcCall::Enqueue {
+                        command_id: command_id.clone(),
+                        kind: kind.into(),
+                        params,
+                        idempotency_key: None,
+                    },
+                },
+            )
+            .await;
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code),
+                Some(nexus_contracts::codes::INVALID_PARAMS),
+                "{kind} / {options}: {response:?}"
+            );
+            assert!(CommandIntents::new(&state.store)
+                .get(&command_id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_exact_queue_selector_is_rejected_before_mutation_journal() {
+    let state = state().await;
+    for options in [
+        serde_json::json!({"agentId":"a_target", "expectedSessionId":null}),
+        serde_json::json!({"agentId":"a_target", "expectedSessionId":""}),
+        serde_json::json!({"expectedSessionId":"s_target"}),
+    ] {
+        let mut request = serde_json::json!({"name":"target", "action":"cancel", "clientMutationId":"malformed-mutation", "commandId":"never-created", "expectedRevision":1});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(options.as_object().unwrap().clone());
+        let response = daemon_ipc::handle_request(
+            &state,
+            "test-token",
+            DaemonIpcRequest {
+                version: DAEMON_IPC_PROTOCOL_VERSION,
+                token: "test-token".into(),
+                request_id: "malformed-query".into(),
+                caller: Some(DaemonIpcCaller {
+                    name: Some("operator".into()),
+                    project: "metadata".into(),
+                    session_id: Some("local-operator".into()),
+                    agent_id: None,
+                    runtime_id: Some("local-operator".into()),
+                    client_key: None,
+                    kind: Kind::Human,
+                    locality: Default::default(),
+                    access: None,
+                    principal_id: None,
+                    tier: Tier::Admin,
+                }),
+                call: DaemonIpcCall::Query {
+                    method: "local.sessionQueue.mutate".into(),
+                    params: serde_json::json!({"project":"metadata", "now":1, "request":request}),
+                },
+            },
+        )
+        .await;
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(nexus_contracts::codes::INVALID_PARAMS),
+            "{response:?}"
+        );
+    }
+    let mut rows = state
+        .store
+        .identity_conn()
+        .query("SELECT COUNT(*) FROM command_queue_mutations", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn command_call_is_durable_and_held_until_worker_completion_without_polling() {
     let state = state().await;
     let worker = command_worker::spawn(state.clone());

@@ -18,6 +18,36 @@ Queue redirection preserves the original request JSON, so converted pending rows
 command kind. Ordinary explicit steer and redirects with omitted/null options
 retain their existing behavior.
 
+## Opt-in exact daemon session dispatch
+
+Daemon `prompt`, `steer`, `interrupt`, and queue-mutation requests accept optional
+`expectedSessionId` together with a nonempty stable `agentId`. Explicit null, empty,
+non-string, or partial selectors are invalid before durable enqueue or mutation
+effects. Omission preserves existing name/id resolution and revival, including
+slash-command handling. Gateway/Lens carrier integration is separate; this daemon
+slice alone does not make an existing HTTP `sessionId` an exact selector.
+
+Exact dispatch resolves the authoritative active agent runtime and verifies that
+its transport session is owned by that agent and matches the selector. It never
+calls `ensure_alive` or substitutes a newer runtime. Successful routed responses
+include the actual resolved `sessionId`; this is routing evidence, not proof of
+native admission, lifecycle exclusion, or completion. A durable S1 row that reaches
+dispatch after a same-agent S2 rebind fails without reaching S2. Existing scheduling
+can still leave that old row waiting behind a busy lane; no immediate rejection is
+promised while it has not reached dispatch.
+
+New queue mutations resolve identity inside the same identity write transaction as
+their application. Split-store transport rows supply only a matching owned session
+description; they are not queried from the identity transaction. Committed mutation
+receipts replay before new target resolution, even after rebind. Reusing their client
+id with another selector conflicts; omitted legacy canonical JSON gains no null key.
+
+Prompt-to-steer conversion preserves the original request bytes, selector, and retry
+identity. Exact redirect rejects a legacy row lacking the selector or a conflicting
+selector; it cannot retrofit exact authority into an unbound command. Omitted legacy
+redirect remains compatible. Unsupported delivery/model intent is still rejected at
+dispatch, including converted rows, without a native operation.
+
 ## Codex completion and display writes
 
 Once the Codex forwarder consumes a terminal native notification, it clears that

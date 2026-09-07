@@ -156,6 +156,39 @@ async fn prompt_target_row_by_session(
         })
 }
 
+/// Exact selectors authorize dispatch against existing identity, never resurrection.
+/// This is a routing check, not proof of native admission or lifecycle exclusivity.
+async fn resolve_session_dispatch_target(
+    state: &AppState,
+    caller: &Caller,
+    agent_id: Option<&nexus_contracts::AgentId>,
+    name: &str,
+    expected_session: Option<&nexus_contracts::SessionId>,
+) -> Result<nexus_contracts::SessionId, RpcError> {
+    if let Some(expected) = expected_session {
+        let agent = agent_id.ok_or_else(|| invalid_params("expectedSessionId requires agentId"))?;
+        let session = Sessions::new(&state.store)
+            .active_runtime_session_for_agent(&agent.0)
+            .await
+            .map_err(|error| contract_to_rpc(&error.to_contract_error()))?;
+        return session
+            .filter(|row| &row.session_id == expected)
+            .map(|row| row.session_id)
+            .ok_or_else(|| {
+                invalid_params(
+                    "expectedSessionId does not match the agent's existing active runtime session",
+                )
+            });
+    }
+    match agent_id {
+        Some(agent_id) => ensure_alive_agent_by_id(state, agent_id).await,
+        None => state
+            .ensure_alive(name, &caller.project)
+            .await
+            .map_err(|error| contract_to_rpc(&error)),
+    }
+}
+
 async fn ensure_alive_agent_by_id(
     state: &AppState,
     agent_id: &nexus_contracts::AgentId,
@@ -848,18 +881,21 @@ async fn route_request_inner(
         "prompt" => {
             let c = require(caller)?;
             if let Some(params) = p {
+                nexus_contracts::prompt::validate_expected_session(params)
+                    .map_err(|error| contract_to_rpc(&error))?;
                 nexus_contracts::PromptRequest::validate_supported_options(params)
                     .map_err(|error| contract_to_rpc(&error))?;
             }
             let r: nexus_contracts::PromptRequest = parse(p)?;
-            // Revive the agent via the correct backend for its transport (pty or acp), then inject.
-            let session = match r.agent_id.as_ref() {
-                Some(agent_id) => ensure_alive_agent_by_id(state, agent_id).await,
-                None => state
-                    .ensure_alive(&r.name, &c.project)
-                    .await
-                    .map_err(|e| contract_to_rpc(&e)),
-            }?;
+            // Exact dispatch uses the existing binding; omitted selectors retain legacy revive.
+            let session = resolve_session_dispatch_target(
+                state,
+                c,
+                r.agent_id.as_ref(),
+                &r.name,
+                r.expected_session_id.as_ref(),
+            )
+            .await?;
             let row = prompt_target_row_by_session(state, &session).await?;
             match prompt_slash_action(&row, &r.text).map_err(|e| contract_to_rpc(&e))? {
                 Some(PromptSlashAction::NativeCompact) => {
@@ -870,6 +906,7 @@ async fn route_request_inner(
                         .map_err(|e| contract_to_rpc(&e))?;
                     return Ok(serde_json::to_value(nexus_contracts::PromptResponse {
                         delivered: true,
+                        session_id: Some(session.clone()),
                     })
                     .unwrap());
                 }
@@ -894,7 +931,11 @@ async fn route_request_inner(
                 )
                 .await
                 .map_err(|e| contract_to_rpc(&e))?;
-            Ok(serde_json::to_value(nexus_contracts::PromptResponse { delivered: true }).unwrap())
+            Ok(serde_json::to_value(nexus_contracts::PromptResponse {
+                delivered: true,
+                session_id: Some(session),
+            })
+            .unwrap())
         }
         // EXPLICIT active-turn redirect. This is intentionally a separate command from `prompt`:
         // normal `harness.prompt` rows retain their per-session boundary queue. The routed adapter
@@ -905,20 +946,23 @@ async fn route_request_inner(
             // Queue redirection preserves the original prompt JSON. Validate before decoding
             // (and before revive) so retained delivery/model intent cannot disappear in serde.
             if let Some(params) = p {
+                nexus_contracts::prompt::validate_expected_session(params)
+                    .map_err(|error| contract_to_rpc(&error))?;
                 nexus_contracts::PromptRequest::validate_supported_options(params)
                     .map_err(|error| contract_to_rpc(&error))?;
             }
             let r: SteerRequest = parse(p)?;
-            let session = match r.agent_id.as_ref() {
-                Some(agent_id) => ensure_alive_agent_by_id(state, agent_id).await,
-                None => state
-                    .ensure_alive(&r.name, &c.project)
-                    .await
-                    .map_err(|e| contract_to_rpc(&e)),
-            }?;
+            let session = resolve_session_dispatch_target(
+                state,
+                c,
+                r.agent_id.as_ref(),
+                &r.name,
+                r.expected_session_id.as_ref(),
+            )
+            .await?;
             prompt_target_row_by_session(state, &session).await?;
             let caller_kind = authenticated_caller_kind(state, c).await?;
-            let response = state
+            let mut response = state
                 .agent
                 .steer_observed(
                     &session,
@@ -938,27 +982,37 @@ async fn route_request_inner(
                 )
                 .await
                 .map_err(|e| contract_to_rpc(&e))?;
+            response.session_id = Some(session);
             Ok(serde_json::to_value(response).unwrap())
         }
         // EXPLICIT active-turn stop. Unlike steer this never injects replacement text; the
         // adapter owns the correct interrupt mechanism for native and headed transports.
         "interrupt" => {
             let c = require(caller)?;
+            if let Some(params) = p {
+                nexus_contracts::prompt::validate_expected_session(params)
+                    .map_err(|error| contract_to_rpc(&error))?;
+            }
             let r: InterruptRequest = parse(p)?;
-            let session = match r.agent_id.as_ref() {
-                Some(agent_id) => ensure_alive_agent_by_id(state, agent_id).await,
-                None => state
-                    .ensure_alive(&r.name, &c.project)
-                    .await
-                    .map_err(|e| contract_to_rpc(&e)),
-            }?;
+            let session = resolve_session_dispatch_target(
+                state,
+                c,
+                r.agent_id.as_ref(),
+                &r.name,
+                r.expected_session_id.as_ref(),
+            )
+            .await?;
             prompt_target_row_by_session(state, &session).await?;
             state
                 .agent
                 .interrupt_active_turn(&session)
                 .await
                 .map_err(|e| contract_to_rpc(&e))?;
-            Ok(serde_json::to_value(InterruptResponse { interrupted: true }).unwrap())
+            Ok(serde_json::to_value(InterruptResponse {
+                interrupted: true,
+                session_id: Some(session),
+            })
+            .unwrap())
         }
         // NATIVE context compaction — same resolve+revive spine as `prompt`, but the
         // transport runs the REAL operation (codex `thread/compact/start`; headed PTY

@@ -43,6 +43,7 @@ pub struct CommandQueue<'a> {
 struct QueueTarget<'a> {
     name: Option<&'a str>,
     agent_id: Option<&'a str>,
+    expected_session_id: Option<&'a str>,
 }
 
 impl<'a> QueueTarget<'a> {
@@ -54,6 +55,7 @@ impl<'a> QueueTarget<'a> {
                 .map(str::trim)
                 .filter(|name| !name.is_empty()),
             agent_id: request.agent_id.as_ref().map(|id| id.0.as_str()),
+            expected_session_id: request.expected_session_id.as_ref().map(|id| id.0.as_str()),
         }
     }
 
@@ -111,6 +113,7 @@ impl<'a> CommandQueue<'a> {
         let target = QueueTarget {
             name: name.map(str::trim).filter(|name| !name.is_empty()),
             agent_id: agent_id.map(|id| id.0.as_str()),
+            expected_session_id: None,
         };
         let runtime = target_runtime(self.store, target, active_sessions).await?;
         let seq = latest_queue_seq_store(self.store).await?;
@@ -152,6 +155,19 @@ impl<'a> CommandQueue<'a> {
         now: i64,
         active_sessions: &[SessionId],
     ) -> Result<CommandQueueMutationOutcome, NexusError> {
+        if request.expected_session_id.as_ref().is_some_and(|id| {
+            id.0.trim().is_empty()
+                || request
+                    .agent_id
+                    .as_ref()
+                    .is_none_or(|agent| agent.0.trim().is_empty())
+        }) {
+            return Ok(error_outcome(
+                request,
+                "expectedSessionId requires a nonempty session id and stable agentId",
+                400,
+            ));
+        }
         if request
             .name
             .as_deref()
@@ -169,7 +185,6 @@ impl<'a> CommandQueue<'a> {
         let canonical = canonical_request(request)?;
         let canonical_json = serde_json::to_string(&canonical).map_err(store_msg)?;
         let target = QueueTarget::from_request(request);
-        let runtime = target_runtime(self.store, target, active_sessions).await?;
         let tx = self
             .store
             .begin_identity_write_txn("command_queue_mutation")
@@ -179,6 +194,10 @@ impl<'a> CommandQueue<'a> {
             tx.commit().await?;
             return Ok(previous);
         }
+
+        // Resolve NEW work under the same identity write gate as apply. A
+        // committed receipt replays without re-resolving a later runtime.
+        let runtime = mutation_target_runtime(self.store, &tx, target, active_sessions).await?;
 
         tx.execute(
             "INSERT INTO command_queue_mutations \
@@ -269,6 +288,59 @@ async fn target_runtime(
             None => None,
         },
     };
+    runtime_from_session(store, session, active_sessions).await
+}
+
+async fn mutation_target_runtime(
+    store: &Store,
+    tx: &WriteTxn,
+    target: QueueTarget<'_>,
+    active_sessions: &[SessionId],
+) -> Result<TargetRuntime, NexusError> {
+    let sessions = Sessions::new(store);
+    let session = if let Some(agent_id) = target.agent_id {
+        // agent_runtimes belongs to identity authority. Transport session rows
+        // describe this binding but cannot choose a replacement for exact mode.
+        let mut rows = tx.query(
+            "SELECT runtime_id FROM agent_runtimes WHERE agent_id = ?1 AND active = 1 AND stopped_at IS NULL ORDER BY started_at DESC LIMIT 1",
+            params![agent_id],
+        ).await?;
+        if let Some(row) = rows.next().await.map_err(store_err)? {
+            let runtime_id = get_text(&row, 0)?;
+            let session = sessions
+                .find_by_session_id(&SessionId(runtime_id.clone()))
+                .await?;
+            if session
+                .as_ref()
+                .is_some_and(|row| row.agent_id.as_deref() != Some(agent_id))
+            {
+                return Err(NexusError::Invalid(format!(
+                    "active runtime {runtime_id} is not owned by agent {agent_id}"
+                )));
+            }
+            if session.is_none() && target.expected_session_id.is_none() {
+                sessions.find_by_agent_id(agent_id).await?
+            } else {
+                session
+            }
+        } else if target.expected_session_id.is_none() {
+            sessions.find_by_agent_id(agent_id).await?
+        } else {
+            None
+        }
+    } else if let Some(name) = target.name {
+        sessions.find_unique_by_name_any_project(name).await?
+    } else {
+        None
+    };
+    runtime_from_session(store, session, active_sessions).await
+}
+
+async fn runtime_from_session(
+    store: &Store,
+    session: Option<crate::types::SessionRow>,
+    active_sessions: &[SessionId],
+) -> Result<TargetRuntime, NexusError> {
     let Some(session) = session else {
         return Ok(TargetRuntime {
             session_id: None,
@@ -491,6 +563,19 @@ async fn apply_mutation(
     now: i64,
     runtime: &TargetRuntime,
 ) -> Result<(CommandQueueMutationOutcome, QueueEffect), NexusError> {
+    if target
+        .expected_session_id
+        .is_some_and(|expected| runtime.session_id.as_deref() != Some(expected))
+    {
+        return Ok((
+            error_outcome(
+                request,
+                "expected session does not match the agent's existing active runtime",
+                409,
+            ),
+            QueueEffect::None,
+        ));
+    }
     match request.action {
         CommandQueueAction::RedirectNow => {
             let Some((command_id, expected_revision)) = command_and_revision(request) else {
@@ -515,7 +600,7 @@ async fn apply_mutation(
                     QueueEffect::None,
                 ));
             }
-            if !command_matches_target(tx, command_id, target, runtime).await? {
+            if !command_matches_target(tx, command_id, target, runtime, true).await? {
                 return Ok((cas_conflict(request), QueueEffect::None));
             }
             let changed = tx
@@ -543,7 +628,7 @@ async fn apply_mutation(
                     QueueEffect::None,
                 ));
             };
-            if !command_matches_target(tx, command_id, target, runtime).await? {
+            if !command_matches_target(tx, command_id, target, runtime, false).await? {
                 return Ok((cas_conflict(request), QueueEffect::None));
             }
             let changed = tx
@@ -596,7 +681,7 @@ async fn apply_mutation(
                     QueueEffect::None,
                 ));
             };
-            if !command_matches_target(tx, command_id, target, runtime).await? {
+            if !command_matches_target(tx, command_id, target, runtime, false).await? {
                 return Ok((cas_conflict(request), QueueEffect::None));
             }
             let changed = tx
@@ -653,7 +738,7 @@ async fn reorder(
 
     let mut created_at = Vec::with_capacity(request.command_ids.len());
     for command_id in &request.command_ids {
-        if !command_matches_target(tx, command_id, target, runtime).await? {
+        if !command_matches_target(tx, command_id, target, runtime, false).await? {
             return Ok((reorder_conflict(request), QueueEffect::None));
         }
         let mut rows = tx
@@ -707,6 +792,7 @@ async fn command_matches_target(
     command_id: &str,
     target: QueueTarget<'_>,
     runtime: &TargetRuntime,
+    require_original_selector: bool,
 ) -> Result<bool, NexusError> {
     let mut rows = tx
         .query(
@@ -718,6 +804,16 @@ async fn command_matches_target(
         return Ok(false);
     };
     let command_request = serde_json::from_str::<Value>(&get_text(&row, 0)?).map_err(store_msg)?;
+    if let Some(expected) = target.expected_session_id {
+        let original = command_request.get("expectedSessionId");
+        // Redirect changes execution intent; an unbound legacy row cannot
+        // acquire a new selector by conversion. Existing selectors always match.
+        if original.is_some_and(|original| original.as_str() != Some(expected))
+            || (require_original_selector && original.is_none())
+        {
+            return Ok(false);
+        }
+    }
     let direct = match target.agent_id {
         Some(agent_id) => command_request.get("agentId").and_then(Value::as_str) == Some(agent_id),
         None => {
@@ -784,7 +880,7 @@ fn command_and_revision(request: &CommandQueueMutationRequest) -> Option<(&str, 
 fn canonical_request(request: &CommandQueueMutationRequest) -> Result<Value, NexusError> {
     let mut expected = request.expected_revisions.clone();
     expected.sort_by(|left, right| left.command_id.cmp(&right.command_id));
-    Ok(json!({
+    let mut canonical = json!({
         "name": request.name.as_deref().map(str::trim),
         "agentId": request.agent_id,
         "action": serde_json::to_value(request.action).map_err(store_msg)?,
@@ -793,7 +889,11 @@ fn canonical_request(request: &CommandQueueMutationRequest) -> Result<Value, Nex
         "text": request.text,
         "commandIds": request.command_ids,
         "expectedRevisions": expected,
-    }))
+    });
+    if let Some(expected) = &request.expected_session_id {
+        canonical["expectedSessionId"] = json!(expected);
+    }
+    Ok(canonical)
 }
 
 fn success_outcome(

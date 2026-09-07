@@ -967,6 +967,11 @@ async fn handle_local_session_queue_mutation(
             "session queue mutations require local operator authority",
         );
     }
+    if let Some(request) = params.get("request") {
+        if let Err(error) = nexus_contracts::prompt::validate_expected_session(request) {
+            return store_failure(request_id, error);
+        }
+    }
     let request: LocalSessionQueueMutationRequest = match serde_json::from_value(params) {
         Ok(request) => request,
         Err(error) => {
@@ -1584,7 +1589,18 @@ async fn command_row_for_acceptance(
     params: Value,
     idempotency_key: Option<String>,
 ) -> Result<(NewCommandIntent, Option<String>), ContractError> {
-    if kind == nexus_store::command_kinds::harness::PROMPT {
+    if matches!(
+        kind.as_str(),
+        nexus_store::command_kinds::harness::PROMPT
+            | nexus_store::command_kinds::harness::STEER
+            | nexus_store::command_kinds::harness::INTERRUPT
+    ) {
+        nexus_contracts::prompt::validate_expected_session(&params)?;
+    }
+    if matches!(
+        kind.as_str(),
+        nexus_store::command_kinds::harness::PROMPT | nexus_store::command_kinds::harness::STEER
+    ) {
         nexus_contracts::PromptRequest::validate_supported_options(&params)?;
     }
     let Some(evidence) = caller else {

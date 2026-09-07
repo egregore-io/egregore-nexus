@@ -207,6 +207,7 @@ impl AgentTurnExecutionPort for SerializedInterruptAndSendTurnExec {
         self.first_completed.notified().await;
         events.emit(accepted_event).await;
         Ok(SteerResponse {
+            session_id: None,
             accepted: true,
             delivery: SteerDelivery::InterruptedAndStarted,
             turn_id: None,
@@ -431,6 +432,7 @@ impl AgentTurnExecutionPort for NativeSteerTurnExec {
         events.emit(accepted_event).await;
         self.steer_accepted.notify_one();
         Ok(SteerResponse {
+            session_id: None,
             accepted: true,
             delivery: SteerDelivery::Steered,
             turn_id: Some("turn_active".into()),

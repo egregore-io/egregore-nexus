@@ -579,6 +579,7 @@ pub trait AgentTurnExecutionPort: Send + Sync {
         self.prompt_observed(_recipient, _text, _events, _accepted_event)
             .await?;
         Ok(SteerResponse {
+            session_id: None,
             accepted: true,
             delivery: crate::SteerDelivery::InterruptedAndStarted,
             turn_id: None,

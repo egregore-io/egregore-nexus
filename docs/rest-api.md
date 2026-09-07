@@ -123,6 +123,15 @@ valid `nexus_human` login cookie.
 
 ### `POST /api/conversation/steer`
 
+**Exact-session compatibility boundary:** daemon request contracts now offer
+`expectedSessionId` plus stable `agentId` for prompt, steer, interrupt, and queue
+mutations. That opt-in rejects stale/absent bindings without revive; explicit
+null/empty/partial selectors are invalid. The Rust daemon slice does not yet wire
+the HTTP `sessionId` carrier into this selector. Existing HTTP/IPC/CLI requests that
+omit it keep their legacy behavior; clients must not infer end-to-end exact routing
+from generated types alone. A routed response's optional `sessionId` identifies the
+actual binding, not native admission proof. See [composer delivery](composer-delivery.md).
+
 Explicitly sends additional input to an active native Codex turn. This route enqueues
 `harness.steer`, waits for the daemon-written final result, and does not reuse the normal
 `harness.prompt` boundary queue. `clientMessageId` is both carried to the runtime and used as the

@@ -493,6 +493,8 @@ export enum CommandQueueAction {
 
 /** Request for one server-owned queue mutation. Fields not used by the selected action are absent. */
 export interface CommandQueueMutationRequest {
+	/** Require the existing active runtime to match before a new mutation is applied. */
+	expectedSessionId?: SessionId;
 	name?: string;
 	agentId?: AgentId;
 	action: CommandQueueAction;
@@ -1045,6 +1047,8 @@ export interface InboxUnsubscribeRequest {
 
 /** Interrupt the active turn on one agent session without injecting replacement text. */
 export interface InterruptRequest {
+	/** Dispatch only to this agent's existing active runtime; never revive or retarget. */
+	expectedSessionId?: SessionId;
 	/** The stable target agent id. When present, it is authoritative over `name`. */
 	agentId?: AgentId;
 	/** The target agent's registered name fallback. */
@@ -1056,6 +1060,8 @@ export interface InterruptRequest {
 /** Response emitted only after the adapter accepted the interrupt. */
 export interface InterruptResponse {
 	interrupted: boolean;
+	/** Actual runtime binding selected by the router. */
+	sessionId?: SessionId;
 }
 
 /** `nexus thread join <name>` (caller joins). */
@@ -1284,7 +1290,12 @@ export interface Project {
 
 /** Inject one operator message directly into an agent's ACP session by agent name. */
 export interface PromptRequest {
-	/** The stable target agent id. When present, the daemon revives this id before `name`. */
+	/** Dispatch only to this agent's existing active runtime; never revive or retarget. */
+	expectedSessionId?: SessionId;
+	/**
+	 * Stable target identity, authoritative over `name`. Only legacy omission of
+	 * `expectedSessionId` permits revival.
+	 */
 	agentId?: AgentId;
 	/** The target agent's registered name fallback (resolved to its live ACP session). */
 	name: string;
@@ -1300,6 +1311,8 @@ export interface PromptRequest {
 /** Response: whether the turn was injected (the reply itself streams over the WS). */
 export interface PromptResponse {
 	delivered: boolean;
+	/** Actual runtime binding used by the router, not a native delivery receipt. */
+	sessionId?: SessionId;
 }
 
 /**
@@ -1689,7 +1702,12 @@ export interface StatusResponse {
  * capability: native steering when available, otherwise an adapter-owned interrupt-and-send.
  */
 export interface SteerRequest {
-	/** The stable target agent id. When present, the daemon revives this id before `name`. */
+	/** Dispatch only to this agent's existing active runtime; never revive or retarget. */
+	expectedSessionId?: SessionId;
+	/**
+	 * Stable target identity, authoritative over `name`. Only legacy omission of
+	 * `expectedSessionId` permits revival.
+	 */
 	agentId?: AgentId;
 	/** The target agent's registered name fallback. */
 	name: string;
@@ -1716,6 +1734,8 @@ export enum SteerDelivery {
 
 /** Response returned only after the selected adapter accepts the redirect operation. */
 export interface SteerResponse {
+	/** Actual runtime binding selected by the router. */
+	sessionId?: SessionId;
 	accepted: boolean;
 	delivery: SteerDelivery;
 	turnId?: string;

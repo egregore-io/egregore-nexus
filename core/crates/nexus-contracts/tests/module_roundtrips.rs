@@ -1810,9 +1810,87 @@ mod prompt {
     };
 
     #[test]
+    fn exact_session_selector_roundtrips_and_legacy_omits_it() {
+        fn check<T: serde::de::DeserializeOwned + serde::Serialize>(base: serde_json::Value) {
+            let legacy: T = serde_json::from_value(base.clone()).unwrap();
+            assert!(serde_json::to_value(legacy)
+                .unwrap()
+                .get("expectedSessionId")
+                .is_none());
+            let mut exact = base.clone();
+            exact["expectedSessionId"] = serde_json::json!("s_owned");
+            let decoded: T = serde_json::from_value(exact).unwrap();
+            assert_eq!(
+                serde_json::to_value(decoded).unwrap()["expectedSessionId"],
+                "s_owned"
+            );
+            for invalid in [
+                serde_json::Value::Null,
+                serde_json::json!(""),
+                serde_json::json!("  "),
+                serde_json::json!({}),
+            ] {
+                let mut wire = base.clone();
+                wire["expectedSessionId"] = invalid;
+                assert!(
+                    serde_json::from_value::<T>(wire).is_err(),
+                    "explicit malformed selector must not become legacy"
+                );
+            }
+        }
+        let input = serde_json::json!({"agentId":"a_owned", "name":"display", "text":"hello"});
+        check::<nexus_contracts::PromptRequest>(input.clone());
+        check::<nexus_contracts::SteerRequest>(input.clone());
+        check::<nexus_contracts::InterruptRequest>(input);
+        check::<CommandQueueMutationRequest>(
+            serde_json::json!({"agentId":"a_owned", "action":"cancel", "clientMutationId":"mutation"}),
+        );
+    }
+
+    #[test]
+    fn routed_session_responses_roundtrip_actual_optional_session() {
+        fn check<T: serde::de::DeserializeOwned + serde::Serialize>(mut base: serde_json::Value) {
+            let legacy: T = serde_json::from_value(base.clone()).unwrap();
+            assert!(serde_json::to_value(legacy)
+                .unwrap()
+                .get("sessionId")
+                .is_none());
+            base["sessionId"] = serde_json::json!("s_actual");
+            let exact: T = serde_json::from_value(base).unwrap();
+            assert_eq!(
+                serde_json::to_value(exact).unwrap()["sessionId"],
+                "s_actual"
+            );
+        }
+        check::<nexus_contracts::PromptResponse>(serde_json::json!({"delivered":true}));
+        check::<nexus_contracts::SteerResponse>(
+            serde_json::json!({"accepted":true,"delivery":"steered"}),
+        );
+        check::<nexus_contracts::InterruptResponse>(serde_json::json!({"interrupted":true}));
+    }
+
+    #[test]
+    fn exact_session_dispatch_golden_is_lossless() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../fixtures/session_dispatch.exact.json")).unwrap();
+        fn check<T: serde::de::DeserializeOwned + serde::Serialize>(value: &serde_json::Value) {
+            let decoded: T = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), *value);
+        }
+        check::<nexus_contracts::PromptRequest>(&fixture["promptRequest"]);
+        check::<nexus_contracts::SteerRequest>(&fixture["steerRequest"]);
+        check::<nexus_contracts::InterruptRequest>(&fixture["interruptRequest"]);
+        check::<CommandQueueMutationRequest>(&fixture["queueMutationRequest"]);
+        check::<nexus_contracts::PromptResponse>(&fixture["promptResponse"]);
+        check::<nexus_contracts::SteerResponse>(&fixture["steerResponse"]);
+        check::<nexus_contracts::InterruptResponse>(&fixture["interruptResponse"]);
+    }
+
+    #[test]
     #[allow(deprecated)] // Compatibility decoding remains supported; production no longer emits it.
     fn steer_request_and_response_roundtrip() {
         let request = SteerRequest {
+            expected_session_id: None,
             agent_id: Some(AgentId("a_otto".into())),
             name: "otto".into(),
             text: "focus on the failing test".into(),
@@ -1827,6 +1905,7 @@ mod prompt {
         );
 
         let response = SteerResponse {
+            session_id: None,
             accepted: true,
             delivery: SteerDelivery::FallbackStarted,
             turn_id: Some("turn_1".into()),
@@ -1843,6 +1922,7 @@ mod prompt {
     #[test]
     fn durable_queue_mutation_uses_exact_redirect_and_capability_tokens() {
         let request = CommandQueueMutationRequest {
+            expected_session_id: None,
             name: Some("otto".into()),
             agent_id: Some(AgentId("a_otto".into())),
             action: CommandQueueAction::RedirectNow,
@@ -1863,6 +1943,7 @@ mod prompt {
         );
 
         let id_only = CommandQueueMutationRequest {
+            expected_session_id: None,
             name: None,
             agent_id: Some(AgentId("a_otto".into())),
             action: CommandQueueAction::Cancel,

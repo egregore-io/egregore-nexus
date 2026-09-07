@@ -404,6 +404,7 @@ impl CodexAppServerTransport {
                 })?;
         }
         Ok(SteerResponse {
+            session_id: None,
             accepted: true,
             delivery: decision.delivery,
             turn_id: decision.turn_id,

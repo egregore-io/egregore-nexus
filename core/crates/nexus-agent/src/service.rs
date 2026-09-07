@@ -589,6 +589,7 @@ impl AgentTurnExecutionPort for Agent {
             .await
             .map_err(ContractError::from)?;
         Ok(SteerResponse {
+            session_id: None,
             accepted: true,
             delivery: SteerDelivery::InterruptedAndStarted,
             turn_id: None,

@@ -11,14 +11,54 @@
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
-use crate::ids::AgentId;
+use crate::ids::{AgentId, SessionId};
+
+/// Validate an explicitly selected runtime before serde can turn null into omission.
+/// Exact mode requires the stable agent/session pair; omission retains legacy routing.
+pub fn validate_expected_session(params: &serde_json::Value) -> Result<(), crate::ContractError> {
+    let Some(session) = params.get("expectedSessionId") else {
+        return Ok(());
+    };
+    if session.as_str().is_none_or(|id| id.trim().is_empty())
+        || params
+            .get("agentId")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|id| id.trim().is_empty())
+    {
+        return Err(crate::ContractError {
+            code: crate::codes::INVALID_PARAMS,
+            message: "expectedSessionId requires a nonempty session id and stable agentId".into(),
+        });
+    }
+    Ok(())
+}
+
+fn deserialize_expected_session<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<SessionId>, D::Error> {
+    let session = String::deserialize(deserializer)?;
+    if session.trim().is_empty() {
+        return Err(serde::de::Error::custom(
+            "expectedSessionId cannot be empty",
+        ));
+    }
+    Ok(Some(SessionId(session)))
+}
 
 /// Inject one operator message directly into an agent's ACP session by agent name.
 #[typeshare]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptRequest {
-    /// The stable target agent id. When present, the daemon revives this id before `name`.
+    /// Dispatch only to this agent's existing active runtime; never revive or retarget.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_expected_session"
+    )]
+    pub expected_session_id: Option<SessionId>,
+    /// Stable target identity, authoritative over `name`. Only legacy omission of
+    /// `expectedSessionId` permits revival.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
     /// The target agent's registered name fallback (resolved to its live ACP session).
@@ -56,6 +96,9 @@ impl PromptRequest {
 #[serde(rename_all = "camelCase")]
 pub struct PromptResponse {
     pub delivered: bool,
+    /// Actual runtime binding used by the router, not a native delivery receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
 }
 
 /// Durable lifecycle of one session-composer command.
@@ -167,6 +210,13 @@ pub struct CommandExpectedRevision {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandQueueMutationRequest {
+    /// Require the existing active runtime to match before a new mutation is applied.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_expected_session"
+    )]
+    pub expected_session_id: Option<SessionId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -241,7 +291,15 @@ pub struct CommandQueueTransition {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SteerRequest {
-    /// The stable target agent id. When present, the daemon revives this id before `name`.
+    /// Dispatch only to this agent's existing active runtime; never revive or retarget.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_expected_session"
+    )]
+    pub expected_session_id: Option<SessionId>,
+    /// Stable target identity, authoritative over `name`. Only legacy omission of
+    /// `expectedSessionId` permits revival.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
     /// The target agent's registered name fallback.
@@ -288,6 +346,9 @@ pub enum SteerDelivery {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SteerResponse {
+    /// Actual runtime binding selected by the router.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
     pub accepted: bool,
     pub delivery: SteerDelivery,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -348,6 +409,13 @@ pub struct CompactResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct InterruptRequest {
+    /// Dispatch only to this agent's existing active runtime; never revive or retarget.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_expected_session"
+    )]
+    pub expected_session_id: Option<SessionId>,
     /// The stable target agent id. When present, it is authoritative over `name`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
@@ -364,4 +432,7 @@ pub struct InterruptRequest {
 #[serde(rename_all = "camelCase")]
 pub struct InterruptResponse {
     pub interrupted: bool,
+    /// Actual runtime binding selected by the router.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
 }

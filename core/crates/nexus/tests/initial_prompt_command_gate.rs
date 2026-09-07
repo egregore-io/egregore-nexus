@@ -51,6 +51,7 @@ impl AgentTurnExecutionPort for CountingExec {
         self.steer.fetch_add(1, Ordering::SeqCst);
         events.emit(accepted_event).await;
         Ok(SteerResponse {
+            session_id: None,
             accepted: true,
             delivery: SteerDelivery::Steered,
             turn_id: Some("turn_test".into()),
@@ -201,6 +202,7 @@ async fn pending_initial_prompt_blocks_prompt_steer_compact_and_warm_until_accep
         command_kinds::harness::PROMPT,
         &alex,
         serde_json::to_string(&PromptRequest {
+            expected_session_id: None,
             agent_id: None,
             name: "Ada".into(),
             text: "hello".into(),
@@ -216,6 +218,7 @@ async fn pending_initial_prompt_blocks_prompt_steer_compact_and_warm_until_accep
         command_kinds::harness::STEER,
         &alex,
         serde_json::to_string(&SteerRequest {
+            expected_session_id: None,
             agent_id: None,
             name: "Ada".into(),
             text: "steer now".into(),
@@ -333,6 +336,7 @@ async fn pending_initial_prompt_blocks_agent_id_targeted_commands_with_stale_nam
         command_kinds::harness::PROMPT,
         &alex,
         serde_json::to_string(&PromptRequest {
+            expected_session_id: None,
             agent_id: Some(ada_agent_id.clone()),
             name: "stale-name".into(),
             text: "hello".into(),
