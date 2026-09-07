@@ -76,6 +76,376 @@ async function loadWs(): Promise<WsModule> {
 }
 
 describe("AG-UI WebSocket server transport", () => {
+  it.each(["queue.redirect", "queue.cancel", "queue.edit", "queue.reorder"].flatMap((t) =>
+    ["", "dm=otto&agentId=a_real", "thread=work&agentId=a_real", "topic=updates&agentId=a_real"]
+      .map((query) => ({ t, query })),
+  ))("rejects $t on non-session socket $query before any queue fallback", async ({ t, query }) => {
+    const { handleWs } = await loadWs();
+    const socket = new FakeSocket();
+    const source = controlledTextStream();
+    const effect = vi.fn(async () => Response.json({ sessionId: "s_real" }));
+    const control = handleWs(socket, new Request(`http://localhost/api/agui/ws?${query}`), {
+      observe: async () => new Response(source.stream),
+      fetchHandler: effect,
+    });
+    socket.emit("message", JSON.stringify({
+      t,
+      agentId: "a_real",
+      expectedSessionId: "s_real",
+      clientMutationId: "mut",
+      commandId: "cmd",
+      expectedRevision: 1,
+      text: "changed",
+      commandIds: ["cmd"],
+      expectedRevisions: [1],
+    }));
+    try {
+      await vi.waitFor(() => expect(socket.sent.length).toBeGreaterThan(0));
+      expect(effect).not.toHaveBeenCalled();
+      expect(socket.sent.map((raw) => JSON.parse(raw))).toEqual([
+        expect.objectContaining({ t: "queue.mutation.err", clientMutationId: "mut" }),
+      ]);
+    } finally {
+      control.close();
+      source.close();
+    }
+  });
+
+  it.each(["input", "steer", "interrupt", "queue.redirect", "queue.cancel", "queue.edit", "queue.reorder", "command"])(
+    "rejects partial nested identity for %s even with complete root identity",
+    async (t) => {
+      const { handleWs } = await loadWs();
+      for (const target of [{ agentId: "a_real" }, { expectedSessionId: "s_real" }]) {
+        const source = controlledTextStream();
+        const socket = new FakeSocket();
+        const effect = vi.fn(async () => Response.json({ result: { sessionId: "s_real" } }));
+        const control = handleWs(socket, new Request("http://localhost/api/v1/agent-sessions/s_real/events"), {
+          observe: async () => boundSessionResponse(source.stream),
+          sessionInput: effect,
+          steerInput: effect,
+          interruptInput: effect,
+          fetchHandler: effect,
+          resolveHarness: async () => "claude",
+        });
+        socket.emit("message", JSON.stringify({
+          t, target,
+          agentId: "a_real", expectedSessionId: "s_real",
+          text: "input", name: "clear",
+          clientMessageId: "cm", clientCommandId: "cc", clientMutationId: "mut",
+          commandId: "cmd", expectedRevision: 1,
+        }));
+        try {
+          await vi.waitFor(() => expect(socket.sent.some((raw) => /\.(ack|err|done)$/.test(JSON.parse(raw).t))).toBe(true));
+          expect(effect).not.toHaveBeenCalled();
+          expect(socket.sent.some((raw) => JSON.parse(raw).t.endsWith(".err"))).toBe(true);
+        } finally {
+          control.close();
+          source.close();
+        }
+      }
+    },
+  );
+
+  it.each(["input", "steer", "interrupt", "command"])(
+    "does not offer a name-only %s escape on an unbound socket",
+    async (t) => {
+      const { handleWs } = await loadWs();
+      const socket = new FakeSocket();
+      const effect = vi.fn(async () =>
+        Response.json({ result: { sessionId: "s_real" } }),
+      );
+      const control = handleWs(
+        socket,
+        new Request("http://localhost/api/agui/ws"),
+        {
+          sessionInput: effect,
+          steerInput: effect,
+          interruptInput: effect,
+          fetchHandler: effect,
+          resolveHarness: async () => "claude",
+        },
+      );
+      socket.emit(
+        "message",
+        JSON.stringify({
+          t,
+          mode: "session",
+          target: "otto",
+          text: "unsafe",
+          name: "clear",
+          clientMessageId: "cm",
+          clientCommandId: "cc",
+        }),
+      );
+      await vi.waitFor(() =>
+        expect(
+          socket.sent.some((raw) => JSON.parse(raw).t.endsWith(".err")),
+        ).toBe(true),
+      );
+      expect(effect).not.toHaveBeenCalled();
+      control.close();
+    },
+  );
+
+  it.each(["compact", "clear"])(
+    "checks actual structured %s response identity and validates identity before replay",
+    async (name) => {
+      const { handleWs } = await loadWs();
+      for (const sessionId of ["s_real", "s_foreign", undefined]) {
+        const source = controlledTextStream();
+        const socket = new FakeSocket();
+        const effect = vi.fn(async () =>
+          Response.json(
+            name === "compact"
+              ? { result: { started: true, sessionId } }
+              : {
+                  receipt: {
+                    commandId: "cmd",
+                    state: "queued",
+                    revision: 1,
+                    seq: 1,
+                    sessionId,
+                  },
+                },
+          ),
+        );
+        const control = handleWs(
+          socket,
+          new Request("http://localhost/api/v1/agent-sessions/s_real/events"),
+          {
+            observe: async () => boundSessionResponse(source.stream),
+            sessionInput: effect,
+            fetchHandler: effect,
+            resolveHarness: async () => "claude",
+          },
+        );
+        const frame = {
+          t: "command",
+          name,
+          agentId: "a_real",
+          expectedSessionId: "s_real",
+          clientCommandId: "cc",
+        };
+        socket.emit("message", JSON.stringify(frame));
+        await vi.waitFor(() =>
+          expect(
+            socket.sent.some((raw) => JSON.parse(raw).t === "command.done"),
+          ).toBe(true),
+        );
+        expect(
+          socket.sent
+            .map((raw) => JSON.parse(raw))
+            .find((frame) => frame.t === "command.done")?.ok,
+        ).toBe(sessionId === "s_real");
+        socket.sent = [];
+        socket.emit(
+          "message",
+          JSON.stringify({ ...frame, expectedSessionId: "s_other" }),
+        );
+        await vi.waitFor(() =>
+          expect(
+            socket.sent.some((raw) => JSON.parse(raw).t === "command.err"),
+          ).toBe(true),
+        );
+        expect(effect).toHaveBeenCalledTimes(1);
+        control.close();
+        source.close();
+      }
+    },
+  );
+
+  it.each(["input", "steer"])(
+    "does not drop unsupported intent from exact %s",
+    async (t) => {
+      const { handleWs } = await loadWs();
+      for (const option of [
+        { delivery: "auto" },
+        { modelSelection: { modelId: "other" } },
+      ]) {
+        const source = controlledTextStream();
+        const socket = new FakeSocket();
+        const effect = vi.fn();
+        const control = handleWs(
+          socket,
+          new Request("http://localhost/api/v1/agent-sessions/s_real/events"),
+          {
+            observe: async () => boundSessionResponse(source.stream),
+            sessionInput: effect,
+            steerInput: effect,
+          },
+        );
+        socket.emit(
+          "message",
+          JSON.stringify({
+            t,
+            text: "do not downgrade",
+            agentId: "a_real",
+            expectedSessionId: "s_real",
+            ...option,
+          }),
+        );
+        await vi.waitFor(() =>
+          expect(
+            socket.sent.some((raw) =>
+              JSON.parse(raw).error?.includes("not supported"),
+            ),
+          ).toBe(true),
+        );
+        expect(effect).not.toHaveBeenCalled();
+        control.close();
+        source.close();
+      }
+    },
+  );
+  it.each(["input", "steer", "interrupt", "queue.cancel", "command"])(
+    "requires a complete exact identity for %s on session lanes",
+    async (t) => {
+      const { handleWs } = await loadWs();
+      for (const identity of [
+        {},
+        { agentId: "a_real" },
+        { expectedSessionId: "s_real" },
+        { agentId: "a_real", expectedSessionId: null },
+        { agentId: "a_real", expectedSessionId: "s_other" },
+        { agentId: "a_real", expectedSessionId: "s_real", target: { agentId: "a_real", expectedSessionId: "s_other" } },
+        { agentId: "a_real", expectedSessionId: "s_real", target: { agentId: "", name: "current-name" } },
+      ]) {
+        const source = controlledTextStream();
+        const socket = new FakeSocket();
+        const effect = vi.fn(
+          async () =>
+            new Response(JSON.stringify({ result: { sessionId: "s_real" } })),
+        );
+        const control = handleWs(
+          socket,
+          new Request("http://localhost/api/v1/agent-sessions/s_real/events"),
+          {
+            observe: async () => boundSessionResponse(source.stream),
+            sessionInput: effect,
+            steerInput: effect,
+            interruptInput: effect,
+            fetchHandler: effect,
+            resolveHarness: async () => "claude",
+          },
+        );
+        socket.emit(
+          "message",
+          JSON.stringify({
+            t,
+            text: "input",
+            name: "clear",
+            clientMessageId: "cm",
+            clientCommandId: "cc",
+            clientMutationId: "mut",
+            commandId: "cmd",
+            expectedRevision: 1,
+            ...identity,
+          }),
+        );
+        await vi.waitFor(() =>
+          expect(
+            socket.sent
+              .map((raw) => JSON.parse(raw))
+              .some((frame) => frame.t.endsWith(".err")),
+          ).toBe(true),
+        );
+        expect(effect).not.toHaveBeenCalled();
+        control.close();
+        source.close();
+      }
+    },
+  );
+
+  it.each(["input", "steer", "interrupt", "queue.redirect", "queue.cancel", "queue.edit", "queue.reorder"])(
+    "carries %s binding through the default HTTP handler and rejects foreign success",
+    async (t) => {
+      const { handleWs } = await loadWs();
+      for (const sessionId of ["s_real", "s_foreign", undefined]) {
+        const source = controlledTextStream();
+        const socket = new FakeSocket();
+        const bodies: unknown[] = [];
+        const control = handleWs(
+          socket,
+          new Request("http://localhost/api/v1/agent-sessions/s_real/events"),
+          {
+            observe: async () => boundSessionResponse(source.stream),
+            fetchHandler: async (request) => {
+              bodies.push(await request.json());
+              const result = {
+                sessionId,
+                commandId: "cmd",
+                state: "queued",
+                revision: 1,
+                seq: 1,
+              };
+              return new Response(
+                JSON.stringify(
+                  t === "input"
+                    ? { receipt: result }
+                    : t.startsWith("queue.")
+                      ? result
+                      : { result },
+                ),
+              );
+            },
+          },
+        );
+        socket.emit(
+          "message",
+          JSON.stringify({
+            t,
+            agentId: "a_real",
+            expectedSessionId: "s_real",
+            text: "input",
+            clientMessageId: "cm",
+            clientMutationId: "mut",
+            commandId: "cmd",
+            expectedRevision: 1,
+          }),
+        );
+        await vi.waitFor(() =>
+          expect(
+            socket.sent
+              .map((raw) => JSON.parse(raw))
+              .some((frame) => /\.(ack|err)$/.test(frame.t)),
+          ).toBe(true),
+        );
+        expect(bodies).toEqual([
+          expect.objectContaining({
+            agentId: "a_real",
+            expectedSessionId: "s_real",
+          }),
+        ]);
+        const frames = socket.sent.map((raw) => JSON.parse(raw));
+        expect(frames[0]).toMatchObject({
+          t: "session.bound",
+          agentId: "a_real",
+          sessionId: "s_real",
+        });
+        expect(frames.some((frame) => frame.t.endsWith(".ack"))).toBe(
+          sessionId === "s_real",
+        );
+        control.close();
+        source.close();
+      }
+    },
+  );
+
+  it("does not bind a legacy session lane from an unproven name-only response", async () => {
+    const { handleWs } = await loadWs();
+    const socket = new FakeSocket();
+    const control = handleWs(
+      socket,
+      new Request("http://localhost/api/agui/ws?session=otto"),
+      {
+        observe: async () =>
+          new Response(textStream(['data: {"type":"RUN_STARTED"}\n\n'])),
+      },
+    );
+    await control.closed;
+    expect(socket.sent).toEqual([]);
+    expect(socket.closed?.code).toBe(1011);
+  });
   it("pumps SSE data records as raw AG-UI JSON websocket messages", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
@@ -85,7 +455,11 @@ describe("AG-UI WebSocket server transport", () => {
         "data: {\"type\":\"RUN_STARTED\",\"runId\":\"r1\"}\n\n",
         "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r1\"}\n\n",
       ]),
-      { status: 200, headers: { "content-type": "text/event-stream" } },
+      { status: 200, headers: { "content-type": "text/event-stream",
+              "x-nexus-agent-name": "otto",
+              "x-nexus-agent-id": "a_otto",
+              "x-nexus-session-id": "s_otto",
+            } },
     ));
 
     const control = handleWs(
@@ -99,6 +473,11 @@ describe("AG-UI WebSocket server transport", () => {
       expect.objectContaining({ url: "http://localhost/api/agui/observe?session=otto" }),
     );
     expect(socket.sent).toEqual([
+      JSON.stringify({
+        t: "session.bound",
+        agentId: "a_otto",
+        sessionId: "s_otto",
+      }),
       "{\"type\":\"RUN_STARTED\",\"runId\":\"r1\"}",
       "{\"type\":\"RUN_FINISHED\",\"runId\":\"r1\"}",
     ]);
@@ -119,7 +498,11 @@ describe("AG-UI WebSocket server transport", () => {
         "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r1\"}\n\n",
         ": ping\n\n",
       ]),
-      { status: 200, headers: { "content-type": "text/event-stream" } },
+      { status: 200, headers: { "content-type": "text/event-stream",
+              "x-nexus-agent-name": "otto",
+              "x-nexus-agent-id": "a_otto",
+              "x-nexus-session-id": "s_otto",
+            } },
     ));
 
     const control = handleWs(
@@ -130,6 +513,11 @@ describe("AG-UI WebSocket server transport", () => {
     await control.closed;
 
     expect(socket.sent).toEqual([
+      JSON.stringify({
+        t: "session.bound",
+        agentId: "a_otto",
+        sessionId: "s_otto",
+      }),
       "{\"type\":\"RUN_STARTED\",\"runId\":\"r1\"}",
       "{\"type\":\"RUN_FINISHED\",\"runId\":\"r1\"}",
     ]);
@@ -140,7 +528,12 @@ describe("AG-UI WebSocket server transport", () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
     handleWs(socket, new Request("http://localhost/api/agui/ws?thread=ops"), {
-      observe: async () => new Response(textStream([]), { status: 200 }),
+      observe: async () =>
+        boundSessionResponse(textStream([]), {
+          name: "otto",
+          agentId: "a_otto",
+          sessionId: "s_otto",
+        }),
     });
 
     socket.emit("message", JSON.stringify({ t: "ping" }));
@@ -171,7 +564,11 @@ describe("AG-UI WebSocket server transport", () => {
       {
         observe: async () => new Response(
           textStream(['data: {"type":"RUN_STARTED","runId":"r1"}\n\n']),
-          { status: 200, headers: { "content-type": "text/event-stream" } },
+          { status: 200, headers: { "content-type": "text/event-stream",
+                "x-nexus-agent-name": "otto",
+                "x-nexus-agent-id": "a_otto",
+                "x-nexus-session-id": "s_otto",
+              } },
         ),
       },
     );
@@ -200,7 +597,12 @@ describe("AG-UI WebSocket server transport", () => {
     ));
 
     handleWs(socket, new Request("http://localhost/api/agui/ws?session=otto"), {
-      observe: async () => new Response(textStream([]), { status: 200 }),
+      observe: async () =>
+        boundSessionResponse(textStream([]), {
+          name: "otto",
+          agentId: "a_otto",
+          sessionId: "s_otto",
+        }),
       sessionInput,
     });
 
@@ -208,6 +610,8 @@ describe("AG-UI WebSocket server transport", () => {
       "message",
       JSON.stringify({
         t: "input",
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
         mode: "session",
         target: "otto",
         text: "continue",
@@ -228,7 +632,11 @@ describe("AG-UI WebSocket server transport", () => {
 
     expect(sessionInput).toHaveBeenCalledWith(
       expect.objectContaining({
-        target: "otto",
+        target: {
+          name: "otto",
+          agentId: "a_otto",
+          expectedSessionId: "s_otto",
+        },
         text: "continue",
         clientMessageId: "cm_1",
       }),
@@ -243,27 +651,37 @@ describe("AG-UI WebSocket server transport", () => {
     const steerInput = vi.fn(async () => new Response(
       JSON.stringify({
         ok: true,
-        result: { accepted: true, delivery: "steered", turnId: "turn_7" },
+        result: {
+              sessionId: "s_otto",
+              accepted: true, delivery: "steered", turnId: "turn_7" },
       }),
       { status: 201, headers: { "content-type": "application/json" } },
     ));
 
     handleWs(socket, new Request("http://localhost/api/agui/ws?session=otto"), {
-      observe: async () => new Response(textStream([]), { status: 200 }),
+      observe: async () =>
+        boundSessionResponse(textStream([]), {
+          name: "otto",
+          agentId: "a_otto",
+          sessionId: "s_otto",
+        }),
       sessionInput,
       steerInput,
     });
 
     socket.emit("message", JSON.stringify({
       t: "steer",
-      text: "inspect the failing assertion before continuing",
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
+        text: "inspect the failing assertion before continuing",
       clientMessageId: "cm_steer_1",
     }));
     await vi.waitFor(() => {
       expect(socket.sent).toContain(JSON.stringify({
         t: "steer.ack",
         clientMessageId: "cm_steer_1",
-        accepted: true,
+          sessionId: "s_otto",
+          accepted: true,
         delivery: "steered",
         turnId: "turn_7",
       }));
@@ -271,7 +689,11 @@ describe("AG-UI WebSocket server transport", () => {
 
     expect(steerInput).toHaveBeenCalledWith(
       {
-        target: "otto",
+        target: {
+          name: "otto",
+          agentId: "a_otto",
+          expectedSessionId: "s_otto",
+        },
         text: "inspect the failing assertion before continuing",
         clientMessageId: "cm_steer_1",
       },
@@ -288,28 +710,38 @@ describe("AG-UI WebSocket server transport", () => {
     handleWs(socket, new Request("http://localhost/api/agui/ws?session=otto", {
       headers: { cookie: "nexus_human=human-token" },
     }), {
-      observe: async () => new Response(textStream([]), { status: 200 }),
+      observe: async () =>
+          boundSessionResponse(textStream([]), {
+            name: "otto",
+            agentId: "a_otto",
+            sessionId: "s_otto",
+          }),
       fetchHandler: vi.fn(async (request: Request) => {
         requests.push(request);
-        return Response.json({ ok: true, result: { interrupted: true } }, { status: 201 });
+        return Response.json({ ok: true, result: { sessionId: "s_otto", interrupted: true } }, { status: 201 });
       }),
     });
 
     socket.emit("message", JSON.stringify({
       t: "interrupt",
-      clientMessageId: "cm_interrupt_1",
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
+        clientMessageId: "cm_interrupt_1",
     }));
 
     await vi.waitFor(() => expect(socket.sent).toContain(JSON.stringify({
       t: "interrupt.ack",
       clientMessageId: "cm_interrupt_1",
-      interrupted: true,
+          sessionId: "s_otto",
+          interrupted: true,
     })));
     expect(requests).toHaveLength(1);
     expect(new URL(requests[0]!.url).pathname).toBe("/api/conversation/interrupt");
     expect(requests[0]!.headers.get("cookie")).toBe("nexus_human=human-token");
     await expect(requests[0]!.json()).resolves.toEqual({
       name: "otto",
+      agentId: "a_otto",
+      expectedSessionId: "s_otto",
       clientMessageId: "cm_interrupt_1",
     });
   });
@@ -382,9 +814,8 @@ describe("AG-UI WebSocket server transport", () => {
       });
     }
 
-    expect(socket.sent.map((raw) => JSON.parse(raw)).filter((frame) => (
-      frame.t === "command.receipt"
-    ))).toEqual([
+    expect(socket.sent.map((raw) => JSON.parse(raw)).filter((frame) => frame.t === "command.receipt"
+    )).toEqual([
       "harness.prompt",
       "harness.steer",
       "harness.interrupt",
@@ -418,11 +849,18 @@ describe("AG-UI WebSocket server transport", () => {
     handleWs(socket, new Request("http://localhost/api/agui/ws?session=otto", {
       headers: { cookie: "nexus_human=human-token" },
     }), {
-      observe: async () => new Response(textStream([]), { status: 200 }),
+      observe: async () =>
+          boundSessionResponse(textStream([]), {
+            name: "otto",
+            agentId: "a_otto",
+            sessionId: "s_otto",
+          }),
       fetchHandler: vi.fn(async (request: Request) => {
         requests.push(request);
         return new Response(
-          JSON.stringify({ ok: true, result: { accepted: true, delivery: "fallback_started" } }),
+          JSON.stringify({ ok: true, result: {
+                sessionId: "s_otto",
+                accepted: true, delivery: "fallback_started" } }),
           { status: 201, headers: { "content-type": "application/json" } },
         );
       }),
@@ -430,7 +868,9 @@ describe("AG-UI WebSocket server transport", () => {
 
     socket.emit("message", JSON.stringify({
       t: "steer",
-      target: { name: "otto", agentId: "a_otto" },
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
+        target: { name: "otto", agentId: "a_otto", expectedSessionId: "s_otto" },
       text: "use the smaller patch",
       clientMessageId: "cm_steer_2",
     }));
@@ -438,7 +878,8 @@ describe("AG-UI WebSocket server transport", () => {
       expect(socket.sent).toContain(JSON.stringify({
         t: "steer.ack",
         clientMessageId: "cm_steer_2",
-        accepted: true,
+          sessionId: "s_otto",
+          accepted: true,
         delivery: "fallback_started",
       }));
     });
@@ -449,6 +890,7 @@ describe("AG-UI WebSocket server transport", () => {
     await expect(requests[0]!.json()).resolves.toEqual({
       name: "otto",
       agentId: "a_otto",
+      expectedSessionId: "s_otto",
       text: "use the smaller patch",
       clientMessageId: "cm_steer_2",
     });
@@ -464,14 +906,21 @@ describe("AG-UI WebSocket server transport", () => {
     ));
 
     handleWs(socket, new Request("http://localhost/api/agui/ws?session=otto"), {
-      observe: async () => new Response(textStream([]), { status: 200 }),
+      observe: async () =>
+        boundSessionResponse(textStream([]), {
+          name: "otto",
+          agentId: "a_otto",
+          sessionId: "s_otto",
+        }),
       sessionInput,
       steerInput,
     });
 
     socket.emit("message", JSON.stringify({
       t: "steer",
-      text: "redirect this turn",
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
+        text: "redirect this turn",
       clientMessageId: "cm_steer_err",
     }));
     await vi.waitFor(() => {
@@ -493,7 +942,7 @@ describe("AG-UI WebSocket server transport", () => {
     expect(sessionInput).not.toHaveBeenCalled();
   });
 
-  it("defaults a bare legacy input frame on a session socket to session mode (Lens plugin shape)", async () => {
+  it("accepts an exact identity frame without redundant session mode or target", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
     const sessionInput = vi.fn(async () => new Response(
@@ -512,14 +961,22 @@ describe("AG-UI WebSocket server transport", () => {
     ));
 
     handleWs(socket, new Request("http://localhost/api/agui/ws?session=otto"), {
-      observe: async () => new Response(textStream([]), { status: 200 }),
+      observe: async () =>
+        boundSessionResponse(textStream([]), {
+          name: "otto",
+          agentId: "a_otto",
+          sessionId: "s_otto",
+        }),
       sessionInput,
     });
 
-    // The Lens nexus plugin sends no mode/target: the socket's ?session= carries both.
+    // Exact identity is required even when mode and display target are omitted.
     socket.emit(
       "message",
-      JSON.stringify({ t: "input", text: "continue", clientMessageId: "cm_lens" }),
+      JSON.stringify({ t: "input",
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
+        text: "continue", clientMessageId: "cm_lens" }),
     );
     await vi.waitFor(() => {
       expect(socket.sent).toContain(JSON.stringify({
@@ -536,7 +993,11 @@ describe("AG-UI WebSocket server transport", () => {
     expect(sessionInput).toHaveBeenCalledWith(
       expect.objectContaining({
         mode: "session",
-        target: "otto",
+        target: {
+          name: "otto",
+          agentId: "a_otto",
+          expectedSessionId: "s_otto",
+        },
         text: "continue",
         clientMessageId: "cm_lens",
       }),
@@ -561,16 +1022,26 @@ describe("AG-UI WebSocket server transport", () => {
       socket,
       new Request("http://localhost/api/agui/ws?session=stale-name&agentId=a_real"),
       {
-        observe: async () => new Response(textStream([]), { status: 200 }),
+        observe: async () =>
+          boundSessionResponse(textStream([]), {
+            name: "stale-name",
+            agentId: "a_real",
+            sessionId: "s_real",
+          }),
         sessionInput,
       },
     );
-    socket.emit("message", JSON.stringify({ t: "input", text: "continue" }));
+    socket.emit("message", JSON.stringify({ t: "input",
+        agentId: "a_real",
+        expectedSessionId: "s_real",
+        text: "continue" }));
 
     await vi.waitFor(() => expect(sessionInput).toHaveBeenCalledWith(
       expect.objectContaining({
         mode: "session",
-        target: { name: "stale-name", agentId: "a_real" },
+        target: { name: "stale-name", agentId: "a_real",
+            expectedSessionId: "s_real",
+          },
       }),
       expect.any(Request),
     ));
@@ -579,7 +1050,12 @@ describe("AG-UI WebSocket server transport", () => {
   it("supports an agent-id-only session socket for observe and input", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
-    const observe = vi.fn(async () => new Response(textStream([]), { status: 200 }));
+    const observe = vi.fn(async () =>
+      boundSessionResponse(textStream([]), {
+        name: "current-name",
+        agentId: "a_real",
+        sessionId: "s_real",
+      }));
     const sessionInput = vi.fn(async () => new Response(JSON.stringify({
       receipt: {
         commandId: "cmd_id_only",
@@ -594,10 +1070,17 @@ describe("AG-UI WebSocket server transport", () => {
       observe,
       sessionInput,
     });
-    socket.emit("message", JSON.stringify({ t: "input", text: "continue" }));
+    socket.emit("message", JSON.stringify({ t: "input",
+        agentId: "a_real",
+        expectedSessionId: "s_real",
+        text: "continue" }));
 
     await vi.waitFor(() => expect(sessionInput).toHaveBeenCalledWith(
-      expect.objectContaining({ mode: "session", target: { agentId: "a_real" } }),
+      expect.objectContaining({ mode: "session", target: {
+            name: "current-name",
+            agentId: "a_real",
+            expectedSessionId: "s_real",
+          } }),
       expect.any(Request),
     ));
     expect(observe).toHaveBeenCalledWith(expect.objectContaining({
@@ -656,34 +1139,48 @@ describe("AG-UI WebSocket server transport", () => {
 
     await vi.waitFor(() => expect(queueSubscribe).toHaveBeenCalledWith(
       expect.any(Request),
-      { name: "current-name", agentId: "a_real" },
+      { name: "current-name", agentId: "a_real",
+          expectedSessionId: "s_real",
+        },
       expect.objectContaining({ onSnapshot: expect.any(Function) }),
     ));
     socket.emit("message", JSON.stringify({
       t: "input",
-      text: "bare stable input",
+        agentId: "a_real",
+        expectedSessionId: "s_real",
+        text: "bare stable input",
       clientMessageId: "cm_bare",
     }));
     socket.emit("message", JSON.stringify({
       t: "input",
-      mode: "session",
-      target: { name: "stale-name", agentId: "a_real" },
+        agentId: "a_real",
+        expectedSessionId: "s_real",
+        mode: "session",
+      target: { name: "stale-name", agentId: "a_real",
+          expectedSessionId: "s_real",
+        },
       text: "stable id wins",
       clientMessageId: "cm_stable",
     }));
     socket.emit("message", JSON.stringify({
       t: "steer",
-      text: "steer canonical lane",
+        agentId: "a_real",
+        expectedSessionId: "s_real",
+        text: "steer canonical lane",
       clientMessageId: "cm_steer_bound",
     }));
     socket.emit("message", JSON.stringify({
       t: "command",
-      name: "compact",
+        agentId: "a_real",
+        expectedSessionId: "s_real",
+        name: "compact",
       clientCommandId: "cc_bound",
     }));
     socket.emit("message", JSON.stringify({
       t: "queue.cancel",
-      clientMutationId: "mut_bound",
+        agentId: "a_real",
+        expectedSessionId: "s_real",
+        clientMutationId: "mut_bound",
       commandId: "queued_bound",
       expectedRevision: 1,
     }));
@@ -691,30 +1188,39 @@ describe("AG-UI WebSocket server transport", () => {
     await vi.waitFor(() => expect(sessionInput).toHaveBeenCalledTimes(2));
     expect(sessionInput).toHaveBeenNthCalledWith(1, expect.objectContaining({
       mode: "session",
-      target: { name: "current-name", agentId: "a_real" },
+      target: { name: "current-name", agentId: "a_real",
+          expectedSessionId: "s_real",
+        },
       text: "bare stable input",
     }), expect.any(Request));
     expect(sessionInput).toHaveBeenNthCalledWith(2, expect.objectContaining({
       mode: "session",
-      target: { name: "current-name", agentId: "a_real" },
+      target: { name: "current-name", agentId: "a_real",
+          expectedSessionId: "s_real",
+        },
       text: "stable id wins",
     }), expect.any(Request));
     await vi.waitFor(() => expect(steerInput).toHaveBeenCalledWith({
-      target: { name: "current-name", agentId: "a_real" },
+      target: { name: "current-name", agentId: "a_real",
+            expectedSessionId: "s_real",
+          },
       text: "steer canonical lane",
       clientMessageId: "cm_steer_bound",
     }, expect.any(Request)));
     await vi.waitFor(() => expect(routed).toEqual(expect.arrayContaining([
       {
         path: "/api/conversation/compact",
-        body: { name: "current-name", agentId: "a_real", clientMessageId: "cc_bound" },
+        body: { name: "current-name", agentId: "a_real",
+              expectedSessionId: "s_real",
+              clientMessageId: "cc_bound" },
       },
       {
         path: "/api/conversation/prompt",
         body: {
           name: "current-name",
           agentId: "a_real",
-          action: "cancel",
+              expectedSessionId: "s_real",
+              action: "cancel",
           clientMutationId: "mut_bound",
           commandId: "queued_bound",
           expectedRevision: 1,
@@ -732,6 +1238,8 @@ describe("AG-UI WebSocket server transport", () => {
       label: "session input target",
       frame: {
         t: "input",
+        agentId: "a_real",
+        expectedSessionId: "s_real",
         mode: "session",
         target: "other-agent",
         text: "cross lane",
@@ -743,6 +1251,8 @@ describe("AG-UI WebSocket server transport", () => {
       label: "bus mode on a session lane",
       frame: {
         t: "input",
+        agentId: "a_real",
+        expectedSessionId: "s_real",
         mode: "bus",
         target: { verb: "post", thread: "other-lane" },
         text: "cross lane",
@@ -754,6 +1264,8 @@ describe("AG-UI WebSocket server transport", () => {
       label: "steer target",
       frame: {
         t: "steer",
+        agentId: "a_real",
+        expectedSessionId: "s_real",
         target: { name: "current-name", agentId: "a_other" },
         text: "cross lane",
         clientMessageId: "cm_cross_steer",
@@ -764,6 +1276,8 @@ describe("AG-UI WebSocket server transport", () => {
       label: "command target",
       frame: {
         t: "command",
+        agentId: "a_real",
+        expectedSessionId: "s_real",
         target: "other-agent",
         name: "compact",
         clientCommandId: "cc_cross",
@@ -774,6 +1288,8 @@ describe("AG-UI WebSocket server transport", () => {
       label: "queue target",
       frame: {
         t: "queue.cancel",
+        agentId: "a_real",
+        expectedSessionId: "s_real",
         target: "other-agent",
         clientMutationId: "mut_cross",
         commandId: "cmd_cross",
@@ -828,7 +1344,12 @@ describe("AG-UI WebSocket server transport", () => {
     ));
 
     handleWs(socket, new Request("http://localhost/api/agui/ws?dm=morgan"), {
-      observe: async () => new Response(textStream([]), { status: 200 }),
+      observe: async () =>
+        boundSessionResponse(textStream([]), {
+          name: "otto",
+          agentId: "a_otto",
+          sessionId: "s_otto",
+        }),
       busInput,
     });
 
@@ -857,7 +1378,12 @@ describe("AG-UI WebSocket server transport", () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
     handleWs(socket, new Request("http://localhost/api/agui/ws"), {
-      observe: async () => new Response(textStream([]), { status: 200 }),
+      observe: async () =>
+        boundSessionResponse(textStream([]), {
+          name: "otto",
+          agentId: "a_otto",
+          sessionId: "s_otto",
+        }),
     });
 
     socket.emit(
@@ -881,7 +1407,12 @@ describe("AG-UI WebSocket server transport", () => {
     ));
 
     handleWs(socket, new Request("http://localhost/api/agui/ws?dm=display&agentId=a_real"), {
-      observe: async () => new Response(textStream([]), { status: 200 }),
+      observe: async () =>
+          boundSessionResponse(textStream([]), {
+            name: "otto",
+            agentId: "a_otto",
+            sessionId: "s_otto",
+          }),
       busInput,
     });
     socket.emit("message", JSON.stringify({ t: "input", text: "hi" }));
@@ -905,7 +1436,12 @@ describe("AG-UI WebSocket server transport", () => {
     ));
 
     handleWs(socket, new Request("http://localhost/api/agui/ws?thread=nexus-project"), {
-      observe: async () => new Response(textStream([]), { status: 200 }),
+      observe: async () =>
+          boundSessionResponse(textStream([]), {
+            name: "otto",
+            agentId: "a_otto",
+            sessionId: "s_otto",
+          }),
       busInput,
     });
 
@@ -959,7 +1495,12 @@ describe("AG-UI WebSocket server transport", () => {
       socket,
       new Request("http://localhost/api/agui/ws?session=otto"),
       {
-        observe: async () => new Response(textStream([]), { status: 200 }),
+        observe: async () =>
+          boundSessionResponse(textStream([]), {
+            name: "otto",
+            agentId: "a_otto",
+            sessionId: "s_otto",
+          }),
         developerEvents: { subscribe },
       },
     );
@@ -1076,7 +1617,12 @@ describe("AG-UI WebSocket server transport", () => {
       socket,
       new Request("http://localhost/api/agui/ws?session=otto"),
       {
-        observe: async () => new Response(source.stream, { status: 200 }),
+        observe: async () =>
+          boundSessionResponse(source.stream, {
+            name: "otto",
+            agentId: "a_otto",
+            sessionId: "s_otto",
+          }),
         daemonToolCallEvents: null,
       },
     );
@@ -1129,7 +1675,12 @@ describe("AG-UI WebSocket server transport", () => {
       socket,
       new Request("http://localhost/api/agui/ws?session=otto"),
       {
-        observe: async () => new Response(source.stream, { status: 200 }),
+        observe: async () =>
+          boundSessionResponse(source.stream, {
+            name: "otto",
+            agentId: "a_otto",
+            sessionId: "s_otto",
+          }),
         daemonToolCallEvents: {
           subscribe(topic: string, afterSeq: number, h: ToolCallEventHandlers) {
             expect(topic).toBe("sys.agent.otto.tool_call");
@@ -1194,7 +1745,12 @@ describe("AG-UI WebSocket server transport", () => {
       // No ?session= — the fleet topic is not session-scoped.
       new Request("http://localhost/api/agui/ws"),
       {
-        observe: async () => new Response(source.stream, { status: 200 }),
+        observe: async () =>
+          boundSessionResponse(source.stream, {
+            name: "otto",
+            agentId: "a_otto",
+            sessionId: "s_otto",
+          }),
         developerEvents: { subscribe: durableSubscribe },
         daemonFleetStatusEvents: {
           subscribe(topic: string, afterSeq: number, h: ToolCallEventHandlers) {
@@ -1279,7 +1835,12 @@ describe("AG-UI WebSocket server transport", () => {
       socket,
       new Request("http://localhost/api/agui/ws"),
       {
-        observe: async () => new Response(source.stream, { status: 200 }),
+        observe: async () =>
+          boundSessionResponse(source.stream, {
+            name: "otto",
+            agentId: "a_otto",
+            sessionId: "s_otto",
+          }),
         daemonFleetStatusEvents: null,
       },
     );
@@ -1333,7 +1894,12 @@ describe("AG-UI WebSocket server transport", () => {
       socket,
       new Request("http://localhost/api/agui/ws?session=smoke-agent"),
       {
-        observe: async () => new Response(source.stream, { status: 200 }),
+        observe: async () =>
+          boundSessionResponse(source.stream, {
+            name: "smoke-agent",
+            agentId: "a_smoke",
+            sessionId: "s_smoke",
+          }),
         sessionInput,
         developerEvents: { subscribe: durableSubscribe },
         daemonToolCallEvents: {
@@ -1354,8 +1920,12 @@ describe("AG-UI WebSocket server transport", () => {
     }));
     socket.emit("message", JSON.stringify({
       t: "input",
-      mode: "session",
-      target: { name: "smoke-agent", agentId: "a_smoke" },
+        agentId: "a_smoke",
+        expectedSessionId: "s_smoke",
+        mode: "session",
+      target: { name: "smoke-agent", agentId: "a_smoke",
+          expectedSessionId: "s_smoke",
+        },
       text: "R1.6 disposable WS smoke",
       clientMessageId: "cm_smoke",
     }));
@@ -1424,7 +1994,9 @@ describe("AG-UI WebSocket server transport", () => {
     expect(sessionInput).toHaveBeenCalledWith(
       expect.objectContaining({
         mode: "session",
-        target: { name: "smoke-agent", agentId: "a_smoke" },
+        target: { name: "smoke-agent", agentId: "a_smoke",
+          expectedSessionId: "s_smoke",
+        },
         text: "R1.6 disposable WS smoke",
         clientMessageId: "cm_smoke",
       }),
@@ -1446,7 +2018,12 @@ describe("AG-UI WebSocket server transport", () => {
       socket,
       new Request("http://localhost/api/agui/ws?session=otto"),
       {
-        observe: async () => new Response(textStream([]), { status: 200 }),
+        observe: async () =>
+          boundSessionResponse(textStream([]), {
+            name: "otto",
+            agentId: "a_otto",
+            sessionId: "s_otto",
+          }),
         daemonToolCallEvents: {
           subscribe(_topic: string, _afterSeq: number, h: ToolCallEventHandlers) {
             handlers = h;
@@ -1488,7 +2065,12 @@ describe("AG-UI WebSocket server transport", () => {
       socket,
       new Request("http://localhost/api/agui/ws?session=otto"),
       {
-        observe: async () => new Response(source.stream, { status: 200 }),
+        observe: async () =>
+          boundSessionResponse(source.stream, {
+            name: "otto",
+            agentId: "a_otto",
+            sessionId: "s_otto",
+          }),
         daemonToolCallEvents: null,
       },
     );
@@ -1532,7 +2114,12 @@ describe("AG-UI WebSocket server transport", () => {
       socket,
       new Request("http://localhost/api/agui/ws?session=otto"),
       {
-        observe: async () => new Response(source.stream, { status: 200 }),
+        observe: async () =>
+          boundSessionResponse(source.stream, {
+            name: "otto",
+            agentId: "a_otto",
+            sessionId: "s_otto",
+          }),
         daemonToolCallEvents: null,
       },
     );
@@ -1567,7 +2154,12 @@ describe("AG-UI WebSocket server transport", () => {
       socket,
       new Request("http://localhost/api/agui/ws?session=otto"),
       {
-        observe: async () => new Response(source.stream, { status: 200 }),
+        observe: async () =>
+          boundSessionResponse(source.stream, {
+            name: "otto",
+            agentId: "a_otto",
+            sessionId: "s_otto",
+          }),
         daemonToolCallEvents: null,
       },
     );
@@ -1606,7 +2198,12 @@ describe("AG-UI WebSocket server transport", () => {
     const subscribe = vi.fn();
 
     handleWs(socket, new Request("http://localhost/api/agui/ws?session=otto"), {
-      observe: async () => new Response(textStream([]), { status: 200 }),
+      observe: async () =>
+        boundSessionResponse(textStream([]), {
+          name: "otto",
+          agentId: "a_otto",
+          sessionId: "s_otto",
+        }),
       daemonToolCallEvents: null,
       developerEvents: { subscribe },
     });
@@ -1631,7 +2228,12 @@ describe("AG-UI WebSocket server transport", () => {
     const subscribe = vi.fn();
 
     handleWs(socket, new Request("http://localhost/api/agui/ws?session=otto"), {
-      observe: async () => new Response(textStream([]), { status: 200 }),
+      observe: async () =>
+        boundSessionResponse(textStream([]), {
+          name: "otto",
+          agentId: "a_otto",
+          sessionId: "s_otto",
+        }),
       developerEvents: { subscribe },
     });
 
@@ -1761,13 +2363,16 @@ describe("AG-UI WebSocket server transport", () => {
     const fetchHandler = vi.fn(async (request: Request) => {
       expect(new URL(request.url).pathname).toBe("/api/conversation/prompt");
       expect(await request.json()).toEqual({
+        name: "current-name",
         agentId: "a_real",
+        expectedSessionId: "s_real",
         action: "cancel",
         clientMutationId: "mut_real",
         commandId: "cmd_real",
         expectedRevision: 1,
       });
       return Response.json({
+        sessionId: "s_real",
         clientMutationId: "mut_real",
         commandId: "cmd_real",
         state: "cancelled",
@@ -1780,7 +2385,12 @@ describe("AG-UI WebSocket server transport", () => {
       socket,
       new Request("http://localhost/api/agui/ws?agentId=a_real"),
       {
-        observe: async () => new Response(source.stream, { status: 200 }),
+        observe: async () =>
+          boundSessionResponse(source.stream, {
+            name: "current-name",
+            agentId: "a_real",
+            sessionId: "s_real",
+          }),
         commandQueueHub: { subscribe },
         fetchHandler,
       },
@@ -1788,12 +2398,18 @@ describe("AG-UI WebSocket server transport", () => {
 
     await vi.waitFor(() => expect(subscribe).toHaveBeenCalledWith(
       expect.any(Request),
-      { agentId: "a_real" },
+      {
+          name: "current-name",
+          agentId: "a_real",
+          expectedSessionId: "s_real",
+        },
       expect.objectContaining({ onSnapshot: expect.any(Function) }),
     ));
     socket.emit("message", JSON.stringify({
       t: "queue.cancel",
-      clientMutationId: "mut_real",
+        agentId: "a_real",
+        expectedSessionId: "s_real",
+        clientMutationId: "mut_real",
       commandId: "cmd_real",
       expectedRevision: 1,
     }));
@@ -1801,6 +2417,7 @@ describe("AG-UI WebSocket server transport", () => {
       expect(socket.sent.map((raw) => JSON.parse(raw))).toContainEqual({
         t: "queue.mutation.ack",
         action: "cancel",
+        sessionId: "s_real",
         clientMutationId: "mut_real",
         commandId: "cmd_real",
         state: "cancelled",
@@ -2796,7 +3413,12 @@ describe("AG-UI WebSocket server transport", () => {
       socket,
       new Request("http://localhost/api/agui/ws?session=otto"),
       {
-        observe: async () => new Response(source.stream, { status: 200 }),
+        observe: async () =>
+          boundSessionResponse(source.stream, {
+            name: "otto",
+            agentId: "a_otto",
+            sessionId: "s_otto",
+          }),
         commandQueueHub: {
           subscribe: vi.fn((_request, _target, nextHandlers) => {
             handlers = nextHandlers;
@@ -2849,7 +3471,12 @@ describe("AG-UI WebSocket command surface (SPEC-ws-full-command-access v1)", () 
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
     handleWs(socket, new Request("http://localhost/api/agui/ws?session=otto"), {
-      observe: async () => new Response(textStream([]), { status: 200 }),
+      observe: async () =>
+        boundSessionResponse(textStream([]), {
+          name: "otto",
+          agentId: "a_otto",
+          sessionId: "s_otto",
+        }),
       ...deps,
     });
     return socket;
@@ -2905,7 +3532,9 @@ describe("AG-UI WebSocket command surface (SPEC-ws-full-command-access v1)", () 
       expect(frames(socket).some((f) => f.t === "commands.catalog")).toBe(true);
     });
 
-    expect(resolveHarness).toHaveBeenCalledWith("otto", expect.any(Request));
+    expect(resolveHarness).toHaveBeenCalledWith(
+      { name: "otto", agentId: "a_otto", expectedSessionId: "s_otto" },
+      expect.any(Request));
     expect(frames(socket).find((f) => f.t === "commands.catalog")).toMatchObject({
       target: "otto",
     });
@@ -2926,15 +3555,21 @@ describe("AG-UI WebSocket command surface (SPEC-ws-full-command-access v1)", () 
       expect(await request.json()).toEqual({
         name: "stale-name",
         agentId: "a_real",
+        expectedSessionId: "s_real",
         clientMessageId: "cc_stable",
       });
-      return Response.json({ ok: true }, { status: 201 });
+      return Response.json({ ok: true, result: { started: true, sessionId: "s_real" } }, { status: 201 });
     });
     const control = handleWs(
       socket,
       new Request("http://localhost/api/agui/ws?session=stale-name&agentId=a_real"),
       {
-        observe: async () => new Response(source.stream, { status: 200 }),
+        observe: async () =>
+          boundSessionResponse(source.stream, {
+            name: "stale-name",
+            agentId: "a_real",
+            sessionId: "s_real",
+          }),
         fetchHandler,
       },
     );
@@ -2951,7 +3586,9 @@ describe("AG-UI WebSocket command surface (SPEC-ws-full-command-access v1)", () 
 
     socket.emit("message", JSON.stringify({
       t: "command",
-      name: "compact",
+        agentId: "a_real",
+        expectedSessionId: "s_real",
+        name: "compact",
       clientCommandId: "cc_stable",
     }));
     await vi.waitFor(() => {
@@ -2970,14 +3607,21 @@ describe("AG-UI WebSocket command surface (SPEC-ws-full-command-access v1)", () 
   it("dispatches a gateway verb to its REST handler and replies ack then done", async () => {
     const fetchHandler = vi.fn(async (request: Request) => {
       expect(new URL(request.url).pathname).toBe("/api/conversation/compact");
-      expect(await request.json()).toEqual({ name: "otto", clientMessageId: "cc_1" });
-      return new Response(JSON.stringify({ ok: true }), { status: 201 });
+      expect(await request.json()).toEqual({ name: "otto",
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
+        clientMessageId: "cc_1" });
+      return new Response(JSON.stringify({ ok: true,
+          result: { started: true, sessionId: "s_otto" },
+        }), { status: 201 });
     });
     const socket = await openSocket({ resolveHarness: claudeHarness, fetchHandler });
 
     socket.emit("message", JSON.stringify({
       t: "command",
-      name: "compact",
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
+        name: "compact",
       target: "otto",
       clientCommandId: "cc_1",
     }));
@@ -3012,7 +3656,9 @@ describe("AG-UI WebSocket command surface (SPEC-ws-full-command-access v1)", () 
 
     socket.emit("message", JSON.stringify({
       t: "command",
-      name: "model",
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
+        name: "model",
       target: "otto",
       clientCommandId: "cc_model",
       args: { model: "opus-4-8" },
@@ -3026,7 +3672,11 @@ describe("AG-UI WebSocket command surface (SPEC-ws-full-command-access v1)", () 
     expect(sessionInput).toHaveBeenCalledWith(
       expect.objectContaining({
         mode: "session",
-        target: "otto",
+        target: {
+          name: "otto",
+          agentId: "a_otto",
+          expectedSessionId: "s_otto",
+        },
         text: "/model opus-4-8",
         clientMessageId: "cc_model",
       }),
@@ -3048,6 +3698,8 @@ describe("AG-UI WebSocket command surface (SPEC-ws-full-command-access v1)", () 
     const socket = await openSocket({ resolveHarness: claudeHarness, sessionInput });
     const send = JSON.stringify({
       t: "command",
+      agentId: "a_otto",
+      expectedSessionId: "s_otto",
       name: "clear",
       target: "otto",
       clientCommandId: "cc_dup",
@@ -3072,7 +3724,9 @@ describe("AG-UI WebSocket command surface (SPEC-ws-full-command-access v1)", () 
 
     socket.emit("message", JSON.stringify({
       t: "command",
-      name: "teleport",
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
+        name: "teleport",
       target: "otto",
       clientCommandId: "cc_unknown",
     }));
@@ -3095,7 +3749,9 @@ describe("AG-UI WebSocket command surface (SPEC-ws-full-command-access v1)", () 
 
     socket.emit("message", JSON.stringify({
       t: "command",
-      name: "model",
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
+        name: "model",
       target: "otto",
       clientCommandId: "cc_codex_model",
       args: { model: "gpt-5.5" },
@@ -3119,7 +3775,9 @@ describe("AG-UI WebSocket command surface (SPEC-ws-full-command-access v1)", () 
 
     socket.emit("message", JSON.stringify({
       t: "command",
-      name: "model",
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
+        name: "model",
       target: "otto",
       clientCommandId: "cc_bad_args",
       args: { modle: "opus-4-8" },
@@ -3141,7 +3799,10 @@ describe("AG-UI WebSocket command surface (SPEC-ws-full-command-access v1)", () 
     const sessionInput = vi.fn();
     const socket = await openSocket({ resolveHarness: claudeHarness, sessionInput });
 
-    socket.emit("message", JSON.stringify({ t: "command", name: "clear", target: "otto" }));
+    socket.emit("message", JSON.stringify({ t: "command",
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
+        name: "clear", target: "otto" }));
     await vi.waitFor(() => {
       expect(frames(socket).some((f) => f.t === "command.err")).toBe(true);
     });
@@ -3165,7 +3826,9 @@ describe("AG-UI WebSocket command surface (SPEC-ws-full-command-access v1)", () 
 
     socket.emit("message", JSON.stringify({
       t: "command",
-      name: "compact",
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
+        name: "compact",
       target: "otto",
       clientCommandId: "cc_noauth",
     }));
@@ -3195,13 +3858,17 @@ describe("AG-UI WebSocket command surface (SPEC-ws-full-command-access v1)", () 
     });
     const fetchHandler = vi.fn(async () => {
       await dispatchGate;
-      return new Response(JSON.stringify({ ok: true }), { status: 201 });
+      return new Response(JSON.stringify({ ok: true,
+          result: { started: true, sessionId: "s_otto" },
+        }), { status: 201 });
     });
     const socket = await openSocket({ resolveHarness: claudeHarness, fetchHandler });
 
     socket.emit("message", JSON.stringify({
       t: "command",
-      name: "compact",
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
+        name: "compact",
       target: "otto",
       clientCommandId: "cc_early_ack",
     }));
@@ -3258,7 +3925,9 @@ describe("AG-UI WebSocket command surface (SPEC-ws-full-command-access v1)", () 
 
     socket.emit("message", JSON.stringify({
       t: "input",
-      mode: "session",
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
+        mode: "session",
       target: "otto",
       text: "/model opus-4-8",
       clientMessageId: "cm_slash",
@@ -3293,7 +3962,12 @@ describe("dedicated events lane (no observe target)", () => {
   it("keeps a bare no-target socket open and serves subscribe frames", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
-    const observe = vi.fn(async () => new Response(textStream([]), { status: 200 }));
+    const observe = vi.fn(async () =>
+      boundSessionResponse(textStream([]), {
+        name: "otto",
+        agentId: "a_otto",
+        sessionId: "s_otto",
+      }));
     handleWs(socket, new Request("http://localhost/api/agui/ws"), {
       observe,
       daemonFleetStatusEvents: { subscribe: () => () => {} },

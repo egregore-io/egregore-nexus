@@ -15,6 +15,10 @@ import { currentHuman } from "@server/identity/human";
 import { parseCookies } from "@server/http/cookies";
 import type { InterruptResponse } from "@shared/types";
 import {
+  exactSessionError,
+  exactSessionResultError,
+} from "@server/command/sessionQueue";
+import {
   localOperatorCaller,
   isLocalOperatorWebAuthMode,
   webAuthModeFromEnv,
@@ -42,12 +46,19 @@ export async function handleConversationInterruptPost(
   request: Request,
   deps: ConversationInterruptDeps = {},
 ): Promise<Response> {
-  let body: { name?: string; agentId?: string; clientMessageId?: string };
+  let body: {
+    name?: string;
+    agentId?: string;
+    expectedSessionId?: string;
+    clientMessageId?: string;
+  };
   try {
     body = (await request.json()) as typeof body;
   } catch {
     return json({ error: "body must be JSON" }, 400);
   }
+  const selectorError = exactSessionError(body);
+  if (selectorError) return json({ error: selectorError }, 400);
   const targetName = body.name ?? body.agentId;
   if (!targetName) return json({ error: "name is required" }, 400);
 
@@ -67,12 +78,17 @@ export async function handleConversationInterruptPost(
       {
         name: targetName,
         ...(body.agentId ? { agentId: body.agentId } : {}),
+        ...(body.expectedSessionId
+          ? { expectedSessionId: body.expectedSessionId }
+          : {}),
         ...(body.clientMessageId ? { clientMessageId: body.clientMessageId } : {}),
       },
       identity,
       deps.commandIngress,
       body.clientMessageId,
     );
+    const resultError = exactSessionResultError(body.expectedSessionId, result);
+    if (resultError) return json({ error: resultError }, 502);
     return json({ ok: true, result }, 201);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

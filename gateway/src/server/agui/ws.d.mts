@@ -13,20 +13,30 @@ export interface AguiWsSocket {
 
 export interface AguiWsInput {
   mode: "session" | "bus";
+  /** Session targets carry the canonical agentId/expectedSessionId pair; bus targets are unchanged. */
   target: unknown;
   text: string;
   clientMessageId?: string;
 }
 
 export interface AguiWsSteerInput {
+  /** Canonical session target including agentId and expectedSessionId. */
   target: unknown;
   text: string;
   clientMessageId?: string;
 }
 
 export interface AguiWsInterruptInput {
+  /** Canonical session target including agentId and expectedSessionId. */
   target: unknown;
   clientMessageId: string;
+}
+
+/** Transport binding only; not an AG-UI run event or native readiness/admission proof. */
+export interface AguiWsSessionBound {
+  t: "session.bound";
+  agentId: string;
+  sessionId: string;
 }
 
 export interface AguiWsDeveloperEventSource {

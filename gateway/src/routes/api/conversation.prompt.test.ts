@@ -3,11 +3,137 @@ import { describe, expect, it } from "vitest";
 
 import { localOperatorCaller } from "@server/auth/webAuthMode";
 import { handleConversationPromptPost } from "./conversation.prompt";
+import { handleConversationSteerPost } from "./conversation.steer";
+import { handleConversationInterruptPost } from "./conversation.interrupt";
+
+describe.each([
+  ["prompt", handleConversationPromptPost],
+  ["steer", handleConversationSteerPost],
+  ["interrupt", handleConversationInterruptPost],
+] as const)("exact HTTP %s", (kind, handle) => {
+    const request = (extra: Record<string, unknown>) =>
+    new Request(`http://localhost/api/conversation/${kind}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: "target",
+        agentId: "a_target",
+        text: "input",
+        ...extra,
+      }),
+    });
+
+  it.each([null, [], "invalid", 3])(
+    "rejects non-object JSON without effects: %j",
+    async (body) => {
+      const db = await makeCommandDb();
+      try {
+        const response = await handle(
+          new Request(`http://localhost/api/conversation/${kind}`, {
+            method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }), {
+      env: { NEXUS_WEB_AUTH_MODE: "local" },
+      commandIngress: { db, timeoutMs: 0 },
+    });
+    expect(response.status).toBe(400);
+    expect(
+          (await db.execute("SELECT * FROM command_intents")).rows).toHaveLength(0);
+      } finally {
+        db.close();
+  }
+    },
+  );
+
+  it.each([
+    { expectedSessionId: null },
+    { expectedSessionId: "" },
+    { expectedSessionId: "  " },
+      { expectedSessionId: {} },
+    { expectedSessionId: "s_target", agentId: undefined },
+    { expectedSessionId: "s_target", agentId: " " },
+  ])("rejects malformed exact identity before effects: %j", async (extra) => {
+    const db = await makeCommandDb();
+    try {
+      const response = await handle(request(extra),
+      {
+        env: { NEXUS_WEB_AUTH_MODE: "local" },
+        commandIngress: {
+          db, timeoutMs: 0 },
+      },
+    );
+
+    expect(response.status).toBe(400);
+      expect(
+        (await db.execute("SELECT * FROM command_intents")).rows,
+      ).toHaveLength(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  it.each(["s_target", "s_foreign", undefined])(
+    "carries the selector and checks actual response session %s", async (actualSession) => {
+    const calls: Array<{ kind: string; request: unknown }> = [];
+    const response = await handle(
+        request({ expectedSessionId: "s_target" }),
+        {
+          env: { NEXUS_WEB_AUTH_MODE: "local" },
+      commandIngress: {
+            nexusHome: `/tmp/exact-http-${kind}-${actualSession}`,
+            daemonBootId: async () => "boot_exact",
+            daemonCommand: async (command, params) => {
+              if (command === "identity.register")
+                return { sessionId: "s_operator" };
+              calls.push({ kind: command, request: params });
+              return {
+                accepted: true,
+                delivered: true,
+                sessionId: actualSession,
+              };
+            },
+            daemonEnqueue: async (command, params) => {
+              calls.push({ kind: command, request: params });
+              return {
+                commandId: "cmd_exact",
+                status: "pending",
+                createdAt: 1,
+                revision: 1,
+                seq: 1,
+                sessionId: actualSession,
+              };
+            },
+          },
+        },
+      );
+      expect(calls).toEqual([
+        {
+          kind: `harness.${kind}`,
+          request: expect.objectContaining({
+            agentId: "a_target",
+            expectedSessionId: "s_target",
+          }),
+        },
+      ]);
+      expect(response.status).toBe(actualSession === "s_target" ? 201 : 502);
+      const body = await response.json();
+      if (actualSession === "s_target")
+        expect(body.receipt ?? body.result).toMatchObject({
+          sessionId: "s_target",
+        });
+      else
+        expect(body).toMatchObject({
+          error: expect.stringMatching(/session/i),
+        });
+    },
+  );
+});
 
 const COMMAND_DDL = `
 CREATE TABLE IF NOT EXISTS command_intents (
   command_id        TEXT PRIMARY KEY,
-  kind              TEXT NOT NULL,
+        kind              TEXT NOT NULL,
   status            TEXT NOT NULL,
   project           TEXT NOT NULL,
   caller_name       TEXT NOT NULL,

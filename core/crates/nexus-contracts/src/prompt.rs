@@ -386,7 +386,14 @@ pub struct WarmResponse {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactRequest {
-    /// The stable target agent id. When present, the daemon revives this id before `name`.
+    /// Dispatch only to this agent's existing active runtime; never revive or retarget.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_expected_session"
+    )]
+    pub expected_session_id: Option<SessionId>,
+    /// Stable agent target. Omitted session selectors retain legacy revive behavior.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
     /// The target agent's registered name fallback (resolved to its live session).
@@ -402,6 +409,9 @@ pub struct CompactRequest {
 #[serde(rename_all = "camelCase")]
 pub struct CompactResponse {
     pub started: bool,
+    /// Actual resolved dispatch session; not a native lifecycle/admission proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
 }
 
 /// Interrupt the active turn on one agent session without injecting replacement text.

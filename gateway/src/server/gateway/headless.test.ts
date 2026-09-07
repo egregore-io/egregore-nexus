@@ -80,6 +80,19 @@ function dispatchers(): HeadlessGatewayDispatchers {
   };
 }
 
+function canonicalSessionObserve(): Promise<Response> {
+  return Promise.resolve(
+    new Response(new ReadableStream<Uint8Array>(), {
+      headers: {
+        "content-type": "text/event-stream",
+        "x-nexus-agent-id": "a_otto",
+        "x-nexus-session-id": "s_otto",
+        "x-nexus-agent-name": "otto",
+      },
+    }),
+  );
+}
+
 describe("headless gateway", () => {
   it("starts hooks before projection and closes both services", async () => {
     const calls: string[] = [];
@@ -174,7 +187,7 @@ describe("headless gateway", () => {
           return chunk;
         });
       const outcome = await new Promise<
-        { type: "frame"; chunk: ReadableStreamReadResult<Uint8Array> }
+        | { type: "frame"; chunk: ReadableStreamReadResult<Uint8Array> }
         | { type: "blocked" }
       >((resolve) => {
         // This is a streaming-order contract, not a 100 ms performance benchmark. The complete
@@ -227,8 +240,17 @@ describe("headless gateway", () => {
 
   it("binds browser cookie CSRF at upgrade before routing a WebSocket mutation", async () => {
     const deps = dispatchers();
+    deps.aguiObserve = canonicalSessionObserve;
     const routed: Request[] = [];
     deps.webuiApi = vi.fn(async (request: Request) => {
+      if (request.method === "GET")
+        return json({
+          sessionId: "s_otto",
+          commands: [],
+          events: [],
+          seq: 0,
+          latestSeq: 0,
+        });
       routed.push(request);
       return json({
         ok: true,
@@ -246,7 +268,7 @@ describe("headless gateway", () => {
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const { port } = server.address() as AddressInfo;
     const socket = new WebSocket(
-      `ws://127.0.0.1:${port}/api/agui/ws`,
+      `ws://127.0.0.1:${port}/api/agui/ws?session=otto&agentId=a_otto`,
       ["nexus-v1", "nexus-csrf.csrf-ws"],
       { headers: { cookie: "nexus_human=human-1; nexus_csrf=csrf-ws" } },
     );
@@ -258,15 +280,16 @@ describe("headless gateway", () => {
       });
       socket.send(JSON.stringify({
         t: "input",
-        mode: "session",
+          agentId: "a_otto",
+          expectedSessionId: "s_otto",
+          mode: "session",
         target: "otto",
         text: "hello",
         clientMessageId: "cm_csrf",
       }));
-      const frame = await new Promise<unknown>((resolve, reject) => {
-        socket.once("message", (data) => resolve(JSON.parse(String(data))));
-        socket.once("error", reject);
-      });
+      const frame = await waitForWsFrame(
+        socket, (frame) => frame.t === "input.ack" || frame.t === "input.err",
+      );
 
       expect(frame).toMatchObject({ t: "input.ack", commandId: "cmd_csrf" });
       expect(routed).toHaveLength(1);
@@ -284,11 +307,12 @@ describe("headless gateway", () => {
     const previousMode = process.env.NEXUS_WEB_AUTH_MODE;
     process.env.NEXUS_WEB_AUTH_MODE = "remote";
     const deps = dispatchers();
+    deps.aguiObserve = canonicalSessionObserve;
     const server = await createHeadlessGatewayServer(deps);
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const { port } = server.address() as AddressInfo;
     const socket = new WebSocket(
-      `ws://127.0.0.1:${port}/api/agui/ws`,
+      `ws://127.0.0.1:${port}/api/agui/ws?session=otto&agentId=a_otto`,
       ["nexus-v1"],
       {
         headers: {
@@ -305,22 +329,26 @@ describe("headless gateway", () => {
       });
       socket.send(JSON.stringify({
         t: "input",
-        mode: "session",
+          agentId: "a_otto",
+          expectedSessionId: "s_otto",
+          mode: "session",
         target: "otto",
         text: "must not route",
         clientMessageId: "cm_forged",
       }));
-      const frame = await new Promise<Record<string, unknown>>((resolve, reject) => {
-        socket.once("message", (data) => resolve(JSON.parse(String(data))));
-        socket.once("error", reject);
-      });
+      const frame = await waitForWsFrame(
+        socket, (frame) => frame.t === "input.err",
+      );
 
       expect(frame).toMatchObject({
         t: "input.err",
         clientMessageId: "cm_forged",
         status: 403,
       });
-      expect(deps.webuiApi).not.toHaveBeenCalled();
+      expect(
+        vi
+          .mocked(deps.webuiApi).mock.calls.filter(([request]) => request.method !== "GET"),
+      ).toHaveLength(0);
     } finally {
       socket.close();
       await new Promise<void>((resolve, reject) => {
@@ -467,7 +495,11 @@ describe("headless gateway", () => {
           socket.once("error", reject);
         });
         const terminal = waitForWsFrame(socket, testCase.terminal);
-        socket.send(JSON.stringify(testCase.frame));
+        socket.send(JSON.stringify({
+            ...testCase.frame,
+            agentId: "a_otto",
+            expectedSessionId: "s_otto",
+          }));
         await expect(terminal, testCase.label).resolves.toEqual(
           expect.objectContaining(testCase.expected),
         );

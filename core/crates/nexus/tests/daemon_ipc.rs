@@ -99,6 +99,7 @@ async fn malformed_exact_selector_is_rejected_before_any_durable_enqueue() {
         nexus_store::command_kinds::harness::PROMPT,
         nexus_store::command_kinds::harness::STEER,
         nexus_store::command_kinds::harness::INTERRUPT,
+        nexus_store::command_kinds::harness::COMPACT,
     ] {
         for (index, options) in [
             serde_json::json!({"agentId":"a_target", "expectedSessionId":null}),

@@ -54,11 +54,13 @@ create silent replay gaps that strand the Gateway directory offline.
 Session composers should use queued prompts for ordinary Send, not infer strict steer from
 displayed activity. Unsupported delivery/model options are rejected rather than discarded,
 including on redirected queued prompts.
-Daemon callers can opt into exact dispatch with stable `agentId` plus
-`expectedSessionId`: prompt, steer, interrupt, and new queue mutations reject a
+Daemon and Gateway HTTP callers can opt into exact dispatch with stable `agentId` plus
+`expectedSessionId`: prompt, steer, interrupt, compact, and new queue mutations reject a
 replaced/absent runtime instead of reviving or retargeting it. Omission preserves
-legacy routing. This is daemon routing evidence, not native admission proof;
-Gateway/Lens exact-session carrier integration is a separate step.
+legacy HTTP/IPC/CLI routing. Agent-session WebSocket commands require the captured exact
+pair, supplied by the retained browser producer only after `session.bound`; missing or
+foreign response bindings are not reported as success. Binding is transport/routing
+evidence, not native admission proof. Lens carrier integration remains a separate step.
 Consumed Codex completion clears native busy state independently of its display write.
 See [composer delivery and retry safety](docs/composer-delivery.md).
 

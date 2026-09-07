@@ -53,6 +53,33 @@ async function makeCommandDb(): Promise<Client> {
 }
 
 describe("POST /api/conversation/steer", () => {
+  it.each([{ delivery: "auto" }, { modelSelection: { modelId: "other" } }])(
+    "rejects unsupported intent before enqueue %j",
+    async (options) => {
+      const db = await makeCommandDb();
+      const response = await handleConversationSteerPost(
+        new Request("http://localhost/api/conversation/steer", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            agentId: "a_target",
+            expectedSessionId: "s_target",
+            text: "do not downgrade",
+            ...options,
+          }),
+        }),
+        {
+          env: { NEXUS_WEB_AUTH_MODE: "local" },
+          commandIngress: { db, timeoutMs: 0 },
+        },
+      );
+      expect(response.status).toBe(400);
+      expect(
+        (await db.execute("SELECT * FROM command_intents")).rows,
+      ).toHaveLength(0);
+      db.close();
+    },
+  );
   it("gives native steer acceptance longer than the generic daemon IPC deadline", async () => {
     const calls: Array<{ kind: string; timeoutMs: number | undefined }> = [];
     const res = await handleConversationSteerPost(

@@ -1020,20 +1020,29 @@ async fn route_request_inner(
         // injecting literal text the model would just read as chat.
         "compact" => {
             let c = require(caller)?;
+            if let Some(params) = p {
+                nexus_contracts::prompt::validate_expected_session(params)
+                    .map_err(|error| contract_to_rpc(&error))?;
+            }
             let r: nexus_contracts::CompactRequest = parse(p)?;
-            let session = match r.agent_id.as_ref() {
-                Some(agent_id) => ensure_alive_agent_by_id(state, agent_id).await,
-                None => state
-                    .ensure_alive(&r.name, &c.project)
-                    .await
-                    .map_err(|e| contract_to_rpc(&e)),
-            }?;
+            let session = resolve_session_dispatch_target(
+                state,
+                c,
+                r.agent_id.as_ref(),
+                &r.name,
+                r.expected_session_id.as_ref(),
+            )
+            .await?;
             state
                 .agent
                 .compact(&session)
                 .await
                 .map_err(|e| contract_to_rpc(&e))?;
-            Ok(serde_json::to_value(nexus_contracts::CompactResponse { started: true }).unwrap())
+            Ok(serde_json::to_value(nexus_contracts::CompactResponse {
+                started: true,
+                session_id: Some(session),
+            })
+            .unwrap())
         }
         // Pre-warm an agent's ACP session WITHOUT injecting — the AionUi "spawn at
         // conversation-open" move. The web console calls this when a DM pane opens (the `observe`

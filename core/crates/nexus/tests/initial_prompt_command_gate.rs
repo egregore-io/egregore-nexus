@@ -234,6 +234,7 @@ async fn pending_initial_prompt_blocks_prompt_steer_compact_and_warm_until_accep
         command_kinds::harness::COMPACT,
         &alex,
         serde_json::to_string(&CompactRequest {
+            expected_session_id: None,
             agent_id: None,
             name: "Ada".into(),
             client_message_id: None,
@@ -352,6 +353,7 @@ async fn pending_initial_prompt_blocks_agent_id_targeted_commands_with_stale_nam
         command_kinds::harness::COMPACT,
         &alex,
         serde_json::to_string(&CompactRequest {
+            expected_session_id: None,
             agent_id: Some(ada_agent_id.clone()),
             name: "stale-name".into(),
             client_message_id: None,

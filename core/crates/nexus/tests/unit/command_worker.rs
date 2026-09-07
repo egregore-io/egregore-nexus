@@ -101,6 +101,13 @@ impl AgentTurnExecutionPort for ExactDispatchSpy {
             .push(("interrupt".into(), recipient.clone()));
         Ok(())
     }
+    async fn compact(&self, recipient: &SessionId) -> PortResult<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("compact".into(), recipient.clone()));
+        Ok(())
+    }
 }
 
 async fn bind_exact_test_runtime(state: &AppState, session: &str) {
@@ -160,6 +167,7 @@ async fn exact_durable_dispatch_rejects_original_session_after_real_same_agent_r
         ("prompt", command_kinds::harness::PROMPT),
         ("steer", command_kinds::harness::STEER),
         ("interrupt", command_kinds::harness::INTERRUPT),
+        ("compact", command_kinds::harness::COMPACT),
     ] {
         let exec = Arc::new(ExactDispatchSpy::default());
         let state = test_state_with_turn_exec(exec.clone()).await;

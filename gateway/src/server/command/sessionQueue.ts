@@ -28,6 +28,36 @@ const PROMPT = "harness.prompt";
 const STEER = "harness.steer";
 const MAX_QUEUE_ROWS = 100;
 
+/** Omission retains legacy lookup; an explicit selector must be a complete stable pair. */
+export function exactSessionError(value: unknown): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return "body must be a JSON object";
+  const body = value as Record<string, unknown>;
+  if (!("expectedSessionId" in body)) return undefined;
+  if (
+    typeof body.expectedSessionId !== "string" ||
+    !body.expectedSessionId.trim() ||
+    typeof body.agentId !== "string" ||
+    !body.agentId.trim()
+  ) {
+    return "expectedSessionId requires a non-empty session id and stable agentId";
+  }
+  return undefined;
+}
+
+export function exactSessionResultError(
+  expectedSessionId: unknown,
+  result: { sessionId?: unknown } | undefined,
+): string | undefined {
+  if (
+    expectedSessionId !== undefined &&
+    result?.sessionId !== expectedSessionId
+  ) {
+    return "command acknowledgement session mismatch; outcome for the requested session is unconfirmed";
+  }
+  return undefined;
+}
+
 function getIdentityDbLazy(): Promise<Client> {
   return getConversationStore();
 }
@@ -137,7 +167,11 @@ async function daemonQueueRead(
   );
 }
 
-type QueueTarget = { name?: string; agentId?: string };
+type QueueTarget = {
+  name?: string;
+  agentId?: string;
+  expectedSessionId?: string;
+};
 
 function targetFromUrl(request: Request): QueueTarget | Response {
   const url = new URL(request.url);
@@ -178,12 +212,16 @@ async function targetRuntime(
       "AND t.status = 'streaming' AND t.finalized_at IS NULL LIMIT 1" +
       ") AS turn_active, s.name FROM sessions s WHERE " +
       "((? IS NOT NULL AND s.agent_id = ?) OR (? IS NULL AND s.name = ?)) " +
+      (target.expectedSessionId
+        ? "AND s.session_id = ? AND EXISTS (SELECT 1 FROM agent_runtimes r WHERE r.agent_id = s.agent_id AND r.runtime_id = s.session_id AND r.active = 1 AND r.stopped_at IS NULL) "
+        : "") +
       "ORDER BY s.created_at DESC LIMIT 1",
     args: [
       target.agentId ?? null,
       target.agentId ?? null,
       target.agentId ?? null,
       target.name ?? null,
+      ...(target.expectedSessionId ? [target.expectedSessionId] : []),
     ],
   });
   const row = result.rows[0];
@@ -408,6 +446,9 @@ function canonicalMutationRequest(
   return JSON.stringify({
     name: target.name,
     agentId: target.agentId ?? null,
+    ...(target.expectedSessionId
+      ? { expectedSessionId: target.expectedSessionId }
+      : {}),
     action: body.action,
     commandId: body.commandId ?? null,
     expectedRevision: body.expectedRevision ?? null,
@@ -501,6 +542,8 @@ export async function handleConversationQueuePost(
   } catch {
     return json({ error: "body must be JSON" }, 400);
   }
+  const selectorError = exactSessionError(body);
+  if (selectorError) return json({ error: selectorError }, 400);
   if (!body.name?.trim() && !body.agentId) {
     return mutationError(body, "name or agentId is required", 400);
   }
@@ -510,6 +553,9 @@ export async function handleConversationQueuePost(
   const target: QueueTarget = {
     ...(body.name?.trim() ? { name: body.name.trim() } : {}),
     ...(body.agentId ? { agentId: String(body.agentId) } : {}),
+    ...(body.expectedSessionId
+      ? { expectedSessionId: body.expectedSessionId }
+      : {}),
   };
   const auth = await authorizedProject(request, deps);
   if (isResponse(auth)) return auth;
@@ -520,6 +566,11 @@ export async function handleConversationQueuePost(
         { project: auth.project, now, request: body },
         deps,
       );
+      const resultError =
+        result.status >= 200 && result.status < 300
+          ? exactSessionResultError(body.expectedSessionId, result.body)
+          : undefined;
+      if (resultError) return mutationError(body, resultError, 502);
       return json(result.body, result.status);
     } catch (error) {
       return mutationError(
@@ -573,6 +624,17 @@ export async function handleConversationQueuePost(
     });
     const runtime = await targetRuntime(tx, target);
     const predicate = targetPredicate(target, runtime.sessionId);
+    if (target.expectedSessionId) {
+      // Conversion cannot grant an old row authority that was absent at its original enqueue.
+      const requireOriginal = body.action === CommandQueueAction.RedirectNow;
+      predicate.sql =
+        `(${predicate.sql}) AND (` +
+        (requireOriginal
+          ? ""
+          : "json_type(request_json, '$.expectedSessionId') IS NULL OR ") +
+        "json_extract(request_json, '$.expectedSessionId') = ?)";
+      predicate.args.push(target.expectedSessionId);
+    }
 
     const finish = async (
       responseBody: Record<string, unknown>,
@@ -595,6 +657,16 @@ export async function handleConversationQueuePost(
     };
     const fail = (error: string, status: number) =>
       finish(mutationErrorBody(body, error), status);
+
+    if (
+      target.expectedSessionId &&
+      runtime.sessionId !== target.expectedSessionId
+    ) {
+      return await fail(
+        "expected session is not the active owned runtime binding",
+        409,
+      );
+    }
 
     switch (body.action) {
       case CommandQueueAction.RedirectNow: {

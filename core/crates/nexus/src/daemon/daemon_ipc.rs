@@ -1594,6 +1594,7 @@ async fn command_row_for_acceptance(
         nexus_store::command_kinds::harness::PROMPT
             | nexus_store::command_kinds::harness::STEER
             | nexus_store::command_kinds::harness::INTERRUPT
+            | nexus_store::command_kinds::harness::COMPACT
     ) {
         nexus_contracts::prompt::validate_expected_session(&params)?;
     }

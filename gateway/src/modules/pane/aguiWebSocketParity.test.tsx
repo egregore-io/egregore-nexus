@@ -246,6 +246,42 @@ describe("AG-UI WebSocket verification source parity", () => {
     rendered.unmount();
   });
 
+  it.each([false, true])(
+    "preserves an unsent draft without name-only fallback before binding or after disconnect: %s",
+    async (disconnect) => {
+      const Socket = installFakeWebSocket();
+      const postPrompt = vi.fn();
+      let send: (text: string) => Promise<void> = async () => {};
+      function Harness() {
+        const session = useAgentSession({
+          name: "iris",
+          sessionId: "s_iris",
+          openSource: openWsSource,
+          postPrompt,
+        });
+        send = session.send;
+        return null;
+      }
+      const rendered = render(<Harness />);
+      Socket.instances[0]!.open();
+      if (disconnect)
+        act(() => {
+          Socket.instances[0]!.message({
+            t: "session.bound",
+            agentId: "a_iris",
+            sessionId: "s_iris",
+          });
+          Socket.instances[0]!.close();
+        });
+      await act(async () => {
+        await expect(send("keep this draft")).rejects.toThrow(/binding/i);
+      });
+      expect(postPrompt).not.toHaveBeenCalled();
+      expect(Socket.instances[0]!.sent).toEqual([]);
+      rendered.unmount();
+    },
+  );
+
   it("reuses the opaque Gateway cursor with the real WS client source", () => {
     vi.useFakeTimers();
     const Socket = installFakeWebSocket();
@@ -400,6 +436,11 @@ describe("AG-UI WebSocket verification source parity", () => {
     render(<Harness />);
     const first = Socket.instances[0]!;
     first.open();
+    first.message({
+      t: "session.bound",
+      agentId: "a_iris",
+      sessionId: "s_iris",
+    });
     const runStarted = {
       type: EventType.RUN_STARTED,
       threadId: "iris",
@@ -448,6 +489,7 @@ describe("AG-UI WebSocket verification source parity", () => {
     act(() => {
       first.message({
         t: "input.ack",
+        sessionId: "s_iris",
         clientMessageId: input.clientMessageId,
         delivered: true,
       });
@@ -535,6 +577,11 @@ describe("AG-UI WebSocket verification source parity", () => {
     render(<Harness />);
     const first = Socket.instances[0]!;
     first.open();
+    first.message({
+      t: "session.bound",
+      agentId: "a_iris",
+      sessionId: "s_iris",
+    });
     const siblingA = {
       type: EventType.TEXT_MESSAGE_CONTENT,
       messageId: "m1",
@@ -581,11 +628,13 @@ describe("AG-UI WebSocket verification source parity", () => {
     act(() => {
       first.message({
         t: "input.ack",
+        sessionId: "s_iris",
         clientMessageId: inputs[1]!.clientMessageId,
         delivered: true,
       });
       first.message({
         t: "input.ack",
+        sessionId: "s_iris",
         clientMessageId: inputs[0]!.clientMessageId,
         delivered: true,
       });
@@ -870,6 +919,13 @@ describe("AG-UI WebSocket verification source parity", () => {
     render(<Harness />);
     const socket = Socket.instances[0]!;
     socket.open();
+    socket.message(
+      JSON.stringify({
+        t: "session.bound",
+        agentId: "a_iris",
+        sessionId: "s_iris",
+      }),
+    );
 
     let sent: Promise<void>;
     act(() => {
@@ -881,6 +937,8 @@ describe("AG-UI WebSocket verification source parity", () => {
     expect(frame).toEqual({
       t: "input",
       text: "socket prompt",
+      agentId: "a_iris",
+      expectedSessionId: "s_iris",
       clientMessageId: expect.stringMatching(/^you:/),
     });
     expect(promptCalls).toHaveLength(0);
@@ -888,7 +946,8 @@ describe("AG-UI WebSocket verification source parity", () => {
     act(() => {
       socket.message(JSON.stringify({
         t: "input.ack",
-        clientMessageId: frame.clientMessageId,
+          sessionId: "s_iris",
+          clientMessageId: frame.clientMessageId,
         delivered: true,
       }));
     });

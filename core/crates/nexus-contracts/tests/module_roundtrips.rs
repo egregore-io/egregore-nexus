@@ -1841,7 +1841,8 @@ mod prompt {
         let input = serde_json::json!({"agentId":"a_owned", "name":"display", "text":"hello"});
         check::<nexus_contracts::PromptRequest>(input.clone());
         check::<nexus_contracts::SteerRequest>(input.clone());
-        check::<nexus_contracts::InterruptRequest>(input);
+        check::<nexus_contracts::InterruptRequest>(input.clone());
+        check::<nexus_contracts::CompactRequest>(input);
         check::<CommandQueueMutationRequest>(
             serde_json::json!({"agentId":"a_owned", "action":"cancel", "clientMutationId":"mutation"}),
         );
@@ -1867,6 +1868,7 @@ mod prompt {
             serde_json::json!({"accepted":true,"delivery":"steered"}),
         );
         check::<nexus_contracts::InterruptResponse>(serde_json::json!({"interrupted":true}));
+        check::<nexus_contracts::CompactResponse>(serde_json::json!({"started":true}));
     }
 
     #[test]
@@ -1880,10 +1882,12 @@ mod prompt {
         check::<nexus_contracts::PromptRequest>(&fixture["promptRequest"]);
         check::<nexus_contracts::SteerRequest>(&fixture["steerRequest"]);
         check::<nexus_contracts::InterruptRequest>(&fixture["interruptRequest"]);
+        check::<nexus_contracts::CompactRequest>(&fixture["compactRequest"]);
         check::<CommandQueueMutationRequest>(&fixture["queueMutationRequest"]);
         check::<nexus_contracts::PromptResponse>(&fixture["promptResponse"]);
         check::<nexus_contracts::SteerResponse>(&fixture["steerResponse"]);
         check::<nexus_contracts::InterruptResponse>(&fixture["interruptResponse"]);
+        check::<nexus_contracts::CompactResponse>(&fixture["compactResponse"]);
     }
 
     #[test]

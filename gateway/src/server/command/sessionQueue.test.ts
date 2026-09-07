@@ -8,6 +8,7 @@ import {
 import { CommandQueueState, SteerCapability } from "@shared/types";
 
 const DDL = `
+CREATE TABLE agent_runtimes (agent_id TEXT, runtime_id TEXT, active INTEGER, stopped_at INTEGER);
 CREATE TABLE sessions (
   session_id TEXT PRIMARY KEY,
   agent_id TEXT,
@@ -112,6 +113,7 @@ async function dbFor(
       "DELETE FROM command_intents",
       "DELETE FROM agent_session_turns",
       "DELETE FROM sessions",
+      "DELETE FROM agent_runtimes",
       "DELETE FROM sqlite_sequence WHERE name = 'command_intent_events'",
     ]);
   }
@@ -124,6 +126,131 @@ async function dbFor(
   });
   return db;
 }
+
+describe("exact queue mutation authority", () => {
+  const request = (extra: Record<string, unknown> = {}) =>
+    new Request("http://localhost/api/conversation/prompt", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
+        action: "redirect_now",
+        commandId: "cmd_exact",
+        expectedRevision: 1,
+        clientMutationId: "mut_exact",
+        ...extra,
+      }),
+    });
+
+  it.each([undefined, "s_foreign", "s_otto"])(
+    "redirect requires the immutable original selector %s",
+    async (original) => {
+      const db = await dbFor();
+      await db.execute(
+        "INSERT INTO agent_runtimes VALUES ('a_otto', 's_otto', 1, NULL)",
+      );
+      await insertActiveTurn(db);
+      await insertCommand(db, "cmd_exact", "pending", 1);
+      const bytes = JSON.stringify(
+        {
+          name: "otto",
+          agentId: "a_otto",
+          expectedSessionId: original,
+          text: "original",
+          clientMessageId: "cm_exact",
+        },
+        null,
+        2,
+      );
+      await db.execute({
+        sql: "UPDATE command_intents SET request_json = ? WHERE command_id = 'cmd_exact'",
+        args: [bytes],
+      });
+      const response = await handleConversationQueuePost(request(), deps(db));
+      expect(response.status).toBe(original === "s_otto" ? 200 : 409);
+      expect(
+        (await db.execute("SELECT request_json FROM command_intents")).rows[0]
+          ?.request_json,
+      ).toBe(bytes);
+    },
+  );
+
+  it("uses active runtime authority inside the transaction, after committed replay", async () => {
+    const db = await dbFor();
+    await db.execute(
+      "INSERT INTO agent_runtimes VALUES ('a_otto', 's_otto', 1, NULL)",
+    );
+    await insertCommand(db, "cmd_exact", "pending", 1);
+    const counted = countedDb(db);
+    const first = await handleConversationQueuePost(
+      request({ action: "cancel" }),
+      deps(counted.db),
+    );
+    expect(first.status).toBe(200);
+    const receipt = await first.json();
+    const canonical = JSON.parse(
+      String(
+        (await db.execute("SELECT request_json FROM command_queue_mutations"))
+          .rows[0]?.request_json,
+      ),
+    );
+    expect(canonical.expectedSessionId).toBe("s_otto");
+    expect(counted.direct.some((sql) => sql.includes("agent_runtimes"))).toBe(
+      false,
+    );
+    expect(
+      counted.transaction.some((sql) => sql.includes("agent_runtimes")),
+    ).toBe(true);
+    await db.execute("UPDATE agent_runtimes SET runtime_id = 's_new'");
+    const replay = await handleConversationQueuePost(
+      request({ action: "cancel" }),
+      deps(db),
+    );
+    expect(await replay.json()).toEqual(receipt);
+    const conflicting = await handleConversationQueuePost(
+      request({ action: "cancel", expectedSessionId: "s_new" }),
+      deps(db),
+    );
+    expect(conflicting.status).toBe(409);
+    const stale = await handleConversationQueuePost(
+      request({ action: "cancel", clientMutationId: "mut_new" }),
+      deps(db),
+    );
+    expect(stale.status).toBe(409);
+  });
+
+  it.each([null, "", " ", {}])(
+    "rejects malformed selector before daemon mutation: %j",
+    async (expectedSessionId) => {
+      const daemonQueueMutation = vi.fn();
+      const response = await handleConversationQueuePost(
+        request({ expectedSessionId }),
+        { env: { NEXUS_WEB_AUTH_MODE: "local" }, daemonQueueMutation },
+      );
+      expect(response.status).toBe(400);
+      expect(daemonQueueMutation).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["s_otto", "s_foreign", undefined])(
+    "checks actual daemon mutation receipt session %s",
+    async (sessionId) => {
+      const daemonQueueMutation = vi.fn(async (_input: unknown) => ({
+        status: 200,
+        body: { sessionId, clientMutationId: "mut_exact" },
+      }));
+      const response = await handleConversationQueuePost(request(), {
+        env: { NEXUS_WEB_AUTH_MODE: "local" },
+        daemonQueueMutation,
+      });
+      expect(response.status).toBe(sessionId === "s_otto" ? 200 : 502);
+      expect(daemonQueueMutation.mock.calls[0]?.[0]).toMatchObject({
+        request: { expectedSessionId: "s_otto" },
+      });
+    },
+  );
+});
 
 async function insertCommand(
   db: Client,

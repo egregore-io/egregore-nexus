@@ -12,12 +12,18 @@ All notable public changes to Egregore Nexus are documented here. This project f
 
 ### Fixed
 
+- Carry exact agent/session identity through Gateway prompt, steer, interrupt, compact,
+  queue mutations, and structured session WebSocket commands. Session sockets publish
+  `session.bound` from canonical observe headers; the retained browser producer rejects
+  unbound input without name-only fallback and verifies actual acknowledgement identity.
+  Preserve legacy omitted HTTP/IPC/CLI selectors and compact scheduling; Lens carriers
+  and native admission/lifecycle exclusion remain separate work.
 - Add opt-in daemon exact-session dispatch for prompt, steer, interrupt, and queue
   mutations using `agentId` plus `expectedSessionId`. Reject stale bindings without
   revive, validate explicit malformed selectors before enqueue, preserve immutable
   redirect/retry identity, and resolve new mutations under the identity write gate.
-  Legacy omission remains compatible; Gateway/Lens carrier wiring and native
-  admission/lifecycle exclusion are not enabled by this change.
+  Legacy omission remains compatible; native admission/lifecycle exclusion is not
+  implied by exact dispatch.
 - Preserve every unacknowledged Gateway projection sequence, including superseded snapshots,
   so a late Gateway can replay registrations without stalling on silent sequence gaps.
 - Clear completed Codex turns from routing activity before waiting on their display writes,

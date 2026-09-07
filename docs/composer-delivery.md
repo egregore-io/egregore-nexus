@@ -18,14 +18,30 @@ Queue redirection preserves the original request JSON, so converted pending rows
 command kind. Ordinary explicit steer and redirects with omitted/null options
 retain their existing behavior.
 
-## Opt-in exact daemon session dispatch
+## Exact session dispatch and Gateway carriers
 
-Daemon `prompt`, `steer`, `interrupt`, and queue-mutation requests accept optional
+Daemon and Gateway HTTP `prompt`, `steer`, `interrupt`, `compact`, and queue-mutation requests accept optional
 `expectedSessionId` together with a nonempty stable `agentId`. Explicit null, empty,
 non-string, or partial selectors are invalid before durable enqueue or mutation
 effects. Omission preserves existing name/id resolution and revival, including
-slash-command handling. Gateway/Lens carrier integration is separate; this daemon
-slice alone does not make an existing HTTP `sessionId` an exact selector.
+slash-command handling. The selector is `expectedSessionId`, not an unrelated HTTP `sessionId` field. Lens carrier integration remains a separate slice.
+
+Agent-session WebSocket input, steer, interrupt, queue mutation, and structured
+command frames require nonempty `agentId` and `expectedSessionId` matching the
+connection's canonical observe-response binding. A generic or bus socket is not a
+name-only escape for session commands. Read-only command catalogs and bus-mode
+DM/post/publish behavior are unchanged. `session.bound` is emitted before queue or
+AG-UI pumping and means transport binding only, not a run event or native readiness.
+The retained browser source captures that pair per connection, checks a session-path
+URL against it, ignores closed-connection callbacks, and refuses unbound/disconnected
+sends without falling back to name-only HTTP. Explicit partial/conflicting caller
+identity is rejected, never overwritten. Rejections propagate to preserve the draft.
+
+Exact HTTP/WS success receipts must name the actual matching session. Missing or
+foreign identities report an unconfirmed outcome, not a fabricated request echo.
+Structured `command.ack` retains its pre-dispatch validation meaning; `command.done`
+cannot report success for a mismatched result. Structured compact still uses the
+compact endpoint and its existing scheduling/timeout, not the normal prompt queue.
 
 Exact dispatch resolves the authoritative active agent runtime and verifies that
 its transport session is owned by that agent and matches the selector. It never

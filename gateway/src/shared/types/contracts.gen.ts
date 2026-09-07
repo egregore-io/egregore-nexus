@@ -574,7 +574,9 @@ export interface CommandQueueTransition {
  * the typed `/compact`; transports without a compaction verb error loudly.
  */
 export interface CompactRequest {
-	/** The stable target agent id. When present, the daemon revives this id before `name`. */
+	/** Dispatch only to this agent's existing active runtime; never revive or retarget. */
+	expectedSessionId?: SessionId;
+	/** Stable agent target. Omitted session selectors retain legacy revive behavior. */
 	agentId?: AgentId;
 	/** The target agent's registered name fallback (resolved to its live session). */
 	name: string;
@@ -585,6 +587,8 @@ export interface CompactRequest {
 /** Response: whether compaction was started (completion streams via observe). */
 export interface CompactResponse {
 	started: boolean;
+	/** Actual resolved dispatch session; not a native lifecycle/admission proof. */
+	sessionId?: SessionId;
 }
 
 /** `consume` (drain-once) request — the held-receive window for one drain. */

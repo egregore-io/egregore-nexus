@@ -18,6 +18,10 @@ import { currentHuman } from "@server/identity/human";
 import { parseCookies } from "@server/http/cookies";
 import type { SteerResponse } from "@shared/types";
 import {
+  exactSessionError,
+  exactSessionResultError,
+} from "@server/command/sessionQueue";
+import {
   localOperatorCaller,
   isLocalOperatorWebAuthMode,
   webAuthModeFromEnv,
@@ -65,18 +69,35 @@ export async function handleConversationSteerPost(
   request: Request,
   deps: ConversationSteerDeps = {},
 ): Promise<Response> {
-  let body: { name?: string; agentId?: string; text?: string; clientMessageId?: string };
+  let body: {
+    name?: string;
+    agentId?: string;
+    expectedSessionId?: string;
+    text?: string;
+    clientMessageId?: string;
+    delivery?: unknown;
+    modelSelection?: unknown;
+  };
   try {
     body = (await request.json()) as typeof body;
   } catch {
     return json({ error: "body must be JSON" }, 400);
   }
 
+  const selectorError = exactSessionError(body);
+  if (selectorError) return json({ error: selectorError }, 400);
+  for (const option of ["delivery", "modelSelection"] as const) {
+    if (body[option] != null)
+      return json({ error: `${option} is not supported by this steer endpoint` }, 400);
+  }
   const targetName = body.name ?? body.agentId;
   if (!targetName || !body.text) return json({ error: "name and text are required" }, 400);
   const target = {
     ...agentCommandTarget(targetName),
     ...(body.agentId ? { agentId: body.agentId } : {}),
+    ...(body.expectedSessionId
+      ? { expectedSessionId: body.expectedSessionId }
+      : {}),
   };
 
   const mode = webAuthModeFromEnv(deps.env ?? process.env);
@@ -104,6 +125,8 @@ export async function handleConversationSteerPost(
       },
       body.clientMessageId,
     );
+    const resultError = exactSessionResultError(body.expectedSessionId, result);
+    if (resultError) return json({ error: resultError }, 502);
     return json({ ok: true, result }, 201);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

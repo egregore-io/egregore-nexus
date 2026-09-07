@@ -136,13 +136,13 @@ describe("reduceAguiEvents — AG-UI BaseEvent[] → PaneMessage[]/Block[]", () 
   it("keeps a named live human author distinct from an agent", () => {
     const rows = reduceAll([
       ev.runStarted("r1"),
-      ({
+      {
         type: EventType.TEXT_MESSAGE_START,
         messageId: "m1",
         role: "assistant",
         name: "other-browser-user",
         kind: "human",
-      }) as BaseEvent,
+      } as BaseEvent,
       ev.textContent("m1", "from another human"),
       ev.textEnd("m1"),
       ev.runFinished("r1"),
@@ -355,6 +355,243 @@ describe("AguiWebSocketSource", () => {
     return FakeWebSocket;
   }
 
+  it("carries the current browser producer through the strict WS parser and real HTTP daemon params", async () => {
+    const { EventEmitter } = await import("node:events");
+    const { handleWs } = await import("../../server/agui/ws.mjs");
+    const { handleConversationPromptPost } =
+      await import("../../routes/api/conversation.prompt");
+    const Socket = installFakeWebSocket();
+    const source = new AguiWebSocketSource(
+      "/api/v1/agent-sessions/s_real/events",
+    );
+    const browser = Socket.instances[0]!;
+    browser.open();
+    const server = Object.assign(new EventEmitter(), {
+      send: (raw: string) => browser.message(raw),
+      close: () => {},
+    });
+    browser.send = (raw) => {
+      browser.sent.push(raw);
+      server.emit("message", raw);
+    };
+    let end!: () => void;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        end = () => controller.close();
+      },
+    });
+    const daemonRequests: unknown[] = [];
+    const control = handleWs(
+      server,
+      new Request("http://localhost/api/v1/agent-sessions/s_real/events"),
+      {
+        observe: async () =>
+          new Response(stream, {
+            headers: {
+              "x-nexus-session-id": "s_real",
+              "x-nexus-agent-id": "a_real",
+              "x-nexus-agent-name": "current",
+            },
+          }),
+        fetchHandler: (request) =>
+          handleConversationPromptPost(request, {
+            env: { NEXUS_WEB_AUTH_MODE: "local" },
+            commandIngress: {
+              nexusHome: "/tmp/current-browser-exact-contract",
+              daemonBootId: async () => "boot",
+              daemonCommand: async () => ({ sessionId: "s_operator" }),
+              daemonEnqueue: async (_kind, params) => {
+                daemonRequests.push(params);
+                return {
+                  commandId: "cmd",
+                  sessionId: "s_real",
+                  status: "pending",
+                  revision: 1,
+                  seq: 1,
+                  createdAt: 1,
+                };
+              },
+            },
+          }),
+      },
+    );
+    await vi.waitFor(() => expect(browser.sent).toEqual([]));
+    // Flush canonical observe binding before submitting; no fabricated UI/native event is needed.
+    await Promise.resolve();
+    await Promise.resolve();
+    await expect(
+      source.sendInput({
+        t: "input",
+        text: "captured lane",
+        clientMessageId: "cm",
+      }),
+    ).resolves.toBe(true);
+    expect(daemonRequests).toEqual([
+      {
+        name: "current",
+        agentId: "a_real",
+        expectedSessionId: "s_real",
+        text: "captured lane",
+        clientMessageId: "cm",
+      },
+    ]);
+    source.close();
+    end();
+    control.close();
+  });
+
+  it("refuses unbound session input without allowing REST fallback, then fills the captured pair", async () => {
+    const Socket = installFakeWebSocket();
+    const source = new AguiWebSocketSource(
+      "/api/v1/agent-sessions/s%2Freal/events?view=agui",
+    );
+    const socket = Socket.instances[0]!;
+    socket.open();
+    const frame = {
+      t: "input" as const,
+      text: "keep draft",
+      clientMessageId: "cm_bound",
+    };
+    const attempted = source.sendInput(frame);
+    // Attach rejection immediately; the unbound path must settle without sending.
+    await expect(
+      Promise.race([attempted, Promise.resolve("unsettled")]),
+    ).rejects.toThrow(/bound|binding/i);
+    expect(socket.sent).toEqual([]);
+    socket.message(
+      JSON.stringify({
+        t: "session.bound",
+        agentId: "a_real",
+        sessionId: "s/real",
+      }),
+    );
+    const sent = source.sendInput(frame);
+    expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({
+      ...frame,
+      agentId: "a_real",
+      expectedSessionId: "s/real",
+    });
+    socket.message(
+      JSON.stringify({
+        t: "input.ack",
+        clientMessageId: frame.clientMessageId,
+        sessionId: "s/real",
+      }),
+    );
+    await expect(sent).resolves.toBe(true);
+    source.close();
+  });
+
+  it("rejects foreign URL bindings and ignores callbacks after a connection is closed", async () => {
+    const Socket = installFakeWebSocket();
+    const old = new AguiWebSocketSource("/api/v1/agent-sessions/s_old/events");
+    const socket = Socket.instances[0]!;
+    const messages = vi.fn();
+    old.onmessage = messages;
+    socket.open();
+    old.close();
+    const current = new AguiWebSocketSource(
+      "/api/v1/agent-sessions/s_new/events",
+    );
+    const next = Socket.instances[1]!;
+    next.open();
+    socket.message(
+      JSON.stringify({
+        t: "session.bound",
+        agentId: "a_old",
+        sessionId: "s_old",
+      }),
+    );
+    socket.message(
+      JSON.stringify({ type: EventType.RUN_STARTED, runId: "old" }),
+    );
+    expect(messages).not.toHaveBeenCalled();
+    next.message(
+      JSON.stringify({
+        t: "session.bound",
+        agentId: "a_old",
+        sessionId: "s_old",
+      }),
+    );
+    await expect(
+      Promise.race([
+        current.sendInput({ t: "input", text: "draft", clientMessageId: "cm" }),
+        Promise.resolve("unsettled"),
+      ]),
+    ).rejects.toThrow(/bound|binding/i);
+    expect(next.sent).toEqual([]);
+    current.close();
+  });
+
+  it("ignores old error/open/close callbacks and rejects a foreign input acknowledgement", async () => {
+    const Socket = installFakeWebSocket();
+    const source = new AguiWebSocketSource(
+      "/api/v1/agent-sessions/s_real/events",
+    );
+    const socket = Socket.instances[0]!;
+    socket.open();
+    socket.message(
+      JSON.stringify({
+        t: "session.bound",
+        agentId: "a_real",
+        sessionId: "s_real",
+      }),
+    );
+    const pending = source.sendInput({
+      t: "input",
+      text: "draft",
+      clientMessageId: "cm",
+    });
+    socket.message(
+      JSON.stringify({
+        t: "input.ack",
+        clientMessageId: "cm",
+        sessionId: "s_foreign",
+      }),
+    );
+    await expect(pending).rejects.toThrow(/session/i);
+    source.close();
+    const errors = vi.fn();
+    source.onerror = errors;
+    socket.dispatchEvent(new Event("error"));
+    socket.open();
+    socket.close();
+    expect(errors).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { agentId: "a_real" },
+    { expectedSessionId: "s_real" },
+    { agentId: "a_foreign", expectedSessionId: "s_real" },
+  ])(
+    "rejects explicitly partial or conflicting producer identity %j",
+    async (identity) => {
+      const Socket = installFakeWebSocket();
+      const source = new AguiWebSocketSource(
+        "/api/v1/agent-sessions/s_real/events",
+      );
+      const socket = Socket.instances[0]!;
+      socket.open();
+      socket.message(
+        JSON.stringify({
+          t: "session.bound",
+          agentId: "a_real",
+          sessionId: "s_real",
+        }),
+      );
+      await expect(
+        source.sendInput({
+          t: "input",
+          text: "draft",
+          clientMessageId: "cm",
+          ...identity,
+        }),
+      ).rejects.toThrow(/identity/i);
+      expect(socket.sent).toEqual([]);
+      source.close();
+    },
+  );
+
   it("forwards raw AG-UI JSON frames while handling control frames internally", () => {
     document.cookie = "nexus_csrf=csrf-source; Path=/";
     const Socket = installFakeWebSocket();
@@ -380,6 +617,13 @@ describe("AguiWebSocketSource", () => {
     const source = new AguiWebSocketSource("/api/agui/observe?session=otto");
     const socket = Socket.instances[0]!;
     socket.open();
+    socket.message(
+      JSON.stringify({
+        t: "session.bound",
+        agentId: "a_otto",
+        sessionId: "s_otto",
+      }),
+    );
 
     const delivered = source.sendInput({
       t: "input",
@@ -395,10 +639,14 @@ describe("AguiWebSocketSource", () => {
         target: "otto",
         text: "hello",
         clientMessageId: "cm1",
+        agentId: "a_otto",
+        expectedSessionId: "s_otto",
       }),
     );
 
-    socket.message(JSON.stringify({ t: "input.ack", clientMessageId: "cm1", delivered: true }));
+    socket.message(JSON.stringify({ t: "input.ack", clientMessageId: "cm1",
+        sessionId: "s_otto",
+        delivered: true }));
     await expect(delivered).resolves.toBe(true);
     source.close();
   });
@@ -421,6 +669,37 @@ describe("AguiWebSocketSource", () => {
 
     expect(socket.readyState).toBe(FakeWebSocket.CLOSED);
     expect(errors).toHaveLength(1);
+    source.close();
+  });
+
+  it("settles in-flight exact input when heartbeat timeout closes the source", async () => {
+    vi.useFakeTimers();
+    const Socket = installFakeWebSocket();
+    const source = new AguiWebSocketSource(
+      "/api/v1/agent-sessions/s_real/events",
+    );
+    const socket = Socket.instances[0]!;
+    socket.open();
+    socket.message(
+      JSON.stringify({
+        t: "session.bound",
+        agentId: "a_real",
+        sessionId: "s_real",
+      }),
+    );
+    const outcome = source
+      .sendInput({ t: "input", text: "pending", clientMessageId: "cm" })
+      .then(
+        () => "resolved",
+        () => "rejected",
+      );
+    vi.advanceTimersByTime(45_000);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await expect(
+      Promise.race([outcome, Promise.resolve("unsettled")]),
+    ).resolves.toBe("rejected");
     source.close();
   });
 });

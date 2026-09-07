@@ -107,6 +107,11 @@ export function handleWs(socket, request, deps = {}) {
       }
       const boundTarget = sessionLane.bindResponse(response);
       if (boundTarget) {
+        sendJson(socket, {
+          t: "session.bound",
+          agentId: boundTarget.agentId,
+          sessionId: boundTarget.expectedSessionId,
+        });
         commandQueue.start(boundTarget);
         subscriptions.bindSession(boundTarget.name);
       }
@@ -358,6 +363,8 @@ async function handleClientFrame(
   if (frame?.t === "steer") {
     const clientMessageId = stringField(frame.clientMessageId);
     try {
+      if (!sessionLane.isSessionLane)
+        throw new Error("steer requires a bound session lane");
       const scoped = sessionLane.isSessionLane
         ? { ...frame, target: sessionTargetWireValue(await sessionLane.targetForFrame(frame)) }
         : withSocketScopedSteerDefaults(frame, request);
@@ -376,6 +383,7 @@ async function handleClientFrame(
       if (!body?.result || typeof body.result !== "object" || Array.isArray(body.result)) {
         throw new Error("steer response is missing its result");
       }
+      assertResponseSession(steer.target, body.result);
       sendJson(socket, { t: "steer.ack", clientMessageId, ...body.result });
     } catch (error) {
       sendJson(socket, {
@@ -389,11 +397,13 @@ async function handleClientFrame(
   if (frame?.t === "interrupt") {
     const clientMessageId = stringField(frame.clientMessageId);
     try {
+      if (!sessionLane.isSessionLane)
+        throw new Error("interrupt requires a bound session lane");
       if (!clientMessageId) throw new Error("interrupt.clientMessageId is required");
       const target = sessionLane.isSessionLane
         ? await sessionLane.targetForFrame(frame)
-        : normalizeSessionLookup(frame.target, frame.agentId)
-          ?? sessionTargetFromRequest(request);
+        : (normalizeSessionLookup(frame.target, frame.agentId)
+          ?? sessionTargetFromRequest(request));
       if (!target) throw new Error("interrupt requires a target session");
       const response = await interruptInput({ target: sessionTargetWireValue(target), clientMessageId }, request);
       if (!response.ok) {
@@ -409,6 +419,7 @@ async function handleClientFrame(
       if (!body?.result || typeof body.result !== "object" || Array.isArray(body.result)) {
         throw new Error("interrupt response is missing its result");
       }
+      assertResponseSession(target, body.result);
       sendJson(socket, { t: "interrupt.ack", clientMessageId, ...body.result });
     } catch (error) {
       sendJson(socket, {
@@ -437,6 +448,8 @@ async function handleClientFrame(
         }
       : withSocketScopedInputDefaults(frame, request);
     const input = normalizeInputFrame(scoped);
+    if (input.mode === "session" && !sessionLane.isSessionLane)
+      throw new Error("input requires a bound session lane");
     const response = input.mode === "session"
       ? await sessionInput(input, request)
       : await busInput(input, request);
@@ -452,6 +465,7 @@ async function handleClientFrame(
     if (input.mode === "session") {
       const body = await response.json();
       const receipt = normalizeQueueReceipt(body?.receipt, clientMessageId);
+      assertResponseSession(input.target, receipt);
       commandQueue.observeReceipt(receipt);
       sendJson(socket, { t: "input.ack", ...receipt });
     } else {
@@ -588,9 +602,10 @@ class SessionCommandQueue {
       return;
     }
     try {
-      const target = this.#sessionLane.isSessionLane
-        ? await this.#sessionLane.targetForFrame(frame)
-        : this.#target;
+      if (!this.#sessionLane.isSessionLane) {
+        throw new Error("queue operations require a session socket");
+      }
+      const target = await this.#sessionLane.targetForFrame(frame);
       if (!target) {
         throw new Error("queue operations require a session socket");
       }
@@ -623,6 +638,7 @@ class SessionCommandQueue {
         return;
       }
       const result = await response.json();
+      assertResponseSession(target, result);
       sendJson(this.#socket, { t: "queue.mutation.ack", action, ...result });
     } catch (error) {
       sendJson(this.#socket, {
@@ -1012,9 +1028,9 @@ class CommandFrames {
     let target;
     try {
       target = this.#sessionLane.isSessionLane
-        ? await this.#sessionLane.targetForFrame(frame)
-        : normalizeSessionLookup(frame.target, frame.agentId)
-          ?? sessionTargetFromRequest(this.#request);
+        ? await this.#sessionLane.targetForFrame(frame, false)
+        : (normalizeSessionLookup(frame.target, frame.agentId)
+          ?? sessionTargetFromRequest(this.#request));
     } catch (error) {
       sendJson(this.#socket, {
         t: "commands.err",
@@ -1056,6 +1072,19 @@ class CommandFrames {
       });
       return;
     }
+    let target;
+    try {
+      target = await this.#sessionLane.targetForFrame(frame);
+    } catch (error) {
+      // A conflicting retry must not replay or replace the original command's settlement.
+      sendJson(this.#socket, {
+        t: "command.err",
+        clientCommandId,
+        error: messageForError(error),
+        code: "invalid_args",
+      });
+      return;
+    }
     const known = this.#replay.get(clientCommandId);
     if (known) {
       // In-flight duplicate: the original dispatch will emit the terminal
@@ -1070,15 +1099,6 @@ class CommandFrames {
     const err = (error, code) =>
       this.#finish(clientCommandId, [{ t: "command.err", clientCommandId, error, code }]);
 
-    let target;
-    try {
-      target = this.#sessionLane.isSessionLane
-        ? await this.#sessionLane.targetForFrame(frame)
-        : normalizeSessionLookup(frame.target, frame.agentId)
-          ?? sessionTargetFromRequest(this.#request);
-    } catch (error) {
-      return err(messageForError(error), "invalid_args");
-    }
     if (!target) return err("command requires a target session", "invalid_args");
     const name = stringField(frame.name);
     if (!name) return err("command.name is required", "invalid_args");
@@ -1117,6 +1137,13 @@ class CommandFrames {
             },
             this.#request,
           );
+      if (response.ok) {
+        const body = await response.json();
+        assertResponseSession(
+          target,
+          descriptor.class === "gateway" ? body?.result : body?.receipt,
+        );
+      }
       done = response.ok
         ? { t: "command.done", clientCommandId, ok: true }
         : {
@@ -1560,14 +1587,18 @@ class SessionLaneBinding {
       response.headers.get("x-nexus-agent-name"),
       response.headers.get("x-nexus-agent-id"),
     );
-    if (this.#pathSessionId) {
-      if (!responseSessionId || responseSessionId !== this.#pathSessionId || !responseTarget?.agentId) {
+    {
+      if (!responseSessionId ||
+        (this.#pathSessionId && responseSessionId !== this.#pathSessionId) || !responseTarget?.agentId ||
+        (this.#fallbackTarget?.agentId &&
+          responseTarget.agentId !== this.#fallbackTarget.agentId)
+      ) {
         const error = "agent-session response is missing its canonical lane binding";
         this.fail(error);
         throw new Error(error);
       }
     }
-    const target = responseTarget ?? this.#fallbackTarget;
+    const target = { ...responseTarget, expectedSessionId: responseSessionId };
     if (!target) {
       const error = "agent-session lane target is not materialized";
       this.fail(error);
@@ -1588,12 +1619,36 @@ class SessionLaneBinding {
     this.#resolve?.({ error });
   }
 
-  async targetForFrame(frame) {
+  async targetForFrame(frame, requireIdentity = true) {
     const state = await this.#ready;
     if (state.error) throw new Error(state.error);
     const canonical = state.target;
     if (!canonical) throw new Error("agent-session lane target is not materialized");
-    const explicit = normalizeSessionLookup(frame?.target, frame?.agentId);
+    if (requireIdentity) {
+      if (
+        !stringField(frame?.agentId) ||
+        !stringField(frame?.expectedSessionId)
+      ) {
+        throw new Error(
+          "session command requires non-empty agentId and expectedSessionId",
+        );
+      }
+      if (
+        frame.agentId !== canonical.agentId ||
+        frame.expectedSessionId !== state.sessionId
+      ) {
+        throw new Error(
+          "frame identity does not match the bound agent-session lane",
+        );
+      }
+    }
+    if (frame?.target && typeof frame.target === "object") {
+      if (("agentId" in frame.target || "expectedSessionId" in frame.target) &&
+        (frame.target.agentId !== canonical.agentId || frame.target.expectedSessionId !== state.sessionId)) {
+        throw new Error("frame target identity must be complete and match the bound agent-session lane");
+      }
+    }
+    const explicit = normalizeSessionLookup(frame?.target);
     if (!explicit) return canonical;
     if (canonical.agentId && explicit.agentId) {
       if (canonical.agentId !== explicit.agentId) {
@@ -1655,7 +1710,21 @@ function sessionTargetRequestBody(target) {
   return {
     ...(target.name ? { name: target.name } : {}),
     ...(target.agentId ? { agentId: target.agentId } : {}),
+    ...(target.expectedSessionId
+      ? { expectedSessionId: target.expectedSessionId }
+      : {}),
   };
+}
+
+function assertResponseSession(target, result) {
+  if (
+    target?.expectedSessionId &&
+    result?.sessionId !== target.expectedSessionId
+  ) {
+    throw new Error(
+      "command acknowledgement session mismatch; outcome is unconfirmed",
+    );
+  }
 }
 
 function sessionTargetKey(target) {
@@ -1745,6 +1814,7 @@ function withSocketScopedSteerDefaults(frame, request) {
 }
 
 function normalizeSteerFrame(frame) {
+  rejectUnsupportedIntent(frame);
   const text = stringField(frame.text);
   if (!text) throw new Error("steer.text is required");
   return {
@@ -1754,12 +1824,20 @@ function normalizeSteerFrame(frame) {
   };
 }
 
+function rejectUnsupportedIntent(frame) {
+  for (const option of ["delivery", "modelSelection"]) {
+    if (frame[option] != null)
+      throw new Error(`${option} is not supported by this session endpoint`);
+  }
+}
+
 function normalizeInputFrame(frame) {
   const mode = frame.mode === "bus" ? "bus" : frame.mode === "session" ? "session" : undefined;
   const text = stringField(frame.text);
   if (!mode) throw new Error("input.mode must be session or bus");
   if (!text) throw new Error("input.text is required");
   if (mode === "session") {
+    rejectUnsupportedIntent(frame);
     const target = normalizeSessionTarget(frame.target);
     return {
       mode,
@@ -1785,6 +1863,9 @@ function normalizeSessionTarget(target) {
       return {
         ...(name ? { name } : {}),
         ...(agentId ? { agentId } : {}),
+        ...(target.expectedSessionId
+          ? { expectedSessionId: target.expectedSessionId }
+          : {}),
       };
     }
   }
@@ -1835,6 +1916,9 @@ function defaultSessionInput(deps) {
       requestWithJson(request, "/api/conversation/prompt", {
         name: target.name ?? target.agentId,
         ...(target.agentId ? { agentId: target.agentId } : {}),
+        ...(target.expectedSessionId
+          ? { expectedSessionId: target.expectedSessionId }
+          : {}),
         text: input.text,
         ...(input.clientMessageId ? { clientMessageId: input.clientMessageId } : {}),
       }),
@@ -1868,6 +1952,9 @@ function defaultSteerInput(deps) {
       requestWithJson(request, "/api/conversation/steer", {
         name: target.name ?? target.agentId,
         ...(target.agentId ? { agentId: target.agentId } : {}),
+        ...(target.expectedSessionId
+          ? { expectedSessionId: target.expectedSessionId }
+          : {}),
         text: input.text,
         ...(input.clientMessageId ? { clientMessageId: input.clientMessageId } : {}),
       }),
@@ -1883,6 +1970,9 @@ function defaultInterruptInput(deps) {
       requestWithJson(request, "/api/conversation/interrupt", {
         name: target.name ?? target.agentId,
         ...(target.agentId ? { agentId: target.agentId } : {}),
+        ...(target.expectedSessionId
+          ? { expectedSessionId: target.expectedSessionId }
+          : {}),
         clientMessageId: input.clientMessageId,
       }),
     );
