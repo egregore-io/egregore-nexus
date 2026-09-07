@@ -70,6 +70,23 @@ fn fake_command() -> HarnessCommand {
 }
 
 #[tokio::test]
+async fn codex_adapter_strict_observed_returns_owned_buffer() {
+    let adapter = CodexAdapter::with_command(fake_command());
+    adapter.open_session().await.expect("open_session");
+    let events = adapter
+        .inject_completion_observed("strict".to_string())
+        .await
+        .expect("strict completion delegates to ACP engine");
+    assert_eq!(reply_chunks(events), vec!["echo: ", "strict"]);
+    assert!(adapter
+        .stream_updates()
+        .await
+        .expect("stream_updates")
+        .is_empty());
+    adapter.kill().await;
+}
+
+#[tokio::test]
 async fn codex_adapter_full_turn_over_acp() {
     let adapter = CodexAdapter::with_command(fake_command());
     adapter.open_session().await.expect("open_session");

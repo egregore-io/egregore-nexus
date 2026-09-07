@@ -12,6 +12,10 @@ All notable public changes to Egregore Nexus are documented here. This project f
 
 ### Fixed
 
+- Wait for correlated ACP completion on observed prompts instead of accepting relay
+  spawn as success. Preserve the original acceptance sink before ordered buffered
+  output, isolate strict output from waiting legacy relays, and retain uncertainty
+  for missing responses or post-submission failures. This is not an early native ACK.
 - Extend the existing durable attempt fence to ordinary session prompts, including
   prompt slash-compaction. Match the complete unexpired claim when arming or settling;
   prevent timed-out preflight from entering the adapter later, and retain uncertain

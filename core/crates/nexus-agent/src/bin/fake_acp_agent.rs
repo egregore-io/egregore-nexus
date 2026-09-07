@@ -68,6 +68,8 @@
 //!   turn" agent update, then later emit the exact prompt as a `UserMessageChunk` followed by a
 //!   model reply. The immediate response is only an in-process queue acknowledgement and must not
 //!   settle observed Nexus delivery before the promoted prompt reaches model context.
+//! - `FAKE_ACP_HERMES_QUEUE_UNRELATED_TEXT=1` — precede that private queue ACK with renderable
+//!   output from an unrelated turn; this cannot prove completion of the queued prompt.
 //! - `FAKE_ACP_USAGE=<input>,<output>` — attach end-turn token usage to the prompt response. This
 //!   proves a silent harness turn can still carry provider-side evidence that input was consumed.
 //! - `FAKE_ACP_SPAWN_CHILD=1` — spawn a long-lived child in the same process group. Engine kill
@@ -78,16 +80,21 @@
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, ContentBlock, ContentChunk,
     InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, Plan, PromptRequest, PromptResponse, SessionId,
-    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCall, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, Usage,
+    NewSessionRequest, NewSessionResponse, Plan, PromptRequest, PromptResponse,
+    RequestPermissionRequest, SessionId, SessionNotification, SessionUpdate, StopReason,
+    TextContent, ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, Usage,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Result};
 
 const FAKE_SESSION_ID: &str = "fake-session-1";
 
 fn end_turn_response() -> PromptResponse {
-    let response = PromptResponse::new(StopReason::EndTurn);
+    let reason = if std::env::var("FAKE_ACP_CANCELLED_RESPONSE").is_ok() {
+        StopReason::Cancelled
+    } else {
+        StopReason::EndTurn
+    };
+    let response = PromptResponse::new(reason);
     let Ok(raw) = std::env::var("FAKE_ACP_USAGE") else {
         return response;
     };
@@ -101,6 +108,16 @@ fn end_turn_response() -> PromptResponse {
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
     response.usage(Usage::new(input + output, input, output))
+}
+
+/// Hermetic entered/release gate; only disposable test children receive these paths.
+async fn fixture_gate(variable: &str) {
+    if let Ok(path) = std::env::var(variable) {
+        std::fs::write(format!("{path}.entered"), b"entered").unwrap();
+        while !std::path::Path::new(&format!("{path}.release")).exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
 }
 
 /// Pull the concatenated text out of a prompt's content blocks.
@@ -321,6 +338,10 @@ async fn main() -> Result<()> {
             async move |req: PromptRequest, responder, cx: ConnectionTo<Client>| {
                 let session_id = req.session_id.clone();
                 let body = prompt_text(&req);
+                fixture_gate("FAKE_ACP_PROMPT_GATE").await;
+                if std::env::var("FAKE_ACP_ECHO_USER").is_ok() {
+                    let _ = cx.send_notification(user_message_chunk(session_id.clone(), &body));
+                }
                 if let Some(delay_ms) = std::env::var("FAKE_ACP_PROMPT_DELAY_MS")
                     .ok()
                     .and_then(|raw| raw.parse::<u64>().ok())
@@ -383,6 +404,12 @@ async fn main() -> Result<()> {
                     // process-local queue. If the daemon restarts now, that queue disappears. The
                     // later UserMessageChunk is the first causal signal that Hermes promoted the
                     // exact prompt into a new model turn.
+                    if std::env::var_os("FAKE_ACP_HERMES_QUEUE_UNRELATED_TEXT").is_some() {
+                        let _ = cx.send_notification(message_chunk(
+                            session_id.clone(),
+                            "unrelated previous turn output",
+                        ));
+                    }
                     let _ = cx.send_notification(message_chunk(
                         session_id.clone(),
                         "Queued for the next turn. (1 queued)",
@@ -490,12 +517,36 @@ async fn main() -> Result<()> {
                 // Turn-end: the PromptResponse carrying StopReason::EndTurn. This is what real
                 // codex-acp sends at `response.completed`; it is the signal the client MUST use to
                 // know the turn is over.
+                if std::env::var_os("FAKE_ACP_RESPONSE_GATE").is_some() {
+                    // Notifications and requests share ordered transport/dispatch. The harmless
+                    // permission round-trip proves prior updates were ingested by Nexus before
+                    // publishing the marker, not merely queued by this child. Register and return:
+                    // awaiting block_task here would deadlock the ACP incoming dispatch loop.
+                    return cx
+                        .send_request(RequestPermissionRequest::new(
+                            session_id,
+                            ToolCallUpdate::new(
+                                "fixture_ingestion_barrier",
+                                ToolCallUpdateFields::new(),
+                            ),
+                            vec![],
+                        ))
+                        .on_receiving_result(async move |result| {
+                            result?;
+                            fixture_gate("FAKE_ACP_RESPONSE_GATE").await;
+                            responder.respond(end_turn_response())
+                        });
+                }
                 responder.respond(end_turn_response())
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_dispatch(
             async move |message: Dispatch, cx: ConnectionTo<Client>| {
+                // Preserve the SDK's normal routing for our fixture-only permission response.
+                if let Dispatch::Response(result, router) = message {
+                    return router.respond_with_result(result);
+                }
                 message.respond_with_error(
                     agent_client_protocol::util::internal_error(
                         "fake-acp-agent: unhandled message",

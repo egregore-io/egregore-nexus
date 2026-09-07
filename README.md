@@ -69,6 +69,9 @@ Ordinary queued prompts also retain a durable attempt fence: a timeout after ada
 entry, restart, or unresolved lease expiry cannot automatically replay that command.
 Such outcomes remain delivery-uncertain under their original identity, not rejected
 or delivered. A deadline that wins before adapter entry prevents later invocation.
+Observed ACP prompts wait for their correlated protocol response rather than relay
+spawn. This is completion-bound evidence, not an early native acknowledgement;
+strict output follows the accepted-input event, while legacy streaming is unchanged.
 See [composer delivery and retry safety](docs/composer-delivery.md).
 
 Check or update the exact npm/Cargo installation that launched the command:

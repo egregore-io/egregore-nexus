@@ -829,7 +829,23 @@ struct TurnActivity {
     /// realtime streaming path (AionUi `responseStream` model); the buffer remains for quiescence
     /// detection and a non-live fallback. Set per turn via `install_live`, dropped via
     /// `clear_live`.
-    live: Mutex<Option<tokio::sync::mpsc::UnboundedSender<StreamEvent>>>,
+    live: Mutex<LiveRelay>,
+}
+
+#[derive(Default)]
+struct LiveRelay {
+    sender: Option<tokio::sync::mpsc::UnboundedSender<StreamEvent>>,
+    strict_suppressed: bool,
+}
+
+struct StrictBufferGuard<'a>(&'a TurnActivity);
+
+impl Drop for StrictBufferGuard<'_> {
+    fn drop(&mut self) {
+        // Clear unreturned output on failure/cancellation before the turn lock is released.
+        self.0.reset_buffer();
+        self.0.live.lock().unwrap().strict_suppressed = false;
+    }
 }
 
 impl TurnActivity {
@@ -840,7 +856,7 @@ impl TurnActivity {
             model_events: std::sync::atomic::AtomicU64::new(0),
             prompt_promotions: Mutex::new(Vec::new()),
             notify: tokio::sync::Notify::new(),
-            live: Mutex::new(None),
+            live: Mutex::new(LiveRelay::default()),
         }
     }
 
@@ -849,13 +865,13 @@ impl TurnActivity {
     /// `clear_live` at turn-end to close the receiver.
     fn install_live(&self) -> tokio::sync::mpsc::UnboundedReceiver<StreamEvent> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        *self.live.lock().unwrap() = Some(tx);
+        self.live.lock().unwrap().sender = Some(tx);
         rx
     }
 
     /// End live relay: drop the sender so the receiver's `recv()` returns `None` and the drain ends.
     fn clear_live(&self) {
-        *self.live.lock().unwrap() = None;
+        self.live.lock().unwrap().sender = None;
     }
 
     /// Ingest one incoming `session/update`: translate it (the full-stream pass-through), buffer
@@ -911,8 +927,13 @@ impl TurnActivity {
     fn push_event(&self, event: StreamEvent) -> usize {
         // LIVE relay: forward this chunk immediately (realtime streaming) if a live sink is
         // installed. Buffer it too — for quiescence detection + the non-live fallback.
-        if let Some(tx) = self.live.lock().unwrap().as_ref() {
-            let _ = tx.send(event.clone());
+        {
+            let live = self.live.lock().unwrap();
+            if !live.strict_suppressed {
+                if let Some(tx) = live.sender.as_ref() {
+                    let _ = tx.send(event.clone());
+                }
+            }
         }
         let idx = {
             let mut buf = self.buffer.lock().unwrap();
@@ -1514,9 +1535,35 @@ impl AcpEngine {
         prompt: String,
         accepted_event: Option<StreamEvent>,
     ) -> Result<(), AdapterInjectError> {
+        self.inject_turn(prompt, accepted_event, false)
+            .await
+            .map(|_| ())
+    }
+
+    /// Strict direct-observed response, with this turn's existing buffer moved out before unlock.
+    /// This is completion-bound ACP evidence, not an early acceptance or remote durability ACK.
+    pub async fn inject_completion_observed(
+        &self,
+        prompt: String,
+    ) -> Result<Vec<StreamEvent>, AdapterInjectError> {
+        self.inject_turn(prompt, None, true).await
+    }
+
+    async fn inject_turn(
+        &self,
+        prompt: String,
+        accepted_event: Option<StreamEvent>,
+        strict: bool,
+    ) -> Result<Vec<StreamEvent>, AdapterInjectError> {
         // Prompt turns are serialized independently of the connection handle. Cancellation must
         // be able to acquire/clone `conn` while this turn is awaiting its response.
         let _turn = self.turn_lock.lock().await;
+        let _strict_buffer = if strict {
+            self.updates.live.lock().unwrap().strict_suppressed = true;
+            Some(StrictBufferGuard(&self.updates))
+        } else {
+            None
+        };
         let cancel_generation = self
             .cancel_generation
             .load(std::sync::atomic::Ordering::Acquire);
@@ -1538,7 +1585,7 @@ impl AcpEngine {
             (live.connection.clone(), session_id)
         };
         let acp_session = session_id.0.clone();
-        let require_terminal_response = accepted_event.is_some();
+        let require_terminal_response = strict || accepted_event.is_some();
 
         // The wire hop: the ACP `session/prompt` request actually leaving for the harness. A live
         // run that reaches "no usable adapter" / an empty drain never gets here — so seeing this
@@ -1567,7 +1614,9 @@ impl AcpEngine {
         let quiescence = quiescence_window();
         let mut prompt_response = Box::pin(prompt_turn.block_task());
         let prompt_outcome = async {
-            if require_terminal_response
+            if strict {
+                TurnEnd::Response(prompt_response.await)
+            } else if require_terminal_response
                 && self
                     .harness
                     .as_ref()
@@ -1663,7 +1712,7 @@ impl AcpEngine {
 
         let buffered = activity.buffered_len();
         let model_events = activity.model_events().saturating_sub(model_events_before);
-        match outcome {
+        let result = match outcome {
             // Hard ceiling tripped. Fail the turn so the caller re-parks instead of wedging here
             // forever; durable delivery must never infer success from buffered content.
             Err(_) => {
@@ -1681,6 +1730,28 @@ impl AcpEngine {
             }
             // (1) Canonical turn-end.
             Ok(TurnEnd::Response(Ok(response))) => {
+                // Hermes may acknowledge only its private queue while unrelated model output
+                // is still arriving. Neither that output nor this ACK proves strict completion.
+                if strict
+                    && self
+                        .harness
+                        .as_ref()
+                        .is_some_and(|h| h.as_str() == "hermes")
+                    && response.usage.is_none()
+                    && activity.has_hermes_busy_queue_ack()
+                {
+                    return Err(NexusError::Adapter(
+                        "Hermes acknowledged its private queue; strict ACP completion remains unconfirmed".into(),
+                    ).into());
+                }
+                if strict
+                    && response.stop_reason
+                        == agent_client_protocol::schema::v1::StopReason::Cancelled
+                {
+                    return Err(
+                        NexusError::Adapter("strict ACP prompt was cancelled".into()).into(),
+                    );
+                }
                 let provider_input_observed = response
                     .usage
                     .as_ref()
@@ -1762,6 +1833,11 @@ impl AcpEngine {
                 Ok(())
             }
             Ok(TurnEnd::Cancelled) => {
+                if strict {
+                    return Err(
+                        NexusError::Adapter("strict ACP prompt was interrupted".into()).into(),
+                    );
+                }
                 info!(
                     target: "nexus_agent::acp",
                     acp_session = %acp_session,
@@ -1771,7 +1847,14 @@ impl AcpEngine {
                 );
                 Ok(())
             }
-        }
+        };
+        result.map(|()| {
+            if strict {
+                self.updates.take()
+            } else {
+                Vec::new()
+            }
+        })
     }
 
     /// Drain the [`StreamEvent`]s captured during the most recent [`AcpEngine::inject`], in order.

@@ -119,6 +119,33 @@ not bound that channel during an indefinitely stalled sink, guarantee progress
 when native input itself is unavailable, or prove the cause of a historical
 stall. No new automatic-delivery mode is enabled.
 
+## ACP observed prompts
+
+The strict `prompt_observed` path waits for the correlated ACP `session/prompt`
+response instead of reporting success when a background relay is spawned. In this
+protocol that response is completion-bound evidence, not an early acceptance ACK.
+Request construction, input echo, quiescence and local cancellation do not supply
+that success boundary. Unsupported adapters fail explicitly.
+Hermes's recognized queue-only acknowledgement is not completion evidence, even
+when unrelated model output has arrived; strict delivery reports uncertainty
+rather than promoting that acknowledgement into success.
+
+This path takes the existing turn's buffered output before releasing its turn
+serialization, awaits the caller's original accepted-input event sink, then emits
+the retained output in order and its completion marker. Sink completion establishes
+local ordering, not remote delivery or durable persistence. Strict output cannot
+leak into a legacy relay waiting for the same engine; legacy prompt/bus streaming
+and explicit steering retain their separate behavior.
+After successful protocol completion, this call no longer counts as active merely
+because its presentation sink is blocked. The observed call itself still waits for
+ordered presentation; failure or cancellation does not establish verified idle.
+
+Strict output is consequently delayed until the correlated response. The existing
+event buffer remains unbounded; this change does not establish streaming parity or
+fix that memory limitation. Post-submission errors and missing responses do not
+prove that nothing happened. The ordinary durable attempt fence below preserves
+that uncertainty rather than permitting an automatic duplicate prompt.
+
 ## Durable prompt attempts and uncertain outcomes
 
 The existing `command_intents` identity-store journal protects ordinary prompt

@@ -63,6 +63,209 @@ fn fake_command() -> HarnessCommand {
     }
 }
 
+async fn wait_fixture_marker(path: &std::path::Path) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("fixture must reach the real ACP gate");
+}
+
+#[tokio::test]
+async fn strict_completion_owns_buffer_and_suppresses_waiting_legacy_live_slot() {
+    let dir = std::env::temp_dir().join(format!(
+        "acp-strict-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut command = fake_command();
+    command.env = vec![
+        (
+            "FAKE_ACP_PROMPT_GATE".into(),
+            dir.join("prompt").display().to_string(),
+        ),
+        (
+            "FAKE_ACP_RESPONSE_GATE".into(),
+            dir.join("response").display().to_string(),
+        ),
+        ("FAKE_ACP_ECHO_USER".into(), "1".into()),
+    ];
+    let engine = Arc::new(AcpEngine::new());
+    engine.spawn_and_initialize(&command).await.unwrap();
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    let strict_engine = engine.clone();
+    let strict = tokio::spawn(async move {
+        strict_engine
+            .inject_completion_observed("strict".into())
+            .await
+    });
+    wait_fixture_marker(&dir.join("prompt.entered")).await;
+    // Real legacy relay installs this before waiting on the already-owned engine turn lock.
+    let mut live = engine.install_live();
+    let legacy_engine = engine.clone();
+    let mut legacy = Box::pin(legacy_engine.inject("legacy".into()));
+    assert!(futures::poll!(&mut legacy).is_pending());
+    std::fs::write(dir.join("prompt.release"), b"release").unwrap();
+    wait_fixture_marker(&dir.join("response.entered")).await;
+    assert!(
+        !strict.is_finished(),
+        "output and user echo cannot settle strict completion"
+    );
+    assert!(
+        live.try_recv().is_err(),
+        "a waiting legacy slot must not leak strict output"
+    );
+    std::fs::write(dir.join("response.release"), b"release").unwrap();
+    let strict_events = strict.await.unwrap().unwrap();
+    legacy.await.unwrap();
+    assert_eq!(reply_text(strict_events), "echo: strict");
+    assert_eq!(reply_text(engine.take_updates()), "echo: legacy");
+    engine.clear_live();
+    let mut legacy_live = Vec::new();
+    while let Some(event) = live.recv().await {
+        legacy_live.push(event);
+    }
+    assert_eq!(
+        reply_text(legacy_live),
+        "echo: legacy",
+        "strict cleanup must not clobber the waiting sender"
+    );
+    engine.kill().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn strict_completion_rejects_cancelled_response_and_error_without_leaking_buffer() {
+    for (variable, value) in [
+        ("FAKE_ACP_CANCELLED_RESPONSE", "1"),
+        ("FAKE_ACP_PROMPT_ERROR_MESSAGE", "rejected"),
+        ("FAKE_ACP_PROMPT_ERROR_MESSAGE", CLAUDE_INTERRUPTED_HANDOFF),
+    ] {
+        let engine = AcpEngine::new();
+        let mut command = fake_command();
+        command.env.push((variable.into(), value.into()));
+        engine.spawn_and_initialize(&command).await.unwrap();
+        engine
+            .new_session(None, &LaunchCtx::default())
+            .await
+            .unwrap();
+        assert!(engine
+            .inject_completion_observed("strict".into())
+            .await
+            .is_err());
+        assert!(engine.take_updates().is_empty());
+        if variable == "FAKE_ACP_CANCELLED_RESPONSE" {
+            engine.inject("legacy".into()).await.unwrap();
+        }
+        engine.kill().await;
+    }
+}
+
+#[tokio::test]
+async fn strict_completion_rejects_local_interrupt_and_disconnect_after_output() {
+    for interrupt in [true, false] {
+        let dir = std::env::temp_dir().join(format!(
+            "acp-strict-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = Arc::new(AcpEngine::new());
+        let mut command = fake_command();
+        command.env.push((
+            "FAKE_ACP_RESPONSE_GATE".into(),
+            dir.join("response").display().to_string(),
+        ));
+        engine.spawn_and_initialize(&command).await.unwrap();
+        engine
+            .new_session(None, &LaunchCtx::default())
+            .await
+            .unwrap();
+        let pending_engine = engine.clone();
+        let pending = tokio::spawn(async move {
+            pending_engine
+                .inject_completion_observed("strict".into())
+                .await
+        });
+        wait_fixture_marker(&dir.join("response.entered")).await;
+        assert!(!pending.is_finished());
+        if interrupt {
+            engine.cancel_active_turn().await.unwrap();
+        } else {
+            engine.kill().await;
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(engine.take_updates().is_empty());
+        engine.kill().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[tokio::test]
+async fn strict_completion_never_uses_compatibility_quiescence_without_response() {
+    // Isolate the engine's existing environment overrides from parallel tests in this binary.
+    if std::env::var_os("NEXUS_TEST_STRICT_ACP_TIMEOUT").is_none() {
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "strict_completion_never_uses_compatibility_quiescence_without_response",
+                "--nocapture",
+            ])
+            .env("NEXUS_TEST_STRICT_ACP_TIMEOUT", "1")
+            .env("NEXUS_ACP_TURN_TIMEOUT_SECS", "1")
+            .env("NEXUS_ACP_QUIESCENCE_MS", "10")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for harness in ["codex", "hermes"] {
+        let engine = AcpEngine::for_harness(HarnessId::new(harness).unwrap());
+        let mut command = fake_command();
+        command
+            .env
+            .push(("FAKE_ACP_NO_TURN_END".into(), "1".into()));
+        engine.spawn_and_initialize(&command).await.unwrap();
+        engine
+            .new_session(None, &LaunchCtx::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            engine.inject_completion_observed("strict".into()).await,
+            Err(AdapterInjectError::CompletionTimeout { .. })
+        ));
+        assert!(engine.take_updates().is_empty());
+        // The same harness's ordinary legacy path retains its existing compatibility behavior.
+        engine.inject("legacy".into()).await.unwrap();
+        assert_eq!(reply_text(engine.take_updates()), "echo: legacy");
+        engine.kill().await;
+    }
+}
+
 fn fake_prompt_error_command(data: serde_json::Value) -> HarnessCommand {
     HarnessCommand {
         program: FAKE_HARNESS.to_string(),

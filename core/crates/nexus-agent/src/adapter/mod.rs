@@ -68,6 +68,8 @@ pub struct AdapterOperatorAction {
 /// typed variants are consumed by the realtime breaker on the observed bus-delivery path.
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterInjectError {
+    #[error("strict completion-observed injection is not supported by this adapter")]
+    Unsupported,
     #[error("{:?} provider limit ({:?})", .0.harness, .0.reason)]
     ProviderLimit(AdapterProviderLimit),
     #[error("{:?} provider error ({})", .0.harness, .0.reason)]
@@ -84,6 +86,12 @@ impl AdapterInjectError {
     /// Attach the Nexus session id and convert to the shared observed-injection error shape.
     pub fn into_inject_error(self, session: &SessionId) -> InjectError {
         match self {
+            AdapterInjectError::Unsupported => InjectError::Contract(
+                NexusError::Adapter(
+                    "strict completion-observed injection is not supported by this adapter".into(),
+                )
+                .to_contract_error(),
+            ),
             AdapterInjectError::ProviderLimit(limit) => InjectError::ProviderLimit(ProviderLimit {
                 harness: limit.harness,
                 session: session.clone(),
@@ -151,6 +159,16 @@ pub trait Adapter: Send + Sync {
 
     /// Inject one already-rendered prompt as a single ACP `session/prompt` turn.
     async fn inject(&self, prompt: String) -> Result<(), AdapterInjectError>;
+
+    /// Strict direct-observed completion. Return this turn's owned buffer only after its
+    /// correlated native prompt response, before releasing serialization. No live relay or
+    /// quiescence fallback may supply this receipt. Legacy adapters fail closed by default.
+    async fn inject_completion_observed(
+        &self,
+        _prompt: String,
+    ) -> Result<Vec<StreamEvent>, AdapterInjectError> {
+        Err(AdapterInjectError::Unsupported)
+    }
 
     /// Active-turn redirect capability exposed by this adapter.
     fn steer_capability(&self) -> SteerCapability {

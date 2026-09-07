@@ -364,6 +364,13 @@ impl Adapter for OpenCodeAdapter {
         Ok(self.engine.take_updates())
     }
 
+    async fn inject_completion_observed(
+        &self,
+        prompt: String,
+    ) -> Result<Vec<StreamEvent>, AdapterInjectError> {
+        self.engine.inject_completion_observed(prompt).await
+    }
+
     async fn kill(&self) {
         self.engine.kill().await
     }
