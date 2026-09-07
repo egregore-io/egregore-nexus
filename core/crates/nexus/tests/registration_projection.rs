@@ -319,6 +319,11 @@ async fn late_gateway_connection_replays_post_resume_online_snapshot() {
         }
         task.abort();
         let _ = task.await;
+        assert_eq!(
+            received.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            (1..=count as i64).collect::<Vec<_>>(),
+            "late Gateway must be able to commit every replay event in sequence"
+        );
         // Latest canonical runtime, not the earlier stopped snapshot, must win on replay.
         let latest = received
             .iter()

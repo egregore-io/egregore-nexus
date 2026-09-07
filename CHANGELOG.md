@@ -12,6 +12,8 @@ All notable public changes to Egregore Nexus are documented here. This project f
 
 ### Fixed
 
+- Preserve every unacknowledged Gateway projection sequence, including superseded snapshots,
+  so a late Gateway can replay registrations without stalling on silent sequence gaps.
 - Clear completed Codex turns from routing activity before waiting on their display writes,
   without reordering output/receipts or clearing a newer active turn.
 - Reject unsupported session-prompt delivery/model options instead of silently sending a

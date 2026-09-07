@@ -162,7 +162,10 @@ impl GatewayProjectionBacklog {
             return AppendProjection::LiveOnly(event);
         }
 
-        coalesce_replaceable(&mut state, &event);
+        // Sequence numbers are immutable once assigned. Removing a superseded snapshot here
+        // would leave a silent hole: Gateway cannot commit or ACK the later sequence, and the
+        // outstanding replay window would never advance. Retain every unacknowledged event;
+        // only bounded overflow may evict it, with an explicit loss boundary.
         state.bytes += event_size(&event);
         state.events.push_back(event.clone());
         enforce_limits(&mut state);
@@ -336,42 +339,6 @@ impl GatewayProjectionBacklog {
             resync_required: state.resync_required,
         }
     }
-}
-
-fn coalesce_replaceable(state: &mut State, incoming: &GatewayProjectionEvent) {
-    let Some(key) = replaceable_key(incoming) else {
-        return;
-    };
-    let Some(index) = state
-        .events
-        .iter()
-        .position(|event| replaceable_key(event).as_deref() == Some(key.as_str()))
-    else {
-        return;
-    };
-    if let Some(event) = state.events.remove(index) {
-        state.bytes = state.bytes.saturating_sub(event_size(&event));
-        state.coalesced += 1;
-    }
-}
-
-fn replaceable_key(event: &GatewayProjectionEvent) -> Option<String> {
-    let entity = match event.kind {
-        GatewayProjectionKind::IdentityUpserted | GatewayProjectionKind::IdentityRemoved => {
-            event.payload.get("agentId")
-        }
-        GatewayProjectionKind::RuntimeUpserted | GatewayProjectionKind::RuntimeStopped => event
-            .payload
-            .get("runtimeId")
-            .or_else(|| event.payload.get("sessionId")),
-        GatewayProjectionKind::PresenceChanged => event
-            .payload
-            .get("agentId")
-            .or_else(|| event.payload.get("sessionId")),
-        _ => None,
-    }?
-    .as_str()?;
-    Some(format!("{:?}:{entity}", event.kind))
 }
 
 fn enforce_limits(state: &mut State) {

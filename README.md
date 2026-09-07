@@ -48,6 +48,8 @@ packaged Webconsole.
 Successful agent resumes republish canonical identity/runtime snapshots even when the session
 already appears online to the daemon. In buffered projection mode, a separately started Gateway
 can replay those updates after connecting; Gateway startup remains explicit.
+Unacknowledged snapshots retain their assigned sequence positions, so repeated updates do not
+create silent replay gaps that strand the Gateway directory offline.
 
 Session composers should use queued prompts for ordinary Send, not infer strict steer from
 displayed activity. Unsupported delivery/model options are rejected rather than discarded,

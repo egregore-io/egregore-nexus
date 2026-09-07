@@ -150,6 +150,20 @@ In `buffered` mode, the daemon retains a bounded in-memory projection backlog wh
 unavailable. Once Gateway commits and acknowledges the facts, the daemon can release that backlog.
 Overflow creates an explicit history gap; it must not block harness transport indefinitely.
 
+Assigned projection sequences are retained unchanged until acknowledgment or explicit bounded
+overflow, including superseded identity/runtime/presence snapshots. The `coalesced` diagnostic
+field remains for compatibility but new backlogs no longer silently coalesce sequenced events.
+An older daemon showing `ackedThrough` stuck below `nextSeq`, nonzero `coalesced`, and no producer
+`gaps`/`dropped` may have discarded a sequence that the Gateway is still waiting for. Reconnecting
+alone cannot recover that discarded event. Deploy the continuity fix and coordinate a daemon
+restart to publish a fresh boot's canonical snapshots; do not patch the Gateway cursor or claim
+lost historical events were restored.
+
+Explicit overflow recovery is separate: the current Gateway records the loss boundary but does
+not automatically advance past it. Harness transport remains available, but projection ingestion
+can remain paused. This continuity fix does not add automatic history-gap recovery or permission
+to skip arbitrary missing sequence numbers.
+
 In `best-effort` mode, disconnected projections are dropped by design. Use it only when Gateway
 history is not required.
 
