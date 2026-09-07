@@ -92,9 +92,9 @@ pub struct CommandIntents<'a> {
     store: &'a Store,
 }
 
-/// Settlement of an automatic admission attempt. `Rejected` requires evidence that no native
+/// Settlement of a prompt admission attempt. `Rejected` requires evidence that no native
 /// delivery occurred; transport loss and response/receipt timeouts are always `Uncertain`.
-pub enum AutoCommandOutcome<'a> {
+pub enum PromptCommandOutcome<'a> {
     Completed(&'a str),
     Rejected(&'a str),
     Uncertain,
@@ -102,7 +102,7 @@ pub enum AutoCommandOutcome<'a> {
 
 impl<'a> CommandIntents<'a> {
     /// Arm only the exact, unexpired claim before crossing native admission.
-    pub async fn mark_auto_started_for_claim(
+    pub async fn mark_prompt_started_for_claim(
         &self,
         claim: &CommandIntentRow,
         now: i64,
@@ -114,12 +114,13 @@ impl<'a> CommandIntents<'a> {
                 "UPDATE command_intents SET started_at = ?4, revision = revision + 1 \
              WHERE command_id = ?1 AND claimed_at = ?2 AND attempts = ?3 \
                AND status = 'claimed' AND started_at IS NULL AND lease_until > ?4 \
-               AND kind = 'harness.prompt' AND json_extract(request_json, '$.delivery') = 'auto'",
+               AND kind = 'harness.prompt' AND lease_until = ?5",
                 params![
                     claim.command_id.as_str(),
                     claim.claimed_at,
                     claim.attempts,
-                    now
+                    now,
+                    claim.lease_until
                 ],
             )
             .await
@@ -127,19 +128,20 @@ impl<'a> CommandIntents<'a> {
         Ok(updated == 1)
     }
 
-    /// Release the current auto attempt only after typed native nonacceptance. This must never
+    /// Release the current prompt attempt only after typed native nonacceptance. This must never
     /// be called on a timeout, lost response, or cancelled future. Queue order remains unchanged.
-    pub async fn defer_auto_claim_known_not_accepted(
+    pub async fn defer_prompt_claim_known_not_accepted(
         &self,
         claim: &CommandIntentRow,
+        now: i64,
     ) -> Result<bool, NexusError> {
         let updated = self.store.identity_conn().execute(
             "UPDATE command_intents SET status = 'pending', claimed_at = NULL, started_at = NULL, \
              lease_until = NULL, revision = revision + 1 \
              WHERE command_id = ?1 AND claimed_at = ?2 AND attempts = ?3 \
                AND status = 'claimed' AND started_at IS NOT NULL \
-               AND kind = 'harness.prompt' AND json_extract(request_json, '$.delivery') = 'auto'",
-            params![claim.command_id.as_str(), claim.claimed_at, claim.attempts],
+               AND kind = 'harness.prompt' AND lease_until = ?4 AND lease_until > ?5",
+            params![claim.command_id.as_str(), claim.claimed_at, claim.attempts, claim.lease_until, now],
         ).await.map_err(store_err)?;
         // Deliberately do not ring ingress here. Native boundary readiness, not this release,
         // must make a deferred row eligible again; otherwise unsupported busy input spins.
@@ -147,17 +149,17 @@ impl<'a> CommandIntents<'a> {
     }
 
     /// Settle one attempt without permitting a late callback to overwrite a newer/terminal row.
-    pub async fn settle_auto_claim(
+    pub async fn settle_prompt_claim(
         &self,
         claim: &CommandIntentRow,
-        outcome: AutoCommandOutcome<'_>,
+        outcome: PromptCommandOutcome<'_>,
         now: i64,
     ) -> Result<bool, NexusError> {
-        let uncertain = auto_uncertain_error_json();
+        let uncertain = prompt_uncertain_error_json();
         let (status, result, error) = match outcome {
-            AutoCommandOutcome::Completed(result) => ("done", Some(result), None),
-            AutoCommandOutcome::Rejected(error) => ("error", None, Some(error)),
-            AutoCommandOutcome::Uncertain => ("error", None, Some(uncertain.as_str())),
+            PromptCommandOutcome::Completed(result) => ("done", Some(result), None),
+            PromptCommandOutcome::Rejected(error) => ("error", None, Some(error)),
+            PromptCommandOutcome::Uncertain => ("error", None, Some(uncertain.as_str())),
         };
         let updated = self
             .store
@@ -167,7 +169,7 @@ impl<'a> CommandIntents<'a> {
              completed_at = ?7, lease_until = NULL, revision = revision + 1 \
              WHERE command_id = ?1 AND claimed_at = ?2 AND attempts = ?3 \
                AND status = 'claimed' AND started_at IS NOT NULL \
-               AND kind = 'harness.prompt' AND json_extract(request_json, '$.delivery') = 'auto'",
+               AND kind = 'harness.prompt' AND lease_until = ?8 AND lease_until > ?7",
                 params![
                     claim.command_id.as_str(),
                     claim.claimed_at,
@@ -175,7 +177,8 @@ impl<'a> CommandIntents<'a> {
                     status,
                     result,
                     error,
-                    now
+                    now,
+                    claim.lease_until
                 ],
             )
             .await
@@ -186,9 +189,9 @@ impl<'a> CommandIntents<'a> {
         Ok(updated == 1)
     }
 
-    /// Expired armed automatic deliveries are unknown, not reclaimable. Their detached native
+    /// Expired armed prompt deliveries are unknown, not reclaimable. Their detached native
     /// work may still finish; this terminal explicitly does not assert that delivery stopped.
-    pub async fn expire_started_auto_claims(&self, now: i64) -> Result<u64, NexusError> {
+    pub async fn expire_started_prompt_claims(&self, now: i64) -> Result<u64, NexusError> {
         let updated = self
             .store
             .identity_conn()
@@ -196,9 +199,9 @@ impl<'a> CommandIntents<'a> {
                 &format!(
                     "UPDATE command_intents SET status = 'error', error_json = ?2, \
              completed_at = ?1, lease_until = NULL, revision = revision + 1 \
-             WHERE status = 'claimed' AND lease_until <= ?1 AND NOT ({AUTO_RECLAIM_SAFE})"
+             WHERE status = 'claimed' AND lease_until <= ?1 AND NOT ({PROMPT_RECLAIM_SAFE})"
                 ),
-                params![now, auto_uncertain_error_json()],
+                params![now, prompt_uncertain_error_json()],
             )
             .await
             .map_err(store_err)?;
@@ -734,7 +737,7 @@ impl<'a> CommandIntents<'a> {
                 &format!(
                     "SELECT {COLUMNS} FROM command_intents WHERE kind = ?1 AND \
                      (status = 'pending' OR (status = 'claimed' AND lease_until <= ?2)) \
-                     AND {AUTO_RECLAIM_SAFE} \
+                     AND {PROMPT_RECLAIM_SAFE} \
                      ORDER BY created_at ASC"
                 ),
                 params![kind, now],
@@ -763,7 +766,7 @@ impl<'a> CommandIntents<'a> {
                      revision = revision + 1, claimed_at = ?1, started_at = NULL, lease_until = ?2 \
                      WHERE command_id = ?3 AND \
                      (status = 'pending' OR (status = 'claimed' AND lease_until <= ?1)) \
-                     AND {AUTO_RECLAIM_SAFE} \
+                     AND {PROMPT_RECLAIM_SAFE} \
                      RETURNING {COLUMNS}"
                 ),
                 params![now, now + lease_ms, command_id],
@@ -897,7 +900,7 @@ impl<'a> CommandIntents<'a> {
             .query(
                 &format!(
                     "SELECT {COLUMNS} FROM command_intents WHERE kind = ?1 AND status = 'claimed' \
-                     AND (lease_until > ?2 OR NOT ({AUTO_RECLAIM_SAFE})) AND command_id != ?3"
+                     AND (lease_until > ?2 OR NOT ({PROMPT_RECLAIM_SAFE})) AND command_id != ?3"
                 ),
                 params![
                     crate::command_kinds::harness::PROMPT,
@@ -1019,11 +1022,11 @@ impl<'a> CommandIntents<'a> {
              WHERE command_id = ( \
                  SELECT command_id FROM command_intents \
                  WHERE (status = 'pending' OR (status = 'claimed' AND lease_until <= ?1)) \
-                 AND {AUTO_RECLAIM_SAFE}");
+                 AND {PROMPT_RECLAIM_SAFE}");
         let suffix = format!(
             ") \
              AND (status = 'pending' OR (status = 'claimed' AND lease_until <= ?1)) \
-             AND {AUTO_RECLAIM_SAFE} RETURNING "
+             AND {PROMPT_RECLAIM_SAFE} RETURNING "
         );
         let sql = match filter {
             ClaimFilter::Any => {
@@ -1115,7 +1118,7 @@ impl<'a> CommandIntents<'a> {
             .identity_conn()
             .execute(
                 &format!("UPDATE command_intents SET status = 'done', revision = revision + 1, result_json = ?2, error_json = NULL, \
-                 completed_at = ?3, lease_until = NULL WHERE command_id = ?1 AND {NOT_AUTO_PROMPT}"),
+                 completed_at = ?3, lease_until = NULL WHERE command_id = ?1 AND {GENERIC_SETTLEMENT_SAFE}"),
                 params![command_id, result_json, now],
             )
             .await
@@ -1126,7 +1129,8 @@ impl<'a> CommandIntents<'a> {
         Ok(())
     }
 
-    /// Record the durable transition from claimed to started for the current claim.
+    /// Record the durable transition for a non-prompt claim. Prompts must use
+    /// [`Self::mark_prompt_started_for_claim`] with the complete captured attempt.
     pub async fn mark_started_for_claim(
         &self,
         command_id: &str,
@@ -1137,9 +1141,9 @@ impl<'a> CommandIntents<'a> {
             .store
             .identity_conn()
             .execute(
-                &format!("UPDATE command_intents SET started_at = ?3, revision = revision + 1 WHERE command_id = ?1 \
+                "UPDATE command_intents SET started_at = ?3, revision = revision + 1 WHERE command_id = ?1 \
                  AND status = 'claimed' AND claimed_at = ?2 AND started_at IS NULL \
-                 AND {NOT_AUTO_PROMPT}"),
+                 AND kind != 'harness.prompt'",
                 params![command_id, claimed_at, started_at],
             )
             .await
@@ -1150,7 +1154,8 @@ impl<'a> CommandIntents<'a> {
     /// Return one current, unfinished claim to the durable pending queue when daemon shutdown
     /// wins before the command crosses its external acceptance boundary.
     ///
-    /// The claim timestamp is the ownership token: a stale worker cannot release a row that a
+    /// Armed prompts are excluded; their typed nonacceptance path requires the full claim.
+    /// For these legacy claims the timestamp is the ownership token: a stale worker cannot release a row that a
     /// newer daemon has already reclaimed. Keep `attempts` unchanged so the durable row records
     /// that this daemon owned the claim even though it never reached the external provider.
     pub async fn release_claim_for_shutdown_retry(
@@ -1166,7 +1171,7 @@ impl<'a> CommandIntents<'a> {
                     "UPDATE command_intents SET status = 'pending', revision = revision + 1, \
                  claimed_at = NULL, started_at = NULL, lease_until = NULL \
                  WHERE command_id = ?1 AND status = 'claimed' AND claimed_at = ?2 \
-                 AND {AUTO_RECLAIM_SAFE}"
+                 AND {PROMPT_RECLAIM_SAFE}"
                 ),
                 params![command_id, claimed_at],
             )
@@ -1247,7 +1252,7 @@ impl<'a> CommandIntents<'a> {
             .execute(
                 &format!("UPDATE command_intents SET status = 'done', revision = revision + 1, result_json = ?3, error_json = NULL, \
                  completed_at = ?4, lease_until = NULL WHERE command_id = ?1 \
-                 AND status = 'claimed' AND claimed_at = ?2 AND {NOT_AUTO_PROMPT}"),
+                 AND status = 'claimed' AND claimed_at = ?2 AND {GENERIC_SETTLEMENT_SAFE}"),
                 params![command_id, claimed_at, result_json, now],
             )
             .await
@@ -1270,7 +1275,7 @@ impl<'a> CommandIntents<'a> {
             .identity_conn()
             .execute(
                 &format!("UPDATE command_intents SET status = 'error', revision = revision + 1, error_json = ?2, \
-                 completed_at = ?3, lease_until = NULL WHERE command_id = ?1 AND {NOT_AUTO_PROMPT}"),
+                 completed_at = ?3, lease_until = NULL WHERE command_id = ?1 AND {GENERIC_SETTLEMENT_SAFE}"),
                 params![command_id, error_json, now],
             )
             .await
@@ -1297,7 +1302,7 @@ impl<'a> CommandIntents<'a> {
             .execute(
                 &format!("UPDATE command_intents SET status = 'error', revision = revision + 1, error_json = ?3, \
                  completed_at = ?4, lease_until = NULL WHERE command_id = ?1 \
-                 AND status = 'claimed' AND claimed_at = ?2 AND {NOT_AUTO_PROMPT}"),
+                 AND status = 'claimed' AND claimed_at = ?2 AND {GENERIC_SETTLEMENT_SAFE}"),
                 params![command_id, claimed_at, error_json, now],
             )
             .await
@@ -1479,14 +1484,14 @@ impl<'a> CommandIntents<'a> {
     /// graceful drain. These rows are externally ambiguous and must not be replayed automatically.
     pub async fn reap_claimed_for_shutdown(&self, now: i64) -> Result<u64, NexusError> {
         let error_json = r#"{"message":"daemon shutdown"}"#;
-        let uncertain = auto_uncertain_error_json();
+        let uncertain = prompt_uncertain_error_json();
         let updated = self
             .store
             .identity_conn()
             .execute(
                 &format!(
                     "UPDATE command_intents SET status = 'error', revision = revision + 1, \
-                 error_json = CASE WHEN {AUTO_RECLAIM_SAFE} THEN ?2 ELSE ?3 END, \
+                 error_json = CASE WHEN {PROMPT_RECLAIM_SAFE} THEN ?2 ELSE ?3 END, \
                  completed_at = ?1, lease_until = NULL WHERE status = 'claimed'"
                 ),
                 params![now, error_json, uncertain],
@@ -1521,7 +1526,7 @@ impl<'a> CommandIntents<'a> {
                SELECT command_id FROM command_intents \
                WHERE status IN ('done', 'error', 'cancelled') \
                  AND completed_at IS NOT NULL AND completed_at <= ?1 \
-                 AND {AUTO_TERMINAL_REAP_SAFE} \
+                 AND {PROMPT_TERMINAL_REAP_SAFE} \
              )"
             ),
             params![cutoff_timestamp],
@@ -1533,7 +1538,7 @@ impl<'a> CommandIntents<'a> {
                     "DELETE FROM command_intents \
                  WHERE status IN ('done', 'error', 'cancelled') \
                    AND completed_at IS NOT NULL \
-                   AND completed_at <= ?1 AND {AUTO_TERMINAL_REAP_SAFE}"
+                   AND completed_at <= ?1 AND {PROMPT_TERMINAL_REAP_SAFE}"
                 ),
                 params![cutoff_timestamp],
             )
@@ -1554,25 +1559,23 @@ enum ClaimFilter<'a> {
     ExceptKindSet(&'a str),
 }
 
-// For opt-in automatic delivery, `started_at` is a conservative may-have-attempted fence,
+// For every prompt delivery, `started_at` is a conservative may-have-attempted fence,
 // NOT proof of native acceptance. Persist it before invoking admission. A lost response or
-// expired lease cannot prove zero effect, so no claim path may replay an armed row. Legacy
+// expired lease cannot prove zero effect, so no claim path may replay an armed row. Other
 // commands retain their existing reclaim behavior. This lives in the identity store and thus
 // survives replacement of the daemon's boot-scoped transport database.
-const AUTO_RECLAIM_SAFE: &str = "NOT (kind = 'harness.prompt' \
-    AND COALESCE(json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END, '$.delivery') = 'auto', 0) \
+const PROMPT_RECLAIM_SAFE: &str = "NOT (kind = 'harness.prompt' \
     AND started_at IS NOT NULL)";
 
-const NOT_AUTO_PROMPT: &str = "NOT (kind = 'harness.prompt' \
-    AND COALESCE(json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END, '$.delivery') = 'auto', 0))";
+const GENERIC_SETTLEMENT_SAFE: &str = "NOT (kind = 'harness.prompt' \
+    AND (started_at IS NOT NULL OR COALESCE(json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END, '$.delivery') = 'auto', 0)))";
 
 // Unknown delivery remains an unresolved obligation. Removing its receipt would allow a
 // reconnect with the same id to create a new send. Known outcomes retain normal retention.
-const AUTO_TERMINAL_REAP_SAFE: &str = "NOT (kind = 'harness.prompt' \
-    AND COALESCE(json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END, '$.delivery') = 'auto', 0) \
+const PROMPT_TERMINAL_REAP_SAFE: &str = "NOT (kind = 'harness.prompt' \
     AND COALESCE(json_extract(CASE WHEN json_valid(error_json) THEN error_json ELSE '{}' END, '$.code') = -32011, 0))";
 
-fn auto_uncertain_error_json() -> String {
+fn prompt_uncertain_error_json() -> String {
     serde_json::json!({
         "code": nexus_contracts::codes::DELIVERY_UNCERTAIN,
         "message": "Delivery outcome is unknown; the agent may have received this message. Do not automatically retry."

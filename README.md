@@ -65,6 +65,10 @@ Codex native activity is ingested before display processing, so a blocked displa
 does not hold a subsequently read completed turn busy. Private binding ownership also
 prevents a superseded request from entering native submission; an already admitted request
 remains potentially accepted after cancellation, not safe to resend automatically.
+Ordinary queued prompts also retain a durable attempt fence: a timeout after adapter
+entry, restart, or unresolved lease expiry cannot automatically replay that command.
+Such outcomes remain delivery-uncertain under their original identity, not rejected
+or delivered. A deadline that wins before adapter entry prevents later invocation.
 See [composer delivery and retry safety](docs/composer-delivery.md).
 
 Check or update the exact npm/Cargo installation that launched the command:

@@ -111,30 +111,31 @@ flush and response waits; a backpressured writer can still delay a control reque
 Cancellation removes only the original pending response correlation. Before local
 admission it leaves no request frame; afterward it does not retract an admitted
 frame or establish retry-safe rejection. A later flush may deliver that original
-frame. These native boundaries do not by themselves extend the durable journal's
-ordinary-prompt timeout/restart policy described below.
+frame. The durable journal applies the separate ordinary-prompt attempt policy
+described below; local native admission is not a durable receipt.
 
 This reuses the existing reader, tracker and serial notification channel. It does
 not bound that channel during an indefinitely stalled sink, guarantee progress
 when native input itself is unavailable, or prove the cause of a historical
 stall. No new automatic-delivery mode is enabled.
 
-## Automatic-delivery safety foundation
+## Durable prompt attempts and uncertain outcomes
 
-The durable `command_intents` identity-store journal now protects automatic rows
-against replay, independently of the boot-scoped transport database. These guards
-are a foundation, not an enabled automatic-delivery capability:
+The existing `command_intents` identity-store journal protects ordinary prompt
+attempts and retained automatic rows against replay, independently of the
+boot-scoped transport database. This does not enable automatic delivery:
 
 - `claimed` without `started_at` means the worker has not armed admission. An
   expired claim may be reclaimed.
-- For `delivery:auto` only, `started_at` means **may have attempted native delivery**.
-  It is persisted before any native admission call, under command id, claim
-  timestamp, attempt number, and an unexpired lease. It is not an acceptance receipt.
+- For `harness.prompt`, `started_at` means **may have attempted native delivery**.
+  It is persisted before execution, under command id, claim timestamp, attempt
+  number, the captured lease value, and an unexpired current lease. It is not an
+  acceptance receipt. Prompt slash-compaction uses the same attempt protection.
 - Once armed, no generic or session-prompt claim path may reclaim the row. Generic
   shutdown retry and legacy settlement helpers cannot clear or overwrite its fence.
-- Only exact-claim, known native nonacceptance may defer the same row. Its original
-  queue position and id are preserved. The future admission scheduler must make
-  this boundary-driven; the defer operation does not ring the ingress wakeup.
+- Only exact-claim, proven pre-entry nonacceptance may defer the same row. Its
+  original queue position and id are preserved. No general error or timeout is
+  reinterpreted by message text as retry permission.
 - Expiry or shutdown of an unresolved armed row reports `DELIVERY_UNCERTAIN`
   (`-32011`). The agent may still receive or finish the message. This is not a
   known rejection and must not offer automatic retry. Late callbacks cannot
@@ -148,7 +149,22 @@ when nothing was sent. This conservative tradeoff prevents automatic duplicate
 delivery; it is not an exactly-once external-effects guarantee. Restart tests
 reopen the actual split daemon identity database, not an in-memory mock.
 
-Native auto admission, lifecycle exclusion, per-session capability advertisement,
+Within a running worker, one private attempt permit orders a reporting deadline
+against adapter entry after asynchronous preflight. If the deadline closes that
+permit first, the detached preflight cannot invoke the adapter later. If adapter
+entry wins, a timeout or general error is potentially accepted and is reported as
+delivery-uncertain. Execution remains detached on a reporting timeout so a store
+statement is not cancelled midway; late completion cannot overwrite the terminal
+uncertainty. A typed shutdown-before-entry result may release its exact claim.
+The short shutdown exclusion is released after the adapter's first poll, not held
+through its later I/O or receipt wait.
+
+This retains the original command's replay protection, not an indefinite block on
+all subsequent commands for that session. Native activity and existing admission
+rules still govern later work. Explicit steer, interrupt and standalone compact
+retain their existing delivery policies; this slice fences `harness.prompt` only.
+
+The combined native-auto admission/lifecycle path, its capability advertisement,
 and active-eligible scheduling remain disabled until their combined tests pass.
 Pre-existing unstarted automatic rows are explicitly rejected without native
 delivery; already-armed rows remain uncertain rather than being re-executed.

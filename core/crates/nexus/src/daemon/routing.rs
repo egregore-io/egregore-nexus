@@ -583,8 +583,17 @@ fn subscription_batch_from_row(
 /// caller resolved by that path (`None` until authenticated). Always returns a [`Response`] — port
 /// errors become `Response.error`, never a panic.
 pub async fn route_request(state: &AppState, caller: Option<Caller>, req: Request) -> Response {
+    route_request_for_prompt_attempt(state, caller, req, None).await
+}
+
+pub(crate) async fn route_request_for_prompt_attempt(
+    state: &AppState,
+    caller: Option<Caller>,
+    req: Request,
+    attempt: Option<&crate::daemon::command_worker::PromptAttempt>,
+) -> Response {
     let id = req.id.clone();
-    match route_request_inner(state, &caller, &req).await {
+    match route_request_inner(state, &caller, &req, attempt).await {
         Ok(resp_value) => ok(id, resp_value),
         Err(e) => err(id, e),
     }
@@ -602,6 +611,7 @@ async fn route_request_inner(
     state: &AppState,
     caller: &Option<Caller>,
     req: &Request,
+    attempt: Option<&crate::daemon::command_worker::PromptAttempt>,
 ) -> Result<Value, RpcError> {
     let p = &req.params;
     match req.method.as_str() {
@@ -900,8 +910,7 @@ async fn route_request_inner(
             match prompt_slash_action(&row, &r.text).map_err(|e| contract_to_rpc(&e))? {
                 Some(PromptSlashAction::NativeCompact) => {
                     state
-                        .agent
-                        .compact(&session)
+                        .prompt_entry_before_shutdown(attempt, state.agent.compact(&session))
                         .await
                         .map_err(|e| contract_to_rpc(&e))?;
                     return Ok(serde_json::to_value(nexus_contracts::PromptResponse {
@@ -915,6 +924,7 @@ async fn route_request_inner(
             let caller_kind = authenticated_caller_kind(state, c).await?;
             state
                 .prompt_observed_before_shutdown(
+                    attempt,
                     &session,
                     r.text.clone(),
                     std::sync::Arc::new(state.ws.clone()),

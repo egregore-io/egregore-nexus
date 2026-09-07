@@ -350,27 +350,62 @@ impl AppState {
     /// If shutdown owns the write fence first, the command worker receives a precise internal
     /// signal and returns the still-unaccepted claim to `pending`. If the prompt owns the fence
     /// first, its tracked session actor owns the handshake and the ordinary graceful drain waits
-    /// for it. The global store fence is released before external I/O so one slow provider cannot
-    /// block unrelated ingress or command claims.
+    /// for it. The global store fence is released after the adapter's first poll, before later
+    /// awaits, so one slow provider cannot block unrelated ingress or command claims.
     pub(crate) async fn prompt_observed_before_shutdown(
         &self,
+        attempt: Option<&crate::daemon::command_worker::PromptAttempt>,
         session: &SessionId,
         text: String,
         events: Arc<dyn EventSink>,
         accepted_event: WsEvent,
     ) -> Result<(), ContractError> {
-        {
-            let _acceptance_permit = self.store.write_lock().lock_owned().await;
-            if self.command_worker_is_shutting_down() {
-                return Err(ContractError {
-                    code: nexus_contracts::codes::INTERNAL_ERROR,
-                    message: PROMPT_DEFERRED_FOR_SHUTDOWN.into(),
-                });
+        self.prompt_entry_before_shutdown(
+            attempt,
+            self.agent
+                .prompt_observed(session, text, events, accepted_event),
+        )
+        .await
+    }
+
+    /// First-poll entry is atomic with shutdown and the attempt deadline. No fence is retained
+    /// across a Pending adapter poll; unrelated ingress and provider I/O remain independent.
+    pub(crate) async fn prompt_entry_before_shutdown<F>(
+        &self,
+        attempt: Option<&crate::daemon::command_worker::PromptAttempt>,
+        future: F,
+    ) -> Result<(), ContractError>
+    where
+        F: std::future::Future<Output = Result<(), ContractError>>,
+    {
+        let guard = self.store.write_lock().lock_owned().await;
+        if self.command_worker_is_shutting_down() {
+            if let Some(attempt) = attempt {
+                attempt.reject_for_shutdown();
             }
+            return Err(ContractError {
+                code: nexus_contracts::codes::INTERNAL_ERROR,
+                message: PROMPT_DEFERRED_FOR_SHUTDOWN.into(),
+            });
         }
-        self.agent
-            .prompt_observed(session, text, events, accepted_event)
-            .await
+        let mut first_poll_guard = Some(guard);
+        let mut future = std::pin::pin!(future);
+        std::future::poll_fn(|cx| {
+            if let Some(guard) = first_poll_guard.take() {
+                if attempt.is_some_and(|attempt| !attempt.try_enter()) {
+                    return std::task::Poll::Ready(Err(ContractError {
+                        code: nexus_contracts::codes::DELIVERY_UNCERTAIN,
+                        message: "prompt attempt closed before adapter entry".into(),
+                    }));
+                }
+                let result = future.as_mut().poll(cx);
+                drop(guard);
+                result
+            } else {
+                future.as_mut().poll(cx)
+            }
+        })
+        .await
     }
 
     /// Heartbeat freshness window used by daemon-side stale-session reapers.

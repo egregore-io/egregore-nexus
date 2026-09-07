@@ -12,6 +12,11 @@ All notable public changes to Egregore Nexus are documented here. This project f
 
 ### Fixed
 
+- Extend the existing durable attempt fence to ordinary session prompts, including
+  prompt slash-compaction. Match the complete unexpired claim when arming or settling;
+  prevent timed-out preflight from entering the adapter later, and retain uncertain
+  post-entry attempts across restart, shutdown and receipt retention without replay.
+  Native automatic delivery remains disabled; no new journal or scheduler is added.
 - Ingest Codex native turn authority before awaited display processing and isolate it
   by binding owner. Reject superseded prompt/control requests before local submission,
   preserve newer native observations across delayed resume/projection responses, and

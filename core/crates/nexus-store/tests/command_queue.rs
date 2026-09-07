@@ -3,7 +3,9 @@
 use nexus_common::NexusError;
 use nexus_contracts::{AgentId, CommandQueueState, SessionId};
 use nexus_store::command_kinds;
-use nexus_store::repos::{CommandIntents, CommandQueue, NewCommandIntent, NewSession, Sessions};
+use nexus_store::repos::{
+    CommandIntents, CommandQueue, NewCommandIntent, NewSession, PromptCommandOutcome, Sessions,
+};
 use nexus_store::{DaemonStore, Store};
 
 async fn store() -> Store {
@@ -92,7 +94,7 @@ async fn claim_wins_promotion_without_duplicate_or_loss() {
         .await
         .unwrap());
     assert!(repo
-        .mark_started_for_claim("cmd_claimed", claimed.claimed_at.unwrap(), 11)
+        .mark_prompt_started_for_claim(&claimed, 11)
         .await
         .unwrap());
 
@@ -139,13 +141,16 @@ async fn command_event_projection_records_every_revision_in_order() {
         .await
         .unwrap()
         .unwrap();
-    let claimed_at = claimed.claimed_at.unwrap();
     assert!(repo
-        .mark_started_for_claim("cmd_lifecycle", claimed_at, 11)
+        .mark_prompt_started_for_claim(&claimed, 11)
         .await
         .unwrap());
     assert!(repo
-        .mark_done_for_claim("cmd_lifecycle", claimed_at, r#"{"accepted":true}"#, 12)
+        .settle_prompt_claim(
+            &claimed,
+            PromptCommandOutcome::Completed(r#"{"accepted":true}"#),
+            12
+        )
         .await
         .unwrap());
 
@@ -361,13 +366,16 @@ async fn typed_transition_read_is_bounded_and_reports_cursor_gaps() {
         .await
         .unwrap()
         .unwrap();
-    let claimed_at = claimed.claimed_at.unwrap();
     assert!(intents
-        .mark_started_for_claim("cmd_events", claimed_at, 11)
+        .mark_prompt_started_for_claim(&claimed, 11)
         .await
         .unwrap());
     assert!(intents
-        .mark_done_for_claim("cmd_events", claimed_at, r#"{"accepted":true}"#, 12)
+        .settle_prompt_claim(
+            &claimed,
+            PromptCommandOutcome::Completed(r#"{"accepted":true}"#),
+            12
+        )
         .await
         .unwrap());
     let queue = CommandQueue::new(&store);
