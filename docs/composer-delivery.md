@@ -179,6 +179,29 @@ before ingestion; this does not promise bounded freshness or credentialed
 real-binary acceptance. The tests use controlled hooks and disposable raw/tmux
 process seams.
 
+## Internal adapter turn observations
+
+The existing execution adapter exposes `verified_idle`, `native_open`, `unknown`
+and `unavailable` independently of queue cursors and transport presence. A bound
+observation carries an opaque owner and a revision of its evidence; reading the
+same facts does not advance that revision. Owner identities are equality scopes,
+not sortable clocks. Unsupported observation defaults to unknown without a made-up
+owner, rather than declaring every unobserved session busy or idle.
+
+Codex idle requires positive native completion or validated thread initialization
+or resume evidence; an empty compatibility response is not such evidence. Claude
+uses the ordered hook facts described above. Generic ACP supplies completion-bound
+responses, not native turn-start notifications: enqueueing a request is unknown,
+and a sole positively completed request can establish idle. A deferred response,
+error, dropped caller or unresolved overlapping request cannot prove idle. Socket
+loss is unavailable and cannot alter a replacement owner's observation.
+
+This is an internal observation method, not a new activity service or public
+readiness guarantee. Existing scheduler activity, adapter capability and native
+admission checks retain their responsibilities. Unknown observations do not add
+permanent scheduler blockers; established open work is not cleared by missing
+evidence. No snapshot reserves input against a later native or direct-human turn.
+
 ## Durable prompt attempts and uncertain outcomes
 
 The existing `command_intents` identity-store journal protects ordinary prompt

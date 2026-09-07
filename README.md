@@ -76,6 +76,9 @@ Headed Claude activity uses ordered native hook records before display processin
 Receipt matching retains the binding owner, native session and hook offset; an old
 hook or delayed forwarder cannot settle a newer binding. Terminal writes alone do
 not prove acceptance, and direct human input cannot be atomically reserved by Nexus.
+Adapters expose an internal turn observation separately from queue position and
+presence: verified idle, native open, unknown, or unavailable. Missing evidence is
+not idle, and an observation does not reserve the next native input operation.
 See [composer delivery and retry safety](docs/composer-delivery.md).
 
 Check or update the exact npm/Cargo installation that launched the command:

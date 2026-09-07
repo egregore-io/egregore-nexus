@@ -11,6 +11,70 @@ use nexus_store::Store;
 const FAKE_BIN: &str = env!("CARGO_BIN_EXE_fake_codex_app_server");
 const THREAD_ID: &str = "seed-thread";
 
+#[tokio::test]
+async fn observation_distinguishes_validated_idle_legacy_resume_and_fresh_creation() {
+    use nexus_contracts::{AgentTurnExecutionPort, TurnState};
+    for (tag, response, expected) in [
+        ("legacy", Some(serde_json::json!({})), TurnState::Unknown),
+        (
+            "idle",
+            Some(serde_json::json!({"thread": {"id": THREAD_ID, "turns": []}})),
+            TurnState::VerifiedIdle,
+        ),
+        (
+            "incomplete",
+            Some(
+                serde_json::json!({"thread": {"id": THREAD_ID, "turns": [{"id": "maybe-active"}]}}),
+            ),
+            TurnState::Unknown,
+        ),
+        ("fresh", None, TurnState::VerifiedIdle),
+    ] {
+        let root = tempdir(tag);
+        let home = root.join("home");
+        write_rollout(&home);
+        let session_dir = root.join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let bridge = CodexBridge::new();
+        let session = SessionId(tag.into());
+        let fresh = response.is_none();
+        bridge
+            .launch_with_options(
+                session.clone(),
+                SupervisorOpts {
+                    codex_exe: FAKE_BIN.into(),
+                    session_dir,
+                    codex_home: Some(home),
+                    model: None,
+                    bus_mcp: None,
+                    cwd: None,
+                    env: response
+                        .map(|value| vec![("FAKE_CODEX_RESUME_RESPONSE".into(), value.to_string())])
+                        .unwrap_or_default(),
+                },
+                Arc::new(RecSink),
+                BridgeLaunchOptions {
+                    known_thread_id: (!fresh).then(|| THREAD_ID.into()),
+                    create_thread_if_missing: fresh,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let transport = bridge.transport();
+        let snapshot = transport.observe_turn(&session);
+        assert_eq!(snapshot.state, expected, "{tag}");
+        assert_eq!(snapshot, transport.observe_turn(&session));
+        assert_eq!(
+            snapshot.steer_capability,
+            transport.steer_capability(&session)
+        );
+        assert!(transport.active_turn_sessions().is_empty());
+        bridge.kill(&session);
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
 #[derive(Default)]
 struct RecSink;
 
@@ -181,6 +245,10 @@ async fn assert_native_terminal_before_resume_seed(script_env: &str) {
         ],
     }, Arc::new(RecSink), BridgeLaunchOptions { known_thread_id: Some(THREAD_ID.into()), ..Default::default() }).await.unwrap();
     let active = bridge.transport().active_turn_sessions();
+    assert_eq!(
+        nexus_contracts::AgentTurnExecutionPort::observe_turn(&bridge.transport(), &session).state,
+        nexus_contracts::TurnState::VerifiedIdle
+    );
     bridge.kill(&session);
     let _ = std::fs::remove_dir_all(root);
     assert!(

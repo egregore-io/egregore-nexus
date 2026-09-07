@@ -3,6 +3,17 @@
 //! These tests intentionally mirror the old inline `#[cfg(test)]` blocks so the
 //! `nexus-contracts` source tree stays focused on wire types while preserving coverage.
 
+#[test]
+fn default_turn_observation_has_no_idle_or_fabricated_stamp() {
+    let observation = nexus_contracts::TurnObservation::default();
+    assert_eq!(observation.state, nexus_contracts::TurnState::Unknown);
+    assert_eq!(observation.stamp, None);
+    assert_eq!(
+        observation.steer_capability,
+        nexus_contracts::SteerCapability::None
+    );
+}
+
 mod ack {
     use nexus_contracts::ack::*;
     use nexus_contracts::ids::MessageId;

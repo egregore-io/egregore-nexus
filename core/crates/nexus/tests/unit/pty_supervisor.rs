@@ -458,12 +458,27 @@ async fn manual_claude_submit_blocks_transport_until_matching_stop_not_tool_outp
             completion: completion.clone(),
         }),
     );
+    let initial = transport.observe_turn(&session);
+    assert_eq!(initial.state, nexus_contracts::TurnState::Unknown);
+    assert_eq!(initial, transport.observe_turn(&session));
+    assert!(transport.active_turn_sessions().is_empty());
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        transport.wait_for_turn_completion(&session),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     completion.observe_hooks(
         &[native_hook("UserPromptSubmit", "manual", 1)],
         Some(1),
         true,
     );
     assert_eq!(transport.active_turn_sessions(), vec![session.clone()]);
+    let open = transport.observe_turn(&session);
+    assert_eq!(open.state, nexus_contracts::TurnState::NativeOpen);
+    assert_eq!(open.steer_capability, transport.steer_capability(&session));
+    assert_ne!(initial.stamp, open.stamp);
     completion.observe_hooks(&[native_hook("PostToolUse", "manual", 2)], Some(2), true);
     assert_eq!(transport.active_turn_sessions(), vec![session.clone()]);
     assert!(tokio::time::timeout(
@@ -475,6 +490,14 @@ async fn manual_claude_submit_blocks_transport_until_matching_stop_not_tool_outp
     completion.observe_hooks(&[native_hook("Stop", "manual", 3)], Some(3), true);
     transport.wait_for_turn_completion(&session).await.unwrap();
     assert!(transport.active_turn_sessions().is_empty());
+    let idle = transport.observe_turn(&session);
+    assert_eq!(idle.state, nexus_contracts::TurnState::VerifiedIdle);
+    assert_eq!(idle, transport.observe_turn(&session));
+    completion.invalidate();
+    assert_eq!(
+        transport.observe_turn(&session).state,
+        nexus_contracts::TurnState::Unavailable
+    );
 }
 
 #[tokio::test]
@@ -667,6 +690,10 @@ fn claude_optional_ids_allow_unambiguous_single_turn_but_not_overlap_or_conflict
         let mut stop = native_hook("Stop", "manual", 2);
         stop.prompt_id = ids.1.map(str::to_string);
         completion.observe_hooks(&[submit, stop], Some(2), true);
+        assert_eq!(
+            completion.observe_turn().state,
+            nexus_contracts::TurnState::VerifiedIdle
+        );
         assert!(
             !completion.has_open_turn(),
             "single native turn with optional ids {ids:?} must retain supported Stop semantics"
@@ -689,6 +716,10 @@ fn claude_optional_ids_allow_unambiguous_single_turn_but_not_overlap_or_conflict
             "overlap/conflict cannot be guessed away without matching ids"
         );
         assert!(completion.is_unknown());
+        assert_eq!(
+            completion.observe_turn().state,
+            nexus_contracts::TurnState::Unknown
+        );
     }
 }
 

@@ -12,6 +12,10 @@ All notable public changes to Egregore Nexus are documented here. This project f
 
 ### Fixed
 
+- Expose adapter-owned internal turn observations with fresh binding identities
+  and evidence revisions. Keep missing responses, ambiguous native evidence and
+  disconnected adapters distinct from verified idle; queue scheduling remains
+  on its existing execution path.
 - Track headed Claude activity from ordered, session-bound hook records before
   display awaits. Keep fresh observation owners through launch/adoption/teardown,
   correlate prompt receipts with hook provenance and acceptance-sink completion,

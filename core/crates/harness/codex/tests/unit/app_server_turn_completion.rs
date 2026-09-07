@@ -1,5 +1,77 @@
 use super::*;
 
+#[test]
+fn observation_requires_positive_idle_evidence_and_stable_owner_facts() {
+    use nexus_contracts::TurnState;
+    let root = CodexTurnTracker::default();
+    let owner = root.new_owner(Some("thread".into()));
+    assert!(owner.publish_owner("thread"));
+    let unknown = owner.observe_turn("thread");
+    assert_eq!(unknown.state, TurnState::Unknown);
+    assert_eq!(unknown, owner.observe_turn("thread"));
+    owner.ingest_native(&note("thread", "turn", "turn/started"));
+    let open = owner.observe_turn("thread");
+    assert_eq!(open.state, TurnState::NativeOpen);
+    assert_ne!(unknown.stamp, open.stamp);
+    assert_eq!(open, owner.observe_turn("thread"));
+    owner.ingest_native(&note("thread", "turn", "turn/completed"));
+    assert_eq!(owner.observe_turn("thread").state, TurnState::VerifiedIdle);
+    owner.clear_active_turn("thread");
+    assert_eq!(owner.observe_turn("thread").state, TurnState::Unknown);
+    owner.revoke_owner();
+    assert_eq!(owner.observe_turn("thread").state, TurnState::Unavailable);
+    let replacement = root.new_owner(Some("thread".into()));
+    assert!(replacement.publish_owner("thread"));
+    assert_ne!(
+        unknown.stamp.unwrap().owner,
+        replacement.observe_turn("thread").stamp.unwrap().owner
+    );
+}
+
+#[test]
+fn idle_setup_seed_cannot_overwrite_newer_native_evidence() {
+    use nexus_contracts::TurnState;
+    for newer_open in [false, true] {
+        let owner = CodexTurnTracker::default().new_owner(Some("thread".into()));
+        let before = owner.native_revision();
+        if newer_open {
+            owner.ingest_native(&note("thread", "new", "turn/started"));
+        }
+        owner.seed_idle("thread", before);
+        assert!(owner.publish_owner("thread"));
+        assert_eq!(
+            owner.observe_turn("thread").state,
+            if newer_open {
+                TurnState::NativeOpen
+            } else {
+                TurnState::VerifiedIdle
+            }
+        );
+        let snapshot = owner.observe_turn("thread");
+        owner.record_turn_start_acceptance("thread", "new");
+        assert_eq!(owner.observe_turn("thread").state, TurnState::NativeOpen);
+        if newer_open {
+            assert_eq!(snapshot, owner.observe_turn("thread"));
+        }
+        owner.ingest_native(&note("thread", "old", "turn/completed"));
+        assert_eq!(owner.observe_turn("thread").state, TurnState::NativeOpen);
+    }
+}
+
+#[test]
+fn provisional_idle_summaries_remain_bounded_and_dropped_evidence_is_unknown() {
+    let owner = CodexTurnTracker::default().new_owner(None);
+    for index in 0..RECENT_COMPLETIONS_LIMIT * 2 {
+        owner.ingest_native(&note(&format!("thread-{index}"), "done", "turn/completed"));
+    }
+    assert!(owner.lock("").idle_threads.len() <= RECENT_COMPLETIONS_LIMIT);
+    assert!(owner.publish_owner("thread-0"));
+    assert_eq!(
+        owner.observe_turn("thread-0").state,
+        nexus_contracts::TurnState::Unknown
+    );
+}
+
 fn note(thread: &str, turn: &str, method: &str) -> Notification {
     Notification {
         id: None,

@@ -290,6 +290,20 @@ impl AgentTurnExecutionPort for PtyTransport {
         }
     }
 
+    fn observe_turn(&self, recipient: &SessionId) -> nexus_contracts::TurnObservation {
+        let sessions = self.sessions.lock().unwrap();
+        match sessions.get(recipient) {
+            Some(input) => nexus_contracts::TurnObservation {
+                steer_capability: SteerCapability::InterruptAndSend,
+                ..input.observe_turn()
+            },
+            None => nexus_contracts::TurnObservation {
+                state: nexus_contracts::TurnState::Unavailable,
+                ..Default::default()
+            },
+        }
+    }
+
     fn active_turn_sessions(&self) -> Vec<SessionId> {
         let mut active = self.active_turns.sessions();
         for (session, input) in self.sessions.lock().unwrap().iter() {

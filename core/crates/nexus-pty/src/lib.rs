@@ -100,6 +100,11 @@ pub trait HarnessInput: Send + Sync {
         false
     }
 
+    /// Read native binding evidence; raw terminal acceptance does not prove idle or open.
+    fn observe_turn(&self) -> nexus_contracts::TurnObservation {
+        Default::default()
+    }
+
     /// Wait only for established native work; unknown observation must not wait forever.
     async fn wait_for_observed_turn_completion(&self) {}
 

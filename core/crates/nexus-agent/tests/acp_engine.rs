@@ -21,6 +21,190 @@ const FAKE_HARNESS: &str = env!("CARGO_BIN_EXE_fake_acp_agent");
 const CLAUDE_INTERRUPTED_HANDOFF: &str =
     "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null";
 
+#[tokio::test]
+async fn observation_survives_dropped_caller_and_requires_correlated_response() {
+    use nexus_contracts::TurnState;
+    let dir = std::env::temp_dir().join(nexus_common::new_binding_id());
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut command = fake_command();
+    command.env.push((
+        "FAKE_ACP_RESPONSE_GATE".into(),
+        dir.join("response").display().to_string(),
+    ));
+    let engine = Arc::new(AcpEngine::new());
+    assert_eq!(engine.observe_turn().state, TurnState::Unavailable);
+    engine.spawn_and_initialize(&command).await.unwrap();
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    let initial = engine.observe_turn();
+    assert_eq!(initial.state, TurnState::Unknown);
+    assert_eq!(initial, engine.observe_turn());
+    let task = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.inject_completion_observed("late".into()).await }
+    });
+    wait_fixture_marker(&dir.join("response.entered")).await;
+    assert_eq!(engine.observe_turn().state, TurnState::Unknown);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    std::fs::write(dir.join("response.release"), b"release").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while engine.observe_turn().state != TurnState::VerifiedIdle {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a late correlated response remains observable after its caller is dropped");
+    let completed = engine.observe_turn();
+    assert_eq!(completed, engine.observe_turn());
+    assert_eq!(
+        initial.stamp.as_ref().unwrap().owner,
+        completed.stamp.as_ref().unwrap().owner
+    );
+    assert!(completed.stamp.as_ref().unwrap().revision > initial.stamp.as_ref().unwrap().revision);
+    engine.kill().await;
+    assert_eq!(engine.observe_turn().state, TurnState::Unavailable);
+    let engine = AcpEngine::new();
+    engine.spawn_and_initialize(&fake_command()).await.unwrap();
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    assert_ne!(
+        initial.stamp.unwrap().owner,
+        engine.observe_turn().stamp.unwrap().owner
+    );
+    engine.kill().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn observation_overlap_stays_unknown_until_a_new_binding() {
+    use nexus_contracts::TurnState;
+    let dir = std::env::temp_dir().join(nexus_common::new_binding_id());
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut command = fake_command();
+    command.env.push((
+        "FAKE_ACP_RESPONSE_GATE".into(),
+        dir.join("response").display().to_string(),
+    ));
+    let engine = Arc::new(AcpEngine::new());
+    engine.spawn_and_initialize(&command).await.unwrap();
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    let first = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.inject_completion_observed("old".into()).await }
+    });
+    wait_fixture_marker(&dir.join("response.entered")).await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    let before = engine.observe_turn();
+    let second = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.inject_completion_observed("new".into()).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while engine.observe_turn().stamp == before.stamp {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::write(dir.join("response.release"), b"release").unwrap();
+    second.await.unwrap().unwrap();
+    assert_eq!(
+        engine.observe_turn().state,
+        TurnState::Unknown,
+        "neither old nor newer completion may erase unresolved overlap"
+    );
+    engine
+        .inject_completion_observed("third".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.observe_turn().state,
+        TurnState::Unknown,
+        "ambiguity is sticky, not a one-request flag"
+    );
+    let before_reload = engine.observe_turn();
+    let native_session = engine.acp_session_id().await.unwrap();
+    engine
+        .load_session(&native_session, None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.observe_turn().stamp.as_ref().unwrap().owner,
+        before_reload.stamp.as_ref().unwrap().owner,
+        "same-session reload is not a new binding"
+    );
+    engine
+        .inject_completion_observed("after reload".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.observe_turn().state,
+        TurnState::Unknown,
+        "same-session load ACK cannot erase unresolved older work"
+    );
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    assert_ne!(
+        engine.observe_turn().stamp.unwrap().owner,
+        before.stamp.unwrap().owner
+    );
+    assert_eq!(engine.observe_turn().state, TurnState::Unknown);
+    engine
+        .inject_completion_observed("fresh binding".into())
+        .await
+        .unwrap();
+    assert_eq!(engine.observe_turn().state, TurnState::VerifiedIdle);
+    let before_switch = engine.observe_turn();
+    engine
+        .load_session("different-native-session", None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    assert_ne!(
+        engine.observe_turn().stamp.unwrap().owner,
+        before_switch.stamp.unwrap().owner,
+        "changing the native session replaces the binding even on the same connection"
+    );
+    assert_eq!(engine.observe_turn().state, TurnState::Unknown);
+    engine.kill().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn observation_queue_only_response_never_claims_idle() {
+    let mut command = fake_command();
+    command
+        .env
+        .push(("FAKE_ACP_HERMES_QUEUE_PROMOTE_MS".into(), "10000".into()));
+    let engine = AcpEngine::for_harness(HarnessId::new("hermes").unwrap());
+    engine.spawn_and_initialize(&command).await.unwrap();
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    assert!(engine
+        .inject_completion_observed("queued only".into())
+        .await
+        .is_err());
+    engine.take_updates();
+    assert_eq!(
+        engine.observe_turn().state,
+        nexus_contracts::TurnState::Unknown,
+        "queue-only EndTurn and draining the display buffer cannot prove native completion"
+    );
+    engine.kill().await;
+}
+
 /// Concatenate the reply text from a drained stream — i.e. the `text` of every `Text`-kind event,
 /// in order. The full-stream pass-through also relays thinking / tool-call / plan events; the
 /// **reply** is just the `Text` ones, so these turn-content assertions filter to those.
@@ -163,6 +347,11 @@ async fn strict_completion_rejects_cancelled_response_and_error_without_leaking_
             .await
             .is_err());
         assert!(engine.take_updates().is_empty());
+        assert_eq!(
+            engine.observe_turn().state,
+            nexus_contracts::TurnState::Unknown,
+            "cancelled/error/handoff responses are not positive native completion"
+        );
         if variable == "FAKE_ACP_CANCELLED_RESPONSE" {
             engine.inject("legacy".into()).await.unwrap();
         }
@@ -783,6 +972,11 @@ async fn accepted_cancel_releases_unanswered_prompt_for_the_replacement_turn() {
     .await
     .expect("replacement prompt must cross the released serialization boundary")
     .expect("the replacement turn must complete");
+    assert_eq!(
+        engine.observe_turn().state,
+        nexus_contracts::TurnState::Unknown,
+        "accepted cancel and newer completion cannot settle older unanswered native work"
+    );
     assert!(
         reply_text(engine.take_updates()).contains("replacement must not wait ten minutes"),
         "the completed replacement output must remain available to the relay"

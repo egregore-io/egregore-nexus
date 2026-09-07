@@ -104,6 +104,10 @@ impl AgentTurnExecutionPort for RoutingTurnExec {
         self.turn_backend(recipient).steer_capability(recipient)
     }
 
+    fn observe_turn(&self, recipient: &SessionId) -> nexus_contracts::TurnObservation {
+        self.turn_backend(recipient).observe_turn(recipient)
+    }
+
     async fn interrupt_active_turn(&self, recipient: &SessionId) -> PortResult<()> {
         self.turn_backend(recipient)
             .interrupt_active_turn(recipient)
@@ -523,6 +527,13 @@ mod tests {
             Arc::new(fake_acp.clone()),
         );
         let events = Arc::new(RecordingEvents::default());
+        let observation = router.observe_turn(&session);
+        assert_eq!(observation.state, nexus_contracts::TurnState::Unknown);
+        assert_eq!(observation.stamp, None);
+        assert_eq!(
+            observation.steer_capability,
+            router.steer_capability(&session)
+        );
         let response = router
             .steer_observed(
                 &session,
@@ -735,6 +746,17 @@ mod tests {
         let fake_acp = FakeAcp::default();
         let router =
             RoutingTurnExec::new(codex_transport, pty_transport, Arc::new(fake_acp.clone()));
+
+        let native_observation = router.observe_turn(&session_a);
+        assert!(native_observation.stamp.is_some());
+        assert_eq!(
+            native_observation.steer_capability,
+            SteerCapability::NativeSteer
+        );
+        assert_eq!(
+            router.observe_turn(&session_b),
+            fake_acp.observe_turn(&session_b)
+        );
 
         // A: bound in codex → inject goes to codex transport (fake server records it).
         router

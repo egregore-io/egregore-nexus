@@ -56,6 +56,9 @@ mod ids {
 
     #[test]
     fn ids_are_prefixed_and_unique() {
+        let owner = nexus_common::new_binding_id();
+        assert!(owner.starts_with("b_"));
+        assert_ne!(owner, nexus_common::new_binding_id());
         let a = new_message_id();
         let b = new_message_id();
         assert!(a.0.starts_with("m_"));

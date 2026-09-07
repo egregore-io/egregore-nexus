@@ -146,6 +146,32 @@ fn agent_with_bound_mock() -> (Agent, MockAdapter, RecordingSink, SessionId) {
     (agent, mock, sink, session)
 }
 
+#[tokio::test]
+async fn legacy_adapter_unknown_keeps_default_dispatch_and_completion_nonblocking() {
+    let (agent, _mock, _sink, session) = agent_with_bound_mock();
+    let observation = agent.observe_turn(&session);
+    assert_eq!(observation.state, nexus_contracts::TurnState::Unknown);
+    assert_eq!(observation.stamp, None);
+    assert_eq!(
+        observation.steer_capability,
+        agent.steer_capability(&session)
+    );
+    assert!(agent.active_turn_sessions().is_empty());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        agent.wait_for_turn_completion(&session),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    agent.prompt(&session, "legacy input".into()).await.unwrap();
+    assert_eq!(agent.observe_turn(&session), observation);
+    assert_eq!(
+        agent.observe_turn(&SessionId("absent".into())).state,
+        nexus_contracts::TurnState::Unavailable
+    );
+}
+
 struct BlockingAdapter {
     started: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,

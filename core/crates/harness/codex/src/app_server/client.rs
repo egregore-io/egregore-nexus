@@ -69,6 +69,9 @@ impl CodexAppServerClient {
                 as super::jsonrpc::NativeIngress
         });
         let rpc = JsonRpc::connect_with_ingress(sock, ingress).await?;
+        if let Some(tracker) = tracker.clone() {
+            rpc.install_close_observer(Arc::new(move || tracker.observe_disconnect()));
+        }
         rpc.request(method::INITIALIZE, initialize_params(client_name))
             .await?;
         rpc.notify(method::INITIALIZED, serde_json::json!({}))
@@ -91,6 +94,9 @@ impl CodexAppServerClient {
         let ingress = tracker.clone();
         self.rpc
             .install_ingress(Arc::new(move |note| ingress.ingest_native(note)));
+        let closed = tracker.clone();
+        self.rpc
+            .install_close_observer(Arc::new(move || closed.observe_disconnect()));
         *origin = Some(tracker);
         true
     }

@@ -146,6 +146,13 @@ impl Adapter for ClaudeAdapter {
         self.engine.cancel_active_turn().await
     }
 
+    fn observe_turn(&self) -> nexus_contracts::TurnObservation {
+        nexus_contracts::TurnObservation {
+            steer_capability: self.steer_capability(),
+            ..self.engine.observe_turn()
+        }
+    }
+
     async fn inject_with_accepted_event(
         &self,
         prompt: String,

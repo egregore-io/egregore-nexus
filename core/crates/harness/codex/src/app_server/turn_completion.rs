@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use nexus_contracts::events::WsEvent;
 use nexus_contracts::ports::EventSink;
-use nexus_contracts::AgentUpdateKind;
+use nexus_contracts::{AgentUpdateKind, TurnObservation, TurnObservationStamp, TurnState};
 use serde_json::Value;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -36,6 +36,9 @@ type AcceptedInputKey = (String, String, String);
 struct Inner {
     phase: OwnerPhase,
     native_revision: u64,
+    fact_revision: u64,
+    disconnected: bool,
+    idle_threads: HashSet<String>,
     /// Latest native active turn observed for each Codex thread. This is routing authority for
     /// explicit `turn/steer`; UI run ids and daemon prompt rows never populate it.
     active_turn_ids: HashMap<String, String>,
@@ -79,6 +82,7 @@ struct Registry {
 
 struct OwnerLease {
     id: u64,
+    observation_id: String,
     registry: Weak<Mutex<Registry>>,
     revoked: CancellationToken,
 }
@@ -263,6 +267,7 @@ impl CodexTurnTracker {
             inner: self.inner.clone(),
             owner: Some(Arc::new(OwnerLease {
                 id,
+                observation_id: nexus_common::new_binding_id(),
                 registry: Arc::downgrade(&self.inner),
                 revoked: CancellationToken::new(),
             })),
@@ -278,21 +283,30 @@ impl CodexTurnTracker {
 
     pub(super) fn publish_owner(&self, thread: &str) -> bool {
         let mut inner = self.lock(thread);
+        if inner.disconnected {
+            return false;
+        }
         match &inner.phase {
             OwnerPhase::Provisional(expected)
                 if expected.as_deref().is_none_or(|id| id == thread) => {}
             _ => return false,
         }
         inner.active_turn_ids.retain(|id, _| id == thread);
+        inner.idle_threads.retain(|id| id == thread);
         inner.native_terminals.retain(|(id, _)| id == thread);
         inner.native_terminal_order.retain(|(id, _)| id == thread);
         inner.phase = OwnerPhase::Published(thread.to_string());
+        inner.fact_revision += 1;
         true
     }
 
     pub(super) fn revoke_owner(&self) {
         if let Some(owner) = &self.owner {
-            self.lock("").phase = OwnerPhase::Revoked;
+            let mut inner = self.lock("");
+            if !matches!(inner.phase, OwnerPhase::Revoked) {
+                inner.phase = OwnerPhase::Revoked;
+                inner.fact_revision += 1;
+            }
             owner.revoked.cancel();
         }
     }
@@ -337,6 +351,60 @@ impl CodexTurnTracker {
         self.lock("").native_revision
     }
 
+    /// Snapshot this incarnation's native facts, separate from request-admission revisions.
+    pub(super) fn observe_turn(&self, thread: &str) -> TurnObservation {
+        let Some(owner) = &self.owner else {
+            return TurnObservation::default();
+        };
+        let inner = self.lock(thread);
+        TurnObservation {
+            state: if inner.disconnected {
+                TurnState::Unavailable
+            } else {
+                match &inner.phase {
+                    OwnerPhase::Revoked => TurnState::Unavailable,
+                    OwnerPhase::Published(expected) if expected == thread => {
+                        if inner.active_turn_ids.contains_key(thread) {
+                            TurnState::NativeOpen
+                        } else if inner.idle_threads.contains(thread) {
+                            TurnState::VerifiedIdle
+                        } else {
+                            TurnState::Unknown
+                        }
+                    }
+                    _ => TurnState::Unknown,
+                }
+            },
+            stamp: Some(TurnObservationStamp {
+                owner: owner.observation_id.clone(),
+                revision: inner.fact_revision,
+            }),
+            ..Default::default()
+        }
+    }
+
+    pub(super) fn observe_disconnect(&self) {
+        let mut inner = self.lock("");
+        if !inner.disconnected {
+            inner.disconnected = true;
+            inner.fact_revision += 1;
+        }
+    }
+
+    /// A validated matching resume or successful fresh thread creation can prove idle only
+    /// if no newer native notification arrived while that setup request was pending.
+    pub(super) fn seed_idle(&self, thread: &str, before: u64) {
+        let mut inner = self.lock(thread);
+        if !thread.is_empty()
+            && matches!(inner.phase, OwnerPhase::Provisional(_))
+            && inner.native_revision == before
+            && !inner.active_turn_ids.contains_key(thread)
+            && inner.idle_threads.insert(thread.to_string())
+        {
+            inner.fact_revision += 1;
+        }
+    }
+
     pub(super) fn apply_steer_response(&self, thread: &str, turn: Option<&str>, before: u64) {
         let mut inner = self.lock(thread);
         if matches!(inner.phase, OwnerPhase::Revoked) || inner.native_revision != before {
@@ -348,12 +416,10 @@ impl CodexTurnTracker {
                     .native_terminals
                     .contains(&(thread.to_string(), turn.to_string())) =>
             {
-                inner
-                    .active_turn_ids
-                    .insert(thread.to_string(), turn.to_string());
+                record_active(&mut inner, thread, turn);
             }
             None => {
-                inner.active_turn_ids.remove(thread);
+                clear_authority(&mut inner, thread);
             }
             _ => {}
         }
@@ -380,10 +446,9 @@ impl CodexTurnTracker {
                     .native_terminals
                     .contains(&(thread.to_string(), turn.to_string()))
                 {
-                    inner
-                        .active_turn_ids
-                        .entry(thread.to_string())
-                        .or_insert_with(|| turn.to_string());
+                    if !inner.active_turn_ids.contains_key(thread) {
+                        record_active(&mut inner, thread, turn);
+                    }
                 }
             }
         }
@@ -418,6 +483,7 @@ impl CodexTurnTracker {
             // A bounded provisional summary cannot turn dropped native-open evidence into idle.
             // Fail this candidate closed; a later attempt may establish its own complete summary.
             inner.phase = OwnerPhase::Revoked;
+            inner.fact_revision += 1;
             if let Some(owner) = &self.owner {
                 owner.revoked.cancel();
             }
@@ -432,9 +498,7 @@ impl CodexTurnTracker {
             .native_terminals
             .contains(&(thread.to_string(), turn.to_string()))
         {
-            inner
-                .active_turn_ids
-                .insert(thread.to_string(), turn.to_string());
+            record_active(&mut inner, thread, turn);
         }
     }
 
@@ -473,9 +537,7 @@ impl CodexTurnTracker {
         {
             return;
         }
-        inner
-            .active_turn_ids
-            .insert(thread_id.to_string(), turn_id.to_string());
+        record_active(&mut inner, thread_id, turn_id);
     }
 
     /// Seed an idle tracker from a successful `turn/start` response without overwriting newer
@@ -489,15 +551,14 @@ impl CodexTurnTracker {
         {
             return;
         }
-        inner
-            .active_turn_ids
-            .entry(thread_id.to_string())
-            .or_insert_with(|| turn_id.to_string());
+        if !inner.active_turn_ids.contains_key(thread_id) {
+            record_active(&mut inner, thread_id, turn_id);
+        }
     }
 
     /// Clear all active-turn authority for a thread after Codex reports there is no active turn.
     pub fn clear_active_turn(&self, thread_id: &str) {
-        self.lock(thread_id).active_turn_ids.remove(thread_id);
+        clear_authority(&mut self.lock(thread_id), thread_id);
     }
 
     /// Queue a session-visible accepted event for the next Codex turn notification on `thread_id`.
@@ -1197,17 +1258,47 @@ impl CodexTurnCompletion {
 }
 
 fn record_terminal(inner: &mut Inner, thread: &str, turn: &str) {
-    if inner.active_turn_ids.get(thread).map(String::as_str) == Some(turn) {
+    let cleared = inner.active_turn_ids.get(thread).map(String::as_str) == Some(turn);
+    if cleared {
         inner.active_turn_ids.remove(thread);
     }
     let key = (thread.to_string(), turn.to_string());
     if inner.native_terminals.insert(key.clone()) {
+        inner.fact_revision += 1;
+        if !inner.active_turn_ids.contains_key(thread) {
+            inner.idle_threads.insert(thread.to_string());
+        }
         inner.native_terminal_order.push_back(key);
         while inner.native_terminal_order.len() > RECENT_COMPLETIONS_LIMIT {
             if let Some(old) = inner.native_terminal_order.pop_front() {
                 inner.native_terminals.remove(&old);
+                if !inner
+                    .native_terminals
+                    .iter()
+                    .any(|(thread, _)| thread == &old.0)
+                {
+                    inner.idle_threads.remove(&old.0);
+                }
             }
         }
+    }
+}
+
+fn record_active(inner: &mut Inner, thread: &str, turn: &str) {
+    let was_idle = inner.idle_threads.remove(thread);
+    let previous = inner
+        .active_turn_ids
+        .insert(thread.to_string(), turn.to_string());
+    if was_idle || previous.as_deref() != Some(turn) {
+        inner.fact_revision += 1;
+    }
+}
+
+fn clear_authority(inner: &mut Inner, thread: &str) {
+    let active = inner.active_turn_ids.remove(thread).is_some();
+    let idle = inner.idle_threads.remove(thread);
+    if active || idle {
+        inner.fact_revision += 1;
     }
 }
 

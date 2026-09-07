@@ -1,6 +1,48 @@
 use super::*;
 
 #[tokio::test]
+async fn close_observation_is_binding_local_and_registration_after_eof_is_not_lost() {
+    use super::super::turn_completion::CodexTurnTracker;
+    use nexus_contracts::TurnState;
+    for install_after_close in [false, true] {
+        let (client, server) = tokio::io::duplex(8192);
+        let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut socket = tokio_tungstenite::accept_async(server).await.unwrap();
+            close_rx.await.unwrap();
+            socket.close(None).await.unwrap();
+        });
+        let rpc = JsonRpc::connect_stream(UDS_WEBSOCKET_HANDSHAKE_URL, Box::new(client), None)
+            .await
+            .unwrap();
+        let root = CodexTurnTracker::default();
+        let old = root.new_owner(Some("thread".into()));
+        assert!(old.publish_owner("thread"));
+        let replacement = root.new_owner(Some("thread".into()));
+        assert!(replacement.publish_owner("thread"));
+        let before = replacement.observe_turn("thread");
+        if !install_after_close {
+            let old = old.clone();
+            rpc.install_close_observer(Arc::new(move || old.observe_disconnect()));
+        }
+        close_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !rpc.reader.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if install_after_close {
+            let old = old.clone();
+            rpc.install_close_observer(Arc::new(move || old.observe_disconnect()));
+        }
+        assert_eq!(old.observe_turn("thread").state, TurnState::Unavailable);
+        assert_eq!(replacement.observe_turn("thread"), before);
+    }
+}
+
+#[tokio::test]
 async fn owner_is_checked_after_blocked_writer_readiness_not_before_it() {
     let (client, server) = tokio::io::duplex(8192);
     let release = Arc::new(tokio::sync::Notify::new());

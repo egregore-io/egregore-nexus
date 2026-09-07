@@ -142,6 +142,28 @@ type PendingMap =
     Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<Result<Value, CodexRpcError>>>>>;
 pub(super) type NativeIngress = Arc<dyn Fn(&Notification) + Send + Sync>;
 
+type CloseObserver = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct CloseObservation {
+    closed: bool,
+    observer: Option<CloseObserver>,
+}
+
+fn observe_closed(state: &std::sync::Mutex<CloseObservation>) {
+    let observer = {
+        let mut state = state.lock().unwrap();
+        if state.closed {
+            return;
+        }
+        state.closed = true;
+        state.observer.clone()
+    };
+    if let Some(observer) = observer {
+        observer();
+    }
+}
+
 struct PendingRequest {
     pending: PendingMap,
     id: u64,
@@ -176,10 +198,12 @@ pub struct JsonRpc {
     notif_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<Notification>>>,
     ingress: Arc<std::sync::Mutex<Option<NativeIngress>>>,
     reader: tokio::task::AbortHandle,
+    close_observation: Arc<std::sync::Mutex<CloseObservation>>,
 }
 
 impl Drop for JsonRpc {
     fn drop(&mut self) {
+        observe_closed(&self.close_observation);
         self.reader.abort();
     }
 }
@@ -272,6 +296,7 @@ impl JsonRpc {
         let writer = Arc::new(Mutex::new(sink));
         let pending: PendingMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let ingress = Arc::new(std::sync::Mutex::new(ingress));
+        let close_observation = Arc::new(std::sync::Mutex::new(CloseObservation::default()));
         let (notif_tx, notif_rx) = mpsc::unbounded_channel();
 
         // Spawn the reader task.
@@ -279,8 +304,10 @@ impl JsonRpc {
             let pending = Arc::clone(&pending);
             let notif_tx = notif_tx.clone();
             let ingress = ingress.clone();
+            let closed = close_observation.clone();
             tokio::spawn(async move {
                 reader_task(stream, pending, notif_tx, ingress).await;
+                observe_closed(&closed);
             })
             .abort_handle()
         };
@@ -293,6 +320,7 @@ impl JsonRpc {
             notif_rx: std::sync::Mutex::new(Some(notif_rx)),
             ingress,
             reader,
+            close_observation,
         })
     }
 
@@ -306,6 +334,21 @@ impl JsonRpc {
         let mut slot = self.ingress.lock().unwrap();
         if slot.is_none() {
             *slot = Some(ingress);
+        }
+    }
+
+    /// Install the binding-local lifecycle observer, including an EOF that raced registration.
+    pub(super) fn install_close_observer(&self, observer: CloseObserver) {
+        let already_closed = {
+            let mut state = self.close_observation.lock().unwrap();
+            if state.observer.is_some() {
+                return;
+            }
+            state.observer = Some(observer.clone());
+            state.closed
+        };
+        if already_closed {
+            observer();
         }
     }
 

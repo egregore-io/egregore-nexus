@@ -1558,6 +1558,7 @@ name = "nexus-pty"
 version = "0.1.6-beta.2"
 dependencies = [
  "async-trait",
+ "nexus-contracts",
  "nexus-harness-claude",
  "nexus-harness-codex",
  "portable-pty",

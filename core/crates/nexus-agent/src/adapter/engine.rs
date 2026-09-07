@@ -46,7 +46,7 @@ use agent_client_protocol::schema::v1::{
     SelectedPermissionOutcome, SessionId, SessionNotification, SessionUpdate, TextContent,
 };
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::{Agent, Client, ConnectionTo};
+use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Handled};
 use nexus_acp_stream::{translate, StreamEvent};
 use tokio::process::Command;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
@@ -55,7 +55,7 @@ use tracing::{debug, info, warn};
 
 use nexus_common::process_ids::runtime_process_ids_for_pid;
 use nexus_common::{NexusError, RuntimeProcessIds};
-use nexus_contracts::HarnessId;
+use nexus_contracts::{HarnessId, TurnObservation, TurnObservationStamp, TurnState};
 
 use super::provider_limit::classify_acp_prompt_error;
 use super::{AdapterInjectError, AdapterOperatorAction};
@@ -1028,10 +1028,95 @@ fn is_hermes_busy_queue_ack(event: &StreamEvent) -> bool {
             .data
             .get("text")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|text| {
-                let text = text.trim();
-                text.starts_with("Queued for the next turn. (") && text.ends_with(" queued)")
-            })
+            .is_some_and(is_private_queue_ack_text)
+}
+
+fn is_private_queue_ack_text(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with("Queued for the next turn. (") && text.ends_with(" queued)")
+}
+
+fn is_queue_backed_harness(harness: Option<&HarnessId>) -> bool {
+    harness.is_some_and(|h| h.as_str() == "hermes")
+}
+
+/// Bounded evidence independent of caller lifetime, reply buffers and local turn locks.
+/// A newer request over unresolved work permanently loses single-request completion authority
+/// for this binding; no request registry or guessed native start state is maintained.
+struct PromptEvidence {
+    connection: String,
+    owner: String,
+    revision: u64,
+    state: TurnState,
+    current_request: Option<serde_json::Value>,
+    older_unresolved: bool,
+    queue_ack: bool,
+}
+
+impl PromptEvidence {
+    fn new() -> Self {
+        Self {
+            connection: nexus_common::new_binding_id(),
+            owner: nexus_common::new_binding_id(),
+            revision: 0,
+            state: TurnState::Unavailable,
+            current_request: None,
+            older_unresolved: false,
+            queue_ack: false,
+        }
+    }
+
+    fn reset_binding(&mut self) {
+        self.owner = nexus_common::new_binding_id();
+        self.revision = 0;
+        if self.state != TurnState::Unavailable {
+            self.state = TurnState::Unknown;
+        }
+        self.current_request = None;
+        self.older_unresolved = false;
+        self.queue_ack = false;
+    }
+
+    fn submitted(&mut self, id: serde_json::Value) {
+        self.older_unresolved |= self.current_request.is_some();
+        self.current_request = Some(id);
+        self.queue_ack = false;
+        self.state = TurnState::Unknown;
+        self.revision += 1;
+    }
+
+    fn response(&mut self, id: &serde_json::Value, completed: bool) {
+        if self.state == TurnState::Unavailable || self.current_request.as_ref() != Some(id) {
+            return;
+        }
+        if completed {
+            self.current_request = None;
+            self.state = if self.older_unresolved {
+                TurnState::Unknown
+            } else {
+                TurnState::VerifiedIdle
+            };
+        }
+        self.revision += 1;
+    }
+
+    fn disconnected(&mut self, connection: &str) {
+        if self.connection == connection && self.state != TurnState::Unavailable {
+            self.state = TurnState::Unavailable;
+            self.revision += 1;
+        }
+    }
+
+    fn snapshot(&self) -> TurnObservation {
+        TurnObservation {
+            state: self.state,
+            stamp: Some(TurnObservationStamp {
+                owner: self.owner.clone(),
+                revision: self.revision,
+            }),
+            ..Default::default()
+        }
+    }
 }
 
 /// A live, initialized ACP connection plus the harness's assigned session id.
@@ -1047,6 +1132,7 @@ struct LiveConn {
 
 /// The real ACP engine. One per launched harness; cheaply shareable (`Arc<dyn Adapter>` wraps it).
 pub struct AcpEngine {
+    evidence: Arc<Mutex<PromptEvidence>>,
     /// The live connection, populated by [`AcpEngine::spawn_and_initialize`]. Behind an async
     /// mutex so the `&self` adapter methods can mutate the recorded session id.
     conn: AsyncMutex<Option<LiveConn>>,
@@ -1096,6 +1182,7 @@ impl AcpEngine {
     /// A fresh, unconnected engine.
     pub fn new() -> Self {
         Self {
+            evidence: Arc::new(Mutex::new(PromptEvidence::new())),
             conn: AsyncMutex::new(None),
             turn_lock: AsyncMutex::new(()),
             cancel_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1116,6 +1203,11 @@ impl AcpEngine {
             harness: Some(harness),
             ..Self::new()
         }
+    }
+
+    /// Read protocol evidence only; absence of a locally active call never proves native idle.
+    pub fn observe_turn(&self) -> TurnObservation {
+        self.evidence.lock().unwrap().snapshot()
     }
 
     /// Override the ACP session-open deadline for an embedded engine.
@@ -1241,6 +1333,11 @@ impl AcpEngine {
     /// Nexus is a child subreaper and explicitly collects descendants orphaned by a wrapper exit;
     /// the returned future resolves only after bounded group shutdown completes or is reported.
     pub async fn kill(&self) {
+        {
+            let mut evidence = self.evidence.lock().unwrap();
+            let connection = evidence.connection.clone();
+            evidence.disconnected(&connection);
+        }
         // Backstop: if kill fires during the initialize handshake before run_connection has taken
         // the child out of the Arc, directly kill it here.
         let early_child = {
@@ -1362,11 +1459,20 @@ impl AcpEngine {
         *self.child.lock().unwrap() = Some(child);
         let child_arc = Arc::clone(&self.child);
 
+        let connection_owner = {
+            let mut evidence = self.evidence.lock().unwrap();
+            *evidence = PromptEvidence::new();
+            evidence.state = TurnState::Unknown;
+            evidence.connection.clone()
+        };
         tokio::spawn(run_connection(
             stdin,
             stdout,
             child_arc,
             Arc::clone(&self.updates),
+            Arc::clone(&self.evidence),
+            connection_owner,
+            is_queue_backed_harness(self.harness.as_ref()),
             init_tx,
             ready_tx,
             shutdown_rx,
@@ -1433,6 +1539,7 @@ impl AcpEngine {
             {
                 Ok(Ok(resp)) => {
                     live.session_id = Some(resp.session_id);
+                    self.evidence.lock().unwrap().reset_binding();
                     return Ok(());
                 }
                 Ok(Err(error)) => {
@@ -1469,7 +1576,20 @@ impl AcpEngine {
             )
             .await
             {
-                Ok(Ok(_)) => live.session_id = Some(session_id),
+                Ok(Ok(_)) => {
+                    let mut evidence = self.evidence.lock().unwrap();
+                    if live.session_id.as_ref() == Some(&session_id) {
+                        // A load ACK on this same native session is not a lifecycle reset.
+                        // It cannot forget a cancelled/dropped unresolved request.
+                        if evidence.state == TurnState::VerifiedIdle {
+                            evidence.state = TurnState::Unknown;
+                            evidence.revision += 1;
+                        }
+                    } else {
+                        evidence.reset_binding();
+                    }
+                    live.session_id = Some(session_id);
+                }
                 Ok(Err(error)) => {
                     return Err(NexusError::Adapter(format!("session/load failed: {error}")))
                 }
@@ -1488,11 +1608,7 @@ impl AcpEngine {
         // starts immediately, its observed-delivery snapshot mistakes that replay for a fresh model
         // response and can settle mail that never reached the new context. Drain to a bounded quiet
         // boundary before exposing the resumed session to prompt injection, then discard the replay.
-        if self
-            .harness
-            .as_ref()
-            .is_some_and(|h| h.as_str() == "hermes")
-        {
+        if is_queue_backed_harness(self.harness.as_ref()) {
             wait_for_activity_quiescence(&self.updates, load_replay_settle_window()).await;
             self.updates.reset_buffer();
         }
@@ -1574,7 +1690,7 @@ impl AcpEngine {
         let activity = Arc::clone(&self.updates);
         let model_events_before = activity.model_events();
 
-        let (connection, session_id) = {
+        let (connection, session_id, owner) = {
             let guard = self.conn.lock().await;
             let live = guard
                 .as_ref()
@@ -1582,7 +1698,11 @@ impl AcpEngine {
             let session_id = live.session_id.clone().ok_or_else(|| {
                 NexusError::Adapter("no active session (open or resume first)".into())
             })?;
-            (live.connection.clone(), session_id)
+            (
+                live.connection.clone(),
+                session_id,
+                self.evidence.lock().unwrap().owner.clone(),
+            )
         };
         let acp_session = session_id.0.clone();
         let require_terminal_response = strict || accepted_event.is_some();
@@ -1598,10 +1718,19 @@ impl AcpEngine {
             "sending ACP session/prompt; awaiting permitted turn-completion evidence"
         );
         let expected_prompt = prompt.clone();
-        let prompt_turn = connection.send_request(PromptRequest::new(
-            session_id,
-            vec![ContentBlock::Text(TextContent::new(prompt))],
-        ));
+        let prompt_turn = {
+            // SDK submission and actual request-id registration share this short lock. The
+            // receive handler cannot race a response ahead of its evidence registration.
+            let mut evidence = self.evidence.lock().unwrap();
+            let sent = connection.send_request(PromptRequest::new(
+                session_id,
+                vec![ContentBlock::Text(TextContent::new(prompt))],
+            ));
+            if evidence.owner == owner && evidence.state != TurnState::Unavailable {
+                evidence.submitted(sent.id());
+            }
+            sent
+        };
         if let Some(event) = accepted_event {
             self.updates.push_event(event);
         }
@@ -1616,12 +1745,7 @@ impl AcpEngine {
         let prompt_outcome = async {
             if strict {
                 TurnEnd::Response(prompt_response.await)
-            } else if require_terminal_response
-                && self
-                    .harness
-                    .as_ref()
-                    .is_some_and(|h| h.as_str() == "hermes")
-            {
+            } else if require_terminal_response && is_queue_backed_harness(self.harness.as_ref()) {
                 tokio::select! {
                     // Canonical Hermes completion remains preferred when available.
                     response = &mut prompt_response => {
@@ -1733,10 +1857,7 @@ impl AcpEngine {
                 // Hermes may acknowledge only its private queue while unrelated model output
                 // is still arriving. Neither that output nor this ACK proves strict completion.
                 if strict
-                    && self
-                        .harness
-                        .as_ref()
-                        .is_some_and(|h| h.as_str() == "hermes")
+                    && is_queue_backed_harness(self.harness.as_ref())
                     && response.usage.is_none()
                     && activity.has_hermes_busy_queue_ack()
                 {
@@ -1764,10 +1885,7 @@ impl AcpEngine {
                 // operator-action error and is never retried automatically. Direct/legacy drive
                 // keeps its existing empty-turn behavior.
                 if require_terminal_response
-                    && self
-                        .harness
-                        .as_ref()
-                        .is_some_and(|h| h.as_str() == "hermes")
+                    && is_queue_backed_harness(self.harness.as_ref())
                     && model_events == 0
                     && !provider_input_observed
                 {
@@ -2018,6 +2136,9 @@ async fn run_connection(
     stdout: tokio::process::ChildStdout,
     child_arc: Arc<Mutex<Option<tokio::process::Child>>>,
     updates: Arc<TurnActivity>,
+    evidence: Arc<Mutex<PromptEvidence>>,
+    connection_owner: String,
+    queue_backed: bool,
     init_tx: oneshot::Sender<Result<(), NexusError>>,
     ready_tx: oneshot::Sender<ConnectionTo<Agent>>,
     shutdown_rx: oneshot::Receiver<()>,
@@ -2033,10 +2154,50 @@ async fn run_connection(
     let connect = Client
         .builder()
         .name("nexus-agent")
+        .on_receive_dispatch(
+            {
+                let evidence = evidence.clone();
+                let connection_owner = connection_owner.clone();
+                async move |dispatch: Dispatch, _cx: ConnectionTo<Agent>| {
+                    let mut facts = evidence.lock().unwrap();
+                    if facts.connection == connection_owner {
+                        if let Dispatch::Response(result, router) = &dispatch {
+                            if router.method() == "session/prompt" {
+                                let completed = result.as_ref().ok()
+                                    .and_then(|value| serde_json::from_value::<PromptResponse>(value.clone()).ok())
+                                    .is_some_and(|response| {
+                                        response.stop_reason != agent_client_protocol::schema::v1::StopReason::Cancelled
+                                            && !(queue_backed && response.usage.is_none() && facts.queue_ack)
+                                    });
+                                facts.response(&router.id(), completed);
+                            }
+                        }
+                    }
+                    // Observation must not claim, rewrite or settle the SDK response.
+                    Ok(Handled::No { message: dispatch, retry: false })
+                }
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
         .on_receive_notification(
             {
                 let updates = Arc::clone(&updates);
+                let evidence = evidence.clone();
+                let connection_owner = connection_owner.clone();
                 async move |notification: SessionNotification, _cx: ConnectionTo<Agent>| {
+                    if queue_backed {
+                        if let SessionUpdate::AgentMessageChunk(chunk) = &notification.update {
+                            if let ContentBlock::Text(text) = &chunk.content {
+                                if is_private_queue_ack_text(&text.text) {
+                                    let mut facts = evidence.lock().unwrap();
+                                    if facts.connection == connection_owner && facts.state != TurnState::Unavailable && facts.current_request.is_some() && !facts.queue_ack {
+                                        facts.queue_ack = true;
+                                        facts.revision += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     // Full-stream pass-through (backend plan 50): translate EVERY `session/update`
                     // and buffer every renderable one — text, thinking, tool calls, plans, the
                     // harness's available commands — no AgentMessageChunk-only drop. A
@@ -2121,15 +2282,18 @@ async fn run_connection(
         Some(ref mut c) => {
             tokio::select! {
                 result = connect => {
+                    evidence.lock().unwrap().disconnected(&connection_owner);
                     if let Err(e) = result {
                         debug!(error = %e, "ACP connection closed with error");
                     }
                     terminate_child_process_tree(c, PROCESS_TREE_TERM_GRACE, "connection closed").await;
                 }
                 status = c.wait() => {
+                    evidence.lock().unwrap().disconnected(&connection_owner);
                     debug!(?status, "harness process exited; ending ACP connection");
                 }
                 completion = kill_signal_rx => {
+                    evidence.lock().unwrap().disconnected(&connection_owner);
                     // engine.kill() was called. Terminate the whole process group so wrapper
                     // descendants cannot re-parent to init and survive the direct child.
                     terminate_child_process_tree(c, PROCESS_TREE_TERM_GRACE, "kill signal").await;
@@ -2154,6 +2318,7 @@ async fn run_connection(
     // Signal that the connection has ended. During the launch race this fails the handshake
     // fast (harness crashed on startup); after a healthy launch the receiver is long gone and
     // this is a harmless no-op.
+    evidence.lock().unwrap().disconnected(&connection_owner);
     let _ = closed_tx.send(());
 }
 

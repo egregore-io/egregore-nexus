@@ -52,6 +52,7 @@ pub struct ClaudeTurnCompletion {
 }
 
 struct ClaudeActivity {
+    revision: u64,
     valid_owner: bool,
     native_session: Option<String>,
     offset: u64,
@@ -131,6 +132,7 @@ impl ClaudeTurnCompletion {
             adopting: false,
             hook_log: Mutex::new(hook_log),
             activity: Mutex::new(ClaudeActivity {
+                revision: 0,
                 valid_owner: true,
                 native_session,
                 offset,
@@ -150,6 +152,29 @@ impl ClaudeTurnCompletion {
     pub fn is_current(&self) -> bool {
         self.activity.lock().unwrap().valid_owner
     }
+
+    /// One atomic, binding-owned snapshot. Ambiguous/truncated facts remain unknown even when
+    /// an older open record is retained for conservative existing completion waits.
+    pub fn observe_turn(&self) -> nexus_contracts::TurnObservation {
+        use nexus_contracts::{TurnObservation, TurnObservationStamp, TurnState};
+        let state = self.activity.lock().unwrap();
+        TurnObservation {
+            state: if !state.valid_owner {
+                TurnState::Unavailable
+            } else if state.unknown {
+                TurnState::Unknown
+            } else if state.open.is_some() {
+                TurnState::NativeOpen
+            } else {
+                TurnState::VerifiedIdle
+            },
+            stamp: Some(TurnObservationStamp {
+                owner: self.owner.to_string(),
+                revision: state.revision,
+            }),
+            ..Default::default()
+        }
+    }
     pub(crate) fn for_adoption(hook_log: Option<PathBuf>) -> Self {
         Self {
             adopting: true,
@@ -167,13 +192,19 @@ impl ClaudeTurnCompletion {
         self.activity.lock().unwrap().unknown
     }
     pub fn invalidate(&self) {
-        self.activity.lock().unwrap().valid_owner = false;
+        let mut state = self.activity.lock().unwrap();
+        if state.valid_owner {
+            state.valid_owner = false;
+            state.revision += 1;
+        }
+        drop(state);
         self.notify.notify_waiters();
         self.submission_notify.notify_waiters();
     }
     pub(crate) fn attach_resume_identity(&self, native_session: Option<String>) {
         let mut state = self.activity.lock().unwrap();
         if self.adopting && state.valid_owner && state.native_session.is_none() {
+            state.revision += u64::from(native_session.is_some());
             state.native_session = native_session;
         }
     }
@@ -184,6 +215,7 @@ impl ClaudeTurnCompletion {
         }
         let mut source = self.hook_log.lock().unwrap();
         if source.as_ref() != Some(&path) {
+            state.revision += 1;
             // Adoption can resolve a non-default sidecar path only after an awaited store read.
             // Historical bytes at that newly attached source cannot establish fresh activity.
             state.offset =
@@ -349,6 +381,8 @@ impl ClaudeHookObservationSink for ClaudeTurnCompletion {
             return;
         }
         if file_len.is_none_or(|len| len < state.offset) {
+            state.revision +=
+                u64::from(!state.unknown || (!state.ambiguous && state.open.is_some()));
             state.unknown = true;
             state.ambiguous |= state.open.is_some();
             // A truncated source cannot close established work, even after cursor rewind.
@@ -359,6 +393,7 @@ impl ClaudeHookObservationSink for ClaudeTurnCompletion {
             if record.end_offset <= state.offset {
                 continue;
             }
+            state.revision += 1;
             state.offset = record.end_offset;
             if !record.valid {
                 state.unknown = true;
@@ -431,6 +466,7 @@ impl ClaudeHookObservationSink for ClaudeTurnCompletion {
             }
         }
         if !complete {
+            state.revision += u64::from(!state.unknown);
             state.unknown = true;
         }
         self.notify.notify_waiters();

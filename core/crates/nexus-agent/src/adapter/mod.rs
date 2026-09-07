@@ -175,6 +175,14 @@ pub trait Adapter: Send + Sync {
         SteerCapability::None
     }
 
+    /// Native turn evidence only; legacy adapters do not manufacture an idle stamp.
+    fn observe_turn(&self) -> nexus_contracts::TurnObservation {
+        nexus_contracts::TurnObservation {
+            steer_capability: self.steer_capability(),
+            ..Default::default()
+        }
+    }
+
     /// Interrupt the adapter's active turn. Real ACP adapters map this to `session/cancel`.
     async fn interrupt_active_turn(&self) -> Result<(), NexusError> {
         Err(NexusError::Adapter(

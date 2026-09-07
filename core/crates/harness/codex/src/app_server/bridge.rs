@@ -702,9 +702,11 @@ async fn create_and_bind_thread(
             ))
             .await?,
     );
+    let before_start = attempt.0.owner.native_revision();
     let thread_id = attempt
         .setup(client.thread_start_in(cwd.as_deref().and_then(Path::to_str)))
         .await?;
+    attempt.0.owner.seed_idle(&thread_id, before_start);
 
     if !attempt.is_current() {
         return Err(stale_binding());
@@ -865,6 +867,26 @@ async fn bind_thread(
         return Err(stale_binding());
     }
     let resumed_active_turn = resumed_active_turn_id(&resume, &thread_id)?;
+    // The legacy empty-object response is deliberately not idle authority.
+    if resumed_active_turn.is_none()
+        && resume
+            .get("thread")
+            .and_then(|thread| thread.get("turns"))
+            .and_then(Value::as_array)
+            .is_some_and(|turns| {
+                turns.iter().all(|turn| {
+                    turn.get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| !id.is_empty())
+                        && matches!(
+                            turn.get("status").and_then(Value::as_str),
+                            Some("completed" | "interrupted" | "failed")
+                        )
+                })
+            })
+    {
+        attempt.0.owner.seed_idle(&thread_id, before_resume);
+    }
     attempt
         .0
         .owner

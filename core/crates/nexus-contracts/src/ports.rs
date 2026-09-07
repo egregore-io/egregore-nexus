@@ -591,6 +591,15 @@ pub trait AgentTurnExecutionPort: Send + Sync {
         crate::SteerCapability::None
     }
 
+    /// Read native evidence without I/O or changing execution authority. Legacy implementations
+    /// are unknown, not verified idle, and do not invent a binding/revision stamp.
+    fn observe_turn(&self, recipient: &SessionId) -> crate::TurnObservation {
+        crate::TurnObservation {
+            steer_capability: self.steer_capability(recipient),
+            ..Default::default()
+        }
+    }
+
     /// Interrupt the adapter's active turn. Implementations must address the adapter's own turn
     /// authority (ACP `session/cancel`, terminal interrupt, etc.), never presence or UI state.
     async fn interrupt_active_turn(&self, _recipient: &SessionId) -> PortResult<()> {

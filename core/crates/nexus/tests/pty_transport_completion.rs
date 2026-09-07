@@ -23,6 +23,36 @@ impl HarnessInput for AcceptedOnlyHarness {
 
 struct NoopSink;
 
+#[tokio::test]
+async fn legacy_observation_is_unknown_and_never_holds_completion_or_dispatch() {
+    let session = SessionId("unknown-terminal".into());
+    let transport = PtyTransport::default();
+    let harness = Arc::new(AcceptedOnlyHarness::default());
+    assert_eq!(
+        transport.observe_turn(&session).state,
+        nexus_contracts::TurnState::Unavailable
+    );
+    transport.bind(session.clone(), harness.clone());
+    let observation = transport.observe_turn(&session);
+    assert_eq!(observation.state, nexus_contracts::TurnState::Unknown);
+    assert_eq!(observation.stamp, None);
+    assert_eq!(
+        observation.steer_capability,
+        transport.steer_capability(&session)
+    );
+    assert!(transport.active_turn_sessions().is_empty());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        transport.wait_for_turn_completion(&session),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    transport.prompt(&session, "legacy".into()).await.unwrap();
+    assert_eq!(harness.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(transport.observe_turn(&session), observation);
+}
+
 #[async_trait]
 impl EventSink for NoopSink {
     async fn emit(&self, _event: WsEvent) {}

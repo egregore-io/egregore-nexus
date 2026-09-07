@@ -402,6 +402,10 @@ fn claude_raw_draft_in_input_box(screen: &str, first: &str, last: &str) -> bool 
 
 #[async_trait]
 impl HarnessInput for ClaudeNativeHarness {
+    fn observe_turn(&self) -> nexus_contracts::TurnObservation {
+        self.completion.observe_turn()
+    }
+
     fn has_observed_open_turn(&self) -> bool {
         self.completion.has_open_turn()
     }

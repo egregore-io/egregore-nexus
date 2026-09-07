@@ -789,6 +789,23 @@ impl AgentTurnExecutionPort for CodexAppServerTransport {
         }
     }
 
+    fn observe_turn(&self, recipient: &SessionId) -> nexus_contracts::TurnObservation {
+        let sessions = self.sessions.lock().unwrap();
+        match sessions
+            .get(recipient)
+            .and_then(|slot| slot.binding.as_ref())
+        {
+            Some(binding) => nexus_contracts::TurnObservation {
+                steer_capability: SteerCapability::NativeSteer,
+                ..binding.tracker.observe_turn(&binding.thread_id)
+            },
+            None => nexus_contracts::TurnObservation {
+                state: nexus_contracts::TurnState::Unavailable,
+                ..Default::default()
+            },
+        }
+    }
+
     async fn compact(&self, recipient: &SessionId) -> PortResult<()> {
         CodexAppServerTransport::compact(self, recipient).await
     }

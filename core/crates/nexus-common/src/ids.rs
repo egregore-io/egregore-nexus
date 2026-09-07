@@ -7,6 +7,11 @@ fn gen(prefix: &str) -> String {
     format!("{prefix}{}", Uuid::new_v4().simple())
 }
 
+/// A fresh opaque runtime binding incarnation, never a session identity or reset counter.
+pub fn new_binding_id() -> String {
+    gen("b_")
+}
+
 /// A fresh `m_…` message id.
 pub fn new_message_id() -> MessageId {
     MessageId(gen("m_"))

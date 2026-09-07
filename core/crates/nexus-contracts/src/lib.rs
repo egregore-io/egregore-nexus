@@ -155,7 +155,7 @@ pub use prompt::{
     CommandQueueMutationResponse, CommandQueueReceipt, CommandQueueSnapshot, CommandQueueState,
     CommandQueueTransition, CompactRequest, CompactResponse, InterruptRequest, InterruptResponse,
     PromptRequest, PromptResponse, SteerCapability, SteerDelivery, SteerRequest, SteerResponse,
-    WarmRequest, WarmResponse,
+    TurnObservation, TurnObservationStamp, TurnState, WarmRequest, WarmResponse,
 };
 pub use register::{
     HeartbeatRequest, HeartbeatResponse, MemberListRequest, MemberListResponse, MemberSummary,

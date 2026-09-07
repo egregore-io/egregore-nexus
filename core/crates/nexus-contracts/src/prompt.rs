@@ -446,3 +446,38 @@ pub struct InterruptResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<SessionId>,
 }
+/// Internal adapter evidence, not a serialized command or a scheduler busy bit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TurnState {
+    VerifiedIdle,
+    NativeOpen,
+    #[default]
+    Unknown,
+    Unavailable,
+}
+
+/// Opaque binding incarnation and its fact revision. Reads never advance this stamp.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnObservationStamp {
+    pub owner: String,
+    pub revision: u64,
+}
+
+/// Synchronous transport-owned evidence. Unknown preserves legacy dispatch; it is not idle
+/// authority and must not itself enter active-turn lists or keep shutdown waiting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnObservation {
+    pub state: TurnState,
+    pub stamp: Option<TurnObservationStamp>,
+    pub steer_capability: SteerCapability,
+}
+
+impl Default for TurnObservation {
+    fn default() -> Self {
+        Self {
+            state: TurnState::Unknown,
+            stamp: None,
+            steer_capability: SteerCapability::None,
+        }
+    }
+}

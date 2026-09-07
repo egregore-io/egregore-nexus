@@ -554,6 +554,15 @@ impl AgentTurnExecutionPort for Agent {
         self.active_turns.sessions()
     }
 
+    fn observe_turn(&self, recipient: &SessionId) -> nexus_contracts::TurnObservation {
+        self.adapter_for(recipient)
+            .map(|adapter| adapter.observe_turn())
+            .unwrap_or_else(|_| nexus_contracts::TurnObservation {
+                state: nexus_contracts::TurnState::Unavailable,
+                ..Default::default()
+            })
+    }
+
     async fn wait_for_turn_completion(&self, recipient: &SessionId) -> Result<(), ContractError> {
         self.active_turns.wait_for_completion(recipient).await;
         Ok(())
