@@ -70,6 +70,108 @@ fn unique_session(label: &str) -> SessionId {
     SessionId(format!("s_{label}_{nanos}"))
 }
 
+struct ParkDisplay {
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+#[async_trait]
+impl EventSink for ParkDisplay {
+    async fn emit(&self, _: WsEvent) {
+        self.entered.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+    }
+}
+
+#[tokio::test]
+async fn native_hook_activity_is_ingested_before_blocked_display() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let session = unique_session("ingress");
+    let paths = seed_active_claude_runtime(store.clone(), session.clone()).await;
+    std::fs::write(&paths.hook_log_path, concat!(
+        "{\"event\":\"SessionStart\",\"session_id\":\"native\"}\n",
+        "{\"event\":\"UserPromptSubmit\",\"session_id\":\"native\",\"prompt_id\":\"A\",\"prompt\":\"manual\"}\n",
+        "{\"event\":\"Stop\",\"session_id\":\"native\",\"prompt_id\":\"A\"}\n"
+    )).unwrap();
+    let completion = Arc::new(ClaudeTurnCompletion::default());
+    let display = Arc::new(ParkDisplay {
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let task = spawn_claude_native_forwarder_with_tool_events(
+        store,
+        session,
+        paths,
+        display.clone(),
+        Bell::new(),
+        10,
+        None,
+        Some(completion.clone()),
+    );
+    tokio::time::timeout(Duration::from_secs(2), display.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let facts = (completion.submission_snapshot(), completion.snapshot());
+    task.abort();
+    assert_eq!(
+        facts,
+        (1, 1),
+        "display must not delay already-read native facts"
+    );
+}
+
+#[tokio::test]
+async fn late_stop_for_a_does_not_complete_the_newer_b_turn() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let session = unique_session("late-stop");
+    let paths = seed_active_claude_runtime(store.clone(), session.clone()).await;
+    std::fs::write(&paths.hook_log_path, concat!(
+        "{\"event\":\"SessionStart\",\"session_id\":\"native\"}\n",
+        "{\"event\":\"UserPromptSubmit\",\"session_id\":\"native\",\"prompt_id\":\"A\",\"prompt\":\"A\"}\n",
+        "{\"event\":\"UserPromptSubmit\",\"session_id\":\"native\",\"prompt_id\":\"B\",\"prompt\":\"B\"}\n",
+        "{\"event\":\"Stop\",\"session_id\":\"native\",\"prompt_id\":\"A\"}\n"
+    )).unwrap();
+    let completion = Arc::new(ClaudeTurnCompletion::default());
+    let sink = CaptureSink::default();
+    let task = spawn_claude_native_forwarder_with_tool_events(
+        store.clone(),
+        session.clone(),
+        paths,
+        Arc::new(sink.clone()),
+        Bell::new(),
+        10,
+        None,
+        Some(completion.clone()),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while sink.events.lock().unwrap().len() < 3 {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    // Cursor persistence acknowledges the complete pass, not merely a spawned task.
+    while ClaudeRuntimeStateRepo::new(&store)
+        .find_by_runtime_id(&session)
+        .await
+        .unwrap()
+        .unwrap()
+        .hook_cursor
+        == 0
+    {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    task.abort();
+    assert_eq!(
+        completion.snapshot(),
+        0,
+        "late A Stop cannot release B's completion wait"
+    );
+}
+
 #[tokio::test]
 async fn claude_turn_completion_waits_for_a_later_terminal_boundary() {
     let completion = Arc::new(ClaudeTurnCompletion::default());
@@ -118,7 +220,10 @@ async fn claude_forwarder_signals_a_structured_user_prompt_submission() {
     store.migrate().await.unwrap();
     let session = unique_session("claude_submit_signal");
     let paths = seed_active_claude_runtime(store.clone(), session.clone()).await;
-    let completion = Arc::new(ClaudeTurnCompletion::default());
+    let completion = Arc::new(ClaudeTurnCompletion::new(
+        Some("claude-real".into()),
+        Some(paths.hook_log_path.clone()),
+    ));
     let observed = completion.submission_snapshot();
     let handle = spawn_claude_native_forwarder_with_tool_events(
         store,
@@ -150,7 +255,10 @@ async fn claude_programmatic_prompt_emits_one_caller_bound_user_input() {
     store.migrate().await.unwrap();
     let session = unique_session("claude_caller_bound_input");
     let paths = seed_active_claude_runtime(store.clone(), session.clone()).await;
-    let completion = Arc::new(ClaudeTurnCompletion::default());
+    let completion = Arc::new(ClaudeTurnCompletion::new(
+        Some("claude-real".into()),
+        Some(paths.hook_log_path.clone()),
+    ));
     let sink = CaptureSink::default();
     let accepted = WsEvent::AgentUpdate {
         session_id: session.clone(),
@@ -202,7 +310,10 @@ async fn claude_manual_prompt_does_not_consume_a_different_programmatic_receipt(
     store.migrate().await.unwrap();
     let session = unique_session("claude_manual_input");
     let paths = seed_active_claude_runtime(store.clone(), session.clone()).await;
-    let completion = Arc::new(ClaudeTurnCompletion::default());
+    let completion = Arc::new(ClaudeTurnCompletion::new(
+        Some("claude-real".into()),
+        Some(paths.hook_log_path.clone()),
+    ));
     let sink = CaptureSink::default();
     let accepted = WsEvent::AgentUpdate {
         session_id: session.clone(),

@@ -285,6 +285,12 @@ impl HarnessInput for ClaudeRawPtyInput {
             ));
         }
 
+        if !self.completion.is_current() {
+            return Err("native binding was replaced".into());
+        }
+        if self.completion.has_open_turn() {
+            return Err("native turn is already open".into());
+        }
         let observed_submission = self.completion.submission_snapshot();
         let writer = self.terminal.attach().writer;
         // Match the proven tmux sequence: clear any stale draft, commit one bracketed paste, then
@@ -396,7 +402,23 @@ fn claude_raw_draft_in_input_box(screen: &str, first: &str, last: &str) -> bool 
 
 #[async_trait]
 impl HarnessInput for ClaudeNativeHarness {
+    fn has_observed_open_turn(&self) -> bool {
+        self.completion.has_open_turn()
+    }
+    async fn wait_for_observed_turn_completion(&self) {
+        self.completion.wait_for_idle().await;
+    }
+    fn invalidate_observation_owner(&self) {
+        self.completion.invalidate();
+    }
+
     async fn send_turn(&self, text: &str) -> Result<(), String> {
+        if !self.completion.is_current() {
+            return Err("native binding was replaced".into());
+        }
+        if self.completion.has_open_turn() {
+            return Err("native turn is already open".into());
+        }
         let observed = self.completion.snapshot();
         self.input.send_turn(text).await?;
         self.completion
@@ -409,12 +431,15 @@ impl HarnessInput for ClaudeNativeHarness {
         text: &str,
         observer: Arc<dyn TurnAcceptanceObserver>,
     ) -> Result<(), String> {
-        let accepted = self.completion.register_accepted_input(text, observer);
-        self.send_turn(text).await?;
-        if !accepted.was_accepted() {
-            return Err("native turn completed without its exact UserPromptSubmit receipt".into());
+        if !self.completion.is_current() {
+            return Err("native binding was replaced".into());
         }
-        Ok(())
+        if self.completion.has_open_turn() {
+            return Err("native turn is already open".into());
+        }
+        let accepted = self.completion.register_accepted_input(text, observer);
+        self.input.send_turn(text).await?;
+        accepted.wait(Duration::from_secs(600)).await
     }
 
     fn turn_completion_evidence(&self) -> TurnCompletionEvidence {
@@ -732,6 +757,7 @@ impl PtySupervisor {
         let program = harness.program();
         let agent = harness.agent_token();
         let runtime = harness.headed_runtime_kind();
+        let claude_completion = self.capture_claude_binding(session, runtime, harness_args);
         // Pre-seed claude's workspace-trust for this fresh cwd. A native claude launched in an
         // untrusted dir sits at the "trust this folder?" dialog (which `--dangerously-skip-permissions`
         // does NOT dismiss) and never processes the daemon's injected turn — proven by the live e2e.
@@ -841,13 +867,11 @@ impl PtySupervisor {
                 }) as Arc<dyn HarnessInput>,
             );
         } else if runtime == HeadedRuntimeKind::ClaudeNative {
-            self.transport.bind(
-                session.clone(),
-                Arc::new(ClaudeNativeHarness {
-                    input: harness.clone() as Arc<dyn HarnessInput>,
-                    completion: self.claude_turn_completion(session),
-                }),
-            );
+            self.bind_claude_input(
+                session,
+                claude_completion.expect("native launch captured its owner"),
+                harness.clone(),
+            )?;
         } else {
             self.transport
                 .bind(session.clone(), harness.clone() as Arc<dyn HarnessInput>);
@@ -888,6 +912,7 @@ impl PtySupervisor {
         let program = harness.program();
         let agent = harness.agent_token();
         let runtime = harness.headed_runtime_kind();
+        let claude_completion = self.capture_claude_binding(session, runtime, harness_args);
         if runtime == HeadedRuntimeKind::ClaudeNative {
             seed_claude_trust(cwd);
         }
@@ -1023,18 +1048,16 @@ impl PtySupervisor {
                 }) as Arc<dyn HarnessInput>,
             );
         } else if runtime == HeadedRuntimeKind::ClaudeNative {
-            let completion = self.claude_turn_completion(session);
-            self.transport.bind(
-                session.clone(),
-                Arc::new(ClaudeNativeHarness {
-                    input: Arc::new(ClaudeRawPtyInput {
-                        input: input_backend,
-                        terminal: terminal_model,
-                        completion: completion.clone(),
-                    }),
-                    completion,
+            let completion = claude_completion.expect("native launch captured its owner");
+            self.bind_claude_input(
+                session,
+                completion.clone(),
+                Arc::new(ClaudeRawPtyInput {
+                    input: input_backend,
+                    terminal: terminal_model,
+                    completion: completion.clone(),
                 }),
-            );
+            )?;
         } else {
             self.transport.bind(session.clone(), input_backend);
         }
@@ -1067,6 +1090,7 @@ impl PtySupervisor {
         let program = harness.program();
         let agent = harness.agent_token();
         let runtime = harness.headed_runtime_kind();
+        let claude_completion = self.capture_claude_binding(session, runtime, harness_args);
         if runtime == HeadedRuntimeKind::ClaudeNative {
             seed_claude_trust(cwd);
         }
@@ -1119,13 +1143,11 @@ impl PtySupervisor {
         }
         self.bind_tmux_backend(session, harness.clone())?;
         if runtime == HeadedRuntimeKind::ClaudeNative {
-            self.transport.bind(
-                session.clone(),
-                Arc::new(ClaudeNativeHarness {
-                    input: harness.clone() as Arc<dyn HarnessInput>,
-                    completion: self.claude_turn_completion(session),
-                }),
-            );
+            self.bind_claude_input(
+                session,
+                claude_completion.expect("native revive captured its owner"),
+                harness.clone(),
+            )?;
         } else {
             self.transport
                 .bind(session.clone(), harness.clone() as Arc<dyn HarnessInput>);
@@ -1194,8 +1216,70 @@ impl PtySupervisor {
             .lock()
             .unwrap()
             .entry(session.clone())
-            .or_insert_with(|| Arc::new(ClaudeTurnCompletion::default()))
+            .or_insert_with(|| Arc::new(ClaudeTurnCompletion::for_adoption(None)))
             .clone()
+    }
+
+    fn capture_claude_binding(
+        &self,
+        session: &SessionId,
+        runtime: HeadedRuntimeKind,
+        args: &[String],
+    ) -> Option<Arc<ClaudeTurnCompletion>> {
+        if runtime != HeadedRuntimeKind::ClaudeNative {
+            return None;
+        }
+        let paths = ClaudeNativeBridgePaths::new(&default_nexus_state_dir(), session);
+        let owner = Arc::new(ClaudeTurnCompletion::new(
+            claude_native_resume_id_from_tail(args).map(str::to_string),
+            Some(paths.hook_log_path),
+        ));
+        if let Some(old) = self
+            .claude_completions
+            .lock()
+            .unwrap()
+            .insert(session.clone(), owner.clone())
+        {
+            old.invalidate();
+        }
+        Some(owner)
+    }
+
+    /// Synchronous observation attachment shares replacement exclusion with owner capture.
+    /// This does not reserve the native terminal against a human or own process launch effects.
+    pub(crate) fn with_claude_owner<T>(
+        &self,
+        session: &SessionId,
+        owner: &Arc<ClaudeTurnCompletion>,
+        attach: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let owners = self.claude_completions.lock().unwrap();
+        if !owners
+            .get(session)
+            .is_some_and(|current| Arc::ptr_eq(current, owner))
+            || !owner.is_current()
+        {
+            return None;
+        }
+        Some(attach())
+    }
+
+    fn bind_claude_input(
+        &self,
+        session: &SessionId,
+        owner: Arc<ClaudeTurnCompletion>,
+        input: Arc<dyn HarnessInput>,
+    ) -> Result<(), PtyError> {
+        self.with_claude_owner(session, &owner, || {
+            self.transport.bind(
+                session.clone(),
+                Arc::new(ClaudeNativeHarness {
+                    input,
+                    completion: owner.clone(),
+                }),
+            )
+        })
+        .ok_or_else(|| PtyError::Io("native observation binding was replaced during launch".into()))
     }
 
     /// Snapshot Claude's hook log before a cold respawn. Delivery waits for a newly appended
@@ -1289,15 +1373,30 @@ impl PtySupervisor {
             return Ok(());
         }
         let harness = self.tmux_backend.adopt(session, cwd)?;
+        let claude_completion = if runtime == HeadedRuntimeKind::ClaudeNative {
+            let paths = ClaudeNativeBridgePaths::new(&default_nexus_state_dir(), session);
+            let owner = Arc::new(ClaudeTurnCompletion::for_adoption(Some(
+                paths.hook_log_path,
+            )));
+            if let Some(old) = self
+                .claude_completions
+                .lock()
+                .unwrap()
+                .insert(session.clone(), owner.clone())
+            {
+                old.invalidate();
+            }
+            Some(owner)
+        } else {
+            None
+        };
         self.bind_tmux_backend(session, harness.clone())?;
         if runtime == HeadedRuntimeKind::ClaudeNative {
-            self.transport.bind(
-                session.clone(),
-                Arc::new(ClaudeNativeHarness {
-                    input: harness.clone() as Arc<dyn HarnessInput>,
-                    completion: self.claude_turn_completion(session),
-                }),
-            );
+            self.bind_claude_input(
+                session,
+                claude_completion.expect("native adoption captured its owner"),
+                harness.clone(),
+            )?;
         } else {
             self.transport
                 .bind(session.clone(), harness.clone() as Arc<dyn HarnessInput>);
@@ -1313,6 +1412,9 @@ impl PtySupervisor {
     /// keep running headless). For codex app-server sessions, the forwarder is aborted and the
     /// subprocess is sent SIGTERM via `CodexAppServer::shutdown`.
     pub fn kill(&self, id: &SessionId) -> bool {
+        if let Some(owner) = self.claude_completions.lock().unwrap().remove(id) {
+            owner.invalidate();
+        }
         let mut killed = false;
         self.terminal.unbind(id);
         if let Some(backend) = self.pty_backends.lock().unwrap().remove(id) {
@@ -1329,6 +1431,9 @@ impl PtySupervisor {
     /// Called on graceful daemon shutdown so harness processes never outlive the daemon.
     /// Returns the count killed.
     pub fn kill_all(&self) -> usize {
+        for (_, owner) in self.claude_completions.lock().unwrap().drain() {
+            owner.invalidate();
+        }
         self.terminal.clear();
         let backends: Vec<_> = self
             .pty_backends

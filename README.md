@@ -72,6 +72,10 @@ or delivered. A deadline that wins before adapter entry prevents later invocatio
 Observed ACP prompts wait for their correlated protocol response rather than relay
 spawn. This is completion-bound evidence, not an early native acknowledgement;
 strict output follows the accepted-input event, while legacy streaming is unchanged.
+Headed Claude activity uses ordered native hook records before display processing.
+Receipt matching retains the binding owner, native session and hook offset; an old
+hook or delayed forwarder cannot settle a newer binding. Terminal writes alone do
+not prove acceptance, and direct human input cannot be atomically reserved by Nexus.
 See [composer delivery and retry safety](docs/composer-delivery.md).
 
 Check or update the exact npm/Cargo installation that launched the command:

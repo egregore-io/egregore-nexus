@@ -12,6 +12,11 @@ All notable public changes to Egregore Nexus are documented here. This project f
 
 ### Fixed
 
+- Track headed Claude activity from ordered, session-bound hook records before
+  display awaits. Keep fresh observation owners through launch/adoption/teardown,
+  correlate prompt receipts with hook provenance and acceptance-sink completion,
+  and prevent old terminals or attachment cleanup from replacing newer activity.
+  Native terminal writes and direct-human input retain their protocol limitations.
 - Wait for correlated ACP completion on observed prompts instead of accepting relay
   spawn as success. Preserve the original acceptance sink before ordered buffered
   output, isolate strict output from waiting legacy relays, and retain uncertainty

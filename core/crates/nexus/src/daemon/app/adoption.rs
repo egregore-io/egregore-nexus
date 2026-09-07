@@ -230,8 +230,22 @@ impl AppState {
     /// launch, revive, and boot adoption so already-running Claude TUIs continue feeding
     /// `stream_events` without requiring a relaunch.
     pub(crate) async fn spawn_claude_native_forwarder_if_needed(&self, session: &SessionId) {
+        const HARNESS: &str = "claude";
         let Some(w) = &self.loop_wiring else { return };
-        if !w.claim_native_forwarder("claude", session) {
+        // Capture before path/identity reads. A late attachment must never borrow NEW's owner.
+        let completion = self
+            .pty
+            .as_ref()
+            .map(|supervisor| supervisor.claude_turn_completion(session));
+        let claimed = match self.pty.as_ref().zip(completion.as_ref()) {
+            Some((supervisor, owner)) => supervisor
+                .with_claude_owner(session, owner, || {
+                    w.claim_native_forwarder_for_owner(HARNESS, session, owner.owner_id())
+                })
+                .unwrap_or(false),
+            None => w.claim_native_forwarder(HARNESS, session),
+        };
+        if !claimed {
             tracing::debug!(
                 target: "nexus::claude_native_forwarder",
                 session = %session,
@@ -239,11 +253,15 @@ impl AppState {
             );
             return;
         }
+        let release = || match &completion {
+            Some(owner) => w.release_native_forwarder_for_owner(HARNESS, session, owner.owner_id()),
+            None => w.release_native_forwarder(HARNESS, session),
+        };
 
         let paths = match claude_native_paths_for_runtime(&self.store, session).await {
             Ok(paths) => paths,
             Err(error) => {
-                w.release_native_forwarder("claude", session);
+                release();
                 tracing::warn!(
                     target: "nexus::claude_native_forwarder",
                     session = %session,
@@ -280,19 +298,52 @@ impl AppState {
         } else {
             None
         };
-        let handle = spawn_claude_native_forwarder_with_tool_events(
-            self.store.clone(),
-            session.clone(),
-            paths,
-            w.events.clone(),
-            w.bell.clone(),
-            DEFAULT_CLAUDE_NATIVE_FORWARDER_POLL_MS,
-            tool_events,
-            self.pty
-                .as_ref()
-                .map(|supervisor| supervisor.claude_turn_completion(session)),
-        );
-        w.track_native_forwarder("claude", session, handle);
+        if let Some(owner) = &completion {
+            if !owner.is_current() {
+                release();
+                return;
+            }
+            owner.attach_hook_source(paths.hook_log_path.clone());
+            if let Ok(Some(state)) =
+                nexus_harness_claude::storage::ClaudeRuntimeStateRepo::new(&self.store)
+                    .find_by_runtime_id(session)
+                    .await
+            {
+                owner.attach_resume_identity(state.claude_session_id);
+            }
+            if !owner.is_current() {
+                release();
+                return;
+            }
+        }
+        let attach = || {
+            let handle = spawn_claude_native_forwarder_with_tool_events(
+                self.store.clone(),
+                session.clone(),
+                paths,
+                w.events.clone(),
+                w.bell.clone(),
+                DEFAULT_CLAUDE_NATIVE_FORWARDER_POLL_MS,
+                tool_events,
+                completion.clone(),
+            );
+            match &completion {
+                Some(owner) => {
+                    w.track_native_forwarder_for_owner(HARNESS, session, owner.owner_id(), handle)
+                }
+                None => w.track_native_forwarder(HARNESS, session, handle),
+            }
+        };
+        if let Some((supervisor, owner)) = self.pty.as_ref().zip(completion.as_ref()) {
+            if supervisor
+                .with_claude_owner(session, owner, attach)
+                .is_none()
+            {
+                release();
+            }
+        } else {
+            attach();
+        }
     }
 
     /// Start the headed OpenCode native SQLite event forwarder once for a session.

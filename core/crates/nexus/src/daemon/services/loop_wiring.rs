@@ -125,11 +125,16 @@ pub struct LoopWiring {
     pub(crate) shutting_down: Arc<AtomicBool>,
     /// Structured native forwarders, including their abort handles so teardown cannot leave a
     /// detached task polling a deleted or stopped runtime sidecar.
-    pub(crate) native_forwarders: Arc<Mutex<HashMap<(String, SessionId), Option<JoinHandle<()>>>>>,
+    pub(crate) native_forwarders: Arc<Mutex<HashMap<(String, SessionId), NativeForwarderSlot>>>,
     /// Headed PTY/tmux sessions whose raw terminal output is already being copied to stream_raw.
     pub(crate) raw_stream_writers: Arc<Mutex<HashSet<SessionId>>>,
     /// Connection-owned liveness registry + materialized presence writer.
     pub(crate) presence: PresenceWriter,
+}
+
+pub(crate) struct NativeForwarderSlot {
+    owner: Option<uuid::Uuid>,
+    handle: Option<JoinHandle<()>>,
 }
 
 #[doc(hidden)]
@@ -266,7 +271,13 @@ impl LoopWiring {
         let inserted = if spawned.contains_key(&key) {
             false
         } else {
-            spawned.insert(key, None);
+            spawned.insert(
+                key,
+                NativeForwarderSlot {
+                    owner: None,
+                    handle: None,
+                },
+            );
             true
         };
         if inserted {
@@ -276,6 +287,91 @@ impl LoopWiring {
             );
         }
         inserted
+    }
+
+    /// Called under the captured binding's owner gate. A fresh owner supersedes an older
+    /// reservation as well as an attached task; the map remains the sole forwarder registry.
+    pub(crate) fn claim_native_forwarder_for_owner(
+        &self,
+        harness: &str,
+        session: &SessionId,
+        owner: uuid::Uuid,
+    ) -> bool {
+        let mut slots = self
+            .native_forwarders
+            .lock()
+            .expect("native forwarder set poisoned");
+        let key = (harness.to_string(), session.clone());
+        if slots
+            .get(&key)
+            .is_some_and(|slot| slot.owner == Some(owner))
+        {
+            return false;
+        }
+        if let Some(old) = slots.insert(
+            key,
+            NativeForwarderSlot {
+                owner: Some(owner),
+                handle: None,
+            },
+        ) {
+            if let Some(handle) = old.handle {
+                handle.abort();
+            }
+        }
+        self.presence.registry().attach(
+            session,
+            TransportHandle::NativeForwarder(harness.to_string()),
+        );
+        true
+    }
+
+    pub(crate) fn track_native_forwarder_for_owner(
+        &self,
+        harness: &str,
+        session: &SessionId,
+        owner: uuid::Uuid,
+        handle: JoinHandle<()>,
+    ) {
+        let mut slots = self
+            .native_forwarders
+            .lock()
+            .expect("native forwarder set poisoned");
+        if let Some(slot) = slots
+            .get_mut(&(harness.to_string(), session.clone()))
+            .filter(|slot| slot.owner == Some(owner))
+        {
+            if let Some(old) = slot.handle.replace(handle) {
+                old.abort();
+            }
+        } else {
+            handle.abort();
+        }
+    }
+
+    pub(crate) fn release_native_forwarder_for_owner(
+        &self,
+        harness: &str,
+        session: &SessionId,
+        owner: uuid::Uuid,
+    ) {
+        let mut slots = self
+            .native_forwarders
+            .lock()
+            .expect("native forwarder set poisoned");
+        let key = (harness.to_string(), session.clone());
+        if slots
+            .get(&key)
+            .is_some_and(|slot| slot.owner == Some(owner))
+        {
+            if let Some(handle) = slots.remove(&key).and_then(|slot| slot.handle) {
+                handle.abort();
+            }
+            self.presence.registry().detach(
+                session,
+                &TransportHandle::NativeForwarder(harness.to_string()),
+            );
+        }
     }
 
     /// Attach the spawned task to its reserved forwarder slot. If teardown won the race after the
@@ -293,7 +389,7 @@ impl LoopWiring {
             .expect("native forwarder set poisoned");
         match spawned.get_mut(&key) {
             Some(slot) => {
-                if let Some(previous) = slot.replace(handle) {
+                if let Some(previous) = slot.handle.replace(handle) {
                     previous.abort();
                 }
             }
@@ -307,8 +403,8 @@ impl LoopWiring {
             .native_forwarders
             .lock()
             .expect("native forwarder set poisoned");
-        if let Some(handle) = spawned.remove(&(harness.to_string(), session.clone())) {
-            if let Some(handle) = handle {
+        if let Some(slot) = spawned.remove(&(harness.to_string(), session.clone())) {
+            if let Some(handle) = slot.handle {
                 handle.abort();
             }
             self.presence.registry().detach(
@@ -440,10 +536,10 @@ impl LoopWiring {
                                 .lock()
                                 .expect("native forwarder set poisoned");
                             for harness in ["claude", "opencode", "hermes"] {
-                                if let Some(handle) =
+                                if let Some(slot) =
                                     native_forwarders.remove(&(harness.to_string(), s.clone()))
                                 {
-                                    if let Some(handle) = handle {
+                                    if let Some(handle) = slot.handle {
                                         handle.abort();
                                     }
                                     presence.registry().detach(

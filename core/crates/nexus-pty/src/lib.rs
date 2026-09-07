@@ -95,6 +95,17 @@ pub trait HarnessInput: Send + Sync {
         TurnCompletionEvidence::InputAcceptedOnly
     }
 
+    /// Binding-local native work, including manual input not represented by a daemon call.
+    fn has_observed_open_turn(&self) -> bool {
+        false
+    }
+
+    /// Wait only for established native work; unknown observation must not wait forever.
+    async fn wait_for_observed_turn_completion(&self) {}
+
+    /// Revoke the observation owner when its transport binding is replaced.
+    fn invalidate_observation_owner(&self) {}
+
     /// Interrupt the active terminal turn before a redirect-now send.
     async fn interrupt_active_turn(&self) -> Result<(), String> {
         Err("this terminal backend does not support active-turn interruption".into())

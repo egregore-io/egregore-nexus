@@ -52,7 +52,9 @@ impl PtyTransport {
     /// Bind a recipient session to the harness backend that should receive its injected turns. The
     /// backend is any [`HarnessInput`]: a raw `PtySession` (tests) or a `TmuxHarness` (production).
     pub fn bind(&self, session: SessionId, input: Arc<dyn HarnessInput>) {
-        self.sessions.lock().unwrap().insert(session, input);
+        if let Some(old) = self.sessions.lock().unwrap().insert(session, input) {
+            old.invalidate_observation_owner();
+        }
     }
 
     /// Whether `session` has a PTY/tmux harness bound here. This is the per-launch mode signal the
@@ -289,11 +291,20 @@ impl AgentTurnExecutionPort for PtyTransport {
     }
 
     fn active_turn_sessions(&self) -> Vec<SessionId> {
-        self.active_turns.sessions()
+        let mut active = self.active_turns.sessions();
+        for (session, input) in self.sessions.lock().unwrap().iter() {
+            if input.has_observed_open_turn() && !active.contains(session) {
+                active.push(session.clone());
+            }
+        }
+        active
     }
 
     async fn wait_for_turn_completion(&self, recipient: &SessionId) -> PortResult<()> {
         self.active_turns.wait_for_completion(recipient).await;
+        if let Ok(input) = self.harness_for(recipient) {
+            input.wait_for_observed_turn_completion().await;
+        }
         Ok(())
     }
 

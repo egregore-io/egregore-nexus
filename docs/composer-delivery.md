@@ -146,6 +146,39 @@ fix that memory limitation. Post-submission errors and missing responses do not
 prove that nothing happened. The ordinary durable attempt fence below preserves
 that uncertainty rather than permitting an automatic duplicate prompt.
 
+## Headed Claude hook observation and receipts
+
+The existing forwarder records ordered hook facts with their native session,
+optional prompt identity and record offset before awaiting display output. A
+validated UserPromptSubmit opens native activity, including manually entered
+input. Tool output, transcript stop reasons and presentation counters cannot
+close it. Matching terminal hook evidence closes its own turn without clearing
+a newer turn. Complete hook records remain usable before a partially appended
+suffix; missing, truncated or conflicting evidence does not fabricate idle.
+
+Launch, revival and adoption capture fresh observation owners. Old forwarder
+attachments, cleanup and replayed offsets cannot replace a current owner's
+facts. A fresh unresumed launch establishes native session identity from a valid
+new SessionStart, not an old sidecar value. SessionStart alone is not idle proof.
+
+Programmatic input registrations retain their owner, native session and eligible
+hook offset. The same record provenance flows into asynchronous accepted-input
+matching. A fresh owner's valid SessionStart can establish its pending identity;
+foreign or historical same-text records cannot consume that registration.
+The observed prompt still requires its matching acceptance callback to finish
+and its required terminal fact. Submit and Stop in one poll pass cannot return
+success while acceptance presentation is blocked. Terminal-only output does not
+substitute for the input receipt, and timeout cleanup does not retract a write.
+
+These facts are observed, not an atomic reservation against direct human input.
+A human may start a turn after the latest observation but before a terminal
+write. Without a native caller token, concurrent identical manual text cannot
+always be distinguished from programmatic input. Missing optional prompt IDs
+also limit ambiguous overlapping-turn correlation. File/store reads may stall
+before ingestion; this does not promise bounded freshness or credentialed
+real-binary acceptance. The tests use controlled hooks and disposable raw/tmux
+process seams.
+
 ## Durable prompt attempts and uncertain outcomes
 
 The existing `command_intents` identity-store journal protects ordinary prompt
