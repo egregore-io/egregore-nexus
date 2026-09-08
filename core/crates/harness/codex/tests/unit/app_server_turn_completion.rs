@@ -1,5 +1,16 @@
 use super::*;
 
+impl CodexTurnTracker {
+    pub(crate) fn live_completion_waiter_count(&self, thread_id: &str, turn_id: &str) -> usize {
+        self.lock(thread_id)
+            .waiters
+            .get(&(thread_id.to_owned(), turn_id.to_owned()))
+            .map_or(0, |waiters| {
+                waiters.iter().filter(|waiter| !waiter.is_closed()).count()
+            })
+    }
+}
+
 #[test]
 fn observation_requires_positive_idle_evidence_and_stable_owner_facts() {
     use nexus_contracts::TurnState;

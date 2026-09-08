@@ -411,6 +411,90 @@ async fn prompt_delivers_turn_start_with_raw_text() {
 }
 
 #[tokio::test]
+async fn prompt_rechecks_native_turn_started_while_waiting_for_start_lock() {
+    use nexus_contracts::TurnState;
+    use serde_json::json;
+
+    let (sock, calls) = spawn_fake_server("cat-transport", "prompt-idle-start-race").await;
+    let client = CodexAppServerClient::connect(&sock, "nexus-inject")
+        .await
+        .expect("client connect should succeed");
+    let transport = CodexAppServerTransport::new();
+    let session = SessionId("s_prompt_idle_start_race".into());
+    let thread = "thread-idle-start-race";
+    transport.bind(session.clone(), Arc::new(client), thread.into());
+    let binding = transport.client_for(&session).unwrap();
+    let native = |turn: &str, method: &str| super::super::jsonrpc::Notification {
+        id: None,
+        method: method.into(),
+        params: json!({"threadId": thread, "turnId": turn}),
+    };
+    binding
+        .tracker
+        .ingest_native(&native("tOld", "turn/completed"));
+    assert_eq!(
+        binding.tracker.observe_turn(thread).state,
+        TurnState::VerifiedIdle
+    );
+
+    let start_guard = binding.start_lock.lock().await;
+    let original = "ORIGINAL-IDLE-THEN-NATIVE-TURN";
+    let mut prompt = Box::pin(transport.prompt(&session, original.into()));
+    assert!(futures::poll!(&mut prompt).is_pending());
+    assert_eq!(
+        binding.tracker.live_completion_waiter_count(thread, "tNew"),
+        0
+    );
+
+    binding
+        .tracker
+        .ingest_native(&native("tNew", "turn/started"));
+    assert_eq!(
+        binding.tracker.observe_turn(thread).state,
+        TurnState::NativeOpen
+    );
+    drop(start_guard);
+    assert!(futures::poll!(&mut prompt).is_pending());
+    // The SAME future must now be parked on the newly observed native turn, not
+    // merely waiting for an unscheduled fake RPC server to answer turn/start.
+    assert_eq!(
+        binding.tracker.live_completion_waiter_count(thread, "tNew"),
+        1,
+        "post-lock prompt must register the new native turn's completion waiter"
+    );
+    assert!(calls
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|call| call["method"] != "turn/start"));
+
+    binding
+        .tracker
+        .ingest_native(&native("tNew", "turn/completed"));
+    binding.tracker.settle_completion(thread, "tNew");
+    tokio::time::timeout(Duration::from_secs(1), &mut prompt)
+        .await
+        .expect("same prompt must resume after matching native completion")
+        .expect("same prompt must succeed");
+    assert_eq!(
+        binding.tracker.live_completion_waiter_count(thread, "tNew"),
+        0
+    );
+    let starts: Vec<_> = calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|call| call["method"] == "turn/start")
+        .cloned()
+        .collect();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0]["params"]["threadId"], thread);
+    assert_eq!(starts[0]["params"]["input"][0]["text"], original);
+    // The helper's null response proves dispatch only, not a native acceptance
+    // receipt. Direct headed-human input does not acquire this start mutex.
+}
+
+#[tokio::test]
 async fn prompt_waits_for_existing_active_turn_boundary() {
     let (sock, calls) = spawn_fake_server("cat-transport", "prompt-active-boundary").await;
 
