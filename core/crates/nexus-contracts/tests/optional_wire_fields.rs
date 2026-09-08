@@ -24,6 +24,28 @@ where
 }
 
 #[test]
+fn queue_evidence_fields_are_strict_optional_wire_values() {
+    use nexus_contracts::CommandQueueEntry;
+    let wire = json!({"commandId":"cmd", "text":"retained", "state":"failed", "mode":"queue", "revision":2, "seq":3, "createdAt":1, "errorCode":-32602, "correlationOwned":true});
+    assert_absent_round_trip::<CommandQueueEntry>(wire.clone());
+    for invalid in [
+        json!("-32602"),
+        json!(true),
+        json!(2147483648_i64),
+        json!(-2147483649_i64),
+    ] {
+        let mut bad = wire.clone();
+        bad["errorCode"] = invalid;
+        assert!(serde_json::from_value::<CommandQueueEntry>(bad).is_err());
+    }
+    for invalid in [json!("true"), json!(1)] {
+        let mut bad = wire.clone();
+        bad["correlationOwned"] = invalid;
+        assert!(serde_json::from_value::<CommandQueueEntry>(bad).is_err());
+    }
+}
+
+#[test]
 fn representative_contract_modules_round_trip_with_absent_optionals() {
     use nexus_contracts::admin::SpawnRequest;
     use nexus_contracts::agents::AgentListRequest;

@@ -43,6 +43,10 @@ fn command(command_id: &str, principal_id: Option<&str>, caller_kind: &str) -> N
 #[tokio::test]
 async fn external_human_principal_is_durable_and_projected_on_completed_receipts() {
     let store = migrated().await;
+    store.conn.execute(
+        "INSERT INTO sessions (session_id, agent_id, name, agent, kind, project, created_at) VALUES ('s_target', 'a_target', 'target', 'other', 'agent', 'default', 1)",
+        (),
+    ).await.expect("seed owned legacy target binding");
     let commands = CommandIntents::new(&store);
     commands
         .insert_pending(command(

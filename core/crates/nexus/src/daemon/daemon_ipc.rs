@@ -876,9 +876,16 @@ struct LocalSessionQueueMutationRequest {
 #[serde(rename_all = "camelCase")]
 struct LocalSessionQueueReadRequest {
     #[serde(default)]
+    project: Option<String>,
+    /// Trusted Gateway read-gate evidence, not a public client-selected ownership flag.
+    #[serde(default)]
+    requester: Option<DaemonIpcCaller>,
+    #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     agent_id: Option<AgentId>,
+    #[serde(default)]
+    expected_session_id: Option<String>,
     #[serde(default)]
     events_after: Option<i64>,
 }
@@ -896,6 +903,9 @@ async fn handle_local_session_queue_read(
             "session queue reads require local operator authority",
         );
     };
+    if let Err(error) = nexus_contracts::prompt::validate_expected_session(&params) {
+        return store_failure(request_id, error);
+    }
     let request: LocalSessionQueueReadRequest = match serde_json::from_value(params) {
         Ok(request) => request,
         Err(error) => {
@@ -907,9 +917,22 @@ async fn handle_local_session_queue_read(
         }
     };
     let queue = CommandQueue::new(&state.store);
+    if request.events_after.is_some() && request.expected_session_id.is_some() {
+        return failure(
+            request_id,
+            codes::INVALID_PARAMS,
+            "eventsAfter is a global read and cannot select an exact lane",
+        );
+    }
+    let requester = resolve_queue_requester(
+        state,
+        request.project.as_deref(),
+        request.requester.as_ref(),
+    )
+    .await;
     let result: Result<Value, ContractError> = match request.events_after {
         Some(after_seq) if after_seq >= 0 => queue
-            .events_after(after_seq)
+            .events_for_requester(after_seq, requester.as_ref())
             .await
             .map_err(|error| error.to_contract_error())
             .map(|page| {
@@ -942,7 +965,13 @@ async fn handle_local_session_queue_read(
             }
             let active_sessions = state.agent.active_turn_sessions();
             queue
-                .snapshot_with_active_sessions(name, request.agent_id.as_ref(), &active_sessions)
+                .snapshot_for_requester(
+                    name,
+                    request.agent_id.as_ref(),
+                    request.expected_session_id.as_deref(),
+                    &active_sessions,
+                    requester.as_ref(),
+                )
                 .await
                 .map_err(|error| error.to_contract_error())
                 .and_then(|snapshot| serde_json::to_value(snapshot).map_err(json_contract_error))
@@ -952,6 +981,54 @@ async fn handle_local_session_queue_read(
         Ok(value) => DaemonIpcResponse::success(request_id, value),
         Err(error) => store_failure(request_id, error),
     }
+}
+
+async fn resolve_queue_requester(
+    state: &AppState,
+    project: Option<&str>,
+    evidence: Option<&DaemonIpcCaller>,
+) -> Option<DaemonIpcCaller> {
+    let evidence = evidence?;
+    if project != Some(evidence.project.as_str()) {
+        return None;
+    }
+    if is_local_operator(evidence) {
+        return Some(evidence.clone());
+    }
+    if evidence.kind != Kind::Human
+        || evidence
+            .principal_id
+            .as_deref()
+            .is_none_or(|id| id.is_empty())
+    {
+        return None;
+    }
+    let key = evidence
+        .client_key
+        .as_deref()
+        .filter(|key| !key.is_empty())?;
+    // The ordinary query resolver is read-only, but its legacy key lookup selects one row.
+    // Reject ambiguity here instead of guessing or registering/rebinding a human during a read.
+    let sessions = Sessions::new(&state.store).list_all().await.ok()?;
+    if sessions
+        .iter()
+        .filter(|row| row.client_key.as_deref() == Some(key))
+        .count()
+        != 1
+    {
+        return None;
+    }
+    let (caller, session) = resolve_registered_query_caller_with_session(state, evidence)
+        .await
+        .ok()?;
+    if session.project != evidence.project || caller.project != evidence.project {
+        return None;
+    }
+    let mut resolved = evidence.clone();
+    resolved.session_id = Some(session.session_id.0.clone());
+    resolved.runtime_id = Some(session.session_id.0);
+    resolved.agent_id = caller.agent_id.map(|id| id.0);
+    Some(resolved)
 }
 
 async fn handle_local_session_queue_mutation(

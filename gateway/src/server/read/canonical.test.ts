@@ -203,6 +203,20 @@ describe("canonical Gateway REST reads", () => {
         sessionId: "s_collision",
         owner: expect.objectContaining({ agentId: "a_session_owner", name: "session-owner" }),
       });
+    await expect(
+      canonicalAgentSessionTarget(db, {
+        agentId: "a_runtime_alias",
+        sessionId: "s_collision",
+        exact: true,
+      }),
+    ).resolves.toBeUndefined();
+    await expect(
+      canonicalAgentSessionTarget(db, {
+        agentId: "a_session_owner",
+        sessionId: "r_session_owner",
+        exact: true,
+      }),
+    ).resolves.toBeUndefined();
     db.close();
   });
 

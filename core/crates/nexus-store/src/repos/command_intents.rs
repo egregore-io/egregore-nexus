@@ -1413,22 +1413,32 @@ impl<'a> CommandIntents<'a> {
             .store
             .identity_conn()
             .query(
-                "SELECT session_id, seq FROM command_intent_events \
-                 WHERE command_id = ?1 ORDER BY seq DESC LIMIT 1",
+                "SELECT session_id, (SELECT MAX(seq) FROM command_intent_events WHERE command_id = ?1) FROM command_intent_events \
+                 WHERE command_id = ?1 ORDER BY seq LIMIT 1",
                 params![command_id],
             )
             .await
             .map_err(store_err)?;
         let event = rows.next().await.map_err(store_err)?;
+        let request =
+            serde_json::from_str(&command.request_json).unwrap_or(serde_json::Value::Null);
+        let original_session = event
+            .as_ref()
+            .map(|row| get_opt_text(row, 0))
+            .transpose()?
+            .flatten();
+        let session_id = super::command_queue::command_session_binding(
+            self.store,
+            &request,
+            original_session.as_deref(),
+        )
+        .await?;
         Ok(Some(CommandIntentReceipt {
             command_id: command.command_id,
             status: command.status,
             created_at: command.created_at,
             revision: command.revision,
-            session_id: match event.as_ref() {
-                Some(row) => get_opt_text(row, 0)?,
-                None => None,
-            },
+            session_id,
             seq: match event.as_ref() {
                 Some(row) => get_opt_int(row, 1)?.unwrap_or(0),
                 None => 0,

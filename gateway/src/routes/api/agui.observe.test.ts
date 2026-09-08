@@ -7,6 +7,9 @@ import type { AgentAccessGrantRow, AgentOwnerRow } from "@server/read/queries";
 import { Kind, Tier } from "@shared/types";
 import { migrateGatewayStore } from "@server/store/migrations";
 import { sessionFanout } from "@server/stream/sessionFanout";
+import { EventEmitter } from "node:events";
+import { CommandQueueHub, handleWs } from "@server/agui/ws.mjs";
+import { handleConversationQueueGet } from "@server/command/sessionQueue";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -193,6 +196,147 @@ describe("canObserveAgentSession", () => {
 });
 
 describe("observeScoped cursor compatibility", () => {
+  it("opens retained exact S1 and active S2 through real HTTP/WS handlers without warming or crossing lanes", async () => {
+    vi.stubEnv("NEXUS_WEB_AUTH_MODE", "local");
+    const db = createClient({ url: ":memory:" });
+    await migrateGatewayStore(db);
+    await db.executeMultiple(`INSERT INTO identities (agent_id,name,metadata_json,updated_at) VALUES ('a_exact','renamed','{}',1), ('a_other','other','{}',1);
+      INSERT INTO runtime_descriptors (runtime_id,agent_id,session_id,harness,mode,status,updated_at) VALUES
+      ('r_old','a_exact','s_old','codex','headless','stopped',1), ('r_new','a_exact','s_new','codex','headless','online',2), ('s_collision','a_other','s_other','codex','headless','online',3);`);
+    const subscribed: string[] = [];
+    vi.spyOn(sessionFanout, "subscribe").mockImplementation((sessionId) => {
+      subscribed.push(sessionId);
+      return { ready: Promise.resolve(), close() {} };
+    });
+    const warm = vi.fn(async () => undefined);
+    const reads: string[] = [];
+    const hub = new CommandQueueHub({
+      commandQueueEventPollMs: 1,
+      fetchHandler: (request) =>
+        handleConversationQueueGet(request, {
+          env: { NEXUS_WEB_AUTH_MODE: "local" },
+          daemonQueueRead: async (input) => {
+            if (input.eventsAfter !== undefined)
+              return {
+                events:
+                  input.eventsAfter < 2
+                    ? [
+                        {
+                          seq: 1,
+                          sessionId: "s_new",
+                          commandId: "cmd_new",
+                          clientMessageId: "cm_new",
+                          commandKind: "harness.prompt",
+                          callerName: "human",
+                          state: "failed" as never,
+                          mode: "queue",
+                          revision: 3,
+                          correlationOwned: true,
+                        },
+                        {
+                          seq: 2,
+                          sessionId: "s_old",
+                          commandId: "cmd_old",
+                          clientMessageId: "cm_old",
+                          commandKind: "harness.prompt",
+                          callerName: "human",
+                          state: "failed" as never,
+                          mode: "queue",
+                          revision: 3,
+                          correlationOwned: true,
+                        },
+                      ]
+                    : [],
+                nextSeq: 2,
+                latestSeq: 2,
+                gap: false,
+              };
+            expect(input.agentId).toBe("a_exact");
+            reads.push(input.expectedSessionId!);
+            return {
+              target: "renamed",
+              sessionId: input.expectedSessionId,
+              turnActive: false,
+              steerCapability: "none" as never,
+              seq: 0,
+              revision: 0,
+              commands: [],
+            };
+          },
+        }),
+    });
+    class Socket extends EventEmitter {
+      sent: string[] = [];
+      send(value: string) {
+        this.sent.push(value);
+      }
+      close() {
+        this.emit("close");
+      }
+    }
+    const sockets = [new Socket(), new Socket()];
+    const controls = sockets.map((socket, index) =>
+      handleWs(
+        socket,
+        new Request(
+          `http://localhost/api/agui/ws?agentId=a_exact&expectedSessionId=${index ? "s_new" : "s_old"}`,
+        ),
+        {
+          observe: (request) =>
+            observeScoped(request, {
+              canonicalDb: () => db,
+              submitCommand: warm,
+            }),
+          commandQueueHub: hub,
+        },
+      ),
+    );
+    try {
+      await vi.waitFor(() =>
+        expect(
+          sockets.every((socket) =>
+            socket.sent.some(
+              (raw) => JSON.parse(raw).t === "command.transition",
+            ),
+          ),
+        ).toBe(true),
+      );
+      for (const [index, socket] of sockets.entries()) {
+        const frames = socket.sent.map((raw) => JSON.parse(raw));
+        const expected = index ? "s_new" : "s_old";
+        expect(frames[0]).toEqual({
+          t: "session.bound",
+          agentId: "a_exact",
+          sessionId: expected,
+        });
+        expect(
+          frames
+            .filter((frame) => frame.t === "command.transition")
+            .map((frame) => frame.sessionId),
+        ).toEqual([expected]);
+      }
+      expect(reads.sort()).toEqual(["s_new", "s_old"]);
+      expect(subscribed.sort()).toEqual(["s_new", "s_old"]);
+      for (const [agent, session] of [
+        ["a_other", "s_old"],
+        ["a_other", "s_collision"],
+      ]) {
+        const response = await observeScoped(
+          new Request(
+            `http://localhost/api/agui/observe?agentId=${agent}&expectedSessionId=${session}`,
+          ),
+          { canonicalDb: () => db, submitCommand: warm },
+        );
+
+    expect(response.status).toBe(404);
+      }
+      expect(warm).not.toHaveBeenCalled();
+    } finally {
+      controls.forEach((control) => control.close());
+      await Promise.all(controls.map((control) => control.closed));
+      db.close();
+    }
+  });
   it("preserves legacy afterId for explicit current-boot translation", async () => {
     vi.stubEnv("NEXUS_WEB_AUTH_MODE", "local");
     const db = createClient({ url: ":memory:" });

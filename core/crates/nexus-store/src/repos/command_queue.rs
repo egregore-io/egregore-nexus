@@ -6,7 +6,8 @@ use libsql::params;
 use nexus_common::NexusError;
 use nexus_contracts::{
     AgentId, CommandQueueAction, CommandQueueEntry, CommandQueueMutationRequest,
-    CommandQueueSnapshot, CommandQueueState, CommandQueueTransition, SessionId, SteerCapability,
+    CommandQueueSnapshot, CommandQueueState, CommandQueueTransition, DaemonIpcCaller, Kind,
+    SessionId, SteerCapability, Tier,
 };
 use serde_json::{json, Map, Value};
 
@@ -110,14 +111,59 @@ impl<'a> CommandQueue<'a> {
         agent_id: Option<&AgentId>,
         active_sessions: &[SessionId],
     ) -> Result<CommandQueueSnapshot, NexusError> {
+        self.snapshot_for_requester(name, agent_id, None, active_sessions, None)
+            .await
+    }
+
+    /// Exact reads may inspect retained, inactive runtimes. This never grants execution authority.
+    pub async fn snapshot_for_requester(
+        &self,
+        name: Option<&str>,
+        agent_id: Option<&AgentId>,
+        expected_session_id: Option<&str>,
+        active_sessions: &[SessionId],
+        requester: Option<&DaemonIpcCaller>,
+    ) -> Result<CommandQueueSnapshot, NexusError> {
         let target = QueueTarget {
             name: name.map(str::trim).filter(|name| !name.is_empty()),
             agent_id: agent_id.map(|id| id.0.as_str()),
-            expected_session_id: None,
+            expected_session_id,
         };
-        let runtime = target_runtime(self.store, target, active_sessions).await?;
+        let runtime = if let Some(expected) = expected_session_id {
+            let Some(agent) = target.agent_id.filter(|id| !id.trim().is_empty()) else {
+                return Err(NexusError::Invalid(
+                    "expectedSessionId requires stable agentId".into(),
+                ));
+            };
+            if expected.trim().is_empty()
+                || !retained_runtime_owned(self.store, agent, expected).await?
+            {
+                return Err(NexusError::Invalid(
+                    "exact session is not retained by this agent".into(),
+                ));
+            }
+            let descriptive = Sessions::new(self.store)
+                .find_by_session_id(&SessionId(expected.to_string()))
+                .await?;
+            let mut runtime =
+                runtime_from_session(self.store, descriptive, active_sessions).await?;
+            runtime.session_id = Some(expected.to_string());
+            if runtime.name.is_none() {
+                runtime.name = crate::repos::Agents::new(self.store)
+                    .find_by_id(agent)
+                    .await?
+                    .and_then(|row| row.name);
+            }
+            runtime
+        } else {
+            target_runtime(self.store, target, active_sessions).await?
+        };
         let seq = latest_queue_seq_store(self.store).await?;
-        let commands = queue_entries(self.store, target, runtime.session_id.as_deref()).await?;
+        let mut commands = queue_entries(self.store, target, runtime.session_id.as_deref()).await?;
+        for command in &mut commands {
+            command.correlation_owned =
+                Some(correlation_owned(self.store, &command.command_id, requester).await?);
+        }
         let steer_capability = runtime.steer_capability();
         Ok(CommandQueueSnapshot {
             target: target.display_name(&runtime),
@@ -133,6 +179,20 @@ impl<'a> CommandQueue<'a> {
     /// Read one bounded global transition page after a reconnect cursor.
     pub async fn events_after(&self, after_seq: i64) -> Result<CommandQueueEventsPage, NexusError> {
         queue_events_after(self.store, after_seq).await
+    }
+
+    /// Shared authenticated global polling retains a scanned cursor even when rows are filtered.
+    pub async fn events_for_requester(
+        &self,
+        after_seq: i64,
+        requester: Option<&DaemonIpcCaller>,
+    ) -> Result<CommandQueueEventsPage, NexusError> {
+        let mut page = queue_events_after(self.store, after_seq).await?;
+        for event in &mut page.events {
+            event.correlation_owned =
+                Some(correlation_owned(self.store, &event.command_id, requester).await?);
+        }
+        Ok(page)
     }
 
     /// Apply one idempotent compare-and-set mutation under the store's single write transaction.
@@ -386,7 +446,8 @@ async fn queue_entries(
         .query(
             "SELECT command_id, kind, status, request_json, error_json, revision, created_at, \
              claimed_at, started_at, completed_at, COALESCE((SELECT MAX(seq) \
-             FROM command_intent_events e WHERE e.command_id = command_intents.command_id), 0) \
+             FROM command_intent_events e WHERE e.command_id = command_intents.command_id), 0), \
+             (SELECT session_id FROM command_intent_events e WHERE e.command_id = command_intents.command_id ORDER BY seq LIMIT 1) \
              FROM command_intents WHERE kind IN (?1, ?2) AND ( \
                (?3 = 1 AND json_extract(request_json, '$.agentId') = ?4) OR \
                (?3 = 0 AND json_extract(request_json, '$.agentId') IS NULL \
@@ -394,7 +455,7 @@ async fn queue_entries(
                (?6 = 1 AND command_id IN (SELECT command_id FROM command_intent_events \
                   WHERE session_id = ?7)) \
              ) ORDER BY CASE WHEN status IN ('pending', 'claimed') THEN 0 ELSE 1 END, \
-             created_at ASC LIMIT 100",
+             created_at ASC",
             params![
                 PROMPT,
                 STEER,
@@ -411,6 +472,11 @@ async fn queue_entries(
     while let Some(row) = rows.next().await.map_err(store_err)? {
         let request_json = get_text(&row, 3)?;
         let request = serde_json::from_str::<Value>(&request_json).unwrap_or(Value::Null);
+        let binding =
+            command_session_binding(store, &request, get_opt_text(&row, 11)?.as_deref()).await?;
+        if binding.as_deref() != session_id || binding.is_none() {
+            continue;
+        }
         let status = get_text(&row, 2)?;
         let started_at = get_opt_int(&row, 8)?;
         entries.push(CommandQueueEntry {
@@ -445,9 +511,164 @@ async fn queue_entries(
                         .and_then(Value::as_str)
                         .map(str::to_string)
                 }),
+            error_code: get_opt_text(&row, 4)?
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                .and_then(|value| value.get("code").and_then(Value::as_i64))
+                .and_then(|code| i32::try_from(code).ok()),
+            correlation_owned: None,
         });
+        // Validate ownership before applying the bounded viewport; another lane cannot starve it.
+        if entries.len() == 100 {
+            break;
+        }
     }
     Ok(entries)
+}
+
+/// Read the original request binding. Event session ids alone are not target authority.
+pub(crate) async fn command_session_binding(
+    store: &Store,
+    request: &Value,
+    original_session: Option<&str>,
+) -> Result<Option<String>, NexusError> {
+    let agent = request
+        .get("agentId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty());
+    if request.get("expectedSessionId").is_some() {
+        let Some(session) = request
+            .get("expectedSessionId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        let Some(agent) = agent else {
+            return Ok(None);
+        };
+        return Ok(retained_runtime_owned(store, agent, session)
+            .await?
+            .then(|| session.to_string()));
+    }
+    let Some(session) = original_session.filter(|id| !id.is_empty()) else {
+        return Ok(None);
+    };
+    let row = Sessions::new(store)
+        .find_by_session_id(&SessionId(session.to_string()))
+        .await?;
+    let runtime = crate::repos::AgentRuntimes::new(store)
+        .find_by_runtime_id(session)
+        .await?;
+    if let Some(agent) = agent {
+        if runtime.as_ref().is_some_and(|row| row.agent_id != agent)
+            || row
+                .as_ref()
+                .is_some_and(|row| row.agent_id.as_deref() != Some(agent))
+        {
+            return Ok(None);
+        }
+        if runtime.is_some() || row.is_some() {
+            return Ok(Some(session.to_string()));
+        }
+    } else if let Some(row) = row {
+        if row
+            .agent_id
+            .as_deref()
+            .is_none_or(|id| id.trim().is_empty())
+        {
+            return Ok(None);
+        }
+        // Without caller-supplied sessionId, the first journal row captured the
+        // target at enqueue. Its retained owner survives descriptive renames.
+        if request
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| {
+                !name.trim().is_empty()
+                    && (Some(name) == row.name.as_deref() || request.get("sessionId").is_none())
+            })
+            && runtime
+                .as_ref()
+                .is_none_or(|runtime| row.agent_id.as_deref() == Some(runtime.agent_id.as_str()))
+        {
+            return Ok(Some(session.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+async fn retained_runtime_owned(
+    store: &Store,
+    agent: &str,
+    session: &str,
+) -> Result<bool, NexusError> {
+    let runtime = crate::repos::AgentRuntimes::new(store)
+        .find_by_runtime_id(session)
+        .await?;
+    if runtime.as_ref().is_none_or(|row| row.agent_id != agent) {
+        return Ok(false);
+    }
+    let descriptive = Sessions::new(store)
+        .find_by_session_id(&SessionId(session.to_string()))
+        .await?;
+    Ok(descriptive
+        .as_ref()
+        .is_none_or(|row| row.agent_id.as_deref() == Some(agent)))
+}
+
+async fn correlation_owned(
+    store: &Store,
+    command_id: &str,
+    requester: Option<&DaemonIpcCaller>,
+) -> Result<bool, NexusError> {
+    let Some(requester) = requester else {
+        return Ok(false);
+    };
+    let Some(caller) = crate::repos::CommandIntents::new(store)
+        .get(command_id)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if caller.project != requester.project
+        || requester.kind != Kind::Human
+        || caller
+            .caller_kind
+            .as_deref()
+            .and_then(nexus_contracts::entity_kind::parse)
+            != Some((requester.locality, requester.kind))
+        || caller.caller_tier.as_deref()
+            != Some(match requester.tier {
+                Tier::Admin => "admin",
+                Tier::Agent => "agent",
+            })
+    {
+        return Ok(false);
+    }
+    if let Some(key) = requester
+        .client_key
+        .as_deref()
+        .filter(|key| !key.is_empty())
+    {
+        return Ok(caller.caller_client_key.as_deref() == Some(key)
+            && requester
+                .principal_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty())
+            && caller.caller_principal_id == requester.principal_id);
+    }
+    Ok(requester.tier == Tier::Admin
+        && requester.session_id.as_deref() == Some("local-operator")
+        && matches!(
+            requester.runtime_id.as_deref(),
+            None | Some("local-operator")
+        )
+        && caller.caller_session_id.as_deref() == Some("local-operator")
+        && matches!(
+            caller.caller_runtime_id.as_deref(),
+            None | Some("local-operator")
+        )
+        && caller.caller_client_key.is_none())
 }
 
 async fn latest_queue_seq_store(store: &Store) -> Result<i64, NexusError> {
@@ -498,19 +719,30 @@ async fn queue_events_after(
         .query(
             "SELECT e.seq, e.session_id, e.command_id, e.client_message_id, \
                     c.kind, c.caller_name, c.caller_session_id, c.caller_agent_id, \
-                    c.caller_principal_id, c.caller_kind, e.state, e.mode, e.revision \
+                    c.caller_principal_id, c.caller_kind, e.state, e.mode, e.revision, c.request_json, \
+                    (SELECT session_id FROM command_intent_events first WHERE first.command_id = c.command_id ORDER BY seq LIMIT 1) \
              FROM command_intent_events e \
-             JOIN command_intents c ON c.command_id = e.command_id \
+             LEFT JOIN command_intents c ON c.command_id = e.command_id \
              WHERE e.seq > ?1 ORDER BY e.seq LIMIT 500",
             params![after_seq],
         )
         .await
         .map_err(store_err)?;
     let mut events = Vec::new();
+    let mut scanned_seq = after_seq;
     while let Some(row) = rows.next().await.map_err(store_err)? {
+        scanned_seq = get_opt_int(&row, 0)?.unwrap_or(scanned_seq);
+        let request = get_opt_text(&row, 13)?
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .unwrap_or(Value::Null);
+        let session_id =
+            command_session_binding(store, &request, get_opt_text(&row, 14)?.as_deref()).await?;
+        if session_id.is_none() {
+            continue;
+        }
         events.push(CommandQueueTransition {
             seq: get_opt_int(&row, 0)?.unwrap_or_default(),
-            session_id: get_opt_text(&row, 1)?,
+            session_id,
             command_id: get_text(&row, 2)?,
             client_message_id: get_opt_text(&row, 3)?,
             command_kind: get_text(&row, 4)?,
@@ -522,11 +754,12 @@ async fn queue_events_after(
             state: command_queue_event_state(&get_text(&row, 10)?),
             mode: get_text(&row, 11)?,
             revision: get_opt_int(&row, 12)?.unwrap_or_default(),
+            correlation_owned: None,
         });
     }
     Ok(CommandQueueEventsPage {
         events,
-        next_seq,
+        next_seq: scanned_seq,
         latest_seq,
         gap,
     })

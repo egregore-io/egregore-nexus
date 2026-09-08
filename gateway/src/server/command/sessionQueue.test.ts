@@ -16,7 +16,10 @@ CREATE TABLE sessions (
   agent TEXT,
   transport TEXT,
   project TEXT,
-  created_at INTEGER
+  created_at INTEGER,
+  client_key TEXT,
+  kind TEXT,
+  tier TEXT
 );
 CREATE TABLE agent_session_turns (
   id TEXT PRIMARY KEY,
@@ -35,6 +38,9 @@ CREATE TABLE command_intents (
   project TEXT NOT NULL,
   caller_name TEXT NOT NULL,
   caller_session_id TEXT,
+  caller_runtime_id TEXT,
+  caller_client_key TEXT,
+  caller_tier TEXT,
   caller_agent_id TEXT,
   caller_principal_id TEXT,
   caller_kind TEXT,
@@ -128,6 +134,155 @@ async function dbFor(
 }
 
 describe("exact queue mutation authority", () => {
+  it("keeps a legacy original binding when only the retained identity owner remains", async () => {
+    const db = await dbFor();
+    await db.execute("INSERT INTO agent_runtimes VALUES ('a_otto', 's_otto', 0, 2)");
+    await insertCommand(db, "cmd_retained_legacy", "error", 1);
+    await db.execute({sql: "UPDATE command_intents SET request_json = ?", args:[JSON.stringify({agentId:"a_otto", text:"retained"})]});
+    await db.execute("DELETE FROM sessions");
+    const response = await handleConversationQueueGet(new Request("http://localhost/api/conversation/prompt?agentId=a_otto&expectedSessionId=s_otto"), deps(db));
+    expect(await response.json()).toMatchObject({sessionId:"s_otto", commands:[{commandId:"cmd_retained_legacy", sessionId:"s_otto"}]});
+  });
+  it("scans ownerless and malformed legacy facts without inventing a lane gap", async () => {
+    const db = await dbFor();
+    await insertCommand(db, "cmd_ownerless", "error", 1);
+    await db.execute("UPDATE sessions SET agent_id = NULL");
+    for (let i = 0; i < 505; i++) {
+      await insertCommand(db, `cmd_bad_${i}`, "pending", i + 2);
+      await db.execute({
+        sql: "UPDATE command_intents SET request_json = ? WHERE command_id = ?",
+        args: [
+          JSON.stringify({
+            agentId: "a_otto",
+            expectedSessionId: null,
+            sessionId: "s_otto",
+            text: "private",
+          }),
+          `cmd_bad_${i}`,
+        ],
+      });
+    }
+    const read = async (after: number) =>
+      (
+        await handleConversationQueueGet(
+          new Request(
+            `http://localhost/api/conversation/prompt?eventsAfter=${after}`,
+          ),
+          deps(db),
+        )
+      ).json();
+    expect(await read(0)).toMatchObject({
+      events: [],
+      nextSeq: 500,
+      gap: false,
+    });
+    expect(await read(500)).toMatchObject({
+      events: [],
+      nextSeq: 506,
+      gap: false,
+    });
+  });
+
+  it.each(["-32602", true, 2147483648, -2147483649])(
+    "omits unstructured error code %s",
+    async (code) => {
+      const db = await dbFor();
+      await insertCommand(db, "cmd_bad_code", "error", 1);
+      await db.execute({
+        sql: "UPDATE command_intents SET error_json = ?",
+        args: [JSON.stringify({ code, message: "failure" })],
+      });
+    const response = await handleConversationQueueGet(
+      new Request("http://localhost/api/conversation/prompt?name=otto"),
+      deps(db),
+    );
+      const body = await response.json();
+      expect(body.commands[0]).not.toHaveProperty("errorCode");
+      expect(body.commands[0].correlationOwned).toBe(false);
+    },
+  );
+
+  it("reads retained S1 without relabelling S2 or trusting forged pairs", async () => {
+    const db = await dbFor();
+    await db.executeMultiple(
+      "INSERT INTO agent_runtimes VALUES ('a_otto','s_otto',0,2), ('a_otto','s_new',1,NULL), ('a_other','s_other',1,NULL); INSERT INTO sessions (session_id,agent_id,name,agent,transport,project,created_at) VALUES ('s_new','a_otto','otto-new','codex','codex-appserver','default',2);",
+    );
+    await insertCommand(db, "cmd_old", "error", 1);
+    await db.execute({
+      sql: "UPDATE command_intents SET request_json = ?, error_json = ? WHERE command_id = 'cmd_old'",
+      args: [
+        JSON.stringify({
+          agentId: "a_otto",
+        expectedSessionId: "s_otto",
+          text: "original",
+        }),
+        JSON.stringify({ code: -32602, message: "stale" }),
+      ],
+    });
+    for (let i = 0; i < 105; i++) {
+      await insertCommand(db, `cmd_new_${i}`, "pending", 2 + i);
+      await db.execute({
+        sql: "UPDATE command_intents SET request_json = ? WHERE command_id = ?",
+        args: [
+          JSON.stringify({
+            agentId: "a_otto",
+            expectedSessionId: "s_new",
+            text: "new",
+          }),
+          `cmd_new_${i}`,
+        ],
+      });
+    }
+    const response = await handleConversationQueueGet(
+      new Request(
+        "http://localhost/api/conversation/prompt?agentId=a_otto&expectedSessionId=s_otto",
+      ),
+      deps(db),
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      sessionId: "s_otto",
+      commands: [
+        {
+          commandId: "cmd_old",
+          sessionId: "s_otto",
+          errorCode: -32602,
+          correlationOwned: false,
+        },
+      ],
+    });
+    const foreign = await handleConversationQueueGet(
+      new Request(
+        "http://localhost/api/conversation/prompt?agentId=a_otto&expectedSessionId=s_other",
+      ),
+      deps(db),
+    );
+    expect(foreign.status).toBe(404);
+    await db.execute(
+      "UPDATE sessions SET agent_id = NULL WHERE session_id = 's_otto'",
+    );
+    const unowned = await handleConversationQueueGet(
+      new Request(
+        "http://localhost/api/conversation/prompt?agentId=a_otto&expectedSessionId=s_otto",
+      ),
+      deps(db),
+    );
+    expect(unowned.status).toBe(404);
+    for (const query of [
+      "agentId=a_otto&expectedSessionId=",
+      "name=otto&expectedSessionId=s_otto",
+    ]) {
+      expect(
+        (
+          await handleConversationQueueGet(
+            new Request(`http://localhost/api/conversation/prompt?${query}`),
+            deps(db),
+          )
+        ).status,
+      ).toBe(400);
+    }
+  });
   const request = (extra: Record<string, unknown> = {}) =>
     new Request("http://localhost/api/conversation/prompt", {
       method: "PATCH",
@@ -434,7 +589,9 @@ describe("durable session command queue", () => {
     }));
 
     const response = await handleConversationQueueGet(
-      new Request("http://localhost/api/conversation/prompt?agentId=a_otto"),
+      new Request(
+        "http://localhost/api/conversation/prompt?agentId=a_otto&expectedSessionId=s_otto",
+      ),
       {
         env: { NEXUS_WEB_AUTH_MODE: "local" },
         daemonQueueRead,
@@ -451,6 +608,12 @@ describe("durable session command queue", () => {
     expect(daemonQueueRead).toHaveBeenCalledWith({
       project: "default",
       agentId: "a_otto",
+        expectedSessionId: "s_otto",
+      requester: expect.objectContaining({
+        sessionId: "local-operator",
+        kind: "human",
+        tier: "admin",
+      }),
     });
   });
 
@@ -497,6 +660,7 @@ describe("durable session command queue", () => {
     expect(daemonQueueRead).toHaveBeenCalledWith({
       project: "default",
       eventsAfter: 12,
+      requester: expect.objectContaining({ sessionId: "local-operator" }),
     });
   });
 
@@ -554,19 +718,15 @@ describe("durable session command queue", () => {
 
     expect(response.status).toBe(200);
     await expect(response.json()).resolves.toMatchObject({
-      events: [{
-        seq: 2,
-        commandId: "cmd_other",
-        callerPrincipalId: "x_other",
-        callerKind: "external.human",
-      }],
+      // An unrelated command's copied event session is not a validated session target.
+      events: [],
       nextSeq: 2,
       latestSeq: 2,
       gap: false,
     });
   });
 
-  it("hydrates a snapshot in three reads with turn activity folded into runtime lookup", async () => {
+  it("hydrates with turn activity folded into runtime lookup and original ownership checked", async () => {
     const raw = await dbFor();
     await insertActiveTurn(raw);
     await insertCommand(raw, "cmd_counted", "pending", 10);
@@ -578,7 +738,7 @@ describe("durable session command queue", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(counted.direct).toHaveLength(3);
+    expect(counted.direct).toHaveLength(4);
     expect(counted.direct[0]).toMatch(/EXISTS[\s\S]+agent_session_turns/i);
   });
 
@@ -664,6 +824,34 @@ describe("durable session command queue", () => {
         { commandId: "cmd_split_store", text: "text cmd_split_store" },
       ],
     });
+    await runtimeDb.execute(
+      "INSERT INTO sessions (session_id, name, project, client_key, kind, tier) VALUES ('human-new-boot', 'renamed', 'default', 'client-1', 'local.human', 'admin')",
+    );
+    await runtimeDb.execute(
+      "UPDATE command_intents SET caller_client_key = 'client-1', caller_principal_id = 'h_aaaaaaaaaaaaaaaaaaaaaaaa', caller_kind = 'local.human', caller_tier = 'admin' WHERE command_id = 'cmd_split_store'",
+    );
+    const read = () => handleConversationQueueGet(
+      new Request("http://localhost/api/conversation/prompt?name=otto", {
+        headers: { cookie: "nexus_human=cookie-1" },
+      }),
+      {
+        env: { NEXUS_WEB_AUTH_MODE: "remote-human" },
+        getWriteDb: async () => runtimeDb,
+        getIdentityDb: async () => identityDb,
+      },
+    );
+    expect(await (await read()).json()).toMatchObject({
+      commands: [{ correlationOwned: true }],
+    });
+    await identityDb.execute(
+      "UPDATE human_session SET principal_id = 'h_wrong_account'",
+    );
+    expect((await read()).status).toBe(401);
+    await identityDb.execute(
+      "UPDATE human_session SET principal_id = 'h_aaaaaaaaaaaaaaaaaaaaaaaa'",
+    );
+    await identityDb.execute("UPDATE human_user SET project = 'other'");
+    expect((await read()).status).toBe(401);
     identityDb.close();
   });
 

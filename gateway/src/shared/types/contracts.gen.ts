@@ -481,6 +481,10 @@ export interface CommandQueueEntry {
 	startedAt?: number;
 	completedAt?: number;
 	error?: string;
+	/** Structured durable error code, never parsed from the display message. */
+	errorCode?: number;
+	/** Computed by the read authority from the authenticated requester and stored caller. */
+	correlationOwned?: boolean;
 }
 
 /** Atomic pending-queue mutation selected by the UI. */
@@ -566,6 +570,7 @@ export interface CommandQueueTransition {
 	state: CommandQueueState;
 	mode: string;
 	revision: number;
+	correlationOwned?: boolean;
 }
 
 /**

@@ -64,6 +64,25 @@ selector; it cannot retrofit exact authority into an unbound command. Omitted le
 redirect remains compatible. Unsupported delivery/model intent is still rejected at
 dispatch, including converted rows, without a native operation.
 
+## Historical queue reads and reconnect binding
+
+Queue reads accept the captured stable `agentId` and `expectedSessionId`. A
+retained inactive session may still be inspected after its agent moves to another
+session; this grants no dispatch or mutation authority. Exact observe connections
+use the same retained ownership and do not warm or revive an agent. Missing,
+partial or conflicting ownership fails closed instead of selecting its replacement.
+
+Queue entries, transitions and receipts keep the original validated command
+binding. Filtering happens before the bounded queue viewport, and filtered global
+events still advance the scanned cursor. This is queue/receipt recovery, not PACT
+transcript isolation. On a non-gap queue-event page, `nextSeq` is the last scanned
+cursor; on a gap page it remains the first surviving sequence for rehydration.
+Optional `errorCode` preserves structured terminal errors;
+`correlationOwned` is computed for the authenticated reader, not supplied by a
+client. A matching client ID alone does not prove that a shared queue row belongs
+to that reader. Cookie identity is resolved without registering or rebinding it
+during a read; absent or ambiguous identity cannot authorize correlation.
+
 ## Codex native activity and request ownership
 
 The existing JSON-RPC reader updates native turn authority before forwarding a

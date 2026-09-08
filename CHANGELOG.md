@@ -12,6 +12,10 @@ All notable public changes to Egregore Nexus are documented here. This project f
 
 ### Fixed
 
+- Preserve exact historical session ownership through queue reads, terminal
+  projection and reconnect binding without warming a replacement session. Carry
+  structured terminal error codes and authenticated caller-correlation evidence
+  without treating a shared client ID as ownership.
 - Expose adapter-owned internal turn observations with fresh binding identities
   and evidence revisions. Keep missing responses, ambiguous native evidence and
   disconnected adapters distinct from verified idle; queue scheduling remains

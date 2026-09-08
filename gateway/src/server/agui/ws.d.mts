@@ -117,7 +117,8 @@ export class CommandQueueHub {
   constructor(deps: AguiWsDeps);
   subscribe(
     request: Request,
-    target: string | { name?: string; agentId?: string },
+    target:
+      string | { name?: string; agentId?: string; expectedSessionId?: string },
     handlers: CommandQueueHubHandlers,
   ): () => void;
 }

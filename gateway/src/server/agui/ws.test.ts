@@ -76,6 +76,28 @@ async function loadWs(): Promise<WsModule> {
 }
 
 describe("AG-UI WebSocket server transport", () => {
+  it("rejects a current S2 opener response before binding or pumping an exact S1 socket", async () => {
+    const { handleWs } = await loadWs();
+    const socket = new FakeSocket();
+    const fetchHandler = vi.fn();
+    const control = handleWs(
+      socket,
+      new Request(
+        "http://localhost/api/agui/ws?agentId=a_real&expectedSessionId=s_old",
+      ),
+      {
+        observe: async () =>
+          boundSessionResponse(
+            textStream(['data: {"type":"RUN_FINISHED"}\n\n']),
+          ),
+        fetchHandler,
+      },
+    );
+    await control.closed;
+    expect(socket.sent).toEqual([]);
+    expect(fetchHandler).not.toHaveBeenCalled();
+    expect(socket.closed?.code).toBe(1011);
+  });
   it.each(["queue.redirect", "queue.cancel", "queue.edit", "queue.reorder"].flatMap((t) =>
     ["", "dm=otto&agentId=a_real", "thread=work&agentId=a_real", "topic=updates&agentId=a_real"]
       .map((query) => ({ t, query })),
@@ -449,18 +471,20 @@ describe("AG-UI WebSocket server transport", () => {
   it("pumps SSE data records as raw AG-UI JSON websocket messages", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
-    const observe = vi.fn(async () => new Response(
-      textStream([
-        ": nexus-open\n\n",
-        "data: {\"type\":\"RUN_STARTED\",\"runId\":\"r1\"}\n\n",
-        "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r1\"}\n\n",
-      ]),
+    const observe = vi.fn(
+      async () =>
+        new Response(
+          textStream([
+            ": nexus-open\n\n",'data: {"type":"RUN_STARTED","runId":"r1"}\n\n',
+            'data: {"type":"RUN_FINISHED","runId":"r1"}\n\n',
+          ]),
       { status: 200, headers: { "content-type": "text/event-stream",
               "x-nexus-agent-name": "otto",
               "x-nexus-agent-id": "a_otto",
               "x-nexus-session-id": "s_otto",
             } },
-    ));
+        ),
+    );
 
     const control = handleWs(
       socket,
@@ -478,8 +502,8 @@ describe("AG-UI WebSocket server transport", () => {
         agentId: "a_otto",
         sessionId: "s_otto",
       }),
-      "{\"type\":\"RUN_STARTED\",\"runId\":\"r1\"}",
-      "{\"type\":\"RUN_FINISHED\",\"runId\":\"r1\"}",
+      '{"type":"RUN_STARTED","runId":"r1"}',
+      '{"type":"RUN_FINISHED","runId":"r1"}',
     ]);
   });
 
@@ -489,21 +513,23 @@ describe("AG-UI WebSocket server transport", () => {
     // junk into every consumer of this socket.
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
-    const observe = vi.fn(async () => new Response(
-      textStream([
-        ": ping\n\n",
-        "data: {\"type\":\"RUN_STARTED\",\"runId\":\"r1\"}\n\n",
-        ": ping\n\n",
-        ": ping\n\n",
-        "data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r1\"}\n\n",
-        ": ping\n\n",
-      ]),
+    const observe = vi.fn(
+      async () =>
+        new Response(
+          textStream([
+            ": ping\n\n",'data: {"type":"RUN_STARTED","runId":"r1"}\n\n',
+            ": ping\n\n",
+            ": ping\n\n",
+            'data: {"type":"RUN_FINISHED","runId":"r1"}\n\n',
+            ": ping\n\n",
+          ]),
       { status: 200, headers: { "content-type": "text/event-stream",
               "x-nexus-agent-name": "otto",
               "x-nexus-agent-id": "a_otto",
               "x-nexus-session-id": "s_otto",
             } },
-    ));
+        ),
+    );
 
     const control = handleWs(
       socket,
@@ -511,15 +537,14 @@ describe("AG-UI WebSocket server transport", () => {
       { observe },
     );
     await control.closed;
-
     expect(socket.sent).toEqual([
       JSON.stringify({
         t: "session.bound",
         agentId: "a_otto",
         sessionId: "s_otto",
       }),
-      "{\"type\":\"RUN_STARTED\",\"runId\":\"r1\"}",
-      "{\"type\":\"RUN_FINISHED\",\"runId\":\"r1\"}",
+      '{"type":"RUN_STARTED","runId":"r1"}',
+      '{"type":"RUN_FINISHED","runId":"r1"}',
     ]);
     expect(socket.sent.join("")).not.toContain("ping");
   });
@@ -1633,8 +1658,12 @@ describe("AG-UI WebSocket server transport", () => {
       afterSeq: 0,
     }));
 
-    source.enqueue("data: {\"type\":\"TOOL_CALL_START\",\"toolCallId\":\"tc1\",\"toolCallName\":\"Read\"}\n\n");
-    source.enqueue("data: {\"type\":\"TOOL_CALL_RESULT\",\"toolCallId\":\"tc1\",\"content\":\"done\",\"status\":\"completed\"}\n\n");
+    source.enqueue(
+      'data: {"type":"TOOL_CALL_START","toolCallId":"tc1","toolCallName":"Read"}\n\n',
+    );
+    source.enqueue(
+      'data: {"type":"TOOL_CALL_RESULT","toolCallId":"tc1","content":"done","status":"completed"}\n\n',
+    );
 
     await vi.waitFor(() => {
       const events = developerEvents(socket);
@@ -1708,10 +1737,15 @@ describe("AG-UI WebSocket server transport", () => {
       phase: "pre",
       ok: true,
     });
-    source.enqueue("data: {\"type\":\"TOOL_CALL_START\",\"toolCallId\":\"tc1\",\"toolCallName\":\"Read\"}\n\n");
+    source.enqueue(
+      'data: {"type":"TOOL_CALL_START","toolCallId":"tc1","toolCallName":"Read"}\n\n',
+    );
 
     await vi.waitFor(() => {
-      expect(socket.sent).toContain("{\"type\":\"TOOL_CALL_START\",\"toolCallId\":\"tc1\",\"toolCallName\":\"Read\"}");
+
+    expect(socket.sent).toContain(
+        '{"type":"TOOL_CALL_START","toolCallId":"tc1","toolCallName":"Read"}',
+      );
       const events = developerEvents(socket);
       expect(events).toHaveLength(1);
       expect(events[0]).toMatchObject({
@@ -1951,9 +1985,13 @@ describe("AG-UI WebSocket server transport", () => {
       phase: "post",
       ok: false,
     });
-    source.enqueue("data: {\"type\":\"TOOL_CALL_START\",\"toolCallId\":\"tc-smoke\",\"toolCallName\":\"Bash\"}\n\n");
-    source.enqueue("data: {\"type\":\"TOOL_CALL_RESULT\",\"toolCallId\":\"tc-smoke\",\"content\":\"boom\",\"status\":\"failed\"}\n\n");
-    source.enqueue("data: {\"type\":\"RUN_FINISHED\",\"runId\":\"r-smoke\"}\n\n");
+    source.enqueue(
+      'data: {"type":"TOOL_CALL_START","toolCallId":"tc-smoke","toolCallName":"Bash"}\n\n',
+    );
+    source.enqueue(
+      'data: {"type":"TOOL_CALL_RESULT","toolCallId":"tc-smoke","content":"boom","status":"failed"}\n\n',
+    );
+    source.enqueue('data: {"type":"RUN_FINISHED","runId":"r-smoke"}\n\n');
 
     await vi.waitFor(() => {
       expect(socket.sent).toContain(JSON.stringify({
@@ -1965,7 +2003,10 @@ describe("AG-UI WebSocket server transport", () => {
         revision: 1,
         seq: 9,
       }));
-      expect(socket.sent).toContain("{\"type\":\"RUN_FINISHED\",\"runId\":\"r-smoke\"}");
+
+    expect(socket.sent).toContain(
+        '{"type":"RUN_FINISHED","runId":"r-smoke"}',
+      );
       expect(developerEvents(socket)).toEqual([
         {
           kind: "tool_call",
@@ -2075,10 +2116,17 @@ describe("AG-UI WebSocket server transport", () => {
       },
     );
 
-    source.enqueue("data: {\"type\":\"TOOL_CALL_START\",\"toolCallId\":\"tc2\",\"toolCallName\":\"Bash\"}\n\n");
-    source.enqueue("data: {\"type\":\"TOOL_CALL_RESULT\",\"toolCallId\":\"tc2\",\"content\":\"boom\",\"status\":\"failed\"}\n\n");
+    source.enqueue(
+      'data: {"type":"TOOL_CALL_START","toolCallId":"tc2","toolCallName":"Bash"}\n\n',
+    );
+    source.enqueue(
+      'data: {"type":"TOOL_CALL_RESULT","toolCallId":"tc2","content":"boom","status":"failed"}\n\n',
+    );
     await vi.waitFor(() => {
-      expect(socket.sent).toContain("{\"type\":\"TOOL_CALL_RESULT\",\"toolCallId\":\"tc2\",\"content\":\"boom\",\"status\":\"failed\"}");
+
+    expect(socket.sent).toContain(
+        '{"type":"TOOL_CALL_RESULT","toolCallId":"tc2","content":"boom","status":"failed"}',
+      );
     });
 
     socket.emit("message", JSON.stringify({
@@ -2130,9 +2178,15 @@ describe("AG-UI WebSocket server transport", () => {
       afterSeq: 0,
     }));
 
-    source.enqueue("data: {\"type\":\"TOOL_CALL_START\",\"toolCallId\":\"tc3\",\"toolCallName\":\"Read\"}\n\n");
-    source.enqueue("data: {\"type\":\"TOOL_CALL_RESULT\",\"toolCallId\":\"tc3\",\"content\":\"done\",\"status\":\"completed\"}\n\n");
-    source.enqueue("data: {\"type\":\"TOOL_CALL_RESULT\",\"toolCallId\":\"tc3\",\"content\":\"late\",\"status\":\"completed\"}\n\n");
+    source.enqueue(
+      'data: {"type":"TOOL_CALL_START","toolCallId":"tc3","toolCallName":"Read"}\n\n',
+    );
+    source.enqueue(
+      'data: {"type":"TOOL_CALL_RESULT","toolCallId":"tc3","content":"done","status":"completed"}\n\n',
+    );
+    source.enqueue(
+      'data: {"type":"TOOL_CALL_RESULT","toolCallId":"tc3","content":"late","status":"completed"}\n\n',
+    );
 
     await vi.waitFor(() => {
       const events = developerEvents(socket);
@@ -2170,7 +2224,10 @@ describe("AG-UI WebSocket server transport", () => {
       );
     }
     await vi.waitFor(() => {
-      expect(socket.sent).toContain("{\"type\":\"TOOL_CALL_START\",\"toolCallId\":\"tc1024\",\"toolCallName\":\"Tool1024\"}");
+
+    expect(socket.sent).toContain(
+        '{"type":"TOOL_CALL_START","toolCallId":"tc1024","toolCallName":"Tool1024"}',
+      );
     });
 
     socket.emit("message", JSON.stringify({
@@ -2178,8 +2235,12 @@ describe("AG-UI WebSocket server transport", () => {
       topic: "sys.agent.otto.tool_call",
       afterSeq: 0,
     }));
-    source.enqueue("data: {\"type\":\"TOOL_CALL_RESULT\",\"toolCallId\":\"tc0\",\"content\":\"old\",\"status\":\"completed\"}\n\n");
-    source.enqueue("data: {\"type\":\"TOOL_CALL_RESULT\",\"toolCallId\":\"tc1024\",\"content\":\"new\",\"status\":\"completed\"}\n\n");
+    source.enqueue(
+      'data: {"type":"TOOL_CALL_RESULT","toolCallId":"tc0","content":"old","status":"completed"}\n\n',
+    );
+    source.enqueue(
+      'data: {"type":"TOOL_CALL_RESULT","toolCallId":"tc1024","content":"new","status":"completed"}\n\n',
+    );
 
     await vi.waitFor(() => {
       const events = developerEvents(socket);

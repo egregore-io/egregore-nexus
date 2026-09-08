@@ -61,6 +61,10 @@ legacy HTTP/IPC/CLI routing. Agent-session WebSocket commands require the captur
 pair, supplied by the retained browser producer only after `session.bound`; missing or
 foreign response bindings are not reported as success. Binding is transport/routing
 evidence, not native admission proof. Lens carrier integration remains a separate step.
+Exact queue reads and reconnects can inspect a retained earlier session without
+warming it or substituting the agent's newer session. Queue recovery preserves
+original command binding and authenticated caller correlation; it does not certify
+PACT transcript paging or native delivery.
 Codex native activity is ingested before display processing, so a blocked display write
 does not hold a subsequently read completed turn busy. Private binding ownership also
 prevents a superseded request from entering native submission; an already admitted request

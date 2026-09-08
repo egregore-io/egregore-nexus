@@ -145,6 +145,12 @@ pub struct CommandQueueEntry {
     pub completed_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Structured durable error code, never parsed from the display message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<i32>,
+    /// Computed by the read authority from the authenticated requester and stored caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_owned: Option<bool>,
 }
 
 /// Reconnect snapshot for one daemon-owned session lane.
@@ -281,6 +287,8 @@ pub struct CommandQueueTransition {
     pub mode: String,
     #[typeshare(serialized_as = "number")]
     pub revision: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_owned: Option<bool>,
 }
 
 /// Redirect one durable operator message into the active turn. This is deliberately separate from

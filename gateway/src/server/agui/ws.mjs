@@ -716,9 +716,10 @@ export class CommandQueueHub {
     return () => {
       subscriber.closed = true;
       this.#subscribers.delete(subscriber);
-      const remaining = [...this.#subscribers].filter((entry) => (
-        entry.authKey === authKey && !entry.closed
-      ));
+      const remaining = [...this.#subscribers].filter(
+        (entry) =>
+        entry.authKey === authKey && !entry.closed,
+      );
       if (remaining.length === 0) {
         if (group.timer) clearTimeout(group.timer);
         group.pendingRefreshes.clear();
@@ -745,9 +746,10 @@ export class CommandQueueHub {
 
   #reconcileGroup(authKey, group, delay = 0) {
     if (this.#groups.get(authKey) !== group) return;
-    const active = [...this.#subscribers].filter((subscriber) => (
-      subscriber.authKey === authKey && !subscriber.closed && !subscriber.failed
-    ));
+    const active = [...this.#subscribers].filter(
+      (subscriber) =>
+      subscriber.authKey === authKey && !subscriber.closed && !subscriber.failed,
+    );
     if (active.length === 0 || active.some((subscriber) => !subscriber.ready)) {
       group.ready = false;
       return;
@@ -760,6 +762,7 @@ export class CommandQueueHub {
   async #hydrate(subscriber, group, phase, generation) {
     try {
       const snapshot = await this.#loadSnapshot(subscriber.request, subscriber.target);
+      assertResponseSession(subscriber.target, snapshot);
       if (
         subscriber.closed
         || this.#groups.get(subscriber.authKey) !== group
@@ -801,11 +804,13 @@ export class CommandQueueHub {
   }
 
   async #loadSnapshot(request, target) {
-    const url = new URL(request.url);
+  const url = new URL(request.url);
     url.pathname = "/api/conversation/prompt";
     url.search = "";
     if (target.name) url.searchParams.set("name", target.name);
     if (target.agentId) url.searchParams.set("agentId", target.agentId);
+    if (target.expectedSessionId)
+      url.searchParams.set("expectedSessionId", target.expectedSessionId);
     const response = await routeThroughFetchHandler(
       this.#deps,
       new Request(url, { method: "GET", headers: request.headers }),
@@ -815,14 +820,16 @@ export class CommandQueueHub {
   }
 
   async #refreshGroupSubscribers(group, generation, subscribers) {
-    const active = [...subscribers].filter((subscriber) => (
-      !subscriber.closed && !subscriber.failed && subscriber.ready
-    ));
+    const active = [...subscribers].filter(
+      (subscriber) =>
+      !subscriber.closed && !subscriber.failed && subscriber.ready,
+    );
     if (active.length === 0) return "done";
     try {
       // All entries share auth + target. Fetch once, then fan the authoritative projection out to
       // every mounted client. This is event-driven reconciliation, not another polling lane.
       const snapshot = await this.#loadSnapshot(active[0].request, active[0].target);
+      assertResponseSession(active[0].target, snapshot);
       if (
         this.#groups.get(active[0].authKey) !== group
         || group.generation !== generation
@@ -881,14 +888,14 @@ export class CommandQueueHub {
     let caughtUp = true;
     try {
       const url = new URL(group.request.url);
-      url.pathname = "/api/conversation/prompt";
+    url.pathname = "/api/conversation/prompt";
       url.search = "";
       url.searchParams.set("eventsAfter", String(requestCursor));
       const response = await routeThroughFetchHandler(
         this.#deps,
         new Request(url, { method: "GET", headers: group.request.headers }),
       );
-      if (!response.ok) throw new Error(await errorReason(response));
+    if (!response.ok) throw new Error(await errorReason(response));
       const body = await response.json();
       if (
         this.#groups.get(authKey) !== group
@@ -900,9 +907,10 @@ export class CommandQueueHub {
         group.generation += 1;
         group.ready = false;
         group.pendingRefreshes.clear();
-        const affected = [...this.#subscribers].filter((entry) => (
-          entry.authKey === authKey && !entry.closed && !entry.failed
-        ));
+        const affected = [...this.#subscribers].filter(
+          (entry) =>
+          entry.authKey === authKey && !entry.closed && !entry.failed,
+        );
         for (const subscriber of affected) {
           subscriber.ready = false;
           subscriber.buffered = [];
@@ -946,6 +954,10 @@ export class CommandQueueHub {
         }
       }
       const latest = nonNegativeInteger(body?.latestSeq) ?? group.cursor;
+      const scanned = nonNegativeInteger(body?.nextSeq);
+      if (scanned !== undefined && scanned > 0)
+        group.cursor = Math.max(group.cursor, scanned);
+      else
       if (events.length === 0) group.cursor = Math.max(group.cursor, latest);
       if (group.cursor < latest) caughtUp = false;
 
@@ -972,9 +984,9 @@ export class CommandQueueHub {
     } finally {
       group.polling = false;
       if (this.#groups.get(authKey) === group && group.ready) {
-        const delay = group.wakeAfterPoll ? 0 : (caughtUp ? this.#pollMs : 0);
+        const delay = group.wakeAfterPoll ? 0 : caughtUp ? this.#pollMs : 0;
         group.wakeAfterPoll = false;
-        this.#scheduleGroup(authKey, group, delay);
+    this.#scheduleGroup(authKey, group, delay);
       }
     }
   }
@@ -1238,7 +1250,7 @@ class DeveloperEventSubscriptions {
     this.#source = deps.developerEvents;
     this.#daemonToolCallSource = Object.prototype.hasOwnProperty.call(deps, "daemonToolCallEvents")
       ? deps.daemonToolCallEvents
-      : (this.#sessionName ? createDaemonPushDeveloperEventSource(this.#sessionName) : undefined);
+      :this.#sessionName ? createDaemonPushDeveloperEventSource(this.#sessionName) : undefined;
     this.#daemonFleetSource = Object.prototype.hasOwnProperty.call(deps, "daemonFleetStatusEvents")
       ? deps.daemonFleetStatusEvents
       : createDaemonPushDeveloperEventSource(FLEET_SESSION_KEY);
@@ -1590,6 +1602,8 @@ class SessionLaneBinding {
     {
       if (!responseSessionId ||
         (this.#pathSessionId && responseSessionId !== this.#pathSessionId) || !responseTarget?.agentId ||
+        (this.#fallbackTarget?.expectedSessionId &&
+          responseSessionId !== this.#fallbackTarget.expectedSessionId) ||
         (this.#fallbackTarget?.agentId &&
           responseTarget.agentId !== this.#fallbackTarget.agentId)
       ) {
@@ -1671,9 +1685,15 @@ function sessionLaneTargetFromRequest(request) {
   const params = new URL(request.url).searchParams;
   const session = stringField(params.get("session"));
   const agentId = stringField(params.get("agentId"));
-  if (session) return normalizeSessionLookup(session, agentId);
+  const expectedSessionId = stringField(params.get("expectedSessionId"));
+  if (session)
+    return normalizeSessionLookup({
+      name: session,
+      agentId,
+      expectedSessionId,
+    });
   if (!agentId || params.get("thread") || params.get("dm") || params.get("topic")) return undefined;
-  return { agentId };
+  return { agentId, ...(expectedSessionId ? { expectedSessionId } : {}) };
 }
 
 function sessionIdFromPath(request) {
@@ -1691,10 +1711,12 @@ function normalizeSessionLookup(value, explicitAgentId) {
     ? stringField(value)
     : stringField(value?.name);
   const agentId = stringField(explicitAgentId) ?? stringField(value?.agentId);
+  const expectedSessionId = stringField(value?.expectedSessionId);
   if (!name && !agentId) return undefined;
   return {
     ...(name ? { name } : {}),
     ...(agentId ? { agentId } : {}),
+    ...(expectedSessionId ? { expectedSessionId } : {}),
   };
 }
 
@@ -1728,7 +1750,11 @@ function assertResponseSession(target, result) {
 }
 
 function sessionTargetKey(target) {
-  return target.agentId ? `agent:${target.agentId}` : `name:${target.name}`;
+  return JSON.stringify([
+    target.agentId ?? null,
+    target.agentId ? null : target.name,
+    target.expectedSessionId ?? null,
+  ]);
 }
 
 function toolCallTopic(agent) {
@@ -1744,11 +1770,13 @@ function toolCallTopicAgent(topic) {
 }
 
 function isInProgressToolResult(frame, status) {
-  return frame.append === true || status === "in_progress" || status === "running";
+  return ( frame.append === true || status === "in_progress" || status === "running"
+  );
 }
 
 function isFailedToolStatus(status) {
-  return status === "failed" || status === "error" || status === "cancelled" || status === "canceled";
+  return ( status === "failed" || status === "error" || status === "cancelled" || status === "canceled"
+  );
 }
 
 function nonNegativeInteger(value) {
