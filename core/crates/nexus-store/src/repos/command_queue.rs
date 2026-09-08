@@ -26,6 +26,13 @@ pub struct CommandQueueMutationOutcome {
     pub body: Value,
 }
 
+/// Private call evidence, never deserialized from a mutation or included in retry identity.
+#[derive(Debug, Clone)]
+pub struct CapturedQueueCapability {
+    pub session_id: SessionId,
+    pub steer_capability: SteerCapability,
+}
+
 /// Bounded monotonic queue transitions returned to the Gateway reconnect poller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandQueueEventsPage {
@@ -75,20 +82,13 @@ impl<'a> QueueTarget<'a> {
 struct TargetRuntime {
     session_id: Option<String>,
     name: Option<String>,
-    harness: Option<String>,
-    transport: Option<String>,
+    steer_capability: SteerCapability,
     turn_active: bool,
 }
 
 impl TargetRuntime {
     fn steer_capability(&self) -> SteerCapability {
-        if self.transport.as_deref() == Some("codex-appserver") {
-            SteerCapability::NativeSteer
-        } else if self.harness.is_some() {
-            SteerCapability::InterruptAndSend
-        } else {
-            SteerCapability::None
-        }
+        self.steer_capability
     }
 }
 
@@ -173,6 +173,7 @@ impl<'a> CommandQueue<'a> {
             seq,
             revision: seq,
             commands,
+            observation: None,
         })
     }
 
@@ -214,6 +215,18 @@ impl<'a> CommandQueue<'a> {
         request: &CommandQueueMutationRequest,
         now: i64,
         active_sessions: &[SessionId],
+    ) -> Result<CommandQueueMutationOutcome, NexusError> {
+        self.mutate_with_capability(project, request, now, active_sessions, None)
+            .await
+    }
+
+    pub async fn mutate_with_capability(
+        &self,
+        project: &str,
+        request: &CommandQueueMutationRequest,
+        now: i64,
+        active_sessions: &[SessionId],
+        capability: Option<&CapturedQueueCapability>,
     ) -> Result<CommandQueueMutationOutcome, NexusError> {
         if request.expected_session_id.as_ref().is_some_and(|id| {
             id.0.trim().is_empty()
@@ -257,7 +270,13 @@ impl<'a> CommandQueue<'a> {
 
         // Resolve NEW work under the same identity write gate as apply. A
         // committed receipt replays without re-resolving a later runtime.
-        let runtime = mutation_target_runtime(self.store, &tx, target, active_sessions).await?;
+        let mut runtime = mutation_target_runtime(self.store, &tx, target, active_sessions).await?;
+        runtime.steer_capability = capability
+            .filter(|captured| {
+                runtime.session_id.as_deref() == Some(captured.session_id.0.as_str())
+            })
+            .map(|captured| captured.steer_capability)
+            .unwrap_or(SteerCapability::None);
 
         tx.execute(
             "INSERT INTO command_queue_mutations \
@@ -405,8 +424,7 @@ async fn runtime_from_session(
         return Ok(TargetRuntime {
             session_id: None,
             name: None,
-            harness: None,
-            transport: None,
+            steer_capability: SteerCapability::None,
             turn_active: false,
         });
     };
@@ -428,8 +446,7 @@ async fn runtime_from_session(
     Ok(TargetRuntime {
         session_id: Some(session.session_id.0),
         name: session.name,
-        harness: session.agent,
-        transport: session.transport,
+        steer_capability: SteerCapability::None,
         turn_active,
     })
 }

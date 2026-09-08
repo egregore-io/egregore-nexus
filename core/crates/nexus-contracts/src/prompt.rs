@@ -161,7 +161,7 @@ pub struct CommandQueueSnapshot {
     pub target: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
-    /// Derived exclusively from the durable normalized session-turn projection.
+    /// Compatibility activity projection. Positive native observations override durable fallback.
     pub turn_active: bool,
     pub steer_capability: SteerCapability,
     /// Monotonic global queue cursor used as the reconnect `afterSeq` boundary.
@@ -171,6 +171,35 @@ pub struct CommandQueueSnapshot {
     #[typeshare(serialized_as = "number")]
     pub revision: i64,
     pub commands: Vec<CommandQueueEntry>,
+    /// Exact adapter evidence, independently versioned from the queue cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<QueueTurnObservation>,
+}
+
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueTurnObservation {
+    pub session_id: String,
+    pub state: TurnState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[typeshare(serialized_as = "Option<number>")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    pub steer_capability: SteerCapability,
+}
+
+impl QueueTurnObservation {
+    pub fn from_observation(session_id: String, observation: TurnObservation) -> Self {
+        Self {
+            session_id,
+            state: observation.state,
+            owner: observation.stamp.as_ref().map(|stamp| stamp.owner.clone()),
+            revision: observation.stamp.map(|stamp| stamp.revision),
+            steer_capability: observation.steer_capability,
+        }
+    }
 }
 
 /// Immediate durable receipt for a newly queued session command.
@@ -454,8 +483,10 @@ pub struct InterruptResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<SessionId>,
 }
-/// Internal adapter evidence, not a serialized command or a scheduler busy bit.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Adapter evidence state, projected for inspection but never a scheduler busy bit.
+#[typeshare]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub enum TurnState {
     VerifiedIdle,
     NativeOpen,

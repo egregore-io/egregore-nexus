@@ -83,6 +83,26 @@ client. A matching client ID alone does not prove that a shared queue row belong
 to that reader. Cookie identity is resolved without registering or rebinding it
 during a read; absent or ambiguous identity cannot authorize correlation.
 
+## Adapter observation on queue snapshots
+
+The optional `observation` on an exact queue snapshot carries the adapter's own
+turn state, session, capability and, when available, opaque binding owner and
+evidence revision. Queue position and activity have separate versions: an idle
+or busy observation can change without a queue transition. Unknown or unavailable
+evidence is not idle, and an observation does not reserve native admission.
+
+Subscribed lanes reuse the existing shared snapshot refresh at a bounded cadence,
+including when transition pages are empty. This bounds refresh requests, not
+network latency. Historical sessions receive their own evidence, never the active
+replacement's state. Consumers compare revisions only within the same owner and
+discard observations from superseded reads without discarding independent queue
+facts.
+
+New redirect mutations use capability captured from the selected adapter, checked
+against the transaction-resolved session after committed replay. Stored harness
+names and caller-supplied fields cannot grant redirect support. This check is not
+an atomic native reservation; actual dispatch still validates its admission.
+
 ## Codex native activity and request ownership
 
 The existing JSON-RPC reader updates native turn authority before forwarding a

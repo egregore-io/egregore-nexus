@@ -21,6 +21,7 @@ import {
   CommandQueueAction,
   CommandQueueState,
   SteerCapability,
+  TurnState,
   type CommandQueueEntry,
   type CommandQueueMutationRequest,
   type CommandQueueSnapshot,
@@ -115,6 +116,8 @@ export interface ConversationQueueDeps {
   ) => Promise<QueueMutationWireResponse>;
   /** Test seam for daemon-owned queue snapshots and reconnect transitions. */
   daemonQueueRead?: (input: QueueReadInput) => Promise<QueueReadWireResponse>;
+  /** Injected direct-DB fixture only. Production observation belongs to the daemon adapter. */
+  observeTurn?: (sessionId: string) => NonNullable<CommandQueueSnapshot["observation"]>;
   nexusHome?: string;
   now?: () => number;
 }
@@ -303,12 +306,7 @@ async function targetRuntime(
   const transport =
     typeof row?.transport === "string" ? row.transport : undefined;
   const turnActive = Number(row?.turn_active ?? 0) === 1;
-  const steerCapability: SteerCapability =
-    transport === "codex-appserver"
-      ? SteerCapability.NativeSteer
-      : harness
-        ? SteerCapability.InterruptAndSend
-        : SteerCapability.None;
+  const steerCapability = SteerCapability.None;
   return { sessionId, name, harness, transport, turnActive, steerCapability };
 }
 
@@ -771,15 +769,24 @@ export async function handleConversationQueueGet(
     latestQueueSeq(db),
   ]);
   if (target.expectedSessionId) runtime.sessionId = target.expectedSessionId;
+  const observation = runtime.sessionId
+    ? deps.observeTurn?.(runtime.sessionId) ?? {
+        sessionId: runtime.sessionId, state: TurnState.Unknown, steerCapability: SteerCapability.None,
+      }
+    : undefined;
+  const exactObservation = observation?.sessionId === runtime.sessionId ? observation : undefined;
   const snapshot: CommandQueueSnapshot = {
     target: runtime.name ?? target.name ?? target.agentId ?? "",
     sessionId: runtime.sessionId,
     turnActive: runtime.turnActive,
-    steerCapability: runtime.steerCapability,
+    steerCapability: exactObservation?.steerCapability ?? SteerCapability.None,
     seq,
     revision: seq,
     commands: await queueEntries(db, target, runtime.sessionId, requester),
+    ...(exactObservation ? {observation: exactObservation} : {}),
   };
+  if (exactObservation?.state === "nativeOpen") snapshot.turnActive = true;
+  if (exactObservation?.state === "verifiedIdle") snapshot.turnActive = false;
   return json(snapshot);
 }
 
@@ -834,6 +841,12 @@ export async function handleConversationQueuePost(
   }
   const db = await deps.getWriteDb();
   const requestJson = canonicalMutationRequest(body, target);
+  let captured: CommandQueueSnapshot["observation"];
+  try {
+    const selected = target.expectedSessionId
+      ? {sessionId:target.expectedSessionId} : await targetRuntime(db, target);
+    captured = selected.sessionId ? deps.observeTurn?.(selected.sessionId) : undefined;
+  } catch { /* Missing private evidence must not prevent committed replay. */ }
   const tx = await db.transaction("write");
   let transactionClosed = false;
 
@@ -875,6 +888,8 @@ export async function handleConversationQueuePost(
       args: [auth.project, body.clientMutationId, requestJson, now],
     });
     const runtime = await targetRuntime(tx, target);
+    runtime.steerCapability = captured?.sessionId === runtime.sessionId
+      ? captured?.steerCapability ?? SteerCapability.None : SteerCapability.None;
     const predicate = targetPredicate(target, runtime.sessionId);
     if (target.expectedSessionId) {
       // Conversion cannot grant an old row authority that was absent at its original enqueue.

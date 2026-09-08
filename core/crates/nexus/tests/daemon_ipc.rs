@@ -24,6 +24,46 @@ async fn state() -> AppState {
     AppState::wire(store, &Config::default())
 }
 
+struct ObservedQueueExec {
+    session: &'static str,
+}
+
+#[async_trait::async_trait]
+impl nexus_contracts::AgentTurnExecutionPort for ObservedQueueExec {
+    async fn inject_turn(
+        &self,
+        _: &SessionId,
+        _: &nexus_contracts::NexusBatch,
+    ) -> nexus_contracts::PortResult<()> {
+        unreachable!()
+    }
+    async fn launch(
+        &self,
+        _: nexus_contracts::SpawnRequest,
+    ) -> nexus_contracts::PortResult<nexus_contracts::SpawnResponse> {
+        unreachable!()
+    }
+    async fn remove(
+        &self,
+        _: nexus_contracts::RemoveRequest,
+    ) -> nexus_contracts::PortResult<nexus_contracts::RemoveResponse> {
+        unreachable!()
+    }
+    fn observe_turn(&self, session: &SessionId) -> nexus_contracts::TurnObservation {
+        if session.0 != self.session {
+            return nexus_contracts::TurnObservation::default();
+        }
+        nexus_contracts::TurnObservation {
+            state: nexus_contracts::TurnState::NativeOpen,
+            stamp: Some(nexus_contracts::TurnObservationStamp {
+                owner: "queue-fixture-owner".into(),
+                revision: 1,
+            }),
+            steer_capability: nexus_contracts::SteerCapability::NativeSteer,
+        }
+    }
+}
+
 fn queue_operator() -> DaemonIpcCaller {
     DaemonIpcCaller {
         name: Some("transport".into()),
@@ -37,6 +77,48 @@ fn queue_operator() -> DaemonIpcCaller {
         access: None,
         principal_id: None,
         tier: Tier::Admin,
+    }
+}
+
+#[tokio::test]
+async fn historical_queue_observation_never_substitutes_current_native_owner() {
+    let original = state().await;
+    let state = AppState::wire_with_turn_exec(
+        original.store.clone(),
+        &Config::default(),
+        Arc::new(ObservedQueueExec { session: "S2" }),
+    );
+    state.store.identity_conn().execute_batch("INSERT INTO agents (agent_id,project,name,tier,created_at) VALUES ('A','default','otto','agent',1);
+        INSERT INTO agent_runtimes (runtime_id,agent_id,harness,active,started_at) VALUES ('S1','A','codex',0,1), ('S2','A','codex',1,2);").await.unwrap();
+    for (session, expected_state, capability) in [
+        ("S1", "unknown", "none"),
+        ("S2", "nativeOpen", "native_steer"),
+    ] {
+        let response = daemon_ipc::handle_request(
+            &state,
+            "boot-token",
+            DaemonIpcRequest {
+                version: DAEMON_IPC_PROTOCOL_VERSION,
+                token: "boot-token".into(),
+                request_id: session.into(),
+                caller: Some(queue_operator()),
+                call: DaemonIpcCall::Query {
+                    method: "local.sessionQueue.read".into(),
+                    params: serde_json::json!({"agentId":"A","expectedSessionId":session}),
+                },
+            },
+        )
+        .await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let snapshot = response.result.unwrap();
+        assert_eq!(snapshot["observation"]["sessionId"], session);
+        assert_eq!(snapshot["observation"]["state"], expected_state);
+        assert_eq!(snapshot["steerCapability"], capability);
+        assert_eq!(snapshot["turnActive"], session == "S2");
+        assert_eq!(snapshot["seq"], 0);
+        if session == "S1" {
+            assert!(snapshot["observation"].get("owner").is_none());
+        }
     }
 }
 
@@ -1073,7 +1155,12 @@ async fn legacy_gateway_export_is_bounded_typed_and_cursor_paginated() {
 
 #[tokio::test]
 async fn local_queue_mutation_executes_atomically_inside_the_daemon_owner() {
-    let state = state().await;
+    let original = state().await;
+    let state = AppState::wire_with_turn_exec(
+        original.store.clone(),
+        &Config::default(),
+        Arc::new(ObservedQueueExec { session: "s_queue" }),
+    );
     state
         .store
         .conn
@@ -1345,6 +1432,13 @@ async fn local_queue_read_returns_typed_snapshot_and_transitions_without_raw_sto
     let snapshot = snapshot.result.unwrap();
     assert_eq!(snapshot["target"], "queue-reader");
     assert_eq!(snapshot["sessionId"], "s_queue_read");
+    assert_eq!(
+        snapshot["observation"],
+        serde_json::json!({
+            "sessionId":"s_queue_read", "state":"unavailable", "steerCapability":"none"
+        })
+    );
+    assert_eq!(snapshot["steerCapability"], "none");
     assert_eq!(snapshot["commands"][0]["commandId"], "cmd_queue_read");
     assert_eq!(snapshot["commands"][0]["state"], "queued");
     assert_eq!(

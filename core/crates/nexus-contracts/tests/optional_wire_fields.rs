@@ -24,6 +24,16 @@ where
 }
 
 #[test]
+fn queue_observation_preserves_exact_native_evidence_independent_of_queue_cursor() {
+    assert_absent_round_trip::<nexus_contracts::CommandQueueSnapshot>(json!({
+        "target":"otto", "sessionId":"s_otto", "turnActive":true,
+        "steerCapability":"none", "seq":0, "revision":0, "commands":[],
+        "observation":{"sessionId":"s_otto", "state":"nativeOpen",
+            "owner":"opaque:1", "revision":2, "steerCapability":"none"}
+    }));
+}
+
+#[test]
 fn queue_evidence_fields_are_strict_optional_wire_values() {
     use nexus_contracts::CommandQueueEntry;
     let wire = json!({"commandId":"cmd", "text":"retained", "state":"failed", "mode":"queue", "revision":2, "seq":3, "createdAt":1, "errorCode":-32602, "correlationOwned":true});

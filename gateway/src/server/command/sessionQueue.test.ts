@@ -447,6 +447,7 @@ const deps = (db: Client) => ({
   env: { NEXUS_WEB_AUTH_MODE: "local" },
   getWriteDb: async () => db,
   now: () => 9_000,
+  observeTurn: (sessionId: string) => ({sessionId, state:"unknown" as any, steerCapability:SteerCapability.NativeSteer}),
 });
 
 function countedDb(db: Client): {
@@ -491,6 +492,32 @@ function countedDb(db: Client): {
 }
 
 describe("durable session command queue", () => {
+  it("does not infer redirect capability from stored Codex metadata", async () => {
+    const db = await dbFor();
+    await insertCommand(db, "cmd_no_cap", "pending", 1);
+    await insertActiveTurn(db);
+    const response = await handleConversationQueuePost(new Request("http://localhost/api/conversation/prompt", {
+      method:"PATCH", headers:{"content-type":"application/json"},
+      body:JSON.stringify({name:"otto", action:"redirect_now", clientMutationId:"no_cap", commandId:"cmd_no_cap", expectedRevision:1}),
+    }), {env:{NEXUS_WEB_AUTH_MODE:"local"}, getWriteDb:async () => db});
+    expect(response.status).toBe(409);
+  });
+
+  it("rejects foreign captured capability and replays a committed redirect after capability loss", async () => {
+    const db = await dbFor();
+    await insertCommand(db, "cmd_cap", "pending", 1);
+    await insertActiveTurn(db);
+    const request = (id:string) => new Request("http://localhost/api/conversation/prompt", {method:"PATCH", headers:{"content-type":"application/json"},
+      body:JSON.stringify({name:"otto", action:"redirect_now", clientMutationId:id, commandId:"cmd_cap", expectedRevision:1})});
+    const foreign = await handleConversationQueuePost(request("foreign"), {...deps(db), observeTurn:() => ({sessionId:"S_foreign", state:"unknown" as any, steerCapability:SteerCapability.NativeSteer})});
+    expect(foreign.status).toBe(409);
+    const accepted = await handleConversationQueuePost(request("accepted"), deps(db));
+    expect(accepted.status).toBe(200);
+    const replay = await handleConversationQueuePost(request("accepted"), {...deps(db), observeTurn:() => {throw new Error("adapter lost");}});
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toEqual(await accepted.json());
+  });
+
   it("sends production mutations to the daemon instead of opening a gateway transaction", async () => {
     const daemonQueueMutation = vi.fn(async () => ({
       status: 200,
@@ -1107,11 +1134,11 @@ describe("durable session command queue", () => {
     });
   });
 
-  it("advertises OpenCode's canonical interrupt-and-send adapter mode", async () => {
+  it("advertises the observed interrupt-and-send adapter mode", async () => {
     const db = await dbFor("opencode", "pty");
     const response = await handleConversationQueueGet(
       new Request("http://localhost/api/conversation/prompt?name=otto"),
-      deps(db),
+      {...deps(db), observeTurn:(sessionId) => ({sessionId, state:"unknown" as any, steerCapability:SteerCapability.InterruptAndSend})},
     );
     await expect(response.json()).resolves.toMatchObject({
       turnActive: false,

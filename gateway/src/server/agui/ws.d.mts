@@ -97,6 +97,7 @@ export interface AguiWsDeps {
   daemonFleetStatusEvents?: AguiWsDaemonToolCallEventSource | null;
   /** One gateway-wide poll cadence for the daemon-owned transition projection. */
   commandQueueEventPollMs?: number;
+  commandQueueObservationPollMs?: number;
   commandQueueHub?: CommandQueueHub;
 }
 

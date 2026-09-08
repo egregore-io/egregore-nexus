@@ -260,11 +260,17 @@ async fn exact_redirect_paths_preserve_original_request_and_retry_identity_throu
             let request = serde_json::from_value(serde_json::json!({"agentId":"a_exact", "expectedSessionId":"s_original", "action":"redirect_now", "clientMutationId":"mut_exact_redirect", "commandId":"cmd_exact_redirect", "expectedRevision":1})).unwrap();
             assert_eq!(
                 nexus_store::repos::CommandQueue::new(&state.store)
-                    .mutate_with_active_sessions(
+                    .mutate_with_capability(
                         "metadata",
                         &request,
                         2,
-                        &[SessionId("s_original".into())]
+                        &[SessionId("s_original".into())],
+                        Some(
+                            &nexus_store::repos::command_queue::CapturedQueueCapability {
+                                session_id: SessionId("s_original".into()),
+                                steer_capability: nexus_contracts::SteerCapability::NativeSteer,
+                            }
+                        ),
                     )
                     .await
                     .unwrap()
@@ -1062,7 +1068,19 @@ async fn redirected_persisted_intent_rejects_unsupported_options_before_native_s
                         let request: nexus_contracts::CommandQueueMutationRequest =
                             serde_json::from_value(request_wire).unwrap();
                         let outcome = nexus_store::repos::CommandQueue::new(&state.store)
-                            .mutate_with_active_sessions("default", &request, 2, &[target_session])
+                            .mutate_with_capability(
+                                "default",
+                                &request,
+                                2,
+                                &[target_session.clone()],
+                                Some(
+                                    &nexus_store::repos::command_queue::CapturedQueueCapability {
+                                        session_id: target_session.clone(),
+                                        steer_capability:
+                                            nexus_contracts::SteerCapability::NativeSteer,
+                                    },
+                                ),
+                            )
                             .await
                             .unwrap();
                         assert_eq!(outcome.status, 200, "{outcome:?}");

@@ -541,11 +541,27 @@ export interface CommandQueueReceipt {
 	seq: number;
 }
 
+/** Adapter evidence state, projected for inspection but never a scheduler busy bit. */
+export enum TurnState {
+	VerifiedIdle = "verifiedIdle",
+	NativeOpen = "nativeOpen",
+	Unknown = "unknown",
+	Unavailable = "unavailable",
+}
+
+export interface QueueTurnObservation {
+	sessionId: string;
+	state: TurnState;
+	owner?: string;
+	revision?: number;
+	steerCapability: SteerCapability;
+}
+
 /** Reconnect snapshot for one daemon-owned session lane. */
 export interface CommandQueueSnapshot {
 	target: string;
 	sessionId?: string;
-	/** Derived exclusively from the durable normalized session-turn projection. */
+	/** Compatibility activity projection. Positive native observations override durable fallback. */
 	turnActive: boolean;
 	steerCapability: SteerCapability;
 	/** Monotonic global queue cursor used as the reconnect `afterSeq` boundary. */
@@ -553,6 +569,8 @@ export interface CommandQueueSnapshot {
 	/** Queue revision. It advances with `seq`; named separately for compare-and-set UI state. */
 	revision: number;
 	commands: CommandQueueEntry[];
+	/** Exact adapter evidence, independently versioned from the queue cursor. */
+	observation?: QueueTurnObservation;
 }
 
 /** One monotonic pushed transition from the durable command-event projection. */

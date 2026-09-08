@@ -399,7 +399,7 @@ async fn typed_snapshot_projects_daemon_queue_truth_for_name_or_agent_id() {
     assert!(by_name.turn_active);
     assert_eq!(
         by_name.steer_capability,
-        nexus_contracts::SteerCapability::InterruptAndSend
+        nexus_contracts::SteerCapability::None
     );
     assert_eq!(by_name.seq, 1);
     assert_eq!(by_name.revision, 1);

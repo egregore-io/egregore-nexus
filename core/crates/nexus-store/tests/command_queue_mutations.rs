@@ -6,6 +6,13 @@ use nexus_contracts::{
 use nexus_store::repos::{CommandIntents, CommandQueue, NewCommandIntent};
 use nexus_store::Store;
 
+fn native_capability() -> nexus_store::repos::command_queue::CapturedQueueCapability {
+    nexus_store::repos::command_queue::CapturedQueueCapability {
+        session_id: SessionId("s_otto".into()),
+        steer_capability: nexus_contracts::SteerCapability::NativeSteer,
+    }
+}
+
 async fn store(active_turn: bool) -> Store {
     let store = Store::open(":memory:").await.unwrap();
     store.migrate().await.unwrap();
@@ -87,6 +94,77 @@ fn exact_mutation(
 }
 
 #[tokio::test]
+async fn redirect_requires_actual_capability_not_stored_codex_metadata() {
+    let store = store(true).await;
+    prompt(&store, "cmd_no_evidence", 1).await;
+    let request = mutation(
+        CommandQueueAction::RedirectNow,
+        "missing_evidence",
+        Some("cmd_no_evidence"),
+    );
+    let result = CommandQueue::new(&store)
+        .mutate("default", &request, 2)
+        .await
+        .unwrap();
+    assert_eq!(result.status, 409);
+    assert_eq!(
+        CommandIntents::new(&store)
+            .get("cmd_no_evidence")
+            .await
+            .unwrap()
+            .unwrap()
+            .kind,
+        nexus_store::command_kinds::harness::PROMPT
+    );
+}
+
+#[tokio::test]
+async fn captured_old_capability_cannot_grant_redirect_after_transaction_rebind() {
+    use std::future::Future;
+    use std::task::Poll;
+    let store = exact_store().await;
+    prompt(&store, "cmd_cap_race", 1).await;
+    let tx = store
+        .begin_identity_write_txn("capability_rebind")
+        .await
+        .unwrap();
+    let request = mutation(
+        CommandQueueAction::RedirectNow,
+        "mut_cap_race",
+        Some("cmd_cap_race"),
+    );
+    let queue = CommandQueue::new(&store);
+    let captured = native_capability();
+    let mut pending =
+        Box::pin(queue.mutate_with_capability("default", &request, 5, &[], Some(&captured)));
+    std::future::poll_fn(|cx| {
+        assert!(matches!(pending.as_mut().poll(cx), Poll::Pending));
+        Poll::Ready(())
+    })
+    .await;
+    tx.execute_batch("UPDATE agent_runtimes SET active=0, stopped_at=2; UPDATE sessions SET name=NULL;
+        INSERT INTO agent_runtimes (runtime_id,agent_id,harness,transport,presence,active,started_at) VALUES ('s_new','a_otto','codex','codex-appserver','busy',1,3);
+        INSERT INTO sessions (session_id,agent_id,name,agent,kind,transport,project,created_at) VALUES ('s_new','a_otto','otto','codex','agent','codex-appserver','default',3);
+        INSERT INTO agent_session_turns VALUES ('new_turn','s_new','streaming',2,2,3,3,NULL);").await.unwrap();
+    tx.commit().await.unwrap();
+    let result = pending.await.unwrap();
+    assert_eq!(result.status, 409);
+    assert!(result.body["error"]
+        .as_str()
+        .unwrap()
+        .contains("cannot redirect"));
+    assert_eq!(
+        CommandIntents::new(&store)
+            .get("cmd_cap_race")
+            .await
+            .unwrap()
+            .unwrap()
+            .kind,
+        nexus_store::command_kinds::harness::PROMPT
+    );
+}
+
+#[tokio::test]
 async fn exact_redirect_requires_matching_immutable_original_selector() {
     for selector in [None, Some("s_foreign"), Some("s_otto")] {
         let store = exact_store().await;
@@ -103,7 +181,7 @@ async fn exact_redirect_requires_matching_immutable_original_selector() {
             "s_otto",
         );
         let outcome = CommandQueue::new(&store)
-            .mutate("metadata", &request, 2)
+            .mutate_with_capability("metadata", &request, 2, &[], Some(&native_capability()))
             .await
             .unwrap();
         assert_eq!(
@@ -268,7 +346,13 @@ async fn split_exact_mutation_uses_identity_runtime_and_transport_owned_descript
         "s_otto",
     );
     let outcome = CommandQueue::new(&store)
-        .mutate_with_active_sessions("metadata", &request, 2, &[SessionId("s_otto".into())])
+        .mutate_with_capability(
+            "metadata",
+            &request,
+            2,
+            &[SessionId("s_otto".into())],
+            Some(&native_capability()),
+        )
         .await
         .unwrap();
     assert_eq!(outcome.status, 200, "{outcome:?}");
@@ -344,7 +428,7 @@ async fn legacy_mutation_retains_fallback_when_active_runtime_has_no_transport_r
         Some("cmd_legacy_fallback"),
     );
     let outcome = CommandQueue::new(&store)
-        .mutate("metadata", &request, 2)
+        .mutate_with_capability("metadata", &request, 2, &[], Some(&native_capability()))
         .await
         .unwrap();
     assert_eq!(
@@ -436,7 +520,7 @@ async fn redirect_promotes_one_pending_row_and_replays_the_receipt_after_ack_los
     );
 
     let first = CommandQueue::new(&store)
-        .mutate("default", &request, 9_000)
+        .mutate_with_capability("default", &request, 9_000, &[], Some(&native_capability()))
         .await
         .unwrap();
     let replay = CommandQueue::new(&store)
@@ -476,7 +560,7 @@ async fn reused_mutation_id_with_different_payload_is_a_durable_conflict() {
     );
     assert_eq!(
         CommandQueue::new(&store)
-            .mutate("default", &redirect, 9_000)
+            .mutate_with_capability("default", &redirect, 9_000, &[], Some(&native_capability()))
             .await
             .unwrap()
             .status,
@@ -559,11 +643,11 @@ async fn stable_agent_id_prefers_its_active_runtime_over_a_newer_stale_session_f
     assert!(snapshot.turn_active);
     assert_eq!(
         snapshot.steer_capability,
-        nexus_contracts::SteerCapability::NativeSteer
+        nexus_contracts::SteerCapability::None
     );
 
     let outcome = CommandQueue::new(&store)
-        .mutate_with_active_sessions(
+        .mutate_with_capability(
             "display-metadata-only",
             &mutation(
                 CommandQueueAction::RedirectNow,
@@ -572,6 +656,7 @@ async fn stable_agent_id_prefers_its_active_runtime_over_a_newer_stale_session_f
             ),
             9_000,
             &active_sessions,
+            Some(&native_capability()),
         )
         .await
         .unwrap();
@@ -665,7 +750,7 @@ async fn redirect_without_an_active_turn_is_rejected_without_changing_the_prompt
     let store = store(false).await;
     prompt(&store, "cmd_inactive", 10).await;
     let result = CommandQueue::new(&store)
-        .mutate(
+        .mutate_with_capability(
             "default",
             &mutation(
                 CommandQueueAction::RedirectNow,
@@ -673,6 +758,8 @@ async fn redirect_without_an_active_turn_is_rejected_without_changing_the_prompt
                 Some("cmd_inactive"),
             ),
             9_000,
+            &[],
+            Some(&native_capability()),
         )
         .await
         .unwrap();

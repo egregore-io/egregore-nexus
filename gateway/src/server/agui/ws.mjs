@@ -657,11 +657,13 @@ export class CommandQueueHub {
   #subscribers = new Set();
   #groups = new Map();
   #pollMs;
+  #observationMs;
 
   constructor(deps) {
     this.#deps = deps;
     this.#pollMs = positiveInteger(deps.commandQueueEventPollMs)
       ?? DEFAULT_COMMAND_QUEUE_EVENT_POLL_MS;
+    this.#observationMs = positiveInteger(deps.commandQueueObservationPollMs) ?? 1000;
   }
 
   subscribe(request, target, handlers) {
@@ -685,6 +687,7 @@ export class CommandQueueHub {
         polling: false,
         wakeAfterPoll: false,
         pendingRefreshes: new Map(),
+        lastObservationRefreshAt: performance.now(),
       };
       this.#groups.set(authKey, group);
     }
@@ -697,6 +700,12 @@ export class CommandQueueHub {
       clearTimeout(group.timer);
       group.timer = undefined;
     }
+    const observationFence = normalizedTarget.expectedSessionId
+      ? [...this.#subscribers].find((entry) =>
+          entry.authKey === authKey && !entry.closed &&
+          sessionTargetKey(entry.target) === sessionTargetKey(normalizedTarget)
+        )?.observationFence ?? { revision: 0, fields: undefined }
+      : undefined;
     const subscriber = {
       request,
       target: normalizedTarget,
@@ -710,6 +719,7 @@ export class CommandQueueHub {
       failed: false,
       closed: false,
       hydrationGeneration: 1,
+      observationFence,
     };
     this.#subscribers.add(subscriber);
     void this.#hydrate(subscriber, group, "subscribe", subscriber.hydrationGeneration);
@@ -760,14 +770,18 @@ export class CommandQueueHub {
   }
 
   async #hydrate(subscriber, group, phase, generation) {
+    const readGeneration = group.generation;
+    const observationRevision = subscriber.observationFence?.revision;
     try {
-      const snapshot = await this.#loadSnapshot(subscriber.request, subscriber.target);
+      let snapshot = await this.#loadSnapshot(subscriber.request, subscriber.target);
       assertResponseSession(subscriber.target, snapshot);
       if (
         subscriber.closed
         || this.#groups.get(subscriber.authKey) !== group
         || subscriber.hydrationGeneration !== generation
       ) return;
+      snapshot = this.#projectObservation(subscriber, snapshot, observationRevision,
+        group.generation === readGeneration);
       subscriber.sessionId = stringField(snapshot?.sessionId);
       subscriber.handlers.onSnapshot(snapshot);
       const snapshotSeq = nonNegativeInteger(snapshot?.seq) ?? 0;
@@ -819,22 +833,71 @@ export class CommandQueueHub {
     return response.json();
   }
 
+  #projectObservation(subscriber, snapshot, readRevision, currentRead) {
+    const fence = subscriber.observationFence;
+    if (!fence) return snapshot;
+    const observation = snapshot?.observation;
+    const previous = fence.fields?.observation;
+    const stamped = typeof observation?.owner === "string" && observation.owner.trim() &&
+      Number.isSafeInteger(observation?.revision) && observation.revision >= 0;
+    const valid = observation?.sessionId === subscriber.target.expectedSessionId &&
+      ["nativeOpen", "verifiedIdle", "unknown", "unavailable"].includes(observation?.state) &&
+      ["native_steer", "interrupt_and_send", "none"].includes(observation?.steerCapability) &&
+      (stamped || (observation?.owner == null && observation?.revision == null &&
+        ["unknown", "unavailable"].includes(observation?.state)));
+    const currentEvidence = valid && currentRead && readRevision === fence.revision;
+    let accepted = currentEvidence;
+    if (accepted && previous) {
+      if (previous.owner && !observation.owner) accepted = false;
+      else if (previous.owner && previous.owner === observation.owner) {
+        const before = previous.revision ?? 0;
+        const after = observation.revision ?? 0;
+        if (after < before || (after === before &&
+            (previous.state !== observation.state || previous.steerCapability !== observation.steerCapability))) {
+          accepted = false;
+        }
+      }
+    }
+    if (currentEvidence) {
+      // This object is shared only by this auth/exact-lane's existing subscribers.
+      // Even identical evidence invalidates concurrent older reads; owners are not clocks.
+      fence.revision += 1;
+    }
+    if (accepted) {
+      fence.fields = {
+        observation: { ...observation },
+        steerCapability: observation.steerCapability,
+        ...(observation.state === "nativeOpen" ? { turnActive: true } : {}),
+        ...(observation.state === "verifiedIdle" ? { turnActive: false } : {}),
+      };
+    }
+    if (observation || fence.fields) {
+      // Retain independently ordered queue facts. Never forward old legacy activity
+      // alongside newer native evidence, or derive replacement proof from those bits.
+      const { observation: ignored, turnActive, steerCapability, ...queueFacts } = snapshot;
+      return { ...queueFacts, ...fence.fields };
+    }
+    return snapshot;
+  }
+
   async #refreshGroupSubscribers(group, generation, subscribers) {
     const active = [...subscribers].filter(
       (subscriber) =>
       !subscriber.closed && !subscriber.failed && subscriber.ready,
     );
     if (active.length === 0) return "done";
+    const observationRevision = active[0].observationFence?.revision;
     try {
       // All entries share auth + target. Fetch once, then fan the authoritative projection out to
       // every mounted client. This is event-driven reconciliation, not another polling lane.
-      const snapshot = await this.#loadSnapshot(active[0].request, active[0].target);
+      let snapshot = await this.#loadSnapshot(active[0].request, active[0].target);
       assertResponseSession(active[0].target, snapshot);
       if (
         this.#groups.get(active[0].authKey) !== group
         || group.generation !== generation
         || !group.ready
       ) return "stale";
+      snapshot = this.#projectObservation(active[0], snapshot, observationRevision, true);
       const sessionId = stringField(snapshot?.sessionId);
       for (const subscriber of active) {
         if (subscriber.closed) continue;
@@ -961,10 +1024,31 @@ export class CommandQueueHub {
       if (events.length === 0) group.cursor = Math.max(group.cursor, latest);
       if (group.cursor < latest) caughtUp = false;
 
+      // Native facts can change without a journal transition. Reuse the coalesced
+      // refresh lane, bounded by elapsed time even during zero-delay catch-up.
+      const observationOnly = new Set();
+      const now = performance.now();
+      if (now - group.lastObservationRefreshAt >= this.#observationMs) {
+        group.lastObservationRefreshAt = now;
+        for (const subscriber of this.#subscribers) {
+          if (subscriber.authKey !== authKey || subscriber.closed || subscriber.failed ||
+              !subscriber.ready || !subscriber.target.expectedSessionId) continue;
+          const key = sessionTargetKey(subscriber.target);
+          let entries = group.pendingRefreshes.get(key);
+          if (!entries) {
+            entries = new Set();
+            group.pendingRefreshes.set(key, entries);
+            observationOnly.add(key);
+          }
+          entries.add(subscriber);
+        }
+      }
       for (const [key, subscribers] of group.pendingRefreshes) {
         const result = await this.#refreshGroupSubscribers(group, generation, subscribers);
         if (result === "stale") return;
-        if (result === "done") group.pendingRefreshes.delete(key);
+        // An observation-only failure retries at its elapsed cadence, never every
+        // immediate catch-up iteration. Existing event refresh retries are unchanged.
+        if (result === "done" || observationOnly.has(key)) group.pendingRefreshes.delete(key);
       }
       for (const subscriber of this.#subscribers) {
         if (subscriber.authKey !== authKey || subscriber.closed || subscriber.failed) continue;

@@ -974,6 +974,25 @@ async fn handle_local_session_queue_read(
                 )
                 .await
                 .map_err(|error| error.to_contract_error())
+                .map(|mut snapshot| {
+                    if let Some(session) = snapshot.session_id.clone() {
+                        let observed = state.agent.observe_turn(&SessionId(session.clone()));
+                        snapshot.steer_capability = observed.steer_capability;
+                        match observed.state {
+                            nexus_contracts::TurnState::VerifiedIdle => {
+                                snapshot.turn_active = false
+                            }
+                            nexus_contracts::TurnState::NativeOpen => snapshot.turn_active = true,
+                            _ => {}
+                        }
+                        snapshot.observation = Some(
+                            nexus_contracts::prompt::QueueTurnObservation::from_observation(
+                                session, observed,
+                            ),
+                        );
+                    }
+                    snapshot
+                })
                 .and_then(|snapshot| serde_json::to_value(snapshot).map_err(json_contract_error))
         }
     };
@@ -1060,12 +1079,50 @@ async fn handle_local_session_queue_mutation(
         }
     };
     let active_sessions = state.agent.active_turn_sessions();
+    // Capture adapter evidence before entering the identity transaction. Only a matching
+    // transaction-resolved session may use it; committed retries do not depend on this read.
+    let sessions = Sessions::new(&state.store);
+    let captured_session = if let Some(session) = request.request.expected_session_id.clone() {
+        Some(session)
+    } else if let Some(agent) = request.request.agent_id.as_ref() {
+        match sessions
+            .active_runtime_session_for_agent(&agent.0)
+            .await
+            .ok()
+            .flatten()
+        {
+            Some(row) => Some(row.session_id),
+            None => sessions
+                .find_by_agent_id(&agent.0)
+                .await
+                .ok()
+                .flatten()
+                .map(|row| row.session_id),
+        }
+    } else if let Some(name) = request.request.name.as_deref() {
+        sessions
+            .find_unique_by_name_any_project(name.trim())
+            .await
+            .ok()
+            .flatten()
+            .map(|row| row.session_id)
+    } else {
+        None
+    };
+    let capability = captured_session.map(|session_id| {
+        let observed = state.agent.observe_turn(&session_id);
+        nexus_store::repos::command_queue::CapturedQueueCapability {
+            session_id,
+            steer_capability: observed.steer_capability,
+        }
+    });
     match CommandQueue::new(&state.store)
-        .mutate_with_active_sessions(
+        .mutate_with_capability(
             &request.project,
             &request.request,
             request.now,
             &active_sessions,
+            capability.as_ref(),
         )
         .await
     {

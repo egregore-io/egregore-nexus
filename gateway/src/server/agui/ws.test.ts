@@ -76,6 +76,142 @@ async function loadWs(): Promise<WsModule> {
 }
 
 describe("AG-UI WebSocket server transport", () => {
+  it("refreshes same-cursor native activity once per shared exact lane at elapsed cadence", async () => {
+    const { CommandQueueHub } = await loadWs();
+    vi.useFakeTimers();
+    let reads = 0;
+    let open = true;
+    const snapshots: any[][] = [[], []];
+    const hub = new CommandQueueHub({
+      commandQueueEventPollMs: 10,
+      commandQueueObservationPollMs: 100,
+      fetchHandler: async (request: Request) => {
+        const url = new URL(request.url);
+        if (url.searchParams.has("eventsAfter")) return Response.json({events:[], latestSeq:0, nextSeq:0});
+        reads++;
+        return Response.json({sessionId:"s_otto", seq:0, revision:0, commands:[], observation:{sessionId:"s_otto", state:open ? "nativeOpen" : "verifiedIdle", owner:"A", revision:open ? 1 : 2, steerCapability:"none"}});
+      },
+    } as any);
+    const off = snapshots.map((events) => hub.subscribe(new Request("http://localhost/api/agui/ws"),
+      {agentId:"a_otto", expectedSessionId:"s_otto"},
+      {onSnapshot:(snapshot: unknown) => events.push(snapshot), onTransition:vi.fn(), onError:vi.fn()}));
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      const initial = reads;
+      open = false;
+      await vi.advanceTimersByTimeAsync(99);
+      expect(reads).toBe(initial + 1);
+      expect(snapshots.map((events) => events.at(-1)?.observation.state)).toEqual(["verifiedIdle", "verifiedIdle"]);
+      await vi.advanceTimersByTimeAsync(90);
+      expect(reads).toBe(initial + 1);
+    } finally { off.forEach((stop) => stop()); vi.useRealTimers(); }
+  });
+
+  it("discards a superseded hydrate observation but retains independently valid queue facts", async () => {
+    const {CommandQueueHub} = await loadWs();
+    let finishOld!: (response:Response) => void;
+    let reads = 0;
+    const first: any[] = [];
+    const second: any[] = [];
+    const hub = new CommandQueueHub({fetchHandler:async (request:Request) => {
+      if (new URL(request.url).searchParams.has("eventsAfter")) return Response.json({events:[], latestSeq:4});
+      if (++reads === 1) return new Promise<Response>((done) => {finishOld = done;});
+      return Response.json({sessionId:"s_otto", seq:4, commands:[], observation:{sessionId:"s_otto", state:"nativeOpen", owner:"NEW", revision:1, steerCapability:"none"}});
+    }});
+    const request = new Request("http://localhost/api/agui/ws");
+    const target = {agentId:"a_otto", expectedSessionId:"s_otto"};
+    const handlers = (out:any[]) => ({onSnapshot:(value:unknown) => out.push(value), onTransition:vi.fn(), onError:vi.fn()});
+    const offA = hub.subscribe(request, target, handlers(first));
+    const offB = hub.subscribe(request, target, handlers(second));
+    try {
+      await vi.waitFor(() => expect(second).toHaveLength(1));
+      finishOld(Response.json({sessionId:"s_otto", seq:3, commands:[{commandId:"old-queue-fact"}], observation:{sessionId:"s_otto", state:"verifiedIdle", owner:"OLD", revision:99, steerCapability:"none"}}));
+      await vi.waitFor(() => expect(first).toHaveLength(1));
+      expect(first[0].commands[0].commandId).toBe("old-queue-fact");
+      expect(first[0].observation).toMatchObject({owner:"NEW", state:"nativeOpen"});
+    } finally {offA(); offB();}
+  });
+
+  it("bounds observation-only retries while empty filtered pages catch up immediately", async () => {
+    const {CommandQueueHub} = await loadWs();
+    vi.useFakeTimers();
+    let reads = 0;
+    let polls = 0;
+    const errors = vi.fn();
+    const hub = new CommandQueueHub({commandQueueEventPollMs:10, commandQueueObservationPollMs:100,
+      fetchHandler:async (request:Request) => {
+        const url = new URL(request.url);
+        if (url.searchParams.has("eventsAfter")) {
+          polls++;
+          return Response.json({events:[], nextSeq:polls, latestSeq:1000});
+        }
+        if (++reads > 1) return new Response("unavailable", {status:503});
+        return Response.json({sessionId:"S1", seq:0, commands:[], observation:{sessionId:"S1", state:"nativeOpen", owner:"A", revision:1, steerCapability:"none"}});
+      }});
+    const snapshots:any[] = [];
+    const off = hub.subscribe(new Request("http://localhost/api/agui/ws"), {agentId:"A",expectedSessionId:"S1"},
+      {onSnapshot:(value:unknown) => snapshots.push(value), onTransition:vi.fn(), onError:errors});
+    try {
+      await vi.advanceTimersByTimeAsync(250);
+      expect(polls).toBeGreaterThan(100);
+      expect(reads).toBe(3);
+      expect(errors).toHaveBeenCalled();
+      expect(snapshots).toHaveLength(1);
+      expect(snapshots[0].observation.state).toBe("nativeOpen");
+    } finally {off(); vi.useRealTimers();}
+  });
+
+  it.each(["new-owner", "ownerless-unknown", "equal-conflict"])("shares accepted native evidence across same-generation gap hydrations without losing queue facts: %s", async (next) => {
+    const {CommandQueueHub} = await loadWs();
+    let reads = 0;
+    let polls = 0;
+    let releaseOld!: (response:Response) => void;
+    let sawNew!: () => void;
+    let sawOldQueue!: () => void;
+    const newDelivered = new Promise<void>((resolve) => {sawNew = resolve;});
+    const oldQueueDelivered = new Promise<void>((resolve) => {sawOldQueue = resolve;});
+    const outputs:any[][] = [[], []];
+    const snapshot = (owner:string, state:string, seq:number, capability = "none") => Response.json({
+      sessionId:"S1", seq, commands:[{commandId:`queue-${seq}`}],
+      turnActive:state === "nativeOpen", steerCapability:capability,
+      observation:{sessionId:"S1", owner, state, revision:1, steerCapability:capability},
+    });
+    const hub = new CommandQueueHub({commandQueueEventPollMs:10000, commandQueueObservationPollMs:10000,
+      fetchHandler:async (request:Request) => {
+        if (new URL(request.url).searchParams.has("eventsAfter")) return Response.json(++polls === 1
+          ? {gap:true, latestSeq:4} : {events:[], nextSeq:4, latestSeq:4});
+        if (++reads <= 2) return snapshot("BASE", "nativeOpen", 1);
+        if (reads === 3) return new Promise<Response>((resolve) => {releaseOld = resolve;});
+        if (next === "ownerless-unknown") return Response.json({
+          sessionId:"S1", seq:4, commands:[], turnActive:false, steerCapability:"native_steer",
+          observation:{sessionId:"S1", state:"unknown", steerCapability:"native_steer"},
+        });
+        if (next === "equal-conflict") return snapshot("BASE", "verifiedIdle", 4, "native_steer");
+        return snapshot("NEW", "nativeOpen", 4, "native_steer");
+      }});
+    const stops = outputs.map((out) => hub.subscribe(new Request("http://localhost/api/agui/ws"),
+      {agentId:"A", expectedSessionId:"S1"}, {
+        onSnapshot:(value:any) => {
+          out.push(value);
+          if (value.seq === 4) sawNew();
+          if (value.commands?.some((command:any) => command.commandId === "queue-3")) sawOldQueue();
+        }, onTransition:vi.fn(), onError:vi.fn(),
+      }));
+    try {
+      await newDelivered;
+      releaseOld(snapshot("OLD", "verifiedIdle", 3));
+      await oldQueueDelivered;
+      expect(reads).toBe(4);
+      for (const out of outputs) {
+        expect(out.some((value) => value.observation?.owner === "OLD")).toBe(false);
+        expect(out.at(-1)).toMatchObject({turnActive:true,
+          steerCapability:next === "new-owner" ? "native_steer" : "none",
+          observation:{owner:next === "new-owner" ? "NEW" : "BASE", state:"nativeOpen"}});
+      }
+      expect(outputs[0]!.at(-1)).toMatchObject({sessionId:"S1", seq:3, commands:[{commandId:"queue-3"}]});
+    } finally {stops.forEach((stop) => stop());}
+  });
+
   it("rejects a current S2 opener response before binding or pumping an exact S1 socket", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();

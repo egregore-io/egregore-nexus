@@ -12,6 +12,9 @@ All notable public changes to Egregore Nexus are documented here. This project f
 
 ### Fixed
 
+- Carry adapter-owned activity and actual redirect capability on exact queue
+  snapshots. Refresh subscribed lanes independently of queue transitions, preserve
+  binding/read freshness, and do not infer native support from harness names.
 - Preserve exact historical session ownership through queue reads, terminal
   projection and reconnect binding without warming a replacement session. Carry
   structured terminal error codes and authenticated caller-correlation evidence
