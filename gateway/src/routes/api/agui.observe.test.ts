@@ -212,6 +212,7 @@ describe("observeScoped cursor compatibility", () => {
     const reads: string[] = [];
     const hub = new CommandQueueHub({
       commandQueueEventPollMs: 1,
+      commandQueueObservationPollMs: 60_000,
       fetchHandler: (request) =>
         handleConversationQueueGet(request, {
           env: { NEXUS_WEB_AUTH_MODE: "local" },
@@ -253,13 +254,14 @@ describe("observeScoped cursor compatibility", () => {
               };
             expect(input.agentId).toBe("a_exact");
             reads.push(input.expectedSessionId!);
+            const refreshed = reads.filter(session => session === input.expectedSessionId).length > 1;
             return {
               target: "renamed",
               sessionId: input.expectedSessionId,
               turnActive: false,
               steerCapability: "none" as never,
-              seq: 0,
-              revision: 0,
+              seq: refreshed ? 2 : 0,
+              revision: refreshed ? 3 : 0,
               commands: [],
             };
           },
@@ -297,7 +299,7 @@ describe("observeScoped cursor compatibility", () => {
           sockets.every((socket) =>
             socket.sent.some(
               (raw) => JSON.parse(raw).t === "command.transition",
-            ),
+            ) && socket.sent.filter(raw => JSON.parse(raw).t === "queue.snapshot").length === 2,
           ),
         ).toBe(true),
       );
@@ -314,8 +316,9 @@ describe("observeScoped cursor compatibility", () => {
             .filter((frame) => frame.t === "command.transition")
             .map((frame) => frame.sessionId),
         ).toEqual([expected]);
+        expect(frames.filter(frame => frame.t === "queue.snapshot").map(frame => [frame.sessionId, frame.seq])).toEqual([[expected, 0], [expected, 2]]);
       }
-      expect(reads.sort()).toEqual(["s_new", "s_old"]);
+      expect(reads.sort()).toEqual(["s_new", "s_new", "s_old", "s_old"]);
       expect(subscribed.sort()).toEqual(["s_new", "s_old"]);
       for (const [agent, session] of [
         ["a_other", "s_old"],

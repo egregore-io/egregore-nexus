@@ -999,10 +999,10 @@ export class CommandQueueHub {
           if (subscriber.ready) {
             subscriber.cursor = seq;
             subscriber.handlers.onTransition(event);
-            // A queued transition can mean new, edited, reordered, or redirected content. The
+            // Queued or failed transitions can require text or terminal recovery. The
             // transition remains the lifecycle fact; one coalesced snapshot supplies text/order
             // that intentionally do not bloat every event row.
-            if (commandQueueState(event?.state) === "queued") {
+            if (["queued", "failed"].includes(commandQueueState(event?.state))) {
               const key = sessionTargetKey(subscriber.target);
               let entries = group.pendingRefreshes.get(key);
               if (!entries) {

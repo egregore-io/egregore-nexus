@@ -12,6 +12,9 @@ All notable public changes to Egregore Nexus are documented here. This project f
 
 ### Fixed
 
+- Refresh the existing exact-session queue snapshot after failed transitions as
+  well as queued transitions, so reconnecting clients can recover structured
+  terminal evidence without treating a sparse event or lost ACK as retry safety.
 - Carry adapter-owned activity and actual redirect capability on exact queue
   snapshots. Refresh subscribed lanes independently of queue transitions, preserve
   binding/read freshness, and do not infer native support from harness names.

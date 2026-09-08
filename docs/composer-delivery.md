@@ -83,6 +83,20 @@ client. A matching client ID alone does not prove that a shared queue row belong
 to that reader. Cookie identity is resolved without registering or rebinding it
 during a read; absent or ambiguous identity cannot authorize correlation.
 
+Failed transitions schedule the existing coalesced snapshot refresh, as queued
+transitions do. A sparse failure event or failed refresh does not establish that
+native submission had no effect. Clients must retain the original pending input
+identity after an unconfirmed acknowledgement, including a later HTTP conflict
+or authentication error. Reconnect may replay that identity under the existing
+journal fence; it must not manufacture a fresh-ID retry.
+
+Validated exact terminal evidence can retire the original transport operation.
+An unknown command ID additionally requires current authenticated caller ownership;
+an already known command association must match. A failed terminal is not native
+nonacceptance proof, and viewport absence is not a terminal fact. Consumers keep
+their pending/draft projection separate from queue state and native model truth.
+These are client evidence requirements, not a new daemon status or native ACK.
+
 ## Adapter observation on queue snapshots
 
 The optional `observation` on an exact queue snapshot carries the adapter's own

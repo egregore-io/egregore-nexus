@@ -65,6 +65,10 @@ Exact queue reads and reconnects can inspect a retained earlier session without
 warming it or substituting the agent's newer session. Queue recovery preserves
 original command binding and authenticated caller correlation; it does not certify
 PACT transcript paging or native delivery.
+Failed queue transitions also refresh that existing snapshot. A lost ACK or later
+HTTP error is not safe-retry evidence: clients retain the original input identity
+until a validated ACK or terminal fact settles transport pending, without
+inventing a fresh send ID.
 Codex native activity is ingested before display processing, so a blocked display write
 does not hold a subsequently read completed turn busy. Private binding ownership also
 prevents a superseded request from entering native submission; an already admitted request

@@ -2629,7 +2629,7 @@ describe("AG-UI WebSocket server transport", () => {
     await control.closed;
   });
 
-  it("coalesces queued-event redraws into one authoritative snapshot for every mounted client", async () => {
+  it.each(["queued", "failed"])("coalesces %s-event redraws into one authoritative snapshot for every mounted client", async (transitionState) => {
     const { CommandQueueHub } = await loadWs();
     let eventPolls = 0;
     let snapshotFetches = 0;
@@ -2663,7 +2663,7 @@ describe("AG-UI WebSocket server transport", () => {
             seq: 6,
             sessionId: "s_otto",
             commandId: "cmd_a",
-            state: "queued",
+            state: transitionState,
             mode: "queue",
             revision: 2,
           },
@@ -2671,7 +2671,7 @@ describe("AG-UI WebSocket server transport", () => {
             seq: 7,
             sessionId: "s_otto",
             commandId: "cmd_b",
-            state: "queued",
+            state: transitionState,
             mode: "queue",
             revision: 2,
           },
