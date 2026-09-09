@@ -18,6 +18,13 @@ for Linux x64/arm64 glibc, macOS x64/arm64, Windows x64, and WSL. Its launcher s
 file locally. An explicit `NEXUS_NATIVE_BIN` takes precedence; Cargo-installed binaries remain a
 fallback. When no matching binary exists, the launcher prints an actionable installation error.
 
+Linux x64 and arm64 prebuilt binaries require glibc 2.35 or newer, including WSL's
+Linux distribution. Release builds pin Ubuntu 22.04 runners for both architectures,
+execute the packaged launcher on that baseline, and inspect ELF imported symbol
+versions before upload to reject requirements above glibc 2.35. This check is not
+provider-runtime validation. Older glibc and musl distributions are outside this
+prebuilt baseline; use a compatible distribution or build from source.
+
 ## Installation
 
 ```bash

@@ -22,8 +22,9 @@ npm install --global @egregore/nexus-gateway   # CLI + daemon + Gateway + Webcon
 cargo install egregore-nexus                   # native CLI + transport daemon
 ```
 
-The npm package selects a prebuilt binary for Linux x64/arm64, macOS x64/arm64, Windows x64, or
-WSL. It does not compile Rust during installation. If npm's command directory is not on `PATH`,
+The npm package selects a prebuilt binary for Linux x64/arm64 (glibc 2.35 or newer),
+macOS x64/arm64, Windows x64, or WSL. It does not compile Rust during installation.
+If npm's command directory is not on `PATH`,
 the installer prints one copyable command for the current shell.
 
 ## Start

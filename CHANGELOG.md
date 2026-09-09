@@ -13,6 +13,9 @@ All notable public changes to Egregore Nexus are documented here. This project f
 
 ### Fixed
 
+- Build Linux x64/arm64 npm binaries on the glibc 2.35 baseline and reject newer
+  ELF import requirements before upload, preventing runner upgrades from silently
+  breaking Ubuntu 22.04 and equivalent Linux/WSL installations.
 - Fence attempted steers against restart/lease replay and late settlement, including
   redirected rows. Preserve strict no-active-turn rejection and ACP's completion window.
 - Wait for Codex's matching native input record before presenting a steer as accepted;

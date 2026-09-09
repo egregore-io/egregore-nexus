@@ -127,6 +127,7 @@ for (const target of nativeTargets) {
 NODE
 
 WORKFLOW="$ROOT/.github/workflows/npm-native-artifacts.yml"
+node --test "$ROOT/scripts/nexus-linux-abi.test.mjs"
 if [ ! -f "$WORKFLOW" ]; then
   echo "missing multi-platform native artifact workflow" >&2
   exit 1
