@@ -13,6 +13,11 @@ All notable public changes to Egregore Nexus are documented here. This project f
 
 ### Fixed
 
+- Fence attempted steers against restart/lease replay and late settlement, including
+  redirected rows. Preserve strict no-active-turn rejection and ACP's completion window.
+- Wait for Codex's matching native input record before presenting a steer as accepted;
+  a terminal without that receipt releases the waiter as unconfirmed, never as delivered
+  or permission to resend. Native history admission is not provider-consumption proof.
 - Launch Windows Gateway and Webconsole `.cmd` shims without hand-built command
   quoting, including npm installations under paths containing spaces.
 

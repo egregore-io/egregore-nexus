@@ -73,10 +73,14 @@ Codex native activity is ingested before display processing, so a blocked displa
 does not hold a subsequently read completed turn busy. Private binding ownership also
 prevents a superseded request from entering native submission; an already admitted request
 remains potentially accepted after cancellation, not safe to resend automatically.
-Ordinary queued prompts also retain a durable attempt fence: a timeout after adapter
+Ordinary queued prompts and explicit steers retain a durable attempt fence: a timeout after adapter
 entry, restart, or unresolved lease expiry cannot automatically replay that command.
 Such outcomes remain delivery-uncertain under their original identity, not rejected
 or delivered. A deadline that wins before adapter entry prevents later invocation.
+Codex steer presentation waits for the matching native input record, not its queue
+acknowledgement. A closed turn without that receipt settles unconfirmed and releases
+the waiter without resending; recorded input still succeeds. Native history admission
+is not itself proof of provider consumption.
 Observed ACP prompts wait for their correlated protocol response rather than relay
 spawn. This is completion-bound evidence, not an early native acknowledgement;
 strict output follows the accepted-input event, while legacy streaming is unchanged.

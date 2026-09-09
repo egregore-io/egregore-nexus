@@ -49,6 +49,10 @@ struct Inner {
     waiters: HashMap<TurnKey, Vec<oneshot::Sender<CodexTurnCompletion>>>,
     completed: HashMap<TurnKey, CodexTurnCompletion>,
     completed_order: VecDeque<TurnKey>,
+    // Projected terminals, after all earlier native input records have been processed. Raw
+    // reader terminals are too early: an input receipt can still be behind a blocked sink.
+    input_closed_turns: HashSet<TurnKey>,
+    input_closed_order: VecDeque<TurnKey>,
     receipt_waiters: HashMap<TurnKey, Vec<oneshot::Sender<CodexTurnCompletion>>>,
     receipts: HashMap<TurnKey, CodexTurnCompletion>,
     receipt_order: VecDeque<TurnKey>,
@@ -193,6 +197,10 @@ enum CodexTurnCompletion {
 /// Error returned when a headed Codex turn does not report successful completion.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodexTurnWaitError {
+    InputReceiptUnavailable {
+        thread_id: String,
+        turn_id: String,
+    },
     Timeout {
         thread_id: String,
         turn_id: String,
@@ -219,6 +227,9 @@ impl std::fmt::Display for CodexTurnWaitError {
             f,
             "{}",
             match self {
+                Self::InputReceiptUnavailable { thread_id, turn_id } => format!(
+                    "codex input receipt unavailable for {thread_id}/{turn_id}; delivery is unconfirmed"
+                ),
                 Self::Timeout {
                     thread_id,
                     turn_id,
@@ -1030,6 +1041,15 @@ impl CodexTurnTracker {
                 inner.accepted_input_receipt_order.retain(|row| row != &key);
                 return Ok(());
             }
+            if inner
+                .input_closed_turns
+                .contains(&(thread_id.to_owned(), turn_id.to_owned()))
+            {
+                return Err(CodexTurnWaitError::InputReceiptUnavailable {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                });
+            }
             let (tx, rx) = oneshot::channel();
             let id = inner.next_accepted_input_receipt_waiter_id;
             inner.next_accepted_input_receipt_waiter_id =
@@ -1049,7 +1069,11 @@ impl CodexTurnTracker {
         let mut registration = registration;
 
         match tokio::time::timeout(timeout, &mut registration.rx).await {
-            Ok(Ok(())) | Ok(Err(_)) => Ok(()),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(CodexTurnWaitError::InputReceiptUnavailable {
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+            }),
             Err(_elapsed) => Err(CodexTurnWaitError::Timeout {
                 thread_id: thread_id.to_string(),
                 turn_id: turn_id.to_string(),
@@ -1196,6 +1220,19 @@ impl CodexTurnTracker {
         let key = (thread_id.to_string(), turn_id.to_string());
         let waiters = {
             let mut inner = self.lock(thread_id);
+            if inner.input_closed_turns.insert(key.clone()) {
+                inner.input_closed_order.push_back(key.clone());
+                while inner.input_closed_order.len() > RECENT_COMPLETIONS_LIMIT {
+                    if let Some(old) = inner.input_closed_order.pop_front() {
+                        inner.input_closed_turns.remove(&old);
+                    }
+                }
+            }
+            // Dropping only this turn's unresolved receipt senders wakes them as unavailable,
+            // never as accepted. Exact receipts already processed remain successful.
+            inner
+                .accepted_input_receipt_waiters
+                .retain(|(thread, turn, _), _| thread != thread_id || turn != turn_id);
             if let Some(waiters) = inner.waiters.remove(&key) {
                 waiters
             } else {

@@ -370,13 +370,13 @@ impl AppState {
 
     /// First-poll entry is atomic with shutdown and the attempt deadline. No fence is retained
     /// across a Pending adapter poll; unrelated ingress and provider I/O remain independent.
-    pub(crate) async fn prompt_entry_before_shutdown<F>(
+    pub(crate) async fn prompt_entry_before_shutdown<F, T>(
         &self,
         attempt: Option<&crate::daemon::command_worker::PromptAttempt>,
         future: F,
-    ) -> Result<(), ContractError>
+    ) -> Result<T, ContractError>
     where
-        F: std::future::Future<Output = Result<(), ContractError>>,
+        F: std::future::Future<Output = Result<T, ContractError>>,
     {
         let guard = self.store.write_lock().lock_owned().await;
         if self.command_worker_is_shutting_down() {

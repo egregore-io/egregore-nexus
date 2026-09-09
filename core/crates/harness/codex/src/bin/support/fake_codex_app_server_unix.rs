@@ -348,6 +348,52 @@ where
                             expected_turn_id
                         };
                         let _ = out_tx.send(response_frame(&id, json!({"turnId": turn_id})));
+                        if let Ok(gate) = std::env::var("FAKE_CODEX_STEER_CONSUME_GATE") {
+                            let thread_id = req["params"]["threadId"].as_str().unwrap();
+                            let subscribers = registry.lock().await;
+                            let targets: Vec<_> = subscribers
+                                .iter()
+                                .filter(|sub| sub.thread_id == thread_id)
+                                .map(|sub| sub.tx.clone())
+                                .collect();
+                            drop(subscribers);
+                            // Native acknowledgement precedes input consumption. An unrelated
+                            // active-turn notification must not claim delivery of the new input.
+                            let busy = notification_frame(
+                                "item/agentMessage/delta",
+                                &json!({
+                                    "threadId": thread_id, "turnId": turn_id,
+                                    "itemId": "busy-output", "delta": "still working before input"
+                                }),
+                            );
+                            for tx in &targets {
+                                let _ = tx.send(busy.clone());
+                            }
+                            while !std::path::Path::new(&gate).exists() {
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                            let receipt = if std::fs::read(&gate).unwrap() == b"abort" {
+                                notification_frame(
+                                    "turn/completed",
+                                    &json!({
+                                        "threadId": thread_id,
+                                        "turn": {"id": turn_id, "status": "interrupted"}
+                                    }),
+                                )
+                            } else {
+                                notification_frame(
+                                    "item/completed",
+                                    &json!({
+                                        "threadId": thread_id, "turnId": turn_id,
+                                        "item": {"id": format!("steer-input-{steer_calls}"),
+                                            "type": "userMessage", "content": req["params"]["input"]}
+                                    }),
+                                )
+                            };
+                            for tx in &targets {
+                                let _ = tx.send(receipt.clone());
+                            }
+                        }
                     }
                 }
             }
