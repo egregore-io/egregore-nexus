@@ -664,7 +664,7 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "egregore-nexus"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "egregore-nexus-common"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "figment",
  "nexus-contracts",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "egregore-nexus-notify"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "async-trait",
  "egregore-nexus-common",
@@ -1382,7 +1382,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-acceptance"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "agent-client-protocol",
  "egregore-nexus",
@@ -1403,7 +1403,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-acp-stream"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "agent-client-protocol",
  "nexus-contracts",
@@ -1413,7 +1413,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-admin"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "async-trait",
  "egregore-nexus-common",
@@ -1425,7 +1425,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-agent"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -1447,7 +1447,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-bus"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "async-trait",
  "egregore-nexus-common",
@@ -1464,7 +1464,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-contracts"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "async-trait",
  "serde",
@@ -1475,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-dispatch"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "async-trait",
  "egregore-nexus-common",
@@ -1488,7 +1488,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-harness-claude"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -1507,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-harness-codex"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -1532,7 +1532,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-harness-core"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "nexus-contracts",
  "thiserror",
@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-identity"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "async-trait",
  "egregore-nexus-common",
@@ -1555,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-pty"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "async-trait",
  "nexus-contracts",
@@ -1570,7 +1570,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-search"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "async-trait",
  "egregore-nexus-common",
@@ -1584,7 +1584,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-store"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "egregore-nexus-common",
  "libsql",
@@ -1597,7 +1597,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-transcript"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "serde",
  "serde_json",

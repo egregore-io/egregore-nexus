@@ -3,6 +3,19 @@
 All notable public changes to Egregore Nexus are documented here. This project follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and uses semantic versioning.
 
+## [0.1.6-beta.3] - Unreleased
+
+### Changed
+
+- Synchronize the Rust workspace and npm distribution packages at `0.1.6-beta.3`
+  for the session-delivery correctness release candidate. Publication and live
+  acceptance remain separate release steps.
+
+### Fixed
+
+- Launch Windows Gateway and Webconsole `.cmd` shims without hand-built command
+  quoting, including npm installations under paths containing spaces.
+
 ## [0.1.6-beta.2] - Unreleased
 
 ### Changed
