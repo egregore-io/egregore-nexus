@@ -137,3 +137,83 @@ fn every_supported_target_resolves_its_provider_package_binary() {
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+/// WSL appends the Windows PATH, so an `opencode-ai` installed for Windows under `%APPDATA%\npm`
+/// is visible from Linux under the same staged filename. Its PE header must disqualify it so the
+/// Linux install elsewhere on PATH wins, even though package candidates outrank plain PATH hits.
+#[test]
+fn linux_skips_a_windows_pe_staged_binary_leaked_in_through_wsl_path() {
+    let windows_root = fixture_root("wsl-windows-npm");
+    let pe = windows_root
+        .join("node_modules")
+        .join("opencode-ai")
+        .join("bin")
+        .join("opencode.exe");
+    std::fs::create_dir_all(pe.parent().unwrap()).unwrap();
+    std::fs::write(&pe, b"MZ\x90\x00PE fixture").unwrap();
+
+    let linux_root = fixture_root("wsl-linux-bun");
+    let elf = linux_root.join("opencode");
+    std::fs::write(&elf, b"\x7fELF fixture").unwrap();
+
+    let path_env = std::env::join_paths([&linux_root, &windows_root]).unwrap();
+    let resolved = resolve_opencode_executable_for(
+        None,
+        Some(path_env.to_string_lossy().as_ref()),
+        OpenCodeNativeTarget::LinuxX64,
+    )
+    .unwrap();
+    assert_eq!(resolved, elf.to_string_lossy());
+
+    // With no Linux install at all, the skipped PE is named so the operator can see why.
+    let error = resolve_opencode_executable_for(
+        None,
+        Some(windows_root.to_string_lossy().as_ref()),
+        OpenCodeNativeTarget::LinuxX64,
+    )
+    .unwrap_err();
+    assert!(error.contains("was not found on PATH"), "{error}");
+    assert!(error.contains(&pe.to_string_lossy().to_string()), "{error}");
+    assert!(error.contains("not a Linux executable"), "{error}");
+
+    let _ = std::fs::remove_dir_all(windows_root);
+    let _ = std::fs::remove_dir_all(linux_root);
+}
+
+#[test]
+fn windows_skips_an_elf_binary_under_the_staged_name() {
+    let root = fixture_root("windows-elf-staged");
+    let elf = root
+        .join("node_modules")
+        .join("opencode-ai")
+        .join("bin")
+        .join("opencode.exe");
+    std::fs::create_dir_all(elf.parent().unwrap()).unwrap();
+    std::fs::write(&elf, b"\x7fELF fixture").unwrap();
+
+    let error = resolve_opencode_executable_for(
+        None,
+        Some(root.to_string_lossy().as_ref()),
+        OpenCodeNativeTarget::WindowsX64,
+    )
+    .unwrap_err();
+    assert!(error.contains("not a Windows executable"), "{error}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn explicit_override_pointing_at_a_foreign_binary_is_rejected_with_its_path() {
+    let root = fixture_root("override-foreign");
+    let pe = root.join("opencode.exe");
+    std::fs::write(&pe, b"MZ\x90\x00PE fixture").unwrap();
+
+    let error = resolve_opencode_executable_for(
+        Some(pe.to_string_lossy().as_ref()),
+        Some(""),
+        OpenCodeNativeTarget::LinuxX64,
+    )
+    .unwrap_err();
+    assert!(error.contains("NEXUS_OPENCODE_BIN"), "{error}");
+    assert!(error.contains("not a Linux executable"), "{error}");
+    let _ = std::fs::remove_dir_all(root);
+}
