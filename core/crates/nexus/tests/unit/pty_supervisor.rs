@@ -1972,3 +1972,70 @@ async fn kill_removes_terminal_socket_endpoint() {
 fn hid(s: &str) -> nexus_contracts::HarnessId {
     nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }
+
+/// A program that prints one line to its terminal and exits non-zero — a stand-in for the
+/// OpenCode serve shim crashing during boot.
+fn crashing_pty_command(message: &str) -> CommandBuilder {
+    #[cfg(windows)]
+    {
+        let mut cmd = CommandBuilder::new("cmd.exe");
+        cmd.args(["/D", "/C", &format!("echo {message}& exit 1")]);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.args(["-c", &format!("echo '{message}'; exit 1")]);
+        cmd
+    }
+}
+
+#[tokio::test]
+async fn raw_opencode_ready_wait_reports_last_screen_output_when_shim_exits() {
+    let size = PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let pty =
+        Arc::new(PtySession::spawn(crashing_pty_command("serve boom: ENOENT"), size).unwrap());
+    let screen = ScreenModelBackend::wrap(pty.clone());
+    let ready_path = std::env::temp_dir().join(format!(
+        "nexus-opencode-ready-never-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&ready_path);
+
+    let err = wait_for_opencode_plugin_ready_raw(
+        pty.as_ref(),
+        screen.as_ref(),
+        &ready_path,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect_err("a shim that exits before writing the ready file must fail the launch");
+
+    assert!(
+        err.starts_with(
+            "raw PTY exited before OpenCode plugin reported ready; last screen output: "
+        ),
+        "{err}"
+    );
+    assert!(
+        err.contains("serve boom: ENOENT"),
+        "the operator-facing error must carry what the shim printed: {err}"
+    );
+}
+
+#[test]
+fn last_screen_output_is_omitted_when_the_screen_is_blank() {
+    assert_eq!(
+        with_last_screen_output("raw PTY exited", "  \n \n"),
+        "raw PTY exited"
+    );
+    assert_eq!(
+        with_last_screen_output("raw PTY exited", "\n  boom  \n"),
+        "raw PTY exited; last screen output: boom"
+    );
+}

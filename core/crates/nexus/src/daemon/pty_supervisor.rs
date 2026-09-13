@@ -1976,8 +1976,12 @@ impl PtySupervisor {
             }
             apply_headed_terminal_environment(&mut cmd);
             let pty = Arc::new(PtySession::spawn(cmd, size)?);
+            // Model the screen from the first byte so a shim that dies before ready can report
+            // what it printed — the raw counterpart of the tmux path's `capture_pane`.
+            let screen = ScreenModelBackend::wrap(pty.clone());
             if let Err(err) = wait_for_opencode_plugin_ready_raw(
                 pty.as_ref(),
+                screen.as_ref(),
                 &files.ready_path,
                 OPENCODE_PLUGIN_READY_TIMEOUT,
             )
@@ -2190,6 +2194,7 @@ async fn wait_for_opencode_plugin_ready(
 
 async fn wait_for_opencode_plugin_ready_raw(
     pty: &PtySession,
+    screen: &ScreenModelBackend,
     ready_path: &Path,
     timeout: Duration,
 ) -> Result<(), String> {
@@ -2199,15 +2204,34 @@ async fn wait_for_opencode_plugin_ready_raw(
             return Ok(());
         }
         if !pty.child_alive() {
-            return Err("raw PTY exited before OpenCode plugin reported ready".to_string());
+            // Give the reader thread a moment to drain the child's final bytes into the model.
+            tokio::time::sleep(OPENCODE_PLUGIN_READY_POLL).await;
+            return Err(with_last_screen_output(
+                "raw PTY exited before OpenCode plugin reported ready",
+                &screen.contents(),
+            ));
         }
         if Instant::now() >= deadline {
-            return Err(format!(
-                "OpenCode plugin did not report ready within {}s",
-                timeout.as_secs()
+            return Err(with_last_screen_output(
+                &format!(
+                    "OpenCode plugin did not report ready within {}s",
+                    timeout.as_secs()
+                ),
+                &screen.contents(),
             ));
         }
         tokio::time::sleep(OPENCODE_PLUGIN_READY_POLL).await;
+    }
+}
+
+/// Append the harness's visible screen to a launch failure, matching the tmux path's
+/// `last pane output` detail so operators see why the shim died instead of only that it did.
+fn with_last_screen_output(detail: &str, screen: &str) -> String {
+    let screen = screen.trim();
+    if screen.is_empty() {
+        detail.to_string()
+    } else {
+        format!("{detail}; last screen output: {screen}")
     }
 }
 
