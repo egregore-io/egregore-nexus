@@ -2804,3 +2804,185 @@ async fn completion_timeout_dead_letters_not_delivered() {
         "completion timeout must not emit a false MessageDelivered"
     );
 }
+
+/// Records every fast-acknowledgment invocation, and can be told to misbehave so the tests can
+/// prove that misbehaviour cannot reach the delivery path.
+struct RecordingFastAck {
+    calls: Arc<Mutex<Vec<String>>>,
+    behavior: FastAckBehavior,
+}
+
+#[derive(Clone, Copy)]
+enum FastAckBehavior {
+    Normal,
+    Panic,
+    Hang,
+}
+
+impl RecordingFastAck {
+    fn new(behavior: FastAckBehavior) -> (Arc<Self>, Arc<Mutex<Vec<String>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        (
+            Arc::new(Self {
+                calls: calls.clone(),
+                behavior,
+            }),
+            calls,
+        )
+    }
+}
+
+#[async_trait]
+impl nexus_contracts::FastAckPort for RecordingFastAck {
+    async fn fast_ack(&self, session: &SessionId, _batch: &NexusBatch) {
+        self.calls.lock().unwrap().push(session.0.clone());
+        match self.behavior {
+            FastAckBehavior::Normal => {}
+            FastAckBehavior::Panic => panic!("fast ack exploded"),
+            FastAckBehavior::Hang => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// Drive one busy-agent delivery with the supplied fast-ack port, returning the recorded calls.
+async fn busy_delivery_with_fast_ack(
+    label: &str,
+    human_sender: bool,
+    fast_ack: Option<Arc<dyn nexus_contracts::FastAckPort>>,
+    calls: Arc<Mutex<Vec<String>>>,
+) -> Arc<Mutex<Vec<String>>> {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let cfg = Config::default();
+    let session = SessionId(format!("s_fast_ack_{label}"));
+    let turn_exec = Arc::new(BoundaryWaitTurnExec::new(session.clone()));
+    let message_id = format!("m_fast_ack_{label}");
+
+    let message = if human_sender {
+        human_dm(&message_id, "pcuser", "are you there")
+    } else {
+        dm(&message_id, "peer-agent", "status ping")
+    };
+    insert(&store, &message).await;
+    Inbox::new(&store)
+        .enqueue_with_timing(
+            &MessageId(message_id.clone()),
+            &session,
+            DeliveryTiming::Interrupt,
+        )
+        .await
+        .unwrap();
+
+    let _loop = EventLoop::spawn(
+        session.clone(),
+        LoopDeps {
+            store: store.clone(),
+            bell: Bell::new(),
+            registry: AgentRegistry::new(),
+            turn_exec: turn_exec.clone(),
+            events: Arc::new(NullSink),
+            project: PROJECT.into(),
+            drain_limit: cfg.drain_limit,
+            preview_chars: cfg.msg_preview_chars,
+            completion_timeout: Duration::from_secs(45),
+            provider_limit_default_cooldown: Duration::from_millis(50),
+            fast_ack,
+            auto_reply_note: None,
+        },
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), turn_exec.wait_started.notified())
+        .await
+        .expect("the busy target must wait for the turn boundary");
+    turn_exec.final_completion.notify_one();
+    wait_for_delivery_state(&store, &message_id, "delivered").await;
+    calls
+}
+
+#[tokio::test]
+async fn fast_ack_failure_never_affects_delivery() {
+    // A courtesy that panics or hangs forever must be invisible to the delivery path: the message
+    // is still injected and still marked delivered.
+    for (label, behavior) in [
+        ("panic", FastAckBehavior::Panic),
+        ("hang", FastAckBehavior::Hang),
+    ] {
+        let (port, calls) = RecordingFastAck::new(behavior);
+        let recorded = busy_delivery_with_fast_ack(label, true, Some(port), calls).await;
+        assert_eq!(
+            recorded.lock().unwrap().len(),
+            1,
+            "the acknowledgment should still have been attempted for {label}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fast_ack_fires_only_for_human_senders() {
+    // The structural cascade guard: an agent never acknowledges another agent, so an
+    // acknowledgment can never provoke another one.
+    let (port, calls) = RecordingFastAck::new(FastAckBehavior::Normal);
+    let recorded = busy_delivery_with_fast_ack("agent_sender", false, Some(port), calls).await;
+    assert!(
+        recorded.lock().unwrap().is_empty(),
+        "an agent-authored message must never be acknowledged"
+    );
+
+    let (port, calls) = RecordingFastAck::new(FastAckBehavior::Normal);
+    let recorded = busy_delivery_with_fast_ack("human_sender", true, Some(port), calls).await;
+    assert_eq!(
+        recorded.lock().unwrap().len(),
+        1,
+        "a human-authored message to a busy agent must be acknowledged"
+    );
+}
+
+#[tokio::test]
+async fn idle_agent_gets_no_fast_ack() {
+    // An idle agent is delivered to immediately, so there is nothing to apologize for.
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let cfg = Config::default();
+    let session = SessionId("s_fast_ack_idle".into());
+    let turn_exec = Arc::new(MockTurnExec::new());
+    let (port, calls) = RecordingFastAck::new(FastAckBehavior::Normal);
+
+    insert(&store, &human_dm("m_fast_ack_idle", "pcuser", "hello")).await;
+    Inbox::new(&store)
+        .enqueue_with_timing(
+            &MessageId("m_fast_ack_idle".into()),
+            &session,
+            DeliveryTiming::Interrupt,
+        )
+        .await
+        .unwrap();
+
+    let _loop = EventLoop::spawn(
+        session.clone(),
+        LoopDeps {
+            store: store.clone(),
+            bell: Bell::new(),
+            registry: AgentRegistry::new(),
+            turn_exec: turn_exec.clone(),
+            events: Arc::new(NullSink),
+            project: PROJECT.into(),
+            drain_limit: cfg.drain_limit,
+            preview_chars: cfg.msg_preview_chars,
+            completion_timeout: Duration::from_secs(45),
+            provider_limit_default_cooldown: Duration::from_millis(50),
+            fast_ack: Some(port),
+            auto_reply_note: None,
+        },
+    );
+
+    // MockTurnExec holds the first turn open until released; let it finish.
+    tokio::time::timeout(Duration::from_secs(2), turn_exec.started.notified())
+        .await
+        .expect("the idle agent should start its turn immediately");
+    turn_exec.gate.notify_one();
+    wait_for_delivery_state(&store, "m_fast_ack_idle", "delivered").await;
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "an idle agent must not be acknowledged"
+    );
+}
