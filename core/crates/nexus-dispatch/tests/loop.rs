@@ -1730,6 +1730,9 @@ async fn interrupted_turn_error_still_redrives_the_unclaimed_replacement_once() 
 
 #[tokio::test]
 async fn refused_interrupt_keeps_the_replacement_for_turn_boundary_delivery() {
+    // A refused cancel means the sender now waits for the turn boundary, which is exactly when
+    // the courtesy acknowledgment is worth sending. This is the path real pty-backed agents take:
+    // they advertise InterruptAndSend but the headed bridge refuses the cancel.
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
     let cfg = Config::default();
@@ -1752,6 +1755,7 @@ async fn refused_interrupt_keeps_the_replacement_for_turn_boundary_delivery() {
         drain_limit: cfg.drain_limit,
         preview_chars: cfg.msg_preview_chars,
     });
+    let (ack_port, ack_calls) = RecordingFastAck::new(FastAckBehavior::Normal);
     let _loop = EventLoop::spawn(
         session.clone(),
         LoopDeps {
@@ -1765,7 +1769,7 @@ async fn refused_interrupt_keeps_the_replacement_for_turn_boundary_delivery() {
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: Duration::from_secs(45),
             provider_limit_default_cooldown: Duration::from_millis(50),
-            fast_ack: None,
+            fast_ack: Some(ack_port),
             auto_reply_note: None,
         },
     );
@@ -1848,6 +1852,13 @@ async fn refused_interrupt_keeps_the_replacement_for_turn_boundary_delivery() {
     assert_eq!(
         accepted_client_ids,
         vec!["bus:m_interrupt_failure_first".to_string()]
+    );
+
+    // This replacement is agent-authored, so the cascade guard suppresses the courtesy even
+    // though the message was deferred. Only people get acknowledged.
+    assert!(
+        ack_calls.lock().unwrap().is_empty(),
+        "an agent-authored message must never be acknowledged, deferred or not"
     );
 
     // Let the original turn finish. The replacement the refused cancel could not deliver early
@@ -2985,4 +2996,87 @@ async fn idle_agent_gets_no_fast_ack() {
         calls.lock().unwrap().is_empty(),
         "an idle agent must not be acknowledged"
     );
+}
+
+/// The path a real pty-backed agent takes. It advertises `InterruptAndSend`, but the headed
+/// bridge refuses the cancel, so the message waits for the turn boundary — and the person who
+/// sent it must be told rather than left in silence.
+#[tokio::test]
+async fn a_human_whose_message_is_deferred_by_a_refused_interrupt_is_acknowledged() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let cfg = Config::default();
+    let bell = Bell::new();
+    let registry = AgentRegistry::new();
+    let session = SessionId("s_refused_interrupt_human".into());
+    let turn_exec = Arc::new(SerializedInterruptAndSendTurnExec::with_interrupt_error(
+        session.clone(),
+        ContractError {
+            code: -32004,
+            message: "this terminal backend does not support active-turn interruption".into(),
+        },
+    ));
+    let service = DispatchService::new(ServiceDeps {
+        store: store.clone(),
+        bell: bell.clone(),
+        registry: registry.clone(),
+        project: PROJECT.into(),
+        drain_limit: cfg.drain_limit,
+        preview_chars: cfg.msg_preview_chars,
+    });
+    let (ack_port, ack_calls) = RecordingFastAck::new(FastAckBehavior::Normal);
+    let _loop = EventLoop::spawn(
+        session.clone(),
+        LoopDeps {
+            store: store.clone(),
+            bell,
+            registry,
+            turn_exec: turn_exec.clone(),
+            events: Arc::new(NullSink),
+            project: PROJECT.into(),
+            drain_limit: cfg.drain_limit,
+            preview_chars: cfg.msg_preview_chars,
+            completion_timeout: Duration::from_secs(45),
+            provider_limit_default_cooldown: Duration::from_millis(50),
+            fast_ack: Some(ack_port),
+            auto_reply_note: None,
+        },
+    );
+
+    insert(&store, &dm("m_refused_human_first", "Alex", "active turn")).await;
+    service
+        .enqueue(&session, &MessageId("m_refused_human_first".into()))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), turn_exec.first_started.notified())
+        .await
+        .expect("first prompt should be active");
+
+    insert(
+        &store,
+        &human_dm(
+            "m_refused_human_followup",
+            "pcuser",
+            "also update the README",
+        ),
+    )
+    .await;
+    service
+        .enqueue(&session, &MessageId("m_refused_human_followup".into()))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while ack_calls.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the deferred human message must be acknowledged");
+    assert_eq!(ack_calls.lock().unwrap().len(), 1);
+
+    // And the message itself still lands once the original turn ends.
+    turn_exec.interrupt_requested.notify_one();
+    turn_exec.terminal_release.notify_one();
+    wait_for_delivery_state(&store, "m_refused_human_followup", "delivered").await;
 }

@@ -198,17 +198,8 @@ async fn run(session: SessionId, deps: LoopDeps) {
             ) {
                 DeliveryAction::WaitForTurnBoundary
                 | DeliveryAction::WaitForFinalTurnCompletion => {
-                    // Courtesy only. Spawned and never awaited, so a slow, failing, or panicking
-                    // acknowledgment cannot delay this delivery or change its outcome.
-                    if let Some(fast_ack) = deps.fast_ack.clone() {
-                        if crate::delivery_timing::batch_has_human_sender(&batch) {
-                            let ack_session = session.clone();
-                            let ack_batch = batch.clone();
-                            tokio::spawn(async move {
-                                fast_ack.fast_ack(&ack_session, &ack_batch).await;
-                            });
-                        }
-                    }
+                    // The sender is about to wait for the turn boundary, so acknowledge now.
+                    spawn_fast_ack(&session, &deps, &batch);
                     if let Err(error) = deps.turn_exec.wait_for_turn_completion(&session).await {
                         if !claim_batch(&session, &deps, &inbox, &batch).await {
                             break;
@@ -497,6 +488,26 @@ async fn handle_pending_during_active_turn(
 /// Do not call `steer_observed` inline here for interrupt-and-send adapters. Their replacement
 /// prompt is serialized behind the active prompt. Awaiting it from this bell branch pauses polling
 /// of the active future, so the cancelled prompt can never release the serialization boundary.
+/// Send the courtesy acknowledgment for a batch whose delivery is being deferred.
+///
+/// Spawned and never awaited: a slow, failing, or panicking acknowledgment must not delay or
+/// change the outcome of the delivery it accompanies. Gated on a human sender so an agent never
+/// acknowledges another agent, which is what keeps two busy agents from acknowledging each other
+/// forever.
+fn spawn_fast_ack(session: &SessionId, deps: &LoopDeps, batch: &NexusBatch) {
+    let Some(fast_ack) = deps.fast_ack.clone() else {
+        return;
+    };
+    if !crate::delivery_timing::batch_has_human_sender(batch) {
+        return;
+    }
+    let session = session.clone();
+    let batch = batch.clone();
+    tokio::spawn(async move {
+        fast_ack.fast_ack(&session, &batch).await;
+    });
+}
+
 async fn interrupt_and_redrive_notified_batch(
     session: &SessionId,
     deps: &LoopDeps,
@@ -515,6 +526,9 @@ async fn interrupt_and_redrive_notified_batch(
             count = batch.counts.total,
             "active-turn interrupt refused; leaving the batch for turn-boundary delivery"
         );
+        // The sender is now waiting for the turn boundary they were supposed to skip, which is
+        // exactly when a courtesy acknowledgment is worth sending. Spawned and never awaited.
+        spawn_fast_ack(session, deps, batch);
         return false;
     }
     true
