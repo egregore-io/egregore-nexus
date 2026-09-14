@@ -23,8 +23,7 @@ use std::sync::Arc;
 use nexus_common::render_injected_turn_for;
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::{
-    AgentTurnExecutionPort, AgentUpdateKind, ContractError, DeliveryTiming, EventSink, InjectError,
-    NexusBatch, WsEvent,
+    AgentTurnExecutionPort, AgentUpdateKind, EventSink, InjectError, NexusBatch, WsEvent,
 };
 use nexus_store::repos::inbox::{
     Inbox, COMPLETION_TIMEOUT_ERROR_CODE, CONTRACT_ERROR_CODE, OPERATOR_ACTION_ERROR_CODE,
@@ -34,7 +33,7 @@ use nexus_store::Store;
 use tokio::task::JoinHandle;
 
 use crate::bell::Bell;
-use crate::delivery_timing::{delivery_action, DeliveryAction, DeliveryTimingError};
+use crate::delivery_timing::{delivery_action, DeliveryAction};
 use crate::drain::InboxDrainer;
 use crate::wake_policy::{AgentState, WakeDecision, WakePolicy};
 
@@ -191,8 +190,8 @@ async fn run(session: SessionId, deps: LoopDeps) {
                 turn_active,
                 deps.turn_exec.steer_capability(&session),
             ) {
-                Ok(DeliveryAction::WaitForTurnBoundary)
-                | Ok(DeliveryAction::WaitForFinalTurnCompletion) => {
+                DeliveryAction::WaitForTurnBoundary
+                | DeliveryAction::WaitForFinalTurnCompletion => {
                     if let Err(error) = deps.turn_exec.wait_for_turn_completion(&session).await {
                         if !claim_batch(&session, &deps, &inbox, &batch).await {
                             break;
@@ -208,7 +207,7 @@ async fn run(session: SessionId, deps: LoopDeps) {
                     }
                     continue;
                 }
-                Ok(DeliveryAction::NativeSteer) | Ok(DeliveryAction::InterruptAndSend) => {
+                DeliveryAction::NativeSteer | DeliveryAction::InterruptAndSend => {
                     if !claim_batch(&session, &deps, &inbox, &batch).await {
                         break;
                     }
@@ -217,21 +216,7 @@ async fn run(session: SessionId, deps: LoopDeps) {
                         SteerAttempt::Failed => break,
                     }
                 }
-                Err(error) => {
-                    if !claim_batch(&session, &deps, &inbox, &batch).await {
-                        break;
-                    }
-                    handle_inject_error(
-                        &session,
-                        &deps,
-                        &inbox,
-                        &batch,
-                        InjectError::Contract(delivery_timing_contract_error(timing, error)),
-                    )
-                    .await;
-                    continue;
-                }
-                Ok(DeliveryAction::StartTurn) => {}
+                DeliveryAction::StartTurn => {}
             }
 
             // Persist the one permitted attempt before crossing the harness boundary. If the
@@ -464,35 +449,21 @@ async fn handle_pending_during_active_turn(
     let timing = timed_batch.timing;
     let batch = timed_batch.batch;
     match delivery_action(timing, true, deps.turn_exec.steer_capability(session)) {
-        Ok(DeliveryAction::NativeSteer) => {
+        DeliveryAction::NativeSteer => {
             if claim_batch(session, deps, inbox, &batch).await {
                 let _ = steer_claimed_batch(session, deps, inbox, &batch).await;
             }
             false
         }
-        Ok(DeliveryAction::InterruptAndSend) => {
+        DeliveryAction::InterruptAndSend => {
             interrupt_and_redrive_notified_batch(session, deps, inbox, &batch).await
         }
-        Ok(DeliveryAction::WaitForTurnBoundary)
-        | Ok(DeliveryAction::WaitForFinalTurnCompletion) => {
+        DeliveryAction::WaitForTurnBoundary | DeliveryAction::WaitForFinalTurnCompletion => {
             // The current turn future is still being polled by the caller. Leave these rows
             // notified; its terminal branch immediately re-drains them.
             false
         }
-        Err(error) => {
-            if claim_batch(session, deps, inbox, &batch).await {
-                handle_inject_error(
-                    session,
-                    deps,
-                    inbox,
-                    &batch,
-                    InjectError::Contract(delivery_timing_contract_error(timing, error)),
-                )
-                .await;
-            }
-            false
-        }
-        Ok(DeliveryAction::StartTurn) => unreachable!("the caller owns an active turn"),
+        DeliveryAction::StartTurn => unreachable!("the caller owns an active turn"),
     }
 }
 
@@ -514,22 +485,6 @@ async fn interrupt_and_redrive_notified_batch(
         return false;
     }
     true
-}
-
-fn delivery_timing_contract_error(
-    timing: DeliveryTiming,
-    error: DeliveryTimingError,
-) -> ContractError {
-    let message = match error {
-        DeliveryTimingError::InterruptUnsupported => format!(
-            "delivery timing {} is unsupported by this harness while a turn is active",
-            timing.as_str()
-        ),
-    };
-    ContractError {
-        code: nexus_contracts::codes::DELIVERY_TIMING_UNSUPPORTED,
-        message,
-    }
 }
 
 async fn steer_claimed_batch(

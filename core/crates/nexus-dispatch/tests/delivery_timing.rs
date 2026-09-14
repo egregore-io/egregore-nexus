@@ -1,5 +1,5 @@
 use nexus_contracts::{DeliveryTiming, SteerCapability};
-use nexus_dispatch::{delivery_action, DeliveryAction, DeliveryTimingError};
+use nexus_dispatch::{delivery_action, DeliveryAction};
 
 #[test]
 fn idle_targets_start_normally_for_every_public_timing() {
@@ -10,7 +10,7 @@ fn idle_targets_start_normally_for_every_public_timing() {
     ] {
         assert_eq!(
             delivery_action(timing, false, SteerCapability::None),
-            Ok(DeliveryAction::StartTurn),
+            DeliveryAction::StartTurn,
         );
     }
 }
@@ -23,7 +23,7 @@ fn interrupt_uses_native_steer_then_atomic_interrupt_and_send() {
             true,
             SteerCapability::NativeSteer,
         ),
-        Ok(DeliveryAction::NativeSteer),
+        DeliveryAction::NativeSteer,
     );
     assert_eq!(
         delivery_action(
@@ -31,11 +31,18 @@ fn interrupt_uses_native_steer_then_atomic_interrupt_and_send() {
             true,
             SteerCapability::InterruptAndSend,
         ),
-        Ok(DeliveryAction::InterruptAndSend),
+        DeliveryAction::InterruptAndSend,
     );
+}
+
+/// The repair: a busy agent whose backend cannot be interrupted must WAIT for the turn
+/// boundary. Returning an error here dead-lettered the message, so the operator never
+/// received a reply at all.
+#[test]
+fn interrupt_on_busy_uninterruptible_agent_waits_for_boundary() {
     assert_eq!(
-        delivery_action(DeliveryTiming::Interrupt, true, SteerCapability::None,),
-        Err(DeliveryTimingError::InterruptUnsupported),
+        delivery_action(DeliveryTiming::Interrupt, true, SteerCapability::None),
+        DeliveryAction::WaitForTurnBoundary,
     );
 }
 
@@ -48,11 +55,11 @@ fn yield_and_tool_loop_policies_wait_for_an_authoritative_boundary() {
     ] {
         assert_eq!(
             delivery_action(DeliveryTiming::YieldTurn, true, capability),
-            Ok(DeliveryAction::WaitForTurnBoundary),
+            DeliveryAction::WaitForTurnBoundary,
         );
         assert_eq!(
             delivery_action(DeliveryTiming::AfterToolLoop, true, capability),
-            Ok(DeliveryAction::WaitForFinalTurnCompletion),
+            DeliveryAction::WaitForFinalTurnCompletion,
         );
     }
 }

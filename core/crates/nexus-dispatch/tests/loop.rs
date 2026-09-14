@@ -1038,7 +1038,7 @@ async fn after_tool_loop_waits_for_authoritative_final_completion_before_injecti
 }
 
 #[tokio::test]
-async fn active_turn_interrupt_without_adapter_support_is_a_typed_terminal_error() {
+async fn active_turn_interrupt_without_adapter_support_waits_and_delivers_at_the_boundary() {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
     let cfg = Config::default();
@@ -1050,7 +1050,7 @@ async fn active_turn_interrupt_without_adapter_support_is_a_typed_terminal_error
         &dm(
             "m_interrupt_unsupported",
             "casey",
-            "do not silently downgrade interrupt",
+            "a busy uninterruptible agent must still receive this",
         ),
     )
     .await;
@@ -1079,21 +1079,37 @@ async fn active_turn_interrupt_without_adapter_support_is_a_typed_terminal_error
         },
     );
 
-    wait_for_delivery_state(&store, "m_interrupt_unsupported", "error").await;
-    assert!(turn_exec.injected.lock().unwrap().is_empty());
+    // The loop must WAIT on the adapter boundary rather than settle the batch as an error.
+    tokio::time::timeout(Duration::from_secs(2), turn_exec.wait_started.notified())
+        .await
+        .expect("a busy uninterruptible target must wait for the turn boundary");
+    tokio::task::yield_now().await;
+    assert!(
+        turn_exec.injected.lock().unwrap().is_empty(),
+        "nothing may be injected while the original turn is still active"
+    );
+
+    turn_exec.final_completion.notify_one();
+    wait_for_delivery_state(&store, "m_interrupt_unsupported", "delivered").await;
+    assert_eq!(
+        turn_exec.injected.lock().unwrap().len(),
+        1,
+        "a busy uninterruptible agent must still receive the message at its turn boundary"
+    );
+
     let mut rows = store
         .conn
         .query(
-            "SELECT error_details_json FROM in_flight WHERE message_id = ?1",
+            "SELECT COUNT(*) FROM in_flight WHERE message_id = ?1 AND state = 'error'",
             ["m_interrupt_unsupported"],
         )
         .await
         .unwrap();
     let row = rows.next().await.unwrap().unwrap();
-    let details: serde_json::Value = serde_json::from_str(&row.get::<String>(0).unwrap()).unwrap();
     assert_eq!(
-        details["rpcCode"],
-        nexus_contracts::codes::DELIVERY_TIMING_UNSUPPORTED
+        row.get::<i64>(0).unwrap(),
+        0,
+        "the message must never be dead-lettered"
     );
 }
 
