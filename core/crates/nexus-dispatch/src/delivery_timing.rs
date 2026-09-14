@@ -3,7 +3,7 @@
 //! This module uses only declared adapter capabilities and authoritative turn state. It never
 //! infers a boundary from rendered text, tool names, or a count of tool calls.
 
-use nexus_contracts::{DeliveryTiming, SteerCapability};
+use nexus_contracts::{DeliveryTiming, Kind, NexusBatch, SteerCapability};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryAction {
@@ -37,4 +37,18 @@ pub fn delivery_action(
         DeliveryTiming::YieldTurn => DeliveryAction::WaitForTurnBoundary,
         DeliveryTiming::AfterToolLoop => DeliveryAction::WaitForFinalTurnCompletion,
     }
+}
+
+/// Whether a batch contains at least one message from a human sender.
+///
+/// This is the structural cascade guard for fast acknowledgment. An agent acknowledges only
+/// people, never other agents, so an acknowledgment can never itself provoke another one — no
+/// loop detection or depth counter is needed to keep two busy agents from acknowledging each
+/// other forever.
+pub fn batch_has_human_sender(batch: &NexusBatch) -> bool {
+    batch
+        .dms
+        .iter()
+        .chain(batch.threads.iter())
+        .any(|message| matches!(message.kind, Kind::Human))
 }

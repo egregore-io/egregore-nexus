@@ -77,6 +77,7 @@ fn full_flow_uses_consistent_top_level_names() {
         dm_message_ids: vec![MessageId("m_01".into())],
         thread_message_ids: vec![],
         message_ids: vec![MessageId("m_01".into())],
+        auto_reply_note: None,
     };
     let _: NexusBatch = serde_json::from_str(&serde_json::to_string(&batch).unwrap()).unwrap();
 

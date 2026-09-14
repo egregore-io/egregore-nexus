@@ -730,3 +730,21 @@ pub trait EventSink: Send + Sync {
     /// re-reads and validates both identities; embedders without projections remain unchanged.
     async fn project_runtime_binding(&self, _session: &SessionId, _agent: &AgentId) {}
 }
+
+/// Advisory immediate acknowledgment for a message that arrived while the agent is mid-turn.
+///
+/// The delivery path spawns this and never awaits it, so an implementation that is slow, errors,
+/// or panics cannot delay or fail delivery. Implementations MUST treat that as their contract:
+/// acknowledging is a courtesy to the sender, never a step in delivering the message.
+#[async_trait]
+pub trait FastAckPort: Send + Sync {
+    async fn fast_ack(&self, session: &SessionId, batch: &crate::NexusBatch);
+}
+
+/// Supplies the acknowledgment already sent under an agent's name while it was busy, so the
+/// agent's next turn can continue from it instead of repeating or contradicting it.
+///
+/// `take` MUST consume the note, so one acknowledgment is injected exactly once.
+pub trait AutoReplyNotePort: Send + Sync {
+    fn take(&self, session: &SessionId) -> Option<String>;
+}

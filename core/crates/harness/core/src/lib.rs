@@ -299,6 +299,18 @@ pub trait Harness: Send + Sync {
         None
     }
 
+    /// One-shot, non-interactive invocation for short auxiliary prompts, such as drafting a
+    /// courtesy reply while the agent's own session is busy.
+    ///
+    /// `None` means this harness exposes no one-shot mode. Callers MUST degrade gracefully rather
+    /// than invent a command line: a harness without one keeps every behavior it already had.
+    ///
+    /// The spawned process is a fresh one with no access to the agent's session, so it is only
+    /// suitable for work that needs the prompt alone.
+    fn oneshot_command(&self, _prompt: &str) -> Option<HeadedCommand> {
+        None
+    }
+
     /// Whether a headless ACP row may be repaired into a headed launch by
     /// `nexus attach` using the stored native session id.
     fn acp_attach_revivable(&self) -> bool {

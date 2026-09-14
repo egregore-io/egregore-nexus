@@ -51,6 +51,7 @@ fn batch() -> NexusBatch {
         dm_message_ids: vec![MessageId("m_1".to_string())],
         thread_message_ids: vec![],
         message_ids: vec![MessageId("m_1".to_string())],
+        auto_reply_note: None,
     }
 }
 

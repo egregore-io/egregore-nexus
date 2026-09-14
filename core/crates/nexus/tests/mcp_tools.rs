@@ -104,6 +104,7 @@ async fn complete_empty_batch(store: Arc<Store>, count: usize) {
         dm_message_ids: vec![],
         thread_message_ids: vec![],
         message_ids: Vec::<MessageId>::new(),
+        auto_reply_note: None,
     };
     CommandIntents::new(&store)
         .mark_done(

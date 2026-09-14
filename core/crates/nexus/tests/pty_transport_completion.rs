@@ -123,6 +123,7 @@ async fn observed_inject_accepts_harness_context_evidence() {
         dm_message_ids: vec![],
         thread_message_ids: vec![],
         message_ids: vec![],
+        auto_reply_note: None,
     };
 
     transport
@@ -159,6 +160,7 @@ async fn observed_inject_rejects_input_acceptance_without_context_evidence() {
         dm_message_ids: vec![],
         thread_message_ids: vec![],
         message_ids: vec![],
+        auto_reply_note: None,
     };
 
     let error = transport

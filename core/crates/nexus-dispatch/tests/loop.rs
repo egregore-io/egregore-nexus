@@ -915,6 +915,8 @@ async fn idle_agent_drains_one_turn_then_coalesces_a_followup() {
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: std::time::Duration::from_secs(45),
             provider_limit_default_cooldown: std::time::Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -1020,6 +1022,8 @@ async fn after_tool_loop_waits_for_authoritative_final_completion_before_injecti
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: Duration::from_secs(45),
             provider_limit_default_cooldown: Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -1076,6 +1080,8 @@ async fn active_turn_interrupt_without_adapter_support_waits_and_delivers_at_the
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: Duration::from_secs(45),
             provider_limit_default_cooldown: Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -1144,6 +1150,8 @@ async fn active_native_turn_receives_new_bus_batch_before_current_turn_completes
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: Duration::from_secs(45),
             provider_limit_default_cooldown: Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -1233,6 +1241,8 @@ async fn interrupt_and_send_redrives_after_cancel_without_deadlocking_the_active
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: Duration::from_secs(45),
             provider_limit_default_cooldown: Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -1372,6 +1382,8 @@ async fn accepted_interrupt_redrives_once_after_the_active_turn_times_out() {
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: Duration::from_millis(250),
             provider_limit_default_cooldown: Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -1495,6 +1507,8 @@ async fn later_arrivals_coalesce_without_reinterrupting_the_canceled_turn() {
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: Duration::from_secs(45),
             provider_limit_default_cooldown: Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -1655,6 +1669,8 @@ async fn interrupted_turn_error_still_redrives_the_unclaimed_replacement_once() 
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: Duration::from_secs(45),
             provider_limit_default_cooldown: Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -1749,6 +1765,8 @@ async fn refused_interrupt_keeps_the_replacement_for_turn_boundary_delivery() {
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: Duration::from_secs(45),
             provider_limit_default_cooldown: Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -1875,6 +1893,8 @@ async fn rejected_native_steer_race_delivers_once_after_current_turn_completes()
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: Duration::from_secs(45),
             provider_limit_default_cooldown: Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -1951,6 +1971,8 @@ async fn non_steerable_native_turn_keeps_bus_mail_for_post_turn_delivery() {
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: Duration::from_secs(45),
             provider_limit_default_cooldown: Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -2020,6 +2042,8 @@ async fn interrupted_turn_completion_redrains_queued_followup() {
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: Duration::from_secs(45),
             provider_limit_default_cooldown: Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -2098,6 +2122,8 @@ async fn drained_bus_batch_is_projected_as_session_visible_user_input() {
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: std::time::Duration::from_secs(45),
             provider_limit_default_cooldown: std::time::Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -2165,6 +2191,8 @@ async fn per_agent_loop_injects_full_message_bodies_not_previews() {
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: std::time::Duration::from_secs(45),
             provider_limit_default_cooldown: std::time::Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -2236,6 +2264,8 @@ async fn single_plain_human_dm_projection_matches_injected_text() {
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: std::time::Duration::from_secs(45),
             provider_limit_default_cooldown: std::time::Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -2358,6 +2388,8 @@ async fn failed_injection_is_terminal_and_is_not_retried() {
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: std::time::Duration::from_secs(45),
             provider_limit_default_cooldown: std::time::Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -2467,6 +2499,8 @@ async fn provider_limit_is_terminal_and_never_schedules_a_retry() {
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: Duration::from_secs(45),
             provider_limit_default_cooldown: Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -2577,6 +2611,8 @@ async fn provider_error_is_terminal_with_structured_explicit_retry_evidence() {
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: Duration::from_secs(45),
             provider_limit_default_cooldown: Duration::from_millis(10),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -2649,6 +2685,8 @@ async fn operator_action_is_terminal_and_never_retries() {
             preview_chars: cfg.msg_preview_chars,
             completion_timeout: Duration::from_secs(45),
             provider_limit_default_cooldown: Duration::from_millis(10),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 
@@ -2713,6 +2751,8 @@ async fn completion_timeout_dead_letters_not_delivered() {
             // Tiny completion budget so the lost-completion timeout fires promptly in-test.
             completion_timeout: Duration::from_millis(50),
             provider_limit_default_cooldown: Duration::from_millis(50),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
 

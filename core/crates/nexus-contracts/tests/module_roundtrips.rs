@@ -573,6 +573,7 @@ mod batch {
                 MessageId("m_02".into()),
                 MessageId("m_03".into()),
             ],
+            auto_reply_note: None,
         }
     }
 

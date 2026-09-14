@@ -80,6 +80,7 @@ async fn hermes_gateway_bridge_delivers_batch_and_acks_on_surface() {
         dm_message_ids: vec![MessageId("m1".into())],
         thread_message_ids: Vec::new(),
         message_ids: vec![MessageId("m1".into())],
+        auto_reply_note: None,
     };
     let expected = render_batch(&batch);
     let send_bridge = bridge.clone();

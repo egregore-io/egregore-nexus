@@ -161,6 +161,7 @@ mod provenance {
             dm_message_ids: vec![MessageId("m_dm".into())],
             thread_message_ids: vec![MessageId("m_thread".into())],
             message_ids: vec![MessageId("m_dm".into()), MessageId("m_thread".into())],
+            auto_reply_note: None,
         };
 
         let rendered = render_batch(&batch);
@@ -206,6 +207,7 @@ mod provenance {
             dm_message_ids: vec![MessageId("m_dm".into())],
             thread_message_ids: vec![MessageId("m_thread".into())],
             message_ids: vec![MessageId("m_dm".into()), MessageId("m_thread".into())],
+            auto_reply_note: None,
         };
 
         let rendered = render_batch_for(&batch, "s_ellie");

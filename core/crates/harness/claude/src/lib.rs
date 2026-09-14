@@ -34,6 +34,20 @@ use nexus_harness_core::{
 pub struct ClaudeHarness;
 
 impl Harness for ClaudeHarness {
+    /// Claude's print mode. A cheap model is selected deliberately: this is used for short
+    /// courtesy replies, never for the agent's real work.
+    fn oneshot_command(&self, prompt: &str) -> Option<HeadedCommand> {
+        Some(HeadedCommand {
+            program: self.program().to_string(),
+            args: vec![
+                "-p".to_string(),
+                "--model".to_string(),
+                "haiku".to_string(),
+                prompt.to_string(),
+            ],
+        })
+    }
+
     fn program(&self) -> &'static str {
         native_harness_program("claude", NativeProcessPlatform::current())
             .expect("Claude has a native headed executable")

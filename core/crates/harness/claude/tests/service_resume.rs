@@ -108,6 +108,7 @@ fn one_dm_batch() -> NexusBatch {
         dm_message_ids: vec![id.clone()],
         thread_message_ids: vec![],
         message_ids: vec![id],
+        auto_reply_note: None,
     }
 }
 

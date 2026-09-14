@@ -144,4 +144,12 @@ pub struct NexusBatch {
     pub thread_message_ids: Vec<MessageId>,
     /// All ids in the drop (dms + threads), for a whole-drop ack.
     pub message_ids: Vec<MessageId>,
+    /// An acknowledgment already sent under this recipient's name while it was busy, if any.
+    ///
+    /// Carried on the batch rather than threaded through every transport because the batch is
+    /// already what "the agent is about to be told", and rendering happens in six places across
+    /// four crates. Renderers prepend it so the agent continues from what was said on its behalf
+    /// instead of repeating or contradicting it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_reply_note: Option<String>,
 }

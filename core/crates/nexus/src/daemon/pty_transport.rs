@@ -458,6 +458,7 @@ mod tests {
             dm_message_ids: vec![MessageId("m_pty".into())],
             thread_message_ids: vec![],
             message_ids: vec![MessageId("m_pty".into())],
+            auto_reply_note: None,
         };
         transport.inject_turn(&session, &batch).await.unwrap();
 
@@ -587,6 +588,7 @@ mod tests {
             dm_message_ids: vec![],
             thread_message_ids: vec![],
             message_ids: vec![],
+            auto_reply_note: None,
         };
 
         transport.inject_turn(&session, &batch).await.unwrap();
@@ -636,6 +638,7 @@ mod tests {
             dm_message_ids: vec![],
             thread_message_ids: vec![],
             message_ids: vec![],
+            auto_reply_note: None,
         };
 
         let err = transport

@@ -144,10 +144,10 @@ pub use notify::{
     RouteRule, NOTIFY_SIGNATURE_HEADER, NOTIFY_TIMESTAMP_HEADER,
 };
 pub use ports::{
-    AdminPort, AgentTurnExecutionPort, BusPort, Caller, ContractError, DispatchPort, EventSink,
-    IdentityPort, InjectError, InjectResult, NotifyPort, OperatorAction, PortResult,
-    PreparedBusSend, ProviderError, ProviderLimit, ProviderLimitReason, RealtimePort, ResetHint,
-    SearchPort,
+    AdminPort, AgentTurnExecutionPort, AutoReplyNotePort, BusPort, Caller, ContractError,
+    DispatchPort, EventSink, FastAckPort, IdentityPort, InjectError, InjectResult, NotifyPort,
+    OperatorAction, PortResult, PreparedBusSend, ProviderError, ProviderLimit, ProviderLimitReason,
+    RealtimePort, ResetHint, SearchPort,
 };
 pub use project::{Project, RegisterProjectRequest, RegisterProjectResponse};
 pub use prompt::{

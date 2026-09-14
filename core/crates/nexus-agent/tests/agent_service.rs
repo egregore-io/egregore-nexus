@@ -127,6 +127,7 @@ fn batch(dms: Vec<BatchMessage>, threads: Vec<BatchMessage>) -> NexusBatch {
         dm_message_ids: dm_ids,
         thread_message_ids: th_ids,
         message_ids: all,
+        auto_reply_note: None,
     }
 }
 

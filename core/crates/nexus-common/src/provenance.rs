@@ -55,6 +55,18 @@ pub fn render_batch_for(batch: &NexusBatch, receiver: &str) -> String {
 /// DM is delivered as bare text, while all other bus traffic is delivered as a rendered
 /// `<nexus-batch>`.
 pub fn render_injected_turn_for(batch: &NexusBatch, receiver: &str) -> String {
+    let body = render_injected_turn_body(batch, receiver);
+    match batch.auto_reply_note.as_deref() {
+        // Tell the agent what already went out under its name while it was busy, so its reply
+        // continues from that instead of repeating or contradicting it.
+        Some(note) if !note.trim().is_empty() => {
+            format!("[auto-reply already sent as you: {note:?}]\n{body}")
+        }
+        _ => body,
+    }
+}
+
+fn render_injected_turn_body(batch: &NexusBatch, receiver: &str) -> String {
     if let Some(m) = single_plain_human_dm(batch) {
         let prov = Provenance {
             from: m.from.clone(),

@@ -290,6 +290,7 @@ fn empty_batch() -> NexusBatch {
         dm_message_ids: vec![],
         thread_message_ids: vec![],
         message_ids: vec![],
+        auto_reply_note: None,
     }
 }
 
@@ -317,6 +318,7 @@ fn batch_with_agent_dm(msg: &str) -> NexusBatch {
         dm_message_ids: vec![],
         thread_message_ids: vec![],
         message_ids: vec![],
+        auto_reply_note: None,
     }
 }
 

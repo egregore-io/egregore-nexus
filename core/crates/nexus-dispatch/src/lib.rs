@@ -24,7 +24,7 @@ pub mod state;
 pub mod wake_policy;
 
 pub use bell::Bell;
-pub use delivery_timing::{delivery_action, DeliveryAction};
+pub use delivery_timing::{batch_has_human_sender, delivery_action, DeliveryAction};
 pub use drain::{InboxDrainer, TimedNexusBatch};
 pub use error::{DispatchResult, DispatchResult as RealtimeResult};
 pub use event_loop::{

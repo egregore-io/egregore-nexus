@@ -342,6 +342,7 @@ fn empty_batch() -> NexusBatch {
         dm_message_ids: Vec::new(),
         thread_message_ids: Vec::new(),
         message_ids: Vec::new(),
+        auto_reply_note: None,
     }
 }
 

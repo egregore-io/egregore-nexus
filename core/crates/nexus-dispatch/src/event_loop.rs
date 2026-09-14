@@ -81,6 +81,12 @@ pub struct LoopDeps {
     pub completion_timeout: std::time::Duration,
     /// Deprecated compatibility field; retry is explicit and this duration is not scheduled.
     pub provider_limit_default_cooldown: std::time::Duration,
+    /// Advisory fast-acknowledgment adapter for messages that arrive mid-turn. `None` disables
+    /// the courtesy entirely; the delivery path is identical either way.
+    pub fast_ack: Option<Arc<dyn nexus_contracts::FastAckPort>>,
+    /// Supplies an acknowledgment already sent under this agent's name, consumed once by the
+    /// next injected turn so the agent continues from it.
+    pub auto_reply_note: Option<Arc<dyn nexus_contracts::AutoReplyNotePort>>,
 }
 
 /// A spawned per-agent loop. Holds the task handle so the daemon can join/abort it on teardown.
@@ -171,7 +177,7 @@ async fn run(session: SessionId, deps: LoopDeps) {
                 "drain_once result"
             );
             let timing = timed_batch.timing;
-            let batch = timed_batch.batch;
+            let mut batch = timed_batch.batch;
             if batch.counts.total == 0 {
                 break;
             }
@@ -192,6 +198,17 @@ async fn run(session: SessionId, deps: LoopDeps) {
             ) {
                 DeliveryAction::WaitForTurnBoundary
                 | DeliveryAction::WaitForFinalTurnCompletion => {
+                    // Courtesy only. Spawned and never awaited, so a slow, failing, or panicking
+                    // acknowledgment cannot delay this delivery or change its outcome.
+                    if let Some(fast_ack) = deps.fast_ack.clone() {
+                        if crate::delivery_timing::batch_has_human_sender(&batch) {
+                            let ack_session = session.clone();
+                            let ack_batch = batch.clone();
+                            tokio::spawn(async move {
+                                fast_ack.fast_ack(&ack_session, &ack_batch).await;
+                            });
+                        }
+                    }
                     if let Err(error) = deps.turn_exec.wait_for_turn_completion(&session).await {
                         if !claim_batch(&session, &deps, &inbox, &batch).await {
                             break;
@@ -235,6 +252,12 @@ async fn run(session: SessionId, deps: LoopDeps) {
             // non-delivered `error` state — neither falsely marked delivered (silent data loss)
             // nor left `pending` to re-inject the same rows on every future bell (the "repeating
             // batch" storm). Only the `Ok(Ok(()))` arm (observed completion) marks delivered.
+            // Consume any acknowledgment already sent under this agent's name while it was busy.
+            // Taking it here means it rides along on the batch to every transport's renderer, and
+            // is injected exactly once.
+            if let Some(notes) = deps.auto_reply_note.as_ref() {
+                batch.auto_reply_note = notes.take(&session);
+            }
             let accepted_event = bus_user_input_event(&session, &batch);
             let turn = deps.turn_exec.inject_turn_observed(
                 &session,

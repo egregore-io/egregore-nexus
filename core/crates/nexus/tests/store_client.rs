@@ -973,6 +973,7 @@ async fn store_client_consume_helper_reissues_after_boot_epoch_change() {
         dm_message_ids: vec![],
         thread_message_ids: vec![],
         message_ids: vec![],
+        auto_reply_note: None,
     };
     let consume_rows = command_rows_for_kind(&daemon_store, command_kinds::inbox::CONSUME).await;
     CommandIntents::new(&daemon_store)

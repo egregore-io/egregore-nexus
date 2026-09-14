@@ -81,6 +81,7 @@ fn batch() -> NexusBatch {
         dm_message_ids: vec![],
         thread_message_ids: vec![MessageId("m_codex_wait".into())],
         message_ids: vec![MessageId("m_codex_wait".into())],
+        auto_reply_note: None,
     }
 }
 
@@ -635,6 +636,8 @@ async fn accepted_then_final_usage_limit_settles_store_error_without_delivery() 
             preview_chars: 10_000,
             completion_timeout: Duration::from_secs(5),
             provider_limit_default_cooldown: Duration::from_millis(10),
+            fast_ack: None,
+            auto_reply_note: None,
         },
     );
     realtime

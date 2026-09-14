@@ -49,6 +49,14 @@ use nexus_harness_core::{
 pub struct CodexHarness;
 
 impl Harness for CodexHarness {
+    /// Codex's non-interactive execution mode, used only for short courtesy replies.
+    fn oneshot_command(&self, prompt: &str) -> Option<HeadedCommand> {
+        Some(HeadedCommand {
+            program: self.program().to_string(),
+            args: vec!["exec".to_string(), prompt.to_string()],
+        })
+    }
+
     fn program(&self) -> &'static str {
         native_harness_program("codex", NativeProcessPlatform::current())
             .expect("Codex has a native headed executable")

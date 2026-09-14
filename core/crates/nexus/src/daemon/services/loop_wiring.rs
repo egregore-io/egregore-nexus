@@ -212,6 +212,8 @@ impl LoopWiring {
                 preview_chars: self.preview_chars,
                 completion_timeout: nexus_dispatch::DEFAULT_INJECT_COMPLETION_TIMEOUT,
                 provider_limit_default_cooldown: nexus_dispatch::DEFAULT_PROVIDER_LIMIT_COOLDOWN,
+                fast_ack: None,
+                auto_reply_note: None,
             },
         );
         spawned.insert(session.clone(), handle);

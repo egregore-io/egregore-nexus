@@ -375,6 +375,7 @@ mod tests {
             dm_message_ids: vec![],
             thread_message_ids: vec![],
             message_ids: vec![],
+            auto_reply_note: None,
         }
     }
 

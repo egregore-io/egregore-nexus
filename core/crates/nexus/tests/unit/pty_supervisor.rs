@@ -1596,6 +1596,7 @@ async fn launch_spawns_binds_and_routes_inject_through_the_pty() {
         dm_message_ids: vec![],
         thread_message_ids: vec![],
         message_ids: vec![],
+        auto_reply_note: None,
     };
     // The cloned transport is bound to the same PTY, so inject reaches it.
     supervisor
@@ -1676,6 +1677,7 @@ async fn launch_stores_raw_runtime_behind_pty_backend_handle() {
         dm_message_ids: vec![],
         thread_message_ids: vec![],
         message_ids: vec![],
+        auto_reply_note: None,
     };
     supervisor
         .transport()

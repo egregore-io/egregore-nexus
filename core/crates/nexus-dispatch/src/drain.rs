@@ -178,6 +178,7 @@ impl InboxDrainer {
             dm_message_ids,
             thread_message_ids,
             message_ids,
+            auto_reply_note: None,
         }
     }
 

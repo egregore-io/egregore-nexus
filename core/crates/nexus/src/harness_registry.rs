@@ -41,6 +41,14 @@ impl HarnessContract for OpenCodeHarness {
     fn resume_style(&self) -> ResumeStyle {
         ResumeStyle::Flag(&["-s"])
     }
+
+    /// OpenCode's non-interactive run mode, used only for short courtesy replies.
+    fn oneshot_command(&self, prompt: &str) -> Option<HeadedCommand> {
+        Some(HeadedCommand {
+            program: self.program().to_string(),
+            args: vec!["run".to_string(), prompt.to_string()],
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
