@@ -686,6 +686,8 @@ impl AppState {
             native_forwarders: Arc::new(Mutex::new(HashMap::new())),
             raw_stream_writers: Arc::new(Mutex::new(HashSet::new())),
             presence: presence_writer.clone(),
+            bus: bus.clone(),
+            auto_reply_notes: Arc::new(crate::daemon::fast_ack::AutoReplyNotes::default()),
         };
 
         // Keep launched agents present in `members` (they're driven over ACP and don't self-heartbeat).

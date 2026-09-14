@@ -130,6 +130,10 @@ pub struct LoopWiring {
     pub(crate) raw_stream_writers: Arc<Mutex<HashSet<SessionId>>>,
     /// Connection-owned liveness registry + materialized presence writer.
     pub(crate) presence: PresenceWriter,
+    /// Message spine, used to publish a busy agent's courtesy acknowledgment as that agent.
+    pub(crate) bus: Arc<dyn nexus_contracts::BusPort>,
+    /// Acknowledgments already sent under an agent's name, consumed by that agent's next turn.
+    pub(crate) auto_reply_notes: Arc<crate::daemon::fast_ack::AutoReplyNotes>,
 }
 
 pub(crate) struct NativeForwarderSlot {
@@ -212,8 +216,13 @@ impl LoopWiring {
                 preview_chars: self.preview_chars,
                 completion_timeout: nexus_dispatch::DEFAULT_INJECT_COMPLETION_TIMEOUT,
                 provider_limit_default_cooldown: nexus_dispatch::DEFAULT_PROVIDER_LIMIT_COOLDOWN,
-                fast_ack: None,
-                auto_reply_note: None,
+                fast_ack: Some(Arc::new(crate::daemon::fast_ack::FastAckAdapter::new(
+                    self.store.clone(),
+                    self.bus.clone(),
+                    self.auto_reply_notes.clone(),
+                    self.turn_exec.clone(),
+                ))),
+                auto_reply_note: Some(self.auto_reply_notes.clone()),
             },
         );
         spawned.insert(session.clone(), handle);

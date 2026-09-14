@@ -884,6 +884,8 @@ async fn claude_new_forwarder_claim_survives_late_old_track_and_cleanup() {
         native_forwarders: Default::default(),
         raw_stream_writers: Default::default(),
         presence: state.presence.clone(),
+        bus: state.bus.clone(),
+        auto_reply_notes: Default::default(),
     };
     let session = SessionId(format!("fixture-{}", uuid::Uuid::new_v4()));
     let args = ["--resume".into(), "native".into()];

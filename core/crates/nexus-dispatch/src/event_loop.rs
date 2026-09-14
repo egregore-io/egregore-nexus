@@ -479,7 +479,7 @@ async fn handle_pending_during_active_turn(
             false
         }
         DeliveryAction::InterruptAndSend => {
-            interrupt_and_redrive_notified_batch(session, deps, inbox, &batch).await
+            interrupt_and_redrive_notified_batch(session, deps, &batch).await
         }
         DeliveryAction::WaitForTurnBoundary | DeliveryAction::WaitForFinalTurnCompletion => {
             // The current turn future is still being polled by the caller. Leave these rows
@@ -500,7 +500,6 @@ async fn handle_pending_during_active_turn(
 async fn interrupt_and_redrive_notified_batch(
     session: &SessionId,
     deps: &LoopDeps,
-    inbox: &Inbox<'_>,
     batch: &NexusBatch,
 ) -> bool {
     if let Err(error) = deps.turn_exec.interrupt_active_turn(session).await {
