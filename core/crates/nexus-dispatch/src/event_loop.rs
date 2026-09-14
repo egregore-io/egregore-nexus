@@ -481,7 +481,18 @@ async fn interrupt_and_redrive_notified_batch(
     batch: &NexusBatch,
 ) -> bool {
     if let Err(error) = deps.turn_exec.interrupt_active_turn(session).await {
-        handle_inject_error(session, deps, inbox, batch, InjectError::Contract(error)).await;
+        // Interrupting is an optimization, never a precondition for delivery. A transport may
+        // advertise `InterruptAndSend` and still refuse the cancel (the headed OpenCode bridge
+        // inherits the trait default, which always errors), so failing here dead-lettered mail
+        // the agent never saw. Leave the batch at the durable `notified` boundary instead: the
+        // active turn's terminal branch re-drains it and delivers it normally.
+        tracing::warn!(
+            target: "nexus_dispatch::loop",
+            %session,
+            %error,
+            count = batch.counts.total,
+            "active-turn interrupt refused; leaving the batch for turn-boundary delivery"
+        );
         return false;
     }
     true

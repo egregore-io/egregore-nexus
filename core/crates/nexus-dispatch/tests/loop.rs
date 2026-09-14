@@ -1713,7 +1713,7 @@ async fn interrupted_turn_error_still_redrives_the_unclaimed_replacement_once() 
 }
 
 #[tokio::test]
-async fn interrupt_failure_settles_replacement_without_injection_or_accepted_event() {
+async fn refused_interrupt_keeps_the_replacement_for_turn_boundary_delivery() {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
     let cfg = Config::default();
@@ -1782,26 +1782,35 @@ async fn interrupt_failure_settles_replacement_without_injection_or_accepted_eve
         .await
         .unwrap();
 
-    wait_for_delivery_state(&store, "m_interrupt_failure_replacement", "error").await;
+    // The refused cancel must not invent an attempt, inject, or emit an accepted event — but it
+    // must also not discard the message. It stays queued for turn-boundary delivery.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while turn_exec.interrupts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the interrupt should have been attempted");
     assert_eq!(turn_exec.interrupts.load(Ordering::SeqCst), 1);
     assert_eq!(turn_exec.injected.lock().unwrap().len(), 1);
     let mut rows = store
         .conn
         .query(
-            "SELECT attempt_count FROM in_flight WHERE message_id = ?1",
+            "SELECT attempt_count, state FROM in_flight WHERE message_id = ?1",
             ["m_interrupt_failure_replacement"],
         )
         .await
         .unwrap();
+    let row = rows.next().await.unwrap().expect("replacement row");
     assert_eq!(
-        rows.next()
-            .await
-            .unwrap()
-            .expect("replacement row")
-            .get::<i64>(0)
-            .unwrap(),
+        row.get::<i64>(0).unwrap(),
         0,
         "a failed cancel must not invent a replacement prompt attempt"
+    );
+    assert_ne!(
+        row.get::<String>(1).unwrap(),
+        "error",
+        "a refused cancel must not dead-letter the replacement"
     );
     let accepted_client_ids = events
         .events()
@@ -1823,10 +1832,17 @@ async fn interrupt_failure_settles_replacement_without_injection_or_accepted_eve
         vec!["bus:m_interrupt_failure_first".to_string()]
     );
 
-    // Let the original test turn finish so the spawned loop does not outlive this fixture.
+    // Let the original turn finish. The replacement the refused cancel could not deliver early
+    // must now be delivered at the turn boundary rather than stay lost.
     turn_exec.interrupt_requested.notify_one();
     turn_exec.terminal_release.notify_one();
     wait_for_delivery_state(&store, "m_interrupt_failure_first", "delivered").await;
+    wait_for_delivery_state(&store, "m_interrupt_failure_replacement", "delivered").await;
+    assert_eq!(
+        turn_exec.injected.lock().unwrap().len(),
+        2,
+        "the replacement must reach the agent once the active turn ends"
+    );
 }
 
 #[tokio::test]
