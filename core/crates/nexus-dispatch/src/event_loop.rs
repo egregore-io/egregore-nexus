@@ -313,6 +313,7 @@ async fn run(session: SessionId, deps: LoopDeps) {
                                 tracing::error!(%error, session = %session, "mid-turn coalesce after interrupt failed");
                             }
                         } else {
+                            tracing::debug!(target: "nexus_dispatch::loop", %session, "mid-turn bell wake");
                             redrive_after_interrupt =
                                 handle_pending_during_active_turn(&session, &deps, &inbox).await;
                         }
@@ -454,7 +455,10 @@ async fn handle_pending_during_active_turn(
     .await
     {
         Ok(Some(batch)) if batch.batch.counts.total > 0 => batch,
-        Ok(_) => return false,
+        Ok(_) => {
+            tracing::debug!(target: "nexus_dispatch::loop", %session, "mid-turn drain found nothing");
+            return false;
+        }
         Err(error) => {
             tracing::error!(%error, %session, "mid-turn drain failed");
             return false;
@@ -462,7 +466,9 @@ async fn handle_pending_during_active_turn(
     };
     let timing = timed_batch.timing;
     let batch = timed_batch.batch;
-    match delivery_action(timing, true, deps.turn_exec.steer_capability(session)) {
+    let capability = deps.turn_exec.steer_capability(session);
+    tracing::debug!(target: "nexus_dispatch::loop", %session, ?timing, ?capability, count = batch.counts.total, "mid-turn batch admitted");
+    match delivery_action(timing, true, capability) {
         DeliveryAction::NativeSteer => {
             if claim_batch(session, deps, inbox, &batch).await {
                 let _ = steer_claimed_batch(session, deps, inbox, &batch).await;

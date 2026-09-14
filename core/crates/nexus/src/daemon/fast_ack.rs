@@ -181,8 +181,10 @@ impl FastAckAdapter {
 impl nexus_contracts::FastAckPort for FastAckAdapter {
     async fn fast_ack(&self, session: &SessionId, batch: &NexusBatch) {
         if !should_acknowledge(&self.notes, session) {
+            tracing::debug!(target: "nexus::fast_ack", %session, "skip: already acknowledged this busy turn");
             return;
         }
+        tracing::debug!(target: "nexus::fast_ack", %session, "fast ack invoked");
         // Reserve the slot before any await so a burst of arrivals cannot each pass the guard and
         // produce a flurry of identical acknowledgments.
         self.notes.put(session, String::new());
@@ -192,12 +194,14 @@ impl nexus_contracts::FastAckPort for FastAckAdapter {
             .await
         {
             Ok(Some(row)) => row,
-            _ => {
+            other => {
+                tracing::debug!(target: "nexus::fast_ack", %session, found = other.is_ok(), "skip: no session row");
                 let _ = self.notes.take(session);
                 return;
             }
         };
         let Some(reply_to) = acknowledgment_target(batch) else {
+            tracing::debug!(target: "nexus::fast_ack", %session, "skip: no human message to reply to");
             let _ = self.notes.take(session);
             return;
         };
@@ -216,9 +220,11 @@ impl nexus_contracts::FastAckPort for FastAckAdapter {
         // The turn may have ended while we were resolving an answer. The agent's real reply is
         // imminent and strictly better, so discard rather than post a stale acknowledgment.
         if !self.turn_is_active(session) {
+            tracing::debug!(target: "nexus::fast_ack", %session, "skip: turn ended while preparing the acknowledgment");
             let _ = self.notes.take(session);
             return;
         }
+        tracing::debug!(target: "nexus::fast_ack", %session, ?reply_to, "posting acknowledgment");
 
         let caller = nexus_contracts::Caller {
             agent_id: row.agent_id.clone().map(nexus_contracts::ids::AgentId),
@@ -242,9 +248,12 @@ impl nexus_contracts::FastAckPort for FastAckAdapter {
         };
 
         match self.bus.send(&caller, request).await {
-            Ok(_) => self.notes.put(session, reply),
+            Ok(_) => {
+                tracing::debug!(target: "nexus::fast_ack", %session, "acknowledgment posted");
+                self.notes.put(session, reply)
+            }
             Err(error) => {
-                tracing::debug!(
+                tracing::warn!(
                     target: "nexus::fast_ack",
                     %session,
                     %error,
