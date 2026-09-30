@@ -83,6 +83,22 @@ impl EventSink for RecordingSink {
     }
 }
 
+#[derive(Default)]
+struct GatedRecordingSink {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    recorded: RecordingSink,
+}
+
+#[async_trait]
+impl EventSink for GatedRecordingSink {
+    async fn emit(&self, event: WsEvent) {
+        self.entered.notify_one();
+        self.release.notified().await;
+        self.recorded.emit(event).await;
+    }
+}
+
 fn dm(from: &str, kind: Kind, body: &str) -> BatchMessage {
     BatchMessage {
         id: nexus_common::new_message_id(),
@@ -130,6 +146,32 @@ fn agent_with_bound_mock() -> (Agent, MockAdapter, RecordingSink, SessionId) {
     (agent, mock, sink, session)
 }
 
+#[tokio::test]
+async fn legacy_adapter_unknown_keeps_default_dispatch_and_completion_nonblocking() {
+    let (agent, _mock, _sink, session) = agent_with_bound_mock();
+    let observation = agent.observe_turn(&session);
+    assert_eq!(observation.state, nexus_contracts::TurnState::Unknown);
+    assert_eq!(observation.stamp, None);
+    assert_eq!(
+        observation.steer_capability,
+        agent.steer_capability(&session)
+    );
+    assert!(agent.active_turn_sessions().is_empty());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        agent.wait_for_turn_completion(&session),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    agent.prompt(&session, "legacy input".into()).await.unwrap();
+    assert_eq!(agent.observe_turn(&session), observation);
+    assert_eq!(
+        agent.observe_turn(&SessionId("absent".into())).state,
+        nexus_contracts::TurnState::Unavailable
+    );
+}
+
 struct BlockingAdapter {
     started: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
@@ -151,6 +193,7 @@ impl Adapter for CompactAdapter {
     }
 
     async fn inject(&self, _prompt: String) -> Result<(), AdapterInjectError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -195,6 +238,14 @@ impl Adapter for BlockingAdapter {
 
     async fn stream_updates(&self) -> Result<Vec<StreamEvent>, NexusError> {
         Ok(Vec::new())
+    }
+
+    async fn inject_completion_observed(
+        &self,
+        prompt: String,
+    ) -> Result<Vec<StreamEvent>, AdapterInjectError> {
+        self.inject(prompt).await?;
+        Ok(vec![StreamEvent::text("reply")])
     }
 }
 
@@ -562,6 +613,312 @@ async fn observed_inject_preserves_adapter_provider_limit() {
     assert_eq!(limit.harness, HarnessId::new("claude").unwrap());
     assert_eq!(limit.reason, ProviderLimitReason::RateLimit);
     assert_eq!(limit.source, "test.structured_frame");
+}
+
+#[tokio::test]
+async fn strict_observed_prompt_waits_for_response_then_original_acceptance_sink_before_output() {
+    use nexus_agent::adapter::{
+        engine::{HarnessCommand, LaunchCtx},
+        SpawnSpecAdapter,
+    };
+    let output = RecordingSink::default();
+    let acceptance = Arc::new(GatedRecordingSink::default());
+    let dir = std::env::temp_dir().join(format!(
+        "acp-service-strict-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let adapter = Arc::new(SpawnSpecAdapter::new(
+        HarnessId::new("other").unwrap(),
+        HarnessCommand {
+            program: env!("CARGO_BIN_EXE_fake_acp_agent").into(),
+            env: vec![
+                (
+                    "FAKE_ACP_RESPONSE_GATE".into(),
+                    dir.join("response").display().to_string(),
+                ),
+                ("FAKE_ACP_ECHO_USER".into(), "1".into()),
+            ],
+            ..Default::default()
+        },
+        LaunchCtx::default(),
+    ));
+    adapter.open_session().await.unwrap();
+    let agent = Arc::new(Agent::new(
+        AdapterRegistry::with_builtins(),
+        Arc::new(StubIdentity),
+        Arc::new(output.clone()),
+    ));
+    let session = SessionId("s_original".into());
+    agent.bind_session(session.clone(), "agent", "default", adapter.clone(), false);
+    let accepted = WsEvent::AgentUpdate {
+        session_id: session.clone(),
+        kind: AgentUpdateKind::UserInput,
+        data: serde_json::json!({"clientMessageId":"original-id","text":"input","custom":{"preserve":true}}),
+    };
+    let original = serde_json::to_value(&accepted).unwrap();
+    let observed_session = session.clone();
+    let task_agent = agent.clone();
+    let task_sink = acceptance.clone();
+    let send = tokio::spawn(async move {
+        task_agent
+            .prompt_observed(&session, "input".into(), task_sink, accepted)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !dir.join("response.entered").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !send.is_finished(),
+        "spawned relay is not a strict completion receipt"
+    );
+    assert!(acceptance.recorded.events().is_empty());
+    assert!(output.events().is_empty());
+    assert_eq!(agent.active_turn_sessions(), vec![observed_session.clone()]);
+    std::fs::write(dir.join("response.release"), b"release").unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        acceptance.entered.notified(),
+    )
+    .await
+    .expect("the supplied acceptance sink must be awaited");
+    assert!(!send.is_finished());
+    assert!(
+        agent.active_turn_sessions().is_empty(),
+        "completed protocol work must not stay active behind a presentation sink"
+    );
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        agent.wait_for_turn_completion(&observed_session),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        output.events().is_empty(),
+        "retained output cannot pass a blocked acceptance sink"
+    );
+    acceptance.release.notify_one();
+    send.await.unwrap().unwrap();
+    let accepted = acceptance.recorded.events();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(serde_json::to_value(&accepted[0]).unwrap(), original);
+    let kinds = output
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            WsEvent::AgentUpdate {
+                session_id, kind, ..
+            } => {
+                assert_eq!(session_id.0, "s_original");
+                Some(*kind)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            AgentUpdateKind::Thinking,
+            AgentUpdateKind::Text,
+            AgentUpdateKind::Text,
+            AgentUpdateKind::Plan,
+            AgentUpdateKind::TurnEnd
+        ]
+    );
+    assert!(agent.active_turn_sessions().is_empty());
+    adapter.kill().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn strict_observed_default_is_unsupported_without_legacy_injection_or_events() {
+    let output = RecordingSink::default();
+    let acceptance = RecordingSink::default();
+    let adapter = Arc::new(CompactAdapter::default());
+    let agent = Agent::new(
+        AdapterRegistry::with_builtins(),
+        Arc::new(StubIdentity),
+        Arc::new(output.clone()),
+    );
+    let session = SessionId("unsupported".into());
+    agent.bind_session(session.clone(), "agent", "default", adapter.clone(), false);
+    let error = agent
+        .prompt_observed(
+            &session,
+            "input".into(),
+            Arc::new(acceptance.clone()),
+            WsEvent::AgentUpdate {
+                session_id: session.clone(),
+                kind: AgentUpdateKind::UserInput,
+                data: serde_json::json!({"text":"input"}),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("not supported"));
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+    assert!(acceptance.events().is_empty());
+    assert!(output.events().is_empty());
+    assert!(agent.active_turn_sessions().is_empty());
+}
+
+#[tokio::test]
+async fn strict_completed_call_does_not_hold_activity_on_output_or_clear_overlapping_call() {
+    let output = Arc::new(GatedRecordingSink::default());
+    let acceptance = RecordingSink::default();
+    let adapter = Arc::new(BlockingAdapter::default());
+    let agent = Arc::new(Agent::new(
+        AdapterRegistry::with_builtins(),
+        Arc::new(StubIdentity),
+        output.clone(),
+    ));
+    let session = SessionId("overlap".into());
+    agent.bind_session(session.clone(), "agent", "default", adapter.clone(), false);
+    let send = |id: &'static str| {
+        let agent = agent.clone();
+        let session = session.clone();
+        let acceptance = acceptance.clone();
+        tokio::spawn(async move {
+            agent
+                .prompt_observed(
+                    &session,
+                    id.into(),
+                    Arc::new(acceptance),
+                    WsEvent::AgentUpdate {
+                        session_id: session.clone(),
+                        kind: AgentUpdateKind::UserInput,
+                        data: serde_json::json!({"clientMessageId":id}),
+                    },
+                )
+                .await
+        })
+    };
+    let first = send("first");
+    adapter.started.acquire().await.unwrap().forget();
+    let second = send("second");
+    adapter.started.acquire().await.unwrap().forget();
+    adapter.release.add_permits(1);
+    output.entered.notified().await;
+    assert!(!first.is_finished());
+    assert!(!second.is_finished());
+    assert_eq!(acceptance.events().len(), 1);
+    assert_eq!(
+        agent.active_turn_sessions(),
+        vec![session.clone()],
+        "ending the first guard must preserve the second unfinished protocol call"
+    );
+    // Release first retained output, then its completion, while second protocol work stays held.
+    output.release.notify_one();
+    output.entered.notified().await;
+    output.release.notify_one();
+    first.await.unwrap().unwrap();
+    assert_eq!(agent.active_turn_sessions(), vec![session.clone()]);
+    adapter.release.add_permits(1);
+    output.entered.notified().await;
+    assert!(agent.active_turn_sessions().is_empty());
+    agent.wait_for_turn_completion(&session).await.unwrap();
+    assert!(
+        !second.is_finished(),
+        "completed protocol work still waits for ordered output publication"
+    );
+    output.release.notify_one();
+    output.entered.notified().await;
+    output.release.notify_one();
+    second.await.unwrap().unwrap();
+    assert_eq!(acceptance.events().len(), 2);
+    assert_eq!(output.recorded.events().len(), 4);
+}
+
+#[tokio::test]
+async fn strict_observed_hermes_private_queue_ack_with_unrelated_output_is_not_success() {
+    use nexus_agent::adapter::{
+        engine::{HarnessCommand, LaunchCtx},
+        SpawnSpecAdapter,
+    };
+    let adapter = Arc::new(SpawnSpecAdapter::new(
+        HarnessId::new("hermes").unwrap(),
+        HarnessCommand {
+            program: env!("CARGO_BIN_EXE_fake_acp_agent").into(),
+            env: vec![
+                ("FAKE_ACP_HERMES_QUEUE_PROMOTE_MS".into(), "60000".into()),
+                ("FAKE_ACP_HERMES_QUEUE_UNRELATED_TEXT".into(), "1".into()),
+            ],
+            ..Default::default()
+        },
+        LaunchCtx::default(),
+    ));
+    adapter.open_session().await.unwrap();
+    let output = RecordingSink::default();
+    let acceptance = RecordingSink::default();
+    let agent = Agent::new(
+        AdapterRegistry::with_builtins(),
+        Arc::new(StubIdentity),
+        Arc::new(output.clone()),
+    );
+    let session = SessionId("s_hermes_queue".into());
+    agent.bind_session(session.clone(), "agent", "default", adapter.clone(), false);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        agent.prompt_observed(
+            &session,
+            "new prompt".into(),
+            Arc::new(acceptance.clone()),
+            WsEvent::AgentUpdate {
+                session_id: session.clone(),
+                kind: AgentUpdateKind::UserInput,
+                data: serde_json::json!({"text":"new prompt"}),
+            },
+        ),
+    )
+    .await
+    .expect("strict mode must reject private queue ACK without awaiting promotion");
+    adapter.kill().await;
+    assert!(
+        result.is_err(),
+        "unrelated model output cannot turn a private queue ACK into completion"
+    );
+    assert!(acceptance.events().is_empty());
+    assert!(output.events().is_empty());
+    assert!(adapter.stream_updates().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn strict_observed_failure_emits_neither_acceptance_nor_successful_completion() {
+    let (agent, mock, output, session) = agent_with_bound_mock();
+    mock.script_updates(vec!["must remain hidden"]);
+    mock.fail_inject_provider_limit(AdapterProviderLimit {
+        harness: HarnessId::new("claude").unwrap(),
+        reason: ProviderLimitReason::RateLimit,
+        reset_hint: None,
+        provider: None,
+        model: None,
+        source: "test.strict.failure".into(),
+    });
+    let acceptance = RecordingSink::default();
+    let error = agent
+        .prompt_observed(
+            &session,
+            "input".into(),
+            Arc::new(acceptance.clone()),
+            WsEvent::AgentUpdate {
+                session_id: session.clone(),
+                kind: AgentUpdateKind::UserInput,
+                data: serde_json::json!({"text":"input"}),
+            },
+        )
+        .await;
+    assert!(error.is_err());
+    assert!(acceptance.events().is_empty());
+    assert!(output.events().is_empty());
 }
 
 #[tokio::test]

@@ -876,9 +876,16 @@ struct LocalSessionQueueMutationRequest {
 #[serde(rename_all = "camelCase")]
 struct LocalSessionQueueReadRequest {
     #[serde(default)]
+    project: Option<String>,
+    /// Trusted Gateway read-gate evidence, not a public client-selected ownership flag.
+    #[serde(default)]
+    requester: Option<DaemonIpcCaller>,
+    #[serde(default)]
     name: Option<String>,
     #[serde(default)]
     agent_id: Option<AgentId>,
+    #[serde(default)]
+    expected_session_id: Option<String>,
     #[serde(default)]
     events_after: Option<i64>,
 }
@@ -896,6 +903,9 @@ async fn handle_local_session_queue_read(
             "session queue reads require local operator authority",
         );
     };
+    if let Err(error) = nexus_contracts::prompt::validate_expected_session(&params) {
+        return store_failure(request_id, error);
+    }
     let request: LocalSessionQueueReadRequest = match serde_json::from_value(params) {
         Ok(request) => request,
         Err(error) => {
@@ -907,9 +917,22 @@ async fn handle_local_session_queue_read(
         }
     };
     let queue = CommandQueue::new(&state.store);
+    if request.events_after.is_some() && request.expected_session_id.is_some() {
+        return failure(
+            request_id,
+            codes::INVALID_PARAMS,
+            "eventsAfter is a global read and cannot select an exact lane",
+        );
+    }
+    let requester = resolve_queue_requester(
+        state,
+        request.project.as_deref(),
+        request.requester.as_ref(),
+    )
+    .await;
     let result: Result<Value, ContractError> = match request.events_after {
         Some(after_seq) if after_seq >= 0 => queue
-            .events_after(after_seq)
+            .events_for_requester(after_seq, requester.as_ref())
             .await
             .map_err(|error| error.to_contract_error())
             .map(|page| {
@@ -942,9 +965,34 @@ async fn handle_local_session_queue_read(
             }
             let active_sessions = state.agent.active_turn_sessions();
             queue
-                .snapshot_with_active_sessions(name, request.agent_id.as_ref(), &active_sessions)
+                .snapshot_for_requester(
+                    name,
+                    request.agent_id.as_ref(),
+                    request.expected_session_id.as_deref(),
+                    &active_sessions,
+                    requester.as_ref(),
+                )
                 .await
                 .map_err(|error| error.to_contract_error())
+                .map(|mut snapshot| {
+                    if let Some(session) = snapshot.session_id.clone() {
+                        let observed = state.agent.observe_turn(&SessionId(session.clone()));
+                        snapshot.steer_capability = observed.steer_capability;
+                        match observed.state {
+                            nexus_contracts::TurnState::VerifiedIdle => {
+                                snapshot.turn_active = false
+                            }
+                            nexus_contracts::TurnState::NativeOpen => snapshot.turn_active = true,
+                            _ => {}
+                        }
+                        snapshot.observation = Some(
+                            nexus_contracts::prompt::QueueTurnObservation::from_observation(
+                                session, observed,
+                            ),
+                        );
+                    }
+                    snapshot
+                })
                 .and_then(|snapshot| serde_json::to_value(snapshot).map_err(json_contract_error))
         }
     };
@@ -952,6 +1000,54 @@ async fn handle_local_session_queue_read(
         Ok(value) => DaemonIpcResponse::success(request_id, value),
         Err(error) => store_failure(request_id, error),
     }
+}
+
+async fn resolve_queue_requester(
+    state: &AppState,
+    project: Option<&str>,
+    evidence: Option<&DaemonIpcCaller>,
+) -> Option<DaemonIpcCaller> {
+    let evidence = evidence?;
+    if project != Some(evidence.project.as_str()) {
+        return None;
+    }
+    if is_local_operator(evidence) {
+        return Some(evidence.clone());
+    }
+    if evidence.kind != Kind::Human
+        || evidence
+            .principal_id
+            .as_deref()
+            .is_none_or(|id| id.is_empty())
+    {
+        return None;
+    }
+    let key = evidence
+        .client_key
+        .as_deref()
+        .filter(|key| !key.is_empty())?;
+    // The ordinary query resolver is read-only, but its legacy key lookup selects one row.
+    // Reject ambiguity here instead of guessing or registering/rebinding a human during a read.
+    let sessions = Sessions::new(&state.store).list_all().await.ok()?;
+    if sessions
+        .iter()
+        .filter(|row| row.client_key.as_deref() == Some(key))
+        .count()
+        != 1
+    {
+        return None;
+    }
+    let (caller, session) = resolve_registered_query_caller_with_session(state, evidence)
+        .await
+        .ok()?;
+    if session.project != evidence.project || caller.project != evidence.project {
+        return None;
+    }
+    let mut resolved = evidence.clone();
+    resolved.session_id = Some(session.session_id.0.clone());
+    resolved.runtime_id = Some(session.session_id.0);
+    resolved.agent_id = caller.agent_id.map(|id| id.0);
+    Some(resolved)
 }
 
 async fn handle_local_session_queue_mutation(
@@ -967,6 +1063,11 @@ async fn handle_local_session_queue_mutation(
             "session queue mutations require local operator authority",
         );
     }
+    if let Some(request) = params.get("request") {
+        if let Err(error) = nexus_contracts::prompt::validate_expected_session(request) {
+            return store_failure(request_id, error);
+        }
+    }
     let request: LocalSessionQueueMutationRequest = match serde_json::from_value(params) {
         Ok(request) => request,
         Err(error) => {
@@ -978,12 +1079,50 @@ async fn handle_local_session_queue_mutation(
         }
     };
     let active_sessions = state.agent.active_turn_sessions();
+    // Capture adapter evidence before entering the identity transaction. Only a matching
+    // transaction-resolved session may use it; committed retries do not depend on this read.
+    let sessions = Sessions::new(&state.store);
+    let captured_session = if let Some(session) = request.request.expected_session_id.clone() {
+        Some(session)
+    } else if let Some(agent) = request.request.agent_id.as_ref() {
+        match sessions
+            .active_runtime_session_for_agent(&agent.0)
+            .await
+            .ok()
+            .flatten()
+        {
+            Some(row) => Some(row.session_id),
+            None => sessions
+                .find_by_agent_id(&agent.0)
+                .await
+                .ok()
+                .flatten()
+                .map(|row| row.session_id),
+        }
+    } else if let Some(name) = request.request.name.as_deref() {
+        sessions
+            .find_unique_by_name_any_project(name.trim())
+            .await
+            .ok()
+            .flatten()
+            .map(|row| row.session_id)
+    } else {
+        None
+    };
+    let capability = captured_session.map(|session_id| {
+        let observed = state.agent.observe_turn(&session_id);
+        nexus_store::repos::command_queue::CapturedQueueCapability {
+            session_id,
+            steer_capability: observed.steer_capability,
+        }
+    });
     match CommandQueue::new(&state.store)
-        .mutate_with_active_sessions(
+        .mutate_with_capability(
             &request.project,
             &request.request,
             request.now,
             &active_sessions,
+            capability.as_ref(),
         )
         .await
     {
@@ -1584,6 +1723,21 @@ async fn command_row_for_acceptance(
     params: Value,
     idempotency_key: Option<String>,
 ) -> Result<(NewCommandIntent, Option<String>), ContractError> {
+    if matches!(
+        kind.as_str(),
+        nexus_store::command_kinds::harness::PROMPT
+            | nexus_store::command_kinds::harness::STEER
+            | nexus_store::command_kinds::harness::INTERRUPT
+            | nexus_store::command_kinds::harness::COMPACT
+    ) {
+        nexus_contracts::prompt::validate_expected_session(&params)?;
+    }
+    if matches!(
+        kind.as_str(),
+        nexus_store::command_kinds::harness::PROMPT | nexus_store::command_kinds::harness::STEER
+    ) {
+        nexus_contracts::PromptRequest::validate_supported_options(&params)?;
+    }
     let Some(evidence) = caller else {
         return Ok((
             command_row(None, command_id, kind, params, idempotency_key),

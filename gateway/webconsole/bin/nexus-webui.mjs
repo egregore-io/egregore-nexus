@@ -2,7 +2,8 @@
 
 import { createReadStream } from "node:fs";
 import { access, realpath, stat } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { dirname, extname, join } from "node:path";
 import { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -36,6 +37,42 @@ const server = createServer((request, response) => {
     response.end(JSON.stringify({ error: { code: "gateway_unavailable", message: String(error) } }));
   });
 });
+const upgradeSockets = new Set();
+// Preserve the Gateway's WebSocket handshake and frames for fleet/session views.
+// Ordinary DM history continues to use the HTTP proxy below.
+server.on("upgrade", (request, socket, head) => {
+  const incoming = new URL(request.url ?? "/", url);
+  if (!incoming.pathname.startsWith("/api/")) {
+    socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+    return;
+  }
+  const target = new URL(`${incoming.pathname}${incoming.search}`, gateway);
+  const connect = target.protocol === "https:" ? httpsRequest : httpRequest;
+  const upstream = connect(target, { method: "GET", headers: request.headers });
+  upgradeSockets.add(socket);
+  socket.on("error", () => socket.destroy());
+  socket.on("close", () => { upgradeSockets.delete(socket); upstream.destroy(); });
+  upstream.on("error", () => socket.destroy());
+  upstream.on("upgrade", (response, peer, upstreamHead) => {
+    if (socket.destroyed) { peer.destroy(); return; }
+    let headers = `HTTP/${response.httpVersion} ${response.statusCode} ${response.statusMessage}\r\n`;
+    for (let i = 0; i < response.rawHeaders.length; i += 2) {
+      headers += `${response.rawHeaders[i]}: ${response.rawHeaders[i + 1]}\r\n`;
+    }
+    socket.write(`${headers}\r\n`);
+    if (upstreamHead.length) socket.write(upstreamHead);
+    if (head.length) peer.write(head);
+    peer.on("error", () => socket.destroy());
+    peer.on("close", () => socket.destroy());
+    socket.on("close", () => peer.destroy());
+    socket.pipe(peer).pipe(socket);
+  });
+  upstream.on("response", (response) => {
+    socket.end(`HTTP/1.1 ${response.statusCode} ${response.statusMessage}\r\nConnection: close\r\n\r\n`);
+    response.resume();
+  });
+  upstream.end();
+});
 server.listen(port, host, async () => {
   if (discoveryPath) {
     await writeDiscovery(discoveryPath, {
@@ -51,10 +88,13 @@ server.listen(port, host, async () => {
   process.stdout.write(`Nexus WebUI listening on ${url} (Gateway ${gateway.origin})\n`);
 });
 for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.on(signal, () => server.close(async () => {
-    if (discoveryPath) await removeOwnedDiscovery(discoveryPath, process.pid);
-    process.exit(0);
-  }));
+  process.on(signal, () => {
+    for (const socket of upgradeSockets) socket.destroy();
+    server.close(async () => {
+      if (discoveryPath) await removeOwnedDiscovery(discoveryPath, process.pid);
+      process.exit(0);
+    });
+  });
 }
 
 async function dispatch(request, response) {
@@ -97,8 +137,19 @@ async function proxyGateway(request, response, incoming) {
     duplex: body ? "half" : undefined,
   });
   response.writeHead(upstream.status, Object.fromEntries(upstream.headers));
-  if (upstream.body) Readable.fromWeb(upstream.body).pipe(response);
-  else response.end();
+  if (!upstream.body) {
+    response.end();
+    return;
+  }
+  // Pipe upstream → client, but NEVER let a stream error crash the process. If
+  // the upstream body resets (idle timeout, gateway restart) or the client
+  // disconnects, tear down cleanly; the browser reconnects on its own.
+  const source = Readable.fromWeb(upstream.body);
+  source.on("error", () => {
+    if (!response.writableEnded) response.end();
+  });
+  response.on("close", () => source.destroy());
+  source.pipe(response);
 }
 
 async function regularFile(path) {

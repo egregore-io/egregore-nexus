@@ -135,10 +135,10 @@ async function exerciseConcurrentPackedInitialization(
   const nexusHome = join(temporaryRoot, "concurrent-home", ".nexus");
   const url = `file:${join(nexusHome, "gateway.db")}`;
   await mkdir(nexusHome, { recursive: true });
-  const headless = await import(
+  const headless = (await import(
     `${pathToFileURL(join(installed.packageRoot, "dist-gateway", "headless.mjs")).href}` +
       `?packed-concurrent=${Date.now()}`
-  ) as {
+  )) as {
     migrateHeadlessGatewayStore(env: NodeJS.ProcessEnv): Promise<{ schemaVersion: number }>;
   };
   const lock = await holdExclusiveStoreLock(url);
@@ -463,7 +463,7 @@ async function exerciseRemotePackedLanes(
       .toMatchObject({ caller: { name: "packed-human", sessionId: "s_packed_human" } });
 
     const missingProtocol = new WebSocket(
-      `${wsBase}/api/agui/ws?nexus_csrf=${csrfToken}`,
+      `${wsBase}/api/v1/agent-sessions/s_packed/events?nexus_csrf=${csrfToken}`,
       ["nexus-v1"],
       { headers: { cookie, "x-nexus-csrf": csrfToken } },
     );
@@ -484,7 +484,7 @@ async function exerciseRemotePackedLanes(
     expect(ipc.count("harness.prompt")).toBe(1);
 
     const duplicateProtocol = new WebSocket(
-      `${wsBase}/api/agui/ws`,
+      `${wsBase}/api/v1/agent-sessions/s_packed/events`,
       ["nexus-v1", `nexus-csrf.${csrfToken}`, "nexus-csrf.second-proof"],
       { headers: { cookie } },
     );
@@ -502,7 +502,7 @@ async function exerciseRemotePackedLanes(
     expect(ipc.count("harness.prompt")).toBe(1);
 
     const mismatchedProtocol = new WebSocket(
-      `${wsBase}/api/agui/ws`,
+      `${wsBase}/api/v1/agent-sessions/s_packed/events`,
       ["nexus-v1", "nexus-csrf.wrong"],
       { headers: { cookie, "x-nexus-csrf": csrfToken } },
     );
@@ -520,7 +520,7 @@ async function exerciseRemotePackedLanes(
     expect(ipc.count("harness.prompt")).toBe(1);
 
     const socket = new WebSocket(
-      `${wsBase}/api/agui/ws`,
+      `${wsBase}/api/v1/agent-sessions/s_packed/events`,
       ["nexus-v1", `nexus-csrf.${csrfToken}`],
       { headers: { cookie } },
     );
@@ -533,8 +533,8 @@ async function exerciseRemotePackedLanes(
     expect(acceptedFrames).toContainEqual(expect.objectContaining({
       t: "input.ack",
       clientMessageId: "cm_ws_accepted",
-      sessionId: "s_packed_target",
-    }));
+      sessionId: "s_packed",
+      }));
     expect(ipc.count("harness.prompt")).toBe(2);
 
     const bearerMutation = await fetch(`${httpBase}/api/v1/messages`, {
@@ -738,7 +738,7 @@ function daemonResult(request: Record<string, unknown>, sequence: number): unkno
       status: "pending",
       createdAt: 1_780_000_000_000 + sequence,
       revision: 1,
-      sessionId: "s_packed_target",
+      sessionId: "s_packed",
       seq: sequence,
     };
   }
@@ -748,7 +748,7 @@ function daemonResult(request: Record<string, unknown>, sequence: number): unkno
   if (call?.mode === "query" && call.method === "local.sessionQueue.read") {
     return {
       target: "packed-agent",
-      sessionId: "s_packed_target",
+      sessionId: "s_packed",
       turnActive: false,
       steerCapability: "interrupt_and_send",
       commands: [],
@@ -875,6 +875,8 @@ function sessionInput(
   return JSON.stringify({
     t: "input",
     mode: "session",
+    agentId: "a_packed",
+    expectedSessionId: "s_packed",
     target: { name: "packed-agent" },
     text: "packed WebSocket auth",
     clientMessageId,
@@ -990,14 +992,14 @@ async function reservePort(): Promise<number> {
     throw new Error("failed to reserve a packed Gateway port");
   }
   await new Promise<void>((resolveClose, reject) => {
-    server.close((error) => error ? reject(error) : resolveClose());
+    server.close((error) => (error ? reject(error) : resolveClose()));
   });
   return address.port;
 }
 
 async function assertPortClosed(port: number): Promise<void> {
   try {
-    await waitFor(async () => !await canConnect(port), 8_000);
+    await waitFor(async () => !(await canConnect(port)), 8_000);
   } catch {
     throw new Error(`packed Gateway port ${port} remained open after shutdown`);
   }

@@ -291,9 +291,35 @@ export function makeDispatch(deps: DispatchDeps) {
         }, 503);
       }
       const sessionId = decodeURIComponent(sessionEvents[1]!);
+      const query = new URL(request.url).searchParams;
+      const expected = query.has("expectedSessionId")
+        ? query.get("expectedSessionId")!
+        : undefined;
+      const agentId = query.get("agentId");
+      if (
+        expected !== undefined &&
+        (!expected.trim() ||
+          expected !== sessionId ||
+          !agentId?.trim() ||
+          query.getAll("agentId").length !== 1 ||
+          query.getAll("expectedSessionId").length !== 1)
+      ) {
+        return json(
+          {
+            error: {
+              code: "bad_request",
+              message:
+                "exact session requires matching path and stable agentId",
+            },
+          },
+          400,
+        );
+      }
       const canonicalDb = await deps.canonicalDb();
-      const target = await canonicalAgentSessionTarget(canonicalDb, { sessionId })
-        .catch(() => undefined);
+      const target = await canonicalAgentSessionTarget(canonicalDb, {
+        sessionId,
+        ...(expected !== undefined ? { agentId: agentId!, exact: true } : {}),
+      }).catch(() => undefined);
       if (!target?.sessionId) {
         return json({
           error: { code: "not_found", message: "agent session stream is not materialized" },
@@ -309,6 +335,7 @@ export function makeDispatch(deps: DispatchDeps) {
           error: { code: "forbidden", message: "agent session owner required" },
         }, 403);
       }
+      if (expected === undefined)
       void commands.submit(
         COMMAND_KINDS.harnessWarm,
         { name: target.owner.name, agentId: target.owner.agentId },

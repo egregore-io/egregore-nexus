@@ -659,7 +659,11 @@ impl AppState {
         // If the daemon restarted while the tmux session survived, the in-memory PTY binding is gone
         // but the deterministic tmux session is still the correct runtime. Adopt it before respawn so
         // warm/revive remains a no-op for live headed harnesses.
-        if viewer_backend == "tmux" && supervisor.adopt_pty_backend(&session, &cwd).is_ok() {
+        if viewer_backend == "tmux"
+            && supervisor
+                .adopt_pty_backend(&session, &cwd, headed_runtime_kind(&kind))
+                .is_ok()
+        {
             self.attach_pty_session_machinery(
                 &supervisor,
                 &session,

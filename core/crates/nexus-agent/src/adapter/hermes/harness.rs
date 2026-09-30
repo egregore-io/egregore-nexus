@@ -149,6 +149,13 @@ impl Adapter for HermesAdapter {
         SteerCapability::InterruptAndSend
     }
 
+    fn observe_turn(&self) -> nexus_contracts::TurnObservation {
+        nexus_contracts::TurnObservation {
+            steer_capability: self.steer_capability(),
+            ..self.engine.observe_turn()
+        }
+    }
+
     async fn interrupt_active_turn(&self) -> Result<(), NexusError> {
         self.engine.cancel_active_turn().await
     }
@@ -165,6 +172,13 @@ impl Adapter for HermesAdapter {
 
     async fn stream_updates(&self) -> Result<Vec<StreamEvent>, NexusError> {
         Ok(self.engine.take_updates())
+    }
+
+    async fn inject_completion_observed(
+        &self,
+        prompt: String,
+    ) -> Result<Vec<StreamEvent>, AdapterInjectError> {
+        self.engine.inject_completion_observed(prompt).await
     }
 
     async fn kill(&self) {

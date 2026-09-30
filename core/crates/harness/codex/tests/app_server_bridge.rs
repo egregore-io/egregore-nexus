@@ -55,6 +55,304 @@ fn write_rollout(session_dir: &std::path::Path, thread_id: &str) {
 }
 
 #[tokio::test]
+async fn same_directory_prelisten_cleanup_cannot_unlink_replacement() {
+    assert_same_directory_retirement(false).await;
+}
+
+#[tokio::test]
+async fn same_directory_listening_candidate_cannot_be_adopted_then_killed_by_old_owner() {
+    assert_same_directory_retirement(true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn replacement_waits_for_registered_child_retirement_before_same_path_adoption() {
+    let dir = tempdir("registered-retirement");
+    let entered = dir.join("retiring");
+    let release = dir.join("release");
+    let bridge = CodexBridge::new();
+    let session = SessionId("registered-retirement".into());
+    let mut opts = SupervisorOpts {
+        codex_exe: FAKE_BIN.into(),
+        session_dir: dir.clone(),
+        codex_home: Some(dir.join("home")),
+        model: None,
+        bus_mcp: None,
+        cwd: None,
+        env: vec![
+            (
+                "FAKE_CODEX_TERM_ENTERED".into(),
+                entered.to_string_lossy().into(),
+            ),
+            (
+                "FAKE_CODEX_TERM_RELEASE".into(),
+                release.to_string_lossy().into(),
+            ),
+        ],
+    };
+    bridge
+        .launch_with_options(
+            session.clone(),
+            opts.clone(),
+            Arc::new(RecSink::default()),
+            BridgeLaunchOptions {
+                create_thread_if_missing: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let old_pid = bridge.process_ledger(&session).unwrap().os_pid;
+    assert!(bridge.kill(&session));
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !entered.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    opts.env.clear();
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let mut new = tokio::spawn({
+        let bridge = bridge.clone();
+        let session = session.clone();
+        let ready = ready.clone();
+        async move {
+            ready.notify_one();
+            bridge
+                .launch_with_options(
+                    session,
+                    opts,
+                    Arc::new(RecSink::default()),
+                    BridgeLaunchOptions {
+                        create_thread_if_missing: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        }
+    });
+    ready.notified().await;
+    let early = tokio::time::timeout(std::time::Duration::from_millis(100), &mut new).await;
+    let overtook = early.is_ok();
+    std::fs::write(release, b"release").unwrap();
+    let socket = if let Ok(result) = early {
+        result.unwrap().unwrap()
+    } else {
+        new.await.unwrap().unwrap()
+    };
+    let replacement_pid = bridge.process_ledger(&session).map(|ids| ids.os_pid);
+    let usable = CodexAppServerClient::connect(&socket, "control").await;
+    bridge.kill(&session);
+    let _ = std::fs::remove_dir_all(dir);
+    assert!(
+        !overtook,
+        "replacement adopted a child whose registered shutdown had not finished"
+    );
+    assert!(replacement_pid.is_some_and(|pid| pid != old_pid));
+    assert!(usable.is_ok());
+}
+
+async fn assert_same_directory_retirement(listening: bool) {
+    let dir = tempdir("same-directory-retirement");
+    let entered = dir.join("entered");
+    let release = dir.join("release");
+    let bridge = CodexBridge::new();
+    let session = SessionId("same-directory-retirement".into());
+    let old = tokio::spawn({
+        let bridge = bridge.clone();
+        let session = session.clone();
+        let dir = dir.clone();
+        let entered = entered.clone();
+        let release = release.clone();
+        async move {
+            bridge
+                .launch_with_options(
+                    session,
+                    SupervisorOpts {
+                        codex_exe: FAKE_BIN.into(),
+                        session_dir: dir.clone(),
+                        codex_home: Some(dir.join("home")),
+                        model: None,
+                        bus_mcp: None,
+                        cwd: None,
+                        env: vec![
+                            (
+                                if listening {
+                                    "FAKE_CODEX_PROBE_ENTERED"
+                                } else {
+                                    "FAKE_CODEX_START_ENTERED"
+                                }
+                                .into(),
+                                entered.to_string_lossy().into(),
+                            ),
+                            (
+                                if listening {
+                                    "FAKE_CODEX_PROBE_RELEASE"
+                                } else {
+                                    "FAKE_CODEX_START_RELEASE"
+                                }
+                                .into(),
+                                release.to_string_lossy().into(),
+                            ),
+                        ],
+                    },
+                    Arc::new(RecSink::default()),
+                    BridgeLaunchOptions {
+                        create_thread_if_missing: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !entered.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!bridge.has(&session));
+    bridge.kill(&session);
+    let socket = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        bridge.launch_with_options(
+            session.clone(),
+            SupervisorOpts {
+                codex_exe: FAKE_BIN.into(),
+                session_dir: dir.clone(),
+                codex_home: Some(dir.join("home")),
+                model: None,
+                bus_mcp: None,
+                cwd: None,
+                env: vec![],
+            },
+            Arc::new(RecSink::default()),
+            BridgeLaunchOptions {
+                create_thread_if_missing: true,
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    std::fs::write(release, b"release").unwrap();
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(3), old)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    let usable = CodexAppServerClient::connect(&socket, "replacement-control").await;
+    let owns_replacement = bridge.process_ledger(&session).is_some();
+    bridge.kill(&session);
+    let _ = std::fs::remove_dir_all(dir);
+    assert!(
+        usable.is_ok(),
+        "old cleanup removed the current physical endpoint"
+    );
+    assert!(
+        owns_replacement,
+        "replacement adopted an unregistered retiring child"
+    );
+}
+
+#[tokio::test]
+async fn kill_before_handle_publication_revokes_old_setup_without_harming_replacement() {
+    let old_dir = tempdir("prehandle-old");
+    let new_dir = tempdir("prehandle-new");
+    let entered = old_dir.join("entered");
+    let release = old_dir.join("release");
+    let bridge = CodexBridge::new();
+    let session = SessionId("prehandle-same-session".into());
+    let old = tokio::spawn({
+        let bridge = bridge.clone();
+        let session = session.clone();
+        let old_dir = old_dir.clone();
+        let entered = entered.clone();
+        let release = release.clone();
+        async move {
+            bridge
+                .launch_with_options(
+                    session,
+                    SupervisorOpts {
+                        codex_exe: FAKE_BIN.into(),
+                        session_dir: old_dir.clone(),
+                        codex_home: Some(old_dir.join("home")),
+                        model: None,
+                        bus_mcp: None,
+                        cwd: None,
+                        env: vec![
+                            (
+                                "FAKE_CODEX_START_ENTERED".into(),
+                                entered.to_string_lossy().into(),
+                            ),
+                            (
+                                "FAKE_CODEX_START_RELEASE".into(),
+                                release.to_string_lossy().into(),
+                            ),
+                        ],
+                    },
+                    Arc::new(RecSink::default()),
+                    BridgeLaunchOptions {
+                        create_thread_if_missing: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !entered.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!bridge.has(&session));
+    bridge.kill(&session);
+    bridge
+        .launch_with_options(
+            session.clone(),
+            SupervisorOpts {
+                codex_exe: FAKE_BIN.into(),
+                session_dir: new_dir.clone(),
+                codex_home: Some(new_dir.join("home")),
+                model: None,
+                bus_mcp: None,
+                cwd: None,
+                env: vec![],
+            },
+            Arc::new(RecSink::default()),
+            BridgeLaunchOptions {
+                create_thread_if_missing: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let replacement_pid = bridge.process_ledger(&session).unwrap().os_pid;
+    std::fs::write(&release, b"release").unwrap();
+    let old_result = tokio::time::timeout(std::time::Duration::from_secs(3), old)
+        .await
+        .unwrap()
+        .unwrap();
+    let actual_pid = bridge.process_ledger(&session).unwrap().os_pid;
+    bridge.kill(&session);
+    let _ = std::fs::remove_dir_all(old_dir);
+    let _ = std::fs::remove_dir_all(new_dir);
+    assert!(
+        old_result.is_err(),
+        "revoked pre-handle setup published after replacement"
+    );
+    assert_eq!(
+        actual_pid, replacement_pid,
+        "stale setup replaced or cleaned up the new handle"
+    );
+}
+
+#[tokio::test]
 async fn launch_discovers_rollout_binds_transport_and_forwards_notifications() {
     let session_dir = tempdir("launch");
     let sink = Arc::new(RecSink::default());
@@ -199,9 +497,9 @@ async fn launch_reports_discovered_thread_id_for_persistence() {
                 known_thread_id: None,
                 on_thread_discovered: Some(Arc::new(move |session, thread_id| {
                     let seen = seen_cb.clone();
-                    tokio::spawn(async move {
+                    Box::pin(async move {
                         seen.lock().await.push((session, thread_id));
-                    });
+                    })
                 })),
                 ..BridgeLaunchOptions::default()
             },

@@ -3,7 +3,9 @@
 use nexus_common::NexusError;
 use nexus_contracts::{AgentId, CommandQueueState, SessionId};
 use nexus_store::command_kinds;
-use nexus_store::repos::{CommandIntents, CommandQueue, NewCommandIntent, NewSession, Sessions};
+use nexus_store::repos::{
+    CommandIntents, CommandQueue, NewCommandIntent, NewSession, PromptCommandOutcome, Sessions,
+};
 use nexus_store::{DaemonStore, Store};
 
 async fn store() -> Store {
@@ -40,6 +42,177 @@ fn prompt(command_id: &str, created_at: i64) -> NewCommandIntent {
         ),
         created_at,
     }
+}
+
+#[tokio::test]
+async fn exact_receipt_retains_original_owned_session_after_rebind() {
+    let store = store().await;
+    store.identity_conn().execute_batch(
+        "INSERT INTO agents (agent_id, project, name, tier, created_at) VALUES ('a_otto', 'default', 'otto', 'agent', 1);
+         INSERT INTO agent_runtimes (runtime_id, agent_id, harness, active, started_at) VALUES ('s_otto', 'a_otto', 'codex', 1, 1);"
+    ).await.unwrap();
+    let intents = CommandIntents::new(&store);
+    let mut original = prompt("cmd_original", 1);
+    original.request_json = serde_json::json!({
+        "agentId": "a_otto", "expectedSessionId": "s_otto", "sessionId": "s_caller",
+        "text": "original exact command", "clientMessageId": "cm_original"
+    })
+    .to_string();
+    intents.insert_pending(original).await.unwrap();
+    store.identity_conn().execute_batch(
+        "UPDATE agent_runtimes SET active = 0, stopped_at = 2;
+         INSERT INTO agent_runtimes (runtime_id, agent_id, harness, active, started_at) VALUES ('s_new', 'a_otto', 'codex', 1, 2);"
+    ).await.unwrap();
+    store.conn.execute_batch("INSERT INTO sessions (session_id, agent_id, name, agent, kind, project, created_at) VALUES ('s_new', 'a_otto', 'otto-new', 'codex', 'agent', 'default', 2);").await.unwrap();
+    let claimed = intents
+        .claim_next_kind(3, 100, command_kinds::harness::PROMPT)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(intents
+        .mark_prompt_started_for_claim(&claimed, 3)
+        .await
+        .unwrap());
+    assert!(intents
+        .settle_prompt_claim(
+            &claimed,
+            PromptCommandOutcome::Rejected(
+                r#"{"code":-32602,"message":"exact session is no longer active"}"#
+            ),
+            4
+        )
+        .await
+        .unwrap());
+    let receipt = intents.receipt("cmd_original").await.unwrap().unwrap();
+    assert_eq!(receipt.session_id.as_deref(), Some("s_otto"));
+    let events = CommandQueue::new(&store).events_after(0).await.unwrap();
+    assert!(events
+        .events
+        .iter()
+        .all(|event| event.session_id.as_deref() == Some("s_otto")));
+    let current = CommandQueue::new(&store)
+        .snapshot_with_active_sessions(None, Some(&AgentId("a_otto".into())), &[])
+        .await
+        .unwrap();
+    assert_eq!(current.session_id.as_deref(), Some("s_new"));
+    assert!(
+        current.commands.is_empty(),
+        "S1 commands must never be relabelled as S2"
+    );
+    for index in 0..105 {
+        let mut newer = prompt(&format!("cmd_new_{index}"), 5 + index);
+        newer.request_json =
+            serde_json::json!({"agentId":"a_otto", "expectedSessionId":"s_new", "text":"new lane"})
+                .to_string();
+        intents.insert_pending(newer).await.unwrap();
+    }
+    let retained = CommandQueue::new(&store)
+        .snapshot_for_requester(
+            None,
+            Some(&AgentId("a_otto".into())),
+            Some("s_otto"),
+            &[SessionId("s_new".into())],
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(retained.session_id.as_deref(), Some("s_otto"));
+    assert!(!retained.turn_active);
+    assert_eq!(retained.commands.len(), 1);
+    assert_eq!(retained.commands[0].error_code, Some(-32602));
+    assert_eq!(retained.commands[0].state, CommandQueueState::Failed);
+    for (agent, session) in [
+        (Some("a_other"), "s_otto"),
+        (None, "s_otto"),
+        (Some("a_otto"), ""),
+        (Some("a_otto"), "unknown"),
+    ] {
+        assert!(CommandQueue::new(&store)
+            .snapshot_for_requester(
+                None,
+                agent.map(|id| AgentId(id.into())).as_ref(),
+                Some(session),
+                &[],
+                None
+            )
+            .await
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn forged_exact_pair_never_projects_sender_or_event_session_as_target() {
+    let store = store().await;
+    store.identity_conn().execute_batch(
+        "INSERT INTO agents (agent_id, project, name, tier, created_at) VALUES ('a_other', 'default', 'other', 'agent', 1);
+         INSERT INTO agent_runtimes (runtime_id, agent_id, harness, active, started_at) VALUES ('s_other', 'a_other', 'codex', 1, 1);"
+    ).await.unwrap();
+    let mut forged = prompt("cmd_forged", 1);
+    forged.request_json = serde_json::json!({"name":"otto", "agentId":"a_otto", "expectedSessionId":"s_other", "sessionId":"s_other", "text":"private A text"}).to_string();
+    CommandIntents::new(&store)
+        .insert_pending(forged)
+        .await
+        .unwrap();
+    let page = CommandQueue::new(&store).events_after(0).await.unwrap();
+    assert!(
+        page.events.is_empty(),
+        "a forged pair must not become a terminal target"
+    );
+    assert_eq!(
+        page.next_seq, 1,
+        "filtered facts must advance the global cursor"
+    );
+    assert!(CommandIntents::new(&store)
+        .receipt("cmd_forged")
+        .await
+        .unwrap()
+        .unwrap()
+        .session_id
+        .is_none());
+}
+
+#[tokio::test]
+async fn ownerless_legacy_and_filtered_pages_never_supply_lane_authority() {
+    let store = store().await;
+    let intents = CommandIntents::new(&store);
+    intents
+        .insert_pending(prompt("cmd_ownerless", 1))
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute("UPDATE sessions SET agent_id = NULL", ())
+        .await
+        .unwrap();
+    assert!(CommandQueue::new(&store)
+        .events_after(0)
+        .await
+        .unwrap()
+        .events
+        .is_empty());
+    assert!(intents
+        .receipt("cmd_ownerless")
+        .await
+        .unwrap()
+        .unwrap()
+        .session_id
+        .is_none());
+    for i in 0..505 {
+        let mut invalid = prompt(&format!("cmd_bad_{i}"), i + 2);
+        invalid.request_json = serde_json::json!({"agentId":"a_otto", "expectedSessionId":null, "sessionId":"s_otto", "text":"must not leak"}).to_string();
+        intents.insert_pending(invalid).await.unwrap();
+    }
+    let first = CommandQueue::new(&store).events_after(0).await.unwrap();
+    assert!(first.events.is_empty());
+    assert_eq!(first.next_seq, 500);
+    assert!(!first.gap);
+    let second = CommandQueue::new(&store)
+        .events_after(first.next_seq)
+        .await
+        .unwrap();
+    assert!(second.events.is_empty());
+    assert_eq!(second.next_seq, 506);
+    assert!(!second.gap);
 }
 
 #[tokio::test]
@@ -92,7 +265,7 @@ async fn claim_wins_promotion_without_duplicate_or_loss() {
         .await
         .unwrap());
     assert!(repo
-        .mark_started_for_claim("cmd_claimed", claimed.claimed_at.unwrap(), 11)
+        .mark_prompt_started_for_claim(&claimed, 11)
         .await
         .unwrap());
 
@@ -139,13 +312,16 @@ async fn command_event_projection_records_every_revision_in_order() {
         .await
         .unwrap()
         .unwrap();
-    let claimed_at = claimed.claimed_at.unwrap();
     assert!(repo
-        .mark_started_for_claim("cmd_lifecycle", claimed_at, 11)
+        .mark_prompt_started_for_claim(&claimed, 11)
         .await
         .unwrap());
     assert!(repo
-        .mark_done_for_claim("cmd_lifecycle", claimed_at, r#"{"accepted":true}"#, 12)
+        .settle_prompt_claim(
+            &claimed,
+            PromptCommandOutcome::Completed(r#"{"accepted":true}"#),
+            12
+        )
         .await
         .unwrap());
 
@@ -223,7 +399,7 @@ async fn typed_snapshot_projects_daemon_queue_truth_for_name_or_agent_id() {
     assert!(by_name.turn_active);
     assert_eq!(
         by_name.steer_capability,
-        nexus_contracts::SteerCapability::InterruptAndSend
+        nexus_contracts::SteerCapability::None
     );
     assert_eq!(by_name.seq, 1);
     assert_eq!(by_name.revision, 1);
@@ -339,10 +515,8 @@ async fn split_store_snapshot_reads_runtime_from_transport_and_queue_from_identi
         .unwrap();
     assert!(snapshot.turn_active);
     assert_eq!(snapshot.session_id.as_deref(), Some("s_split"));
-    assert_eq!(snapshot.commands.len(), 1);
-    assert_eq!(snapshot.commands[0].command_id, "cmd_split");
-    assert_eq!(snapshot.commands[0].text, "split truth");
-    assert_eq!(snapshot.commands[0].state, CommandQueueState::Queued);
+    // A raw split-store insert with no original target event is not historical target proof.
+    assert!(snapshot.commands.is_empty());
 }
 
 #[tokio::test]
@@ -361,19 +535,22 @@ async fn typed_transition_read_is_bounded_and_reports_cursor_gaps() {
         .await
         .unwrap()
         .unwrap();
-    let claimed_at = claimed.claimed_at.unwrap();
     assert!(intents
-        .mark_started_for_claim("cmd_events", claimed_at, 11)
+        .mark_prompt_started_for_claim(&claimed, 11)
         .await
         .unwrap());
     assert!(intents
-        .mark_done_for_claim("cmd_events", claimed_at, r#"{"accepted":true}"#, 12)
+        .settle_prompt_claim(
+            &claimed,
+            PromptCommandOutcome::Completed(r#"{"accepted":true}"#),
+            12
+        )
         .await
         .unwrap());
     let queue = CommandQueue::new(&store);
 
     let page = queue.events_after(1).await.unwrap();
-    assert_eq!(page.next_seq, 2);
+    assert_eq!(page.next_seq, 5);
     assert_eq!(page.latest_seq, 5);
     assert!(!page.gap);
     assert_eq!(

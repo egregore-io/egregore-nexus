@@ -55,6 +55,8 @@ export interface CanonicalAgentSessionLookup {
   agentId?: string;
   sessionId?: string;
   name?: string;
+  /** Strict retained pair: no runtime-id alias or current-runtime fallback. */
+  exact?: boolean;
 }
 
 interface CanonicalRuntimeRow extends AgentRuntimeRow {
@@ -323,6 +325,8 @@ export async function canonicalAgentSessionTarget(
 ): Promise<CanonicalAgentSessionTarget | undefined> {
   const exactAgentId = typeof lookup === "string" ? undefined : optionalString(lookup.agentId);
   const exactSessionId = typeof lookup === "string" ? undefined : optionalString(lookup.sessionId);
+  const strict = typeof lookup !== "string" && lookup.exact === true;
+  if (strict && (!exactAgentId || !exactSessionId)) return undefined;
   const displayLookup = typeof lookup === "string"
     ? lookup
     : optionalString(lookup.name);
@@ -350,7 +354,7 @@ export async function canonicalAgentSessionTarget(
             ${runtimeOrder}`,
       args: [exactSessionId],
     });
-    if (!result.rows[0]) {
+    if (!result.rows[0] && !strict) {
       result = await db.execute({
         sql: `${runtimeColumns} WHERE r.runtime_id = ? ${runtimeOrder}`,
         args: [exactSessionId],
@@ -359,6 +363,7 @@ export async function canonicalAgentSessionTarget(
     const row = result.rows[0];
     if (!row) return undefined;
     identity = canonicalIdentityFromRow(row);
+    if (exactAgentId && identity.agentId !== exactAgentId) return undefined;
     sessionId = optionalString(row.session_id) ?? optionalString(row.runtime_id);
   } else {
     identity = exactAgentId
@@ -480,12 +485,13 @@ export async function canonicalThreadHistory(
 export async function canonicalDmHistory(
   db: Client,
   nameOrAgentId: string,
+  callerName: string,
   options: MessagePageOptions,
 ): Promise<CanonicalHistoryPage> {
   const identity = await canonicalIdentity(db, nameOrAgentId);
   const target = !identity
-    ? { dmName: nameOrAgentId }
-    : { dmAgentId: identity.agentId };
+    ? { dmName: nameOrAgentId, callerName }
+    : { dmAgentId: identity.agentId, callerName };
   return mapHistory(await pageCanonicalMessages(db, target, options));
 }
 
@@ -757,7 +763,7 @@ function parseObject(value: unknown): Record<string, unknown> {
   try {
     const parsed = JSON.parse(String(value)) as unknown;
     return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
+      ? ( parsed as Record<string, unknown>)
       : {};
   } catch {
     return {};
@@ -823,6 +829,7 @@ async function canonicalIdentity(db: Client, id: string): Promise<CanonicalIdent
 function isStamp(value: unknown): value is Provenance["stamp"] & object {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const stamp = value as Record<string, unknown>;
-  return typeof stamp.algo === "string" && typeof stamp.signature === "string" &&
-    typeof stamp.signedAt === "number";
+  return ( typeof stamp.algo === "string" && typeof stamp.signature === "string" &&
+    typeof stamp.signedAt === "number"
+  );
 }

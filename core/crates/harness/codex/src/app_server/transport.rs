@@ -47,6 +47,20 @@ struct PromptAcceptanceCleanup {
     turn_id: Option<String>,
 }
 
+#[derive(Clone)]
+struct Binding {
+    client: Arc<CodexAppServerClient>,
+    thread_id: String,
+    tracker: CodexTurnTracker,
+    start_lock: Arc<AsyncMutex<()>>,
+}
+
+#[derive(Default)]
+struct SessionSlot {
+    binding: Option<Binding>,
+    candidate: Option<CodexTurnTracker>,
+}
+
 impl Drop for PromptAcceptanceCleanup {
     fn drop(&mut self) {
         self.tracker.cancel_accepted_event(&self.accepted_event);
@@ -66,10 +80,9 @@ impl Drop for PromptAcceptanceCleanup {
 /// `Clone` is cheap — all state is behind `Arc<Mutex<…>>`.
 #[derive(Clone, Default)]
 pub struct CodexAppServerTransport {
-    sessions: Arc<Mutex<HashMap<SessionId, (Arc<CodexAppServerClient>, String)>>>,
+    sessions: Arc<Mutex<HashMap<SessionId, SessionSlot>>>,
     /// Serializes Nexus-owned `turn/start` boundaries per session. Durable prompts and realtime
     /// bus delivery run on independent lanes and must not race two starts onto one Codex thread.
-    turn_start_locks: Arc<Mutex<HashMap<SessionId, Arc<AsyncMutex<()>>>>>,
     /// Sessions whose codex app-server PROCESS is alive — marked at launch, independent of
     /// `sessions` (the turn-routing binding), which is only populated after first-turn discovery.
     /// Value = the app-server root OS pid when the daemon spawned it; `None` for stamp-only
@@ -106,30 +119,157 @@ impl CodexAppServerTransport {
     /// Bind `session` to a connected inject client + the thread it owns.
     /// Called once per session after `CodexAppServerClient::connect` + `thread_resume`.
     pub fn bind(&self, session: SessionId, client: Arc<CodexAppServerClient>, thread_id: String) {
+        let owner = self.begin_binding(&session, Some(thread_id.clone()));
+        if client.install_tracker(owner.clone()) {
+            self.publish_binding(&session, &owner, client, thread_id);
+        } else {
+            self.cancel_binding(&session, &owner);
+        }
+    }
+
+    pub(super) fn begin_binding(
+        &self,
+        session: &SessionId,
+        thread: Option<String>,
+    ) -> CodexTurnTracker {
+        let mut sessions = self.sessions.lock().unwrap();
+        let slot = sessions.entry(session.clone()).or_default();
+        if let Some(previous) = slot.candidate.take() {
+            previous.revoke_owner();
+        }
+        let owner = self.turn_tracker.new_owner(thread);
+        slot.candidate = Some(owner.clone());
+        owner
+    }
+
+    pub(super) fn binding_is_current(&self, session: &SessionId, owner: &CodexTurnTracker) -> bool {
         self.sessions
             .lock()
             .unwrap()
-            .insert(session, (client, thread_id));
+            .get(session)
+            .is_some_and(|slot| {
+                slot.candidate
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.same_owner(owner))
+            })
+    }
+
+    pub(super) fn owns_binding(&self, session: &SessionId, owner: &CodexTurnTracker) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(session)
+            .is_some_and(|slot| {
+                slot.candidate.as_ref().map_or_else(
+                    || {
+                        slot.binding
+                            .as_ref()
+                            .is_some_and(|binding| binding.tracker.same_owner(owner))
+                    },
+                    |candidate| candidate.same_owner(owner),
+                )
+            })
+    }
+
+    pub(super) fn cancel_binding(&self, session: &SessionId, owner: &CodexTurnTracker) {
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some(slot) = sessions.get_mut(session) {
+            if slot
+                .binding
+                .as_ref()
+                .is_some_and(|binding| binding.tracker.same_owner(owner))
+            {
+                return;
+            }
+            if slot
+                .candidate
+                .as_ref()
+                .is_some_and(|candidate| candidate.same_owner(owner))
+            {
+                slot.candidate = None;
+            }
+            if slot.binding.is_none() && slot.candidate.is_none() {
+                sessions.remove(session);
+            }
+        }
+        owner.revoke_owner();
+    }
+
+    pub(super) fn unbind_all(&self) {
+        let mut sessions = self.sessions.lock().unwrap();
+        for (_, slot) in sessions.drain() {
+            if let Some(binding) = slot.binding {
+                binding.tracker.revoke_owner();
+            }
+            if let Some(candidate) = slot.candidate {
+                candidate.revoke_owner();
+            }
+        }
+    }
+
+    pub(super) fn publish_binding(
+        &self,
+        session: &SessionId,
+        owner: &CodexTurnTracker,
+        client: Arc<CodexAppServerClient>,
+        thread_id: String,
+    ) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        let Some(slot) = sessions.get_mut(session) else {
+            return false;
+        };
+        if !slot
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.same_owner(owner))
+        {
+            return false;
+        }
+        if !owner.publish_owner(&thread_id) {
+            return false;
+        }
+        if let Some(previous) = slot.binding.take() {
+            previous.tracker.revoke_owner();
+        }
+        slot.binding = Some(Binding {
+            client,
+            thread_id,
+            tracker: owner.clone(),
+            start_lock: Arc::new(AsyncMutex::new(())),
+        });
+        slot.candidate = None;
+        true
     }
 
     /// Whether `session` has a bound codex app-server client. O(1); no I/O.
     /// Used by `RoutingTurnExec` to decide the dispatch path before checking PTY.
     pub fn is_bound(&self, session: &SessionId) -> bool {
-        self.sessions.lock().unwrap().contains_key(session)
-    }
-
-    /// Current Codex native thread bound to `session`, if the structured turn client is bound.
-    pub fn bound_thread_id(&self, session: &SessionId) -> Option<String> {
         self.sessions
             .lock()
             .unwrap()
             .get(session)
-            .map(|(_, thread_id)| thread_id.clone())
+            .is_some_and(|slot| slot.binding.is_some())
+    }
+
+    /// Current Codex native thread bound to `session`, if the structured turn client is bound.
+    pub fn bound_thread_id(&self, session: &SessionId) -> Option<String> {
+        self.sessions.lock().unwrap().get(session).and_then(|slot| {
+            slot.binding
+                .as_ref()
+                .map(|binding| binding.thread_id.clone())
+        })
     }
 
     /// Remove the binding for `session` (called on kill/cleanup by `PtySupervisor`).
     pub fn unbind(&self, session: &SessionId) {
-        self.sessions.lock().unwrap().remove(session);
+        if let Some(slot) = self.sessions.lock().unwrap().remove(session) {
+            if let Some(binding) = slot.binding {
+                binding.tracker.revoke_owner();
+            }
+            if let Some(candidate) = slot.candidate {
+                candidate.revoke_owner();
+            }
+        }
     }
 
     /// Mark `session`'s codex app-server alive WITHOUT a verifiable pid (adopted socket).
@@ -167,7 +307,7 @@ impl CodexAppServerTransport {
     /// rows delivered on app-server handoff even when the actual Codex agent session is dead.
     /// Returns `-32004` if session is not bound or the turn does not complete.
     pub async fn inject_turn(&self, recipient: &SessionId, batch: &NexusBatch) -> PortResult<()> {
-        self.inject_turn_inner(recipient, batch, None)
+        self.inject_turn_inner(recipient, batch, None, TURN_COMPLETION_TIMEOUT)
             .await
             .map_err(ContractError::from)
     }
@@ -177,23 +317,27 @@ impl CodexAppServerTransport {
         recipient: &SessionId,
         batch: &NexusBatch,
         accepted_event: Option<(Arc<dyn EventSink>, WsEvent)>,
+        receipt_timeout: Duration,
     ) -> InjectResult<()> {
-        let (client, thread_id) = self.client_for(recipient).map_err(InjectError::Contract)?;
-        let turn_start_lock = self.turn_start_lock(recipient);
+        let Binding {
+            client,
+            thread_id,
+            tracker,
+            start_lock,
+        } = self.client_for(recipient).map_err(InjectError::Contract)?;
+        let turn_start_lock = start_lock;
         let _turn_start_guard = turn_start_lock.lock().await;
-        self.wait_for_prior_turn_boundary(&thread_id)
+        self.wait_for_prior_turn_boundary(&tracker, &thread_id)
             .await
             .map_err(InjectError::Contract)?;
         let text = render_injected_turn_for(batch, &recipient.0);
-        let accepted_event = accepted_event.map(|(events, event)| {
-            self.turn_tracker
-                .queue_accepted_event(&thread_id, events, event)
-        });
+        let accepted_event = accepted_event
+            .map(|(events, event)| tracker.queue_accepted_event(&thread_id, events, event));
         let turn_id = match client.turn_start_id(&thread_id, &text).await {
             Ok(turn_id) => turn_id,
             Err(e) => {
                 if let Some(queued) = &accepted_event {
-                    self.turn_tracker.cancel_accepted_event(queued);
+                    tracker.cancel_accepted_event(queued);
                 }
                 if let Some(error) = classify_rpc_error(recipient, &e) {
                     return Err(error);
@@ -205,23 +349,20 @@ impl CodexAppServerTransport {
             }
         };
         if let Some(queued) = &accepted_event {
-            self.turn_tracker
+            tracker
                 .emit_accepted_event(queued, turn_id.as_deref())
                 .await;
         }
         if let Some(turn_id) = turn_id.as_deref() {
-            self.turn_tracker
-                .record_turn_start_acceptance(&thread_id, turn_id);
+            tracker.record_turn_start_acceptance(&thread_id, turn_id);
         }
         if let Some(turn_id) = turn_id {
-            match self
-                .turn_tracker
-                .wait_for_delivery_receipt(&thread_id, &turn_id, TURN_COMPLETION_TIMEOUT)
+            match tracker
+                .wait_for_delivery_receipt(&thread_id, &turn_id, receipt_timeout)
                 .await
             {
                 Ok(()) => {}
                 Err(super::turn_completion::CodexTurnWaitError::Timeout { .. }) => {
-                    self.turn_tracker.clear_active_turn(&thread_id);
                     return Err(InjectError::CompletionTimeout {
                         session: recipient.clone(),
                         source: "codex_app_server_turn_completion".into(),
@@ -250,18 +391,21 @@ impl CodexAppServerTransport {
     /// notification forwarder / observe lane. Returns `-32004` if session is not bound or Codex
     /// rejects the turn.
     pub async fn prompt(&self, recipient: &SessionId, text: String) -> PortResult<()> {
-        let (client, thread_id) = self.client_for(recipient)?;
-        let turn_start_lock = self.turn_start_lock(recipient);
+        let Binding {
+            client,
+            thread_id,
+            tracker,
+            start_lock,
+        } = self.client_for(recipient)?;
+        let turn_start_lock = start_lock;
         let _turn_start_guard = turn_start_lock.lock().await;
-        self.wait_for_prior_turn_boundary(&thread_id).await?;
-        let accepted_echo = self
-            .turn_tracker
-            .queue_accepted_user_input_echo(&thread_id, text.clone());
+        self.wait_for_prior_turn_boundary(&tracker, &thread_id)
+            .await?;
+        let accepted_echo = tracker.queue_accepted_user_input_echo(&thread_id, text.clone());
         let turn_id = match client.turn_start_id(&thread_id, &text).await {
             Ok(turn_id) => turn_id,
             Err(e) => {
-                self.turn_tracker
-                    .cancel_accepted_user_input_echo(&accepted_echo);
+                tracker.cancel_accepted_user_input_echo(&accepted_echo);
                 return Err(ContractError {
                     code: -32004,
                     message: e.to_string(),
@@ -269,10 +413,8 @@ impl CodexAppServerTransport {
             }
         };
         if let Some(turn_id) = turn_id {
-            self.turn_tracker
-                .record_turn_start_acceptance(&thread_id, &turn_id);
-            self.turn_tracker
-                .record_accepted_user_input_echo_for_queued(&accepted_echo, &turn_id);
+            tracker.record_turn_start_acceptance(&thread_id, &turn_id);
+            tracker.record_accepted_user_input_echo_for_queued(&accepted_echo, &turn_id);
         }
         Ok(())
     }
@@ -288,20 +430,21 @@ impl CodexAppServerTransport {
         events: Arc<dyn EventSink>,
         accepted_event: WsEvent,
     ) -> PortResult<()> {
-        let (client, thread_id) = self.client_for(recipient)?;
-        let turn_start_lock = self.turn_start_lock(recipient);
+        let Binding {
+            client,
+            thread_id,
+            tracker,
+            start_lock,
+        } = self.client_for(recipient)?;
+        let turn_start_lock = start_lock;
         let _turn_start_guard = turn_start_lock.lock().await;
-        self.wait_for_prior_turn_boundary(&thread_id).await?;
-        let queued_event = self.turn_tracker.queue_accepted_event_on_native_user_input(
-            &thread_id,
-            events,
-            accepted_event,
-        );
-        let accepted_echo = self
-            .turn_tracker
-            .queue_accepted_user_input_echo(&thread_id, text.clone());
+        self.wait_for_prior_turn_boundary(&tracker, &thread_id)
+            .await?;
+        let queued_event =
+            tracker.queue_accepted_event_on_native_user_input(&thread_id, events, accepted_event);
+        let accepted_echo = tracker.queue_accepted_user_input_echo(&thread_id, text.clone());
         let mut acceptance_cleanup = PromptAcceptanceCleanup {
-            tracker: self.turn_tracker.clone(),
+            tracker: tracker.clone(),
             accepted_event: queued_event.clone(),
             accepted_echo: accepted_echo.clone(),
             text: text.clone(),
@@ -310,9 +453,8 @@ impl CodexAppServerTransport {
         let turn_id = match client.turn_start_id(&thread_id, &text).await {
             Ok(turn_id) => turn_id,
             Err(e) => {
-                self.turn_tracker.cancel_accepted_event(&queued_event);
-                self.turn_tracker
-                    .cancel_accepted_user_input_echo(&accepted_echo);
+                tracker.cancel_accepted_event(&queued_event);
+                tracker.cancel_accepted_user_input_echo(&accepted_echo);
                 return Err(ContractError {
                     code: -32004,
                     message: e.to_string(),
@@ -326,12 +468,9 @@ impl CodexAppServerTransport {
             });
         };
         acceptance_cleanup.turn_id = Some(turn_id.clone());
-        self.turn_tracker
-            .record_turn_start_acceptance(&thread_id, &turn_id);
-        self.turn_tracker
-            .record_accepted_user_input_echo_for_queued(&accepted_echo, &turn_id);
-        if let Err(error) = self
-            .turn_tracker
+        tracker.record_turn_start_acceptance(&thread_id, &turn_id);
+        tracker.record_accepted_user_input_echo_for_queued(&accepted_echo, &turn_id);
+        if let Err(error) = tracker
             .wait_for_accepted_user_input_echo(
                 &thread_id,
                 &turn_id,
@@ -363,31 +502,30 @@ impl CodexAppServerTransport {
         events: Arc<dyn EventSink>,
         accepted_event: WsEvent,
     ) -> PortResult<SteerResponse> {
-        let (client, thread_id) = self.client_for(recipient)?;
-        let queued_event =
-            self.turn_tracker
-                .queue_accepted_event(&thread_id, events, accepted_event);
-        let accepted_echo = self
-            .turn_tracker
-            .queue_accepted_user_input_echo(&thread_id, text.clone());
+        let Binding {
+            client,
+            thread_id,
+            tracker,
+            ..
+        } = self.client_for(recipient)?;
+        let queued_event = tracker.queue_accepted_event(&thread_id, events, accepted_event);
+        let accepted_echo = tracker.queue_accepted_user_input_echo(&thread_id, text.clone());
 
         let decision = self
-            .steer_active(&client, &thread_id, &text)
+            .steer_active(&client, &tracker, &thread_id, &text)
             .await
             .map_err(|error| {
-                self.turn_tracker.cancel_accepted_event(&queued_event);
-                self.turn_tracker
-                    .cancel_accepted_user_input_echo(&accepted_echo);
+                tracker.cancel_accepted_event(&queued_event);
+                tracker.cancel_accepted_user_input_echo(&accepted_echo);
                 error
             })?;
 
-        self.turn_tracker
+        tracker
             .emit_accepted_event(&queued_event, decision.turn_id.as_deref())
             .await;
         if let Some(turn_id) = decision.turn_id.as_deref() {
-            self.turn_tracker
-                .record_accepted_user_input_echo_for_queued(&accepted_echo, turn_id);
-            self.turn_tracker
+            tracker.record_accepted_user_input_echo_for_queued(&accepted_echo, turn_id);
+            tracker
                 .wait_for_accepted_user_input_echo(
                     &thread_id,
                     turn_id,
@@ -403,6 +541,7 @@ impl CodexAppServerTransport {
                 })?;
         }
         Ok(SteerResponse {
+            session_id: None,
             accepted: true,
             delivery: decision.delivery,
             turn_id: decision.turn_id,
@@ -412,20 +551,22 @@ impl CodexAppServerTransport {
     async fn steer_active(
         &self,
         client: &CodexAppServerClient,
+        tracker: &CodexTurnTracker,
         thread_id: &str,
         text: &str,
     ) -> PortResult<SteerDecision> {
-        let Some(mut expected_turn_id) = self.turn_tracker.active_turn_id(thread_id) else {
+        let Some(mut expected_turn_id) = tracker.active_turn_id(thread_id) else {
             return Err(active_turn_required());
         };
         let mut retried_mismatch = false;
         loop {
+            let before = tracker.native_revision();
             match client
                 .turn_steer_id(thread_id, &expected_turn_id, text)
                 .await
             {
                 Ok(turn_id) => {
-                    self.turn_tracker.observe_active_turn(thread_id, &turn_id);
+                    tracker.apply_steer_response(thread_id, Some(&turn_id), before);
                     return Ok(SteerDecision {
                         delivery: SteerDelivery::Steered,
                         turn_id: Some(turn_id),
@@ -433,15 +574,16 @@ impl CodexAppServerTransport {
                 }
                 Err(error) => match active_turn_steer_race(&error) {
                     Some(ActiveTurnSteerRace::Missing) => {
-                        self.turn_tracker.clear_active_turn(thread_id);
+                        tracker.apply_steer_response(thread_id, None, before);
                         return Err(active_turn_required());
                     }
                     Some(ActiveTurnSteerRace::ExpectedTurnMismatch { actual_turn_id })
                         if !retried_mismatch && actual_turn_id != expected_turn_id =>
                     {
-                        self.turn_tracker
-                            .observe_active_turn(thread_id, &actual_turn_id);
-                        expected_turn_id = actual_turn_id;
+                        tracker.apply_steer_response(thread_id, Some(&actual_turn_id), before);
+                        expected_turn_id = tracker
+                            .active_turn_id(thread_id)
+                            .ok_or_else(active_turn_required)?;
                         retried_mismatch = true;
                     }
                     _ => {
@@ -460,7 +602,9 @@ impl CodexAppServerTransport {
     /// through `turn/start` just hands the model a literal chat message). Completion is
     /// signalled by the `thread/compacted` notification on the forwarded stream.
     pub async fn compact(&self, recipient: &SessionId) -> PortResult<()> {
-        let (client, thread_id) = self.client_for(recipient)?;
+        let Binding {
+            client, thread_id, ..
+        } = self.client_for(recipient)?;
         client
             .thread_compact_start(&thread_id)
             .await
@@ -473,9 +617,13 @@ impl CodexAppServerTransport {
 
     /// Interrupt the currently active native Codex turn for a bound session.
     pub async fn interrupt_active_turn(&self, recipient: &SessionId) -> PortResult<()> {
-        let (client, thread_id) = self.client_for(recipient)?;
-        let turn_id = self
-            .turn_tracker
+        let Binding {
+            client,
+            thread_id,
+            tracker,
+            ..
+        } = self.client_for(recipient)?;
+        let turn_id = tracker
             .active_turn_id(&thread_id)
             .ok_or_else(|| ContractError {
                 code: nexus_contracts::codes::ACTIVE_TURN_REQUIRED,
@@ -511,9 +659,11 @@ impl CodexAppServerTransport {
             .lock()
             .unwrap()
             .iter()
-            .filter_map(|(session, (_, thread_id))| {
-                self.turn_tracker
-                    .active_turn_id(thread_id)
+            .filter_map(|(session, slot)| {
+                let binding = slot.binding.as_ref()?;
+                binding
+                    .tracker
+                    .active_turn_id(&binding.thread_id)
                     .is_some()
                     .then(|| session.clone())
             })
@@ -522,22 +672,20 @@ impl CodexAppServerTransport {
 
     // -- Internal helpers --
 
-    fn turn_start_lock(&self, recipient: &SessionId) -> Arc<AsyncMutex<()>> {
-        self.turn_start_locks
-            .lock()
-            .unwrap()
-            .entry(recipient.clone())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
-    }
-
-    async fn wait_for_prior_turn_boundary(&self, thread_id: &str) -> PortResult<()> {
-        while let Some(turn_id) = self.turn_tracker.active_turn_id(thread_id) {
-            match self
-                .turn_tracker
-                .wait_for_completion(thread_id, &turn_id, TURN_COMPLETION_TIMEOUT)
-                .await
-            {
+    async fn wait_for_prior_turn_boundary(
+        &self,
+        tracker: &CodexTurnTracker,
+        thread_id: &str,
+    ) -> PortResult<()> {
+        if tracker.is_revoked() {
+            return Err(binding_revoked());
+        }
+        while let Some(turn_id) = tracker.active_turn_id(thread_id) {
+            let result = tokio::select! {
+                result = tracker.wait_for_completion(thread_id, &turn_id, TURN_COMPLETION_TIMEOUT) => result,
+                _ = tracker.revoked() => return Err(binding_revoked()),
+            };
+            match result {
                 Ok(()) | Err(super::turn_completion::CodexTurnWaitError::Failed(_)) => {}
                 Err(error) => {
                     return Err(ContractError {
@@ -552,15 +700,17 @@ impl CodexAppServerTransport {
         Ok(())
     }
 
-    fn client_for(&self, recipient: &SessionId) -> PortResult<(Arc<CodexAppServerClient>, String)> {
+    fn client_for(&self, recipient: &SessionId) -> PortResult<Binding> {
         let map = self.sessions.lock().unwrap();
-        map.get(recipient).cloned().ok_or_else(|| ContractError {
-            code: -32004,
-            message: format!(
-                "no codex app-server client bound for session {}",
-                recipient.0
-            ),
-        })
+        map.get(recipient)
+            .and_then(|slot| slot.binding.clone())
+            .ok_or_else(|| ContractError {
+                code: -32004,
+                message: format!(
+                    "no codex app-server client bound for session {}",
+                    recipient.0
+                ),
+            })
     }
 }
 
@@ -577,8 +727,13 @@ impl AgentTurnExecutionPort for CodexAppServerTransport {
         events: Arc<dyn EventSink>,
         accepted_event: WsEvent,
     ) -> InjectResult<()> {
-        self.inject_turn_inner(recipient, batch, Some((events, accepted_event)))
-            .await
+        self.inject_turn_inner(
+            recipient,
+            batch,
+            Some((events, accepted_event)),
+            TURN_COMPLETION_TIMEOUT,
+        )
+        .await
     }
 
     async fn launch(&self, _req: SpawnRequest) -> PortResult<SpawnResponse> {
@@ -633,6 +788,23 @@ impl AgentTurnExecutionPort for CodexAppServerTransport {
         }
     }
 
+    fn observe_turn(&self, recipient: &SessionId) -> nexus_contracts::TurnObservation {
+        let sessions = self.sessions.lock().unwrap();
+        match sessions
+            .get(recipient)
+            .and_then(|slot| slot.binding.as_ref())
+        {
+            Some(binding) => nexus_contracts::TurnObservation {
+                steer_capability: SteerCapability::NativeSteer,
+                ..binding.tracker.observe_turn(&binding.thread_id)
+            },
+            None => nexus_contracts::TurnObservation {
+                state: nexus_contracts::TurnState::Unavailable,
+                ..Default::default()
+            },
+        }
+    }
+
     async fn compact(&self, recipient: &SessionId) -> PortResult<()> {
         CodexAppServerTransport::compact(self, recipient).await
     }
@@ -646,12 +818,13 @@ impl AgentTurnExecutionPort for CodexAppServerTransport {
     }
 
     async fn wait_for_turn_completion(&self, recipient: &SessionId) -> PortResult<()> {
-        let (_, thread_id) = self.client_for(recipient)?;
-        let Some(turn_id) = self.turn_tracker.active_turn_id(&thread_id) else {
+        let Binding {
+            thread_id, tracker, ..
+        } = self.client_for(recipient)?;
+        let Some(turn_id) = tracker.active_turn_id(&thread_id) else {
             return Ok(());
         };
-        match self
-            .turn_tracker
+        match tracker
             .wait_for_completion(&thread_id, &turn_id, TURN_COMPLETION_TIMEOUT)
             .await
         {
@@ -673,6 +846,13 @@ fn active_turn_required() -> ContractError {
     ContractError {
         code: nexus_contracts::codes::ACTIVE_TURN_REQUIRED,
         message: "no active turn to steer".into(),
+    }
+}
+
+fn binding_revoked() -> ContractError {
+    ContractError {
+        code: -32004,
+        message: "captured Codex binding was revoked before local admission".into(),
     }
 }
 
@@ -808,312 +988,5 @@ pub(crate) mod test_support {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::test_support::spawn_fake_server;
-    use super::*;
-    use nexus_contracts::batch::{BatchCounts, NexusBatch};
-    use nexus_contracts::ids::SessionId;
-    use std::sync::Arc;
-
-    fn empty_batch() -> NexusBatch {
-        NexusBatch {
-            counts: BatchCounts {
-                dms: 0,
-                thread: 0,
-                total: 0,
-            },
-            dms: vec![],
-            threads: vec![],
-            dm_message_ids: vec![],
-            thread_message_ids: vec![],
-            message_ids: vec![],
-        }
-    }
-
-    fn batch_with_agent_dm(msg: &str) -> NexusBatch {
-        use nexus_contracts::batch::BatchMessage;
-        use nexus_contracts::enums::{Kind, Scope};
-        use nexus_contracts::ids::MessageId;
-        NexusBatch {
-            counts: BatchCounts {
-                dms: 1,
-                thread: 0,
-                total: 1,
-            },
-            dms: vec![BatchMessage {
-                id: MessageId("m_test".into()),
-                from: "test".to_string(),
-                kind: Kind::Agent,
-                scope: Scope::Dm,
-                thread: None,
-                topic: None,
-                body: msg.to_string(),
-                truncated: false,
-            }],
-            threads: vec![],
-            dm_message_ids: vec![],
-            thread_message_ids: vec![],
-            message_ids: vec![],
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Test 1: inject_turn delivers turn/start with the rendered batch text
-    // -------------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn inject_turn_delivers_turn_start_with_batch_text() {
-        let (sock, calls) = spawn_fake_server("cat-transport", "inject-turn").await;
-
-        let client = CodexAppServerClient::connect(&sock, "nexus-inject")
-            .await
-            .expect("client connect should succeed");
-
-        // Resume (or start) a thread — fake server returns null, which is fine.
-        // We supply a known thread_id directly.
-        let thread_id = "test-thread-1".to_string();
-
-        let transport = CodexAppServerTransport::new();
-        let s1 = SessionId("s1".into());
-        transport.bind(s1.clone(), Arc::new(client), thread_id.clone());
-
-        // Use an agent DM so this path asserts envelope framing rather than the single-human-DM
-        // plain-text exception.
-        let batch = batch_with_agent_dm("hi");
-        transport
-            .inject_turn(&s1, &batch)
-            .await
-            .expect("inject_turn should succeed");
-
-        // The fake server should have recorded a turn/start call.
-        let recorded = calls.lock().unwrap().clone();
-        let turn_start_call = recorded
-            .iter()
-            .find(|v| v.get("method").and_then(|m| m.as_str()) == Some("turn/start"))
-            .expect("fake server must have received a turn/start request");
-
-        // The rendered batch text should contain body text plus recipient framing.
-        let input_text = turn_start_call["params"]["input"][0]["text"]
-            .as_str()
-            .unwrap_or("");
-        assert!(
-            input_text.contains("hi"),
-            "turn/start input must contain 'hi'; got: {input_text}"
-        );
-        assert!(
-            input_text.contains("receiver=\"s1\""),
-            "turn/start input must name the recipient session; got: {input_text}"
-        );
-        assert!(
-            input_text.contains("target=\"dm:s1\""),
-            "turn/start input must name the per-recipient DM target; got: {input_text}"
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // Test 2: prompt delivers turn/start with the raw text
-    // -------------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn prompt_delivers_turn_start_with_raw_text() {
-        let (sock, calls) = spawn_fake_server("cat-transport", "prompt").await;
-
-        let client = CodexAppServerClient::connect(&sock, "nexus-inject")
-            .await
-            .expect("client connect should succeed");
-
-        let thread_id = "test-thread-prompt".to_string();
-        let transport = CodexAppServerTransport::new();
-        let s1 = SessionId("s_prompt".into());
-        transport.bind(s1.clone(), Arc::new(client), thread_id.clone());
-
-        transport
-            .prompt(&s1, "RAW-OPERATOR-TEXT-9999".to_string())
-            .await
-            .expect("prompt should succeed");
-
-        let recorded = calls.lock().unwrap().clone();
-        let turn_call = recorded
-            .iter()
-            .find(|v| v.get("method").and_then(|m| m.as_str()) == Some("turn/start"))
-            .expect("fake server must have received a turn/start request");
-
-        let input_text = turn_call["params"]["input"][0]["text"]
-            .as_str()
-            .unwrap_or("");
-        assert!(
-            input_text.contains("RAW-OPERATOR-TEXT-9999"),
-            "turn/start input must contain the raw operator text; got: {input_text}"
-        );
-    }
-
-    #[tokio::test]
-    async fn prompt_waits_for_existing_active_turn_boundary() {
-        let (sock, calls) = spawn_fake_server("cat-transport", "prompt-active-boundary").await;
-
-        let client = CodexAppServerClient::connect(&sock, "nexus-inject")
-            .await
-            .expect("client connect should succeed");
-
-        let thread_id = "test-thread-prompt-active".to_string();
-        let transport = CodexAppServerTransport::new();
-        let session = SessionId("s_prompt_active".into());
-        transport.bind(session.clone(), Arc::new(client), thread_id.clone());
-        transport
-            .turn_tracker()
-            .observe_active_turn(&thread_id, "turn-existing");
-
-        let pending = tokio::spawn({
-            let transport = transport.clone();
-            let session = session.clone();
-            async move {
-                transport
-                    .prompt(&session, "MUST-WAIT-FOR-BOUNDARY".to_string())
-                    .await
-            }
-        });
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            calls.lock().unwrap().iter().all(|call| {
-                call.get("method").and_then(|method| method.as_str()) != Some("turn/start")
-            }),
-            "a queued prompt must not turn/start while the prior session turn is active"
-        );
-
-        transport
-            .turn_tracker()
-            .complete(&thread_id, "turn-existing");
-        tokio::time::timeout(Duration::from_secs(1), pending)
-            .await
-            .expect("prompt did not resume after the prior turn completed")
-            .expect("prompt task panicked")
-            .expect("prompt failed after the prior turn completed");
-
-        let recorded = calls.lock().unwrap().clone();
-        assert_eq!(
-            recorded
-                .iter()
-                .filter(|call| {
-                    call.get("method").and_then(|method| method.as_str()) == Some("turn/start")
-                })
-                .count(),
-            1,
-            "the queued prompt must start exactly once after the active boundary"
-        );
-    }
-
-    #[tokio::test]
-    async fn compact_sends_thread_compact_start_for_the_bound_thread() {
-        let (sock, calls) = spawn_fake_server("cat-transport", "compact").await;
-
-        let client = CodexAppServerClient::connect(&sock, "nexus-inject")
-            .await
-            .expect("client connect should succeed");
-
-        let thread_id = "test-thread-compact".to_string();
-        let transport = CodexAppServerTransport::new();
-        let s1 = SessionId("s_compact".into());
-        transport.bind(s1.clone(), Arc::new(client), thread_id.clone());
-
-        transport
-            .compact(&s1)
-            .await
-            .expect("compact should succeed");
-
-        let recorded = calls.lock().unwrap().clone();
-        let call = recorded
-            .iter()
-            .find(|v| v.get("method").and_then(|m| m.as_str()) == Some("thread/compact/start"))
-            .expect("fake server must have received a thread/compact/start request");
-        assert_eq!(
-            call["params"]["threadId"].as_str(),
-            Some("test-thread-compact"),
-            "compact must target the bound thread"
-        );
-        assert!(
-            recorded
-                .iter()
-                .all(|v| v.get("method").and_then(|m| m.as_str()) != Some("turn/start")),
-            "native slash compaction must not be delivered through turn/start: {recorded:?}"
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // Test 3: is_bound / unbind / is_harness_alive
-    // -------------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn is_bound_and_unbind_work() {
-        let (sock, _calls) = spawn_fake_server("cat-transport", "is-bound").await;
-
-        let client = Arc::new(
-            CodexAppServerClient::connect(&sock, "nexus-inject")
-                .await
-                .expect("connect"),
-        );
-        let transport = CodexAppServerTransport::new();
-        let s = SessionId("s_bound".into());
-
-        assert!(!transport.is_bound(&s), "unbound session must not be bound");
-        assert_eq!(transport.is_harness_alive(&s), None, "unbound → None");
-
-        transport.bind(s.clone(), client, "t1".to_string());
-        assert!(transport.is_bound(&s), "bound session must report bound");
-        assert_eq!(
-            transport.is_harness_alive(&s),
-            Some(true),
-            "bound → Some(true)"
-        );
-
-        transport.unbind(&s);
-        assert!(!transport.is_bound(&s), "after unbind must not be bound");
-        assert_eq!(transport.is_harness_alive(&s), None, "after unbind → None");
-    }
-
-    #[tokio::test]
-    async fn app_server_keepalive_without_bound_session_is_not_agent_liveness() {
-        let transport = CodexAppServerTransport::new();
-        let s = SessionId("s_app_server_only".into());
-
-        transport.mark_live(s.clone());
-
-        assert!(
-            !transport.is_app_server_live(&s),
-            "a stamp-only mark (no verifiable pid) must NOT count as a live app-server — \
-             stale stamps must not mask dead agents"
-        );
-        transport.mark_live_with_pid(s.clone(), std::process::id());
-        assert!(
-            transport.is_app_server_live(&s),
-            "a pid-backed mark with a RUNNING process is a live app-server"
-        );
-        assert!(
-            !transport.is_bound(&s),
-            "actual Codex turn session is not bound"
-        );
-        assert_eq!(
-            transport.is_harness_alive(&s),
-            None,
-            "a live app-server process alone must not make the agent read online"
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // Test 4: inject_turn returns error for unbound session
-    // -------------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn inject_turn_errors_on_unbound_session() {
-        let transport = CodexAppServerTransport::new();
-        let err = transport
-            .inject_turn(&SessionId("s_missing".into()), &empty_batch())
-            .await
-            .unwrap_err();
-        assert!(
-            err.message.contains("no codex app-server client bound"),
-            "error must mention unbound; got: {}",
-            err.message
-        );
-    }
-}
+#[path = "../../tests/unit/app_server_transport.rs"]
+mod tests;

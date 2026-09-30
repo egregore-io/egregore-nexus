@@ -246,6 +246,7 @@ impl nexus_contracts::AgentTurnExecutionPort for MockAgent {
     ) -> PortResult<nexus_contracts::SteerResponse> {
         events.emit(accepted_event).await;
         Ok(nexus_contracts::SteerResponse {
+            session_id: None,
             accepted: true,
             delivery: nexus_contracts::SteerDelivery::Steered,
             turn_id: Some("turn_native".into()),
@@ -296,6 +297,7 @@ impl nexus_contracts::AgentTurnExecutionPort for RecipientRecordingAgent {
         self.recipients.lock().unwrap().push(recipient.clone());
         events.emit(accepted_event).await;
         Ok(nexus_contracts::SteerResponse {
+            session_id: None,
             accepted: true,
             delivery: nexus_contracts::SteerDelivery::Steered,
             turn_id: Some("turn_recorded".into()),

@@ -107,6 +107,11 @@ export function handleWs(socket, request, deps = {}) {
       }
       const boundTarget = sessionLane.bindResponse(response);
       if (boundTarget) {
+        sendJson(socket, {
+          t: "session.bound",
+          agentId: boundTarget.agentId,
+          sessionId: boundTarget.expectedSessionId,
+        });
         commandQueue.start(boundTarget);
         subscriptions.bindSession(boundTarget.name);
       }
@@ -358,6 +363,8 @@ async function handleClientFrame(
   if (frame?.t === "steer") {
     const clientMessageId = stringField(frame.clientMessageId);
     try {
+      if (!sessionLane.isSessionLane)
+        throw new Error("steer requires a bound session lane");
       const scoped = sessionLane.isSessionLane
         ? { ...frame, target: sessionTargetWireValue(await sessionLane.targetForFrame(frame)) }
         : withSocketScopedSteerDefaults(frame, request);
@@ -376,6 +383,7 @@ async function handleClientFrame(
       if (!body?.result || typeof body.result !== "object" || Array.isArray(body.result)) {
         throw new Error("steer response is missing its result");
       }
+      assertResponseSession(steer.target, body.result);
       sendJson(socket, { t: "steer.ack", clientMessageId, ...body.result });
     } catch (error) {
       sendJson(socket, {
@@ -389,11 +397,13 @@ async function handleClientFrame(
   if (frame?.t === "interrupt") {
     const clientMessageId = stringField(frame.clientMessageId);
     try {
+      if (!sessionLane.isSessionLane)
+        throw new Error("interrupt requires a bound session lane");
       if (!clientMessageId) throw new Error("interrupt.clientMessageId is required");
       const target = sessionLane.isSessionLane
         ? await sessionLane.targetForFrame(frame)
-        : normalizeSessionLookup(frame.target, frame.agentId)
-          ?? sessionTargetFromRequest(request);
+        : (normalizeSessionLookup(frame.target, frame.agentId)
+          ?? sessionTargetFromRequest(request));
       if (!target) throw new Error("interrupt requires a target session");
       const response = await interruptInput({ target: sessionTargetWireValue(target), clientMessageId }, request);
       if (!response.ok) {
@@ -409,6 +419,7 @@ async function handleClientFrame(
       if (!body?.result || typeof body.result !== "object" || Array.isArray(body.result)) {
         throw new Error("interrupt response is missing its result");
       }
+      assertResponseSession(target, body.result);
       sendJson(socket, { t: "interrupt.ack", clientMessageId, ...body.result });
     } catch (error) {
       sendJson(socket, {
@@ -437,6 +448,8 @@ async function handleClientFrame(
         }
       : withSocketScopedInputDefaults(frame, request);
     const input = normalizeInputFrame(scoped);
+    if (input.mode === "session" && !sessionLane.isSessionLane)
+      throw new Error("input requires a bound session lane");
     const response = input.mode === "session"
       ? await sessionInput(input, request)
       : await busInput(input, request);
@@ -452,6 +465,7 @@ async function handleClientFrame(
     if (input.mode === "session") {
       const body = await response.json();
       const receipt = normalizeQueueReceipt(body?.receipt, clientMessageId);
+      assertResponseSession(input.target, receipt);
       commandQueue.observeReceipt(receipt);
       sendJson(socket, { t: "input.ack", ...receipt });
     } else {
@@ -588,9 +602,10 @@ class SessionCommandQueue {
       return;
     }
     try {
-      const target = this.#sessionLane.isSessionLane
-        ? await this.#sessionLane.targetForFrame(frame)
-        : this.#target;
+      if (!this.#sessionLane.isSessionLane) {
+        throw new Error("queue operations require a session socket");
+      }
+      const target = await this.#sessionLane.targetForFrame(frame);
       if (!target) {
         throw new Error("queue operations require a session socket");
       }
@@ -623,6 +638,7 @@ class SessionCommandQueue {
         return;
       }
       const result = await response.json();
+      assertResponseSession(target, result);
       sendJson(this.#socket, { t: "queue.mutation.ack", action, ...result });
     } catch (error) {
       sendJson(this.#socket, {
@@ -641,11 +657,13 @@ export class CommandQueueHub {
   #subscribers = new Set();
   #groups = new Map();
   #pollMs;
+  #observationMs;
 
   constructor(deps) {
     this.#deps = deps;
     this.#pollMs = positiveInteger(deps.commandQueueEventPollMs)
       ?? DEFAULT_COMMAND_QUEUE_EVENT_POLL_MS;
+    this.#observationMs = positiveInteger(deps.commandQueueObservationPollMs) ?? 1000;
   }
 
   subscribe(request, target, handlers) {
@@ -669,6 +687,7 @@ export class CommandQueueHub {
         polling: false,
         wakeAfterPoll: false,
         pendingRefreshes: new Map(),
+        lastObservationRefreshAt: performance.now(),
       };
       this.#groups.set(authKey, group);
     }
@@ -681,6 +700,12 @@ export class CommandQueueHub {
       clearTimeout(group.timer);
       group.timer = undefined;
     }
+    const observationFence = normalizedTarget.expectedSessionId
+      ? [...this.#subscribers].find((entry) =>
+          entry.authKey === authKey && !entry.closed &&
+          sessionTargetKey(entry.target) === sessionTargetKey(normalizedTarget)
+        )?.observationFence ?? { revision: 0, fields: undefined }
+      : undefined;
     const subscriber = {
       request,
       target: normalizedTarget,
@@ -694,15 +719,17 @@ export class CommandQueueHub {
       failed: false,
       closed: false,
       hydrationGeneration: 1,
+      observationFence,
     };
     this.#subscribers.add(subscriber);
     void this.#hydrate(subscriber, group, "subscribe", subscriber.hydrationGeneration);
     return () => {
       subscriber.closed = true;
       this.#subscribers.delete(subscriber);
-      const remaining = [...this.#subscribers].filter((entry) => (
-        entry.authKey === authKey && !entry.closed
-      ));
+      const remaining = [...this.#subscribers].filter(
+        (entry) =>
+        entry.authKey === authKey && !entry.closed,
+      );
       if (remaining.length === 0) {
         if (group.timer) clearTimeout(group.timer);
         group.pendingRefreshes.clear();
@@ -729,9 +756,10 @@ export class CommandQueueHub {
 
   #reconcileGroup(authKey, group, delay = 0) {
     if (this.#groups.get(authKey) !== group) return;
-    const active = [...this.#subscribers].filter((subscriber) => (
-      subscriber.authKey === authKey && !subscriber.closed && !subscriber.failed
-    ));
+    const active = [...this.#subscribers].filter(
+      (subscriber) =>
+      subscriber.authKey === authKey && !subscriber.closed && !subscriber.failed,
+    );
     if (active.length === 0 || active.some((subscriber) => !subscriber.ready)) {
       group.ready = false;
       return;
@@ -742,13 +770,18 @@ export class CommandQueueHub {
   }
 
   async #hydrate(subscriber, group, phase, generation) {
+    const readGeneration = group.generation;
+    const observationRevision = subscriber.observationFence?.revision;
     try {
-      const snapshot = await this.#loadSnapshot(subscriber.request, subscriber.target);
+      let snapshot = await this.#loadSnapshot(subscriber.request, subscriber.target);
+      assertResponseSession(subscriber.target, snapshot);
       if (
         subscriber.closed
         || this.#groups.get(subscriber.authKey) !== group
         || subscriber.hydrationGeneration !== generation
       ) return;
+      snapshot = this.#projectObservation(subscriber, snapshot, observationRevision,
+        group.generation === readGeneration);
       subscriber.sessionId = stringField(snapshot?.sessionId);
       subscriber.handlers.onSnapshot(snapshot);
       const snapshotSeq = nonNegativeInteger(snapshot?.seq) ?? 0;
@@ -785,11 +818,13 @@ export class CommandQueueHub {
   }
 
   async #loadSnapshot(request, target) {
-    const url = new URL(request.url);
+  const url = new URL(request.url);
     url.pathname = "/api/conversation/prompt";
     url.search = "";
     if (target.name) url.searchParams.set("name", target.name);
     if (target.agentId) url.searchParams.set("agentId", target.agentId);
+    if (target.expectedSessionId)
+      url.searchParams.set("expectedSessionId", target.expectedSessionId);
     const response = await routeThroughFetchHandler(
       this.#deps,
       new Request(url, { method: "GET", headers: request.headers }),
@@ -798,20 +833,71 @@ export class CommandQueueHub {
     return response.json();
   }
 
+  #projectObservation(subscriber, snapshot, readRevision, currentRead) {
+    const fence = subscriber.observationFence;
+    if (!fence) return snapshot;
+    const observation = snapshot?.observation;
+    const previous = fence.fields?.observation;
+    const stamped = typeof observation?.owner === "string" && observation.owner.trim() &&
+      Number.isSafeInteger(observation?.revision) && observation.revision >= 0;
+    const valid = observation?.sessionId === subscriber.target.expectedSessionId &&
+      ["nativeOpen", "verifiedIdle", "unknown", "unavailable"].includes(observation?.state) &&
+      ["native_steer", "interrupt_and_send", "none"].includes(observation?.steerCapability) &&
+      (stamped || (observation?.owner == null && observation?.revision == null &&
+        ["unknown", "unavailable"].includes(observation?.state)));
+    const currentEvidence = valid && currentRead && readRevision === fence.revision;
+    let accepted = currentEvidence;
+    if (accepted && previous) {
+      if (previous.owner && !observation.owner) accepted = false;
+      else if (previous.owner && previous.owner === observation.owner) {
+        const before = previous.revision ?? 0;
+        const after = observation.revision ?? 0;
+        if (after < before || (after === before &&
+            (previous.state !== observation.state || previous.steerCapability !== observation.steerCapability))) {
+          accepted = false;
+        }
+      }
+    }
+    if (currentEvidence) {
+      // This object is shared only by this auth/exact-lane's existing subscribers.
+      // Even identical evidence invalidates concurrent older reads; owners are not clocks.
+      fence.revision += 1;
+    }
+    if (accepted) {
+      fence.fields = {
+        observation: { ...observation },
+        steerCapability: observation.steerCapability,
+        ...(observation.state === "nativeOpen" ? { turnActive: true } : {}),
+        ...(observation.state === "verifiedIdle" ? { turnActive: false } : {}),
+      };
+    }
+    if (observation || fence.fields) {
+      // Retain independently ordered queue facts. Never forward old legacy activity
+      // alongside newer native evidence, or derive replacement proof from those bits.
+      const { observation: ignored, turnActive, steerCapability, ...queueFacts } = snapshot;
+      return { ...queueFacts, ...fence.fields };
+    }
+    return snapshot;
+  }
+
   async #refreshGroupSubscribers(group, generation, subscribers) {
-    const active = [...subscribers].filter((subscriber) => (
-      !subscriber.closed && !subscriber.failed && subscriber.ready
-    ));
+    const active = [...subscribers].filter(
+      (subscriber) =>
+      !subscriber.closed && !subscriber.failed && subscriber.ready,
+    );
     if (active.length === 0) return "done";
+    const observationRevision = active[0].observationFence?.revision;
     try {
       // All entries share auth + target. Fetch once, then fan the authoritative projection out to
       // every mounted client. This is event-driven reconciliation, not another polling lane.
-      const snapshot = await this.#loadSnapshot(active[0].request, active[0].target);
+      let snapshot = await this.#loadSnapshot(active[0].request, active[0].target);
+      assertResponseSession(active[0].target, snapshot);
       if (
         this.#groups.get(active[0].authKey) !== group
         || group.generation !== generation
         || !group.ready
       ) return "stale";
+      snapshot = this.#projectObservation(active[0], snapshot, observationRevision, true);
       const sessionId = stringField(snapshot?.sessionId);
       for (const subscriber of active) {
         if (subscriber.closed) continue;
@@ -865,14 +951,14 @@ export class CommandQueueHub {
     let caughtUp = true;
     try {
       const url = new URL(group.request.url);
-      url.pathname = "/api/conversation/prompt";
+    url.pathname = "/api/conversation/prompt";
       url.search = "";
       url.searchParams.set("eventsAfter", String(requestCursor));
       const response = await routeThroughFetchHandler(
         this.#deps,
         new Request(url, { method: "GET", headers: group.request.headers }),
       );
-      if (!response.ok) throw new Error(await errorReason(response));
+    if (!response.ok) throw new Error(await errorReason(response));
       const body = await response.json();
       if (
         this.#groups.get(authKey) !== group
@@ -884,9 +970,10 @@ export class CommandQueueHub {
         group.generation += 1;
         group.ready = false;
         group.pendingRefreshes.clear();
-        const affected = [...this.#subscribers].filter((entry) => (
-          entry.authKey === authKey && !entry.closed && !entry.failed
-        ));
+        const affected = [...this.#subscribers].filter(
+          (entry) =>
+          entry.authKey === authKey && !entry.closed && !entry.failed,
+        );
         for (const subscriber of affected) {
           subscriber.ready = false;
           subscriber.buffered = [];
@@ -912,10 +999,10 @@ export class CommandQueueHub {
           if (subscriber.ready) {
             subscriber.cursor = seq;
             subscriber.handlers.onTransition(event);
-            // A queued transition can mean new, edited, reordered, or redirected content. The
+            // Queued or failed transitions can require text or terminal recovery. The
             // transition remains the lifecycle fact; one coalesced snapshot supplies text/order
             // that intentionally do not bloat every event row.
-            if (commandQueueState(event?.state) === "queued") {
+            if (["queued", "failed"].includes(commandQueueState(event?.state))) {
               const key = sessionTargetKey(subscriber.target);
               let entries = group.pendingRefreshes.get(key);
               if (!entries) {
@@ -930,13 +1017,38 @@ export class CommandQueueHub {
         }
       }
       const latest = nonNegativeInteger(body?.latestSeq) ?? group.cursor;
+      const scanned = nonNegativeInteger(body?.nextSeq);
+      if (scanned !== undefined && scanned > 0)
+        group.cursor = Math.max(group.cursor, scanned);
+      else
       if (events.length === 0) group.cursor = Math.max(group.cursor, latest);
       if (group.cursor < latest) caughtUp = false;
 
+      // Native facts can change without a journal transition. Reuse the coalesced
+      // refresh lane, bounded by elapsed time even during zero-delay catch-up.
+      const observationOnly = new Set();
+      const now = performance.now();
+      if (now - group.lastObservationRefreshAt >= this.#observationMs) {
+        group.lastObservationRefreshAt = now;
+        for (const subscriber of this.#subscribers) {
+          if (subscriber.authKey !== authKey || subscriber.closed || subscriber.failed ||
+              !subscriber.ready || !subscriber.target.expectedSessionId) continue;
+          const key = sessionTargetKey(subscriber.target);
+          let entries = group.pendingRefreshes.get(key);
+          if (!entries) {
+            entries = new Set();
+            group.pendingRefreshes.set(key, entries);
+            observationOnly.add(key);
+          }
+          entries.add(subscriber);
+        }
+      }
       for (const [key, subscribers] of group.pendingRefreshes) {
         const result = await this.#refreshGroupSubscribers(group, generation, subscribers);
         if (result === "stale") return;
-        if (result === "done") group.pendingRefreshes.delete(key);
+        // An observation-only failure retries at its elapsed cadence, never every
+        // immediate catch-up iteration. Existing event refresh retries are unchanged.
+        if (result === "done" || observationOnly.has(key)) group.pendingRefreshes.delete(key);
       }
       for (const subscriber of this.#subscribers) {
         if (subscriber.authKey !== authKey || subscriber.closed || subscriber.failed) continue;
@@ -956,9 +1068,9 @@ export class CommandQueueHub {
     } finally {
       group.polling = false;
       if (this.#groups.get(authKey) === group && group.ready) {
-        const delay = group.wakeAfterPoll ? 0 : (caughtUp ? this.#pollMs : 0);
+        const delay = group.wakeAfterPoll ? 0 : caughtUp ? this.#pollMs : 0;
         group.wakeAfterPoll = false;
-        this.#scheduleGroup(authKey, group, delay);
+    this.#scheduleGroup(authKey, group, delay);
       }
     }
   }
@@ -1012,9 +1124,9 @@ class CommandFrames {
     let target;
     try {
       target = this.#sessionLane.isSessionLane
-        ? await this.#sessionLane.targetForFrame(frame)
-        : normalizeSessionLookup(frame.target, frame.agentId)
-          ?? sessionTargetFromRequest(this.#request);
+        ? await this.#sessionLane.targetForFrame(frame, false)
+        : (normalizeSessionLookup(frame.target, frame.agentId)
+          ?? sessionTargetFromRequest(this.#request));
     } catch (error) {
       sendJson(this.#socket, {
         t: "commands.err",
@@ -1056,6 +1168,19 @@ class CommandFrames {
       });
       return;
     }
+    let target;
+    try {
+      target = await this.#sessionLane.targetForFrame(frame);
+    } catch (error) {
+      // A conflicting retry must not replay or replace the original command's settlement.
+      sendJson(this.#socket, {
+        t: "command.err",
+        clientCommandId,
+        error: messageForError(error),
+        code: "invalid_args",
+      });
+      return;
+    }
     const known = this.#replay.get(clientCommandId);
     if (known) {
       // In-flight duplicate: the original dispatch will emit the terminal
@@ -1070,15 +1195,6 @@ class CommandFrames {
     const err = (error, code) =>
       this.#finish(clientCommandId, [{ t: "command.err", clientCommandId, error, code }]);
 
-    let target;
-    try {
-      target = this.#sessionLane.isSessionLane
-        ? await this.#sessionLane.targetForFrame(frame)
-        : normalizeSessionLookup(frame.target, frame.agentId)
-          ?? sessionTargetFromRequest(this.#request);
-    } catch (error) {
-      return err(messageForError(error), "invalid_args");
-    }
     if (!target) return err("command requires a target session", "invalid_args");
     const name = stringField(frame.name);
     if (!name) return err("command.name is required", "invalid_args");
@@ -1117,6 +1233,13 @@ class CommandFrames {
             },
             this.#request,
           );
+      if (response.ok) {
+        const body = await response.json();
+        assertResponseSession(
+          target,
+          descriptor.class === "gateway" ? body?.result : body?.receipt,
+        );
+      }
       done = response.ok
         ? { t: "command.done", clientCommandId, ok: true }
         : {
@@ -1211,7 +1334,7 @@ class DeveloperEventSubscriptions {
     this.#source = deps.developerEvents;
     this.#daemonToolCallSource = Object.prototype.hasOwnProperty.call(deps, "daemonToolCallEvents")
       ? deps.daemonToolCallEvents
-      : (this.#sessionName ? createDaemonPushDeveloperEventSource(this.#sessionName) : undefined);
+      :this.#sessionName ? createDaemonPushDeveloperEventSource(this.#sessionName) : undefined;
     this.#daemonFleetSource = Object.prototype.hasOwnProperty.call(deps, "daemonFleetStatusEvents")
       ? deps.daemonFleetStatusEvents
       : createDaemonPushDeveloperEventSource(FLEET_SESSION_KEY);
@@ -1560,14 +1683,20 @@ class SessionLaneBinding {
       response.headers.get("x-nexus-agent-name"),
       response.headers.get("x-nexus-agent-id"),
     );
-    if (this.#pathSessionId) {
-      if (!responseSessionId || responseSessionId !== this.#pathSessionId || !responseTarget?.agentId) {
+    {
+      if (!responseSessionId ||
+        (this.#pathSessionId && responseSessionId !== this.#pathSessionId) || !responseTarget?.agentId ||
+        (this.#fallbackTarget?.expectedSessionId &&
+          responseSessionId !== this.#fallbackTarget.expectedSessionId) ||
+        (this.#fallbackTarget?.agentId &&
+          responseTarget.agentId !== this.#fallbackTarget.agentId)
+      ) {
         const error = "agent-session response is missing its canonical lane binding";
         this.fail(error);
         throw new Error(error);
       }
     }
-    const target = responseTarget ?? this.#fallbackTarget;
+    const target = { ...responseTarget, expectedSessionId: responseSessionId };
     if (!target) {
       const error = "agent-session lane target is not materialized";
       this.fail(error);
@@ -1588,12 +1717,36 @@ class SessionLaneBinding {
     this.#resolve?.({ error });
   }
 
-  async targetForFrame(frame) {
+  async targetForFrame(frame, requireIdentity = true) {
     const state = await this.#ready;
     if (state.error) throw new Error(state.error);
     const canonical = state.target;
     if (!canonical) throw new Error("agent-session lane target is not materialized");
-    const explicit = normalizeSessionLookup(frame?.target, frame?.agentId);
+    if (requireIdentity) {
+      if (
+        !stringField(frame?.agentId) ||
+        !stringField(frame?.expectedSessionId)
+      ) {
+        throw new Error(
+          "session command requires non-empty agentId and expectedSessionId",
+        );
+      }
+      if (
+        frame.agentId !== canonical.agentId ||
+        frame.expectedSessionId !== state.sessionId
+      ) {
+        throw new Error(
+          "frame identity does not match the bound agent-session lane",
+        );
+      }
+    }
+    if (frame?.target && typeof frame.target === "object") {
+      if (("agentId" in frame.target || "expectedSessionId" in frame.target) &&
+        (frame.target.agentId !== canonical.agentId || frame.target.expectedSessionId !== state.sessionId)) {
+        throw new Error("frame target identity must be complete and match the bound agent-session lane");
+      }
+    }
+    const explicit = normalizeSessionLookup(frame?.target);
     if (!explicit) return canonical;
     if (canonical.agentId && explicit.agentId) {
       if (canonical.agentId !== explicit.agentId) {
@@ -1616,9 +1769,15 @@ function sessionLaneTargetFromRequest(request) {
   const params = new URL(request.url).searchParams;
   const session = stringField(params.get("session"));
   const agentId = stringField(params.get("agentId"));
-  if (session) return normalizeSessionLookup(session, agentId);
+  const expectedSessionId = stringField(params.get("expectedSessionId"));
+  if (session)
+    return normalizeSessionLookup({
+      name: session,
+      agentId,
+      expectedSessionId,
+    });
   if (!agentId || params.get("thread") || params.get("dm") || params.get("topic")) return undefined;
-  return { agentId };
+  return { agentId, ...(expectedSessionId ? { expectedSessionId } : {}) };
 }
 
 function sessionIdFromPath(request) {
@@ -1636,10 +1795,12 @@ function normalizeSessionLookup(value, explicitAgentId) {
     ? stringField(value)
     : stringField(value?.name);
   const agentId = stringField(explicitAgentId) ?? stringField(value?.agentId);
+  const expectedSessionId = stringField(value?.expectedSessionId);
   if (!name && !agentId) return undefined;
   return {
     ...(name ? { name } : {}),
     ...(agentId ? { agentId } : {}),
+    ...(expectedSessionId ? { expectedSessionId } : {}),
   };
 }
 
@@ -1655,11 +1816,29 @@ function sessionTargetRequestBody(target) {
   return {
     ...(target.name ? { name: target.name } : {}),
     ...(target.agentId ? { agentId: target.agentId } : {}),
+    ...(target.expectedSessionId
+      ? { expectedSessionId: target.expectedSessionId }
+      : {}),
   };
 }
 
+function assertResponseSession(target, result) {
+  if (
+    target?.expectedSessionId &&
+    result?.sessionId !== target.expectedSessionId
+  ) {
+    throw new Error(
+      "command acknowledgement session mismatch; outcome is unconfirmed",
+    );
+  }
+}
+
 function sessionTargetKey(target) {
-  return target.agentId ? `agent:${target.agentId}` : `name:${target.name}`;
+  return JSON.stringify([
+    target.agentId ?? null,
+    target.agentId ? null : target.name,
+    target.expectedSessionId ?? null,
+  ]);
 }
 
 function toolCallTopic(agent) {
@@ -1675,11 +1854,13 @@ function toolCallTopicAgent(topic) {
 }
 
 function isInProgressToolResult(frame, status) {
-  return frame.append === true || status === "in_progress" || status === "running";
+  return ( frame.append === true || status === "in_progress" || status === "running"
+  );
 }
 
 function isFailedToolStatus(status) {
-  return status === "failed" || status === "error" || status === "cancelled" || status === "canceled";
+  return ( status === "failed" || status === "error" || status === "cancelled" || status === "canceled"
+  );
 }
 
 function nonNegativeInteger(value) {
@@ -1745,6 +1926,7 @@ function withSocketScopedSteerDefaults(frame, request) {
 }
 
 function normalizeSteerFrame(frame) {
+  rejectUnsupportedIntent(frame);
   const text = stringField(frame.text);
   if (!text) throw new Error("steer.text is required");
   return {
@@ -1754,12 +1936,20 @@ function normalizeSteerFrame(frame) {
   };
 }
 
+function rejectUnsupportedIntent(frame) {
+  for (const option of ["delivery", "modelSelection"]) {
+    if (frame[option] != null)
+      throw new Error(`${option} is not supported by this session endpoint`);
+  }
+}
+
 function normalizeInputFrame(frame) {
   const mode = frame.mode === "bus" ? "bus" : frame.mode === "session" ? "session" : undefined;
   const text = stringField(frame.text);
   if (!mode) throw new Error("input.mode must be session or bus");
   if (!text) throw new Error("input.text is required");
   if (mode === "session") {
+    rejectUnsupportedIntent(frame);
     const target = normalizeSessionTarget(frame.target);
     return {
       mode,
@@ -1785,6 +1975,9 @@ function normalizeSessionTarget(target) {
       return {
         ...(name ? { name } : {}),
         ...(agentId ? { agentId } : {}),
+        ...(target.expectedSessionId
+          ? { expectedSessionId: target.expectedSessionId }
+          : {}),
       };
     }
   }
@@ -1835,6 +2028,9 @@ function defaultSessionInput(deps) {
       requestWithJson(request, "/api/conversation/prompt", {
         name: target.name ?? target.agentId,
         ...(target.agentId ? { agentId: target.agentId } : {}),
+        ...(target.expectedSessionId
+          ? { expectedSessionId: target.expectedSessionId }
+          : {}),
         text: input.text,
         ...(input.clientMessageId ? { clientMessageId: input.clientMessageId } : {}),
       }),
@@ -1868,6 +2064,9 @@ function defaultSteerInput(deps) {
       requestWithJson(request, "/api/conversation/steer", {
         name: target.name ?? target.agentId,
         ...(target.agentId ? { agentId: target.agentId } : {}),
+        ...(target.expectedSessionId
+          ? { expectedSessionId: target.expectedSessionId }
+          : {}),
         text: input.text,
         ...(input.clientMessageId ? { clientMessageId: input.clientMessageId } : {}),
       }),
@@ -1883,6 +2082,9 @@ function defaultInterruptInput(deps) {
       requestWithJson(request, "/api/conversation/interrupt", {
         name: target.name ?? target.agentId,
         ...(target.agentId ? { agentId: target.agentId } : {}),
+        ...(target.expectedSessionId
+          ? { expectedSessionId: target.expectedSessionId }
+          : {}),
         clientMessageId: input.clientMessageId,
       }),
     );

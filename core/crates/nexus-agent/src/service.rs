@@ -509,26 +509,38 @@ impl AgentTurnExecutionPort for Agent {
         &self,
         recipient: &SessionId,
         text: String,
-        _events: Arc<dyn EventSink>,
+        events: Arc<dyn EventSink>,
         accepted_event: WsEvent,
     ) -> Result<(), ContractError> {
-        let accepted_event = stream_event_from_observed_update(accepted_event)?;
+        // Validate the event kind but retain the exact caller-supplied session envelope.
+        stream_event_from_observed_update(accepted_event.clone())?;
         let adapter = self.adapter_for(recipient).map_err(to_contract)?;
-        let events = self.events.clone();
-        let recipient = recipient.clone();
-        let active_turn = self.active_turns.begin(&recipient);
-        tokio::spawn(async move {
-            let _active_turn = active_turn;
-            let _ = relay_turn(
-                adapter,
-                events,
-                recipient,
-                text,
-                InjectSource::Bus,
-                Some(accepted_event),
-            )
+        let active_turn = self.active_turns.begin(recipient);
+        let updates = adapter
+            .inject_completion_observed(text)
+            .await
+            .map_err(|error| error.into_contract_error(recipient))?;
+        // A successful correlated response ends protocol work, independently of projection.
+        drop(active_turn);
+        // Completion-bound, not early acceptance: the supplied sink must finish before any
+        // retained output is published through the service's (possibly different) sink.
+        events.emit(accepted_event).await;
+        for update in updates {
+            self.events
+                .emit(WsEvent::AgentUpdate {
+                    session_id: recipient.clone(),
+                    kind: update.kind,
+                    data: update.data,
+                })
+                .await;
+        }
+        self.events
+            .emit(WsEvent::AgentUpdate {
+                session_id: recipient.clone(),
+                kind: AgentUpdateKind::TurnEnd,
+                data: serde_json::json!({}),
+            })
             .await;
-        });
         Ok(())
     }
 
@@ -540,6 +552,15 @@ impl AgentTurnExecutionPort for Agent {
 
     fn active_turn_sessions(&self) -> Vec<SessionId> {
         self.active_turns.sessions()
+    }
+
+    fn observe_turn(&self, recipient: &SessionId) -> nexus_contracts::TurnObservation {
+        self.adapter_for(recipient)
+            .map(|adapter| adapter.observe_turn())
+            .unwrap_or_else(|_| nexus_contracts::TurnObservation {
+                state: nexus_contracts::TurnState::Unavailable,
+                ..Default::default()
+            })
     }
 
     async fn wait_for_turn_completion(&self, recipient: &SessionId) -> Result<(), ContractError> {
@@ -589,6 +610,7 @@ impl AgentTurnExecutionPort for Agent {
             .await
             .map_err(ContractError::from)?;
         Ok(SteerResponse {
+            session_id: None,
             accepted: true,
             delivery: SteerDelivery::InterruptedAndStarted,
             turn_id: None,

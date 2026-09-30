@@ -185,6 +185,7 @@ fn prompt_command(
         caller_name,
         caller_client_key,
         serde_json::to_string(&PromptRequest {
+            expected_session_id: None,
             agent_id: None,
             name: target.into(),
             text: text.into(),
@@ -492,6 +493,7 @@ async fn expired_claimed_control_command_does_not_block_later_message_post_send(
         "Alex Morgan",
         "ck_operator",
         serde_json::to_string(&PromptRequest {
+            expected_session_id: None,
             agent_id: None,
             name: "missing-agent".into(),
             text: "this prompt was claimed by a worker that died".into(),
@@ -572,6 +574,7 @@ async fn held_harness_prompt_does_not_starve_message_post_send() {
             "Alex Morgan",
             "ck_operator",
             serde_json::to_string(&PromptRequest {
+                expected_session_id: None,
                 agent_id: None,
                 name: "Bianca".into(),
                 text: "long model turn".into(),

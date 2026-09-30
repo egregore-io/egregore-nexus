@@ -64,11 +64,17 @@ function toChannel(t: ThreadRow): ChannelNavItem {
   return { id: t.name, name: t.name };
 }
 
-function toDm(m: MemberRow): DmNavItem {
+type AddressableMember = MemberRow & { agentId: string };
+
+function isAddressableMember(m: MemberRow): m is AddressableMember {
+  return typeof m.agentId === "string" && m.agentId.trim().length > 0;
+}
+
+function toDm(m: AddressableMember): DmNavItem {
   return {
-    id: m.name,
+    id: m.agentId,
+    agentId: m.agentId,
     name: m.name,
-    sessionId: m.sessionId,
     kind: memberKind(m),
     presence: presence(m.presence),
     kindLabel: m.agent,
@@ -91,6 +97,13 @@ function toMe(w: WhoamiRow): MeIdentity {
 // ── query hooks (each a thin useQuery over the read-view) ─────────────────────
 
 const STALE = 15_000;
+// TanStack pauses intervals in hidden tabs and refetches stale data on return.
+// Both roster observers share the same cache/in-flight HTTP request.
+const ROSTER_REFRESH = {
+  refetchInterval: 30_000,
+  refetchIntervalInBackground: false,
+  refetchOnWindowFocus: true,
+};
 
 // Threads/members are read GLOBALLY now: a "project" is a console-only grouping (see
 // `@app/projects`), so the rail fetches every thread/member and `AppShell` filters channels to the
@@ -114,10 +127,14 @@ export function useChannels() {
  */
 export function useDms() {
   return useQuery({
+    ...ROSTER_REFRESH,
     queryKey: qk.members("all"),
     queryFn: () => getJson<MemberRow[]>("/api/v1/members?includeOffline=true"),
     select: (rows) => rows
-      .filter((m) => m.kind !== "human" && presence(m.presence) !== "offline")
+      .filter((m): m is AddressableMember =>
+        m.kind !== "human"
+          && presence(m.presence) !== "offline"
+          && isAddressableMember(m))
       .map(toDm),
     staleTime: STALE,
   });
@@ -126,6 +143,7 @@ export function useDms() {
 /** Real members → the live-agents count. */
 export function useAgentsLive() {
   return useQuery({
+    ...ROSTER_REFRESH,
     queryKey: qk.members("all"),
     queryFn: () => getJson<MemberRow[]>("/api/v1/members?includeOffline=true"),
     select: (rows) => rows.filter(

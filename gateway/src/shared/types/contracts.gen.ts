@@ -481,6 +481,10 @@ export interface CommandQueueEntry {
 	startedAt?: number;
 	completedAt?: number;
 	error?: string;
+	/** Structured durable error code, never parsed from the display message. */
+	errorCode?: number;
+	/** Computed by the read authority from the authenticated requester and stored caller. */
+	correlationOwned?: boolean;
 }
 
 /** Atomic pending-queue mutation selected by the UI. */
@@ -493,6 +497,8 @@ export enum CommandQueueAction {
 
 /** Request for one server-owned queue mutation. Fields not used by the selected action are absent. */
 export interface CommandQueueMutationRequest {
+	/** Require the existing active runtime to match before a new mutation is applied. */
+	expectedSessionId?: SessionId;
 	name?: string;
 	agentId?: AgentId;
 	action: CommandQueueAction;
@@ -535,11 +541,27 @@ export interface CommandQueueReceipt {
 	seq: number;
 }
 
+/** Adapter evidence state, projected for inspection but never a scheduler busy bit. */
+export enum TurnState {
+	VerifiedIdle = "verifiedIdle",
+	NativeOpen = "nativeOpen",
+	Unknown = "unknown",
+	Unavailable = "unavailable",
+}
+
+export interface QueueTurnObservation {
+	sessionId: string;
+	state: TurnState;
+	owner?: string;
+	revision?: number;
+	steerCapability: SteerCapability;
+}
+
 /** Reconnect snapshot for one daemon-owned session lane. */
 export interface CommandQueueSnapshot {
 	target: string;
 	sessionId?: string;
-	/** Derived exclusively from the durable normalized session-turn projection. */
+	/** Compatibility activity projection. Positive native observations override durable fallback. */
 	turnActive: boolean;
 	steerCapability: SteerCapability;
 	/** Monotonic global queue cursor used as the reconnect `afterSeq` boundary. */
@@ -547,6 +569,8 @@ export interface CommandQueueSnapshot {
 	/** Queue revision. It advances with `seq`; named separately for compare-and-set UI state. */
 	revision: number;
 	commands: CommandQueueEntry[];
+	/** Exact adapter evidence, independently versioned from the queue cursor. */
+	observation?: QueueTurnObservation;
 }
 
 /** One monotonic pushed transition from the durable command-event projection. */
@@ -564,6 +588,7 @@ export interface CommandQueueTransition {
 	state: CommandQueueState;
 	mode: string;
 	revision: number;
+	correlationOwned?: boolean;
 }
 
 /**
@@ -572,7 +597,9 @@ export interface CommandQueueTransition {
  * the typed `/compact`; transports without a compaction verb error loudly.
  */
 export interface CompactRequest {
-	/** The stable target agent id. When present, the daemon revives this id before `name`. */
+	/** Dispatch only to this agent's existing active runtime; never revive or retarget. */
+	expectedSessionId?: SessionId;
+	/** Stable agent target. Omitted session selectors retain legacy revive behavior. */
 	agentId?: AgentId;
 	/** The target agent's registered name fallback (resolved to its live session). */
 	name: string;
@@ -583,6 +610,8 @@ export interface CompactRequest {
 /** Response: whether compaction was started (completion streams via observe). */
 export interface CompactResponse {
 	started: boolean;
+	/** Actual resolved dispatch session; not a native lifecycle/admission proof. */
+	sessionId?: SessionId;
 }
 
 /** `consume` (drain-once) request — the held-receive window for one drain. */
@@ -1045,6 +1074,8 @@ export interface InboxUnsubscribeRequest {
 
 /** Interrupt the active turn on one agent session without injecting replacement text. */
 export interface InterruptRequest {
+	/** Dispatch only to this agent's existing active runtime; never revive or retarget. */
+	expectedSessionId?: SessionId;
 	/** The stable target agent id. When present, it is authoritative over `name`. */
 	agentId?: AgentId;
 	/** The target agent's registered name fallback. */
@@ -1056,6 +1087,8 @@ export interface InterruptRequest {
 /** Response emitted only after the adapter accepted the interrupt. */
 export interface InterruptResponse {
 	interrupted: boolean;
+	/** Actual runtime binding selected by the router. */
+	sessionId?: SessionId;
 }
 
 /** `nexus thread join <name>` (caller joins). */
@@ -1284,7 +1317,12 @@ export interface Project {
 
 /** Inject one operator message directly into an agent's ACP session by agent name. */
 export interface PromptRequest {
-	/** The stable target agent id. When present, the daemon revives this id before `name`. */
+	/** Dispatch only to this agent's existing active runtime; never revive or retarget. */
+	expectedSessionId?: SessionId;
+	/**
+	 * Stable target identity, authoritative over `name`. Only legacy omission of
+	 * `expectedSessionId` permits revival.
+	 */
 	agentId?: AgentId;
 	/** The target agent's registered name fallback (resolved to its live ACP session). */
 	name: string;
@@ -1300,6 +1338,8 @@ export interface PromptRequest {
 /** Response: whether the turn was injected (the reply itself streams over the WS). */
 export interface PromptResponse {
 	delivered: boolean;
+	/** Actual runtime binding used by the router, not a native delivery receipt. */
+	sessionId?: SessionId;
 }
 
 /**
@@ -1689,7 +1729,12 @@ export interface StatusResponse {
  * capability: native steering when available, otherwise an adapter-owned interrupt-and-send.
  */
 export interface SteerRequest {
-	/** The stable target agent id. When present, the daemon revives this id before `name`. */
+	/** Dispatch only to this agent's existing active runtime; never revive or retarget. */
+	expectedSessionId?: SessionId;
+	/**
+	 * Stable target identity, authoritative over `name`. Only legacy omission of
+	 * `expectedSessionId` permits revival.
+	 */
 	agentId?: AgentId;
 	/** The target agent's registered name fallback. */
 	name: string;
@@ -1716,6 +1761,8 @@ export enum SteerDelivery {
 
 /** Response returned only after the selected adapter accepts the redirect operation. */
 export interface SteerResponse {
+	/** Actual runtime binding selected by the router. */
+	sessionId?: SessionId;
 	accepted: boolean;
 	delivery: SteerDelivery;
 	turnId?: string;

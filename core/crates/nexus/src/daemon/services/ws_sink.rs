@@ -351,6 +351,23 @@ fn lifecycle_effect(
 
 #[async_trait]
 impl EventSink for WsSink {
+    async fn project_runtime_binding(
+        &self,
+        session: &nexus_contracts::SessionId,
+        agent: &nexus_contracts::AgentId,
+    ) {
+        // Reuse the exact canonical builder, but do not emit a duplicate spawn notification
+        // or ephemeral fleet event. Missing/mismatched store authority yields no projection.
+        let binding = WsEvent::AgentSpawned {
+            session_id: session.clone(),
+            name: None,
+            agent_id: Some(agent.0.clone()),
+        };
+        for effect in self.lifecycle_projection_effects(&binding).await {
+            self.project(effect).await;
+        }
+    }
+
     async fn project(&self, effect: GatewayProjectionEffect) {
         if let Some(gateway_stream) = &self.gateway_stream {
             gateway_stream.publish_projection(

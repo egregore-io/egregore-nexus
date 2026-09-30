@@ -95,9 +95,8 @@ const presenceState = (m: MemberRow): string =>
 // daemon read-view would match no backend project and return nothing — which is what made the
 // Admin table / rosters go empty whenever a project was selected.
 
-// Fleet events invalidate the canonical member cache in providers.tsx. This is
-// only a bounded visible-tab fallback for missed push events and non-fleet read
-// views. Hidden tabs remain completely quiet.
+// Read views refresh over HTTP, without a shared shell WebSocket.
+// Periodic reads pause in hidden tabs; stale data refreshes on return.
 const FALLBACK_REFETCH_MS = 30_000;
 const visibleFallbackInterval = (): number | false =>
   typeof document !== "undefined" && document.hidden ? false : FALLBACK_REFETCH_MS;
@@ -203,10 +202,19 @@ export function useRoster(thread?: string): { members: MemberItem[]; isLoading: 
   return { members, isLoading: all.isLoading };
 }
 
+/** Resolve canonical agent ids first while retaining legacy display-name deep links. */
+function memberForAgentReference(
+  rows: MemberRow[] | undefined,
+  agentReference: string,
+): MemberRow | undefined {
+  return rows?.find((row) => row.agentId === agentReference)
+    ?? rows?.find((row) => row.name === agentReference);
+}
+
 /** Agent-detail facts for the DM context panel. `undefined` until resolved. */
-export function useAgentFacts(name: string): { facts: Fact[]; isLoading: boolean; found: boolean } {
+export function useAgentFacts(agentReference: string): { facts: Fact[]; isLoading: boolean; found: boolean } {
   const q = useMembers();
-  const m = (q.data ?? []).find((x) => x.name === name);
+  const m = memberForAgentReference(q.data, agentReference);
   const facts: Fact[] = m
     ? [
         { dt: "Name", dd: m.name },
@@ -594,21 +602,22 @@ export function useChannelView(name: string): ConversationView {
   };
 }
 
-/** Build a DM pane header from the live member row (presence). */
-export function useDmView(name: string): ConversationView {
+/** Build a DM pane header from an exact agent id or legacy display name. */
+export function useDmView(agentReference: string): ConversationView {
   const { data } = useMembers();
-  const m = data?.find((x) => x.name === name);
+  const m = memberForAgentReference(data, agentReference);
+  const displayName = m?.name ?? agentReference;
   return {
-    key: name,
-    title: name,
+    key: m?.agentId ?? agentReference,
+    title: displayName,
     target: {
       verb: "dm",
-      name,
+      name: displayName,
       ...(m?.agentId ? { agentId: m.agentId } : {}),
     },
     presence: presenceOf(m?.presence),
-    composerPlaceholder: `Message ${name}`,
-    composerLabel: `Message ${name}`,
+    composerPlaceholder: `Message ${displayName}`,
+    composerLabel: `Message ${displayName}`,
   };
 }
 

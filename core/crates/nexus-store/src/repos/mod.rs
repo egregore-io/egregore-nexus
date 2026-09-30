@@ -45,6 +45,7 @@ pub use agent_session_messages::{
 pub use agents::{AgentOwner, AgentRef, Agents, NewAgent};
 pub use command_intents::{
     CommandIntentDepth, CommandIntentReceipt, CommandIntentRow, CommandIntents, NewCommandIntent,
+    PromptCommandOutcome,
 };
 pub use command_queue::{CommandQueue, CommandQueueEventsPage, CommandQueueMutationOutcome};
 pub use daemon_state::DaemonState;

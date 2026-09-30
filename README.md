@@ -35,7 +35,61 @@ nexus webconsole launch     # start dependencies and open the browser
 ```
 
 Installing the complete package lets `nexus daemon install` register both daemon and Gateway in
-dependency order. Webconsole remains on demand.
+dependency order. The daemon service preserves the executable search path present during
+installation and adds stable platform fallbacks, so user-installed harnesses remain discoverable
+after login or reboot. Rerun `nexus daemon install` to refresh an existing service definition.
+Webconsole remains on demand.
+
+The Webconsole shell and direct messages use HTTP only: caller-scoped DM history uses long
+polling, and the sidebar roster refreshes every 30 seconds while visible. Existing `/agent/...`
+streaming views remain available, including route-specific WebSocket support forwarded by the
+packaged Webconsole.
+
+Successful agent resumes republish canonical identity/runtime snapshots even when the session
+already appears online to the daemon. In buffered projection mode, a separately started Gateway
+can replay those updates after connecting; Gateway startup remains explicit.
+Unacknowledged snapshots retain their assigned sequence positions, so repeated updates do not
+create silent replay gaps that strand the Gateway directory offline.
+
+Session composers should use queued prompts for ordinary Send, not infer strict steer from
+displayed activity. Unsupported delivery/model options are rejected rather than discarded,
+including on redirected queued prompts.
+Daemon and Gateway HTTP callers can opt into exact dispatch with stable `agentId` plus
+`expectedSessionId`: prompt, steer, interrupt, compact, and new queue mutations reject a
+replaced/absent runtime instead of reviving or retargeting it. Omission preserves
+legacy HTTP/IPC/CLI routing. Agent-session WebSocket commands require the captured exact
+pair, supplied by the retained browser producer only after `session.bound`; missing or
+foreign response bindings are not reported as success. Binding is transport/routing
+evidence, not native admission proof. External client integration remains a separate step.
+Exact queue reads and reconnects can inspect a retained earlier session without
+warming it or substituting the agent's newer session. Queue recovery preserves
+original command binding and authenticated caller correlation; it does not certify
+PACT transcript paging or native delivery.
+Failed queue transitions also refresh that existing snapshot. A lost ACK or later
+HTTP error is not safe-retry evidence: clients retain the original input identity
+until a validated ACK or terminal fact settles transport pending, without
+inventing a fresh send ID.
+Codex native activity is ingested before display processing, so a blocked display write
+does not hold a subsequently read completed turn busy. Private binding ownership also
+prevents a superseded request from entering native submission; an already admitted request
+remains potentially accepted after cancellation, not safe to resend automatically.
+Ordinary queued prompts also retain a durable attempt fence: a timeout after adapter
+entry, restart, or unresolved lease expiry cannot automatically replay that command.
+Such outcomes remain delivery-uncertain under their original identity, not rejected
+or delivered. A deadline that wins before adapter entry prevents later invocation.
+Observed ACP prompts wait for their correlated protocol response rather than relay
+spawn. This is completion-bound evidence, not an early native acknowledgement;
+strict output follows the accepted-input event, while legacy streaming is unchanged.
+Headed Claude activity uses ordered native hook records before display processing.
+Receipt matching retains the binding owner, native session and hook offset; an old
+hook or delayed forwarder cannot settle a newer binding. Terminal writes alone do
+not prove acceptance, and direct human input cannot be atomically reserved by Nexus.
+Adapters expose a turn observation separately from queue position and presence:
+verified idle, native open, unknown, or unavailable. Exact queue snapshots carry
+that evidence and actual redirect capability, refreshing subscribed lanes even
+without queue transitions. Missing evidence is not idle, and an observation does
+not reserve the next native input operation.
+See [composer delivery and retry safety](docs/composer-delivery.md).
 
 Check or update the exact npm/Cargo installation that launched the command:
 

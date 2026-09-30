@@ -24,6 +24,8 @@ import {
 import {
   handleConversationQueueGet,
   handleConversationQueuePost,
+  exactSessionError,
+  exactSessionResultError,
 } from "@server/command/sessionQueue";
 
 function json(body: unknown, status = 200): Response {
@@ -58,22 +60,37 @@ export async function handleConversationPromptPost(
   request: Request,
   deps: ConversationPromptDeps = {},
 ): Promise<Response> {
-  let body: { name?: string; agentId?: string; text?: string; clientMessageId?: string };
+  let body: {
+    name?: string;
+    agentId?: string;
+    expectedSessionId?: string;
+    text?: string;
+    clientMessageId?: string;
+    delivery?: unknown;
+    modelSelection?: unknown;
+  };
   try {
-    body = (await request.json()) as {
-      name?: string;
-      agentId?: string;
-      text?: string;
-      clientMessageId?: string;
-    };
+    body = (await request.json()) as typeof body;
   } catch {
     return json({ error: "body must be JSON" }, 400);
+  }
+  const selectorError = exactSessionError(body);
+  if (selectorError) return json({ error: selectorError }, 400);
+  // Never discard an explicit model selection or delivery policy and enqueue a different
+  // operation on the user's behalf.
+  for (const option of ["delivery", "modelSelection"] as const) {
+    if (body[option] != null) {
+      return json({ error: `${option} is not supported by this prompt endpoint` }, 400);
+    }
   }
   const targetName = body.name ?? body.agentId;
   if (!targetName || !body.text) return json({ error: "name and text are required" }, 400);
   const target = {
     ...agentCommandTarget(targetName),
     ...(body.agentId ? { agentId: body.agentId } : {}),
+    ...(body.expectedSessionId
+      ? { expectedSessionId: body.expectedSessionId }
+      : {}),
   };
 
   // Same identity resolution as every other gateway surface (`/api/v1/$`,
@@ -101,6 +118,8 @@ export async function handleConversationPromptPost(
       deps.commandIngress,
       body.clientMessageId,
     );
+    const resultError = exactSessionResultError(body.expectedSessionId, queued);
+    if (resultError) return json({ error: resultError }, 502);
     return json({
       ok: true,
       receipt: {

@@ -181,9 +181,11 @@ export const getHookAudit: Handler = async ({ deps, req }) =>
   ));
 
 export const getDmHistory: Handler = async ({ deps, params, req }) => {
+  const caller = req.caller;
+  if (!caller) return fail(401, "not logged in", "unauthorized");
   if (deps.canonicalDb) {
     const db = await deps.canonicalDb();
-    const read = () => canonicalDmHistory(db, params.name!, {
+    const read = () => canonicalDmHistory(db, params.name!, caller.name, {
       limit: intParam(req.query.limit) ?? 50,
       before: req.query.before,
       after: req.query.after,
@@ -200,8 +202,8 @@ export const getDmHistory: Handler = async ({ deps, params, req }) => {
   return withHumanReadReceipt(
     deps, req, await dmHistory(await deps.db(), {
       with: params.name!,
-      me: req.caller?.name ?? req.query.me,
-      project: req.query.project ?? req.caller?.project,
+      me: caller.name,
+      project: req.query.project ?? caller.project,
       limit: intParam(req.query.limit),
       before: intParam(req.query.before),
       after: intParam(req.query.after),

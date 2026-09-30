@@ -1,11 +1,11 @@
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
 use nexus::webconsole_lifecycle::{
     build_webconsole_spawn_command, classify_webconsole_start_error, launch_webconsole_with,
     resolve_webconsole_installation, start_webconsole_with, stop_webconsole_with,
-    WebconsoleBackend, WebconsoleInstallation, WebconsoleInvocation, WebconsoleRuntimeStatus,
-    WebconsoleStartOptions,
+    WebconsoleBackend, WebconsoleInstallation, WebconsoleRuntimeStatus, WebconsoleStartOptions,
 };
 
 struct FakeBackend {
@@ -30,7 +30,6 @@ impl WebconsoleBackend for FakeBackend {
         self.calls.push("resolve");
         Ok(WebconsoleInstallation {
             executable: PathBuf::from("/usr/bin/nexus-webui"),
-            invocation: WebconsoleInvocation::Direct,
         })
     }
 
@@ -217,11 +216,10 @@ fn explicit_webconsole_symlink_resolves_to_the_spawned_executable() {
             .unwrap();
 
     assert_eq!(installation.executable, executable.canonicalize().unwrap());
-    assert_eq!(installation.invocation, WebconsoleInvocation::Direct);
 }
 
 #[test]
-fn windows_webconsole_command_files_use_the_native_command_shim() {
+fn windows_webconsole_command_files_resolve_to_the_shim_itself() {
     for extension in ["cmd", "bat"] {
         let directory = tempfile::tempdir().unwrap();
         let launcher = directory.path().join(format!("nexus-webui.{extension}"));
@@ -232,72 +230,44 @@ fn windows_webconsole_command_files_use_the_native_command_shim() {
                 .unwrap();
 
         assert_eq!(installation.executable, launcher);
-        assert_eq!(
-            installation.invocation,
-            WebconsoleInvocation::WindowsCommandShim
-        );
     }
 }
 
-#[cfg(unix)]
 #[test]
-fn windows_command_shims_with_spaced_paths_preserve_the_start_argv() {
-    use std::os::unix::fs::PermissionsExt;
-
+fn windows_command_shims_are_spawned_as_the_program_itself() {
+    // A hand-rolled `cmd.exe /D /S /C "<path>"` wrapper cannot survive `Command::arg`, which
+    // escapes the quotes into `\"<path>\"` and leaves cmd.exe reporting an unrecognised command.
+    // The shim must be the program, so the standard library builds the batch command line.
     for extension in ["cmd", "bat"] {
         let directory = tempfile::tempdir().unwrap();
-        let shim_dir = directory.path().join("command shim");
         let install_dir = directory.path().join("Program Files/Egregore Nexus");
-        std::fs::create_dir_all(&shim_dir).unwrap();
         std::fs::create_dir_all(&install_dir).unwrap();
         let launcher = install_dir.join(format!("nexus-webui.{extension}"));
         std::fs::write(&launcher, "@echo off\r\n").unwrap();
-        let capture = directory.path().join(format!("{extension}-argv.txt"));
-        let cmd = shim_dir.join("cmd.exe");
-        std::fs::write(
-            &cmd,
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAPTURE_ARGS\"\n",
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&cmd).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&cmd, permissions).unwrap();
 
         let installation =
             resolve_webconsole_installation(Some(launcher.clone().into_os_string()), None, true)
                 .unwrap();
         let discovery = directory.path().join("Nexus Home/webconsole.json");
-        let mut command = build_webconsole_spawn_command(
+        let command = build_webconsole_spawn_command(
             &installation,
             "http://127.0.0.1:4100",
             &options(),
             &discovery,
         );
-        let status = command
-            .env("PATH", &shim_dir)
-            .env("CAPTURE_ARGS", &capture)
-            .status()
-            .unwrap();
 
-        assert!(status.success());
+        assert_eq!(command.get_program(), launcher.as_os_str());
         assert_eq!(
-            std::fs::read_to_string(&capture)
-                .unwrap()
-                .lines()
-                .collect::<Vec<_>>(),
+            command.get_args().collect::<Vec<_>>(),
             vec![
-                "/D".to_string(),
-                "/S".to_string(),
-                "/C".to_string(),
-                format!("\"{}\"", launcher.display()),
-                "--host".to_string(),
-                "127.0.0.1".to_string(),
-                "--port".to_string(),
-                "4200".to_string(),
-                "--gateway-url".to_string(),
-                "http://127.0.0.1:4100".to_string(),
-                "--discovery".to_string(),
-                discovery.display().to_string(),
+                OsStr::new("--host"),
+                OsStr::new("127.0.0.1"),
+                OsStr::new("--port"),
+                OsStr::new("4200"),
+                OsStr::new("--gateway-url"),
+                OsStr::new("http://127.0.0.1:4100"),
+                OsStr::new("--discovery"),
+                discovery.as_os_str(),
             ]
         );
     }
@@ -360,7 +330,6 @@ fn windows_webconsole_executable_stays_a_direct_invocation() {
             .unwrap();
 
     assert_eq!(installation.executable, launcher);
-    assert_eq!(installation.invocation, WebconsoleInvocation::Direct);
 }
 
 fn options() -> WebconsoleStartOptions {

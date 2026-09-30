@@ -36,6 +36,16 @@ use std::time::Duration;
 
 use tokio::sync::broadcast;
 
+/// Receipt boundary for one programmatic native-harness turn.
+///
+/// The default input path calls this after [`HarnessInput::send_turn`] succeeds. Structured
+/// harnesses may defer it until their native event stream proves the exact input was admitted,
+/// allowing callers to publish one canonical accepted event instead of a second synthetic echo.
+#[async_trait::async_trait]
+pub trait TurnAcceptanceObserver: Send + Sync {
+    async fn accepted(&self);
+}
+
 /// Claude commits a bracketed paste asynchronously. Submitting in the same PTY write can leave a
 /// large payload sitting in the composer as `[Pasted text ...]`; match the proven tmux sequence by
 /// giving the paste one UI tick before sending Enter as a separate terminal input event.
@@ -65,10 +75,41 @@ pub trait HarnessInput: Send + Sync {
     /// nuance (bracketed paste, verified Enter, etc.); callers just pass the rendered turn text.
     async fn send_turn(&self, text: &str) -> Result<(), String>;
 
+    /// Deliver `text` and report its authoritative acceptance boundary.
+    ///
+    /// Terminal-only backends retain the historical behavior: successful submission is the only
+    /// available boundary. Structured harness adapters override this to correlate their native
+    /// input receipt before calling `observer`.
+    async fn send_turn_observed(
+        &self,
+        text: &str,
+        observer: Arc<dyn TurnAcceptanceObserver>,
+    ) -> Result<(), String> {
+        self.send_turn(text).await?;
+        observer.accepted().await;
+        Ok(())
+    }
+
     /// What the successful return from [`send_turn`](Self::send_turn) proves.
     fn turn_completion_evidence(&self) -> TurnCompletionEvidence {
         TurnCompletionEvidence::InputAcceptedOnly
     }
+
+    /// Binding-local native work, including manual input not represented by a daemon call.
+    fn has_observed_open_turn(&self) -> bool {
+        false
+    }
+
+    /// Read native binding evidence; raw terminal acceptance does not prove idle or open.
+    fn observe_turn(&self) -> nexus_contracts::TurnObservation {
+        Default::default()
+    }
+
+    /// Wait only for established native work; unknown observation must not wait forever.
+    async fn wait_for_observed_turn_completion(&self) {}
+
+    /// Revoke the observation owner when its transport binding is replaced.
+    fn invalidate_observation_owner(&self) {}
 
     /// Interrupt the active terminal turn before a redirect-now send.
     async fn interrupt_active_turn(&self) -> Result<(), String> {

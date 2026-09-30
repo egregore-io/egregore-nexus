@@ -331,9 +331,9 @@ impl AppState {
         let store = self.store.clone();
         Arc::new(move |session, thread_id| {
             let store = store.clone();
-            tokio::spawn(async move {
+            Box::pin(async move {
                 persist_codex_thread_binding_with_retry(store, session, thread_id).await;
-            });
+            })
         })
     }
 

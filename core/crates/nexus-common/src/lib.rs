@@ -22,7 +22,9 @@ pub use config::{
 };
 pub use credential::hash_runtime_credential;
 pub use error::NexusError;
-pub use ids::{new_message_id, new_project_id, new_session_id, new_source_token, new_thread_id};
+pub use ids::{
+    new_binding_id, new_message_id, new_project_id, new_session_id, new_source_token, new_thread_id,
+};
 pub use log::init_tracing;
 pub use process_ids::RuntimeProcessIds;
 pub use provenance::{

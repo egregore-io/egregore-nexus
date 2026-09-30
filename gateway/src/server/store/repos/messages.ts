@@ -21,8 +21,8 @@ export type CanonicalMessageTarget =
   | { threadId: string }
   | { threadName: string }
   | { toAgentId: string }
-  | { dmAgentId: string }
-  | { dmName: string }
+  | { dmAgentId: string; callerName: string }
+  | { dmName: string; callerName: string }
   | { topic: string };
 
 export interface MessagePageOptions {
@@ -90,16 +90,28 @@ function targetClause(target: CanonicalMessageTarget): TargetClause {
   }
   if ("dmAgentId" in target) {
     return {
-      sql: "kind = 'dm' AND (from_agent_id = ? OR to_agent_id = ?)",
-      args: [target.dmAgentId, target.dmAgentId],
-      key: `dm:${target.dmAgentId}`,
+      sql: `kind = 'dm' AND ((from_name = ? AND to_agent_id = ?)
+            OR (from_agent_id = ? AND to_name = ?))`,
+      args: [
+        target.callerName,
+        target.dmAgentId,
+        target.dmAgentId,
+        target.callerName,
+      ],
+      key: `dm:${target.dmAgentId}:with:${target.callerName}`,
     };
   }
   if ("dmName" in target) {
     return {
-      sql: "kind = 'dm' AND (from_name = ? OR to_name = ?)",
-      args: [target.dmName, target.dmName],
-      key: `dm-name:${target.dmName}`,
+      sql: `kind = 'dm' AND ((from_name = ? AND to_name = ?)
+            OR (from_name = ? AND to_name = ?))`,
+      args: [
+        target.callerName,
+        target.dmName,
+        target.dmName,
+        target.callerName,
+      ],
+      key: `dm-name:${target.dmName}:with:${target.callerName}`,
     };
   }
   return { sql: "topic = ?", args: [target.topic], key: `topic:${target.topic}` };

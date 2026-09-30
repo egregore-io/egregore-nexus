@@ -264,6 +264,7 @@ async fn passive_pty_text_reaches_stream_events() {
         }),
         "prompt",
         PromptRequest {
+            expected_session_id: None,
             agent_id: None,
             name: "ada".into(),
             text: marker.clone(),

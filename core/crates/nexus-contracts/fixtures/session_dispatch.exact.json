@@ -1,0 +1,11 @@
+{
+  "promptRequest": { "agentId": "a_owned", "expectedSessionId": "s_owned", "name": "display", "text": "hello" },
+  "steerRequest": { "agentId": "a_owned", "expectedSessionId": "s_owned", "name": "display", "text": "redirect" },
+  "interruptRequest": { "agentId": "a_owned", "expectedSessionId": "s_owned", "name": "display" },
+  "compactRequest": { "agentId": "a_owned", "expectedSessionId": "s_owned", "name": "display" },
+  "queueMutationRequest": { "agentId": "a_owned", "expectedSessionId": "s_owned", "action": "cancel", "clientMutationId": "mutation", "commandId": "command", "expectedRevision": 1, "commandIds": [], "expectedRevisions": [] },
+  "promptResponse": { "delivered": true, "sessionId": "s_owned" },
+  "steerResponse": { "accepted": true, "delivery": "steered", "sessionId": "s_owned" },
+  "interruptResponse": { "interrupted": true, "sessionId": "s_owned" },
+  "compactResponse": { "started": true, "sessionId": "s_owned" }
+}

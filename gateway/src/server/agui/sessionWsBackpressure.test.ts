@@ -226,7 +226,12 @@ describe("agent-session WebSocket backpressure", () => {
     await firstControl.closed;
     const reconnectCursor = opaqueCursorFromClose(first);
     expect(reconnectCursor).toBe(priorCursor);
-    expect(first.sent).toEqual([prior, siblingA]);
+    const binding = JSON.stringify({
+      t: "session.bound",
+      agentId: `a_${sessionId}`,
+      sessionId,
+    });
+    expect(first.sent).toEqual([binding, prior, siblingA]);
 
     const resumed = new TestSocket();
     const resumedControl = handleWs(
@@ -244,7 +249,7 @@ describe("agent-session WebSocket backpressure", () => {
     );
 
     await resumedControl.closed;
-    expect(resumed.sent).toEqual([siblingA, siblingB]);
+    expect(resumed.sent).toEqual([binding, siblingA, siblingB]);
   });
 
   it("rejects a frame that would exceed the byte bound before accepting it", async () => {
@@ -298,8 +303,9 @@ describe("agent-session WebSocket backpressure", () => {
     await keeper.ready;
 
     const slow = new TestSocket();
-    slow.onSend = () => {
-      slow.bufferedAmount = MAX_OUTBOUND_BYTES + 1;
+    slow.onSend = (payload) => {
+      if (JSON.parse(payload).t !== "session.bound")
+        slow.bufferedAmount = MAX_OUTBOUND_BYTES + 1;
     };
     const first = handleWs(
       slow,
@@ -382,14 +388,14 @@ describe("agent-session WebSocket backpressure", () => {
       cursor: secondCursor,
       epoch: BOOT_ID,
     })}\n\n`);
-    await vi.waitFor(() => expect(socket.sent).toHaveLength(2));
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(3));
 
     socket.bufferedAmount = MAX_OUTBOUND_BYTES + 1;
     onSnapshot?.({ sessionId, seq: 2, commands: [] });
 
     await control.closed;
     expect(opaqueCursorFromClose(socket)).toBe(firstCursor);
-    expect(socket.sent).toHaveLength(2);
+    expect(socket.sent).toHaveLength(3);
   });
 
   it("allows one bounded canonical queue snapshot on an empty socket", async () => {
@@ -429,7 +435,7 @@ describe("agent-session WebSocket backpressure", () => {
     });
 
     expect(socket.closes).toEqual([]);
-    expect(JSON.parse(socket.sent[0] ?? "{}")).toMatchObject({
+    expect(JSON.parse(socket.sent[1] ?? "{}")).toMatchObject({
       t: "queue.snapshot",
       sessionId,
       seq: 100,

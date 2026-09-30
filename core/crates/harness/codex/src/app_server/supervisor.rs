@@ -470,17 +470,31 @@ impl CodexAppServer {
         let child = command
             .spawn()
             .map_err(|e| CodexRpcError::Connect(format!("spawn {:?}: {e}", opts.codex_exe)))?;
+        // Own the physical child before the first post-spawn await. Unix cancellation reaps it
+        // and cleans its endpoint before setup exclusion is released. Other platforms retain
+        // their existing abnormal-Drop termination behavior below.
+        let process_ledger = child.id().and_then(runtime_process_ids_for_pid);
+        let mut server = CodexAppServer {
+            #[cfg(unix)]
+            sock: sock.clone(),
+            #[cfg(windows)]
+            sock: PathBuf::new(),
+            codex_home,
+            child: Some(child),
+            process_ledger,
+            pid_file: None,
+        };
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         #[cfg(unix)]
         let endpoint = sock;
         #[cfg(windows)]
-        let (child, endpoint) = {
-            let mut child = child;
-            let endpoint =
-                wait_for_windows_websocket_endpoint(&mut child, &stderr_path, deadline).await?;
-            (child, endpoint)
-        };
-        let process_ledger = child.id().and_then(runtime_process_ids_for_pid);
+        let endpoint = wait_for_windows_websocket_endpoint(
+            server.child.as_mut().unwrap(),
+            &stderr_path,
+            deadline,
+        )
+        .await?;
+        server.sock = endpoint.clone();
         let pid_file = process_ledger.map(|ids| {
             let pid_file = opts.session_dir.join("app-server.pid");
             let contents = format!("{{\"pid\":{},\"pgid\":{}}}\n", ids.os_pid, ids.os_pgid);
@@ -490,7 +504,7 @@ impl CodexAppServer {
                 })
                 .map(|_| pid_file)
         });
-        let pid_file = match pid_file {
+        server.pid_file = match pid_file {
             Some(Ok(path)) => Some(path),
             Some(Err(e)) => return Err(e),
             None => None,
@@ -532,13 +546,7 @@ impl CodexAppServer {
         // their own handle via `CodexAppServer::socket()`).
         drop(rpc);
 
-        Ok(CodexAppServer {
-            sock: endpoint,
-            codex_home,
-            child: Some(child),
-            process_ledger,
-            pid_file,
-        })
+        Ok(server)
     }
 
     /// Adopt an already-running app-server bound to `sock`.
@@ -629,6 +637,9 @@ impl Drop for CodexAppServer {
             "drop",
         );
         let _ = std::fs::remove_file(&self.sock);
+        if let Some(pid_file) = &self.pid_file {
+            let _ = std::fs::remove_file(pid_file);
+        }
     }
 }
 

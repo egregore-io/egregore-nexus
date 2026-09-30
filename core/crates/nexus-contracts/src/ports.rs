@@ -579,6 +579,7 @@ pub trait AgentTurnExecutionPort: Send + Sync {
         self.prompt_observed(_recipient, _text, _events, _accepted_event)
             .await?;
         Ok(SteerResponse {
+            session_id: None,
             accepted: true,
             delivery: crate::SteerDelivery::InterruptedAndStarted,
             turn_id: None,
@@ -588,6 +589,15 @@ pub trait AgentTurnExecutionPort: Send + Sync {
     /// Capability advertised by the adapter underneath this session.
     fn steer_capability(&self, _recipient: &SessionId) -> crate::SteerCapability {
         crate::SteerCapability::None
+    }
+
+    /// Read native evidence without I/O or changing execution authority. Legacy implementations
+    /// are unknown, not verified idle, and do not invent a binding/revision stamp.
+    fn observe_turn(&self, recipient: &SessionId) -> crate::TurnObservation {
+        crate::TurnObservation {
+            steer_capability: self.steer_capability(recipient),
+            ..Default::default()
+        }
     }
 
     /// Interrupt the adapter's active turn. Implementations must address the adapter's own turn
@@ -714,4 +724,9 @@ pub trait EventSink: Send + Sync {
     /// existing event-sink contract. The production daemon overrides it with the bounded
     /// same-epoch Gateway projection publisher.
     async fn project(&self, _effect: crate::GatewayProjectionEffect) {}
+
+    /// Refresh canonical Gateway identity/runtime snapshots after a successful exact binding.
+    /// This is not a new spawn or a compatibility presence transition. The production sink
+    /// re-reads and validates both identities; embedders without projections remain unchanged.
+    async fn project_runtime_binding(&self, _session: &SessionId, _agent: &AgentId) {}
 }

@@ -1,78 +1,74 @@
-import type { PropsWithChildren } from "react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, render, waitFor } from "@testing-library/react";
+import { focusManager } from "@tanstack/react-query";
+import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { GatewayEventInvalidator } from "./providers";
-import { qk } from "@server/read/keys";
-
-class FakeWebSocket extends EventTarget {
-  static instances: FakeWebSocket[] = [];
-  static OPEN = 1;
-  readyState = 0;
-  sent: string[] = [];
-  readonly url: string;
-
-  constructor(url: string | URL) {
-    super();
-    this.url = String(url);
-    FakeWebSocket.instances.push(this);
-  }
-
-  open(): void {
-    this.readyState = FakeWebSocket.OPEN;
-    this.dispatchEvent(new Event("open"));
-  }
-
-  send(value: string): void {
-    this.sent.push(value);
-  }
-
-  message(value: unknown): void {
-    this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(value) }));
-  }
-
-  close(): void {
-    this.readyState = 3;
-    this.dispatchEvent(new Event("close"));
-  }
-}
-
-function wrapperWithClient(queryClient: QueryClient) {
-  return function Wrapper({ children }: PropsWithChildren) {
-    return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
-  };
-}
+import { AppProviders } from "./providers";
+import { useAgentsLive, useDms } from "@modules/shell/useShellNav";
 
 afterEach(() => {
-  FakeWebSocket.instances = [];
+  cleanup();
+  focusManager.setFocused(undefined);
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
-describe("GatewayEventInvalidator", () => {
-  it("subscribes once and invalidates the canonical roster on fleet status", async () => {
-    vi.stubGlobal("WebSocket", FakeWebSocket);
-    const queryClient = new QueryClient();
-    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+function setup() {
+  vi.useFakeTimers();
+  focusManager.setFocused(true);
+  const sockets = vi.fn();
+  vi.stubGlobal("WebSocket", class {
+    constructor() { sockets(); }
+    addEventListener() {}
+    close() {}
+  });
+  let online = true;
+  const fetchSpy = vi.fn(async () => new Response(JSON.stringify([
+    { name: "Agent", agentId: "a_test", kind: "agent", presence: online ? "online" : "offline" },
+  ]), { status: 200 }));
+  vi.stubGlobal("fetch", fetchSpy);
+  const hook = renderHook(() => ({ dms: useDms(), live: useAgentsLive() }), {
+    wrapper: AppProviders,
+  });
+  return { ...hook, sockets, fetchSpy, goOffline: () => { online = false; } };
+}
 
-    render(<GatewayEventInvalidator />, { wrapper: wrapperWithClient(queryClient) });
-    const socket = FakeWebSocket.instances[0]!;
-    act(() => socket.open());
+async function advance(ms: number) {
+  await act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+}
 
-    expect(socket.sent).toEqual([
-      JSON.stringify({ t: "subscribe", topic: "sys.fleet.status", afterSeq: 0 }),
-    ]);
+describe("HTTP-only shell", () => {
+  it("never opens a WebSocket and refreshes the roster over HTTP", async () => {
+    const probe = setup();
+    await advance(1);
+    expect(probe.result.current.dms.data?.[0]?.agentId).toBe("a_test");
+    expect(probe.result.current.live.data).toBe(1);
+    expect(probe.sockets).not.toHaveBeenCalled();
 
-    act(() => {
-      socket.message({
-        type: "developer.event",
-        event: { topic: "sys.fleet.status", lifecycle: "status", seq: 7 },
-      });
-    });
+    probe.goOffline();
+    await advance(30_001);
+    expect(probe.fetchSpy.mock.calls.length).toBeGreaterThan(1);
+    expect(probe.result.current.dms.data).toEqual([]);
+    expect(probe.result.current.live.data).toBe(0);
+    expect(probe.sockets).not.toHaveBeenCalled();
+  });
 
-    await waitFor(() => {
-      expect(invalidate).toHaveBeenCalledWith({ queryKey: qk.members("all") });
-    });
+  it("pauses periodic reads when hidden, refreshes on return, and stops on unmount", async () => {
+    const probe = setup();
+    await advance(1);
+    act(() => { focusManager.setFocused(false); });
+    const initialReads = probe.fetchSpy.mock.calls.length;
+    probe.goOffline();
+    await advance(60_000);
+    expect(probe.fetchSpy).toHaveBeenCalledTimes(initialReads);
+
+    act(() => { focusManager.setFocused(true); });
+    await advance(1);
+    expect(probe.result.current.live.data).toBe(0);
+    expect(probe.fetchSpy.mock.calls.length).toBeGreaterThan(initialReads);
+    probe.unmount();
+    const finalReads = probe.fetchSpy.mock.calls.length;
+    await advance(60_000);
+    expect(probe.fetchSpy).toHaveBeenCalledTimes(finalReads);
   });
 });

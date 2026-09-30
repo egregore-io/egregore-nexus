@@ -13,6 +13,10 @@ import { currentHuman } from "@server/identity/human";
 import { parseCookies } from "@server/http/cookies";
 import type { CompactResponse } from "@shared/types";
 import {
+  exactSessionError,
+  exactSessionResultError,
+} from "@server/command/sessionQueue";
+import {
   localOperatorCaller,
   isLocalOperatorWebAuthMode,
   webAuthModeFromEnv,
@@ -53,17 +57,27 @@ function statusForError(err: unknown): number {
 }
 
 export async function handleConversationCompactPost(request: Request): Promise<Response> {
-  let body: { name?: string; agentId?: string; clientMessageId?: string };
+  let body: {
+    name?: string;
+    agentId?: string;
+    expectedSessionId?: string;
+    clientMessageId?: string;
+  };
   try {
     body = (await request.json()) as typeof body;
   } catch {
     return json({ error: "body must be JSON" }, 400);
   }
+  const selectorError = exactSessionError(body);
+  if (selectorError) return json({ error: selectorError }, 400);
   const targetName = body.name ?? body.agentId;
   if (!targetName) return json({ error: "name is required" }, 400);
   const target = {
     ...agentCommandTarget(targetName),
     ...(body.agentId ? { agentId: body.agentId } : {}),
+    ...(body.expectedSessionId
+      ? { expectedSessionId: body.expectedSessionId }
+      : {}),
   };
 
   // Same identity resolution as every other gateway surface (`/api/v1/$`,
@@ -89,6 +103,8 @@ export async function handleConversationCompactPost(request: Request): Promise<R
       { timeoutMs: COMPACT_COMMAND_TIMEOUT_MS },
       body.clientMessageId,
     );
+    const resultError = exactSessionResultError(body.expectedSessionId, result);
+    if (resultError) return json({ error: resultError }, 502);
     return json({ ok: true, result }, 201);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

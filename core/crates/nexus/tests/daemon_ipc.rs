@@ -24,6 +24,255 @@ async fn state() -> AppState {
     AppState::wire(store, &Config::default())
 }
 
+struct ObservedQueueExec {
+    session: &'static str,
+}
+
+#[async_trait::async_trait]
+impl nexus_contracts::AgentTurnExecutionPort for ObservedQueueExec {
+    async fn inject_turn(
+        &self,
+        _: &SessionId,
+        _: &nexus_contracts::NexusBatch,
+    ) -> nexus_contracts::PortResult<()> {
+        unreachable!()
+    }
+    async fn launch(
+        &self,
+        _: nexus_contracts::SpawnRequest,
+    ) -> nexus_contracts::PortResult<nexus_contracts::SpawnResponse> {
+        unreachable!()
+    }
+    async fn remove(
+        &self,
+        _: nexus_contracts::RemoveRequest,
+    ) -> nexus_contracts::PortResult<nexus_contracts::RemoveResponse> {
+        unreachable!()
+    }
+    fn observe_turn(&self, session: &SessionId) -> nexus_contracts::TurnObservation {
+        if session.0 != self.session {
+            return nexus_contracts::TurnObservation::default();
+        }
+        nexus_contracts::TurnObservation {
+            state: nexus_contracts::TurnState::NativeOpen,
+            stamp: Some(nexus_contracts::TurnObservationStamp {
+                owner: "queue-fixture-owner".into(),
+                revision: 1,
+            }),
+            steer_capability: nexus_contracts::SteerCapability::NativeSteer,
+        }
+    }
+}
+
+fn queue_operator() -> DaemonIpcCaller {
+    DaemonIpcCaller {
+        name: Some("transport".into()),
+        project: "default".into(),
+        session_id: Some("local-operator".into()),
+        runtime_id: Some("local-operator".into()),
+        agent_id: None,
+        client_key: None,
+        kind: Kind::Human,
+        locality: Locality::Local,
+        access: None,
+        principal_id: None,
+        tier: Tier::Admin,
+    }
+}
+
+#[tokio::test]
+async fn historical_queue_observation_never_substitutes_current_native_owner() {
+    let original = state().await;
+    let state = AppState::wire_with_turn_exec(
+        original.store.clone(),
+        &Config::default(),
+        Arc::new(ObservedQueueExec { session: "S2" }),
+    );
+    state.store.identity_conn().execute_batch("INSERT INTO agents (agent_id,project,name,tier,created_at) VALUES ('A','default','otto','agent',1);
+        INSERT INTO agent_runtimes (runtime_id,agent_id,harness,active,started_at) VALUES ('S1','A','codex',0,1), ('S2','A','codex',1,2);").await.unwrap();
+    for (session, expected_state, capability) in [
+        ("S1", "unknown", "none"),
+        ("S2", "nativeOpen", "native_steer"),
+    ] {
+        let response = daemon_ipc::handle_request(
+            &state,
+            "boot-token",
+            DaemonIpcRequest {
+                version: DAEMON_IPC_PROTOCOL_VERSION,
+                token: "boot-token".into(),
+                request_id: session.into(),
+                caller: Some(queue_operator()),
+                call: DaemonIpcCall::Query {
+                    method: "local.sessionQueue.read".into(),
+                    params: serde_json::json!({"agentId":"A","expectedSessionId":session}),
+                },
+            },
+        )
+        .await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let snapshot = response.result.unwrap();
+        assert_eq!(snapshot["observation"]["sessionId"], session);
+        assert_eq!(snapshot["observation"]["state"], expected_state);
+        assert_eq!(snapshot["steerCapability"], capability);
+        assert_eq!(snapshot["turnActive"], session == "S2");
+        assert_eq!(snapshot["seq"], 0);
+        if session == "S1" {
+            assert!(snapshot["observation"].get("owner").is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn exact_retained_read_follows_real_worker_rejection_after_rebind() {
+    let state = state().await;
+    state.store.identity_conn().execute_batch("INSERT INTO agents (agent_id,project,name,tier,created_at) VALUES ('a_retained','default','retained','agent',1); INSERT INTO agent_runtimes (runtime_id,agent_id,harness,active,started_at) VALUES ('s_old','a_retained','other',1,1);").await.unwrap();
+    state.store.conn.execute_batch("INSERT INTO sessions (session_id,agent_id,name,agent,kind,tier,project,created_at) VALUES ('s_old','a_retained','retained','other','agent','agent','default',1);").await.unwrap();
+    let enqueue = daemon_ipc::handle_request(&state, "boot-token", DaemonIpcRequest {
+        version: DAEMON_IPC_PROTOCOL_VERSION, token: "boot-token".into(), request_id: "enqueue-old".into(), caller: Some(queue_operator()),
+        call: DaemonIpcCall::Enqueue { command_id:"cmd_retained".into(), kind:"harness.prompt".into(), params:serde_json::json!({"name":"retained","agentId":"a_retained","expectedSessionId":"s_old","text":"original private command","clientMessageId":"cm_retained"}), idempotency_key:Some("cm_retained".into()) },
+    }).await;
+    assert!(enqueue.error.is_none(), "{:?}", enqueue.error);
+    state.store.identity_conn().execute_batch("UPDATE agent_runtimes SET active=0,stopped_at=2; INSERT INTO agent_runtimes (runtime_id,agent_id,harness,active,started_at) VALUES ('s_new','a_retained','other',1,2);").await.unwrap();
+    state.store.conn.execute_batch("INSERT INTO sessions (session_id,agent_id,name,agent,kind,tier,project,created_at) VALUES ('s_new','a_retained','retained-new','other','agent','agent','default',2);").await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), command_worker::process_next(&state))
+            .await
+            .expect("real worker must settle the old exact row")
+            .unwrap()
+    );
+    let terminal = CommandIntents::new(&state.store)
+        .get("cmd_retained")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(terminal.status, "error");
+    let error: serde_json::Value =
+        serde_json::from_str(terminal.error_json.as_deref().unwrap()).unwrap();
+    assert!(
+        error["message"].as_str().unwrap().contains("session"),
+        "{error}"
+    );
+    let snapshot = daemon_ipc::handle_request(&state, "boot-token", DaemonIpcRequest {
+        version: DAEMON_IPC_PROTOCOL_VERSION, token:"boot-token".into(), request_id:"read-old".into(), caller:Some(queue_operator()),
+        call:DaemonIpcCall::Query { method:"local.sessionQueue.read".into(), params:serde_json::json!({"project":"default","agentId":"a_retained","expectedSessionId":"s_old","requester":queue_operator()}) },
+    }).await;
+    assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
+    let snapshot = snapshot.result.unwrap();
+    assert_eq!(snapshot["sessionId"], "s_old");
+    assert_eq!(snapshot["commands"][0]["state"], "failed");
+    assert_eq!(snapshot["commands"][0]["errorCode"], error["code"]);
+    assert_eq!(snapshot["commands"][0]["correlationOwned"], true);
+    assert_eq!(snapshot["commands"][0]["text"], "original private command");
+}
+
+#[tokio::test]
+async fn queue_read_resolves_cookie_requester_without_boot_rebind_or_writes() {
+    let state = state().await;
+    state.store.conn.execute_batch("INSERT INTO sessions (session_id,agent_id,name,agent,kind,tier,project,created_at,client_key) VALUES ('s_target','a_target','target','other','agent','agent','default',1,NULL), ('s_human_new',NULL,'human-renamed','other','human','admin','default',2,'ck_human');").await.unwrap();
+    CommandIntents::new(&state.store).insert_pending(nexus_store::repos::NewCommandIntent {
+        command_id:"cmd_human".into(),kind:"harness.prompt".into(),project:"default".into(),caller_name:"old-human-name".into(),caller_session_id:Some("s_human_old".into()),caller_agent_id:None,caller_runtime_id:Some("s_human_old".into()),caller_client_key:Some("ck_human".into()),caller_principal_id:Some("h_owner".into()),caller_kind:Some("human".into()),caller_tier:Some("admin".into()),idempotency_key:Some("same-client-id".into()),request_json:serde_json::json!({"agentId":"a_target","text":"owned text","clientMessageId":"same-client-id"}).to_string(),created_at:1,
+    }).await.unwrap();
+    for (key, principal, project, owned) in [
+        ("ck_human", "h_owner", "default", true),
+        ("ck_human", "h_other", "default", false),
+        ("unregistered", "h_owner", "default", false),
+        ("ck_human", "h_owner", "other", false),
+    ] {
+        let requester = DaemonIpcCaller {
+            client_key: Some(key.into()),
+            principal_id: Some(principal.into()),
+            project: project.into(),
+            session_id: None,
+            runtime_id: None,
+            ..queue_operator()
+        };
+        let before = state
+            .store
+            .conn
+            .query("SELECT total_changes()", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        let response = daemon_ipc::handle_request(&state,"boot-token",DaemonIpcRequest {
+            version:DAEMON_IPC_PROTOCOL_VERSION,token:"boot-token".into(),request_id:"read-human".into(),caller:Some(queue_operator()),call:DaemonIpcCall::Query {method:"local.sessionQueue.read".into(),params:serde_json::json!({"project":"default","agentId":"a_target","requester":requester,"correlationOwned":true})},
+        }).await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        assert_eq!(
+            response.result.unwrap()["commands"][0]["correlationOwned"],
+            owned,
+            "{key}/{principal}/{project}"
+        );
+        let after = state
+            .store
+            .conn
+            .query("SELECT total_changes()", ())
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get::<i64>(0)
+            .unwrap();
+        assert_eq!(before, after, "read must not register or rebind a human");
+    }
+}
+
+#[tokio::test]
+async fn unsupported_prompt_options_are_rejected_before_durable_enqueue() {
+    let state = state().await;
+    for (index, options) in [
+        serde_json::json!({"delivery": "auto"}),
+        serde_json::json!({"modelSelection": {"modelId": "target-model"}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut params =
+            serde_json::json!({"agentId": "a_target", "name": "target", "text": "preserve intent"});
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(options.as_object().unwrap().clone());
+        let command_id = format!("cmd-unsupported-options-{index}");
+        let response = daemon_ipc::handle_request(
+            &state,
+            "boot-token",
+            DaemonIpcRequest {
+                version: DAEMON_IPC_PROTOCOL_VERSION,
+                token: "boot-token".into(),
+                request_id: format!("rpc-options-{index}"),
+                caller: None,
+                call: DaemonIpcCall::Enqueue {
+                    command_id: command_id.clone(),
+                    kind: nexus_store::command_kinds::harness::PROMPT.into(),
+                    params,
+                    idempotency_key: None,
+                },
+            },
+        )
+        .await;
+        assert!(
+            response.error.is_some(),
+            "unsupported options must not silently become ordinary delivery"
+        );
+        assert_eq!(
+            response.error.unwrap().code,
+            nexus_contracts::codes::INVALID_PARAMS
+        );
+        assert!(CommandIntents::new(&state.store)
+            .get(&command_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
 fn register_request() -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
@@ -40,6 +289,122 @@ fn register_request() -> RegisterRequest {
         role: None,
         cwd: None,
     }
+}
+
+#[tokio::test]
+async fn malformed_exact_selector_is_rejected_before_any_durable_enqueue() {
+    let state = state().await;
+    for kind in [
+        nexus_store::command_kinds::harness::PROMPT,
+        nexus_store::command_kinds::harness::STEER,
+        nexus_store::command_kinds::harness::INTERRUPT,
+        nexus_store::command_kinds::harness::COMPACT,
+    ] {
+        for (index, options) in [
+            serde_json::json!({"agentId":"a_target", "expectedSessionId":null}),
+            serde_json::json!({"agentId":"a_target", "expectedSessionId":""}),
+            serde_json::json!({"agentId":"a_target", "expectedSessionId":"  "}),
+            serde_json::json!({"agentId":"a_target", "expectedSessionId":{}}),
+            serde_json::json!({"expectedSessionId":"s_target"}),
+            serde_json::json!({"agentId":null, "expectedSessionId":"s_target"}),
+            serde_json::json!({"agentId":" ", "expectedSessionId":"s_target"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut params = serde_json::json!({"name":"target", "text":"no side effects"});
+            params
+                .as_object_mut()
+                .unwrap()
+                .extend(options.as_object().unwrap().clone());
+            let command_id = format!("malformed-{kind}-{index}");
+            let response = daemon_ipc::handle_request(
+                &state,
+                "test-token",
+                DaemonIpcRequest {
+                    version: DAEMON_IPC_PROTOCOL_VERSION,
+                    token: "test-token".into(),
+                    request_id: command_id.clone(),
+                    caller: None,
+                    call: DaemonIpcCall::Enqueue {
+                        command_id: command_id.clone(),
+                        kind: kind.into(),
+                        params,
+                        idempotency_key: None,
+                    },
+                },
+            )
+            .await;
+            assert_eq!(
+                response.error.as_ref().map(|error| error.code),
+                Some(nexus_contracts::codes::INVALID_PARAMS),
+                "{kind} / {options}: {response:?}"
+            );
+            assert!(CommandIntents::new(&state.store)
+                .get(&command_id)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_exact_queue_selector_is_rejected_before_mutation_journal() {
+    let state = state().await;
+    for options in [
+        serde_json::json!({"agentId":"a_target", "expectedSessionId":null}),
+        serde_json::json!({"agentId":"a_target", "expectedSessionId":""}),
+        serde_json::json!({"expectedSessionId":"s_target"}),
+    ] {
+        let mut request = serde_json::json!({"name":"target", "action":"cancel", "clientMutationId":"malformed-mutation", "commandId":"never-created", "expectedRevision":1});
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(options.as_object().unwrap().clone());
+        let response = daemon_ipc::handle_request(
+            &state,
+            "test-token",
+            DaemonIpcRequest {
+                version: DAEMON_IPC_PROTOCOL_VERSION,
+                token: "test-token".into(),
+                request_id: "malformed-query".into(),
+                caller: Some(DaemonIpcCaller {
+                    name: Some("operator".into()),
+                    project: "metadata".into(),
+                    session_id: Some("local-operator".into()),
+                    agent_id: None,
+                    runtime_id: Some("local-operator".into()),
+                    client_key: None,
+                    kind: Kind::Human,
+                    locality: Default::default(),
+                    access: None,
+                    principal_id: None,
+                    tier: Tier::Admin,
+                }),
+                call: DaemonIpcCall::Query {
+                    method: "local.sessionQueue.mutate".into(),
+                    params: serde_json::json!({"project":"metadata", "now":1, "request":request}),
+                },
+            },
+        )
+        .await;
+        assert_eq!(
+            response.error.as_ref().map(|error| error.code),
+            Some(nexus_contracts::codes::INVALID_PARAMS),
+            "{response:?}"
+        );
+    }
+    let mut rows = state
+        .store
+        .identity_conn()
+        .query("SELECT COUNT(*) FROM command_queue_mutations", ())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -790,7 +1155,12 @@ async fn legacy_gateway_export_is_bounded_typed_and_cursor_paginated() {
 
 #[tokio::test]
 async fn local_queue_mutation_executes_atomically_inside_the_daemon_owner() {
-    let state = state().await;
+    let original = state().await;
+    let state = AppState::wire_with_turn_exec(
+        original.store.clone(),
+        &Config::default(),
+        Arc::new(ObservedQueueExec { session: "s_queue" }),
+    );
     state
         .store
         .conn
@@ -1062,8 +1432,38 @@ async fn local_queue_read_returns_typed_snapshot_and_transitions_without_raw_sto
     let snapshot = snapshot.result.unwrap();
     assert_eq!(snapshot["target"], "queue-reader");
     assert_eq!(snapshot["sessionId"], "s_queue_read");
+    assert_eq!(
+        snapshot["observation"],
+        serde_json::json!({
+            "sessionId":"s_queue_read", "state":"unavailable", "steerCapability":"none"
+        })
+    );
+    assert_eq!(snapshot["steerCapability"], "none");
     assert_eq!(snapshot["commands"][0]["commandId"], "cmd_queue_read");
     assert_eq!(snapshot["commands"][0]["state"], "queued");
+    assert_eq!(
+        snapshot["commands"][0]["correlationOwned"], false,
+        "the Gateway transport marker is not the requesting human"
+    );
+    for selector in [
+        serde_json::json!(""),
+        serde_json::json!(null),
+        serde_json::json!(123),
+    ] {
+        let malformed = daemon_ipc::handle_request(
+            &state,
+            "boot-token",
+            read(
+                "bad-exact",
+                serde_json::json!({"agentId":"a_queue_read", "expectedSessionId": selector}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            malformed.error.unwrap().code,
+            nexus_contracts::codes::INVALID_PARAMS
+        );
+    }
 
     let stale_name = daemon_ipc::handle_request(
         &state,

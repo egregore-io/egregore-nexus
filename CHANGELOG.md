@@ -1,5 +1,75 @@
 # Changelog
 
+## [0.1.6-beta.2] - Unreleased
+
+### Changed
+
+- Remove the shared Webconsole fleet WebSocket. DM navigation stays HTTP-only, with
+  visible-tab roster polling; existing agent-session streaming endpoints remain available.
+
+### Fixed
+
+- Refresh the existing exact-session queue snapshot after failed transitions as
+  well as queued transitions, so reconnecting clients can recover structured
+  terminal evidence without treating a sparse event or lost ACK as retry safety.
+- Carry adapter-owned activity and actual redirect capability on exact queue
+  snapshots. Refresh subscribed lanes independently of queue transitions, preserve
+  binding/read freshness, and do not infer native support from harness names.
+- Preserve exact historical session ownership through queue reads, terminal
+  projection and reconnect binding without warming a replacement session. Carry
+  structured terminal error codes and authenticated caller-correlation evidence
+  without treating a shared client ID as ownership.
+- Expose adapter-owned internal turn observations with fresh binding identities
+  and evidence revisions. Keep missing responses, ambiguous native evidence and
+  disconnected adapters distinct from verified idle; queue scheduling remains
+  on its existing execution path.
+- Track headed Claude activity from ordered, session-bound hook records before
+  display awaits. Keep fresh observation owners through launch/adoption/teardown,
+  correlate prompt receipts with hook provenance and acceptance-sink completion,
+  and prevent old terminals or attachment cleanup from replacing newer activity.
+  Native terminal writes and direct-human input retain their protocol limitations.
+- Wait for correlated ACP completion on observed prompts instead of accepting relay
+  spawn as success. Preserve the original acceptance sink before ordered buffered
+  output, isolate strict output from waiting legacy relays, and retain uncertainty
+  for missing responses or post-submission failures. This is not an early native ACK.
+- Extend the existing durable attempt fence to ordinary session prompts, including
+  prompt slash-compaction. Match the complete unexpired claim when arming or settling;
+  prevent timed-out preflight from entering the adapter later, and retain uncertain
+  post-entry attempts across restart, shutdown and receipt retention without replay.
+  Native automatic delivery remains disabled; no new journal or scheduler is added.
+- Ingest Codex native turn authority before awaited display processing and isolate it
+  by binding owner. Reject superseded prompt/control requests before local submission,
+  preserve newer native observations across delayed resume/projection responses, and
+  clean up cancelled request correlations without treating admitted frames as retracted.
+  Order setup persistence and deferred registration against replacement publication;
+  finish owned process cleanup before reusing its session endpoint. Existing receipt
+  ordering remains separate from native activity ingestion.
+- Carry exact agent/session identity through Gateway prompt, steer, interrupt, compact,
+  queue mutations, and structured session WebSocket commands. Session sockets publish
+  `session.bound` from canonical observe headers; the retained browser producer rejects
+  unbound input without name-only fallback and verifies actual acknowledgement identity.
+  Preserve legacy omitted HTTP/IPC/CLI selectors and compact scheduling. This change does not
+  include Lens carriers or native admission/lifecycle exclusion.
+- Add opt-in daemon exact-session dispatch for prompt, steer, interrupt, and queue
+  mutations using `agentId` plus `expectedSessionId`. Reject stale bindings without
+  revive, validate explicit malformed selectors before enqueue, preserve immutable
+  redirect/retry identity, and resolve new mutations under the identity write gate.
+  Legacy omission remains compatible; native admission/lifecycle exclusion is not
+  implied by exact dispatch.
+- Preserve every unacknowledged Gateway projection sequence, including superseded snapshots,
+  so a late Gateway can replay registrations without stalling on silent sequence gaps.
+- Clear completed Codex turns from routing activity before waiting on their display writes,
+  without reordering output/receipts or clearing a newer active turn.
+- Reject unsupported session-prompt delivery/model options instead of silently sending a
+  different operation, including after queued prompts are redirected to Steer. Add restart-safe
+  automatic-delivery journal guards without enabling native auto-delivery; uncertain attempts
+  cannot be replayed after lease expiry or shutdown.
+- Refresh canonical Gateway identity/runtime snapshots after same-session daemon binds and
+  resumed registrations, so restored agents do not remain missing or offline in the directory.
+  Reject mismatched bindings before changing liveness; preserve idempotent spawn notifications.
+- Forward Gateway WebSocket upgrades through the packaged Webconsole so fleet updates and
+  existing agent-session connections no longer fail with HTTP 502.
+
 ## [0.1.5] - Unreleased
 
 ### Added
@@ -104,6 +174,9 @@
 - Gateway lifecycle commands report missing installation and unhealthy runtime states explicitly.
 - Gateway startup does not signal a stale discovery PID that may have been reused after reboot;
   destructive recovery from a degraded PID requires explicit operator force.
+- Daemon service definitions preserve the install-time executable search path with stable
+  Linux, macOS, and Windows fallbacks, preventing post-login harness revival from requiring a
+  manual daemon restart.
 
 ### Security
 

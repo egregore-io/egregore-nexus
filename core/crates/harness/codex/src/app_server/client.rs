@@ -6,6 +6,7 @@
 //! with those builders and parses the scalar fields the caller needs.
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -15,6 +16,7 @@ use super::protocol::{
     initialize_params, method, thread_compact_params, thread_resume_params, thread_start_params,
     turn_interrupt_params, turn_start_params, turn_steer_params,
 };
+use super::turn_completion::CodexTurnTracker;
 
 /// A connected, initialized Codex app-server client.
 ///
@@ -22,6 +24,7 @@ use super::protocol::{
 /// one WebSocket connection to the server.
 pub struct CodexAppServerClient {
     rpc: JsonRpc,
+    origin: Mutex<Option<CodexTurnTracker>>,
 }
 
 /// Extract a thread id from a `thread/start` or `thread/resume` result.
@@ -45,12 +48,80 @@ impl CodexAppServerClient {
     ///    server's `{result: …}` response.
     /// 3. `notify(INITIALIZED, {})` — fire-and-forget confirmation.
     pub async fn connect(sock: &Path, client_name: &str) -> Result<Self, CodexRpcError> {
-        let rpc = JsonRpc::connect(sock).await?;
+        Self::connect_inner(sock, client_name, None).await
+    }
+
+    pub(super) async fn connect_with_tracker(
+        sock: &Path,
+        client_name: &str,
+        tracker: CodexTurnTracker,
+    ) -> Result<Self, CodexRpcError> {
+        Self::connect_inner(sock, client_name, Some(tracker)).await
+    }
+
+    async fn connect_inner(
+        sock: &Path,
+        client_name: &str,
+        tracker: Option<CodexTurnTracker>,
+    ) -> Result<Self, CodexRpcError> {
+        let ingress = tracker.clone().map(|tracker| {
+            Arc::new(move |note: &Notification| tracker.ingest_native(note))
+                as super::jsonrpc::NativeIngress
+        });
+        let rpc = JsonRpc::connect_with_ingress(sock, ingress).await?;
+        if let Some(tracker) = tracker.clone() {
+            rpc.install_close_observer(Arc::new(move || tracker.observe_disconnect()));
+        }
         rpc.request(method::INITIALIZE, initialize_params(client_name))
             .await?;
         rpc.notify(method::INITIALIZED, serde_json::json!({}))
             .await?;
-        Ok(Self { rpc })
+        Ok(Self {
+            rpc,
+            origin: Mutex::new(tracker),
+        })
+    }
+
+    pub(super) fn origin_tracker(&self) -> Option<CodexTurnTracker> {
+        self.origin.lock().unwrap().clone()
+    }
+
+    pub(super) fn install_tracker(&self, tracker: CodexTurnTracker) -> bool {
+        let mut origin = self.origin.lock().unwrap();
+        if let Some(existing) = origin.as_ref() {
+            return existing.same_owner(&tracker);
+        }
+        let ingress = tracker.clone();
+        self.rpc
+            .install_ingress(Arc::new(move |note| ingress.ingest_native(note)));
+        let closed = tracker.clone();
+        self.rpc
+            .install_close_observer(Arc::new(move || closed.observe_disconnect()));
+        *origin = Some(tracker);
+        true
+    }
+
+    async fn request_mutation(&self, method: &str, params: Value) -> Result<Value, CodexRpcError> {
+        let origin = self.origin_tracker();
+        match origin {
+            Some(origin) => {
+                self.rpc
+                    .request_with_admission(method, params, |submit| origin.admit(submit))
+                    .await
+            }
+            None => self.rpc.request(method, params).await,
+        }
+    }
+
+    async fn request_setup(&self, method: &str, params: Value) -> Result<Value, CodexRpcError> {
+        match self.origin_tracker() {
+            Some(origin) => {
+                self.rpc
+                    .request_with_admission(method, params, |submit| origin.admit_setup(submit))
+                    .await
+            }
+            None => self.rpc.request(method, params).await,
+        }
     }
 
     /// Start a new thread and return its thread id.
@@ -69,8 +140,7 @@ impl CodexAppServerClient {
     /// in the request prevents the app-server from defaulting to the daemon's own working directory.
     pub async fn thread_start_in(&self, cwd: Option<&str>) -> Result<String, CodexRpcError> {
         let result = self
-            .rpc
-            .request(method::THREAD_START, thread_start_params(cwd))
+            .request_setup(method::THREAD_START, thread_start_params(cwd))
             .await?;
         thread_id_from_result(&result).ok_or_else(|| {
             CodexRpcError::Decode(format!("thread/start response missing thread.id: {result}"))
@@ -94,8 +164,7 @@ impl CodexAppServerClient {
         thread_id: &str,
         cwd: Option<&str>,
     ) -> Result<Value, CodexRpcError> {
-        self.rpc
-            .request(method::THREAD_RESUME, thread_resume_params(thread_id, cwd))
+        self.request_setup(method::THREAD_RESUME, thread_resume_params(thread_id, cwd))
             .await
     }
 
@@ -121,8 +190,7 @@ impl CodexAppServerClient {
         text: &str,
     ) -> Result<Option<String>, CodexRpcError> {
         let result = self
-            .rpc
-            .request(method::TURN_START, turn_start_params(thread_id, text))
+            .request_mutation(method::TURN_START, turn_start_params(thread_id, text))
             .await?;
         Ok(result["turn"]["id"].as_str().map(str::to_owned))
     }
@@ -139,8 +207,7 @@ impl CodexAppServerClient {
         text: &str,
     ) -> Result<String, CodexRpcError> {
         let result = self
-            .rpc
-            .request(
+            .request_mutation(
                 method::TURN_STEER,
                 turn_steer_params(thread_id, text, expected_turn_id),
             )
@@ -156,12 +223,11 @@ impl CodexAppServerClient {
     /// TUI's `/compact` performs. The server acks the request and emits a
     /// `thread/compacted` notification when done.
     pub async fn thread_compact_start(&self, thread_id: &str) -> Result<(), CodexRpcError> {
-        self.rpc
-            .request(
-                method::THREAD_COMPACT_START,
-                thread_compact_params(thread_id),
-            )
-            .await?;
+        self.request_mutation(
+            method::THREAD_COMPACT_START,
+            thread_compact_params(thread_id),
+        )
+        .await?;
         Ok(())
     }
 
@@ -173,12 +239,11 @@ impl CodexAppServerClient {
         thread_id: &str,
         turn_id: &str,
     ) -> Result<(), CodexRpcError> {
-        self.rpc
-            .request(
-                method::TURN_INTERRUPT,
-                turn_interrupt_params(thread_id, turn_id),
-            )
-            .await?;
+        self.request_mutation(
+            method::TURN_INTERRUPT,
+            turn_interrupt_params(thread_id, turn_id),
+        )
+        .await?;
         Ok(())
     }
 

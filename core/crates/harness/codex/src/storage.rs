@@ -158,6 +158,8 @@ impl<'a> CodexRuntimeStateRepo<'a> {
         self.ensure_schema().await?;
         self.claim_native_thread_binding(runtime_id, codex_thread_id)
             .await?;
+        #[cfg(test)]
+        binding_tests::after_thread_claim(runtime_id, codex_thread_id).await;
         self.store
             .conn
             .execute(
@@ -324,6 +326,10 @@ impl<'a> CodexRuntimeStateRepo<'a> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/storage_binding.rs"]
+mod binding_tests;
 
 fn row_to_state(row: &libsql::Row) -> Result<CodexRuntimeState, NexusError> {
     Ok(CodexRuntimeState {

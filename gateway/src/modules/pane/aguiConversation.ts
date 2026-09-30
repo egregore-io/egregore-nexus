@@ -806,7 +806,10 @@ async function defaultLoadBacklog(
 }
 
 export type AguiTransport = "sse" | "ws";
-export type AguiInputFrame =
+export type AguiInputFrame = {
+  agentId?: string;
+  expectedSessionId?: string;
+} & (
   | {
       /** Stable session-path sockets derive their immutable target server-side. */
       t: "input";
@@ -826,11 +829,13 @@ export type AguiInputFrame =
       target: SendTarget;
       text: string;
       clientMessageId: string;
-    };
+    }
+);
 
 type AguiControlFrame =
+  | { t: "session.bound"; agentId?: string; sessionId?: string }
   | { t: "pong" }
-  | { t: "input.ack"; clientMessageId?: string; delivered?: boolean }
+  | { t: "input.ack"; clientMessageId?: string; delivered?: boolean; sessionId?: string }
   | { t: "input.err"; clientMessageId?: string; message?: string; error?: string };
 
 /** The minimal AG-UI source surface the hook uses (so tests can fake it). */
@@ -934,6 +939,7 @@ export function observeWebSocketUrl(
 }
 
 type PendingSocketInput = {
+  expectedSessionId?: string;
   resolve: (value: boolean) => void;
   reject: (reason?: unknown) => void;
 };
@@ -981,26 +987,58 @@ export class AguiWebSocketSource implements AguiEventSource {
   private heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   private missedPongs = 0;
   private closed = false;
+  private binding: { agentId: string; expectedSessionId: string } | undefined;
+  private readonly pathSessionId: string | undefined;
 
   constructor(observeUrl: string, socketUrl: string = observeWebSocketUrl(observeUrl)) {
+    const match = /^\/api\/v1\/agent-sessions\/([^/]+)\/events$/.exec(
+      new URL(socketUrl).pathname,
+    );
+    this.pathSessionId = match ? decodeURIComponent(match[1]!) : undefined;
     this.socket = new WebSocket(socketUrl, gatewayWebSocketProtocols());
     this.socket.addEventListener("open", () => {
+      if (this.closed) return;
+      this.binding = undefined;
       this.missedPongs = 0;
       this.heartbeatTimer = setInterval(() => this.ping(), 15_000);
     });
     this.socket.addEventListener("message", (event) => this.handleMessage(event.data));
-    this.socket.addEventListener("error", (event) => this.reportError(event));
+    this.socket.addEventListener("error", (event) => {
+      if (!this.closed) this.reportError(event);
+    });
     this.socket.addEventListener("close", (event) => {
+      if (this.closed) return;
+      this.closed = true;
+      this.binding = undefined;
       const error = new AguiWebSocketCloseError(event.code, event.reason);
       this.failPending(error);
-      if (!this.closed) this.reportError(error);
+      this.reportError(error);
     });
   }
 
   async sendInput(frame: AguiInputFrame): Promise<boolean> {
+    if (!("mode" in frame) || frame.mode !== "bus") {
+      if (
+        this.closed || this.socket.readyState !== WebSocket.OPEN ||
+        !this.binding
+      ) {
+        throw new Error("Session binding is not ready; input was not sent");
+      }
+      if (
+        ("agentId" in frame || "expectedSessionId" in frame) &&
+        (frame.agentId !== this.binding.agentId ||
+          frame.expectedSessionId !== this.binding.expectedSessionId)
+      ) {
+        throw new Error("Input identity does not match the session binding");
+      }
+      frame = { ...frame, ...this.binding };
+    }
     if (this.closed || this.socket.readyState !== WebSocket.OPEN) return false;
     return new Promise<boolean>((resolve, reject) => {
-      this.pending.set(frame.clientMessageId, { resolve, reject });
+      this.pending.set(frame.clientMessageId, {
+        resolve, reject,
+        expectedSessionId: frame.expectedSessionId,
+      });
       try {
         this.socket.send(JSON.stringify(frame));
       } catch (err) {
@@ -1013,6 +1051,7 @@ export class AguiWebSocketSource implements AguiEventSource {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    this.binding = undefined;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.failPending(new Error("AG-UI source closed"));
     this.socket.close();
@@ -1032,7 +1071,7 @@ export class AguiWebSocketSource implements AguiEventSource {
   }
 
   private handleMessage(data: unknown): void {
-    if (typeof data !== "string") return;
+    if (this.closed || typeof data !== "string") return;
     const control = parseAguiControlFrame(data);
     if (control) {
       this.handleControl(control);
@@ -1042,6 +1081,25 @@ export class AguiWebSocketSource implements AguiEventSource {
   }
 
   private handleControl(frame: AguiControlFrame): void {
+    if (frame.t === "session.bound") {
+      if (
+        !frame.agentId?.trim() ||
+        !frame.sessionId?.trim() ||
+        (this.pathSessionId && frame.sessionId !== this.pathSessionId) ||
+        (this.binding &&
+          (this.binding.agentId !== frame.agentId ||
+            this.binding.expectedSessionId !== frame.sessionId))
+      ) {
+        this.binding = undefined;
+        this.reportError(new Error("Invalid session binding"));
+        return;
+      }
+      this.binding = {
+        agentId: frame.agentId,
+        expectedSessionId: frame.sessionId,
+      };
+      return;
+    }
     if (frame.t === "pong") {
       this.missedPongs = 0;
       return;
@@ -1051,6 +1109,17 @@ export class AguiWebSocketSource implements AguiEventSource {
     if (!pending) return;
     this.pending.delete(frame.clientMessageId);
     if (frame.t === "input.ack") {
+      if (
+        pending.expectedSessionId &&
+        frame.sessionId !== pending.expectedSessionId
+      ) {
+        pending.reject(
+          new Error(
+            "Input acknowledgement session mismatch; outcome is unconfirmed",
+          ),
+        );
+        return;
+      }
       pending.resolve(frame.delivered !== false);
     } else {
       pending.reject(new Error(frame.message ?? frame.error ?? "input rejected"));
@@ -1058,7 +1127,11 @@ export class AguiWebSocketSource implements AguiEventSource {
   }
 
   private reportError(err: unknown): void {
+    this.binding = undefined;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.failPending(
+      err instanceof Error ? err : new Error("AG-UI WebSocket failed"),
+    );
     this.onerror?.(err);
   }
 
@@ -1074,11 +1147,24 @@ function parseAguiControlFrame(data: string): AguiControlFrame | null {
     if (!parsed || typeof parsed !== "object") return null;
     const record = parsed as Record<string, unknown>;
     if (record.t === "pong") return { t: "pong" };
+    if (record.t === "session.bound")
+      return {
+        t: "session.bound",
+        ...(typeof record.agentId === "string"
+          ? { agentId: record.agentId }
+          : {}),
+        ...(typeof record.sessionId === "string"
+          ? { sessionId: record.sessionId }
+          : {}),
+      };
     if (record.t === "input.ack") {
       return {
         t: "input.ack",
         ...(typeof record.clientMessageId === "string" ? { clientMessageId: record.clientMessageId } : {}),
         ...(typeof record.delivered === "boolean" ? { delivered: record.delivered } : {}),
+        ...(typeof record.sessionId === "string"
+          ? { sessionId: record.sessionId }
+          : {}),
       };
     }
     if (record.t === "input.err") {
@@ -1466,6 +1552,8 @@ export function useAguiConversation(
       setMessages(stateRef.current.messages);
       try {
         const activeSource = sourceRef.current;
+        if (isSession && !activeSource)
+          throw new Error("Session binding is not ready; input was not sent");
         if (activeSource?.sendInput) {
           const delivered = await activeSource.sendInput(
             isSession
@@ -1507,6 +1595,7 @@ export function useAguiConversation(
         logEvent("run", "error", `send failed: ${err instanceof Error ? err.message : String(err)}`, {
           conversationId,
         });
+        if (isSession) throw err;
       }
     },
     [

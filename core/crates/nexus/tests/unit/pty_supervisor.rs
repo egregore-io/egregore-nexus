@@ -1,8 +1,21 @@
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use async_trait::async_trait;
 use nexus_contracts::batch::{BatchCounts, NexusBatch};
 use nexus_contracts::ports::AgentTurnExecutionPort;
+use nexus_harness_claude::native::{
+    forwarder::ClaudeHookObservationSink,
+    transcript::{parse_hook_record, ClaudeHookRecord},
+};
 use nexus_harness_core::{native_harness_program, NativeProcessPlatform};
+
+fn native_hook(kind: &str, prompt: &str, offset: u64) -> ClaudeHookRecord {
+    parse_hook_record(
+        &serde_json::json!({"event": kind, "session_id": "native", "prompt_id": "A", "prompt": prompt}),
+        offset,
+    )
+}
 
 struct LivenessProbeInput {
     alive: bool,
@@ -11,6 +24,40 @@ struct LivenessProbeInput {
 struct SubmissionSignalWriter {
     completion: Arc<ClaudeTurnCompletion>,
     writes: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+struct StructuredAcceptedInput {
+    completion: Arc<ClaudeTurnCompletion>,
+    emit_native_receipt: bool,
+}
+
+#[async_trait]
+impl HarnessInput for StructuredAcceptedInput {
+    async fn send_turn(&self, text: &str) -> Result<(), String> {
+        if self.emit_native_receipt {
+            let submit = native_hook("UserPromptSubmit", text, 1);
+            self.completion.observe_hooks(
+                &[submit.clone(), native_hook("Stop", text, 2)],
+                Some(2),
+                true,
+            );
+            self.completion.accept_native_user_input(&submit).await;
+        }
+        self.completion.signal();
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct CountAcceptance {
+    count: AtomicUsize,
+}
+
+#[async_trait]
+impl TurnAcceptanceObserver for CountAcceptance {
+    async fn accepted(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl nexus_pty::TerminalWriter for SubmissionSignalWriter {
@@ -155,6 +202,169 @@ async fn claude_raw_submit_accepts_structured_hook_evidence_while_queue_preview_
     assert!(writes.lock().unwrap().iter().any(|bytes| bytes == b"\r"));
 }
 
+#[tokio::test]
+async fn claude_raw_input_rechecks_manual_activity_before_terminal_write() {
+    let completion = Arc::new(ClaudeTurnCompletion::new(Some("native".into()), None));
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (output, _keepalive) = tokio::sync::broadcast::channel(16);
+    let backend = Arc::new(SubmissionSignalTerminal {
+        output: output.clone(),
+        writer: Arc::new(SubmissionSignalWriter {
+            completion: completion.clone(),
+            writes: writes.clone(),
+        }),
+    });
+    let terminal = ScreenModelBackend::wrap(backend);
+    let input = ClaudeRawPtyInput {
+        input: Arc::new(LivenessProbeInput { alive: true }),
+        terminal: terminal.clone(),
+        completion: completion.clone(),
+    };
+    // Native input arrived while the raw path was waiting for its terminal readiness projection.
+    completion.observe_hooks(
+        &[native_hook("UserPromptSubmit", "manual", 1)],
+        Some(1),
+        true,
+    );
+    output
+        .send(
+            "❯ queued during a tool loop\r\n------------------------\r\n"
+                .as_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !terminal.contents().contains("queued during") {
+        assert!(Instant::now() < deadline);
+        tokio::task::yield_now().await;
+    }
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        input.send_turn("queued during a tool loop"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        result.is_err(),
+        "newly observed manual work must reject native admission"
+    );
+    assert!(writes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn claude_observed_turn_uses_exact_native_input_as_its_only_acceptance_boundary() {
+    let completion = Arc::new(ClaudeTurnCompletion::new(Some("native".into()), None));
+    let input = ClaudeNativeHarness {
+        input: Arc::new(StructuredAcceptedInput {
+            completion: completion.clone(),
+            emit_native_receipt: true,
+        }),
+        completion,
+    };
+    let observer = Arc::new(CountAcceptance::default());
+
+    input
+        .send_turn_observed("one canonical input", observer.clone())
+        .await
+        .expect("the matching native receipt should settle the observed turn");
+
+    assert_eq!(observer.count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn claude_observed_turn_rejects_terminal_without_exact_native_input_receipt() {
+    let completion = Arc::new(ClaudeTurnCompletion::default());
+    let input = ClaudeNativeHarness {
+        input: Arc::new(StructuredAcceptedInput {
+            completion: completion.clone(),
+            emit_native_receipt: false,
+        }),
+        completion,
+    };
+    let observer = Arc::new(CountAcceptance::default());
+
+    tokio::time::timeout(
+        Duration::from_millis(25),
+        input.send_turn_observed("missing native receipt", observer.clone()),
+    )
+    .await
+    .expect_err("a terminal hook alone cannot prove which prompt Claude admitted");
+    assert_eq!(observer.count.load(Ordering::SeqCst), 0);
+}
+
+struct BlockAcceptance {
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+struct NativeWriteBarrier {
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+#[async_trait]
+impl HarnessInput for NativeWriteBarrier {
+    async fn send_turn(&self, _: &str) -> Result<(), String> {
+        self.entered.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl TurnAcceptanceObserver for BlockAcceptance {
+    async fn accepted(&self) {
+        self.entered.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+    }
+}
+
+#[tokio::test]
+async fn claude_same_pass_terminal_waits_for_its_blocked_accepted_callback() {
+    let completion = Arc::new(ClaudeTurnCompletion::new(Some("native".into()), None));
+    let writer = Arc::new(NativeWriteBarrier {
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let input = Arc::new(ClaudeNativeHarness {
+        input: writer.clone(),
+        completion: completion.clone(),
+    });
+    let observer = Arc::new(BlockAcceptance {
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let mut call = {
+        let observer = observer.clone();
+        tokio::spawn(async move { input.send_turn_observed("text", observer).await })
+    };
+    writer.entered.acquire().await.unwrap().forget();
+    let submit = native_hook("UserPromptSubmit", "text", 1);
+    completion.observe_hooks(
+        &[submit.clone(), native_hook("Stop", "text", 2)],
+        Some(2),
+        true,
+    );
+    let accept = {
+        let completion = completion.clone();
+        tokio::spawn(async move { completion.accept_native_user_input(&submit).await })
+    };
+    observer.entered.acquire().await.unwrap().forget();
+    writer.release.add_permits(1);
+    let prematurely_finished = tokio::time::timeout(Duration::from_millis(25), &mut call)
+        .await
+        .is_ok();
+    observer.release.add_permits(1);
+    accept.await.unwrap();
+    assert!(
+        !prematurely_finished,
+        "receipt callback completion is part of successful wrapper settlement"
+    );
+    if !prematurely_finished {
+        call.await.unwrap().unwrap();
+    }
+}
+
 #[test]
 fn claude_cold_resume_waits_for_a_new_session_start_record() {
     let supervisor = PtySupervisor::new();
@@ -179,6 +389,739 @@ fn claude_cold_resume_waits_for_a_new_session_start_record() {
     });
 
     supervisor.wait_for_claude_startup(&session).unwrap();
+}
+
+#[test]
+fn claude_teardown_invalidates_old_owner_and_replacement_is_fresh() {
+    let supervisor = PtySupervisor::new();
+    let session = SessionId("owner-replacement".into());
+    let old = supervisor.claude_turn_completion(&session);
+    supervisor.kill(&session);
+    let new = supervisor.claude_turn_completion(&session);
+    assert!(
+        !old.is_current(),
+        "teardown must invalidate outstanding captured owners"
+    );
+    assert_ne!(old.owner_id(), new.owner_id());
+}
+
+#[test]
+fn claude_same_session_binding_capture_replaces_owner_without_waiting_for_teardown() {
+    let supervisor = PtySupervisor::new();
+    let session = SessionId(format!("fixture-{}", uuid::Uuid::new_v4()));
+    let old = supervisor
+        .capture_claude_binding(
+            &session,
+            HeadedRuntimeKind::ClaudeNative,
+            &["--resume".into(), "old-native".into()],
+        )
+        .unwrap();
+    let new = supervisor
+        .capture_claude_binding(
+            &session,
+            HeadedRuntimeKind::ClaudeNative,
+            &["--resume".into(), "new-native".into()],
+        )
+        .unwrap();
+    assert!(!old.is_current());
+    assert!(new.is_current());
+    assert_ne!(old.owner_id(), new.owner_id());
+    assert_eq!(
+        supervisor.claude_turn_completion(&session).owner_id(),
+        new.owner_id()
+    );
+    // A late old attachment must not obtain replacement authority.
+    old.attach_resume_identity(Some("wrong".into()));
+    assert!(!old.is_current());
+    assert_eq!(
+        supervisor.claude_turn_completion(&session).owner_id(),
+        new.owner_id()
+    );
+    assert!(supervisor
+        .bind_claude_input(&session, old, Arc::new(LivenessProbeInput { alive: true }))
+        .is_err());
+    assert!(new.is_current());
+    assert!(supervisor
+        .with_claude_owner(&session, &new, || ())
+        .is_some());
+}
+
+#[tokio::test]
+async fn manual_claude_submit_blocks_transport_until_matching_stop_not_tool_output() {
+    let transport = PtyTransport::default();
+    let session = SessionId("manual-open".into());
+    let completion = Arc::new(ClaudeTurnCompletion::new(Some("native".into()), None));
+    transport.bind(
+        session.clone(),
+        Arc::new(ClaudeNativeHarness {
+            input: Arc::new(LivenessProbeInput { alive: true }),
+            completion: completion.clone(),
+        }),
+    );
+    let initial = transport.observe_turn(&session);
+    assert_eq!(initial.state, nexus_contracts::TurnState::Unknown);
+    assert_eq!(initial, transport.observe_turn(&session));
+    assert!(transport.active_turn_sessions().is_empty());
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        transport.wait_for_turn_completion(&session),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    completion.observe_hooks(
+        &[native_hook("UserPromptSubmit", "manual", 1)],
+        Some(1),
+        true,
+    );
+    assert_eq!(transport.active_turn_sessions(), vec![session.clone()]);
+    let open = transport.observe_turn(&session);
+    assert_eq!(open.state, nexus_contracts::TurnState::NativeOpen);
+    assert_eq!(open.steer_capability, transport.steer_capability(&session));
+    assert_ne!(initial.stamp, open.stamp);
+    completion.observe_hooks(&[native_hook("PostToolUse", "manual", 2)], Some(2), true);
+    assert_eq!(transport.active_turn_sessions(), vec![session.clone()]);
+    assert!(tokio::time::timeout(
+        Duration::from_millis(25),
+        transport.wait_for_turn_completion(&session)
+    )
+    .await
+    .is_err());
+    completion.observe_hooks(&[native_hook("Stop", "manual", 3)], Some(3), true);
+    transport.wait_for_turn_completion(&session).await.unwrap();
+    assert!(transport.active_turn_sessions().is_empty());
+    let idle = transport.observe_turn(&session);
+    assert_eq!(idle.state, nexus_contracts::TurnState::VerifiedIdle);
+    assert_eq!(idle, transport.observe_turn(&session));
+    completion.invalidate();
+    assert_eq!(
+        transport.observe_turn(&session).state,
+        nexus_contracts::TurnState::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn claude_receipt_requires_exact_offset_native_session_and_live_owner() {
+    let dir = temp_test_dir("receipt-provenance");
+    let log = dir.join("hooks.jsonl");
+    let completion = Arc::new(ClaudeTurnCompletion::new(
+        Some("native".into()),
+        Some(log.clone()),
+    ));
+    // The historical identical text is on disk before registration, but not yet ingested.
+    std::fs::write(&log, vec![b' '; 100]).unwrap();
+    let observer = Arc::new(CountAcceptance::default());
+    let accepted = completion.register_accepted_input("same", observer.clone());
+    let old = native_hook("UserPromptSubmit", "same", 50);
+    let mut foreign = native_hook("UserPromptSubmit", "same", 110);
+    foreign.session_id = Some("foreign".into());
+    let current = native_hook("UserPromptSubmit", "same", 120);
+    completion.observe_hooks(
+        &[old.clone(), foreign.clone(), current.clone()],
+        Some(120),
+        true,
+    );
+    assert!(
+        !completion.accept_native_user_input(&old).await,
+        "historical text cannot consume a registration authorized by the later record"
+    );
+    assert!(!completion.accept_native_user_input(&foreign).await);
+    assert!(!accepted.was_accepted());
+    assert!(completion.accept_native_user_input(&current).await);
+    assert!(accepted.was_accepted());
+    assert_eq!(observer.count.load(Ordering::SeqCst), 1);
+    let retired = completion.register_accepted_input("late", observer.clone());
+    completion.invalidate();
+    let late = native_hook("UserPromptSubmit", "late", 130);
+    completion.observe_hooks(&[late.clone()], Some(130), true);
+    assert!(!completion.accept_native_user_input(&late).await);
+    assert!(!retired.was_accepted());
+}
+
+#[test]
+fn claude_replay_truncation_missing_and_invalid_evidence_cannot_clear_open_work() {
+    let completion = ClaudeTurnCompletion::new(Some("native".into()), None);
+    completion.observe_hooks(
+        &[native_hook("UserPromptSubmit", "manual", 100)],
+        Some(100),
+        true,
+    );
+    completion.observe_hooks(
+        &[
+            native_hook("UserPromptSubmit", "old", 1),
+            native_hook("Stop", "old", 2),
+        ],
+        Some(100),
+        true,
+    );
+    assert!(
+        completion.has_open_turn(),
+        "replayed old Submit/Stop cannot replace newer work"
+    );
+    let terminal = native_hook("Stop", "manual", 90);
+    completion.observe_hooks(&[terminal.clone()], Some(100), true);
+    assert!(completion.has_open_turn());
+    completion.observe_hooks(&[terminal], Some(90), true);
+    assert!(completion.has_open_turn());
+    assert!(completion.is_unknown());
+    completion.observe_hooks(&[], None, false);
+    assert!(completion.has_open_turn());
+    let mut invalid = native_hook("Stop", "manual", 110);
+    invalid.valid = false;
+    completion.observe_hooks(&[invalid], Some(110), true);
+    assert!(completion.has_open_turn());
+    let mut unidentified = native_hook("Stop", "manual", 120);
+    unidentified.prompt_id = None;
+    completion.observe_hooks(&[unidentified], Some(120), true);
+    assert!(
+        completion.has_open_turn(),
+        "absent prompt ids cannot invent a matching terminal"
+    );
+}
+
+#[test]
+fn claude_valid_submit_before_partial_tail_still_establishes_open_work() {
+    let completion = ClaudeTurnCompletion::new(Some("native".into()), None);
+    completion.observe_hooks(
+        &[native_hook("UserPromptSubmit", "manual", 100)],
+        Some(110),
+        false,
+    );
+    assert!(
+        completion.has_open_turn(),
+        "partial trailing JSON cannot discard a fully parsed submit prefix"
+    );
+    assert!(completion.is_unknown());
+}
+
+#[test]
+fn claude_complete_stop_before_partial_tail_retains_terminal_authority() {
+    let completion = ClaudeTurnCompletion::new(Some("native".into()), None);
+    completion.observe_hooks(
+        &[native_hook("UserPromptSubmit", "manual", 100)],
+        Some(100),
+        true,
+    );
+    completion.observe_hooks(&[native_hook("Stop", "manual", 200)], Some(210), false);
+    assert!(
+        !completion.has_open_turn(),
+        "complete Stop is authoritative independently of a later partial JSON suffix"
+    );
+    assert_eq!(completion.snapshot(), 1);
+    assert!(
+        completion.is_unknown(),
+        "the unfinished suffix still limits subsequent freshness"
+    );
+}
+
+#[test]
+fn claude_fresh_launch_cannot_inherit_stored_native_session_identity() {
+    let completion = ClaudeTurnCompletion::new(None, None);
+    completion.attach_resume_identity(Some("old-native".into()));
+    let start = parse_hook_record(
+        &serde_json::json!({"event": "SessionStart", "session_id": "native"}),
+        1,
+    );
+    completion.observe_hooks(
+        &[start, native_hook("UserPromptSubmit", "manual", 2)],
+        Some(2),
+        true,
+    );
+    assert!(
+        completion.has_open_turn(),
+        "fresh SessionStart must establish NEW, not stale persisted resume metadata"
+    );
+}
+
+#[tokio::test]
+async fn claude_initial_registration_learns_identity_only_from_new_valid_session_start() {
+    let completion = Arc::new(ClaudeTurnCompletion::new(None, None));
+    let observer = Arc::new(CountAcceptance::default());
+    let registration = completion.register_accepted_input("initial", observer.clone());
+    let start = parse_hook_record(
+        &serde_json::json!({"event": "SessionStart", "session_id": "native"}),
+        1,
+    );
+    let submit = native_hook("UserPromptSubmit", "initial", 2);
+    completion.observe_hooks(
+        &[start, submit.clone(), native_hook("Stop", "initial", 3)],
+        Some(3),
+        true,
+    );
+    assert!(completion.accept_native_user_input(&submit).await);
+    registration.wait(Duration::from_millis(25)).await.unwrap();
+    assert_eq!(observer.count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn claude_initial_registration_accepts_fresh_start_written_before_registration() {
+    let dir = temp_test_dir("start-before-registration");
+    let path = dir.join("hooks");
+    let completion = Arc::new(ClaudeTurnCompletion::new(None, Some(path.clone())));
+    let start = serde_json::json!({"event": "SessionStart", "session_id": "native"});
+    let text = start.to_string();
+    std::fs::write(&path, &text).unwrap();
+    let offset = text.len() as u64;
+    let observer = Arc::new(CountAcceptance::default());
+    let registration = completion.register_accepted_input("initial", observer.clone());
+    let submit = native_hook("UserPromptSubmit", "initial", offset + 1);
+    completion.observe_hooks(
+        &[
+            parse_hook_record(&start, offset),
+            submit.clone(),
+            native_hook("Stop", "initial", offset + 2),
+        ],
+        Some(offset + 2),
+        true,
+    );
+    assert!(
+        completion.accept_native_user_input(&submit).await,
+        "the binding floor, not the prompt-write floor, validates SessionStart lineage"
+    );
+    registration.wait(Duration::from_millis(25)).await.unwrap();
+}
+
+#[test]
+fn claude_optional_ids_allow_unambiguous_single_turn_but_not_overlap_or_conflict() {
+    for ids in [(None, None), (Some("A"), None), (None, Some("A"))] {
+        let completion = ClaudeTurnCompletion::new(Some("native".into()), None);
+        let mut submit = native_hook("UserPromptSubmit", "manual", 1);
+        submit.prompt_id = ids.0.map(str::to_string);
+        let mut stop = native_hook("Stop", "manual", 2);
+        stop.prompt_id = ids.1.map(str::to_string);
+        completion.observe_hooks(&[submit, stop], Some(2), true);
+        assert_eq!(
+            completion.observe_turn().state,
+            nexus_contracts::TurnState::VerifiedIdle
+        );
+        assert!(
+            !completion.has_open_turn(),
+            "single native turn with optional ids {ids:?} must retain supported Stop semantics"
+        );
+    }
+    for conflicting in [false, true] {
+        let completion = ClaudeTurnCompletion::new(Some("native".into()), None);
+        let mut a = native_hook("UserPromptSubmit", "A", 1);
+        a.prompt_id = None;
+        let mut b = native_hook("UserPromptSubmit", "B", 2);
+        b.prompt_id = None;
+        if conflicting {
+            b.valid = false;
+        }
+        let mut stop = native_hook("Stop", "A", 3);
+        stop.prompt_id = None;
+        completion.observe_hooks(&[a, b, stop], Some(3), true);
+        assert!(
+            completion.has_open_turn(),
+            "overlap/conflict cannot be guessed away without matching ids"
+        );
+        assert!(completion.is_unknown());
+        assert_eq!(
+            completion.observe_turn().state,
+            nexus_contracts::TurnState::Unknown
+        );
+    }
+}
+
+#[tokio::test]
+async fn claude_old_waiter_retains_terminal_when_next_manual_turn_opens() {
+    let completion = Arc::new(ClaudeTurnCompletion::new(Some("native".into()), None));
+    let observer = Arc::new(CountAcceptance::default());
+    let accepted = completion.register_accepted_input("A", observer);
+    let submit = native_hook("UserPromptSubmit", "A", 1);
+    let mut next = native_hook("UserPromptSubmit", "B", 3);
+    next.prompt_id = Some("B".into());
+    completion.observe_hooks(
+        &[submit.clone(), native_hook("Stop", "A", 2), next],
+        Some(3),
+        true,
+    );
+    assert!(completion.has_open_turn());
+    completion.accept_native_user_input(&submit).await;
+    accepted.wait(Duration::from_millis(25)).await.unwrap();
+    assert!(
+        completion.has_open_turn(),
+        "settling A cannot make manual B idle"
+    );
+}
+
+struct WrittenHarness {
+    input: Arc<dyn HarnessInput>,
+    written: tokio::sync::Semaphore,
+}
+
+#[tokio::test]
+async fn manual_no_id_hooks_close_transport_through_real_forwarder_pass() {
+    use nexus_harness_claude::native::forwarder::forward_once_with_observations;
+    use std::io::Write;
+    let store = Arc::new(nexus_store::Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let session = SessionId(format!("fixture-{}", uuid::Uuid::new_v4()));
+    let dir = temp_test_dir("manual-no-id");
+    let paths = ClaudeNativeBridgePaths::new(&dir, &session);
+    std::fs::create_dir_all(&paths.bridge_dir).unwrap();
+    let completion = Arc::new(ClaudeTurnCompletion::new(
+        Some("native".into()),
+        Some(paths.hook_log_path.clone()),
+    ));
+    ClaudeRuntimeStateRepo::new(&store)
+        .upsert_launch(ClaudeRuntimeLaunch {
+            runtime_id: session.clone(),
+            bridge_dir: paths.bridge_dir.clone(),
+            claude_session_id: Some("native".into()),
+            launch_cwd: dir,
+            transcript_path: Some(paths.bridge_dir.join("transcript.jsonl")),
+            bridge_pid: None,
+            hook_pids_json: None,
+        })
+        .await
+        .unwrap();
+    let transport = PtyTransport::default();
+    transport.bind(
+        session.clone(),
+        Arc::new(ClaudeNativeHarness {
+            input: Arc::new(LivenessProbeInput { alive: true }),
+            completion: completion.clone(),
+        }),
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.hook_log_path)
+        .unwrap();
+    for (payload, open) in [
+        (
+            serde_json::json!({"hook_event_name": "UserPromptSubmit", "session_id": "native", "prompt": "manual"}),
+            true,
+        ),
+        (
+            serde_json::json!({"hook_event_name": "PostToolUse", "session_id": "native", "tool_name": "Read", "tool_use_id": "tool"}),
+            true,
+        ),
+        (
+            serde_json::json!({"hook_event_name": "Stop", "session_id": "native", "last_assistant_message": "done"}),
+            false,
+        ),
+    ] {
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({"event": payload["hook_event_name"], "payload": payload})
+        )
+        .unwrap();
+        forward_once_with_observations(
+            store.clone(),
+            session.clone(),
+            paths.clone(),
+            Arc::new(DiscardClaudeDisplay),
+            None,
+            Some(completion.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            transport.active_turn_sessions().contains(&session),
+            open,
+            "native optional-id payload must retain singleton lifecycle semantics"
+        );
+    }
+    transport.wait_for_turn_completion(&session).await.unwrap();
+}
+
+#[async_trait]
+impl HarnessInput for WrittenHarness {
+    async fn send_turn(&self, text: &str) -> Result<(), String> {
+        self.input.send_turn(text).await?;
+        self.written.add_permits(1);
+        Ok(())
+    }
+}
+
+struct DiscardClaudeDisplay;
+
+#[cfg(unix)]
+#[derive(Default)]
+struct ClaudeFixtureProcesses {
+    raw: Option<Arc<PtySession>>,
+    tmux: Option<Arc<TmuxHarness>>,
+}
+
+#[cfg(unix)]
+impl Drop for ClaudeFixtureProcesses {
+    fn drop(&mut self) {
+        if let Some(raw) = &self.raw {
+            let _ = raw.kill();
+        }
+        if let Some(tmux) = &self.tmux {
+            let _ = tmux.kill();
+        }
+    }
+}
+#[async_trait]
+impl EventSink for DiscardClaudeDisplay {
+    async fn emit(&self, _: nexus_contracts::WsEvent) {}
+}
+
+#[tokio::test]
+async fn claude_new_forwarder_claim_survives_late_old_track_and_cleanup() {
+    use crate::daemon::claude_native_forwarder::spawn_claude_native_forwarder_with_tool_events;
+    use std::io::Write;
+    let store = Arc::new(nexus_store::Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let state = crate::daemon::AppState::wire_pty(store.clone(), &nexus_common::Config::default());
+    let supervisor = state.pty_supervisor().unwrap();
+    let wiring = crate::daemon::app::LoopWiring {
+        store: store.clone(),
+        bell: Bell::new(),
+        registry: nexus_dispatch::AgentRegistry::new(),
+        events: Arc::new(DiscardClaudeDisplay),
+        turn_exec: state.agent.clone(),
+        gateway_stream: None,
+        drain_limit: 100,
+        preview_chars: 100,
+        spawned: Default::default(),
+        shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        native_forwarders: Default::default(),
+        raw_stream_writers: Default::default(),
+        presence: state.presence.clone(),
+    };
+    let session = SessionId(format!("fixture-{}", uuid::Uuid::new_v4()));
+    let args = ["--resume".into(), "native".into()];
+    let old = supervisor
+        .capture_claude_binding(&session, HeadedRuntimeKind::ClaudeNative, &args)
+        .unwrap();
+    assert!(wiring.claim_native_forwarder_for_owner("claude", &session, old.owner_id()));
+    // OLD is parked after the real reservation and before attachment. NEW must replace it.
+    let new = supervisor
+        .capture_claude_binding(&session, HeadedRuntimeKind::ClaudeNative, &args)
+        .unwrap();
+    assert!(
+        wiring.claim_native_forwarder_for_owner("claude", &session, new.owner_id()),
+        "a stale reserved slot must not strand NEW without an observer"
+    );
+    let dir = temp_test_dir("forwarder-claim");
+    let paths = ClaudeNativeBridgePaths::new(&dir, &session);
+    std::fs::create_dir_all(&paths.bridge_dir).unwrap();
+    std::fs::write(&paths.hook_log_path, "").unwrap();
+    new.attach_hook_source(paths.hook_log_path.clone());
+    ClaudeRuntimeStateRepo::new(&store)
+        .upsert_launch(ClaudeRuntimeLaunch {
+            runtime_id: session.clone(),
+            bridge_dir: paths.bridge_dir.clone(),
+            claude_session_id: Some("native".into()),
+            launch_cwd: dir,
+            transcript_path: Some(paths.bridge_dir.join("transcript.jsonl")),
+            bridge_pid: None,
+            hook_pids_json: None,
+        })
+        .await
+        .unwrap();
+    let handle = spawn_claude_native_forwarder_with_tool_events(
+        store,
+        session.clone(),
+        paths.clone(),
+        Arc::new(DiscardClaudeDisplay),
+        Bell::new(),
+        5,
+        None,
+        Some(new.clone()),
+    );
+    let live = handle.abort_handle();
+    wiring.track_native_forwarder_for_owner("claude", &session, new.owner_id(), handle);
+    let obsolete = tokio::spawn(std::future::pending());
+    let obsolete_status = obsolete.abort_handle();
+    wiring.track_native_forwarder_for_owner("claude", &session, old.owner_id(), obsolete);
+    wiring.release_native_forwarder_for_owner("claude", &session, old.owner_id());
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(paths.hook_log_path)
+        .unwrap();
+    writeln!(file, "{{\"event\":\"UserPromptSubmit\",\"session_id\":\"native\",\"prompt_id\":\"A\",\"prompt\":\"manual\"}}").unwrap();
+    new.wait_for_submission_after(0, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(new.has_open_turn());
+    assert!(
+        !live.is_finished(),
+        "OLD cleanup must not abort NEW's native forwarder"
+    );
+    assert!(
+        obsolete_status.is_finished(),
+        "late OLD attachment is aborted"
+    );
+    writeln!(
+        file,
+        "{{\"event\":\"Stop\",\"session_id\":\"native\",\"prompt_id\":\"A\"}}"
+    )
+    .unwrap();
+    new.wait_after(0, Duration::from_secs(1)).await.unwrap();
+    assert!(!new.has_open_turn());
+    wiring.release_native_forwarder_for_owner("claude", &session, new.owner_id());
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_raw_and_tmux_claude_wrappers_require_fresh_native_receipt_and_matching_terminal() {
+    use nexus_harness_claude::native::forwarder::forward_once_with_observations;
+    use std::io::Write;
+    for (backend, prompt_ids) in [
+        ("raw", true),
+        ("tmux", true),
+        ("raw", false),
+        ("tmux", false),
+    ] {
+        let dir = temp_test_dir(backend);
+        let session = SessionId(format!("fixture-{}", uuid::Uuid::new_v4()));
+        let paths = ClaudeNativeBridgePaths::new(&dir, &session);
+        std::fs::create_dir_all(&paths.bridge_dir).unwrap();
+        let historical = "{\"event\":\"UserPromptSubmit\",\"session_id\":\"native\",\"prompt_id\":\"historical\",\"prompt\":\"same\"}\n";
+        std::fs::write(&paths.hook_log_path, historical).unwrap();
+        let completion = Arc::new(ClaudeTurnCompletion::new(
+            Some("native".into()),
+            Some(paths.hook_log_path.clone()),
+        ));
+        // Disposable shell paints a readiness glyph. It is not Claude or provider proof.
+        let script = r"while :; do printf '\033[2J\033[H❯\n'; sleep 0.05; done";
+        let mut processes = ClaudeFixtureProcesses::default();
+        let native: Arc<dyn HarnessInput> = if backend == "raw" {
+            let mut command = CommandBuilder::new("sh");
+            command.args(["-c", script]);
+            let pty = Arc::new(
+                PtySession::spawn(
+                    command,
+                    PtySize {
+                        rows: 24,
+                        cols: 80,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    },
+                )
+                .unwrap(),
+            );
+            let terminal = ScreenModelBackend::wrap(pty.clone());
+            processes.raw = Some(pty.clone());
+            Arc::new(ClaudeRawPtyInput {
+                input: pty,
+                terminal,
+                completion: completion.clone(),
+            })
+        } else {
+            let harness = Arc::new(
+                TmuxHarness::launch(
+                    &session.0,
+                    "sh",
+                    &["-c".into(), script.into()],
+                    dir.to_str().unwrap(),
+                    80,
+                    24,
+                )
+                .unwrap(),
+            );
+            processes.tmux = Some(harness.clone());
+            harness
+        };
+        let writer = Arc::new(WrittenHarness {
+            input: native,
+            written: tokio::sync::Semaphore::new(0),
+        });
+        let input = Arc::new(ClaudeNativeHarness {
+            input: writer.clone(),
+            completion: completion.clone(),
+        });
+        let observer = Arc::new(CountAcceptance::default());
+        let mut call = {
+            let input = input.clone();
+            let observer = observer.clone();
+            tokio::spawn(async move { input.send_turn_observed("same", observer).await })
+        };
+        tokio::time::timeout(Duration::from_secs(15), writer.written.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let store = Arc::new(nexus_store::Store::open(":memory:").await.unwrap());
+        store.migrate().await.unwrap();
+        ClaudeRuntimeStateRepo::new(&store)
+            .upsert_launch(ClaudeRuntimeLaunch {
+                runtime_id: session.clone(),
+                bridge_dir: paths.bridge_dir.clone(),
+                claude_session_id: Some("native".into()),
+                launch_cwd: dir.clone(),
+                transcript_path: Some(paths.bridge_dir.join("transcript.jsonl")),
+                bridge_pid: None,
+                hook_pids_json: None,
+            })
+            .await
+            .unwrap();
+        let mut hooks = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&paths.hook_log_path)
+            .unwrap();
+        writeln!(
+            hooks,
+            "{{\"event\":\"Stop\",\"session_id\":\"native\",\"prompt_id\":\"A\"}}"
+        )
+        .unwrap();
+        forward_once_with_observations(
+            store.clone(),
+            session.clone(),
+            paths.clone(),
+            Arc::new(DiscardClaudeDisplay),
+            None,
+            Some(completion.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            observer.count.load(Ordering::SeqCst),
+            0,
+            "{backend}: historical same-text receipt is not this write"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut call)
+                .await
+                .is_err(),
+            "{backend}: terminal-only evidence cannot settle the wrapper"
+        );
+        let mut submit = serde_json::json!({"event": "UserPromptSubmit", "session_id": "native", "prompt_id": "A", "prompt": "same"});
+        let mut stop =
+            serde_json::json!({"event": "Stop", "session_id": "native", "prompt_id": "A"});
+        if !prompt_ids {
+            submit.as_object_mut().unwrap().remove("prompt_id");
+            stop.as_object_mut().unwrap().remove("prompt_id");
+        }
+        writeln!(hooks, "{submit}\n{stop}").unwrap();
+        forward_once_with_observations(
+            store,
+            session.clone(),
+            paths,
+            Arc::new(DiscardClaudeDisplay),
+            None,
+            Some(completion.clone()),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), &mut call)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(observer.count.load(Ordering::SeqCst), 1);
+        let transport = PtyTransport::default();
+        transport.bind(session.clone(), input);
+        let new = Arc::new(ClaudeTurnCompletion::new(Some("native".into()), None));
+        transport.bind(
+            session,
+            Arc::new(ClaudeNativeHarness {
+                input: writer,
+                completion: new.clone(),
+            }),
+        );
+        assert!(!completion.is_current());
+        assert!(new.is_current());
+        assert_ne!(completion.owner_id(), new.owner_id());
+        drop(processes);
+    }
 }
 
 #[test]

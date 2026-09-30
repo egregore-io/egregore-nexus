@@ -25,7 +25,7 @@ use nexus_contracts::ports::{
 use nexus_contracts::{
     RemoveRequest, RemoveResponse, SpawnRequest, SpawnResponse, SteerCapability, WsEvent,
 };
-use nexus_pty::{HarnessInput, TurnCompletionEvidence};
+use nexus_pty::{HarnessInput, TurnAcceptanceObserver, TurnCompletionEvidence};
 use serde_json::Value;
 
 use super::opencode_plugin_bridge::OPENCODE_PROVIDER_ERROR_PREFIX;
@@ -52,7 +52,9 @@ impl PtyTransport {
     /// Bind a recipient session to the harness backend that should receive its injected turns. The
     /// backend is any [`HarnessInput`]: a raw `PtySession` (tests) or a `TmuxHarness` (production).
     pub fn bind(&self, session: SessionId, input: Arc<dyn HarnessInput>) {
-        self.sessions.lock().unwrap().insert(session, input);
+        if let Some(old) = self.sessions.lock().unwrap().insert(session, input) {
+            old.invalidate_observation_owner();
+        }
     }
 
     /// Whether `session` has a PTY/tmux harness bound here. This is the per-launch mode signal the
@@ -116,6 +118,49 @@ async fn send_turn_with_prompt_retries(
         }
     }
     Err(last_error.unwrap_or_else(|| "prompt readiness retry exhausted".to_string()))
+}
+
+async fn send_turn_observed_with_prompt_retries(
+    input: Arc<dyn HarnessInput>,
+    text: &str,
+    observer: Arc<dyn TurnAcceptanceObserver>,
+) -> Result<(), String> {
+    let mut last_error = None;
+    for attempt in 0..=PROMPT_READY_RETRY_DELAYS.len() {
+        match input.send_turn_observed(text, observer.clone()).await {
+            Ok(()) => return Ok(()),
+            Err(error) if prompt_readiness_error(&error) => {
+                last_error = Some(error);
+                if let Some(delay) = PROMPT_READY_RETRY_DELAYS.get(attempt) {
+                    tokio::time::sleep(*delay).await;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "prompt readiness retry exhausted".to_string()))
+}
+
+struct EmitAcceptedEvent {
+    pending: Mutex<Option<(Arc<dyn EventSink>, WsEvent)>>,
+}
+
+impl EmitAcceptedEvent {
+    fn new(events: Arc<dyn EventSink>, event: WsEvent) -> Self {
+        Self {
+            pending: Mutex::new(Some((events, event))),
+        }
+    }
+}
+
+#[async_trait]
+impl TurnAcceptanceObserver for EmitAcceptedEvent {
+    async fn accepted(&self) {
+        let pending = self.pending.lock().unwrap().take();
+        if let Some((events, event)) = pending {
+            events.emit(event).await;
+        }
+    }
 }
 
 async fn compact_with_prompt_retries(input: Arc<dyn HarnessInput>) -> Result<(), String> {
@@ -186,10 +231,13 @@ impl AgentTurnExecutionPort for PtyTransport {
             }));
         }
         let _active_turn = self.active_turns.begin(recipient);
-        send_turn_with_prompt_retries(input, &render_injected_turn_for(batch, &recipient.0))
-            .await
-            .map_err(|error| inject_harness_error(recipient, error))?;
-        events.emit(accepted_event).await;
+        send_turn_observed_with_prompt_retries(
+            input,
+            &render_injected_turn_for(batch, &recipient.0),
+            Arc::new(EmitAcceptedEvent::new(events, accepted_event)),
+        )
+        .await
+        .map_err(|error| inject_harness_error(recipient, error))?;
         Ok(())
     }
 
@@ -221,13 +269,16 @@ impl AgentTurnExecutionPort for PtyTransport {
     ) -> PortResult<()> {
         let input = self.harness_for(recipient)?;
         let _active_turn = self.active_turns.begin(recipient);
-        send_turn_with_prompt_retries(input, &text)
-            .await
-            .map_err(|e| ContractError {
-                code: -32004,
-                message: e,
-            })?;
-        events.emit(accepted_event).await;
+        send_turn_observed_with_prompt_retries(
+            input,
+            &text,
+            Arc::new(EmitAcceptedEvent::new(events, accepted_event)),
+        )
+        .await
+        .map_err(|e| ContractError {
+            code: -32004,
+            message: e,
+        })?;
         Ok(())
     }
 
@@ -239,12 +290,35 @@ impl AgentTurnExecutionPort for PtyTransport {
         }
     }
 
+    fn observe_turn(&self, recipient: &SessionId) -> nexus_contracts::TurnObservation {
+        let sessions = self.sessions.lock().unwrap();
+        match sessions.get(recipient) {
+            Some(input) => nexus_contracts::TurnObservation {
+                steer_capability: SteerCapability::InterruptAndSend,
+                ..input.observe_turn()
+            },
+            None => nexus_contracts::TurnObservation {
+                state: nexus_contracts::TurnState::Unavailable,
+                ..Default::default()
+            },
+        }
+    }
+
     fn active_turn_sessions(&self) -> Vec<SessionId> {
-        self.active_turns.sessions()
+        let mut active = self.active_turns.sessions();
+        for (session, input) in self.sessions.lock().unwrap().iter() {
+            if input.has_observed_open_turn() && !active.contains(session) {
+                active.push(session.clone());
+            }
+        }
+        active
     }
 
     async fn wait_for_turn_completion(&self, recipient: &SessionId) -> PortResult<()> {
         self.active_turns.wait_for_completion(recipient).await;
+        if let Ok(input) = self.harness_for(recipient) {
+            input.wait_for_observed_turn_completion().await;
+        }
         Ok(())
     }
 

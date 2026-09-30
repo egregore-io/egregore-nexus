@@ -26,7 +26,8 @@ use crate::native::codec::{
 };
 use crate::native::message_delta::parse_message_display_value;
 use crate::native::transcript::{
-    parse_transcript_value, AssistantText, ClaudeToolUpdate, TranscriptRecord,
+    parse_hook_record, parse_transcript_value, AssistantText, ClaudeHookRecord, ClaudeToolUpdate,
+    TranscriptRecord,
 };
 use crate::storage::{ClaudeRuntimeState, ClaudeRuntimeStateRepo};
 
@@ -56,6 +57,16 @@ pub trait ClaudeToolObservationSink: Send + Sync {
     fn publish_tool_call(&self, session: &SessionId, observation: ToolCallObservation);
 }
 
+/// Native hook facts are ingested synchronously before any presentation await. Acceptance
+/// receives that same record, never a later text-only reconstruction from a public event.
+#[async_trait::async_trait]
+pub trait ClaudeHookObservationSink: Send + Sync {
+    fn observe_hooks(&self, records: &[ClaudeHookRecord], file_len: Option<u64>, complete: bool);
+    async fn accept_input(&self, _record: &ClaudeHookRecord) -> bool {
+        false
+    }
+}
+
 /// Forward newly appended Claude native bridge records into Nexus events once.
 pub async fn forward_once(
     store: Arc<Store>,
@@ -74,6 +85,18 @@ pub async fn forward_once_with_tool_observations(
     events: Arc<dyn EventSink>,
     tool_observations: Option<Arc<dyn ClaudeToolObservationSink>>,
 ) -> Result<ClaudeForwarderStats, NexusError> {
+    forward_once_with_observations(store, session, paths, events, tool_observations, None).await
+}
+
+/// Compatibility-preserving pass with an optional binding-owned hook observer.
+pub async fn forward_once_with_observations(
+    store: Arc<Store>,
+    session: SessionId,
+    paths: ClaudeNativeBridgePaths,
+    events: Arc<dyn EventSink>,
+    tool_observations: Option<Arc<dyn ClaudeToolObservationSink>>,
+    hooks: Option<Arc<dyn ClaudeHookObservationSink>>,
+) -> Result<ClaudeForwarderStats, NexusError> {
     let repo = ClaudeRuntimeStateRepo::new(&store);
     let state = repo.find_by_runtime_id(&session).await?;
     let state_ref = state.as_ref();
@@ -86,8 +109,30 @@ pub async fn forward_once_with_tool_observations(
         cursor(state_ref, CursorKind::MessageDelta),
     )?;
 
-    let (hook_values, hook_cursor) =
-        read_new_json_values(&paths.hook_log_path, cursor(state_ref, CursorKind::Hook))?;
+    let hook_start = cursor(state_ref, CursorKind::Hook);
+    let hook_read = match read_json_records(&paths.hook_log_path, hook_start) {
+        Ok(read) => read,
+        Err(error) => {
+            if let Some(hooks) = &hooks {
+                hooks.observe_hooks(&[], None, false);
+            }
+            return Err(error);
+        }
+    };
+    let hook_cursor = hook_read.cursor;
+    let hook_records: Vec<_> = hook_read
+        .values
+        .iter()
+        .map(|(value, offset)| parse_hook_record(value, *offset))
+        .collect();
+    if let Some(hooks) = &hooks {
+        hooks.observe_hooks(&hook_records, hook_read.file_len, hook_read.complete);
+    }
+    let hook_values: Vec<_> = hook_read
+        .values
+        .into_iter()
+        .map(|(value, _)| value)
+        .collect();
 
     let (transcript_path, transcript_start_cursor, transcript_rebound) = resolve_transcript_tail(
         &repo,
@@ -102,7 +147,15 @@ pub async fn forward_once_with_tool_observations(
         producer_ids.clear_runtime(&session.0).await?;
     }
     count_hook_session_starts(&hook_values, &mut stats);
-    emit_hook_user_inputs(&session, events.as_ref(), &hook_values, &mut stats).await;
+    emit_hook_user_inputs(
+        &session,
+        events.as_ref(),
+        &hook_values,
+        &hook_records,
+        hooks.as_deref(),
+        &mut stats,
+    )
+    .await;
     emit_hook_tool_observations(&session, tool_observations.as_deref(), &hook_values);
     let StreamedMessages {
         text: message_text,
@@ -391,10 +444,21 @@ async fn emit_hook_user_inputs(
     session: &SessionId,
     events: &dyn EventSink,
     values: &[Value],
+    records: &[ClaudeHookRecord],
+    hooks: Option<&dyn ClaudeHookObservationSink>,
     stats: &mut ClaudeForwarderStats,
 ) {
-    for record in values.iter().filter_map(parse_transcript_value) {
+    for (value, provenance) in values.iter().zip(records) {
+        let Some(record) = parse_transcript_value(value) else {
+            continue;
+        };
         if let Some(prompt) = &record.user_prompt {
+            if let Some(hooks) = hooks {
+                if hooks.accept_input(provenance).await {
+                    stats.user_input_events += 1;
+                    continue;
+                }
+            }
             emit_claude_event(
                 session,
                 events,
@@ -503,10 +567,30 @@ fn cursor(state: Option<&ClaudeRuntimeState>, kind: CursorKind) -> i64 {
 }
 
 fn read_new_json_values(path: &Path, cursor: i64) -> Result<(Vec<Value>, i64), NexusError> {
+    let read = read_json_records(path, cursor)?;
+    Ok((
+        read.values.into_iter().map(|(value, _)| value).collect(),
+        read.cursor,
+    ))
+}
+
+struct JsonRecords {
+    values: Vec<(Value, u64)>,
+    cursor: i64,
+    file_len: Option<u64>,
+    complete: bool,
+}
+
+fn read_json_records(path: &Path, cursor: i64) -> Result<JsonRecords, NexusError> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((Vec::new(), cursor.max(0)));
+            return Ok(JsonRecords {
+                values: Vec::new(),
+                cursor: cursor.max(0),
+                file_len: None,
+                complete: false,
+            });
         }
         Err(e) => {
             return Err(NexusError::Internal(format!(
@@ -521,17 +605,26 @@ fn read_new_json_values(path: &Path, cursor: i64) -> Result<(Vec<Value>, i64), N
         .unwrap_or(0);
     let mut values = Vec::new();
     let mut consumed = 0;
+    let mut complete = cursor.max(0) as u64 <= bytes.len() as u64;
     let mut stream = serde_json::Deserializer::from_slice(&bytes[start..]).into_iter::<Value>();
     while let Some(next) = stream.next() {
         match next {
             Ok(value) => {
-                values.push(value);
                 consumed = stream.byte_offset();
+                values.push((value, (start + consumed) as u64));
             }
-            Err(_) => break,
+            Err(_) => {
+                complete = false;
+                break;
+            }
         }
     }
-    Ok((values, start as i64 + consumed as i64))
+    Ok(JsonRecords {
+        values,
+        cursor: start as i64 + consumed as i64,
+        file_len: Some(bytes.len() as u64),
+        complete,
+    })
 }
 
 fn transcript_end_offset(path: &Path) -> Result<i64, NexusError> {

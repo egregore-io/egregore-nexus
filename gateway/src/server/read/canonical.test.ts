@@ -85,7 +85,7 @@ describe("canonical Gateway REST reads", () => {
       limit: 10,
       before: page.before,
     })).rows).toMatchObject([{ messageId: "m_t1" }]);
-    expect((await canonicalDmHistory(db, "blake", { limit: 10 })).rows)
+    expect((await canonicalDmHistory(db, "blake", "ada", { limit: 10 })).rows)
       .toMatchObject([{ messageId: "m_d1" }]);
     expect(await canonicalTopics(db)).toEqual([{ topic: "builds", subscribers: 1 }]);
     expect(await canonicalNotifications(db, { limit: 10 })).toMatchObject([
@@ -203,6 +203,20 @@ describe("canonical Gateway REST reads", () => {
         sessionId: "s_collision",
         owner: expect.objectContaining({ agentId: "a_session_owner", name: "session-owner" }),
       });
+    await expect(
+      canonicalAgentSessionTarget(db, {
+        agentId: "a_runtime_alias",
+        sessionId: "s_collision",
+        exact: true,
+      }),
+    ).resolves.toBeUndefined();
+    await expect(
+      canonicalAgentSessionTarget(db, {
+        agentId: "a_session_owner",
+        sessionId: "r_session_owner",
+        exact: true,
+      }),
+    ).resolves.toBeUndefined();
     db.close();
   });
 
@@ -251,9 +265,9 @@ describe("canonical Gateway REST reads", () => {
         ('m_alias','dm','sender','a_sender','a_collision','a_alias_owner','alias','{}',11)`,
     ], "write");
 
-    await expect(canonicalDmHistory(db, "a_collision", { limit: 10 }))
+    await expect(canonicalDmHistory(db, "a_collision", "sender", { limit: 10 }))
       .resolves.toMatchObject({ rows: [{ messageId: "m_exact" }] });
-    await expect(canonicalDmHistory(db, "duplicate", { limit: 10 }))
+    await expect(canonicalDmHistory(db, "duplicate", "sender", { limit: 10 }))
       .rejects.toThrow("ambiguous agent name");
     db.close();
   });

@@ -202,8 +202,8 @@ fn event_and_byte_limits_evict_only_behind_an_explicit_gap() {
 }
 
 #[test]
-fn replaceable_snapshots_coalesce_before_canonical_history_is_evicted() {
-    let backlog = GatewayProjectionBacklog::with_epoch(config(2, 100_000, 5), "boot-a");
+fn repeated_snapshots_preserve_contiguous_unacknowledged_history() {
+    let backlog = GatewayProjectionBacklog::with_epoch(config(3, 100_000, 5), "boot-a");
     backlog.append(
         "presence:a_ada:1",
         GatewayProjectionKind::PresenceChanged,
@@ -224,9 +224,15 @@ fn replaceable_snapshots_coalesce_before_canonical_history_is_evicted() {
     );
 
     let replay = backlog.replay_batch();
-    assert!(
-        replay.gap.is_none(),
-        "snapshot coalescing is not a history gap"
+    assert!(replay.gap.is_none());
+    assert_eq!(
+        replay
+            .events
+            .iter()
+            .map(|event| event.seq)
+            .collect::<Vec<_>>(),
+        [1, 2, 3],
+        "the consumer requires every assigned sequence, even for superseded snapshots"
     );
     assert_eq!(
         replay
@@ -234,9 +240,38 @@ fn replaceable_snapshots_coalesce_before_canonical_history_is_evicted() {
             .iter()
             .map(|event| event.event_id.as_str())
             .collect::<Vec<_>>(),
-        ["message:m1", "presence:a_ada:2"]
+        ["presence:a_ada:1", "message:m1", "presence:a_ada:2"]
     );
-    assert_eq!(backlog.stats().coalesced, 1);
+    assert_eq!(backlog.stats().coalesced, 0);
+}
+
+#[test]
+fn sent_snapshot_remains_replayable_until_ack_after_a_new_snapshot_arrives() {
+    let backlog = GatewayProjectionBacklog::with_epoch(config(10, 100_000, 1), "boot-a");
+    for (id, presence) in [("first", "offline"), ("second", "online")] {
+        backlog.append(
+            id,
+            GatewayProjectionKind::PresenceChanged,
+            1,
+            json!({"agentId": "a_ada", "presence": presence}),
+        );
+        if id == "first" {
+            assert_eq!(backlog.replay_batch().events[0].seq, 1);
+        }
+    }
+    // A reconnect before ACK must still start at the first assigned sequence.
+    let replay = backlog.replay_batch();
+    assert_eq!(replay.events[0].seq, 1);
+    assert_eq!(replay.events[0].payload["presence"], "offline");
+    backlog
+        .ack(&GatewayProjectionAck {
+            daemon_epoch: "boot-a".into(),
+            through_seq: 1,
+        })
+        .unwrap();
+    let next = backlog.replay_batch();
+    assert_eq!(next.events[0].seq, 2);
+    assert_eq!(next.events[0].payload["presence"], "online");
 }
 
 #[test]

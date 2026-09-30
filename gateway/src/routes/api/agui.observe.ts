@@ -114,13 +114,16 @@ function humanCookie(request: Request): string | undefined {
  * instead of duplicating as an attributed "assistant" bubble). Best-effort:
  * any failure (no cookie, unknown token, DB error) yields undefined.
  */
-async function identityFromRequest(request: Request): Promise<GatewayCallerIdentity | null> {
+async function identityFromRequest(
+  request: Request,
+): Promise<GatewayCallerIdentity | null> {
   const mode = webAuthModeFromEnv(process.env);
   const token = humanCookie(request);
   if (!token) return isLocalOperatorWebAuthMode(mode) ? localOperatorCaller() : null;
   try {
     const identity = await currentHuman(token, { db: await getWriteDbLazy() });
-    return identity ?? (isLocalOperatorWebAuthMode(mode) ? localOperatorCaller() : null);
+    return ( identity ?? (isLocalOperatorWebAuthMode(mode) ? localOperatorCaller() : null)
+    );
   } catch {
     return isLocalOperatorWebAuthMode(mode) ? localOperatorCaller() : null;
   }
@@ -185,16 +188,15 @@ export function canObserveAgentSession(
     return true;
   }
   if (hasObserveAdminOverride(agent, identity)) return true;
-  return grants.some(
-    (grant) => {
+  return grants.some((grant) => {
       const principalMatches = grant.principalAgentId
         ? grant.principalAgentId === identity.agentId
         : grant.principalSessionId
           ? grant.principalSessionId === identity.sessionId
           : grant.principalName === identity.name;
-      return principalMatches && (grant.role === "viewer" || grant.role === "co_owner");
-    },
-  );
+    return ( principalMatches && (grant.role === "viewer" || grant.role === "co_owner")
+    );
+  });
 }
 
 /** Attach the immutable lane identity that WebSocket mutation handling binds once per socket. */
@@ -230,6 +232,27 @@ export async function observeScoped(
   // Read BEFORE ?dm= so the new dedicated path takes priority over the shared one.
   const session = url.searchParams.get("session");
   const requestedAgentId = url.searchParams.get("agentId") ?? undefined;
+  const expectedSessionId = url.searchParams.has("expectedSessionId")
+    ? url.searchParams.get("expectedSessionId")!
+    : undefined;
+  if (
+    expectedSessionId !== undefined &&
+    (!expectedSessionId.trim() ||
+      !requestedAgentId?.trim() ||
+      url.searchParams.getAll("agentId").length !== 1 ||
+      url.searchParams.getAll("expectedSessionId").length !== 1)
+  ) {
+    return Response.json(
+      { error: "expectedSessionId requires a complete stable pair" },
+      { status: 400 },
+    );
+  }
+  if (expectedSessionId !== undefined && !deps.canonicalDb) {
+    return Response.json(
+      { error: "exact session authority is unavailable" },
+      { status: 503 },
+    );
+  }
   if (session || requestedAgentId) {
     let owner: AgentOwnerRow | undefined;
     let sessionId: string | undefined;
@@ -245,6 +268,9 @@ export async function observeScoped(
         target = await canonicalAgentSessionTarget(canonicalReadDb, {
           ...(requestedAgentId ? { agentId: requestedAgentId } : {}),
           ...(session ? { name: session } : {}),
+          ...(expectedSessionId !== undefined
+            ? { sessionId: expectedSessionId, exact: true }
+            : {}),
         });
       } catch (error) {
         return agentDirectoryErrorResponse(error);
@@ -309,7 +335,13 @@ export async function observeScoped(
     }
 
     // Eager spawn: bring the agent's ACP session live as the pane opens. Fire-and-forget.
-    warmSession(canonicalName, canonicalAgentId, identity, deps.submitCommand);
+    if (expectedSessionId === undefined)
+      warmSession(
+        canonicalName,
+        canonicalAgentId,
+        identity,
+        deps.submitCommand,
+      );
 
     // Resolve the agent's session id so we can project its durable Turso stream.
     if (!sessionId) {

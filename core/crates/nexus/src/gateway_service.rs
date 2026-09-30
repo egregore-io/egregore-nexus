@@ -3,7 +3,7 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -11,19 +11,21 @@ use serde::Serialize;
 
 use crate::daemon::lifecycle;
 use crate::gateway_lifecycle::{
-    gateway_status, resolve_installed_gateway, GatewayInvocation, GatewayLifecycleError,
-    GatewayPaths, GatewayRuntimeStatus,
+    gateway_status, resolve_installed_gateway, GatewayLifecycleError, GatewayPaths,
+    GatewayRuntimeStatus,
 };
+use crate::lifecycle_process;
 
 const SYSTEMD_SERVICE: &str = "nexus-gateway.service";
 const LAUNCHD_LABEL: &str = "io.egregore.nexus.gateway";
 const WINDOWS_TASK_NAME: &str = "EgregoreNexusGateway";
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
+const SERVICE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVICE_COMMAND_OUTPUT_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayServiceSpec {
     pub executable: PathBuf,
-    pub invocation: GatewayInvocation,
     pub home: PathBuf,
     pub log: PathBuf,
 }
@@ -169,16 +171,16 @@ impl SystemGatewayServiceBackend {
     }
 
     fn command_checked(&self, program: &str, args: &[String]) -> Result<(), String> {
-        let output = Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| error.to_string())?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(format!("{program} service command failed"))
-        }
+        let mut command = Command::new(program);
+        command.args(args);
+        lifecycle_process::run_bounded(
+            &mut command,
+            "Gateway service-manager command",
+            SERVICE_COMMAND_TIMEOUT,
+            SERVICE_COMMAND_OUTPUT_LIMIT,
+        )
+        .map(|_| ())
+        .map_err(|error| format!("{program} service command failed: {error}"))
     }
 }
 
@@ -194,7 +196,6 @@ impl GatewayServiceBackend for SystemGatewayServiceBackend {
         let installation = resolve_installed_gateway().map_err(|error| error.to_string())?;
         Ok(GatewayServiceSpec {
             executable: installation.executable,
-            invocation: installation.invocation,
             home: self.paths.home.clone(),
             log: self.paths.log.clone(),
         })
@@ -355,13 +356,14 @@ impl GatewayServiceBackend for SystemGatewayServiceBackend {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         return self.definition_path().is_file();
         #[cfg(target_os = "windows")]
-        return Command::new("schtasks.exe")
-            .args(["/Query", "/TN", WINDOWS_TASK_NAME])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
+        {
+            return self
+                .command_checked(
+                    "schtasks.exe",
+                    &["/Query".into(), "/TN".into(), WINDOWS_TASK_NAME.into()],
+                )
+                .is_ok();
+        }
         #[allow(unreachable_code)]
         false
     }
@@ -398,18 +400,16 @@ pub fn windows_registration_script(spec: &GatewayServiceSpec) -> String {
     )
 }
 
-#[cfg(target_os = "windows")]
-fn windows_runner_script(spec: &GatewayServiceSpec) -> String {
-    let invocation = match spec.invocation {
-        GatewayInvocation::Direct => format!(
-            "& {}",
-            powershell_literal(&spec.executable.to_string_lossy())
-        ),
-        GatewayInvocation::WindowsCommandShim => format!(
-            "& 'cmd.exe' '/D' '/S' '/C' {}",
-            powershell_literal(&format!("\"{}\"", spec.executable.display()))
-        ),
-    };
+/// Render the PowerShell runner the scheduled task executes.
+///
+/// PowerShell runs a `.cmd`/`.bat` shim directly. Routing it through `cmd.exe /S /C` instead
+/// required hand-quoting the path, and PowerShell passes those quotes through literally, so `/S`
+/// stripped them back off and any installation path containing a space was split.
+pub fn windows_runner_script(spec: &GatewayServiceSpec) -> String {
+    let invocation = format!(
+        "& {}",
+        powershell_literal(&spec.executable.to_string_lossy())
+    );
     format!(
         "$env:NEXUS_HOME = {}\n$env:NEXUS_GATEWAY_DISCOVERY = 'write'\n{}\nexit $LASTEXITCODE\n",
         powershell_literal(&spec.home.to_string_lossy()),

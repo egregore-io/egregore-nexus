@@ -55,6 +55,14 @@ uuid = { workspace = true }
 sha2 = { workspace = true }
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }
+
 [[bin]]
 # Re-expose the hermetic fake Codex app-server so nexus crate integration tests
 # get CARGO_BIN_EXE_nexus_fake_codex_app_server. Same pattern as nexus-harness-codex

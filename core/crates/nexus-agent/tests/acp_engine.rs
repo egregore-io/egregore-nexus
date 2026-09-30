@@ -21,6 +21,190 @@ const FAKE_HARNESS: &str = env!("CARGO_BIN_EXE_fake_acp_agent");
 const CLAUDE_INTERRUPTED_HANDOFF: &str =
     "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null";
 
+#[tokio::test]
+async fn observation_survives_dropped_caller_and_requires_correlated_response() {
+    use nexus_contracts::TurnState;
+    let dir = std::env::temp_dir().join(nexus_common::new_binding_id());
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut command = fake_command();
+    command.env.push((
+        "FAKE_ACP_RESPONSE_GATE".into(),
+        dir.join("response").display().to_string(),
+    ));
+    let engine = Arc::new(AcpEngine::new());
+    assert_eq!(engine.observe_turn().state, TurnState::Unavailable);
+    engine.spawn_and_initialize(&command).await.unwrap();
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    let initial = engine.observe_turn();
+    assert_eq!(initial.state, TurnState::Unknown);
+    assert_eq!(initial, engine.observe_turn());
+    let task = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.inject_completion_observed("late".into()).await }
+    });
+    wait_fixture_marker(&dir.join("response.entered")).await;
+    assert_eq!(engine.observe_turn().state, TurnState::Unknown);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    std::fs::write(dir.join("response.release"), b"release").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while engine.observe_turn().state != TurnState::VerifiedIdle {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a late correlated response remains observable after its caller is dropped");
+    let completed = engine.observe_turn();
+    assert_eq!(completed, engine.observe_turn());
+    assert_eq!(
+        initial.stamp.as_ref().unwrap().owner,
+        completed.stamp.as_ref().unwrap().owner
+    );
+    assert!(completed.stamp.as_ref().unwrap().revision > initial.stamp.as_ref().unwrap().revision);
+    engine.kill().await;
+    assert_eq!(engine.observe_turn().state, TurnState::Unavailable);
+    let engine = AcpEngine::new();
+    engine.spawn_and_initialize(&fake_command()).await.unwrap();
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    assert_ne!(
+        initial.stamp.unwrap().owner,
+        engine.observe_turn().stamp.unwrap().owner
+    );
+    engine.kill().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn observation_overlap_stays_unknown_until_a_new_binding() {
+    use nexus_contracts::TurnState;
+    let dir = std::env::temp_dir().join(nexus_common::new_binding_id());
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut command = fake_command();
+    command.env.push((
+        "FAKE_ACP_RESPONSE_GATE".into(),
+        dir.join("response").display().to_string(),
+    ));
+    let engine = Arc::new(AcpEngine::new());
+    engine.spawn_and_initialize(&command).await.unwrap();
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    let first = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.inject_completion_observed("old".into()).await }
+    });
+    wait_fixture_marker(&dir.join("response.entered")).await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    let before = engine.observe_turn();
+    let second = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.inject_completion_observed("new".into()).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while engine.observe_turn().stamp == before.stamp {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::write(dir.join("response.release"), b"release").unwrap();
+    second.await.unwrap().unwrap();
+    assert_eq!(
+        engine.observe_turn().state,
+        TurnState::Unknown,
+        "neither old nor newer completion may erase unresolved overlap"
+    );
+    engine
+        .inject_completion_observed("third".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.observe_turn().state,
+        TurnState::Unknown,
+        "ambiguity is sticky, not a one-request flag"
+    );
+    let before_reload = engine.observe_turn();
+    let native_session = engine.acp_session_id().await.unwrap();
+    engine
+        .load_session(&native_session, None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.observe_turn().stamp.as_ref().unwrap().owner,
+        before_reload.stamp.as_ref().unwrap().owner,
+        "same-session reload is not a new binding"
+    );
+    engine
+        .inject_completion_observed("after reload".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.observe_turn().state,
+        TurnState::Unknown,
+        "same-session load ACK cannot erase unresolved older work"
+    );
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    assert_ne!(
+        engine.observe_turn().stamp.unwrap().owner,
+        before.stamp.unwrap().owner
+    );
+    assert_eq!(engine.observe_turn().state, TurnState::Unknown);
+    engine
+        .inject_completion_observed("fresh binding".into())
+        .await
+        .unwrap();
+    assert_eq!(engine.observe_turn().state, TurnState::VerifiedIdle);
+    let before_switch = engine.observe_turn();
+    engine
+        .load_session("different-native-session", None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    assert_ne!(
+        engine.observe_turn().stamp.unwrap().owner,
+        before_switch.stamp.unwrap().owner,
+        "changing the native session replaces the binding even on the same connection"
+    );
+    assert_eq!(engine.observe_turn().state, TurnState::Unknown);
+    engine.kill().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn observation_queue_only_response_never_claims_idle() {
+    let mut command = fake_command();
+    command
+        .env
+        .push(("FAKE_ACP_HERMES_QUEUE_PROMOTE_MS".into(), "10000".into()));
+    let engine = AcpEngine::for_harness(HarnessId::new("hermes").unwrap());
+    engine.spawn_and_initialize(&command).await.unwrap();
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    assert!(engine
+        .inject_completion_observed("queued only".into())
+        .await
+        .is_err());
+    engine.take_updates();
+    assert_eq!(
+        engine.observe_turn().state,
+        nexus_contracts::TurnState::Unknown,
+        "queue-only EndTurn and draining the display buffer cannot prove native completion"
+    );
+    engine.kill().await;
+}
+
 /// Concatenate the reply text from a drained stream — i.e. the `text` of every `Text`-kind event,
 /// in order. The full-stream pass-through also relays thinking / tool-call / plan events; the
 /// **reply** is just the `Text` ones, so these turn-content assertions filter to those.
@@ -60,6 +244,214 @@ fn fake_command() -> HarnessCommand {
         args: vec![],
         cwd: None,
         ..Default::default()
+    }
+}
+
+async fn wait_fixture_marker(path: &std::path::Path) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("fixture must reach the real ACP gate");
+}
+
+#[tokio::test]
+async fn strict_completion_owns_buffer_and_suppresses_waiting_legacy_live_slot() {
+    let dir = std::env::temp_dir().join(format!(
+        "acp-strict-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut command = fake_command();
+    command.env = vec![
+        (
+            "FAKE_ACP_PROMPT_GATE".into(),
+            dir.join("prompt").display().to_string(),
+        ),
+        (
+            "FAKE_ACP_RESPONSE_GATE".into(),
+            dir.join("response").display().to_string(),
+        ),
+        ("FAKE_ACP_ECHO_USER".into(), "1".into()),
+    ];
+    let engine = Arc::new(AcpEngine::new());
+    engine.spawn_and_initialize(&command).await.unwrap();
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    let strict_engine = engine.clone();
+    let strict = tokio::spawn(async move {
+        strict_engine
+            .inject_completion_observed("strict".into())
+            .await
+    });
+    wait_fixture_marker(&dir.join("prompt.entered")).await;
+    // Real legacy relay installs this before waiting on the already-owned engine turn lock.
+    let mut live = engine.install_live();
+    let legacy_engine = engine.clone();
+    let mut legacy = Box::pin(legacy_engine.inject("legacy".into()));
+    assert!(futures::poll!(&mut legacy).is_pending());
+    std::fs::write(dir.join("prompt.release"), b"release").unwrap();
+    wait_fixture_marker(&dir.join("response.entered")).await;
+    assert!(
+        !strict.is_finished(),
+        "output and user echo cannot settle strict completion"
+    );
+    assert!(
+        live.try_recv().is_err(),
+        "a waiting legacy slot must not leak strict output"
+    );
+    std::fs::write(dir.join("response.release"), b"release").unwrap();
+    let strict_events = strict.await.unwrap().unwrap();
+    legacy.await.unwrap();
+    assert_eq!(reply_text(strict_events), "echo: strict");
+    assert_eq!(reply_text(engine.take_updates()), "echo: legacy");
+    engine.clear_live();
+    let mut legacy_live = Vec::new();
+    while let Some(event) = live.recv().await {
+        legacy_live.push(event);
+    }
+    assert_eq!(
+        reply_text(legacy_live),
+        "echo: legacy",
+        "strict cleanup must not clobber the waiting sender"
+    );
+    engine.kill().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn strict_completion_rejects_cancelled_response_and_error_without_leaking_buffer() {
+    for (variable, value) in [
+        ("FAKE_ACP_CANCELLED_RESPONSE", "1"),
+        ("FAKE_ACP_PROMPT_ERROR_MESSAGE", "rejected"),
+        ("FAKE_ACP_PROMPT_ERROR_MESSAGE", CLAUDE_INTERRUPTED_HANDOFF),
+    ] {
+        let engine = AcpEngine::new();
+        let mut command = fake_command();
+        command.env.push((variable.into(), value.into()));
+        engine.spawn_and_initialize(&command).await.unwrap();
+        engine
+            .new_session(None, &LaunchCtx::default())
+            .await
+            .unwrap();
+        assert!(engine
+            .inject_completion_observed("strict".into())
+            .await
+            .is_err());
+        assert!(engine.take_updates().is_empty());
+        assert_eq!(
+            engine.observe_turn().state,
+            nexus_contracts::TurnState::Unknown,
+            "cancelled/error/handoff responses are not positive native completion"
+        );
+        if variable == "FAKE_ACP_CANCELLED_RESPONSE" {
+            engine.inject("legacy".into()).await.unwrap();
+        }
+        engine.kill().await;
+    }
+}
+
+#[tokio::test]
+async fn strict_completion_rejects_local_interrupt_and_disconnect_after_output() {
+    for interrupt in [true, false] {
+        let dir = std::env::temp_dir().join(format!(
+            "acp-strict-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = Arc::new(AcpEngine::new());
+        let mut command = fake_command();
+        command.env.push((
+            "FAKE_ACP_RESPONSE_GATE".into(),
+            dir.join("response").display().to_string(),
+        ));
+        engine.spawn_and_initialize(&command).await.unwrap();
+        engine
+            .new_session(None, &LaunchCtx::default())
+            .await
+            .unwrap();
+        let pending_engine = engine.clone();
+        let pending = tokio::spawn(async move {
+            pending_engine
+                .inject_completion_observed("strict".into())
+                .await
+        });
+        wait_fixture_marker(&dir.join("response.entered")).await;
+        assert!(!pending.is_finished());
+        if interrupt {
+            engine.cancel_active_turn().await.unwrap();
+        } else {
+            engine.kill().await;
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert!(engine.take_updates().is_empty());
+        engine.kill().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[tokio::test]
+async fn strict_completion_never_uses_compatibility_quiescence_without_response() {
+    // Isolate the engine's existing environment overrides from parallel tests in this binary.
+    if std::env::var_os("NEXUS_TEST_STRICT_ACP_TIMEOUT").is_none() {
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "strict_completion_never_uses_compatibility_quiescence_without_response",
+                "--nocapture",
+            ])
+            .env("NEXUS_TEST_STRICT_ACP_TIMEOUT", "1")
+            .env("NEXUS_ACP_TURN_TIMEOUT_SECS", "1")
+            .env("NEXUS_ACP_QUIESCENCE_MS", "10")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for harness in ["codex", "hermes"] {
+        let engine = AcpEngine::for_harness(HarnessId::new(harness).unwrap());
+        let mut command = fake_command();
+        command
+            .env
+            .push(("FAKE_ACP_NO_TURN_END".into(), "1".into()));
+        engine.spawn_and_initialize(&command).await.unwrap();
+        engine
+            .new_session(None, &LaunchCtx::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            engine.inject_completion_observed("strict".into()).await,
+            Err(AdapterInjectError::CompletionTimeout { .. })
+        ));
+        assert!(engine.take_updates().is_empty());
+        // The same harness's ordinary legacy path retains its existing compatibility behavior.
+        engine.inject("legacy".into()).await.unwrap();
+        assert_eq!(reply_text(engine.take_updates()), "echo: legacy");
+        engine.kill().await;
     }
 }
 
@@ -580,6 +972,11 @@ async fn accepted_cancel_releases_unanswered_prompt_for_the_replacement_turn() {
     .await
     .expect("replacement prompt must cross the released serialization boundary")
     .expect("the replacement turn must complete");
+    assert_eq!(
+        engine.observe_turn().state,
+        nexus_contracts::TurnState::Unknown,
+        "accepted cancel and newer completion cannot settle older unanswered native work"
+    );
     assert!(
         reply_text(engine.take_updates()).contains("replacement must not wait ten minutes"),
         "the completed replacement output must remain available to the relay"

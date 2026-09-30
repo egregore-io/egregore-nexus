@@ -590,21 +590,40 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
         randomSecret: (prefix) => `${prefix}_secret_${++idSeq}`,
       },
     );
+    const submit = vi.fn(async () => ({}));
     const dispatch = makeDispatch({
       db: async () => db,
       canonicalDb: () => canonicalDb,
       authMode: "remote",
       now: () => 2_000_000,
+      commands: { submit } as CommandIntentSender,
     });
 
-    const response = await dispatch(new Request(
-      "http://localhost/api/v1/agent-sessions/s_collision/events?view=agui",
+    const response = await dispatch(
+      new Request(
+        "http://localhost/api/v1/agent-sessions/s_collision/events?view=agui&agentId=a_exact_target&expectedSessionId=s_collision",
       { headers: { authorization: `Bearer ${issued.accessToken}` } },
-    ));
+      ),
+    );
 
     expect(response.status).toBe(200);
     expect(response.headers.get("x-nexus-agent-id")).toBe("a_exact_target");
+    expect(submit).not.toHaveBeenCalled();
     await response.body?.cancel();
+    for (const [session, agent, expected, status] of [
+      ["s_collision", "a_runtime_alias", "s_collision", 404],
+      ["r_exact", "a_exact_target", "r_exact", 404],
+      ["s_collision", "a_exact_target", "s_other", 400],
+    ]) {
+      const wrong = await dispatch(
+        new Request(
+          `http://localhost/api/v1/agent-sessions/${session}/events?agentId=${agent}&expectedSessionId=${expected}`,
+      { headers: { authorization: `Bearer ${issued.accessToken}` } },
+        ),
+      );
+      expect(wrong.status).toBe(status);
+    }
+    expect(submit).not.toHaveBeenCalled();
     canonicalDb.close();
   });
 
@@ -946,7 +965,10 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
     }));
 
     expect(issue.status).toBe(201);
-    const issued = await issue.json() as { accessToken: string; tokenId: string };
+    const issued = (await issue.json()) as {
+      accessToken: string;
+      tokenId: string;
+    };
     expect(issued.accessToken).toMatch(/^nx_at_/);
 
     const send = await dispatch(new Request("http://localhost/api/v1/messages", {
@@ -1013,7 +1035,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
       },
       body: JSON.stringify({ scopes: ["message:read"] }),
     }));
-    const issued = await issue.json() as { accessToken: string };
+    const issued = (await issue.json()) as { accessToken: string };
 
     const send = await dispatch(new Request("http://localhost/api/v1/messages", {
       method: "POST",
@@ -1141,7 +1163,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
       },
       body: JSON.stringify({ scopes: ["agent:read"] }),
     }));
-    const readBearer = await issueRead.json() as { accessToken: string };
+    const readBearer = (await issueRead.json()) as { accessToken: string };
 
     const allowed = await dispatch(new Request("http://localhost/api/v1/agents/ben?project=nexus", {
       headers: { authorization: `Bearer ${readBearer.accessToken}` },
@@ -1160,7 +1182,9 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
       },
       body: JSON.stringify({ scopes: ["message:read"] }),
     }));
-    const messageReadBearer = await issueMessageRead.json() as { accessToken: string };
+    const messageReadBearer = (await issueMessageRead.json()) as {
+      accessToken: string;
+    };
     const denied = await dispatch(new Request("http://localhost/api/v1/agents/ben?project=nexus", {
       headers: { authorization: `Bearer ${messageReadBearer.accessToken}` },
     }));
@@ -1237,8 +1261,9 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
         },
         body: JSON.stringify({ scopes }),
       }));
-      expect(res.status).toBe(201);
-      const issued = await res.json() as { accessToken: string };
+
+    expect(res.status).toBe(201);
+      const issued = (await res.json()) as { accessToken: string };
       return issued.accessToken;
     }
 
@@ -1350,7 +1375,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
       body: JSON.stringify({ scopes: ["source:push"] }),
     }));
     expect(issuedRes.status).toBe(201);
-    const issued = await issuedRes.json() as { accessToken: string };
+    const issued = (await issuedRes.json()) as { accessToken: string };
 
     const patch = await dispatch(new Request("http://localhost/api/v1/messages/m_seed_1/metadata", {
       method: "PATCH",
@@ -1404,7 +1429,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
       },
       body: JSON.stringify({ scopes: ["message:read"], ttlMs: 1_000 }),
     }));
-    const issued = await issue.json() as { accessToken: string };
+    const issued = (await issue.json()) as { accessToken: string };
 
     now += 1_001;
     const read = await dispatch(new Request("http://localhost/api/v1/threads", {
@@ -1445,7 +1470,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
       },
       body: JSON.stringify({ scopes: ["message:send"], ttlMs: 60_000 }),
     }));
-    const first = await issue.json() as {
+    const first = (await issue.json()) as {
       accessToken: string;
       refreshToken: string;
       tokenId: string;
@@ -1459,7 +1484,10 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
     }));
 
     expect(refreshed.status).toBe(201);
-    const second = await refreshed.json() as { accessToken: string; tokenId: string };
+    const second = (await refreshed.json()) as {
+      accessToken: string;
+      tokenId: string;
+    };
     expect(second.accessToken).not.toBe(first.accessToken);
 
     const oldAccess = await dispatch(new Request("http://localhost/api/v1/messages", {

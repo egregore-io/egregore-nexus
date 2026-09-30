@@ -22,6 +22,8 @@ use nexus_store::repos::CommandIntents;
 use nexus_store::{DaemonStore, Store};
 use sha2::{Digest, Sha256};
 
+use crate::lifecycle_process;
+
 #[cfg(target_os = "linux")]
 const SYSTEMD_SERVICE: &str = "nexus-daemon.service";
 #[cfg(target_os = "linux")]
@@ -34,6 +36,8 @@ const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(45);
 const FORCE_STOP_GRACE: Duration = Duration::from_secs(10);
 const SERVICE_START_GRACE: Duration = Duration::from_secs(5);
 const SERVICE_STABILITY_GRACE: Duration = Duration::from_millis(500);
+const SERVICE_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVICE_HELPER_OUTPUT_LIMIT: usize = 64 * 1024;
 
 /// Parser for the daemon arm of the `nexus` binary.
 #[derive(Parser, Debug)]
@@ -641,8 +645,7 @@ impl Supervisor for SelfDaemonSupervisor {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(err));
-        detach_command(&mut command);
-        let child = command.spawn()?;
+        let child = lifecycle_process::spawn_detached(&mut command)?;
         wait_for_pidfile(&self.paths.pid_file, child.id(), Duration::from_secs(3));
         Ok(())
     }
@@ -1037,12 +1040,28 @@ impl CommandSpec {
     }
 
     fn run_capture(&self) -> Result<CommandOutput, LifecycleError> {
-        let output = Command::new(&self.program).args(&self.args).output()?;
-        Ok(CommandOutput {
-            success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        })
+        let mut command = Command::new(&self.program);
+        command.args(&self.args);
+        match lifecycle_process::run_bounded(
+            &mut command,
+            "daemon service-manager command",
+            SERVICE_HELPER_TIMEOUT,
+            SERVICE_HELPER_OUTPUT_LIMIT,
+        ) {
+            Ok(output) => Ok(CommandOutput {
+                success: true,
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            }),
+            Err(lifecycle_process::BoundedProcessError::Exit { stdout, stderr, .. }) => {
+                Ok(CommandOutput {
+                    success: false,
+                    stdout: String::from_utf8_lossy(&stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&stderr).to_string(),
+                })
+            }
+            Err(error) => Err(LifecycleError::Command(error.to_string())),
+        }
     }
 
     fn run_checked(&self) -> Result<(), LifecycleError> {
@@ -1699,24 +1718,96 @@ fn signal_process(pid: u32, kill: bool) -> io::Result<()> {
     }
 }
 
-fn detach_command(command: &mut Command) {
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
+#[derive(Debug, Clone, Copy)]
+enum ServicePathPlatform {
+    Linux,
+    Macos,
+    Windows,
+}
+
+impl ServicePathPlatform {
+    fn separator(self) -> char {
+        match self {
+            Self::Linux | Self::Macos => ':',
+            Self::Windows => ';',
+        }
+    }
+}
+
+fn build_service_execution_path(
+    binary: &Path,
+    ambient: impl IntoIterator<Item = PathBuf>,
+    fallbacks: impl IntoIterator<Item = PathBuf>,
+    separator: char,
+) -> String {
+    let mut entries = Vec::<PathBuf>::new();
+    let mut push_unique = |entry: PathBuf| {
+        if entry.as_os_str().is_empty() || entries.iter().any(|seen| seen == &entry) {
+            return;
+        }
+        entries.push(entry);
+    };
+
+    if let Some(parent) = binary.parent() {
+        push_unique(parent.to_path_buf());
+    }
+    for entry in ambient {
+        push_unique(entry);
+    }
+    for entry in fallbacks {
+        push_unique(entry);
+    }
+
+    entries
+        .iter()
+        .map(|entry| entry.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(&separator.to_string())
+}
+
+fn service_execution_path(binary: &Path, platform: ServicePathPlatform) -> String {
+    let ambient = env::var_os("PATH")
+        .map(|value| env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default();
+    build_service_execution_path(
+        binary,
+        ambient,
+        service_path_fallbacks(platform),
+        platform.separator(),
+    )
+}
+
+fn service_path_fallbacks(platform: ServicePathPlatform) -> Vec<PathBuf> {
+    let mut entries = Vec::new();
+    match platform {
+        ServicePathPlatform::Linux | ServicePathPlatform::Macos => {
+            if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+                entries.push(home.join(".local/bin"));
+                entries.push(home.join("bin"));
             }
-            Ok(())
-        });
+            if matches!(platform, ServicePathPlatform::Macos) {
+                entries.push(PathBuf::from("/opt/homebrew/bin"));
+            }
+            entries.extend([
+                PathBuf::from("/usr/local/bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin"),
+            ]);
+        }
+        ServicePathPlatform::Windows => {
+            if let Some(app_data) = env::var_os("APPDATA").map(PathBuf::from) {
+                entries.push(app_data.join("npm"));
+            }
+            if let Some(local_app_data) = env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+                entries.push(local_app_data.join("Microsoft/WindowsApps"));
+            }
+            if let Some(system_root) = env::var_os("SystemRoot").map(PathBuf::from) {
+                entries.push(system_root.join("System32"));
+                entries.push(system_root);
+            }
+        }
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
-    }
+    entries
 }
 
 /// Build the per-user Windows Task Scheduler registration script.
@@ -1725,15 +1816,26 @@ fn detach_command(command: &mut Command) {
 /// scheduler can observe the foreground daemon's exit status for restart-on-failure.
 #[doc(hidden)]
 pub fn windows_task_registration_script(binary: &Path, nexus_home: &Path) -> String {
+    let service_path = service_execution_path(binary, ServicePathPlatform::Windows);
+    windows_task_registration_script_with_path(binary, nexus_home, &service_path)
+}
+
+fn windows_task_registration_script_with_path(
+    binary: &Path,
+    nexus_home: &Path,
+    service_path: &str,
+) -> String {
     let wrapper_path =
         powershell_single_quote(&nexus_home.join("daemon-task.ps1").display().to_string());
     let binary = powershell_single_quote(&binary.display().to_string());
     let nexus_home = powershell_single_quote(&nexus_home.display().to_string());
+    let service_path = powershell_single_quote(service_path);
     format!(
         "$ErrorActionPreference = 'Stop'\n\
 $wrapperPath = '{wrapper_path}'\n\
 $wrapper = @'\n\
 $env:NEXUS_HOME = '{nexus_home}'\n\
+$env:Path = '{service_path}'\n\
 & '{binary}' daemon run\n\
 exit $LASTEXITCODE\n\
 '@\n\
@@ -1754,22 +1856,48 @@ fn powershell_single_quote(value: &str) -> String {
 
 #[cfg(target_os = "linux")]
 fn systemd_unit(binary: &Path, paths: &DaemonPaths) -> String {
+    let service_path = service_execution_path(binary, ServicePathPlatform::Linux);
+    systemd_unit_with_path(binary, paths, &service_path)
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_unit_with_path(binary: &Path, paths: &DaemonPaths, service_path: &str) -> String {
+    let service_path = systemd_escape_environment(service_path);
     format!(
-        "[Unit]\nDescription=Nexus daemon\n\n[Service]\nType=simple\nExecStart={} daemon run\nRestart=on-failure\nEnvironment=NEXUS_HOME={}\nWorkingDirectory={}\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Nexus daemon\n\n[Service]\nType=simple\nExecStart={} daemon run\nRestart=on-failure\nEnvironment=NEXUS_HOME={}\nEnvironment=\"PATH={}\"\nWorkingDirectory={}\n\n[Install]\nWantedBy=default.target\n",
         binary.display(),
         paths.home.display(),
+        service_path,
         env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .display()
     )
 }
 
+fn systemd_escape_environment(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%")
+}
+
 /// Build the per-user macOS LaunchAgent property list.
 #[doc(hidden)]
 pub fn launchd_service_plist(binary: &Path, nexus_home: &Path, log_file: &Path) -> String {
+    let service_path = service_execution_path(binary, ServicePathPlatform::Macos);
+    launchd_service_plist_with_path(binary, nexus_home, log_file, &service_path)
+}
+
+fn launchd_service_plist_with_path(
+    binary: &Path,
+    nexus_home: &Path,
+    log_file: &Path,
+    service_path: &str,
+) -> String {
     let binary = escape_xml_text(&binary.display().to_string());
     let nexus_home = escape_xml_text(&nexus_home.display().to_string());
     let log_file = escape_xml_text(&log_file.display().to_string());
+    let service_path = escape_xml_text(service_path);
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1778,7 +1906,11 @@ pub fn launchd_service_plist(binary: &Path, nexus_home: &Path, log_file: &Path) 
   <key>Label</key><string>{LAUNCHD_LABEL}</string>
   <key>ProgramArguments</key>
   <array><string>{}</string><string>daemon</string><string>run</string></array>
-  <key>EnvironmentVariables</key><dict><key>NEXUS_HOME</key><string>{}</string></dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>NEXUS_HOME</key><string>{}</string>
+    <key>PATH</key><string>{}</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>StandardOutPath</key><string>{}</string>
@@ -1786,7 +1918,7 @@ pub fn launchd_service_plist(binary: &Path, nexus_home: &Path, log_file: &Path) 
 </dict>
 </plist>
 "#,
-        binary, nexus_home, log_file, log_file
+        binary, nexus_home, service_path, log_file, log_file
     )
 }
 

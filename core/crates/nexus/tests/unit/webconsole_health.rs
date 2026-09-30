@@ -59,3 +59,49 @@ fn health_probe_avoids_chunked_node_response_framing() {
     assert_eq!(health.host, "127.0.0.1");
     assert_eq!(health.port, port);
 }
+
+#[test]
+fn webconsole_uses_shared_detach_and_never_waits_for_browser_exit() {
+    let source = include_str!("../../src/webconsole_lifecycle.rs");
+
+    assert!(source.contains("lifecycle_process::spawn_detached"));
+    assert!(source.contains("spawn_browser_opener"));
+    assert!(!source.contains("fn detach_command("));
+    assert!(!source.contains("Command::new(\"xdg-open\").arg(url).status()"));
+}
+
+#[cfg(unix)]
+#[test]
+fn browser_opener_returns_after_spawn_instead_of_process_exit() {
+    use std::fs;
+    use std::process::Command;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::spawn_browser_opener;
+
+    let temp = tempfile::tempdir().unwrap();
+    let pid_path = temp.path().join("browser.pid");
+    let script = format!(
+        "printf '%s\\n' \"$$\" > '{}'; exec sleep 60",
+        pid_path.display()
+    );
+    let mut command = Command::new("sh");
+    command.args(["-c", &script]);
+    let started = Instant::now();
+
+    spawn_browser_opener(&mut command).unwrap();
+
+    assert!(started.elapsed() < Duration::from_millis(500));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && !pid_path.exists() {
+        thread::sleep(Duration::from_millis(20));
+    }
+    let pid: i32 = fs::read_to_string(pid_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+}

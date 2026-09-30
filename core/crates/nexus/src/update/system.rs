@@ -3,16 +3,15 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
 use crate::daemon::lifecycle::{self, DaemonPaths};
 use crate::gateway_lifecycle::{gateway_status, restart_gateway, GatewayRuntimeStatus};
+use crate::lifecycle_process::{self, BoundedProcessError};
 
 use super::install_context::{InstallContext, InstallMethod, InstalledFacet};
 use super::lock::UpdateLock;
@@ -24,8 +23,9 @@ use super::transaction::{
 };
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(60);
-const INSTALL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+const COMMAND_OUTPUT_LIMIT: usize = 256 * 1024;
 
 pub async fn execute_system_update(context: &InstallContext, check_only: bool) -> UpdateOutcome {
     let mut port = SystemUpdatePort::new(context.clone());
@@ -342,56 +342,23 @@ fn run_command(plan: &CommandPlan, timeout: Duration) -> Result<String, String> 
     command
         .args(&plan.args)
         .current_dir(&plan.cwd)
-        .envs(&plan.env_overrides)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|_| format!("failed to start {}", plan.redacted_display()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "stdout unavailable".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "stderr unavailable".to_string())?;
-    let stdout_reader = thread::spawn(move || read_bounded(stdout));
-    let stderr_reader = thread::spawn(move || read_bounded(stderr));
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            break status;
+        .envs(&plan.env_overrides);
+    match lifecycle_process::run_bounded(
+        &mut command,
+        "Nexus update helper",
+        timeout,
+        COMMAND_OUTPUT_LIMIT,
+    ) {
+        Ok(output) => String::from_utf8(output.stdout).map_err(|error| error.to_string()),
+        Err(BoundedProcessError::Timeout { .. }) => {
+            Err(format!("{} timed out", plan.redacted_display()))
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
-            return Err(format!("{} timed out", plan.redacted_display()));
+        Err(BoundedProcessError::Spawn { .. }) => {
+            Err(format!("failed to start {}", plan.redacted_display()))
         }
-        thread::sleep(Duration::from_millis(50));
-    };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| "stdout reader failed".to_string())?;
-    let _stderr = stderr_reader
-        .join()
-        .map_err(|_| "stderr reader failed".to_string())?;
-    if !status.success() {
-        return Err(format!("{} failed", plan.redacted_display()));
+        Err(BoundedProcessError::Exit { .. }) => Err(format!("{} failed", plan.redacted_display())),
+        Err(_) => Err(format!("{} failed", plan.redacted_display())),
     }
-    String::from_utf8(stdout).map_err(|error| error.to_string())
-}
-
-fn read_bounded(mut input: impl Read) -> Vec<u8> {
-    const LIMIT: usize = 256 * 1024;
-    let mut bytes = Vec::new();
-    let _ = input.by_ref().take(LIMIT as u64).read_to_end(&mut bytes);
-    let mut sink = std::io::sink();
-    let _ = std::io::copy(&mut input, &mut sink);
-    bytes
 }
 
 fn user_home() -> PathBuf {

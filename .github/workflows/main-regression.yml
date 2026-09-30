@@ -24,6 +24,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Cross-platform config and process contract
         run: cargo test --manifest-path core/Cargo.toml -p egregore-nexus gateway_lifecycle_contracts
+      # These suites hold the only tests that execute a real Windows `.cmd` shim end to end.
+      # The name filter above never selected them, so a broken cmd.exe invocation reached
+      # operators despite this job being green on windows-latest.
+      - name: Cross-platform lifecycle shim spawning
+        run: cargo test --manifest-path core/Cargo.toml -p egregore-nexus --test webconsole_lifecycle --test gateway_service
       - name: Cross-platform delivery-mode persistence
         run: cargo test --manifest-path core/Cargo.toml -p egregore-nexus-common --test config
 

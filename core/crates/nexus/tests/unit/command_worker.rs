@@ -45,6 +45,361 @@ struct InterruptSpy {
     calls: AtomicUsize,
 }
 
+#[derive(Default)]
+struct SteerDispatchSpy {
+    calls: AtomicUsize,
+}
+
+#[derive(Default)]
+struct ExactDispatchSpy {
+    calls: Mutex<Vec<(String, SessionId)>>,
+    probes: AtomicUsize,
+    prompt_error: Option<ContractError>,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutionPort for ExactDispatchSpy {
+    async fn inject_turn(&self, _: &SessionId, _: &NexusBatch) -> PortResult<()> {
+        panic!("no bus delivery")
+    }
+    async fn launch(&self, _: SpawnRequest) -> PortResult<SpawnResponse> {
+        panic!("exact dispatch cannot revive")
+    }
+    async fn remove(&self, _: RemoveRequest) -> PortResult<RemoveResponse> {
+        panic!("no removal")
+    }
+    fn is_harness_alive(&self, _: &SessionId) -> Option<bool> {
+        self.probes.fetch_add(1, Ordering::SeqCst);
+        Some(true)
+    }
+    async fn prompt(&self, recipient: &SessionId, _: String) -> PortResult<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("prompt".into(), recipient.clone()));
+        self.prompt_error.clone().map_or(Ok(()), Err)
+    }
+    async fn steer_observed(
+        &self,
+        recipient: &SessionId,
+        _: String,
+        _: Arc<dyn nexus_contracts::EventSink>,
+        _: nexus_contracts::WsEvent,
+    ) -> PortResult<nexus_contracts::SteerResponse> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("steer".into(), recipient.clone()));
+        Ok(
+            serde_json::from_value(serde_json::json!({"accepted":true,"delivery":"steered"}))
+                .unwrap(),
+        )
+    }
+    async fn interrupt_active_turn(&self, recipient: &SessionId) -> PortResult<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("interrupt".into(), recipient.clone()));
+        Ok(())
+    }
+    async fn compact(&self, recipient: &SessionId) -> PortResult<()> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("compact".into(), recipient.clone()));
+        Ok(())
+    }
+}
+
+async fn bind_exact_test_runtime(state: &AppState, session: &str) {
+    let sessions = Sessions::new(&state.store);
+    sessions
+        .create(NewSession {
+            session_id: SessionId(session.into()),
+            name: Some(format!("target {session}")),
+            agent: Some("claude".into()),
+            kind: "agent".into(),
+            role: None,
+            tier: "agent".into(),
+            harness_session_id: None,
+            client_key: None,
+            cwd: None,
+            project: "metadata".into(),
+            transport: Some("pty".into()),
+        })
+        .await
+        .unwrap();
+    sessions
+        .set_agent_id(&SessionId(session.into()), "a_exact")
+        .await
+        .unwrap();
+    nexus_store::repos::AgentRuntimes::new(&state.store)
+        .create(nexus_store::repos::NewAgentRuntime {
+            runtime_id: session.into(),
+            agent_id: "a_exact".into(),
+            harness: "claude".into(),
+            cwd: None,
+            transport: Some("pty".into()),
+            presence: Some("online".into()),
+            active: true,
+        })
+        .await
+        .unwrap();
+}
+
+async fn exact_test_agent(state: &AppState) {
+    Agents::new(&state.store)
+        .create(NewAgent {
+            agent_id: "a_exact".into(),
+            project: "metadata".into(),
+            name: Some("exact target".into()),
+            default_harness: Some("claude".into()),
+            role: None,
+            tier: Some("agent".into()),
+            owner: None,
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn exact_durable_dispatch_rejects_original_session_after_real_same_agent_rebind() {
+    for (method, kind) in [
+        ("prompt", command_kinds::harness::PROMPT),
+        ("steer", command_kinds::harness::STEER),
+        ("interrupt", command_kinds::harness::INTERRUPT),
+        ("compact", command_kinds::harness::COMPACT),
+    ] {
+        let exec = Arc::new(ExactDispatchSpy::default());
+        let state = test_state_with_turn_exec(exec.clone()).await;
+        let operator = state
+            .identity
+            .register(human_register("operator", "ck_exact"))
+            .await
+            .unwrap();
+        exact_test_agent(&state).await;
+        bind_exact_test_runtime(&state, "s_original").await;
+        let mut old = prompt_intent("cmd_exact_old", &operator, "operator", "ck_exact", "old", 1);
+        old.kind = kind.into();
+        old.request_json = serde_json::json!({"agentId":"a_exact", "expectedSessionId":"s_original", "name":"not routing authority", "text":"old", "clientMessageId":"client_exact_old"}).to_string();
+        let repo = CommandIntents::new(&state.store);
+        repo.insert_pending(old).await.unwrap();
+        bind_exact_test_runtime(&state, "s_current").await;
+        assert!(process_next(&state).await.unwrap());
+        let old = repo.get("cmd_exact_old").await.unwrap().unwrap();
+        assert_eq!(old.status, "error", "{method}: {old:?}");
+        assert!(
+            exec.calls.lock().unwrap().is_empty(),
+            "old durable row must not reach the replacement harness"
+        );
+        assert_eq!(
+            exec.probes.load(Ordering::SeqCst),
+            0,
+            "exact resolution must bypass ensure_alive"
+        );
+
+        let mut current = prompt_intent(
+            "cmd_exact_current",
+            &operator,
+            "operator",
+            "ck_exact",
+            "current",
+            2,
+        );
+        current.kind = kind.into();
+        current.request_json = serde_json::json!({"agentId":"a_exact", "expectedSessionId":"s_current", "name":"ignored", "text":"current"}).to_string();
+        repo.insert_pending(current).await.unwrap();
+        assert!(process_next(&state).await.unwrap());
+        let current = repo.get("cmd_exact_current").await.unwrap().unwrap();
+        assert_eq!(current.status, "done", "{method}: {current:?}");
+        let result: serde_json::Value =
+            serde_json::from_str(current.result_json.as_deref().unwrap()).unwrap();
+        assert_eq!(result["sessionId"], "s_current");
+        assert_eq!(
+            *exec.calls.lock().unwrap(),
+            vec![(method.into(), SessionId("s_current".into()))]
+        );
+        assert_eq!(exec.probes.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn exact_redirect_paths_preserve_original_request_and_retry_identity_through_rebind() {
+    for path in ["promote", "redirect", "already-steer"] {
+        let exec = Arc::new(ExactDispatchSpy::default());
+        let state = test_state_with_turn_exec(exec.clone()).await;
+        let operator = state
+            .identity
+            .register(human_register("operator", "ck_exact_redirect"))
+            .await
+            .unwrap();
+        exact_test_agent(&state).await;
+        bind_exact_test_runtime(&state, "s_original").await;
+        let mut intent = prompt_intent(
+            "cmd_exact_redirect",
+            &operator,
+            "operator",
+            "ck_exact_redirect",
+            "redirect",
+            1,
+        );
+        intent.request_json = r#"{ "name":"ignored", "agentId":"a_exact", "expectedSessionId":"s_original", "text":"redirect", "clientMessageId":"cm_exact_redirect" }"#.into();
+        intent.idempotency_key = Some("cm_exact_redirect".into());
+        if path == "already-steer" {
+            intent.kind = command_kinds::harness::STEER.into();
+        }
+        let original = intent.clone();
+        let repo = CommandIntents::new(&state.store);
+        repo.insert_pending(intent).await.unwrap();
+        if path == "promote" {
+            assert!(repo
+                .promote_pending_prompt_to_steer("cmd_exact_redirect")
+                .await
+                .unwrap());
+        } else if path == "redirect" {
+            let request = serde_json::from_value(serde_json::json!({"agentId":"a_exact", "expectedSessionId":"s_original", "action":"redirect_now", "clientMutationId":"mut_exact_redirect", "commandId":"cmd_exact_redirect", "expectedRevision":1})).unwrap();
+            assert_eq!(
+                nexus_store::repos::CommandQueue::new(&state.store)
+                    .mutate_with_capability(
+                        "metadata",
+                        &request,
+                        2,
+                        &[SessionId("s_original".into())],
+                        Some(
+                            &nexus_store::repos::command_queue::CapturedQueueCapability {
+                                session_id: SessionId("s_original".into()),
+                                steer_capability: nexus_contracts::SteerCapability::NativeSteer,
+                            }
+                        ),
+                    )
+                    .await
+                    .unwrap()
+                    .status,
+                200
+            );
+        }
+        let converted = repo.get("cmd_exact_redirect").await.unwrap().unwrap();
+        assert_eq!(converted.kind, command_kinds::harness::STEER);
+        assert_eq!(
+            converted.request_json, original.request_json,
+            "no JSON normalization during conversion"
+        );
+        let mut retry = original;
+        retry.command_id = "cmd_retry_new_envelope".into();
+        assert_eq!(
+            repo.insert_pending_idempotent(retry).await.unwrap(),
+            "cmd_exact_redirect"
+        );
+        bind_exact_test_runtime(&state, "s_current").await;
+        assert!(process_next(&state).await.unwrap());
+        assert_eq!(
+            repo.get("cmd_exact_redirect")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "error",
+            "{path}"
+        );
+        assert!(exec.calls.lock().unwrap().is_empty());
+        assert_eq!(exec.probes.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn exact_dispatch_rejects_absent_and_misowned_runtime_without_revive() {
+    for state_kind in ["absent", "no-session", "misowned"] {
+        let exec = Arc::new(ExactDispatchSpy::default());
+        let state = test_state_with_turn_exec(exec.clone()).await;
+        let operator = state
+            .identity
+            .register(human_register("operator", "ck_exact_absent"))
+            .await
+            .unwrap();
+        exact_test_agent(&state).await;
+        if state_kind != "absent" {
+            bind_exact_test_runtime(&state, "s_original").await;
+            if state_kind == "no-session" {
+                state
+                    .store
+                    .conn
+                    .execute("DELETE FROM sessions WHERE session_id = 's_original'", ())
+                    .await
+                    .unwrap();
+            } else {
+                state.store.conn.execute("UPDATE sessions SET agent_id = 'a_foreign' WHERE session_id = 's_original'", ()).await.unwrap();
+            }
+        }
+        for (index, kind) in [
+            command_kinds::harness::PROMPT,
+            command_kinds::harness::STEER,
+            command_kinds::harness::INTERRUPT,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("cmd_exact_missing_{index}");
+            let mut intent = prompt_intent(
+                &id,
+                &operator,
+                "operator",
+                "ck_exact_absent",
+                "must not revive",
+                1,
+            );
+            intent.kind = kind.into();
+            intent.request_json = serde_json::json!({"agentId":"a_exact", "expectedSessionId":"s_original", "name":"exact target", "text":"must not revive"}).to_string();
+            CommandIntents::new(&state.store)
+                .insert_pending(intent)
+                .await
+                .unwrap();
+            assert!(process_next(&state).await.unwrap());
+            assert_eq!(
+                CommandIntents::new(&state.store)
+                    .get(&id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "error"
+            );
+        }
+        assert!(exec.calls.lock().unwrap().is_empty());
+        assert_eq!(exec.probes.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutionPort for SteerDispatchSpy {
+    async fn inject_turn(&self, _recipient: &SessionId, _batch: &NexusBatch) -> PortResult<()> {
+        panic!("steer must not fall back to bus injection")
+    }
+
+    async fn launch(&self, _req: SpawnRequest) -> PortResult<SpawnResponse> {
+        panic!("steer test must not launch a harness")
+    }
+
+    async fn remove(&self, _req: RemoveRequest) -> PortResult<RemoveResponse> {
+        panic!("steer test must not remove a harness")
+    }
+
+    async fn steer_observed(
+        &self,
+        _recipient: &SessionId,
+        _text: String,
+        _events: Arc<dyn nexus_contracts::EventSink>,
+        _accepted_event: nexus_contracts::WsEvent,
+    ) -> PortResult<nexus_contracts::SteerResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(nexus_contracts::SteerResponse {
+            session_id: None,
+            accepted: true,
+            delivery: nexus_contracts::SteerDelivery::Steered,
+            turn_id: Some("native-steer-ack".into()),
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl AgentTurnExecutionPort for InterruptSpy {
     async fn inject_turn(&self, _recipient: &SessionId, _batch: &NexusBatch) -> PortResult<()> {
@@ -131,6 +486,10 @@ impl AgentTurnExecutionPort for PromptDispatchBarrier {
         self.entered.notify_one();
         self.release.notified().await;
         Ok(())
+    }
+
+    async fn compact(&self, recipient: &SessionId) -> PortResult<()> {
+        self.prompt(recipient, "/compact".into()).await
     }
 }
 
@@ -521,6 +880,7 @@ fn prompt_intent(
         caller_tier: Some("admin".into()),
         idempotency_key: None,
         request_json: serde_json::to_string(&PromptRequest {
+            expected_session_id: None,
             agent_id: None,
             name: "Target Human".into(),
             text: text.into(),
@@ -548,6 +908,7 @@ fn steer_intent(
     );
     intent.kind = command_kinds::harness::STEER.into();
     intent.request_json = serde_json::to_string(&SteerRequest {
+        expected_session_id: None,
         agent_id: None,
         name: "Target Human".into(),
         text: "steer now".into(),
@@ -598,6 +959,199 @@ async fn harness_prompt_claim_lease_outlives_execution_timeout() {
             > i64::try_from(HARNESS_PROMPT_EXECUTION_TIMEOUT.as_millis()).unwrap(),
         "prompt claim must not expire before the prompt execution timeout fires"
     );
+}
+
+#[tokio::test]
+async fn persisted_unsupported_auto_prompt_is_rejected_without_native_delivery() {
+    let exec = Arc::new(PromptDispatchBarrier::default());
+    let state = test_state_with_turn_exec(exec.clone()).await;
+    let operator = state
+        .identity
+        .register(human_register("operator", "ck_auto_reject"))
+        .await
+        .unwrap();
+    let mut intent = prompt_intent(
+        "cmd_auto_reject",
+        &operator,
+        "operator",
+        "ck_auto_reject",
+        "hello",
+        1,
+    );
+    let mut params: serde_json::Value = serde_json::from_str(&intent.request_json).unwrap();
+    params["delivery"] = serde_json::json!("auto");
+    intent.request_json = params.to_string();
+    let repo = CommandIntents::new(&state.store);
+    repo.insert_pending(intent).await.unwrap();
+    assert!(process_next(&state).await.unwrap());
+    let row = repo.get("cmd_auto_reject").await.unwrap().unwrap();
+    assert_eq!(
+        row.status, "error",
+        "unsupported durable rows must settle, not remain wedged"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(row.error_json.as_deref().unwrap()).unwrap()
+            ["code"],
+        nexus_contracts::codes::INVALID_PARAMS
+    );
+    assert_eq!(exec.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn redirected_persisted_intent_rejects_unsupported_options_before_native_steer() {
+    for exact in [false, true] {
+        for path in ["promote", "redirect", "already-steer"] {
+            for extra in [
+                serde_json::json!({"delivery": "auto"}),
+                serde_json::json!({"modelSelection": {"modelId": "target-choice"}}),
+                serde_json::json!({}),
+                serde_json::json!({"delivery": null, "modelSelection": null}),
+            ] {
+                let unsupported = extra.as_object().unwrap().values().any(|v| !v.is_null());
+                let exec = Arc::new(SteerDispatchSpy::default());
+                let state = test_state_with_turn_exec(exec.clone()).await;
+                let operator = state
+                    .identity
+                    .register(human_register("operator", "ck_redirect_operator"))
+                    .await
+                    .unwrap();
+                let target_session = if exact {
+                    exact_test_agent(&state).await;
+                    bind_exact_test_runtime(&state, "s_exact_options").await;
+                    SessionId("s_exact_options".into())
+                } else {
+                    state
+                        .identity
+                        .register(human_register("Target Human", "ck_redirect_target"))
+                        .await
+                        .unwrap()
+                        .session_id
+                };
+                let repo = CommandIntents::new(&state.store);
+                let mut intent = prompt_intent(
+                    "cmd_redirect",
+                    &operator,
+                    "operator",
+                    "ck_redirect_operator",
+                    "hello",
+                    1,
+                );
+                let mut params: serde_json::Value =
+                    serde_json::from_str(&intent.request_json).unwrap();
+                params
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                if exact {
+                    params["agentId"] = serde_json::json!("a_exact");
+                    params["expectedSessionId"] = serde_json::json!(target_session);
+                }
+                intent.request_json = params.to_string();
+                if path == "already-steer" {
+                    intent.kind = command_kinds::harness::STEER.into();
+                }
+                repo.insert_pending(intent).await.unwrap();
+                match path {
+                    "promote" => assert!(repo
+                        .promote_pending_prompt_to_steer("cmd_redirect")
+                        .await
+                        .unwrap()),
+                    "redirect" => {
+                        let mut request_wire = serde_json::json!({
+                            "name": "Target Human", "action": "redirect_now", "clientMutationId": "mut_redirect",
+                            "commandId": "cmd_redirect", "expectedRevision": 1
+                        });
+                        if exact {
+                            request_wire["agentId"] = serde_json::json!("a_exact");
+                            request_wire["expectedSessionId"] = serde_json::json!(target_session);
+                        }
+                        let request: nexus_contracts::CommandQueueMutationRequest =
+                            serde_json::from_value(request_wire).unwrap();
+                        let outcome = nexus_store::repos::CommandQueue::new(&state.store)
+                            .mutate_with_capability(
+                                "default",
+                                &request,
+                                2,
+                                &[target_session.clone()],
+                                Some(
+                                    &nexus_store::repos::command_queue::CapturedQueueCapability {
+                                        session_id: target_session.clone(),
+                                        steer_capability:
+                                            nexus_contracts::SteerCapability::NativeSteer,
+                                    },
+                                ),
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(outcome.status, 200, "{outcome:?}");
+                    }
+                    _ => {}
+                }
+                let converted = repo.get("cmd_redirect").await.unwrap().unwrap();
+                assert_eq!(converted.kind, command_kinds::harness::STEER);
+                assert_eq!(
+                    converted.request_json,
+                    params.to_string(),
+                    "conversion must preserve intent"
+                );
+                assert!(process_next(&state).await.unwrap());
+                let terminal = repo.get("cmd_redirect").await.unwrap().unwrap();
+                if unsupported {
+                    assert_eq!(terminal.status, "error", "{path}: {extra}");
+                    let error: serde_json::Value =
+                        serde_json::from_str(terminal.error_json.as_deref().unwrap()).unwrap();
+                    assert_eq!(error["code"], nexus_contracts::codes::INVALID_PARAMS);
+                    assert_eq!(exec.calls.load(Ordering::SeqCst), 0);
+                } else {
+                    assert_eq!(terminal.status, "done", "{path}: {extra}: {terminal:?}");
+                    assert_eq!(
+                        exec.calls.load(Ordering::SeqCst),
+                        1,
+                        "ordinary explicit steer stays supported"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn worker_settles_expired_armed_auto_as_unknown_without_native_redelivery() {
+    let exec = Arc::new(PromptDispatchBarrier::default());
+    let state = test_state_with_turn_exec(exec.clone()).await;
+    let operator = state
+        .identity
+        .register(human_register("operator", "ck_auto_expired"))
+        .await
+        .unwrap();
+    let mut intent = prompt_intent(
+        "cmd_auto_expired",
+        &operator,
+        "operator",
+        "ck_auto_expired",
+        "hello",
+        1,
+    );
+    let mut params: serde_json::Value = serde_json::from_str(&intent.request_json).unwrap();
+    params["delivery"] = serde_json::json!("auto");
+    intent.request_json = params.to_string();
+    let repo = CommandIntents::new(&state.store);
+    repo.insert_pending(intent).await.unwrap();
+    let old_claim = repo.claim_next(100, 10).await.unwrap().unwrap();
+    assert!(repo
+        .mark_prompt_started_for_claim(&old_claim, 101)
+        .await
+        .unwrap());
+    assert!(!process_next(&state).await.unwrap());
+    let row = repo.get("cmd_auto_expired").await.unwrap().unwrap();
+    assert_eq!(row.status, "error");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(row.error_json.as_deref().unwrap()).unwrap()
+            ["code"],
+        nexus_contracts::codes::DELIVERY_UNCERTAIN
+    );
+    assert_eq!(row.attempts, 1);
+    assert_eq!(exec.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -874,6 +1428,7 @@ async fn durable_interrupt_runs_once_on_the_control_lane_with_the_authenticated_
         caller_tier: Some("admin".into()),
         idempotency_key: Some("cm_interrupt_control".into()),
         request_json: serde_json::to_string(&InterruptRequest {
+            expected_session_id: None,
             agent_id: None,
             name: "Target Human".into(),
             client_message_id: Some("cm_interrupt_control".into()),
@@ -974,6 +1529,199 @@ async fn idle_worker_wait_wakes_on_command_intent_signal_before_poll_interval() 
 }
 
 #[tokio::test]
+async fn expired_prompt_preflight_cannot_mint_a_shutdown_retry_witness() {
+    let attempt = PromptAttempt::new(tokio::time::Instant::now() - Duration::from_millis(1));
+    attempt.reject_for_shutdown();
+    assert!(!attempt.0.shutdown_rejected.load(Ordering::Acquire));
+    assert_eq!(
+        attempt.0.entry.load(Ordering::Acquire),
+        PromptAttempt::CLOSED_BEFORE_ENTRY
+    );
+    assert!(!attempt.try_enter());
+}
+
+#[tokio::test]
+async fn prompt_timeout_closes_real_preflight_before_prompt_or_slash_compact_entry() {
+    for lane in [WorkerLane::HarnessPrompt, WorkerLane::Any] {
+        for text in ["hello", "/compact"] {
+            let exec = Arc::new(ExactDispatchSpy::default());
+            let state = test_state_with_turn_exec(exec.clone()).await;
+            let boot_refs = Arc::strong_count(&state.agent);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while Arc::strong_count(&state.agent) >= boot_refs {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("fixture boot task must drain before measuring detached work");
+            let caller = state
+                .identity
+                .register(human_register("Alex Morgan", "ck_gate_operator"))
+                .await
+                .unwrap();
+            let target = state
+                .identity
+                .register(human_register("Target Human", "ck_gate_target"))
+                .await
+                .unwrap();
+            state
+                .store
+                .conn
+                .execute(
+                    "UPDATE sessions SET agent = 'codex', transport = 'acp' WHERE session_id = ?1",
+                    libsql::params![target.session_id.0.as_str()],
+                )
+                .await
+                .unwrap();
+            let repo = CommandIntents::new(&state.store);
+            repo.insert_pending(prompt_intent(
+                "blocked",
+                &caller,
+                "Alex Morgan",
+                "ck_gate_operator",
+                text,
+                1,
+            ))
+            .await
+            .unwrap();
+            // Caller authentication awaits this real presence gate. Claims and terminal
+            // settlement use a different gate and remain able to make progress.
+            let preflight = state.store.lock_presence_transition().await;
+            let baseline_refs = Arc::strong_count(&state.agent);
+            tokio::time::timeout(Duration::from_secs(1), process_next_for_lane(&state, lane))
+                .await
+                .expect("every prompt claim path needs a bounded report deadline")
+                .unwrap();
+            let terminal = repo.get("blocked").await.unwrap().unwrap();
+            drop(preflight);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while Arc::strong_count(&state.agent) != baseline_refs {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("detached preflight must finish after release");
+            assert!(
+                exec.calls.lock().unwrap().is_empty(),
+                "timed-out preflight must never enter {text}, lane {lane:?}"
+            );
+            assert_eq!(repo.get("blocked").await.unwrap().unwrap(), terminal);
+            assert_eq!(
+                serde_json::from_str::<Value>(terminal.error_json.as_deref().unwrap()).unwrap()
+                    ["code"],
+                codes::DELIVERY_UNCERTAIN
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn prompt_entered_timeout_retains_uncertainty_after_late_completion() {
+    let exec = Arc::new(PromptDispatchBarrier::default());
+    let state = test_state_with_turn_exec(exec.clone()).await;
+    let boot_refs = Arc::strong_count(&state.agent);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while Arc::strong_count(&state.agent) >= boot_refs {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let caller = state
+        .identity
+        .register(human_register("Alex Morgan", "ck_late_operator"))
+        .await
+        .unwrap();
+    state
+        .identity
+        .register(human_register("Target Human", "ck_late_target"))
+        .await
+        .unwrap();
+    let repo = CommandIntents::new(&state.store);
+    repo.insert_pending(prompt_intent(
+        "late",
+        &caller,
+        "Alex Morgan",
+        "ck_late_operator",
+        "hello",
+        1,
+    ))
+    .await
+    .unwrap();
+    let baseline_refs = Arc::strong_count(&state.agent);
+    let worker_state = state.clone();
+    let worker = tokio::spawn(async move {
+        process_next_for_lane(&worker_state, WorkerLane::HarnessPrompt).await
+    });
+    exec.entered.notified().await;
+    worker.await.unwrap().unwrap();
+    let terminal = repo.get("late").await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(terminal.error_json.as_deref().unwrap()).unwrap()["code"],
+        codes::DELIVERY_UNCERTAIN
+    );
+    exec.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while Arc::strong_count(&state.agent) != baseline_refs {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(exec.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(repo.get("late").await.unwrap().unwrap(), terminal);
+}
+
+#[tokio::test]
+async fn prompt_adapter_error_is_uncertain_even_when_it_looks_like_validation_or_shutdown() {
+    for error in [
+        ContractError {
+            code: codes::INVALID_PARAMS,
+            message: "native adapter rejected payload".into(),
+        },
+        ContractError {
+            code: codes::INTERNAL_ERROR,
+            message: crate::daemon::app::PROMPT_DEFERRED_FOR_SHUTDOWN.into(),
+        },
+    ] {
+        let exec = Arc::new(ExactDispatchSpy {
+            prompt_error: Some(error),
+            ..Default::default()
+        });
+        let state = test_state_with_turn_exec(exec.clone()).await;
+        let caller = state
+            .identity
+            .register(human_register("Alex Morgan", "ck_error_operator"))
+            .await
+            .unwrap();
+        state
+            .identity
+            .register(human_register("Target Human", "ck_error_target"))
+            .await
+            .unwrap();
+        let repo = CommandIntents::new(&state.store);
+        repo.insert_pending(prompt_intent(
+            "error",
+            &caller,
+            "Alex Morgan",
+            "ck_error_operator",
+            "hello",
+            1,
+        ))
+        .await
+        .unwrap();
+        process_next(&state).await.unwrap();
+        assert_eq!(exec.calls.lock().unwrap().len(), 1);
+        let row = repo.get("error").await.unwrap().unwrap();
+        assert_eq!(row.status, "error");
+        assert_eq!(
+            serde_json::from_str::<Value>(row.error_json.as_deref().unwrap()).unwrap()["code"],
+            codes::DELIVERY_UNCERTAIN
+        );
+    }
+}
+
+#[tokio::test]
 async fn harness_prompt_timeout_marks_error_and_unblocks_next_prompt() {
     let exec = Arc::new(FirstPromptHangs {
         calls: AtomicUsize::new(0),
@@ -1017,11 +1765,10 @@ async fn harness_prompt_timeout_marks_error_and_unblocks_next_prompt() {
         .unwrap());
     let first = repo.get("cmd_hung_prompt").await.unwrap().unwrap();
     assert_eq!(first.status, "error");
-    assert!(first
-        .error_json
-        .as_deref()
-        .unwrap()
-        .contains("harness.prompt command cmd_hung_prompt timed out"));
+    assert_eq!(
+        serde_json::from_str::<Value>(first.error_json.as_deref().unwrap()).unwrap()["code"],
+        codes::DELIVERY_UNCERTAIN
+    );
 
     assert!(process_next_for_lane(&state, WorkerLane::HarnessPrompt)
         .await

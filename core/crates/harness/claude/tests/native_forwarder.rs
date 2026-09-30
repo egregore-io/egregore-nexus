@@ -16,6 +16,79 @@ use nexus_store::{
 use nexus_transcript::{ToolCallObservation, ToolCallPhase};
 use serde_json::json;
 
+#[derive(Default)]
+struct CaptureHooks(Mutex<Vec<nexus_harness_claude::native::transcript::ClaudeHookRecord>>);
+
+#[async_trait]
+impl nexus_harness_claude::native::forwarder::ClaudeHookObservationSink for CaptureHooks {
+    fn observe_hooks(
+        &self,
+        records: &[nexus_harness_claude::native::transcript::ClaudeHookRecord],
+        _: Option<u64>,
+        _: bool,
+    ) {
+        self.0.lock().unwrap().extend_from_slice(records);
+    }
+}
+
+#[tokio::test]
+async fn native_hook_records_preserve_append_order_absolute_offsets_and_validity() {
+    use nexus_harness_claude::native::forwarder::forward_once_with_observations;
+    let (store, session, paths, sink) = setup("ordered-provenance").await;
+    let hooks = Arc::new(CaptureHooks::default());
+    let first = r#"{"event":"SessionStart","session_id":"native"}"#;
+    let second = r#"{"event":"Stop","payload":{"hook_event_name":"UserPromptSubmit","session_id":"native","prompt_id":"A","prompt":"text"}}"#;
+    let third = r#"{"event":"StopFailure","session_id":"native","prompt_id":"B"}"#;
+    std::fs::write(
+        &paths.hook_log_path,
+        format!("{first}\n  {second}\n{third}"),
+    )
+    .unwrap();
+    forward_once_with_observations(
+        store.clone(),
+        session.clone(),
+        paths.clone(),
+        Arc::new(sink.clone()),
+        None,
+        Some(hooks.clone()),
+    )
+    .await
+    .unwrap();
+    let records = hooks.0.lock().unwrap().clone();
+    assert_eq!(
+        records.iter().map(|r| r.end_offset).collect::<Vec<_>>(),
+        vec![
+            first.len() as u64,
+            (first.len() + 3 + second.len()) as u64,
+            (first.len() + 4 + second.len() + third.len()) as u64
+        ]
+    );
+    assert_eq!(
+        records
+            .iter()
+            .map(|r| r.kind.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("SessionStart"), Some("Stop"), Some("StopFailure")]
+    );
+    assert!(records[0].valid);
+    assert!(
+        !records[1].valid,
+        "conflicting hook aliases cannot establish authority"
+    );
+    assert_eq!(records[2].prompt_id.as_deref(), Some("B"));
+    forward_once_with_observations(
+        store,
+        session,
+        paths,
+        Arc::new(sink),
+        None,
+        Some(hooks.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(hooks.0.lock().unwrap().len(), 3);
+}
+
 #[derive(Clone, Default)]
 struct CaptureSink {
     events: Arc<Mutex<Vec<WsEvent>>>,

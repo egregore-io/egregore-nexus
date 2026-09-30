@@ -15,6 +15,8 @@
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::FutureExt;
@@ -29,20 +31,20 @@ use nexus_contracts::{
 };
 use nexus_store::command_kinds;
 use nexus_store::repos::{
-    AgentRef, Agents, CommandIntentRow, CommandIntents, DaemonState, Inbox, Sessions,
+    AgentRef, Agents, CommandIntentRow, CommandIntents, DaemonState, Inbox, PromptCommandOutcome,
+    Sessions,
 };
 use nexus_store::types::SessionRow;
 
-use crate::daemon::app::{AppState, PROMPT_DEFERRED_FOR_SHUTDOWN};
+use crate::daemon::app::AppState;
 use crate::daemon::retention_policy::{maybe_reap_operational_tables, RetentionPolicyState};
 use crate::daemon::routing;
 use crate::local_operator::LOCAL_OPERATOR_SESSION_ID;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const LEASE_MS: i64 = 15_000;
-/// Prompt execution is guarded by a 45s timeout in production. The prompt lane may spawn multiple
-/// executions, so its store lease must outlive that timeout; otherwise the same claimed row could
-/// be reclaimed while the original execution task is still running.
+/// Prompt execution is guarded by a 45s timeout in production. Keep its normal report deadline
+/// inside the claim lease; an expired armed attempt becomes uncertain, never reclaimable.
 const HARNESS_PROMPT_LEASE_MS: i64 = 60_000;
 /// Non-native redirect adapters keep the command alive until the replacement turn finishes.
 /// Match the ACP turn ceiling so an interrupt-and-send row cannot be reclaimed mid-turn.
@@ -57,7 +59,78 @@ const INBOX_CONSUME_SLICE_MS: u32 = 1_000;
 #[cfg(not(test))]
 const HARNESS_PROMPT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(test)]
-const HARNESS_PROMPT_EXECUTION_TIMEOUT: Duration = Duration::from_millis(50);
+const HARNESS_PROMPT_EXECUTION_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// One in-memory attempt, not a session owner or evidence of native acceptance. The durable
+/// started fence is armed first; this permit only prevents detached preflight from entering late.
+#[derive(Clone)]
+pub(crate) struct PromptAttempt(Arc<PromptAttemptState>);
+
+struct PromptAttemptState {
+    entry: AtomicU8,
+    shutdown_rejected: AtomicBool,
+    deadline: tokio::time::Instant,
+}
+
+impl PromptAttempt {
+    const PENDING: u8 = 0;
+    const ENTERED: u8 = 1;
+    const CLOSED_BEFORE_ENTRY: u8 = 2;
+
+    fn new(deadline: tokio::time::Instant) -> Self {
+        Self(Arc::new(PromptAttemptState {
+            entry: AtomicU8::new(Self::PENDING),
+            shutdown_rejected: AtomicBool::new(false),
+            deadline,
+        }))
+    }
+
+    pub(crate) fn try_enter(&self) -> bool {
+        if tokio::time::Instant::now() >= self.0.deadline {
+            self.close_before_entry();
+            return false;
+        }
+        self.0
+            .entry
+            .compare_exchange(
+                Self::PENDING,
+                Self::ENTERED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn close_before_entry(&self) -> bool {
+        self.0
+            .entry
+            .compare_exchange(
+                Self::PENDING,
+                Self::CLOSED_BEFORE_ENTRY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Typed witness supplied only by AppState's shutdown fence, never inferred from RPC text.
+    pub(crate) fn reject_for_shutdown(&self) {
+        if tokio::time::Instant::now() >= self.0.deadline {
+            self.close_before_entry();
+            return;
+        }
+        if self.close_before_entry() {
+            self.0.shutdown_rejected.store(true, Ordering::Release);
+        }
+    }
+}
+
+enum PromptAttemptOutcome {
+    Completed(Value),
+    Rejected(ContractError),
+    DeferredForShutdown,
+    Uncertain,
+}
 
 /// Spawn the daemon's command-intent worker loops.
 ///
@@ -516,6 +589,9 @@ async fn claim_next_for_lane(
     // isolated by lane.
     let _claim_guard = state.store.write_lock().lock_owned().await;
     let repo = CommandIntents::new(&state.store);
+    if matches!(lane, WorkerLane::Any | WorkerLane::Control) {
+        repo.expire_started_prompt_claims(now()).await?;
+    }
     let row = match lane {
         WorkerLane::Any => repo.claim_next(now(), LEASE_MS).await?,
         WorkerLane::Control => {
@@ -617,11 +693,64 @@ async fn claim_next_harness_prompt_for_session(
 async fn complete_claimed_row(
     state: &AppState,
     row: CommandIntentRow,
-    lane: WorkerLane,
+    _lane: WorkerLane,
 ) -> Result<(), NexusError> {
     let repo = CommandIntents::new(&state.store);
     let command_id = row.command_id.clone();
     let claimed_at = row.claimed_at;
+    if row.kind == command_kinds::harness::PROMPT {
+        if !repo.mark_prompt_started_for_claim(&row, now()).await? {
+            return Ok(());
+        }
+        let params: Value = serde_json::from_str(&row.request_json).unwrap_or(Value::Null);
+        if params.get("delivery").and_then(Value::as_str) == Some("auto") {
+            // Ingress does not advertise/accept auto yet. Settle a pre-existing/direct-store
+            // row explicitly rather than downgrading it or wedging behind legacy settlement.
+            // No native call occurs. A previously armed row is instead handled by uncertainty
+            // recovery and can never reach this claim path again.
+            let error = ContractError {
+                code: codes::INVALID_PARAMS,
+                message: "delivery is not supported by this prompt endpoint".into(),
+            };
+            repo.settle_prompt_claim(
+                &row,
+                PromptCommandOutcome::Rejected(&json_string(&error)?),
+                now(),
+            )
+            .await?;
+            return Ok(());
+        }
+        let settled = match execute_prompt_attempt(state, row.clone()).await {
+            PromptAttemptOutcome::Completed(result) => {
+                repo.settle_prompt_claim(
+                    &row,
+                    PromptCommandOutcome::Completed(&json_string(&result)?),
+                    now(),
+                )
+                .await?
+            }
+            PromptAttemptOutcome::Rejected(error) => {
+                repo.settle_prompt_claim(
+                    &row,
+                    PromptCommandOutcome::Rejected(&json_string(&error)?),
+                    now(),
+                )
+                .await?
+            }
+            PromptAttemptOutcome::DeferredForShutdown => {
+                repo.defer_prompt_claim_known_not_accepted(&row, now())
+                    .await?
+            }
+            PromptAttemptOutcome::Uncertain => {
+                repo.settle_prompt_claim(&row, PromptCommandOutcome::Uncertain, now())
+                    .await?
+            }
+        };
+        if !settled {
+            tracing::warn!(command_id = %row.command_id, attempts = row.attempts, "skipped prompt settlement; exact unexpired claim no longer current");
+        }
+        return Ok(());
+    }
     if let Some(claimed_at) = claimed_at {
         if !repo
             .mark_started_for_claim(&command_id, claimed_at, now())
@@ -635,7 +764,7 @@ async fn complete_claimed_row(
             return Ok(());
         }
     }
-    match execute_for_lane(state, row, lane).await {
+    match execute(state, row, None).await {
         Ok(result) => {
             if let Some(claimed_at) = claimed_at {
                 if !repo
@@ -654,24 +783,6 @@ async fn complete_claimed_row(
             }
         }
         Err(error) => {
-            if matches!(lane, WorkerLane::HarnessPrompt)
-                && error.code == codes::INTERNAL_ERROR
-                && error.message == PROMPT_DEFERRED_FOR_SHUTDOWN
-            {
-                if let Some(claimed_at) = claimed_at {
-                    if !repo
-                        .release_claim_for_shutdown_retry(&command_id, claimed_at)
-                        .await?
-                    {
-                        tracing::warn!(
-                            command_id = %command_id,
-                            claimed_at,
-                            "skipped shutdown retry release because its claim was no longer current"
-                        );
-                    }
-                    return Ok(());
-                }
-            }
             if let Some(claimed_at) = claimed_at {
                 if !repo
                     .mark_error_for_claim(&command_id, claimed_at, &json_string(&error)?, now())
@@ -740,7 +851,11 @@ async fn lane_has_unsettled_commands(
         .any(|depth| lane.owns_kind(&depth.kind) && depth.pending + depth.claimed > 0))
 }
 
-async fn execute(state: &AppState, row: CommandIntentRow) -> Result<Value, ContractError> {
+async fn execute(
+    state: &AppState,
+    row: CommandIntentRow,
+    attempt: Option<&PromptAttempt>,
+) -> Result<Value, ContractError> {
     // Public notification trust terminates at the durable command worker. The ordinary `notify`
     // dispatch method deliberately remains unverified; only this command kind accepts the signed
     // raw-body envelope, independently re-verifies it, then enters verified ingest.
@@ -820,7 +935,7 @@ async fn execute(state: &AppState, row: CommandIntentRow) -> Result<Value, Contr
             message: format!("failed to serialize source.push response: {e}"),
         });
     }
-    let response = routing::route_request(
+    let response = routing::route_request_for_prompt_attempt(
         state,
         caller,
         Request {
@@ -829,6 +944,7 @@ async fn execute(state: &AppState, row: CommandIntentRow) -> Result<Value, Contr
             method: method.to_string(),
             params: Some(params),
         },
+        attempt,
     )
     .await;
     if let Some(error) = response.error {
@@ -1069,43 +1185,43 @@ fn promote_message_post_idempotency_key(row: &CommandIntentRow, params: &mut Val
     }
 }
 
-async fn execute_for_lane(
-    state: &AppState,
-    row: CommandIntentRow,
-    lane: WorkerLane,
-) -> Result<Value, ContractError> {
-    let WorkerLane::HarnessPrompt = lane else {
-        return execute(state, row).await;
-    };
+async fn execute_prompt_attempt(state: &AppState, row: CommandIntentRow) -> PromptAttemptOutcome {
     let command_id = row.command_id.clone();
-    // The timeout REPORTS; it must never CANCEL. Dropping an execute future mid-store statement
-    // can interrupt unrelated work on the daemon-owned connection. Run the execution on its own
-    // task and detach on elapse: the prompt may still deliver late, and the 60s lease
-    // (HARNESS_PROMPT_LEASE_MS) was already sized for executions that outlive the timeout.
+    // Any/process_next claims use the generic lease. Never keep their preflight permission
+    // open beyond that captured lease, even though the dedicated prompt lane has a longer lease.
+    let lease_remaining =
+        Duration::from_millis(row.lease_until.unwrap_or(0).saturating_sub(now()).max(0) as u64);
+    let deadline =
+        tokio::time::Instant::now() + HARNESS_PROMPT_EXECUTION_TIMEOUT.min(lease_remaining);
+    let attempt = PromptAttempt::new(deadline);
+    let owned_attempt = attempt.clone();
     let owned_state = state.clone();
-    let exec_task = tokio::spawn(async move { execute(&owned_state, row).await });
-    match tokio::time::timeout(HARNESS_PROMPT_EXECUTION_TIMEOUT, exec_task).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(join_error)) => Err(ContractError {
-            code: codes::INTERNAL_ERROR,
-            message: format!(
-                "harness.prompt command {command_id} execution panicked: {join_error}"
-            ),
-        }),
-        Err(_elapsed) => {
-            tracing::warn!(
-                command_id = %command_id,
-                timeout_ms = HARNESS_PROMPT_EXECUTION_TIMEOUT.as_millis() as u64,
-                "harness.prompt execution exceeded its report deadline; leaving it running \
-                 detached (never cancel mid-statement) and marking the intent timed out"
-            );
-            Err(ContractError {
-                code: codes::INTERNAL_ERROR,
-                message: format!(
-                    "harness.prompt command {command_id} timed out after {}ms",
-                    HARNESS_PROMPT_EXECUTION_TIMEOUT.as_millis()
-                ),
-            })
+    // Detach on timeout: cancellation during a store statement can interrupt unrelated work.
+    // The permit closes before terminal settlement awaits; detached preflight cannot invoke.
+    let exec_task =
+        tokio::spawn(async move { execute(&owned_state, row, Some(&owned_attempt)).await });
+    match tokio::time::timeout_at(deadline, exec_task).await {
+        Ok(Ok(result)) => {
+            if attempt.0.shutdown_rejected.load(Ordering::Acquire) {
+                return PromptAttemptOutcome::DeferredForShutdown;
+            }
+            match result {
+                Ok(value) if attempt.0.entry.load(Ordering::Acquire) == PromptAttempt::ENTERED => {
+                    PromptAttemptOutcome::Completed(value)
+                }
+                Err(error) if attempt.close_before_entry() => PromptAttemptOutcome::Rejected(error),
+                _ => PromptAttemptOutcome::Uncertain,
+            }
+        }
+        Ok(Err(error)) => {
+            attempt.close_before_entry();
+            tracing::warn!(%command_id, %error, "prompt execution task failed; delivery outcome remains unknown");
+            PromptAttemptOutcome::Uncertain
+        }
+        Err(_) => {
+            attempt.close_before_entry();
+            tracing::warn!(%command_id, "prompt report deadline elapsed; detached preflight is fenced and delivery outcome remains unknown");
+            PromptAttemptOutcome::Uncertain
         }
     }
 }

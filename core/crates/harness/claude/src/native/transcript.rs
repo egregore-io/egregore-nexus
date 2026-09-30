@@ -9,6 +9,58 @@
 
 use serde_json::Value;
 
+/// Exact hook provenance, separate from transcript-derived display boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeHookRecord {
+    pub end_offset: u64,
+    pub session_id: Option<String>,
+    pub prompt_id: Option<String>,
+    pub kind: Option<String>,
+    pub valid: bool,
+    pub prompt: Option<String>,
+}
+
+/// Parse authority only from native hook fields; conflicting aliases are not evidence.
+pub fn parse_hook_record(value: &Value, end_offset: u64) -> ClaudeHookRecord {
+    let payload = wrapped_payload(value);
+    let mut valid = value.is_object();
+    let mut field = |names: &[&str]| {
+        let mut result: Option<String> = None;
+        for source in [value, payload] {
+            for name in names {
+                if let Some(v) = source.get(*name) {
+                    match v.as_str().filter(|s| !s.is_empty()) {
+                        Some(s) if result.as_deref().is_none_or(|old| old == s) => {
+                            result = Some(s.into())
+                        }
+                        _ => valid = false,
+                    }
+                }
+            }
+        }
+        result
+    };
+    let kind = field(&["event", "hook_event_name", "hookEventName"]);
+    let session_id = field(&["session_id", "sessionId"]);
+    let prompt_id = field(&["prompt_id", "promptId"]);
+    let prompt = user_prompt(payload, kind.as_deref()).map(|p| p.text);
+    valid &= kind.is_some() && session_id.is_some();
+    if kind.as_deref() == Some("UserPromptSubmit") {
+        valid &= prompt.is_some();
+    }
+    if let Some(active) = payload.get("stop_hook_active") {
+        valid &= active.as_bool() == Some(false);
+    }
+    ClaudeHookRecord {
+        end_offset,
+        session_id,
+        prompt_id,
+        kind,
+        valid,
+        prompt,
+    }
+}
+
 /// Parsed facts from one Claude transcript or hook-like JSONL record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptRecord {

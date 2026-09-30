@@ -143,6 +143,18 @@ impl Adapter for MockAdapter {
         Ok(())
     }
 
+    async fn inject_completion_observed(
+        &self,
+        prompt: String,
+    ) -> Result<Vec<StreamEvent>, AdapterInjectError> {
+        let mut state = self.inner.lock().unwrap();
+        state.injected.push(prompt);
+        if let Some(limit) = state.provider_limit.clone() {
+            return Err(AdapterInjectError::ProviderLimit(limit));
+        }
+        Ok(std::mem::take(&mut state.script))
+    }
+
     async fn stream_updates(&self) -> Result<Vec<StreamEvent>, NexusError> {
         Ok(self.inner.lock().unwrap().script.clone())
     }

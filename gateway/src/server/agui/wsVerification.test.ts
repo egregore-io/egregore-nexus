@@ -90,7 +90,11 @@ describe("AG-UI WebSocket verification gates", () => {
               "data: {\"type\":\"RUN_STARTED\",\"threadId\":\"session:iris\",\"runId\":\"r-materialized\"}\n\n",
               "data: {\"type\":\"TEXT_MESSAGE_CONTENT\",\"messageId\":\"m1\",\"delta\":\"replayed\",\"streamEventId\":2141089}\n\n",
             ]),
-            { status: 200, headers: { "content-type": "text/event-stream" } },
+            { status: 200, headers: { "content-type": "text/event-stream",
+                "x-nexus-session-id": "s_iris",
+                "x-nexus-agent-id": "a_iris",
+                "x-nexus-agent-name": "iris",
+              } },
           );
         },
       },
@@ -101,6 +105,11 @@ describe("AG-UI WebSocket verification gates", () => {
       "http://localhost/api/agui/observe?session=iris&afterId=2141088",
     ]);
     expect(socket.sent).toEqual([
+      JSON.stringify({
+        t: "session.bound",
+        agentId: "a_iris",
+        sessionId: "s_iris",
+      }),
       "{\"type\":\"RUN_STARTED\",\"threadId\":\"session:iris\",\"runId\":\"r-materialized\"}",
       "{\"type\":\"TEXT_MESSAGE_CONTENT\",\"messageId\":\"m1\",\"delta\":\"replayed\",\"streamEventId\":2141089}",
     ]);
@@ -119,7 +128,13 @@ describe("AG-UI WebSocket verification gates", () => {
       socket,
       new Request("http://localhost/api/agui/ws?session=iris"),
       {
-        observe: async () => new Response(openStream(), { status: 200 }),
+        observe: async () => new Response(openStream(), { status: 200,
+            headers: {
+              "x-nexus-session-id": "s_iris",
+              "x-nexus-agent-id": "a_iris",
+              "x-nexus-agent-name": "iris",
+            },
+          }),
         sessionInput,
       },
     );
@@ -128,8 +143,12 @@ describe("AG-UI WebSocket verification gates", () => {
       "message",
       JSON.stringify({
         t: "input",
+        agentId: "a_iris",
+        expectedSessionId: "s_iris",
         mode: "session",
-        target: { name: "iris", agentId: "a_iris" },
+        target: { name: "iris", agentId: "a_iris",
+          expectedSessionId: "s_iris",
+        },
         text: "continue",
         clientMessageId: "cm_socket",
       }),
@@ -138,7 +157,9 @@ describe("AG-UI WebSocket verification gates", () => {
     await vi.waitFor(() => expect(sessionInput).toHaveBeenCalledWith(
       expect.objectContaining({
         mode: "session",
-        target: { name: "iris", agentId: "a_iris" },
+        target: { name: "iris", agentId: "a_iris",
+            expectedSessionId: "s_iris",
+          },
         text: "continue",
         clientMessageId: "cm_socket",
       }),
@@ -182,7 +203,8 @@ describe("AG-UI WebSocket verification gates", () => {
   it("routes bus input through the Message Post ingress with the client idempotency key", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
-    const routed: Array<{ url: string; body: unknown; idempotencyKey: string | null }> = [];
+    const routed: Array<{ url: string; body: unknown; idempotencyKey: string | null;
+    }> = [];
 
     const control = handleWs(
       socket,

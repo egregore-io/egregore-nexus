@@ -123,6 +123,19 @@ valid `nexus_human` login cookie.
 
 ### `POST /api/conversation/steer`
 
+**Exact-session compatibility boundary:** daemon and Gateway HTTP requests accept
+`expectedSessionId` plus stable `agentId` for prompt, steer, interrupt, compact, and queue
+mutations. That opt-in rejects stale/absent bindings without revive; explicit
+null/empty/partial selectors are invalid before enqueue/mutation. Existing HTTP/IPC/CLI requests that
+omit it keep legacy behavior. Successful exact responses and receipts
+must carry the matching actual `sessionId`; missing/foreign results return an
+unconfirmed-outcome error, never the request selector echoed as evidence.
+Agent-session WebSocket commands require this pair on every mutation frame and only
+accept it against canonical `session.bound` metadata. The retained browser producer
+waits for that binding and does not fall back to name-only HTTP while unbound.
+Binding identifies transport/routing, not native admission or lifecycle exclusion.
+This contract does not establish Lens carrier integration. See [composer delivery](composer-delivery.md).
+
 Explicitly sends additional input to an active native Codex turn. This route enqueues
 `harness.steer`, waits for the daemon-written final result, and does not reuse the normal
 `harness.prompt` boundary queue. `clientMessageId` is both carried to the runtime and used as the

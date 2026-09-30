@@ -1,7 +1,7 @@
 //! On-demand Nexus Webconsole lifecycle.
 
 use std::env;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -15,20 +15,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::daemon::lifecycle::{self, DaemonPaths};
 use crate::gateway_lifecycle::{start_gateway, GatewayRuntimeStatus};
+use crate::lifecycle_process;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const STOP_TIMEOUT: Duration = Duration::from_secs(8);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WebconsoleInvocation {
-    Direct,
-    WindowsCommandShim,
-}
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const OS_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+const HELPER_OUTPUT_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebconsoleInstallation {
     pub executable: PathBuf,
-    pub invocation: WebconsoleInvocation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -502,9 +500,7 @@ impl WebconsoleBackend for SystemWebconsoleBackend {
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));
-        detach_command(&mut command);
-        command
-            .spawn()
+        lifecycle_process::spawn_detached(&mut command)
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
@@ -604,36 +600,13 @@ fn webconsole_installation(executable: PathBuf, windows: bool) -> WebconsoleInst
     } else {
         fs::canonicalize(&executable).unwrap_or(executable)
     };
-    let invocation = if windows
-        && executable
-            .extension()
-            .and_then(OsStr::to_str)
-            .is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
-            }) {
-        WebconsoleInvocation::WindowsCommandShim
-    } else {
-        WebconsoleInvocation::Direct
-    };
-    WebconsoleInstallation {
-        executable,
-        invocation,
-    }
+    WebconsoleInstallation { executable }
 }
 
 fn webconsole_command(installation: &WebconsoleInstallation) -> Command {
-    match installation.invocation {
-        WebconsoleInvocation::Direct => Command::new(&installation.executable),
-        WebconsoleInvocation::WindowsCommandShim => {
-            let mut command = Command::new("cmd.exe");
-            command
-                .arg("/D")
-                .arg("/S")
-                .arg("/C")
-                .arg(format!("\"{}\"", installation.executable.display()));
-            command
-        }
-    }
+    // Name the installed executable directly; the standard library builds the `cmd.exe` command
+    // line for a Windows `.cmd`/`.bat` shim. See the matching note in `gateway_lifecycle`.
+    Command::new(&installation.executable)
 }
 
 #[doc(hidden)]
@@ -811,28 +784,32 @@ fn process_matches(pid: u32, executable: &Path) -> bool {
 
 #[cfg(target_os = "macos")]
 fn process_matches(pid: u32, executable: &Path) -> bool {
-    Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()
-        .map(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains(&*executable.to_string_lossy())
-        })
-        .unwrap_or(false)
+    let mut command = Command::new("ps");
+    command.args(["-p", &pid.to_string(), "-o", "command="]);
+    lifecycle_process::run_bounded(
+        &mut command,
+        "Webconsole process identity probe",
+        OS_HELPER_TIMEOUT,
+        HELPER_OUTPUT_LIMIT,
+    )
+    .map(|output| String::from_utf8_lossy(&output.stdout).contains(&*executable.to_string_lossy()))
+    .unwrap_or(false)
 }
 
 #[cfg(target_os = "windows")]
 fn process_matches(pid: u32, executable: &Path) -> bool {
     let script =
         format!("(Get-CimInstance Win32_Process -Filter \"ProcessId = {pid}\").CommandLine");
-    Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-        .map(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains(&*executable.to_string_lossy())
-        })
-        .unwrap_or(false)
+    let mut command = Command::new("powershell.exe");
+    command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    lifecycle_process::run_bounded(
+        &mut command,
+        "Webconsole process identity probe",
+        OS_HELPER_TIMEOUT,
+        HELPER_OUTPUT_LIMIT,
+    )
+    .map(|output| String::from_utf8_lossy(&output.stdout).contains(&*executable.to_string_lossy()))
+    .unwrap_or(false)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -848,37 +825,44 @@ fn process_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 fn process_alive(pid: u32) -> bool {
-    Command::new("tasklist.exe")
-        .args(["/FI", &format!("PID eq {pid}")])
-        .output()
-        .map(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
-        })
-        .unwrap_or(false)
+    let mut command = Command::new("tasklist.exe");
+    command.args(["/FI", &format!("PID eq {pid}")]);
+    lifecycle_process::run_bounded(
+        &mut command,
+        "Webconsole process liveness probe",
+        OS_HELPER_TIMEOUT,
+        HELPER_OUTPUT_LIMIT,
+    )
+    .map(|output| String::from_utf8_lossy(&output.stdout).contains(&pid.to_string()))
+    .unwrap_or(false)
 }
 
 fn signal_process(pid: u32, force: bool) -> io::Result<()> {
     #[cfg(unix)]
-    let status = Command::new("kill")
-        .arg(if force { "-KILL" } else { "-TERM" })
-        .arg(pid.to_string())
-        .status()?;
+    {
+        let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+        let result = unsafe { libc::kill(pid as libc::pid_t, signal) };
+        return if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        };
+    }
     #[cfg(windows)]
-    let status = {
+    {
         let mut command = Command::new("taskkill.exe");
         command.arg("/PID").arg(pid.to_string()).arg("/T");
         if force {
             command.arg("/F");
         }
-        command.status()?
-    };
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "failed to terminate Webconsole pid {pid}"
-        )))
+        return lifecycle_process::run_bounded(
+            &mut command,
+            "Webconsole process termination",
+            OS_HELPER_TIMEOUT,
+            HELPER_OUTPUT_LIMIT,
+        )
+        .map(|_| ())
+        .map_err(io::Error::other);
     }
 }
 
@@ -893,41 +877,39 @@ fn wait_pid_down(pid: u32, timeout: Duration) -> bool {
     false
 }
 
-fn detach_command(command: &mut Command) {
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x0000_0200 | 0x0000_0008);
-    }
-}
-
 fn open_browser(url: &str) -> Result<(), String> {
     #[cfg(target_os = "linux")]
-    let status = Command::new("xdg-open").arg(url).status();
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
     #[cfg(target_os = "macos")]
-    let status = Command::new("open").arg(url).status();
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(url);
+        command
+    };
     #[cfg(target_os = "windows")]
-    let status = Command::new("cmd.exe")
-        .args(["/C", "start", "", url])
-        .status();
+    let mut command = {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/S", "/C", "start", "", url]);
+        command
+    };
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     return Err("opening a browser is unsupported on this platform".into());
     #[allow(unreachable_code)]
-    match status {
-        Ok(status) if status.success() => Ok(()),
-        Ok(_) => Err("browser command failed".into()),
-        Err(error) => Err(error.to_string()),
-    }
+    spawn_browser_opener(&mut command)
+}
+
+fn spawn_browser_opener(command: &mut Command) -> Result<(), String> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    lifecycle_process::spawn_detached(command)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn print_file_tail(path: &Path, lines: usize) -> io::Result<()> {
