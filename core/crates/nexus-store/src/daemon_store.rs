@@ -75,7 +75,10 @@ pub struct DaemonStore {
 impl DaemonStore {
     /// Open the embedded identity file and a fresh anonymous transport database.
     pub async fn open(identity_path: &str) -> Result<Self, NexusError> {
-        let identity = Arc::new(Store::open(identity_path).await?);
+        // Keep the compatibility stream schema anonymous on identity. Only transport may attach
+        // the configured named stream file; sharing it creates a cross-authority SQLite writer
+        // dependency inside transactions that already own separate async write gates.
+        let identity = Arc::new(Store::open_with_stream_path(identity_path, None).await?);
         identity.migrate().await?;
         prune_to_authority(&identity, PERSISTENT_CONTINUITY_TABLES).await?;
         identity

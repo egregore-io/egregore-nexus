@@ -1613,3 +1613,269 @@ fn assert_tool_observation(
 }
 
 use std::io::Write;
+
+#[tokio::test]
+async fn forwarder_follows_a_forked_claude_session_start() {
+    let (store, session, paths, sink) = setup("forked-session").await;
+    let repo = ClaudeRuntimeStateRepo::new(&store);
+    let old_transcript = paths.bridge_dir.join("old-session.jsonl");
+    let new_transcript = paths.bridge_dir.join("forked-session.jsonl");
+    let history = r#"{"type":"assistant","sessionId":"old-claude","message":{"role":"assistant","content":[{"type":"text","text":"before fork"}],"stop_reason":"end_turn"}}"#;
+    std::fs::write(&old_transcript, history).unwrap();
+    // A fork copies the history into the new transcript; it must not replay.
+    std::fs::write(
+        &new_transcript,
+        history.replace("old-claude", "forked-claude"),
+    )
+    .unwrap();
+    let copied_len = std::fs::metadata(&new_transcript).unwrap().len() as i64;
+    repo.set_claude_session(&session, "old-claude", Some(old_transcript.clone()))
+        .await
+        .unwrap();
+    repo.set_transcript_path_and_cursor(
+        &session,
+        old_transcript.clone(),
+        std::fs::metadata(&old_transcript).unwrap().len() as i64,
+    )
+    .await
+    .unwrap();
+    std::fs::write(
+        &paths.hook_log_path,
+        [
+            json!({"event":"SessionStart","payload":{"hook_event_name":"SessionStart","session_id":"forked-claude","source":"fork","transcript_path":new_transcript}}).to_string(),
+            json!({"event":"UserPromptSubmit","payload":{"hook_event_name":"UserPromptSubmit","session_id":"forked-claude","transcript_path":new_transcript,"prompt":"after fork"}}).to_string(),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        &paths.message_delta_log_path,
+        json!({"event":"MessageDisplay","payload":{"hook_event_name":"MessageDisplay","session_id":"forked-claude","delta":"forked reply","final":true,"message_id":"m-fork"}}).to_string(),
+    )
+    .unwrap();
+
+    let stats = forward_once(
+        store.clone(),
+        session.clone(),
+        paths.clone(),
+        Arc::new(sink.clone()),
+    )
+    .await
+    .expect("a forked session start is a sequence, not a collision");
+
+    assert_eq!(stats.session_start_events, 1);
+    assert_eq!(stats.user_input_events, 1);
+    assert_eq!(stats.text_events, 1);
+    let state = repo
+        .find_by_runtime_id(&session)
+        .await
+        .unwrap()
+        .expect("runtime state");
+    assert_eq!(state.claude_session_id.as_deref(), Some("forked-claude"));
+    assert_eq!(
+        state.transcript_path.as_deref(),
+        Some(new_transcript.as_path())
+    );
+    assert_eq!(
+        state.transcript_cursor, copied_len,
+        "copied history must not replay after the fork"
+    );
+    {
+        let events = sink.events.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "user input and the streamed reply: {events:?}"
+        );
+        assert_agent_update(&events[0], AgentUpdateKind::UserInput, "after fork");
+        assert_agent_update(&events[1], AgentUpdateKind::Text, "forked reply");
+    }
+
+    sink.events.lock().unwrap().clear();
+    // The transcript twin of the streamed "forked reply" is deduplicated as usual; the next
+    // reply in the forked session is forwarded.
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&new_transcript)
+        .unwrap()
+        .write_all(
+            br#"
+{"type":"assistant","sessionId":"forked-claude","message":{"role":"assistant","content":[{"type":"text","text":"forked reply"}],"stop_reason":"end_turn"}}
+{"type":"assistant","sessionId":"forked-claude","message":{"role":"assistant","content":[{"type":"text","text":"fresh after fork"}],"stop_reason":"end_turn"}}"#,
+        )
+        .unwrap();
+    let stats = forward_once(store, session, paths, Arc::new(sink.clone()))
+        .await
+        .unwrap();
+    assert_eq!(stats.text_events, 1);
+    assert_eq!(stats.turn_end_events, 1);
+    let events = sink.events.lock().unwrap();
+    assert_agent_update(&events[0], AgentUpdateKind::Text, "fresh after fork");
+}
+
+#[tokio::test]
+async fn forwarder_drops_stray_records_from_a_superseded_claude_session() {
+    let (store, session, paths, sink) = setup("stray-session").await;
+    let repo = ClaudeRuntimeStateRepo::new(&store);
+    let transcript = paths.bridge_dir.join("live-session.jsonl");
+    std::fs::write(&transcript, "").unwrap();
+    repo.set_claude_session(&session, "live-claude", Some(transcript.clone()))
+        .await
+        .unwrap();
+    std::fs::write(
+        &paths.hook_log_path,
+        [
+            json!({"event":"UserPromptSubmit","payload":{"hook_event_name":"UserPromptSubmit","session_id":"old-claude","prompt":"stale prompt"}}).to_string(),
+            json!({"event":"UserPromptSubmit","payload":{"hook_event_name":"UserPromptSubmit","session_id":"live-claude","transcript_path":transcript,"prompt":"live prompt"}}).to_string(),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        &paths.message_delta_log_path,
+        [
+            json!({"event":"MessageDisplay","payload":{"hook_event_name":"MessageDisplay","session_id":"old-claude","delta":"stale delta","final":true,"message_id":"m-old"}}).to_string(),
+            json!({"event":"MessageDisplay","payload":{"hook_event_name":"MessageDisplay","session_id":"live-claude","delta":"live delta","final":true,"message_id":"m-live"}}).to_string(),
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let stats = forward_once(
+        store.clone(),
+        session.clone(),
+        paths.clone(),
+        Arc::new(sink.clone()),
+    )
+    .await
+    .expect("stray records from a superseded session never stall the owner");
+
+    assert_eq!(stats.user_input_events, 1);
+    assert_eq!(stats.text_events, 1);
+    {
+        let events = sink.events.lock().unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_agent_update(&events[0], AgentUpdateKind::UserInput, "live prompt");
+        assert_agent_update(&events[1], AgentUpdateKind::Text, "live delta");
+    }
+    let state = repo
+        .find_by_runtime_id(&session)
+        .await
+        .unwrap()
+        .expect("runtime state");
+    assert_eq!(state.claude_session_id.as_deref(), Some("live-claude"));
+    assert_eq!(state.transcript_path.as_deref(), Some(transcript.as_path()));
+}
+
+/// Opt-in replay of a real runtime bridge copy from its persisted cursors, read-only:
+/// `NEXUS_BRIDGE_COPY=<dir holding hooks.jsonl + message_display.jsonl>` and
+/// `NEXUS_BRIDGE_STATE='{"claude_session_id":..,"transcript_path":..,"hook_cursor":..,"transcript_cursor":..,"message_delta_cursor":..}'`.
+/// Proves that a bridge which stalled on a forked Claude session now forwards and advances.
+#[tokio::test]
+async fn real_bridge_copy_forwards_from_its_persisted_cursors() {
+    let Some(bridge_dir) = std::env::var_os("NEXUS_BRIDGE_COPY") else {
+        return;
+    };
+    let state: serde_json::Value =
+        serde_json::from_str(&std::env::var("NEXUS_BRIDGE_STATE").expect("NEXUS_BRIDGE_STATE"))
+            .expect("NEXUS_BRIDGE_STATE is JSON");
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let session = SessionId("s_real_bridge_copy".into());
+    let bridge_dir = std::path::PathBuf::from(bridge_dir);
+    let paths = ClaudeNativeBridgePaths {
+        settings_path: bridge_dir.join("settings.json"),
+        hook_log_path: bridge_dir.join("hooks.jsonl"),
+        message_delta_log_path: bridge_dir.join("message_display.jsonl"),
+        identity_path: bridge_dir.join("identity.env"),
+        bridge_dir: bridge_dir.clone(),
+    };
+    let repo = ClaudeRuntimeStateRepo::new(&store);
+    let transcript_path = state["transcript_path"]
+        .as_str()
+        .map(std::path::PathBuf::from);
+    repo.upsert_launch(ClaudeRuntimeLaunch {
+        runtime_id: session.clone(),
+        bridge_dir: bridge_dir.clone(),
+        claude_session_id: state["claude_session_id"].as_str().map(str::to_string),
+        launch_cwd: bridge_dir.clone(),
+        transcript_path: transcript_path.clone(),
+        bridge_pid: None,
+        hook_pids_json: None,
+    })
+    .await
+    .unwrap();
+    if let (Some(id), Some(path)) = (state["claude_session_id"].as_str(), transcript_path) {
+        repo.set_claude_session(&session, id, Some(path))
+            .await
+            .unwrap();
+    }
+    repo.set_cursors(
+        &session,
+        state["hook_cursor"].as_i64(),
+        state["transcript_cursor"].as_i64(),
+        state["message_delta_cursor"].as_i64(),
+    )
+    .await
+    .unwrap();
+    let before = repo.find_by_runtime_id(&session).await.unwrap().unwrap();
+    let sink = CaptureSink::default();
+
+    let first = forward_once(
+        store.clone(),
+        session.clone(),
+        paths.clone(),
+        Arc::new(sink.clone()),
+    )
+    .await
+    .expect("the stalled bridge forwards");
+    let after = repo.find_by_runtime_id(&session).await.unwrap().unwrap();
+    let second = forward_once(
+        store.clone(),
+        session.clone(),
+        paths,
+        Arc::new(sink.clone()),
+    )
+    .await
+    .expect("the following pass forwards too");
+    let settled = repo.find_by_runtime_id(&session).await.unwrap().unwrap();
+    let kinds: Vec<String> = sink
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|event| match event {
+            WsEvent::AgentUpdate { kind, .. } => format!("{kind:?}"),
+            other => format!("{other:?}").chars().take(24).collect(),
+        })
+        .collect();
+    let mut histogram = std::collections::BTreeMap::new();
+    for kind in &kinds {
+        *histogram.entry(kind.clone()).or_insert(0usize) += 1;
+    }
+    eprintln!(
+        "real bridge copy: before session={:?} hook_cursor={} delta_cursor={} transcript={:?}@{}",
+        before.claude_session_id,
+        before.hook_cursor,
+        before.message_delta_cursor,
+        before.transcript_path,
+        before.transcript_cursor
+    );
+    eprintln!(
+        "  first pass: {first:?}\n  after: session={:?} hook_cursor={} delta_cursor={} transcript={:?}@{}",
+        after.claude_session_id, after.hook_cursor, after.message_delta_cursor,
+        after.transcript_path, after.transcript_cursor
+    );
+    eprintln!(
+        "  second pass: {second:?}\n  settled: session={:?} hook_cursor={} delta_cursor={}\n  events by kind: {histogram:?}",
+        settled.claude_session_id, settled.hook_cursor, settled.message_delta_cursor
+    );
+    assert!(
+        after.hook_cursor > before.hook_cursor,
+        "hook cursor advanced"
+    );
+    assert_ne!(
+        after.claude_session_id, before.claude_session_id,
+        "moved to the forked session"
+    );
+}

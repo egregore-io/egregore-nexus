@@ -4,6 +4,132 @@ use nexus_harness_claude::native::transcript::{
 };
 use serde_json::json;
 
+fn response_usage_fixture() -> serde_json::Value {
+    json!({"type":"assistant","isSidechain":false,"sessionId":"native-root","uuid":"block-one",
+      "timestamp":"2026-09-15T00:00:00Z","message":{"type":"message","role":"assistant","id":"api-response",
+      "model":"claude-native","stop_reason":"end_turn","usage":{"input_tokens":120,"output_tokens":30,
+      "cache_read_input_tokens":80,"cache_creation_input_tokens":20,"output_tokens_details":{"thinking_tokens":12}}}})
+}
+
+#[test]
+fn native_response_usage_preserves_separate_response_counters_not_block_totals() {
+    use nexus_contracts::telemetry::{
+        NativeTelemetryUpdate, NativeTelemetryValue, TokenUsageScope,
+    };
+    use nexus_harness_claude::native::model_reporting::parse_response_model;
+    let mut row = response_usage_fixture();
+    for input in [120, 120, 12, 0] {
+        row["message"]["usage"]["input_tokens"] = json!(input);
+        let record = parse_response_model(&row).unwrap();
+        let NativeTelemetryUpdate::Usage {
+            value: NativeTelemetryValue::Observed(usage),
+            ..
+        } = record.usage.unwrap().update("native-root", 10)
+        else {
+            panic!("native usage")
+        };
+        assert_eq!(usage.scope, TokenUsageScope::LastResponse);
+        assert_eq!(usage.input_tokens.unwrap().get(), input);
+        assert_eq!(usage.output_tokens.unwrap().get(), 30);
+        assert_eq!(usage.cache_read_tokens.unwrap().get(), 80);
+        assert_eq!(usage.cache_write_tokens.unwrap().get(), 20);
+        assert_eq!(usage.reasoning_tokens.unwrap().get(), 12);
+        assert!(
+            usage.total_tokens.is_none()
+                && usage.native_turn_id.is_none()
+                && usage.reset_id.is_none()
+                && usage.model.is_none()
+        );
+        assert!(
+            usage.metadata.native_reported_at.is_none(),
+            "content-block creation is not final usage time"
+        );
+    }
+}
+
+#[test]
+fn native_response_usage_excludes_partial_aborted_synthetic_and_zeroed_compaction() {
+    use nexus_harness_claude::native::model_reporting::parse_response_model;
+    for (pointer, value) in [
+        ("/message/stop_reason", json!(null)),
+        ("/isAbortedMidStream", json!(true)),
+        ("/isApiErrorMessage", json!(true)),
+    ] {
+        let mut row = response_usage_fixture();
+        if pointer.starts_with("/message/") {
+            row["message"]["stop_reason"] = value;
+        } else {
+            row[pointer.trim_start_matches('/')] = value;
+        }
+        assert!(
+            parse_response_model(&row).unwrap().usage.is_none(),
+            "{pointer}"
+        );
+    }
+    let mut row = response_usage_fixture();
+    for field in [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ] {
+        row["message"]["usage"][field] = json!(0);
+    }
+    assert!(
+        parse_response_model(&row).unwrap().usage.is_none(),
+        "compaction zeros main fields but can retain thinking"
+    );
+    row["message"]["model"] = json!("<synthetic>");
+    assert!(parse_response_model(&row).is_none());
+    row = response_usage_fixture();
+    row["isSidechain"] = json!(true);
+    assert!(parse_response_model(&row).is_none());
+}
+
+#[test]
+fn native_response_usage_rejects_malformed_and_unsafe_without_salvaging_partial_counters() {
+    use nexus_contracts::telemetry::{NativeTelemetryUpdate, NativeTelemetryValue};
+    use nexus_harness_claude::native::model_reporting::parse_response_model;
+    for bad in [
+        json!(-1),
+        json!(0.5),
+        json!("120"),
+        json!(9007199254740992_u64),
+        json!(null),
+    ] {
+        let mut row = response_usage_fixture();
+        row["message"]["usage"]["input_tokens"] = bad;
+        assert!(matches!(
+            parse_response_model(&row)
+                .unwrap()
+                .usage
+                .unwrap()
+                .update("native-root", 10),
+            NativeTelemetryUpdate::Usage {
+                value: NativeTelemetryValue::Invalid,
+                ..
+            }
+        ));
+    }
+    let mut row = response_usage_fixture();
+    row["message"]["usage"]
+        .as_object_mut()
+        .unwrap()
+        .remove("output_tokens_details");
+    let NativeTelemetryUpdate::Usage {
+        value: NativeTelemetryValue::Observed(usage),
+        ..
+    } = parse_response_model(&row)
+        .unwrap()
+        .usage
+        .unwrap()
+        .update("native-root", 10)
+    else {
+        panic!("optional reasoning")
+    };
+    assert!(usage.reasoning_tokens.is_none());
+}
+
 #[test]
 fn message_display_records_produce_text_deltas_in_order() {
     let jsonl = [

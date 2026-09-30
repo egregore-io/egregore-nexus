@@ -34,6 +34,12 @@ name = "rust-cache-preflight"
 workdir = "C:\\w\\src\\egregore-nexus\\core"
 timeout_seconds = 1800
 command = '''
+# Snapshot archives normalize mtimes. Refresh source timestamps so a reused Cargo
+# target cannot mistake different candidate bytes for an older already-built tree.
+$SourceTimestamp = [DateTime]::UtcNow
+Get-ChildItem (Resolve-Path '..').Path -Recurse -Force -File |
+    Where-Object { $_.FullName -notmatch '[\\/]\.git[\\/]' } |
+    ForEach-Object { $_.LastWriteTimeUtc = $SourceTimestamp }
 $MinimumFreeBytes = 40GB
 $FreeBytes = [int64](Get-PSDrive -Name C).Free
 if ($FreeBytes -lt $MinimumFreeBytes) {
@@ -57,10 +63,21 @@ command = '''
 '''
 
 [[steps]]
+name = "gateway-install"
+workdir = "C:\\w\\src\\egregore-nexus"
+timeout_seconds = 3600
+command = '''
+& pnpm.cmd --store-dir C:\w\cache\pnpm-store --dir gateway install --frozen-lockfile --prefer-offline
+'''
+
+[[steps]]
 name = "rust-tests"
 workdir = "C:\\w\\src\\egregore-nexus\\core"
 timeout_seconds = 7200
 command = '''
+$GitTools = Join-Path (Split-Path (Split-Path (Get-Command git.exe).Source)) 'usr\bin'
+if (-not (Test-Path (Join-Path $GitTools 'cp.exe'))) { throw 'Git for Windows cp.exe is required by libsql-ffi' }
+$env:Path = "$env:Path;$GitTools"
 & cargo.exe test --workspace --no-fail-fast
 '''
 
@@ -69,6 +86,9 @@ name = "rust-release"
 workdir = "C:\\w\\src\\egregore-nexus\\core"
 timeout_seconds = 7200
 command = '''
+$GitTools = Join-Path (Split-Path (Split-Path (Get-Command git.exe).Source)) 'usr\bin'
+if (-not (Test-Path (Join-Path $GitTools 'cp.exe'))) { throw 'Git for Windows cp.exe is required by libsql-ffi' }
+$env:Path = "$env:Path;$GitTools"
 $SourceProvenancePath = Join-Path (Resolve-Path "..").Path ".git\egregore-source.json"
 $SourceProvenance = Get-Content -LiteralPath $SourceProvenancePath -Raw | ConvertFrom-Json
 $SourceRevision = [string]$SourceProvenance.original_revision
@@ -112,7 +132,7 @@ command = '''
 $nativeRoot = "packages\nexus-cli\native\win32-x64-msvc"
 New-Item -ItemType Directory -Force -Path $nativeRoot | Out-Null
 Copy-Item "C:\w\cache\cargo-target\release\nexus.exe" (Join-Path $nativeRoot "nexus.exe") -Force
-$ExpectedVersion = '0.1.5'
+$ExpectedVersion = (Get-Content -LiteralPath 'VERSION' -Raw).Trim()
 $VersionOutput = (& node.exe packages/nexus-cli/bin/nexus.mjs --version | Out-String).Trim()
 if ($LASTEXITCODE -ne 0) { throw "Windows npm launcher version probe failed" }
 if ($VersionOutput -ne "nexus $ExpectedVersion") {
@@ -120,15 +140,8 @@ if ($VersionOutput -ne "nexus $ExpectedVersion") {
 }
 Write-Output $VersionOutput
 & node.exe packages/nexus-cli/bin/nexus.mjs daemon install --help
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & node.exe scripts/nexus-cli-command-surface-smoke.mjs packages/nexus-cli/bin/nexus.mjs
-'''
-
-[[steps]]
-name = "gateway-install"
-workdir = "C:\\w\\src\\egregore-nexus"
-timeout_seconds = 3600
-command = '''
-& pnpm.cmd --store-dir C:\w\cache\pnpm-store --dir gateway install --frozen-lockfile --prefer-offline
 '''
 
 [[steps]]
@@ -136,10 +149,18 @@ name = "gateway-gates"
 workdir = "C:\\w\\src\\egregore-nexus"
 timeout_seconds = 5400
 command = '''
+$GitTools = Join-Path (Split-Path (Split-Path (Get-Command git.exe).Source)) 'usr\bin'
+if (-not (Test-Path (Join-Path $GitTools 'sh.exe'))) { throw 'Git for Windows sh.exe is required by the shell hook fixture' }
+$env:Path = "$env:Path;$GitTools"
 & pnpm.cmd --dir gateway typecheck
-& pnpm.cmd --dir gateway test
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & pnpm.cmd --dir gateway build:gateway-package
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & pnpm.cmd --dir gateway webconsole:build
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+# The four-vCPU lab runs native authority subprocesses and packed-install probes.
+# Keep the full suite and its original deadlines, but do not overlap test-file workers.
+& pnpm.cmd --dir gateway exec vitest run --maxWorkers=1
 '''
 
 [[steps]]
@@ -203,6 +224,20 @@ finally {
     $Probe.Dispose()
 }
 '''
+
+[[steps]]
+name = "core-package-lifecycle"
+workdir = "C:\\w\\src\\egregore-nexus"
+timeout_seconds = 1800
+command = '''
+& pwsh.exe -NoProfile -File testing/windows/core-lifecycle.ps1
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+'''
+
+[[artifacts]]
+name = "nexus-core-cli"
+path = "C:\\w\\artifacts\\nexus-core-cli.tgz"
+required = true
 
 [[artifacts]]
 name = "nexus-exe"

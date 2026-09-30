@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use nexus_acp_stream::StreamEvent;
 use nexus_contracts::AgentUpdateKind;
+pub use nexus_harness_telemetry::OPENCODE_PLUGIN_SOURCE as PLUGIN_SOURCE;
 use nexus_transcript::{ToolCallObservation, ToolCallPhase};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -24,6 +25,29 @@ pub fn model_profile() -> super::super::NativeModelReportingProfile {
         Capability::Unverified,
     )
     .unwrap()
+    .with_telemetry(super::super::AdapterTelemetryReportingProfile::new(
+        super::super::AdapterTelemetryCapability::new(
+            Capability::Supported,
+            Some(
+                nexus_contracts::ModelObservationSource::new(
+                    nexus_harness_telemetry::OPENCODE_MESSAGE_USAGE_SOURCE,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap(),
+        super::super::AdapterTelemetryCapability::new(
+            Capability::Supported,
+            Some(
+                nexus_contracts::ModelObservationSource::new(
+                    nexus_harness_telemetry::OPENCODE_MESSAGE_CONTEXT_SOURCE,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap(),
+        super::super::AdapterTelemetryCapability::new(Capability::Unsupported, None).unwrap(),
+    ))
 }
 
 /// Decode original assistant metadata under a separately captured native root.

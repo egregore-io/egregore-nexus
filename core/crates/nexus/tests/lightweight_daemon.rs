@@ -1620,6 +1620,170 @@ async fn gateway_absent_delivery_uses_memory_transport_and_only_unsettled_contin
 }
 
 #[tokio::test]
+async fn ttl_terminal_delivery_is_not_restored_from_split_store_continuity() {
+    ttl_delivery_reopen_case(false).await;
+}
+
+#[tokio::test]
+async fn ttl_explicit_requeue_survives_split_store_reopen() {
+    ttl_delivery_reopen_case(true).await;
+}
+
+async fn ttl_delivery_reopen_case(explicit_requeue: bool) {
+    let (dir, store) = boot_model_fixture().await;
+    let session = SessionId("s_boot_model".into());
+    // No registered adapters: this exercises real daemon/store recovery without
+    // launching a provider, native process, or external service.
+    let state =
+        AppState::wire_with_registry(store.clone(), &Config::default(), AdapterRegistry::new());
+    state.wait_for_runtime_identity_ready().await.unwrap();
+    state
+        .identity
+        .register(agent("ttl-sender", "ttl-sender-key"))
+        .await
+        .unwrap();
+    let caller = state
+        .identity
+        .resolve("default", "ttl-sender")
+        .await
+        .unwrap();
+    let send = |body: &str| SendRequest {
+        to: SendTarget::dm_name("boot-model"),
+        summary: None,
+        body: body.into(),
+        mention: Vec::new(),
+        metadata: None,
+        idempotency_key: None,
+    };
+    let expired = state
+        .bus
+        .send(&caller, send("expire before restart"))
+        .await
+        .unwrap();
+    assert_eq!(expired.fanout, Some(1));
+    assert_eq!(
+        DeliveryObligations::new(&store)
+            .pending()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let inbox = Inbox::new(&store);
+    inbox.mark_notified(&session).await.unwrap();
+    let ttl = nexus_store::repos::inbox::DELIVERY_TIMEOUT_TTL_MS;
+    let mutation = inbox
+        .dead_letter_expired_deliveries(nexus_common::now() + ttl, ttl)
+        .await
+        .unwrap();
+    assert_eq!(
+        mutation.count, 1,
+        "the real sweep must terminalize accepted mail"
+    );
+    let mut rows = store
+        .conn
+        .query(
+            "SELECT state, attempt_count, error_code FROM in_flight WHERE message_id = ?1",
+            libsql::params![expired.message_id.0.clone()],
+        )
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<String>(0).unwrap(), "error");
+    assert_eq!(row.get::<i64>(1).unwrap(), 0);
+    assert_eq!(row.get::<String>(2).unwrap(), "delivery_timeout");
+    drop(row);
+    drop(rows);
+    let outstanding_after_expiry = DeliveryObligations::new(&store)
+        .pending()
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(outstanding_after_expiry, 0);
+    if explicit_requeue {
+        // Completed attempts are historical audit data, not a new attempt.
+        store
+            .conn
+            .execute(
+                "UPDATE in_flight SET attempt_count = 3 WHERE message_id = ?1",
+                libsql::params![expired.message_id.0.clone()],
+            )
+            .await
+            .unwrap();
+        let requeued = inbox
+            .requeue_dead_letters(nexus_store::repos::inbox::DeadLetterSelector::InFlightId(
+                mutation.in_flight_ids[0].clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(requeued.count, 1);
+        let obligations = DeliveryObligations::new(&store).pending().await.unwrap();
+        assert_eq!(obligations.len(), 1);
+        assert_eq!(
+            obligations[0].attempt, 3,
+            "requeue must retain completed attempt history"
+        );
+        assert_eq!(obligations[0].message_id, expired.message_id.0);
+        assert_eq!(
+            obligations[0].recipient_runtime_id.as_deref(),
+            Some("s_boot_model")
+        );
+    }
+
+    // A separately accepted, unswept obligation is the positive recovery control.
+    let pending = state
+        .bus
+        .send(&caller, send("still unsettled at restart"))
+        .await
+        .unwrap();
+    drop(state);
+    drop(store);
+
+    let reopened = DaemonStore::open(dir.path().join("identity.db").to_str().unwrap())
+        .await
+        .unwrap();
+    let store = Arc::new(reopened.compatibility_store());
+    let state =
+        AppState::wire_with_registry(store.clone(), &Config::default(), AdapterRegistry::new());
+    state.wait_for_runtime_identity_ready().await.unwrap();
+    // Ingress readiness precedes backlog recovery; explicitly await the same
+    // idempotent production recovery method rather than racing its boot task.
+    state
+        .restore_unsettled_delivery_obligations_once()
+        .await
+        .unwrap();
+    let mut rows = store
+        .conn
+        .query(
+            "SELECT message_id, state, attempt_count FROM in_flight WHERE recipient_session = ?1",
+            libsql::params![session.0],
+        )
+        .await
+        .unwrap();
+    let mut recovered = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        recovered.push((
+            row.get::<String>(0).unwrap(),
+            row.get::<String>(1).unwrap(),
+            row.get::<i64>(2).unwrap(),
+        ));
+    }
+    assert!(
+        recovered
+            .iter()
+            .any(|(id, _, _)| id == &pending.message_id.0),
+        "control must prove that actual continuity recovery ran: {recovered:?}"
+    );
+    assert_eq!(
+        recovered
+            .iter()
+            .any(|(id, _, _)| id == &expired.message_id.0),
+        explicit_requeue,
+        "only an explicit requeue may restore TTL-terminal mail; recovered={recovered:?}"
+    );
+}
+
+#[tokio::test]
 async fn ten_thousand_session_frames_remain_boot_scoped_and_create_no_transcript_history() {
     let path = unique_store_path("frames");
     let session = SessionId("s_frames".into());
@@ -1680,6 +1844,528 @@ async fn ten_thousand_session_frames_remain_boot_scoped_and_create_no_transcript
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("db-wal"));
     let _ = std::fs::remove_file(path.with_extension("db-shm"));
+}
+
+fn isolated_ttl_boot<T>(future: impl std::future::Future<Output = T>) -> T {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(future)));
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    result.unwrap_or_else(|error| std::panic::resume_unwind(error))
+}
+
+#[test]
+fn external_recipient_without_runtime_capsule_expires_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("identity.db");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (message_id, agent_id, runtime_id, created_at) = isolated_ttl_boot(async {
+            let daemon = DaemonStore::open(path.to_str().unwrap()).await.unwrap();
+            let store = Arc::new(daemon.compatibility_store());
+            let state = AppState::wire_with_registry(
+                store.clone(),
+                &Config::default(),
+                AdapterRegistry::new(),
+            );
+            state.wait_for_runtime_identity_ready().await.unwrap();
+            state
+                .identity
+                .register(agent("external-ttl-sender", "external-ttl-sender-key"))
+                .await
+                .unwrap();
+            let target = state
+                .identity
+                .register(agent("external-ttl-ghost", "external-ttl-ghost-key"))
+                .await
+                .unwrap();
+            let caller = state
+                .identity
+                .resolve("default", "external-ttl-sender")
+                .await
+                .unwrap();
+            let ack = state
+                .bus
+                .send(
+                    &caller,
+                    SendRequest {
+                        to: SendTarget::dm_name("external-ttl-ghost"),
+                        summary: None,
+                        body: "accepted before restart without runtime capsule".into(),
+                        mention: vec![],
+                        metadata: None,
+                        idempotency_key: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(ack.fanout, Some(1));
+            assert!(IdentitySessions::new(&store)
+                .list()
+                .await
+                .unwrap()
+                .is_empty());
+            let obligations = DeliveryObligations::new(&store).pending().await.unwrap();
+            assert_eq!(obligations.len(), 1);
+            assert_eq!(obligations[0].attempt, 0);
+            let message = nexus_store::repos::Messages::new(&store)
+                .get("default", &ack.message_id)
+                .await
+                .unwrap()
+                .unwrap();
+            (
+                ack.message_id,
+                obligations[0].recipient_agent_id.clone(),
+                target.session_id,
+                message.created_at,
+            )
+        });
+        isolated_ttl_boot(async {
+            let daemon = DaemonStore::open(path.to_str().unwrap()).await.unwrap();
+            let store = Arc::new(daemon.compatibility_store());
+            use nexus::daemon::gateway_stream_socket::{
+                GatewayStreamFrame, GatewayStreamPublisher,
+            };
+            let publisher = GatewayStreamPublisher::new(128);
+            let mut projected = publisher.subscribe();
+            let state = AppState::wire_with_registry_and_gateway_stream(
+                store.clone(),
+                &Config::default(),
+                AdapterRegistry::new(),
+                Some(publisher),
+            );
+            state.wait_for_runtime_identity_ready().await.unwrap();
+            assert!(Sessions::new(&store)
+                .find_by_session_id(&runtime_id)
+                .await
+                .unwrap()
+                .is_none());
+            // Readiness precedes the boot task's recovery. Observe that real task's completed
+            // edge before exercising sequential idempotence, not a second concurrent restore.
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let mut rows = store
+                        .conn
+                        .query(
+                            "SELECT COUNT(*) FROM in_flight WHERE message_id=?1",
+                            libsql::params![message_id.0.clone()],
+                        )
+                        .await
+                        .unwrap();
+                    if rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap() == 1 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("boot must reconstruct a durable external recipient edge");
+            state
+                .restore_unsettled_delivery_obligations_once()
+                .await
+                .unwrap();
+            let mutation = nexus::daemon::retention_policy::sweep_delivery_timeouts(
+                &state,
+                created_at + 1_001,
+                1_000,
+            )
+            .await
+            .unwrap();
+            let pending = DeliveryObligations::new(&store).pending().await.unwrap();
+            eprintln!(
+                "external TTL recovery: mutation_count={} durable_pending={} runtime_present=false",
+                mutation.count,
+                pending.len()
+            );
+            assert_eq!(
+                mutation.count, 1,
+                "accepted external obligation must expire without re-registering its recipient"
+            );
+            assert!(pending.is_empty());
+            let mut settlements = Vec::new();
+            while let Ok(frame) = projected.try_recv() {
+                if let GatewayStreamFrame::Projection { event } = frame {
+                    if event.kind == nexus_contracts::GatewayProjectionKind::DeliverySettled {
+                        settlements.push(event);
+                    }
+                }
+            }
+            assert_eq!(
+                settlements.len(),
+                1,
+                "expiry must publish its committed terminal fact"
+            );
+            assert_eq!(settlements[0].payload["messageId"], message_id.0);
+            assert_eq!(settlements[0].payload["recipientAgentId"], agent_id);
+            assert_eq!(settlements[0].payload["state"], "error");
+            assert_eq!(settlements[0].payload["attempt"], 0);
+            assert_eq!(settlements[0].payload["errorCode"], "delivery_timeout");
+            let mut rows = store.conn.query(
+                "SELECT recipient_agent_id,state,attempt_count,error_code,delivery_timing FROM in_flight WHERE message_id=?1",
+                libsql::params![message_id.0.clone()],
+            ).await.unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            assert_eq!(row.get::<String>(0).unwrap(), agent_id);
+            assert_eq!(row.get::<String>(1).unwrap(), "error");
+            assert_eq!(row.get::<i64>(2).unwrap(), 0);
+            assert_eq!(row.get::<String>(3).unwrap(), "delivery_timeout");
+            assert_eq!(row.get::<String>(4).unwrap(), "interrupt");
+            assert!(rows.next().await.unwrap().is_none());
+            assert!(
+                Sessions::new(&store)
+                    .find_by_session_id(&runtime_id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "reconstruction must not invent runtime presence"
+            );
+        });
+        isolated_ttl_boot(async {
+            let daemon = DaemonStore::open(path.to_str().unwrap()).await.unwrap();
+            let store = Arc::new(daemon.compatibility_store());
+            let state = AppState::wire_with_registry(
+                store.clone(),
+                &Config::default(),
+                AdapterRegistry::new(),
+            );
+            state.wait_for_runtime_identity_ready().await.unwrap();
+            assert_eq!(
+                state
+                    .restore_unsettled_delivery_obligations_once()
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert!(DeliveryObligations::new(&store)
+                .pending()
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(nexus_store::repos::Messages::new(&store)
+                .get("default", &message_id)
+                .await
+                .unwrap()
+                .is_none());
+        });
+    }));
+    let cleanup = directory.close();
+    assert!(cleanup.is_ok(), "disposable TTL store cleanup: {cleanup:?}");
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
+}
+
+#[test]
+fn external_ttl_recovery_preserves_owner_timing_and_rejects_invalid_capsules() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("identity.db");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        isolated_ttl_boot(async {
+            let daemon = DaemonStore::open(path.to_str().unwrap()).await.unwrap();
+            let store = Arc::new(daemon.compatibility_store());
+            Agents::new(&store)
+                .create(NewAgent {
+                    agent_id: "a_stable_ttl".into(),
+                    project: "default".into(),
+                    name: Some("stable-ttl".into()),
+                    default_harness: Some("other".into()),
+                    role: None,
+                    tier: None,
+                    owner: None,
+                })
+                .await
+                .unwrap();
+            let legacy = SessionId("s_legacy_ttl".into());
+            Sessions::new(&store)
+                .create(NewSession {
+                    session_id: legacy.clone(),
+                    name: Some("legacy-ttl".into()),
+                    agent: Some("other".into()),
+                    kind: "agent".into(),
+                    role: None,
+                    tier: "agent".into(),
+                    harness_session_id: None,
+                    client_key: None,
+                    cwd: None,
+                    project: "default".into(),
+                    transport: None,
+                })
+                .await
+                .unwrap();
+            // The last sorted valid edge is a rendezvous for the real boot recovery loop.
+            let cases = [
+                ("m_bad_json", "a_stable_ttl", None, "bad", false),
+                ("m_bad_id", "a_stable_ttl", None, "mismatch", false),
+                (
+                    "m_unknown_owner",
+                    "a_missing",
+                    Some("s_legacy_ttl"),
+                    "interrupt",
+                    false,
+                ),
+                (
+                    "m_legacy_absent",
+                    "s_absent",
+                    Some("s_absent"),
+                    "interrupt",
+                    false,
+                ),
+                (
+                    "m_legacy_valid",
+                    "s_legacy_ttl",
+                    Some("s_legacy_ttl"),
+                    "interrupt",
+                    true,
+                ),
+                (
+                    "m_stable_no_runtime",
+                    "a_stable_ttl",
+                    None,
+                    "yield_turn",
+                    true,
+                ),
+                (
+                    "m_zz_stable_absent",
+                    "a_stable_ttl",
+                    Some("s_absent"),
+                    "after_tool_loop",
+                    true,
+                ),
+            ];
+            for (id, owner, runtime, timing, _) in cases {
+                let message = Message {
+                    id: MessageId(
+                        if timing == "mismatch" {
+                            "m_not_the_capsule"
+                        } else {
+                            id
+                        }
+                        .into(),
+                    ),
+                    project: ProjectId("default".into()),
+                    from: "operator".into(),
+                    scope: Scope::Dm,
+                    thread: None,
+                    topic: None,
+                    body: "retained delivery".into(),
+                    summary: None,
+                    provenance: Provenance {
+                        from: "operator".into(),
+                        kind: Kind::Human,
+                        locality: Default::default(),
+                        access: None,
+                        thread: None,
+                        topic: None,
+                        stamp: None,
+                    },
+                    created_at: 17,
+                };
+                let payload_json = if timing == "bad" {
+                    "{".into()
+                } else {
+                    serde_json::json!({"message": message, "deliveryTiming":
+                        if timing == "mismatch" { "interrupt" } else { timing }})
+                    .to_string()
+                };
+                DeliveryObligations::new(&store)
+                    .insert(NewDeliveryObligation {
+                        message_id: id.into(),
+                        recipient_agent_id: owner.into(),
+                        recipient_runtime_id: runtime.map(str::to_owned),
+                        payload_json,
+                        dedupe_key: format!("delivery:{id}:{owner}"),
+                        attempt: 0,
+                        state: "pending".into(),
+                        created_at: 17,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let constructions = Arc::new(AtomicUsize::new(0));
+            let observed = constructions.clone();
+            let mut registry = AdapterRegistry::new();
+            registry.register(
+                &hid("other"),
+                Arc::new(move |_cwd| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Arc::new(MockAdapter::new()) as Arc<dyn Adapter>
+                }),
+            );
+            let state = AppState::wire_with_registry(store.clone(), &Config::default(), registry);
+            state.wait_for_runtime_identity_ready().await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let mut rows = store
+                        .conn
+                        .query(
+                            "SELECT COUNT(*) FROM in_flight WHERE message_id='m_zz_stable_absent'",
+                            (),
+                        )
+                        .await
+                        .unwrap();
+                    if rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap() == 1 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("boot recovery must reach the valid last edge");
+            state
+                .restore_unsettled_delivery_obligations_once()
+                .await
+                .unwrap();
+            state.respawn_pending_agents().await;
+            assert_eq!(
+                constructions.load(Ordering::SeqCst),
+                0,
+                "recovery cannot launch a native adapter"
+            );
+            for (id, owner, _, timing, valid) in cases {
+                let message = nexus_store::repos::Messages::new(&store)
+                    .get("default", &MessageId(id.into()))
+                    .await
+                    .unwrap();
+                assert_eq!(message.is_some(), valid, "capsule {id}");
+                let mut rows = store.conn.query(
+                    "SELECT recipient_agent_id,recipient_session,delivery_timing,attempt_count FROM in_flight WHERE message_id=?1",
+                    libsql::params![id],
+                ).await.unwrap();
+                let row = rows.next().await.unwrap();
+                assert_eq!(row.is_some(), valid, "recipient edge {id}");
+                if let Some(row) = row {
+                    assert_eq!(
+                        message.unwrap().created_at,
+                        17,
+                        "retain original TTL origin"
+                    );
+                    assert_eq!(
+                        row.get::<Option<String>>(0).unwrap().as_deref(),
+                        if owner == "a_stable_ttl" {
+                            Some(owner)
+                        } else {
+                            None
+                        }
+                    );
+                    assert_eq!(
+                        row.get::<Option<String>>(1).unwrap().as_deref(),
+                        if owner == "s_legacy_ttl" {
+                            Some(owner)
+                        } else {
+                            None
+                        }
+                    );
+                    assert_eq!(row.get::<String>(2).unwrap(), timing);
+                    assert_eq!(row.get::<i64>(3).unwrap(), 0);
+                }
+            }
+            assert!(nexus_store::repos::Messages::new(&store)
+                .get("default", &MessageId("m_not_the_capsule".into()))
+                .await
+                .unwrap()
+                .is_none());
+            assert!(Sessions::new(&store)
+                .find_by_session_id(&SessionId("s_absent".into()))
+                .await
+                .unwrap()
+                .is_none());
+            assert!(AgentRuntimes::new(&store)
+                .active_for_agent("a_stable_ttl")
+                .await
+                .unwrap()
+                .is_none());
+            assert!(IdentitySessions::new(&store)
+                .list()
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                nexus::daemon::retention_policy::sweep_delivery_timeouts(&state, 1_016, 1_000)
+                    .await
+                    .unwrap()
+                    .count,
+                0
+            );
+            assert_eq!(
+                nexus::daemon::retention_policy::sweep_delivery_timeouts(&state, 1_017, 1_000)
+                    .await
+                    .unwrap()
+                    .count,
+                3
+            );
+            let pending = DeliveryObligations::new(&store).pending().await.unwrap();
+            assert_eq!(
+                pending.len(),
+                4,
+                "unverifiable capsules stay retained, not falsely settled"
+            );
+            for row in pending {
+                assert!(
+                    !cases
+                        .iter()
+                        .find(|case| case.0 == row.message_id)
+                        .unwrap()
+                        .4
+                );
+            }
+            // Unlike mere runtime absence, explicit identity death retains its terminal path.
+            let mut rows = store
+                .conn
+                .query(
+                    "SELECT in_flight_id FROM in_flight WHERE message_id='m_stable_no_runtime'",
+                    (),
+                )
+                .await
+                .unwrap();
+            let id = rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<String>(0)
+                .unwrap();
+            drop(rows);
+            assert_eq!(
+                Inbox::new(&store)
+                    .requeue_dead_letters(
+                        nexus_store::repos::inbox::DeadLetterSelector::InFlightId(id.clone()),
+                    )
+                    .await
+                    .unwrap()
+                    .count,
+                1
+            );
+            assert!(Agents::new(&store)
+                .mark_dead("a_stable_ttl", "explicit test death")
+                .await
+                .unwrap());
+            assert_eq!(
+                Inbox::new(&store)
+                    .dead_letter_undeliverable_for_dead_recipients()
+                    .await
+                    .unwrap(),
+                1
+            );
+            let effect = Inbox::new(&store)
+                .gateway_delivery_effects_for_ids(&[id])
+                .await
+                .unwrap();
+            assert_eq!(effect.len(), 1);
+            assert_eq!(effect[0].payload["errorCode"], "target_dead");
+            assert_eq!(effect[0].payload["recipientAgentId"], "a_stable_ttl");
+        });
+    }));
+    let cleanup = directory.close();
+    assert!(
+        cleanup.is_ok(),
+        "disposable TTL control cleanup: {cleanup:?}"
+    );
+    if let Err(error) = result {
+        std::panic::resume_unwind(error);
+    }
 }
 
 /// A validated [`HarnessId`] from a literal (panics on invalid — test-only).

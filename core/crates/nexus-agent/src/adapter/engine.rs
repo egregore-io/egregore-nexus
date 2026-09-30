@@ -1268,19 +1268,28 @@ impl AcpEngine {
     /// bridges that answer only after receiving a replacement cannot otherwise release
     /// `turn_lock`, making the replacement structurally impossible to send.
     pub async fn cancel_active_turn(&self) -> Result<(), NexusError> {
-        let (connection, session_id) = {
-            let guard = self.conn.lock().await;
+        // Keep the captured connection installed through this synchronous boundary. A delayed
+        // cancel must not revoke a replacement connection's prompt. Raw replies and new prompt
+        // registration use the same metadata exclusion; no future poll/Drop is needed to revoke.
+        let guard = self.conn.lock().await;
+        let (connection, session_id, model_owner) = {
             let live = guard
                 .as_ref()
                 .ok_or_else(|| NexusError::Adapter("acp engine not connected".into()))?;
             let session_id = live.session_id.clone().ok_or_else(|| {
                 NexusError::Adapter("no active session (open or resume first)".into())
             })?;
-            (live.connection.clone(), session_id)
+            (
+                live.connection.clone(),
+                session_id,
+                live.model_connection_owner.clone(),
+            )
         };
+        let mut metadata = self.model_metadata.lock().unwrap();
         connection
-            .send_notification(CancelNotification::new(session_id))
+            .send_notification(CancelNotification::new(session_id.clone()))
             .map_err(|e| NexusError::Adapter(format!("session/cancel failed: {e}")))?;
+        metadata.cancel_prompt(&model_owner, &session_id.0);
         self.cancel_generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.cancel_notify.notify_waiters();
@@ -1578,7 +1587,7 @@ impl AcpEngine {
                     return Ok(());
                 }
                 Ok(Err(error)) => {
-                    return Err(NexusError::Adapter(format!("session/new failed: {error}")))
+                    return Err(NexusError::Adapter(format!("session/new failed: {error}")));
                 }
                 Err(_) => {}
             }
@@ -1637,7 +1646,7 @@ impl AcpEngine {
                     live.session_id = Some(session_id);
                 }
                 Ok(Err(error)) => {
-                    return Err(NexusError::Adapter(format!("session/load failed: {error}")))
+                    return Err(NexusError::Adapter(format!("session/load failed: {error}")));
                 }
                 Err(_) => {
                     drop(guard);
@@ -1736,7 +1745,7 @@ impl AcpEngine {
         let activity = Arc::clone(&self.updates);
         let model_events_before = activity.model_events();
 
-        let (connection, session_id, owner) = {
+        let (connection, session_id, owner, model_owner) = {
             let guard = self.conn.lock().await;
             let live = guard
                 .as_ref()
@@ -1748,6 +1757,7 @@ impl AcpEngine {
                 live.connection.clone(),
                 session_id,
                 self.evidence.lock().unwrap().owner.clone(),
+                live.model_connection_owner.clone(),
             )
         };
         let acp_session = session_id.0.clone();
@@ -1764,9 +1774,11 @@ impl AcpEngine {
             "sending ACP session/prompt; awaiting permitted turn-completion evidence"
         );
         let expected_prompt = prompt.clone();
-        let prompt_turn = {
+        let (prompt_turn, _pending_metadata) = {
             // SDK submission and actual request-id registration share this short lock. The
             // receive handler cannot race a response ahead of its evidence registration.
+            // Match raw dispatch lock order: metadata before prompt evidence; no await here.
+            let mut metadata = self.model_metadata.lock().unwrap();
             let mut evidence = self.evidence.lock().unwrap();
             let sent = connection.send_request(PromptRequest::new(
                 session_id,
@@ -1775,7 +1787,10 @@ impl AcpEngine {
             if evidence.owner == owner && evidence.state != TurnState::Unavailable {
                 evidence.submitted(sent.id());
             }
-            sent
+            let id = serde_json::to_value(sent.id()).expect("SDK request id serializes");
+            metadata.register_prompt(&model_owner, id.clone(), &acp_session);
+            let pending = PendingMetadataRequest::new(self.model_metadata.clone(), model_owner, id);
+            (sent, pending)
         };
         if let Some(event) = accepted_event {
             self.updates.push_event(event);

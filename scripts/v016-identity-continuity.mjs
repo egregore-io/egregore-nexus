@@ -15,6 +15,7 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { makeWindowsFilePrivate } from "./lib/windows-private-file.mjs";
 
 const requireFromGateway = createRequire(new URL("../gateway/package.json", import.meta.url));
 const { createClient } = requireFromGateway("@libsql/client");
@@ -510,17 +511,22 @@ async function writeCanonicalAtomic(path, value) {
   let handle;
   try {
     handle = await open(temporary, "wx", 0o600);
+    if (process.platform === "win32") await makeWindowsFilePrivate(temporary);
     await handle.writeFile(`${canonicalJson(value)}\n`, "utf8");
     await handle.sync();
     await handle.close();
     handle = undefined;
-    await chmod(temporary, 0o600);
+    if (process.platform !== "win32") await chmod(temporary, 0o600);
     await rename(temporary, target);
-    const directory = await open(parent, "r");
-    try {
-      await directory.sync();
-    } finally {
-      await directory.close();
+    // Windows does not support fsync on this directory handle. The file itself was flushed
+    // before rename; directory-entry crash durability is only asserted on POSIX.
+    if (process.platform !== "win32") {
+      const directory = await open(parent, "r");
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
     }
   } finally {
     if (handle) await handle.close().catch(() => {});

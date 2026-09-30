@@ -268,6 +268,28 @@ struct ClaudeRawPtyInput {
 #[async_trait]
 impl HarnessInput for ClaudeRawPtyInput {
     async fn send_turn(&self, text: &str) -> Result<(), String> {
+        self.write_prompt(text, false).await
+    }
+
+    async fn submit_prompt(&self, text: &str) -> Result<(), String> {
+        self.write_prompt(text, true).await
+    }
+
+    async fn interrupt_active_turn(&self) -> Result<(), String> {
+        self.input.interrupt_active_turn().await
+    }
+
+    async fn compact(&self) -> Result<(), String> {
+        self.send_turn("/compact").await
+    }
+
+    fn is_alive(&self) -> bool {
+        self.input.is_alive()
+    }
+}
+
+impl ClaudeRawPtyInput {
+    async fn write_prompt(&self, text: &str, native_queue: bool) -> Result<(), String> {
         let ready_deadline = Instant::now() + CLAUDE_RAW_PROMPT_READY_TIMEOUT;
         while Instant::now() < ready_deadline {
             if claude_raw_prompt_rendered(&self.terminal.contents()) {
@@ -288,14 +310,26 @@ impl HarnessInput for ClaudeRawPtyInput {
         if !self.completion.is_current() {
             return Err("native binding was replaced".into());
         }
-        if self.completion.has_open_turn() {
+        if !native_queue && self.completion.has_open_turn() {
             return Err("native turn is already open".into());
         }
         let observed_submission = self.completion.submission_snapshot();
         let writer = self.terminal.attach().writer;
         // Match the proven tmux sequence: clear any stale draft, commit one bracketed paste, then
         // submit only after the daemon-side screen model can see the draft.
-        writer.write_bytes(&[0x01, 0x0b])?;
+        // Claude treats a coalesced multi-key chunk as pasted text. Give each editing key
+        // its own UI tick before bracketed paste, as the tmux key-event path does. Otherwise
+        // U+0001/U+000B can become literal prompt content and defeat exact native receipts.
+        for key in [0x01, 0x0b] {
+            if !self.completion.is_current() {
+                return Err("native binding was replaced".into());
+            }
+            writer.write_bytes(&[key])?;
+            tokio::time::sleep(CLAUDE_RAW_PASTE_SETTLE).await;
+        }
+        if !self.completion.is_current() {
+            return Err("native binding was replaced".into());
+        }
         writer.write_bytes(&bracketed_paste(&format!("{text}\n")))?;
 
         let (first_needle, last_needle) = claude_raw_submit_needles(text);
@@ -339,18 +373,6 @@ impl HarnessInput for ClaudeRawPtyInput {
             "Claude raw PTY did not accept the submitted turn within {}s; draft remains visible",
             CLAUDE_RAW_SUBMIT_VERIFY_TIMEOUT.as_secs()
         ))
-    }
-
-    async fn interrupt_active_turn(&self) -> Result<(), String> {
-        self.input.interrupt_active_turn().await
-    }
-
-    async fn compact(&self) -> Result<(), String> {
-        self.send_turn("/compact").await
-    }
-
-    fn is_alive(&self) -> bool {
-        self.input.is_alive()
     }
 }
 
@@ -402,6 +424,38 @@ fn claude_raw_draft_in_input_box(screen: &str, first: &str, last: &str) -> bool 
 
 #[async_trait]
 impl HarnessInput for ClaudeNativeHarness {
+    fn accepts_prompt_while_busy(&self) -> bool {
+        self.completion.is_current()
+    }
+
+    async fn submit_prompt_observed(
+        &self,
+        text: &str,
+        observer: Arc<dyn TurnAcceptanceObserver>,
+        interrupt: bool,
+    ) -> Result<(), String> {
+        self.completion
+            .wait_for_model_source(CLAUDE_RAW_PROMPT_READY_TIMEOUT)
+            .await?;
+        let lane = self.completion.lock_input().await;
+        if !self.completion.is_current() {
+            return Err("native binding was replaced".into());
+        }
+        let accepted = self.completion.register_accepted_input(text, observer);
+        if interrupt {
+            self.input.interrupt_active_turn().await?;
+            // Keep Ctrl-C a distinct native key event, not part of the following paste/edit
+            // chunk. This is parser settling, not invented evidence of native turn completion.
+            tokio::time::sleep(CLAUDE_RAW_PASTE_SETTLE).await;
+            if !self.completion.is_current() {
+                return Err("native binding was replaced".into());
+            }
+        }
+        self.input.submit_prompt(text).await?;
+        drop(lane);
+        accepted.wait_accepted(Duration::from_secs(30)).await
+    }
+
     fn observe_turn(&self) -> nexus_contracts::TurnObservation {
         self.completion.observe_turn()
     }
@@ -420,6 +474,7 @@ impl HarnessInput for ClaudeNativeHarness {
         self.completion
             .wait_for_model_source(CLAUDE_RAW_PROMPT_READY_TIMEOUT)
             .await?;
+        let lane = self.completion.lock_input().await;
         if !self.completion.is_current() {
             return Err("native binding was replaced".into());
         }
@@ -428,6 +483,7 @@ impl HarnessInput for ClaudeNativeHarness {
         }
         let observed = self.completion.snapshot();
         self.input.send_turn(text).await?;
+        drop(lane);
         self.completion
             .wait_after(observed, Duration::from_secs(600))
             .await
@@ -441,6 +497,7 @@ impl HarnessInput for ClaudeNativeHarness {
         self.completion
             .wait_for_model_source(CLAUDE_RAW_PROMPT_READY_TIMEOUT)
             .await?;
+        let lane = self.completion.lock_input().await;
         if !self.completion.is_current() {
             return Err("native binding was replaced".into());
         }
@@ -449,6 +506,7 @@ impl HarnessInput for ClaudeNativeHarness {
         }
         let accepted = self.completion.register_accepted_input(text, observer);
         self.input.send_turn(text).await?;
+        drop(lane);
         accepted.wait(Duration::from_secs(600)).await
     }
 
@@ -457,10 +515,20 @@ impl HarnessInput for ClaudeNativeHarness {
     }
 
     async fn interrupt_active_turn(&self) -> Result<(), String> {
-        self.input.interrupt_active_turn().await
+        let _lane = self.completion.lock_input().await;
+        if !self.completion.is_current() {
+            return Err("native binding was replaced".into());
+        }
+        self.input.interrupt_active_turn().await?;
+        tokio::time::sleep(CLAUDE_RAW_PASTE_SETTLE).await;
+        Ok(())
     }
 
     async fn compact(&self) -> Result<(), String> {
+        let _lane = self.completion.lock_input().await;
+        if !self.completion.is_current() {
+            return Err("native binding was replaced".into());
+        }
         self.input.compact().await
     }
 
@@ -487,6 +555,16 @@ impl OpenCodeHeadedHarness {
 impl HarnessInput for OpenCodeHeadedHarness {
     async fn send_turn(&self, text: &str) -> Result<(), String> {
         self.bridge.send_turn(text).await
+    }
+
+    async fn send_turn_observed(
+        &self,
+        text: &str,
+        observer: Arc<dyn TurnAcceptanceObserver>,
+    ) -> Result<(), String> {
+        // Preserve native admission timing; the default waits for turn completion and
+        // would publish a second user echo after the native reply.
+        self.bridge.send_turn_observed(text, observer).await
     }
 
     fn turn_completion_evidence(&self) -> TurnCompletionEvidence {
@@ -2044,6 +2122,7 @@ impl PtySupervisor {
         events: Arc<dyn EventSink>,
         state_dir: &str,
         harness_args: &[String],
+        expected_native_key: Option<&str>,
         resume_isolated_store: bool,
         viewer_backend: &str,
         reporting: Option<nexus_agent::adapter::NativeModelReporting>,
@@ -2084,7 +2163,20 @@ impl PtySupervisor {
         self.tmux_backend.kill_if_exists(session);
         let mut args = vec![files.serve_path.to_string_lossy().into_owned()];
         args.extend(harness_args.iter().cloned());
-        let mut env = nexus_runtime_env(session, agent_id, name, project, client_key, "opencode");
+        let nexus_exe = std::env::current_exe()
+            .map_err(|error| PtyError::Spawn(format!("capture Nexus executable: {error}")))?;
+        let mut env = opencode_plugin_env(
+            session,
+            agent_id,
+            name,
+            project,
+            client_key,
+            &nexus_exe.to_string_lossy(),
+            [
+                std::env::var("NEXUS_SKIP_AGENT_BOOTSTRAP_INSTALL").as_deref() == Ok("1"),
+                std::env::var("NEXUS_SKIP_AGENT_HOOK_INSTALL").as_deref() == Ok("1"),
+            ],
+        );
         env.push((
             "NEXUS_NATIVE_READY_OWNER".into(),
             bridge.endpoint().ready_owner().into(),
@@ -2135,8 +2227,12 @@ impl PtySupervisor {
             }
             apply_headed_terminal_environment(&mut cmd);
             let pty = Arc::new(PtySession::spawn(cmd, size)?);
+            // Subscribe before waiting for readiness so buffered visible diagnostics can be
+            // reported. Output emitted before this subscription is not guaranteed retained.
+            let screen = ScreenModelBackend::wrap(pty.clone());
             if let Err(err) = wait_for_opencode_plugin_ready_raw(
                 pty.as_ref(),
+                screen.as_ref(),
                 &files.ready_path,
                 OPENCODE_PLUGIN_READY_TIMEOUT,
             )
@@ -2166,12 +2262,11 @@ impl PtySupervisor {
         };
         let opencode_ready = read_opencode_plugin_ready(&files.ready_path)?;
         if observed {
-            let expected =
-                crate::daemon::services::runtime_helpers::opencode_resume_session_id(harness_args);
             let accepted = opencode_ready.ready_owner.as_deref()
                 == Some(bridge.endpoint().ready_owner())
                 && opencode_ready.session_id.as_deref().is_some_and(|root| {
-                    expected.is_none_or(|expected| expected == root) && bridge.bind_model_root(root)
+                    expected_native_key.is_none_or(|expected| expected == root)
+                        && bridge.bind_model_root(root)
                 });
             if !accepted {
                 bridge.shutdown();
@@ -2373,6 +2468,7 @@ async fn wait_for_opencode_plugin_ready(
 
 async fn wait_for_opencode_plugin_ready_raw(
     pty: &PtySession,
+    screen: &ScreenModelBackend,
     ready_path: &Path,
     timeout: Duration,
 ) -> Result<(), String> {
@@ -2382,15 +2478,34 @@ async fn wait_for_opencode_plugin_ready_raw(
             return Ok(());
         }
         if !pty.child_alive() {
-            return Err("raw PTY exited before OpenCode plugin reported ready".to_string());
+            // Give the reader thread a moment to drain the child's final bytes into the model.
+            tokio::time::sleep(OPENCODE_PLUGIN_READY_POLL).await;
+            return Err(with_last_screen_output(
+                "raw PTY exited before OpenCode plugin reported ready",
+                &screen.contents(),
+            ));
         }
         if Instant::now() >= deadline {
-            return Err(format!(
-                "OpenCode plugin did not report ready within {}s",
-                timeout.as_secs()
+            return Err(with_last_screen_output(
+                &format!(
+                    "OpenCode plugin did not report ready within {}s",
+                    timeout.as_secs()
+                ),
+                &screen.contents(),
             ));
         }
         tokio::time::sleep(OPENCODE_PLUGIN_READY_POLL).await;
+    }
+}
+
+/// Append the harness's visible screen to a launch failure, matching the tmux path's
+/// `last pane output` detail so operators see why the shim died instead of only that it did.
+fn with_last_screen_output(detail: &str, screen: &str) -> String {
+    let screen = screen.trim();
+    if screen.is_empty() {
+        detail.to_string()
+    } else {
+        format!("{detail}; last screen output: {screen}")
     }
 }
 
@@ -2425,6 +2540,33 @@ fn codex_appserver_env(
 ) -> Vec<(String, String)> {
     let env = nexus_runtime_env(session, agent_id, name, project, client_key, "codex");
     with_nexus_cli_path(env, nexus_exe)
+}
+
+fn opencode_plugin_env(
+    session: &SessionId,
+    agent_id: &str,
+    name: Option<&str>,
+    project: &str,
+    client_key: &str,
+    nexus_exe: &str,
+    install_opt_outs: [bool; 2],
+) -> Vec<(String, String)> {
+    let mut env = nexus_runtime_env(session, agent_id, name, project, client_key, "opencode");
+    // Both raw PTY and tmux receive this captured executable after inherited
+    // identity scrubbing. Do not select an ambient agent's CLI or alter PATH.
+    env.push(("NEXUS_CLI".into(), nexus_exe.into()));
+    // Explicitly restore both captured policies after tmux's NEXUS_* scrub,
+    // and exclude conflicting ambient values in the raw child environment.
+    for (key, skip) in [
+        "NEXUS_SKIP_AGENT_BOOTSTRAP_INSTALL",
+        "NEXUS_SKIP_AGENT_HOOK_INSTALL",
+    ]
+    .into_iter()
+    .zip(install_opt_outs)
+    {
+        env.push((key.into(), if skip { "1" } else { "0" }.into()));
+    }
+    env
 }
 
 fn nexus_runtime_env(

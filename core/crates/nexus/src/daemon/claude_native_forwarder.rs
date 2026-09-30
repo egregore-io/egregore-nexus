@@ -44,6 +44,7 @@ pub const DEFAULT_CLAUDE_NATIVE_FORWARDER_POLL_MS: u64 = 250;
 /// record-provenance receipt, callback completion, and matching terminal fact.
 pub struct ClaudeTurnCompletion {
     owner: uuid::Uuid,
+    input_lane: tokio::sync::Mutex<()>,
     adopting: bool,
     hook_log: Mutex<Option<PathBuf>>,
     activity: Mutex<ClaudeActivity>,
@@ -111,6 +112,8 @@ struct ClaudeModelReporter {
     offset: u64,
     messages: HashSet<String>,
     message_bytes: usize,
+    usage_messages: HashSet<String>,
+    usage_message_bytes: usize,
 }
 
 impl Drop for ClaudeModelReporter {
@@ -153,6 +156,27 @@ impl ClaudeAcceptedInputRegistration {
         self.accepted.load(Ordering::SeqCst)
     }
 
+    /// Operator input settles at the exact native submit callback, including native queuing.
+    /// This neither closes an earlier turn nor claims that the queued work has finished.
+    pub(crate) async fn wait_accepted(&self, timeout: Duration) -> Result<(), String> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let changed = self.completion.notify.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if !self.completion.is_current() {
+                    return Err("native binding was replaced".into());
+                }
+                if self.was_accepted() {
+                    return Ok(());
+                }
+                changed.await;
+            }
+        })
+        .await
+        .map_err(|_| "native input receipt timed out; submission outcome is unknown".to_string())?
+    }
+
     /// Completion remains bound to this input, including when Stop and another Submit were
     /// ingested together while the caller's acceptance callback was still blocked.
     pub async fn wait(&self, timeout: Duration) -> Result<(), String> {
@@ -187,6 +211,7 @@ impl ClaudeTurnCompletion {
             .map_or(0, |m| m.len());
         Self {
             owner: uuid::Uuid::new_v4(),
+            input_lane: tokio::sync::Mutex::new(()),
             adopting: false,
             hook_log: Mutex::new(hook_log),
             activity: Mutex::new(ClaudeActivity {
@@ -213,6 +238,10 @@ impl ClaudeTurnCompletion {
 
     pub fn is_current(&self) -> bool {
         self.activity.lock().unwrap().valid_owner
+    }
+
+    pub(crate) async fn lock_input(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.input_lane.lock().await
     }
 
     pub(crate) fn begin_model_source(&self) -> ClaudeModelSourceGuard<'_> {
@@ -308,6 +337,8 @@ impl ClaudeTurnCompletion {
             pending: Some(source),
             messages: HashSet::new(),
             message_bytes: 0,
+            usage_messages: HashSet::new(),
+            usage_message_bytes: 0,
         });
         self.resolve_model_source(&mut state);
         !matches!(state.model_source_state, ModelSourceState::Unavailable(_))
@@ -725,9 +756,53 @@ impl ClaudeHookObservationSink for ClaudeTurnCompletion {
                 break;
             }
             reporter.offset = *offset;
-            if root.as_deref() != Some(&record.native_session_id)
-                || reporter.messages.contains(&record.native_message_id)
-            {
+            if root.as_deref() != Some(&record.native_session_id) {
+                continue;
+            }
+            // Same API response may span multiple content-block rows. Model selection can arrive
+            // before usage settles, so its replay set cannot suppress an eligible usage sample.
+            if let Some(usage) = record.usage.as_ref().filter(|_| {
+                !reporter.usage_messages.contains(&record.native_message_id)
+                    && reporter
+                        .reporting
+                        .profile()
+                        .telemetry()
+                        .is_some_and(|profile| {
+                            profile.usage().capability()
+                                == nexus_contracts::ModelEvidenceCapability::Supported
+                        })
+            }) {
+                if reporter.usage_messages.len() >= 4096
+                    || record.native_message_id.len()
+                        > 262_144usize.saturating_sub(reporter.usage_message_bytes)
+                    || !reporter
+                        .reporting
+                        .sink()
+                        .bind_native_root(&record.native_session_id)
+                {
+                    revoke = true;
+                    break;
+                }
+                let update = usage.update(&record.native_session_id, nexus_common::now());
+                let observed = matches!(
+                    &update,
+                    nexus_contracts::telemetry::NativeTelemetryUpdate::Usage {
+                        value: nexus_contracts::telemetry::NativeTelemetryValue::Observed(_),
+                        ..
+                    }
+                );
+                if !reporter.reporting.sink().observe_telemetry(update) {
+                    revoke = true;
+                    break;
+                }
+                if observed {
+                    reporter.usage_message_bytes += record.native_message_id.len();
+                    reporter
+                        .usage_messages
+                        .insert(record.native_message_id.clone());
+                }
+            }
+            if reporter.messages.contains(&record.native_message_id) {
                 continue;
             }
             // Bound replay state for this exact source lifetime. Exhaustion is loss of
@@ -790,8 +865,16 @@ impl ClaudeHookObservationSink for ClaudeTurnCompletion {
                 state.ambiguous = true;
                 continue;
             }
-            if state.native_session.is_none() && record.kind.as_deref() == Some("SessionStart") {
+            // The bridge belongs to the runtime; Claude's session id is a field. A
+            // `SessionStart` naming a new id (resume, fork, `/clear`) moves the tracker to that
+            // session, and any turn of the superseded session is over.
+            if record.kind.as_deref() == Some("SessionStart")
+                && record.session_id.is_some()
+                && state.native_session != record.session_id
+            {
                 state.native_session = record.session_id.clone();
+                state.open = None;
+                state.ambiguous = false;
                 for pending in inputs.iter_mut() {
                     if pending.owner == self.owner && pending.native_session.is_none() {
                         pending.native_session = record.session_id.clone();

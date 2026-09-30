@@ -180,3 +180,58 @@ fn windows_bounded_command_uses_a_killable_tree() {
 
     assert!(matches!(error, BoundedProcessError::Timeout { .. }));
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_detached_child_does_not_hold_parent_capture_pipes_open() {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command.args([
+        "--ignored",
+        "--exact",
+        "windows_detached_stdio_probe",
+        "--nocapture",
+    ]);
+    command.env("NEXUS_DETACHED_STDIO_PROBE", "1");
+    // The bounded helper owns a Windows job and cleans its disposable descendants on
+    // either outcome. Success requires EOF before that cleanup, not after killing the child.
+    let output = run_bounded(
+        &mut command,
+        "detached capture contract",
+        Duration::from_secs(5),
+        4096,
+    )
+    .expect("a detached child must not retain its parent's output pipes");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("detached child is alive"));
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "subprocess helper, invoked only by the captured-stdio contract"]
+fn windows_detached_stdio_probe() {
+    assert_eq!(
+        std::env::var("NEXUS_DETACHED_STDIO_PROBE").as_deref(),
+        Ok("1")
+    );
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--ignored", "--exact", "windows_detached_sleep_probe"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = spawn_detached(&mut command).unwrap();
+    thread::sleep(Duration::from_millis(500));
+    assert!(child.try_wait().unwrap().is_none());
+    println!("detached child is alive");
+    drop(child);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "disposable long-lived child for the captured-stdio contract"]
+fn windows_detached_sleep_probe() {
+    assert_eq!(
+        std::env::var("NEXUS_DETACHED_STDIO_PROBE").as_deref(),
+        Ok("1")
+    );
+    thread::sleep(Duration::from_secs(30));
+}

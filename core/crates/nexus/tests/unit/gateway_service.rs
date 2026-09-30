@@ -6,6 +6,98 @@ use nexus::gateway_service::{
     windows_registration_script, windows_runner_script, GatewayServiceBackend, GatewayServiceSpec,
 };
 
+#[test]
+fn launchd_restart_after_rewrite_or_explicit_unload_bootstraps_without_second_stop() {
+    for previously_loaded in [false, true] {
+        let mut calls = Vec::new();
+        nexus::gateway_service::launchd_start_with(
+            "gui/501",
+            "io.egregore.nexus.gateway",
+            "/tmp/gateway.plist",
+            true,
+            |args| {
+                calls.push(args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>());
+                if args[0] == "print" && !previously_loaded {
+                    Err((Some(113), "service absent".into()))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        let expected = if previously_loaded {
+            vec!["kickstart", "-k", "gui/501/io.egregore.nexus.gateway"]
+        } else {
+            vec!["bootstrap", "gui/501", "/tmp/gateway.plist"]
+        };
+        assert_eq!(calls[1], expected);
+        assert_eq!(calls.len(), 2);
+    }
+}
+
+#[test]
+fn launchd_query_and_action_errors_are_not_classified_as_absence() {
+    for code in [None, Some(1), Some(3), Some(5), Some(125)] {
+        let mut calls = 0;
+        let result = nexus::gateway_service::launchd_start_with(
+            "gui/501",
+            "label",
+            "/tmp/service.plist",
+            false,
+            |_| {
+                calls += 1;
+                Err((code, "manager denied".into()))
+            },
+        );
+        assert_eq!(result.unwrap_err(), "manager denied");
+        assert_eq!(calls, 1);
+    }
+    let result = nexus::gateway_service::launchd_start_with(
+        "gui/501",
+        "label",
+        "/tmp/service.plist",
+        true,
+        |args| {
+            if args[0] == "print" {
+                Err((Some(113), "absent".into()))
+            } else {
+                Err((Some(5), "bootstrap denied".into()))
+            }
+        },
+    );
+    assert_eq!(result.unwrap_err(), "bootstrap denied");
+}
+
+#[test]
+fn launchd_stop_is_idempotent_only_for_confirmed_missing_service() {
+    for (code, expected_ok) in [(113, true), (1, false), (3, false), (125, false)] {
+        let mut calls = 0;
+        let result = nexus::gateway_service::launchd_stop_with("gui/501/label", |_| {
+            calls += 1;
+            Err((Some(code), "query failed".into()))
+        });
+        assert_eq!(result.is_ok(), expected_ok);
+        assert_eq!(calls, 1);
+    }
+    let mut calls = Vec::new();
+    let result = nexus::gateway_service::launchd_stop_with("gui/501/label", |args| {
+        calls.push(args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>());
+        if args[0] == "print" {
+            Ok(())
+        } else {
+            Err((Some(1), "stop denied".into()))
+        }
+    });
+    assert_eq!(result.unwrap_err(), "stop denied");
+    assert_eq!(
+        calls,
+        [
+            vec!["print", "gui/501/label"],
+            vec!["bootout", "gui/501/label"]
+        ]
+    );
+}
+
 #[derive(Default)]
 struct FakeBackend {
     calls: Vec<&'static str>,
@@ -109,6 +201,7 @@ fn systemd_unit_is_dependency_ordered_and_shell_free() {
 
     assert!(rendered.contains("Requires=nexus-daemon.service"));
     assert!(rendered.contains("After=nexus-daemon.service"));
+    assert!(rendered.contains("PartOf=nexus-daemon.service"));
     assert!(rendered.contains("Restart=on-failure"));
     assert!(rendered.contains("ExecStart=\"/opt/egregore gateway/nexus-gateway\""));
     assert!(!rendered.contains("sh -c"));

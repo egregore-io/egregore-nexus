@@ -9,7 +9,15 @@ use super::{Database, Error, Result, Rows, RowsFuture, Statement, Transaction};
 use crate::TransactionBehavior;
 
 use libsql_sys::ffi;
-use std::{ffi::c_int, fmt, path::Path, sync::Arc};
+use std::{
+    ffi::c_int,
+    fmt,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 /// A connection to a libSQL database.
 #[derive(Clone)]
@@ -17,9 +25,27 @@ pub struct Connection {
     pub(crate) raw: *mut ffi::sqlite3,
 
     drop_ref: Arc<()>,
+    quarantined: Arc<AtomicBool>,
 
     #[cfg(feature = "replication")]
     pub(crate) writer: Option<crate::replication::Writer>,
+}
+
+/// Hold SQLite's recursive connection mutex through the error code/message copy.
+/// Per-call SQLite locking does not protect the gap after a failed operation.
+/// The borrow keeps the connection alive, and the raw pointer makes this guard
+/// !Send. It is only held in synchronous code, never across an await.
+pub(super) struct ConnectionGuard<'a> {
+    _conn: &'a Connection,
+    mutex: *mut ffi::sqlite3_mutex,
+}
+
+impl Drop for ConnectionGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: lock() entered this mutex on this thread and the connection
+        // remains alive for the guard's lifetime.
+        unsafe { ffi::sqlite3_mutex_leave(self.mutex) };
+    }
 }
 
 impl Drop for Connection {
@@ -28,12 +54,34 @@ impl Drop for Connection {
     }
 }
 
-// SAFETY: This is safe because we compile sqlite3 w/ SQLITE_THREADSAFE=1
+// SAFETY: SQLite is compiled with SQLITE_THREADSAFE=1, connect requests FULLMUTEX,
+// and from_handle requires the same serialized connection mode.
 unsafe impl Send for Connection {}
-// SAFETY: This is safe because we compile sqlite3 w/ SQLITE_THREADSAFE=1
+// SAFETY: Same serialized connection invariant as Send above.
 unsafe impl Sync for Connection {}
 
 impl Connection {
+    pub(super) fn lock(&self) -> Result<ConnectionGuard<'_>> {
+        // SAFETY: self owns a live SQLite connection. Connections opened here
+        // explicitly request serialized mode; imported handles must do likewise.
+        let mutex = unsafe { ffi::sqlite3_db_mutex(self.raw) };
+        assert!(
+            !mutex.is_null(),
+            "local libSQL connections require SQLite serialized threading mode"
+        );
+        // SQLite uses a recursive mutex, so its own locking remains reentrant.
+        unsafe { ffi::sqlite3_mutex_enter(mutex) };
+        let guard = ConnectionGuard { _conn: self, mutex };
+        // Check only after acquisition: a waiter may have started before the
+        // current owner failed cleanup. Cleanup/finalization do not call lock.
+        if self.quarantined.load(Ordering::Acquire) {
+            return Err(Error::Misuse(
+                "connection quarantined after unconfirmed transaction rollback".into(),
+            ));
+        }
+        Ok(guard)
+    }
+
     /// Connect to the database.
     pub(crate) fn connect(db: &Database) -> Result<Connection> {
         let mut raw = std::ptr::null_mut();
@@ -45,7 +93,7 @@ impl Connection {
                     .as_c_str()
                     .as_ptr() as *const _,
                 &mut raw,
-                db.flags.bits() as c_int,
+                db.flags.bits() as c_int | ffi::SQLITE_OPEN_FULLMUTEX,
                 std::ptr::null(),
             )
         };
@@ -61,6 +109,7 @@ impl Connection {
         Ok(Connection {
             raw,
             drop_ref: Arc::new(()),
+            quarantined: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "replication")]
             writer: db.writer()?,
         })
@@ -72,10 +121,14 @@ impl Connection {
     }
 
     /// Create a connection from a raw handle to the underlying libSQL connection
+    ///
+    /// The handle must use SQLite's serialized threading mode (a non-null
+    /// sqlite3_db_mutex), as required by this connection's Send + Sync contract.
     pub fn from_handle(raw: *mut ffi::sqlite3) -> Self {
         Self {
             raw,
             drop_ref: Arc::new(()),
+            quarantined: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "replication")]
             writer: None,
         }
@@ -289,15 +342,34 @@ impl Connection {
     where
         S: Into<String>,
     {
+        let sql = sql.into();
+        // Keep other clones (including already-prepared statements) out of this
+        // synchronous transaction, not merely out of each individual step.
+        let _guard = self.lock()?;
         self.execute("BEGIN TRANSACTION", Params::None)?;
-
-        match self.execute_transactional_batch_inner(sql) {
-            Ok(_) => {
-                self.execute("COMMIT", Params::None)?;
-                Ok(())
-            }
+        let result = self
+            .execute_transactional_batch_inner(sql)
+            .and_then(|()| self.execute("COMMIT", Params::None).map(|_| ()));
+        match result {
+            Ok(()) => Ok(()),
             Err(e) => {
-                self.execute("ROLLBACK", Params::None)?;
+                if !self.is_autocommit() {
+                    let rollback = self.execute("ROLLBACK", Params::None);
+                    let still_open = !self.is_autocommit();
+                    if still_open {
+                        self.quarantined.store(true, Ordering::Release);
+                    }
+                    if let Err(rollback) = rollback {
+                        return Err(Error::TransactionalBatchError(format!(
+                            "{e}; rollback failed: {rollback}"
+                        )));
+                    }
+                    if still_open {
+                        return Err(Error::TransactionalBatchError(format!(
+                            "{e}; rollback returned success but transaction remains open"
+                        )));
+                    }
+                }
                 Err(e)
             }
         }
@@ -449,3 +521,7 @@ impl fmt::Debug for Connection {
         f.debug_struct("Connection").finish()
     }
 }
+
+#[cfg(test)]
+#[path = "connection/tests.rs"]
+mod batch_cleanup_tests;

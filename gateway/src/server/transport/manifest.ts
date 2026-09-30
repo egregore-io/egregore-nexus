@@ -4,6 +4,7 @@ import { lstat, open } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { parse } from "smol-toml";
+import { captureWindowsAuthority, windowsEntryCommand, type WindowsCapture } from "./windowsAuthority";
 
 const NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const PROVIDER_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
@@ -31,6 +32,8 @@ export interface LoadedTransportManifest {
   readonly secretRefs: Readonly<Record<string, string>>;
   readonly authority: Readonly<{
     expectedUid?: number;
+    home: string;
+    windows?: readonly WindowsCapture[];
     manifest: FileAuthority;
     entry: FileAuthority;
   }>;
@@ -57,12 +60,27 @@ export async function loadTransportManifest(
   const directory = join(home, "gateway", "transports.d");
   const manifestPath = join(directory, `${name}.toml`);
   const expectedUid = options.expectedUid ?? process.getuid?.();
-  await validateDirectoryChain(home, directory, expectedUid);
-  const manifest = await captureRegularFile(manifestPath, expectedUid, "manifest");
+  let windows: WindowsCapture[] | undefined;
+  let manifest: FileAuthority;
+  let manifestBytes: Buffer;
+  if (process.platform === "win32") {
+    const captured = await captureWindowsAuthority([
+      ...directoryChain(home, directory).map((path) => ({ path, directory: true })),
+      { path: manifestPath, directory: false, includeBytes: true },
+    ]);
+    const file = captured[captured.length - 1]!;
+    manifest = windowsFile(file);
+    manifestBytes = Buffer.from(file.bytes!, "base64");
+    windows = captured;
+  } else {
+    await validateDirectoryChain(home, directory, expectedUid);
+    manifest = await captureRegularFile(manifestPath, expectedUid, "manifest");
+    manifestBytes = await readCaptured(manifest);
+  }
 
   let parsed: unknown;
   try {
-    parsed = parse((await readCaptured(manifest)).toString("utf8"));
+    parsed = parse(manifestBytes.toString("utf8"));
   } catch (error) {
     throw new TransportManifestError(manifestPath, `invalid TOML: ${errorMessage(error)}`);
   }
@@ -77,17 +95,36 @@ export async function loadTransportManifest(
     throw new TransportManifestError(manifestPath, "provider is invalid");
   }
   const entryValue = string(root.entry, manifestPath, "entry");
-  if (isAbsolute(entryValue)) {
+  if (isAbsolute(entryValue) || (process.platform === "win32" &&
+    (entryValue.includes(":") || /[\x00-\x1f]/.test(entryValue)
+      || entryValue.split(/[\\/]/).some((part) => /[. ]$/.test(part)
+        || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))))) {
     throw new TransportManifestError(manifestPath, "entry must be contained and relative");
   }
   const entryPath = resolve(directory, entryValue);
   if (entryPath === directory || !entryPath.startsWith(`${directory}${sep}`)) {
     throw new TransportManifestError(manifestPath, "entry escapes the contained transport directory");
   }
-  await validateDirectoryChain(directory, resolve(entryPath, ".."), expectedUid);
-  const entry = await captureRegularFile(entryPath, expectedUid, "entry");
-  if ((entry.mode & 0o111) === 0) {
-    throw new TransportManifestError(entryPath, "entry must be executable");
+  let entry: FileAuthority;
+  if (windows) {
+    windowsEntryCommand(entryPath, []);
+    const captured = await captureWindowsAuthority([
+      ...directoryChain(home, resolve(entryPath, "..")).map((path) => ({ path, directory: true })),
+      { path: manifestPath, directory: false, includeBytes: true },
+      { path: entryPath, directory: false },
+    ]);
+    for (const prior of windows) {
+      const current = captured.find((item) => item.path === prior.path);
+      if (!current || !sameWindowsAuthority(prior, current))
+        throw new TransportManifestError(prior.path, "Windows authority changed before parse completed");
+    }
+    windows = captured;
+    entry = windowsFile(captured[captured.length - 1]!);
+  } else {
+    await validateDirectoryChain(directory, resolve(entryPath, ".."), expectedUid);
+    entry = await captureRegularFile(entryPath, expectedUid, "entry");
+    if ((entry.mode & 0o111) === 0)
+      throw new TransportManifestError(entryPath, "entry must be executable");
   }
 
   const args = stringArray(root.args ?? [], manifestPath, "args");
@@ -117,13 +154,25 @@ export async function loadTransportManifest(
     args,
     config,
     secretRefs,
-    authority: { expectedUid, manifest, entry },
+    authority: { expectedUid, home, manifest, entry, ...(windows ? { windows } : {}) },
   });
 }
 
 export async function revalidateTransportManifest(
   manifest: LoadedTransportManifest,
 ): Promise<void> {
+  if (process.platform === "win32") {
+    const captured = manifest.authority.windows;
+    if (!captured) throw new TransportManifestError(manifest.manifestPath, "missing Windows authority");
+    const current = await captureWindowsAuthority(captured.map((item) => ({
+      path: item.path, directory: item.directory,
+    })));
+    if (captured.some((item, index) => !sameWindowsAuthority(item, current[index]!)))
+      throw new TransportManifestError(manifest.manifestPath, "Windows identity, DACL or hash changed before spawn");
+    return;
+  }
+  await validateDirectoryChain(manifest.authority.home, resolve(manifest.entryPath, ".."),
+    manifest.authority.expectedUid);
   const currentManifest = await captureRegularFile(
     manifest.manifestPath,
     manifest.authority.expectedUid,
@@ -143,6 +192,15 @@ async function validateDirectoryChain(
   target: string,
   expectedUid: number | undefined,
 ): Promise<void> {
+  for (const path of directoryChain(root, target)) {
+    const stat = await safeLstat(path, "directory");
+    if (stat.isSymbolicLink()) throw new TransportManifestError(path, "no-follow ancestry refused symlink");
+    if (!stat.isDirectory()) throw new TransportManifestError(path, "authority component is not a directory");
+    requireOwnershipAndMode(path, stat.uid, stat.mode, expectedUid);
+  }
+}
+
+function directoryChain(root: string, target: string): string[] {
   const from = resolve(root);
   const to = resolve(target);
   const rel = relative(from, to);
@@ -155,12 +213,19 @@ async function validateDirectoryChain(
     cursor = join(cursor, part);
     components.push(cursor);
   }
-  for (const path of components) {
-    const stat = await safeLstat(path, "directory");
-    if (stat.isSymbolicLink()) throw new TransportManifestError(path, "no-follow ancestry refused symlink");
-    if (!stat.isDirectory()) throw new TransportManifestError(path, "authority component is not a directory");
-    requireOwnershipAndMode(path, stat.uid, stat.mode, expectedUid);
-  }
+  return components;
+}
+
+function windowsFile(file: WindowsCapture): FileAuthority {
+  return { path: file.path, dev: 0, ino: 0, uid: 0, mode: 0,
+    size: file.size, sha256: file.sha256! };
+}
+
+function sameWindowsAuthority(before: WindowsCapture, after: WindowsCapture): boolean {
+  return before.path === after.path && before.directory === after.directory
+    && before.identity === after.identity && before.size === after.size
+    && before.sha256 === after.sha256 && before.security.owner === after.security.owner
+    && before.security.digest === after.security.digest;
 }
 
 async function captureRegularFile(

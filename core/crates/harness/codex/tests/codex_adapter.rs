@@ -122,6 +122,12 @@ fn codex_resolves_pinned_app_server_acp_command_without_legacy_flags() {
         nexus_harness_core::native_npm_runner(nexus_harness_core::NativeProcessPlatform::current())
     );
     assert_eq!(cmd.args, ["-y", "@agentclientprotocol/codex-acp@1.1.2"]);
+    let profile = CodexAdapter::model_reporting_profile();
+    let telemetry = profile.telemetry().unwrap();
+    assert_eq!(telemetry.quota().capability(), nexus_contracts::ModelEvidenceCapability::Unsupported,
+        "pinned bridge keeps account windows internally; _meta.quota contains token usage, not account allowance");
+    assert!(telemetry.quota().source().is_none());
+    assert!(telemetry.quota_dialect().is_none());
 }
 
 #[test]

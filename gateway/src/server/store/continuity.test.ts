@@ -10,6 +10,8 @@ import { createClient, type Client } from "@libsql/client";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createGatewayV1StoreForTest, migrateGatewayStore } from "./migrations";
+import { collectClosedSqliteHandles } from "../../../test-fixtures/closedSqliteHandles";
+import { captureWindowsAuthority } from "../transport/windowsAuthority";
 
 const execFileAsync = promisify(execFile);
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..");
@@ -26,10 +28,11 @@ const secrets = {
 const cleanupRoots: string[] = [];
 
 afterEach(async () => {
+  await collectClosedSqliteHandles();
   await Promise.all(cleanupRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
 
-describe("v0.1.6 identity continuity operator gate", () => {
+describe("v0.1.6 identity continuity operator gate", { timeout: process.platform === "win32" ? 60_000 : 5_000 }, () => {
   it("snapshots the complete legacy identity rows read-only without leaking credentials", async () => {
     const fixture = await seedLegacyFixture();
     const beforeGateway = await fileDigest(fixture.gatewayDb);
@@ -41,7 +44,7 @@ describe("v0.1.6 identity continuity operator gate", () => {
 
     expect(first.stdout).toBe("identity continuity snapshot written\n");
     expect(first.stderr).toBe("");
-    expect((await stat(fixture.pre)).mode & 0o777).toBe(0o600);
+    await expectPrivateArtifact(fixture.pre);
     expect(await fileDigest(fixture.gatewayDb)).toBe(beforeGateway);
     expect(await fileDigest(fixture.daemonDb)).toBe(beforeDaemon);
     expect(artifact.schemaVersion).toBe("nexus-v016-identity-continuity/1");
@@ -101,7 +104,7 @@ describe("v0.1.6 identity continuity operator gate", () => {
 
     expect(first.stdout).toBe("identity continuity verified\n");
     expect(first.stderr).toBe("");
-    expect((await stat(`${fixture.pre}.verified.json`)).mode & 0o777).toBe(0o600);
+    await expectPrivateArtifact(`${fixture.pre}.verified.json`);
     expect(firstIds.humanUserId).toMatch(/^hu_[a-f0-9]{24}$/);
     expect(firstIds.principalId).toBe(`h_${firstIds.humanUserId.slice(3)}`);
 
@@ -147,6 +150,19 @@ interface Fixture {
   gatewayDb: string;
   daemonDb: string;
   pre: string;
+}
+
+async function expectPrivateArtifact(path: string) {
+  if (process.platform !== "win32") {
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    return;
+  }
+  const [capture] = await captureWindowsAuthority([{ path, directory: false }]);
+  expect(capture!.security.daclPresent).toBe(true);
+  for (const ace of capture!.security.aces as Array<{ sid: string; type: number }>) {
+    expect(ace.sid).toBe(capture!.security.owner);
+    expect(ace.type).toBe(0);
+  }
 }
 
 async function seedLegacyFixture(): Promise<Fixture> {

@@ -2,7 +2,9 @@ import { chmod, copyFile, mkdir, mkdtemp, readFile, writeFile } from "node:fs/pr
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createClient } from "@libsql/client";
+import { createClient as createActualClient } from "@libsql/client";
+import { collectClosedSqliteHandles } from "../../../test-fixtures/closedSqliteHandles";
+import { windowsFixtureAcl } from "../../../test-fixtures/windowsTransportAuthority";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { handle } from "@server/api/router";
@@ -12,7 +14,7 @@ import { applyCanonicalProjection } from "@server/projection/apply";
 import { setTransportSecret } from "./secrets";
 import {
   bindIngressAuthority,
-  createTransportHost,
+  createTransportHost as createActualTransportHost,
   type TransportHost,
   type TransportIngressEvent,
 } from "./host";
@@ -20,12 +22,57 @@ import { enqueueObligationsForMessage } from "./outbox";
 import { gatewayTransportStates, publishGatewayTransportHost } from "./registry";
 
 const roots: string[] = [];
+const clients: ReturnType<typeof createActualClient>[] = [];
+const hosts: TransportHost[] = [];
+function createClient(...args: Parameters<typeof createActualClient>) {
+  const client = createActualClient(...args); clients.push(client); return client;
+}
+function createTransportHost(...args: Parameters<typeof createActualTransportHost>) {
+  const host = createActualTransportHost(...args); hosts.push(host); return host;
+}
 afterEach(async () => {
+  await Promise.all(hosts.splice(0).map((host) => host.stop()));
+  for (const client of clients.splice(0)) client.close();
+  await collectClosedSqliteHandles();
   const { rm } = await import("node:fs/promises");
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-describe("transport host protocol", () => {
+describe("transport host protocol", { timeout: process.platform === "win32" ? 60_000 : 5_000 }, () => {
+  it("does not start a bridge when stopped during asynchronous authority loading", async () => {
+    const fixture = await hostFixture("happy");
+    const db = createClient({ url: ":memory:" });
+    await migrateGatewayStore(db);
+    await setTransportSecret(db, "fake.token", "fixture-secret");
+    const host = createTransportHost({ nexusHome: fixture.home, db: () => db });
+    const starting = host.start();
+    await host.stop();
+    await starting;
+    expect(host.states()).toEqual([]);
+  });
+  it("revalidates the entry after asynchronous secret/database preparation", async () => {
+    const fixture = await hostFixture("happy");
+    const db = createClient({ url: ":memory:" });
+    await migrateGatewayStore(db);
+    await setTransportSecret(db, "fake.token", "fixture-secret");
+    let changed = false;
+    const host = createTransportHost({
+      nexusHome: fixture.home,
+      db: async () => {
+        if (!changed) {
+          changed = true;
+          await writeFile(join(fixture.home, "gateway", "transports.d", "fake-bridge.mjs"),
+            "process.exit(99);\n");
+        }
+        return db;
+      },
+    });
+    try {
+      await host.start();
+      expect(changed).toBe(true);
+      expect(host.states()).toContainEqual({ name: "fake", state: "disabled" });
+    } finally { await host.stop(); db.close(); }
+  });
   it("uses an allowlisted environment, resolves durable bindings after start, and dedupes ingress", async () => {
     const fixture = await hostFixture("happy");
     const db = createClient({ url: `file:${fixture.dbPath}` });
@@ -52,12 +99,28 @@ describe("transport host protocol", () => {
       principal: { kind: "external.human" },
     });
     const childEnv = JSON.parse(await readFile(fixture.envCapture, "utf8")) as Record<string, string>;
-    expect(childEnv).toEqual({
+    const expectedEnv: Record<string, string | undefined> = {
       PATH: process.env.PATH,
       HOME: fixture.home,
       LANG: "C",
       FAKE_TOKEN: "super-secret",
-    });
+    };
+    if (process.platform === "win32") {
+      // Node 24's libuv make_program_env adds these OS-required variables from
+      // the real parent environment even when spawn receives an explicit env.
+      // Keep exact equality (and LEAK exclusion), not an arbitrary-extra allow.
+      const required = new Set([
+        "HOMEDRIVE", "HOMEPATH", "LOGONSERVER", "SYSTEMDRIVE", "SYSTEMROOT",
+        "TEMP", "USERDOMAIN", "USERNAME", "USERPROFILE", "WINDIR",
+      ]);
+      for (const [key, value] of Object.entries(process.env)) {
+        if (required.has(key.toUpperCase())) expectedEnv[key.toUpperCase()] = value;
+      }
+      expect(Object.fromEntries(Object.entries(childEnv).map(([key, value]) =>
+        [key.toUpperCase(), value]))).toEqual(expectedEnv);
+    } else {
+      expect(childEnv).toEqual(expectedEnv);
+    }
     const logs = await db.execute("SELECT message FROM logs WHERE scope = 'transport' ORDER BY seq");
     expect(logs.rows.map((row) => String(row.message)).join("\n")).not.toContain("super-secret");
     await host.stop();
@@ -203,7 +266,7 @@ describe("transport host protocol", () => {
     }, 10_000);
     await host.stop();
     db.close();
-  }, 20_000);
+  }, process.platform === "win32" ? 60_000 : 20_000);
 
   it("redelivers from a bridge journal after provider success without a duplicate provider call", async () => {
     const fixture = await hostFixture("journal-crash");
@@ -276,7 +339,7 @@ describe("transport host protocol", () => {
       await host.stop();
       db.close();
     },
-    10_000,
+    process.platform === "win32" ? 60_000 : 10_000,
   );
 });
 
@@ -328,10 +391,13 @@ async function hostFixture(scenario: string) {
     'FAKE_TOKEN = "fake.token"',
     "",
   ].join("\n"), { mode: 0o600 });
+  if (process.platform === "win32") await windowsFixtureAcl(home, "secure-tree");
   return { root, home, dir, entry, envCapture, startCount, stateRoot, dbPath };
 }
 
 async function eventually(assertion: () => void | Promise<void>, timeoutMs = 2000) {
+  // Each crash recovery performs a fresh batched native security capture on Windows.
+  if (process.platform === "win32") timeoutMs = Math.max(timeoutMs, 30_000);
   const deadline = Date.now() + timeoutMs;
   let error: unknown;
   while (Date.now() < deadline) {

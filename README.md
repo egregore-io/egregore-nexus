@@ -6,6 +6,53 @@ without asking agents to poll.
 
 Nexus routes messages; it does not orchestrate what agents do with them.
 
+Messages to a busy agent remain queued when its harness cannot interrupt. Refused interruption
+does not discard an unsubmitted message; it waits for the next delivery boundary. This does not
+retry messages whose native delivery outcome is uncertain or generate replies on an agent's behalf.
+
+Accepted, unattempted deliveries retain their stable recipient and original timing across a
+daemon restart, including external agents with no live runtime capsule. Recovery does not
+register an offline agent or invent an input receipt. Expired pending deliveries become explicit
+timeout outcomes rather than being silently replayed; an operator's explicit requeue establishes
+new durable continuity before it is acknowledged. Gateway timeout projection follows settlement,
+so a crash between those steps can still leave the Gateway view behind the daemon outcome.
+
+OpenCode attach/resume and automatic wake must restore the existing runtime's exact native
+conversation, not merely return its saved identity. Native argument grammar and identity
+reconciliation belong in the harness implementation, not daemon-specific conditionals. Missing
+or conflicting resume identity is an explicit error, never a fresh-conversation fallback.
+See [runtime ownership](docs/architecture.md) for the recovery boundaries.
+
+Headed Claude operator input uses Claude's native queue: normal Send submits without interrupting
+the active work; Interrupt & send interrupts and submits through the same captured input owner.
+Native input acceptance is distinct from turn completion. Missing receipts remain uncertain and
+are not automatically resent. Bus delivery and other harnesses retain their existing boundaries.
+
+Headed OpenCode also forwards its native acceptance observer through the runtime wrapper:
+the canonical user echo precedes completion, rather than appearing again after the reply.
+The wrapper/bridge regression covers repeated receipts and intentional identical sends;
+running daemons need the corrected build before this behavior is active.
+
+Gateway roster reads preserve native harness identity for both legacy `agent` and canonical
+`local.agent`, `external.agent`, and `trusted.agent` kinds. Human and unknown-kind members do not
+gain a fabricated harness; missing harness evidence remains absent.
+
+Recording clients can request `replay=retained` on the authenticated exact-agent/session event
+route. This reads the daemon's retained current-boot events independently of the Gateway's small
+live fanout buffer, with bounded reader backpressure and exact saved-anchor verification.
+It is not durable history across daemon restarts; missing anchors remain explicit gaps. Ordinary
+live views and command delivery are unchanged. Recording clients and Gateway must both support this option.
+
+OpenCode display fidelity pairs stable source-anchored Gateway message IDs with an
+explicit generated-origin marker and replacement-marked tool argument snapshots in compatible clients.
+Native tool-call IDs and failure text are preserved, without synthetic “Running tool” replies.
+The implementation also binds each submitted prompt to its persisted native user ID,
+publishes its canonical echo before the reply, preserves reasoning and missing tool outcomes,
+and follows external rename by exact identity. Inline MCP configuration captures the launch
+identity; plugin-backed runtimes have one visible display publisher. These behaviors require
+compatible Nexus and client versions; they do not repair duplicate aliases in previously saved
+history or certify every live harness configuration.
+
 Headed Codex reporting now includes native-session token snapshots and Codex's own baseline-adjusted
 remaining-context percentage, labeled as a last-reported estimate. Native capacity and raw token
 counts remain separate. Passive native Codex account windows retain their separate provider scope
@@ -15,6 +62,11 @@ calculation; this does not imply ACP cumulative token usage or account-window su
 See [model and status reporting](docs/model-reporting.md) for capability and verification limits.
 
 ## Install
+
+This source includes a daemon stack-overflow fix for headed launch/rebind (including
+launches requested while attaching). Ordinary and admin launches take a small awaited dispatch
+path rather than nesting cold revival under the general RPC router. It does not increase worker
+stack sizes or require resetting session data.
 
 Install everything—the native CLI and daemon, REST/WebSocket Gateway, and browser console:
 
@@ -31,15 +83,37 @@ cargo install egregore-nexus                   # native CLI + transport daemon
 ```
 
 The npm package selects a prebuilt binary for Linux x64/arm64 (glibc 2.35 or newer),
-macOS x64/arm64, Windows x64, or WSL. It does not compile Rust during installation.
+Windows x64, or WSL. The beta.5 npm release does not support macOS.
+It does not compile Rust during installation.
+Windows default paths use the operating-system user profile when `HOME` is unset. Detached-daemon
+stop/restart requests graceful cleanup over local authenticated IPC; only explicit `--force`
+may terminate a process that fails to drain. Older running daemons without this control path
+need an explicit forced stop before the first restart into the corrected build.
+Installed services cancel the Task Scheduler action before draining any surviving daemon child;
+restart/uninstall wait for that captured child to exit.
+Windows startup success requires a live daemon and authenticated IPC readiness. Scheduled-task
+startup has a bounded 60-second allowance for the scheduler action and daemon, versus 15 seconds
+for a directly spawned daemon; the CLI does not repeat launch while waiting. Scheduled-task startup
+errors are appended to the same `daemon.log` shown by the CLI.
 If npm's command directory is not on `PATH`,
 the installer prints one copyable command for the current shell.
 
 ## Start
 
+On the first interactive operator run, `nexus` offers one prompt to run the installed daemon,
+Gateway and Webconsole server now and automatically at login. No separate setup command is
+required, and accepting does not open a browser. The choice is remembered per Nexus home.
+Missing packages are reported, not downloaded. Scripts, agent sessions, CI, help/version and
+JSON/quiet commands never prompt; `NEXUS_NO_SETUP=1` also suppresses the offer.
+The offer is attached to bare `nexus` and ordinary interactive launch/read commands; explicit
+service-management commands keep their existing direct behavior.
+
+Explicit service controls remain available if you decline or need to repair an installation:
+
 ```bash
 nexus daemon install        # start now and at login
 nexus gateway install       # supervise the Gateway too
+nexus webconsole install    # supervise the loopback server; requires healthy Gateway service
 nexus webconsole launch     # start dependencies and open the browser
 ```
 
@@ -47,7 +121,10 @@ Installing the complete package lets `nexus daemon install` register both daemon
 dependency order. The daemon service preserves the executable search path present during
 installation and adds stable platform fallbacks, so user-installed harnesses remain discoverable
 after login or reboot. Rerun `nexus daemon install` to refresh an existing service definition.
-Webconsole remains on demand.
+Use `nexus webconsole uninstall` to stop and remove its automatic-login service. Without that
+service, Webconsole remains on demand. Webconsole service installation captures the current
+Gateway URL and PATH; reinstall it after changing those. Services are per-user (systemd on Linux,
+launchd on macOS, Task Scheduler on Windows), not machine-wide pre-login services.
 
 The Webconsole shell and direct messages use HTTP only: caller-scoped DM history uses long
 polling, and the sidebar roster refreshes every 30 seconds while visible. Existing `/agent/...`
@@ -57,8 +134,18 @@ packaged Webconsole.
 Successful agent resumes republish canonical identity/runtime snapshots even when the session
 already appears online to the daemon. In buffered projection mode, a separately started Gateway
 can replay those updates after connecting; Gateway startup remains explicit.
+Codex remote resume inherits app-server thread permissions; Nexus does not add the CLI permission
+bypass flag on that path. Explicit native arguments are still forwarded, so do not supply permission
+overrides with remote resume. Per-harness YAML configuration is not supported.
 Unacknowledged snapshots retain their assigned sequence positions, so repeated updates do not
 create silent replay gaps that strand the Gateway directory offline.
+
+Lost submission acknowledgements can be recovered through exact caller-owned queue reads using
+the original `clientMessageId`, `agentId`, and `expectedSessionId`. This lookup does not enqueue
+or resend input; a missing retained row is not proof that the original attempt had no effect.
+Clients can persist an inspection-only journal for prompt and direct redirect recovery across restart.
+Queued/started recovery proves daemon admission, not native receipt or completion. Credential or
+target changes leave unmatched inspections unresolved rather than transferring ownership.
 
 Session composers should use queued prompts for ordinary Send, not infer strict steer from
 displayed activity. Unsupported delivery/model options are rejected rather than discarded,
@@ -130,6 +217,11 @@ An offline daemon-owned agent is revived with its stored harness, headed/headles
 working directory, and native resume correlation when the harness exposes one. Names are mutable
 aliases; stable agent IDs are the routing identity.
 
+Gateway launch callers can pass headed/headless mode and an optional initial prompt through the same
+authenticated Gateway launch endpoint. Update Gateway and clients together for these options;
+older Gateways reject them rather than silently changing mode or sending a second prompt.
+Native harness and platform launch support still belongs to the daemon.
+
 ## Operate
 
 ```bash
@@ -147,14 +239,22 @@ nexus webconsole restart
 The daemon is the lightweight transport authority. The Gateway is the persistent REST/WebSocket
 backend and the only backend used by Webconsole. Webconsole never connects directly to the daemon.
 
+Gateway transport-host shutdown stops new bridge work, waits for owned child processes and
+in-flight authority/log operations, and reports cleanup failures before its store is closed.
+A start requested during shutdown waits for that shutdown before starting a new host generation.
+
+Live stream storage is anonymous memory by default. If a nonstandard deployment sets
+`NEXUS_STREAM_DB_PATH`, only the daemon's transport connection attaches that named stream file;
+the identity connection keeps an independent anonymous stream schema so transport transactions
+cannot block identity writes through a shared SQLite attachment.
+
 Local presentation services bind to loopback by default. Binding Webconsole to another interface
 prints a warning; use a firewall or trusted private network.
 
 ## Platforms
 
-Linux and Windows/WSL are the hardened initial baselines. macOS packages install and select their
-native binaries out of the box, while live macOS harness behavior remains experimental until it
-has equivalent real-machine validation.
+Linux and Windows/WSL are the beta.5 release platforms. macOS is deferred and unsupported
+in this npm release; no macOS native binaries are bundled.
 
 ## Documentation
 
@@ -174,7 +274,12 @@ metadata from the exact session selected by its launch-local framework hook. Mis
 unknown; native root replacement, disconnect or compaction closes the captured reporter. Cold
 Gateway resume retains the isolated native profile and requires its prior exact root evidence;
 process startup alone does not certify restored context. Final live session-brief verification
-remains open. These collectors do not infer usage or quota.
+remains open. Model evidence does not imply usage or quota. Separate telemetry collectors preserve
+headed Codex usage/context/allowance, mode-specific usage/context for all four ACP adapters, and
+headed Hermes native session-row usage, headed OpenCode response usage/live-context estimates,
+and headed Claude processed-response usage. Headed Claude context/allowance capture remains
+separate pending safe statusline composition. Context does not derive from lifetime tokens. New usage
+scopes require paired consumer updates; current source candidates are not a live rollout claim.
 `scripts/check model-reporting` composes all eight headed/headless collector paths with captured
 native fixtures, the Rust publisher and Gateway canonical snapshots in disposable storage. It
 requires fresh artifacts for every mode and verifies that delayed older reports cannot restore a

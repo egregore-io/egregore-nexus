@@ -95,9 +95,19 @@ fn accepted_event(session: &SessionId, text: &str) -> WsEvent {
 
 #[tokio::test]
 async fn busy_steer_publishes_only_native_recorded_input_and_later_send_progresses() {
-    for abort_first in [false, true] {
+    for (abort_first, staged_gate) in [
+        (false, None),
+        (true, None),
+        (true, Some(b"".as_slice())),
+        (true, Some(b"ab".as_slice())),
+    ] {
         let dir = tempdir("steer-consumption");
         let gate = dir.join("consume");
+        if let Some(bytes) = staged_gate {
+            // Hold the create/truncate or partial-write state before the fake
+            // reads it; file existence is not publication of a complete command.
+            std::fs::write(&gate, bytes).unwrap();
+        }
         let (dir, server, transport, session) = setup_with_env(
             "steer-consumption",
             dir,
@@ -124,7 +134,7 @@ async fn busy_steer_publishes_only_native_recorded_input_and_later_send_progress
         transport
             .turn_tracker()
             .observe_active_turn("fake-thread", "t1");
-        let first = {
+        let mut first = {
             let transport = transport.clone();
             let session = session.clone();
             let sink = sink.clone();
@@ -157,6 +167,14 @@ async fn busy_steer_publishes_only_native_recorded_input_and_later_send_progress
             !first.is_finished(),
             "RPC queue admission is not native consumption"
         );
+        if staged_gate.is_some() {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut first)
+                    .await
+                    .is_err(),
+                "an empty/partial fixture gate must not manufacture a native receipt: {staged_gate:?}"
+            );
+        }
         assert!(
             !sink.0.lock().await.iter().any(|event| matches!(
                 event,
@@ -237,7 +255,7 @@ async fn busy_steer_publishes_only_native_recorded_input_and_later_send_progress
 async fn tracked_active_turn_uses_native_turn_steer() {
     let dir = tempdir("steer_active");
     let gate = dir.join("record-input");
-    std::fs::write(&gate, b"ready").unwrap();
+    std::fs::write(&gate, b"consume").unwrap();
     let (dir, server, transport, session) = setup_with_env(
         "steer_active",
         dir,

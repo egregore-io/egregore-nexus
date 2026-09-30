@@ -1,0 +1,20 @@
+[package]
+name = "nexus-harness-opencode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = ["crates-io"]
+description = "OpenCode native launch and exact-runtime resurrection policy for Nexus."
+
+[dependencies]
+nexus-harness-core = { workspace = true }
+nexus-common = { workspace = true }
+nexus-contracts = { workspace = true }
+nexus-store = { workspace = true }
+libsql = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

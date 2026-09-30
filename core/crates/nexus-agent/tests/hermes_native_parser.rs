@@ -32,7 +32,19 @@ fn native_session_model_is_configured_only_and_preserves_exact_native_identity()
     assert!(observation.native_message_id.is_none());
     assert!(observation.native_reported_at.is_none());
     let profile = model_profile();
-    assert!(profile.telemetry().is_none());
+    let telemetry = profile.telemetry().unwrap();
+    assert_eq!(
+        telemetry.usage().capability(),
+        nexus_contracts::ModelEvidenceCapability::Supported
+    );
+    assert_eq!(
+        telemetry.context().capability(),
+        nexus_contracts::ModelEvidenceCapability::Unsupported
+    );
+    assert_eq!(
+        telemetry.quota().capability(),
+        nexus_contracts::ModelEvidenceCapability::Unsupported
+    );
 }
 
 #[test]
@@ -56,6 +68,67 @@ fn native_session_model_rejects_foreign_child_and_ambiguous_lineage() {
         assert!(configured_model(&row, "root", 1).is_none(), "{row}");
     }
     assert!(configured_model(&base, "", 1).is_none());
+}
+
+#[test]
+fn native_session_usage_validates_every_counter_and_preserves_unknown_without_identity_guessing() {
+    use nexus_agent::adapter::hermes::native::session_usage;
+    use nexus_contracts::telemetry::{NativeTelemetryUpdate, NativeTelemetryValue};
+    let base = json!({"id":"root","parent_session_id":null,"model_config":"{}",
+        "usage":{"api_call_count":1,"input_tokens":120,"output_tokens":30,
+            "cache_read_tokens":80,"cache_write_tokens":20,"reasoning_tokens":12}});
+    for key in [
+        "api_call_count",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+    ] {
+        for malformed in [
+            json!(-1),
+            json!(1.5),
+            json!("1"),
+            json!(true),
+            json!(null),
+            json!(9_007_199_254_740_992_u64),
+        ] {
+            let mut row = base.clone();
+            row["usage"][key] = malformed;
+            assert!(
+                matches!(
+                    session_usage(&row, "root", 17).unwrap(),
+                    NativeTelemetryUpdate::Usage {
+                        value: NativeTelemetryValue::Invalid,
+                        ..
+                    }
+                ),
+                "malformed {key} cannot partially publish counters"
+            );
+        }
+    }
+    for changes in [
+        json!({"id":"foreign"}),
+        json!({"ended_at":17}),
+        json!({"parent_session_id":"parent"}),
+        json!({"model_config":"{\"_delegate_from\":\"parent\"}"}),
+    ] {
+        let mut row = base.clone();
+        row.as_object_mut()
+            .unwrap()
+            .extend(changes.as_object().unwrap().clone());
+        assert!(session_usage(&row, "root", 17).is_none());
+    }
+    let NativeTelemetryUpdate::Usage {
+        value: NativeTelemetryValue::Observed(value),
+        ..
+    } = session_usage(&base, "root", 17).unwrap()
+    else {
+        panic!("usage is independent of missing configured model")
+    };
+    assert_eq!(value.metadata.observed_at.get(), 17);
+    assert!(value.metadata.native_reported_at.is_none());
+    assert!(value.model.is_none());
 }
 
 #[test]

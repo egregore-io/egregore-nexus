@@ -1,0 +1,34 @@
+{
+  "runtimeId": "s_last_response_fixture",
+  "agentId": "a_last_response_fixture",
+  "harness": "codex",
+  "presence": "online",
+  "active": true,
+  "startedAt": 10,
+  "modelReport": {
+    "backend": "codex.acp",
+    "observerActive": true,
+    "reportRevision": 2,
+    "configured": {"capability": "supported", "status": "unknown"},
+    "turnSelected": {"capability": "unverified", "status": "unknown"},
+    "responseReported": {"capability": "unverified", "status": "unknown"},
+    "telemetry": {
+      "usage": {
+        "status": "observed",
+        "capability": "supported",
+        "observation": {
+          "metadata": {"nativeSessionId": "native/root", "source": "codex.acp.prompt.usage", "observedAt": 30},
+          "scope": "lastResponse",
+          "counterId": "codex.acp.prompt.usage",
+          "inputTokens": 120,
+          "outputTokens": 30,
+          "cacheReadTokens": 80,
+          "reasoningTokens": 12,
+          "totalTokens": 230
+        }
+      },
+      "context": {"status": "unknown", "capability": "supported"},
+      "quota": {"status": "unknown", "capability": "unverified"}
+    }
+  }
+}

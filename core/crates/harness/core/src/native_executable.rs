@@ -50,6 +50,14 @@ impl OpenCodeNativeTarget {
         matches!(self, Self::WindowsX64 | Self::WindowsArm64)
     }
 
+    const fn os_label(self) -> &'static str {
+        match self {
+            Self::LinuxX64 | Self::LinuxArm64 => "Linux",
+            Self::MacX64 | Self::MacArm64 => "macOS",
+            Self::WindowsX64 | Self::WindowsArm64 => "Windows",
+        }
+    }
+
     fn package_names(self) -> [String; 2] {
         let base = format!("opencode-{}", self.package_suffix());
         let baseline = format!("{base}-baseline");
@@ -84,6 +92,13 @@ pub fn resolve_opencode_executable_for(
         .filter(|value| !value.is_empty())
     {
         if let Some(resolved) = resolve_override(program, path_env, target) {
+            if is_foreign_executable(Path::new(&resolved), target) {
+                return Err(format!(
+                    "NEXUS_OPENCODE_BIN '{resolved}' is not a {} executable; point it at the \
+                     native OpenCode binary for this host",
+                    target.os_label()
+                ));
+            }
             return Ok(resolved);
         }
         return Err(not_found_message(target, Some(program)));
@@ -93,14 +108,61 @@ pub fn resolve_opencode_executable_for(
         .into_iter()
         .flat_map(std::env::split_paths)
         .collect();
-    if let Some(resolved) = package_candidates(&path_dirs, target)
-        .chain(direct_candidates(&path_dirs, target))
-        .find(|candidate| candidate.is_file())
+    let mut foreign = None;
+    for candidate in
+        package_candidates(&path_dirs, target).chain(direct_candidates(&path_dirs, target))
     {
-        return Ok(resolved.to_string_lossy().into_owned());
+        if !candidate.is_file() {
+            continue;
+        }
+        // WSL appends the Windows PATH, so `%APPDATA%\npm\node_modules\opencode-ai` is visible
+        // from Linux with the same staged filename as a Linux install. A PE cannot serve a Linux
+        // plugin, so skip it and keep looking rather than launch it through interop.
+        if is_foreign_executable(&candidate, target) {
+            foreign.get_or_insert(candidate);
+            continue;
+        }
+        return Ok(candidate.to_string_lossy().into_owned());
     }
 
-    Err(not_found_message(target, None))
+    let mut message = not_found_message(target, None);
+    if let Some(foreign) = foreign {
+        message.push_str(&format!(
+            " (skipped {} because it is not a {} executable)",
+            foreign.display(),
+            target.os_label()
+        ));
+    }
+    Err(message)
+}
+
+/// Whether the file's header identifies it as an executable for a different operating system
+/// than `target`. Only known-foreign formats are rejected; anything unrecognised is left to the
+/// spawn to judge, so provider fixtures and future formats keep resolving.
+fn is_foreign_executable(path: &Path, target: OpenCodeNativeTarget) -> bool {
+    let mut magic = [0u8; 4];
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(read) = std::io::Read::read(&mut file, &mut magic) else {
+        return false;
+    };
+    let magic = &magic[..read];
+    let is_pe = magic.starts_with(b"MZ");
+    let is_elf = magic.starts_with(b"\x7fELF");
+    let is_mach_o = matches!(
+        magic,
+        [0xfe, 0xed, 0xfa, 0xce]
+            | [0xfe, 0xed, 0xfa, 0xcf]
+            | [0xce, 0xfa, 0xed, 0xfe]
+            | [0xcf, 0xfa, 0xed, 0xfe]
+            | [0xca, 0xfe, 0xba, 0xbe]
+    );
+    if target.is_windows() {
+        is_elf || is_mach_o
+    } else {
+        is_pe
+    }
 }
 
 fn resolve_override(

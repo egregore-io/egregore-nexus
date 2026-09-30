@@ -51,3 +51,20 @@ fn resume_places_native_tail_before_thread_id() {
         .windows(2)
         .any(|pair| pair == ["--remote", "unix:///tmp/codex.sock"]));
 }
+
+#[test]
+fn remote_resume_inherits_server_permissions() {
+    let args = argv(remote_resume_command_with_executable(
+        "codex",
+        "/tmp/codex.sock",
+        "stored-thread",
+        None,
+        &[],
+    ));
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"),
+        "{args:?}"
+    );
+}

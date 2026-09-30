@@ -73,8 +73,8 @@ pub struct PromptRequest {
 
 impl PromptRequest {
     /// Reject unsupported intent before serde's forward-compatible field handling can discard
-    /// it. This candidate supports boundary prompts only; automatic native admission and model
-    /// selection must not be downgraded to an ordinary prompt while their capability is absent.
+    /// it. Explicit delivery/model-selection options remain unsupported; the bound adapter's
+    /// internal native-queue capability does not authorize caller-supplied delivery overrides.
     pub fn validate_supported_options(
         params: &serde_json::Value,
     ) -> Result<(), crate::ContractError> {
@@ -126,7 +126,8 @@ pub struct CommandQueueEntry {
     pub session_id: Option<String>,
     pub text: String,
     pub state: CommandQueueState,
-    /// `queue` retains the normal turn boundary; `redirect` uses the adapter strategy.
+    /// `queue` uses normal adapter admission (native queuing where supported);
+    /// `redirect` explicitly uses the adapter's interrupt/steer strategy.
     pub mode: String,
     #[typeshare(serialized_as = "number")]
     pub revision: i64,

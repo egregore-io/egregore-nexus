@@ -1559,10 +1559,11 @@ async fn read_client_refuses_ambiguous_claude_resume_harvest_before_revive() {
         })
         .await
         .unwrap();
+    // Two Claude ids and no SessionStart to order them: nothing says which one hugo is.
     write_claude_hooks(
         &bridge_dir,
         "\
-{\"event\":\"SessionStart\",\"payload\":{\"session_id\":\"claude-native-a\"}}\n\
+{\"event\":\"Stop\",\"payload\":{\"session_id\":\"claude-native-a\"}}\n\
 {\"event\":\"Stop\",\"payload\":{\"session_id\":\"claude-native-b\"}}\n",
     );
 

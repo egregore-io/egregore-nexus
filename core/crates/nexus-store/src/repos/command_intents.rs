@@ -628,6 +628,19 @@ impl<'a> CommandIntents<'a> {
         lease_ms: i64,
         active_sessions: &[String],
     ) -> Result<Option<CommandIntentRow>, NexusError> {
+        self.claim_next_ready_harness_prompt_with_native_queues(now, lease_ms, active_sessions, &[])
+            .await
+    }
+
+    /// Native operator queues may accept input during an older bus turn. The daemon supplies
+    /// exact currently opted-in runtime IDs; startup and command-claim exclusions still apply.
+    pub async fn claim_next_ready_harness_prompt_with_native_queues(
+        &self,
+        now: i64,
+        lease_ms: i64,
+        active_sessions: &[String],
+        native_queue_sessions: &[String],
+    ) -> Result<Option<CommandIntentRow>, NexusError> {
         for candidate in self
             .claim_candidates(now, crate::command_kinds::harness::PROMPT)
             .await?
@@ -639,9 +652,12 @@ impl<'a> CommandIntents<'a> {
                 || self
                     .has_pending_initial_prompt(&candidate, target.as_ref())
                     .await?
-                || self
-                    .has_older_unsettled_delivery(&candidate, target.as_ref())
-                    .await?
+                || (!target
+                    .as_ref()
+                    .is_some_and(|row| native_queue_sessions.contains(&row.session_id.0))
+                    && self
+                        .has_older_unsettled_delivery(&candidate, target.as_ref())
+                        .await?)
                 || self
                     .has_claimed_prompt_for_target(now, &candidate, target.as_ref())
                     .await?
@@ -669,6 +685,23 @@ impl<'a> CommandIntents<'a> {
         lease_ms: i64,
         target_session_id: &str,
     ) -> Result<Option<CommandIntentRow>, NexusError> {
+        self.claim_next_ready_harness_prompt_for_session_with_native_queue(
+            now,
+            lease_ms,
+            target_session_id,
+            false,
+        )
+        .await
+    }
+
+    /// Session-actor counterpart of the exact native-queue scheduling exception above.
+    pub async fn claim_next_ready_harness_prompt_for_session_with_native_queue(
+        &self,
+        now: i64,
+        lease_ms: i64,
+        target_session_id: &str,
+        native_queue: bool,
+    ) -> Result<Option<CommandIntentRow>, NexusError> {
         for candidate in self
             .claim_candidates(now, crate::command_kinds::harness::PROMPT)
             .await?
@@ -678,9 +711,10 @@ impl<'a> CommandIntents<'a> {
                 || self
                     .has_pending_initial_prompt(&candidate, target.as_ref())
                     .await?
-                || self
-                    .has_older_unsettled_delivery(&candidate, target.as_ref())
-                    .await?
+                || (!native_queue
+                    && self
+                        .has_older_unsettled_delivery(&candidate, target.as_ref())
+                        .await?)
                 || self
                     .has_claimed_prompt_for_target(now, &candidate, target.as_ref())
                     .await?
@@ -757,6 +791,10 @@ impl<'a> CommandIntents<'a> {
         now: i64,
         lease_ms: i64,
     ) -> Result<Option<CommandIntentRow>, NexusError> {
+        // The daemon owns the transport gate while claiming. On split stores,
+        // also exclude identity batches until this write cursor is finalized.
+        // This introduces no explicit transaction or rollback owner.
+        let _identity_guard = self.store.lock_split_identity_write().await;
         let mut rows = self
             .store
             .identity_conn()
@@ -773,10 +811,12 @@ impl<'a> CommandIntents<'a> {
             )
             .await
             .map_err(store_err)?;
-        match rows.next().await.map_err(store_err)? {
+        let claimed = match rows.next().await.map_err(store_err)? {
             Some(row) => Ok(Some(row_to_command_intent(&row)?)),
             None => Ok(None),
-        }
+        };
+        drop(rows);
+        claimed
     }
 
     async fn resolve_target_session(
@@ -1017,6 +1057,9 @@ impl<'a> CommandIntents<'a> {
         lease_ms: i64,
         filter: ClaimFilter<'_>,
     ) -> Result<Option<CommandIntentRow>, NexusError> {
+        // Keep the implicit UPDATE ... RETURNING write entirely inside the
+        // split identity gate, including row decoding and statement finalization.
+        let _identity_guard = self.store.lock_split_identity_write().await;
         let update = format!("UPDATE command_intents \
              SET status = 'claimed', attempts = attempts + 1, revision = revision + 1, claimed_at = ?1, started_at = NULL, lease_until = ?2 \
              WHERE command_id = ( \
@@ -1100,10 +1143,12 @@ impl<'a> CommandIntents<'a> {
             }
         }
         .map_err(store_err)?;
-        match rows.next().await.map_err(store_err)? {
+        let claimed = match rows.next().await.map_err(store_err)? {
             Some(row) => Ok(Some(row_to_command_intent(&row)?)),
             None => Ok(None),
-        }
+        };
+        drop(rows);
+        claimed
     }
 
     /// Mark a command as successfully executed and persist the serialized result.

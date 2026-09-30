@@ -76,6 +76,7 @@ describe("local hook command runner", () => {
         PATH: process.env.PATH,
         HOME: process.env.HOME,
         LANG: "C.UTF-8",
+        ...(process.platform === "win32" ? { SystemRoot: process.env.SystemRoot } : {}),
         HOOK_ALLOWED: "yes",
         HOOK_SECRET: "must-not-leak",
       },
@@ -113,7 +114,8 @@ describe("local hook command runner", () => {
     ["shell", ["sh", join(FIXTURES, "echo-hook.sh")]],
   ])("executes %s hooks through the same JSON boundary", async (runtime, run) => {
     const result = await new LocalCommandRunner({
-      environment: { PATH: process.env.PATH, HOME: process.env.HOME, HOOK_ALLOWED: "yes" },
+      environment: { PATH: process.env.PATH, HOME: process.env.HOME, HOOK_ALLOWED: "yes",
+        ...(process.platform === "win32" ? { SystemRoot: process.env.SystemRoot } : {}) },
     }).run(manifest(run), invocation());
 
     expect(result).toMatchObject({ action: "continue", metadata: { runtime } });

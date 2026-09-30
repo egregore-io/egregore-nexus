@@ -28,6 +28,16 @@ async fn main() -> ExitCode {
     // through `cli::run`. We dispatch on `argv[1]` but still parse each arm through clap so `--help`
     // works for both `nexus daemon --help` and `nexus <client-cmd> --help`.
     let args: Vec<String> = std::env::args().collect();
+    if args.len() == 1 {
+        match nexus::first_run::maybe_setup(&[]).await {
+            Ok(true) => return ExitCode::SUCCESS,
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        }
+    }
     if args.get(1).map(String::as_str) == Some("daemon") {
         // Parse through clap so `daemon --help`/bad-args behave correctly (clap exits for --help
         // and parse errors). Bare `nexus daemon` remains foreground-compatible and is equivalent to
@@ -53,6 +63,10 @@ async fn main() -> ExitCode {
     }
 
     let cli = Cli::parse();
+    if let Err(error) = nexus::first_run::maybe_setup(&args[1..]).await {
+        eprintln!("error: {error}");
+        return ExitCode::from(1);
+    }
     cli::run(cli).await
 }
 
@@ -148,7 +162,10 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     // A daemon restart must preserve headed harness terminals. Existing tmux/app-server processes
     // are durable runtime attachments; boot revive/rebind reconciles liveness instead of treating
     // restart as a destructive lifecycle command.
-    shutdown_signal().await;
+    tokio::select! {
+        _ = shutdown_signal() => {},
+        _ = state.wait_for_shutdown_request() => {},
+    }
     nexus::daemon::command_worker::begin_shutdown(&state).await;
     // Stop accepting fresh IPC connections after the ingress fence is durable. Requests already
     // inside the server linearize on the same store write gate: accepted rows drain here, while

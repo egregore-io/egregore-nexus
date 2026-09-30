@@ -233,7 +233,29 @@ fn raw_pty_attach_target_is_live(descriptor: &PtyAttachDescriptor) -> Option<boo
     Some(std::os::unix::net::UnixStream::connect(&endpoint.path).is_ok())
 }
 
-#[cfg(not(unix))]
+/// A named pipe exists only while its server holds an instance open, so `open` succeeding — or
+/// failing because every instance is momentarily busy — means the daemon is serving it.
+#[cfg(windows)]
+fn raw_pty_attach_target_is_live(descriptor: &PtyAttachDescriptor) -> Option<bool> {
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
+
+    let session = descriptor.argv.get(2)?;
+    let endpoint = crate::daemon::terminal_socket::read_terminal_endpoint_manifest(&SessionId(
+        session.clone(),
+    ))?;
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&endpoint.path)
+    {
+        Ok(_) => Some(true),
+        Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => Some(true),
+        Err(e) if e.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) => Some(false),
+        Err(_) => None,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn raw_pty_attach_target_is_live(_descriptor: &PtyAttachDescriptor) -> Option<bool> {
     None
 }

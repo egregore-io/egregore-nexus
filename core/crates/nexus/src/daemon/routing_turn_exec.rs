@@ -104,6 +104,11 @@ impl AgentTurnExecutionPort for RoutingTurnExec {
         self.turn_backend(recipient).steer_capability(recipient)
     }
 
+    fn accepts_prompt_while_busy(&self, recipient: &SessionId) -> bool {
+        self.turn_backend(recipient)
+            .accepts_prompt_while_busy(recipient)
+    }
+
     fn observe_turn(&self, recipient: &SessionId) -> nexus_contracts::TurnObservation {
         self.turn_backend(recipient).observe_turn(recipient)
     }

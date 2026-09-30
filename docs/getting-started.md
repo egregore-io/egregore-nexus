@@ -67,8 +67,17 @@ cargo build --manifest-path core/Cargo.toml -p egregore-nexus --release
 
 ## 2. Start Nexus transport
 
+For an interactive first run, enter `nexus` and accept the single background-startup prompt to
+enable all installed components now and at login. The complete package includes Webconsole;
+its server starts without opening a browser. The choice is remembered per Nexus home, and
+automated/agent commands never prompt. No additional setup command or package download is needed.
+
+To configure services explicitly instead:
+
 ```bash
 nexus daemon install
+nexus gateway install       # if installed
+nexus webconsole install    # if installed; requires healthy Gateway service
 nexus daemon status
 ```
 

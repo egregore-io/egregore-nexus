@@ -24,6 +24,41 @@ impl HarnessInput for AcceptedOnlyHarness {
 struct NoopSink;
 
 #[tokio::test]
+async fn ordinary_backend_operator_prompt_keeps_readiness_retries() {
+    #[derive(Default)]
+    struct FlakyPromptHarness(AtomicUsize);
+    #[async_trait]
+    impl HarnessInput for FlakyPromptHarness {
+        async fn send_turn(&self, _text: &str) -> Result<(), String> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err("harness terminal did not become ready within 30s (input prompt never rendered)".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let session = SessionId("s_legacy_prompt_retry".into());
+    let harness = Arc::new(FlakyPromptHarness::default());
+    let transport = PtyTransport::default();
+    transport.bind(session.clone(), harness.clone());
+    assert!(!transport.accepts_prompt_while_busy(&session));
+    transport
+        .prompt_observed(
+            &session,
+            "hello".into(),
+            Arc::new(NoopSink),
+            WsEvent::AgentUpdate {
+                session_id: session.clone(),
+                kind: AgentUpdateKind::UserInput,
+                data: serde_json::json!({"text":"hello"}),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(harness.0.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn legacy_observation_is_unknown_and_never_holds_completion_or_dispatch() {
     let session = SessionId("unknown-terminal".into());
     let transport = PtyTransport::default();

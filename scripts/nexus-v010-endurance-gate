@@ -266,7 +266,6 @@ log "Building the candidate Nexus CLI with bounded compiler resources"
 docker exec \
   -e CARGO_BUILD_JOBS=2 \
   -e CARGO_TARGET_DIR=/tmp/nexus-target \
-  -e "NEXUS_BUILD_REVISION=$FULL_CANDIDATE" \
   -e PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin \
   "$CONTAINER" bash -c '
     set -euo pipefail
@@ -275,8 +274,12 @@ docker exec \
   '
 docker exec "$CONTAINER" "$NEXUS_BIN" --version \
   > "$OUT/runtime/nexus-version.txt"
-grep -Fq "revision $FULL_CANDIDATE)" "$OUT/runtime/nexus-version.txt" \
-  || die "candidate binary revision does not match $FULL_CANDIDATE"
+VERSION=$(tr -d '\n' < "$ROOT/VERSION")
+test "$(cat "$OUT/runtime/nexus-version.txt")" = "nexus $VERSION" \
+  || die "candidate binary version does not match $VERSION"
+# Source identity was checked against clean HEAD above; associate the resulting
+# executable separately instead of expecting a private revision suffix in --version.
+docker exec "$CONTAINER" sha256sum "$NEXUS_BIN" > "$OUT/runtime/nexus-binary.sha256"
 
 log "Building the Gateway and distributable WebUI from the candidate source"
 docker exec -e NODE_OPTIONS=--max-old-space-size=4096 "$CONTAINER" bash -c '

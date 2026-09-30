@@ -107,127 +107,32 @@ impl AppState {
         &self,
         row: SessionRow,
     ) -> Result<SessionId, nexus_contracts::ContractError> {
-        match revive_route(row.transport.as_deref()) {
+        self.ensure_alive_row_with_native_request(row, None).await
+    }
+
+    /// Forward a captured native request through the selected runtime host, including ID reuse.
+    /// Hosts without this request interface must not silently discard an explicit constraint.
+    pub(crate) async fn ensure_alive_row_with_native_request(
+        &self,
+        row: SessionRow,
+        requested_key: Option<&str>,
+    ) -> Result<SessionId, nexus_contracts::ContractError> {
+        let route = revive_route(row.transport.as_deref());
+        if requested_key.is_some() && route != ReviveRoute::OpenCodePlugin {
+            return Err(NexusError::Invalid(
+                "selected runtime host does not accept this native resume request".into(),
+            )
+            .to_contract_error());
+        }
+        match route {
             ReviveRoute::Acp => self.ensure_live_row(row).await,
             ReviveRoute::Pty => self.ensure_harness_live_row(row).await,
             ReviveRoute::CodexAppServer => self.ensure_codex_appserver_live_row(row).await,
-            ReviveRoute::OpenCodePlugin => self.ensure_opencode_plugin_live_row(row).await,
-        }
-    }
-
-    /// UNIFIED TEARDOWN — best-effort; logs on failure. Dispatch based on `transport`:
-    ///
-    /// - `"acp"` → close the ACP child via `agent_concrete.detach_session`.
-    /// - `"pty"` / `NULL` → kill the tmux harness via [`AppState::kill_harness`].
-    pub async fn teardown_harness(&self, name: &str, project: &str) {
-        use nexus_store::repos::Sessions;
-        let sessions = Sessions::new(&self.store);
-        let row = sessions
-            .find_unique_by_name_any_project(name)
-            .await
-            .ok()
-            .flatten();
-        if let Some(row) = row.as_ref() {
-            self.teardown_harness_row(row).await;
-            return;
-        }
-        match teardown_route(None) {
-            TeardownRoute::Acp => unreachable!("missing rows cannot select ACP teardown"),
-            TeardownRoute::Pty => {
-                self.kill_harness(name, project).await;
+            ReviveRoute::OpenCodePlugin => {
+                self.ensure_opencode_plugin_live_row_with_key(row, requested_key)
+                    .await
             }
         }
-    }
-
-    /// Best-effort teardown for a resolved session row. This is the session-exact backend for
-    /// `admin.remove --kill`; it avoids the older generic `agent.remove(name)` route, which could
-    /// re-resolve a name after the app had already selected the row to remove.
-    pub(crate) async fn teardown_harness_row(&self, row: &SessionRow) {
-        match teardown_route(row.transport.as_deref()) {
-            TeardownRoute::Acp => {
-                if let Some(a) = &self.agent_concrete {
-                    let _ = a.detach_session(&row.session_id, true).await;
-                } else {
-                    // No ACP service to close the child — a leaked headless harness with no log is the
-                    // exact silent-reaper footgun we avoid elsewhere; make the gap observable.
-                    tracing::warn!(name = %row.display_name(), session = %row.session_id, "teardown_harness: agent_concrete absent for acp row — ACP child may leak");
-                }
-            }
-            TeardownRoute::Pty => {
-                self.kill_harness_row(row).await;
-            }
-        }
-    }
-
-    /// Best-effort daemon shutdown sweep for every agent session with an explicit transport record.
-    ///
-    /// Lifecycle stop/restart owns process cleanup at the daemon boundary: close/detach the recorded
-    /// transport, release native sidecar bindings, mark the session offline, and clear the active
-    /// runtime row. Rows without a transport are legacy or externally registered and are left alone
-    /// here; targeted admin remove/delete still handles those paths explicitly.
-    pub async fn teardown_owned_transports_for_shutdown(&self) -> usize {
-        // Quiesce and JOIN delivery loops before closing adapters. Closing an ACP/app-server
-        // channel first wakes the still-running loop with a synthetic contract error and turns a
-        // planned restart into a false DLQ row. The boot recovery boundary owns any attempt left
-        // `injecting` and records the intentionally conservative `delivery_outcome_unknown` state.
-        if let Some(wiring) = &self.loop_wiring {
-            let quiesced = wiring.quiesce_delivery_loops_for_shutdown().await;
-            tracing::info!(
-                quiesced,
-                "daemon shutdown quiesced delivery loops before adapter teardown"
-            );
-        }
-
-        let rows = match Sessions::new(&self.store).list_all().await {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "daemon shutdown transport sweep could not list sessions"
-                );
-                return 0;
-            }
-        };
-
-        let mut torn_down = 0;
-        for row in rows {
-            if !row.is_agent() || row.transport.is_none() {
-                continue;
-            }
-            self.teardown_harness_row(&row).await;
-            if let Some(w) = &self.loop_wiring {
-                w.teardown_session_transports(&row.session_id);
-            }
-            if let Err(error) = self.presence.mark_transport_offline(&row.session_id).await {
-                tracing::warn!(
-                    session = %row.session_id,
-                    name = %row.display_name(),
-                    error = %error,
-                    "daemon shutdown transport sweep could not mark session offline"
-                );
-            }
-            if let Err(error) = self.archive_native_session_for_stop(&row.session_id).await {
-                tracing::warn!(
-                    session = %row.session_id,
-                    name = %row.display_name(),
-                    error = %error,
-                    "daemon shutdown transport sweep could not archive native state"
-                );
-            }
-            if let Err(error) = AgentRuntimes::new(&self.store)
-                .stop(&row.session_id.0)
-                .await
-            {
-                tracing::warn!(
-                    session = %row.session_id,
-                    name = %row.display_name(),
-                    error = %error,
-                    "daemon shutdown transport sweep could not stop runtime row"
-                );
-            }
-            torn_down += 1;
-        }
-        torn_down
     }
 
     /// REVIVE-ON-INTERACTION for headed Codex app-server sessions. Reuses the durable Nexus session
@@ -460,6 +365,15 @@ impl AppState {
         &self,
         row: SessionRow,
     ) -> Result<SessionId, nexus_contracts::ContractError> {
+        self.ensure_opencode_plugin_live_row_with_key(row, None)
+            .await
+    }
+
+    pub(crate) async fn ensure_opencode_plugin_live_row_with_key(
+        &self,
+        row: SessionRow,
+        requested_key: Option<&str>,
+    ) -> Result<SessionId, nexus_contracts::ContractError> {
         let name = row.name.clone().ok_or_else(|| {
             NexusError::Invalid("cannot revive unnamed OpenCode runtime".into()).to_contract_error()
         })?;
@@ -477,36 +391,15 @@ impl AppState {
         // this structured runtime into one launch, then re-check liveness under the gate so the
         // waiter reuses the bridge/viewer pair installed by the owner.
         let _revive = self.runtime_revive_gate.acquire(&session).await;
-        if supervisor.has_opencode_plugin(&session) && supervisor.transport().is_bound(&session) {
-            // Existing hot reuse keeps its best-effort refresh policy and its current model owner.
-            let _ = self
-                .attach_opencode_plugin_session_machinery(&session, &project)
-                .await;
-            return Ok(session);
+        let kind = harness_from_token(row.agent.as_deref());
+        if headed_runtime_kind(&kind) != HeadedRuntimeKind::OpenCodePlugin {
+            return Err(NexusError::Invalid(format!(
+                "cannot revive runtime {session}: harness metadata does not match plugin transport"
+            ))
+            .to_contract_error());
         }
+        let harness = harness_registry_by_id(&kind);
         let reporting_agent = self.capture_model_reporting_agent(&row).await?;
-        let mut model_observation = self.reserve_native_observation(
-            &reporting_agent,
-            &session,
-            nexus_agent::adapter::opencode::native::model_profile(),
-        )?;
-        model_observation.commit(self).await?;
-        let events = self
-            .loop_wiring
-            .as_ref()
-            .map(|w| w.events.clone())
-            .ok_or_else(|| nexus_contracts::ContractError {
-                code: -32004,
-                message: "opencode plugin revive requires loop wiring (events sink)".into(),
-            })?;
-
-        let cwd = row
-            .cwd
-            .clone()
-            .unwrap_or_else(|| default_agent_cwd_for(row.agent_id.as_deref(), &name));
-        ensure_agent_launch_cwd(&cwd, row.cwd.is_none());
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let state_dir = format!("{home}/.nexus");
         let opencode_state = OpenCodeRuntimeStateRepo::new(&self.store)
             .find_by_runtime_id(&session)
             .await
@@ -519,17 +412,42 @@ impl AppState {
         } else {
             None
         };
-        let resume_args: Vec<String> = opencode_state
-            .as_ref()
-            .and_then(|state| state.opencode_session_id.as_deref())
-            .or_else(|| {
-                capsule
+        let resume = self
+            .native_resume_plan_for_row(
+                &row,
+                harness,
+                &reporting_agent,
+                capsule.as_ref(),
+                opencode_state
                     .as_ref()
-                    .and_then(|capsule| capsule.native_resume_key.as_deref())
-            })
-            .filter(|id| !id.is_empty())
-            .map(|id| vec!["-s".to_string(), id.to_string()])
-            .unwrap_or_default();
+                    .and_then(|state| state.opencode_session_id.as_deref()),
+                requested_key,
+            )
+            .await?;
+        if supervisor.has_opencode_plugin(&session)
+            && supervisor.transport().is_harness_alive(&session) == Some(true)
+        {
+            // Validate the requested identity before reuse; retain the existing model owner.
+            let _ = self
+                .attach_opencode_plugin_session_machinery(&session, &project)
+                .await;
+            return Ok(session);
+        }
+        let events = self
+            .loop_wiring
+            .as_ref()
+            .map(|w| w.events.clone())
+            .ok_or_else(|| nexus_contracts::ContractError {
+                code: -32004,
+                message: "plugin revive requires loop wiring (events sink)".into(),
+            })?;
+        let cwd = row
+            .cwd
+            .clone()
+            .unwrap_or_else(|| default_agent_cwd_for(row.agent_id.as_deref(), &name));
+        ensure_agent_launch_cwd(&cwd, row.cwd.is_none());
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let state_dir = format!("{home}/.nexus");
         let viewer_backend = opencode_state
             .as_ref()
             .map(|state| state.viewer_backend.as_str())
@@ -545,6 +463,12 @@ impl AppState {
             pixel_width: 0,
             pixel_height: 0,
         };
+        let mut model_observation = self.reserve_native_observation(
+            &reporting_agent,
+            &session,
+            nexus_agent::adapter::opencode::native::model_profile(),
+        )?;
+        model_observation.commit(self).await?;
         supervisor
             .launch_opencode_plugin(
                 &session,
@@ -556,8 +480,9 @@ impl AppState {
                 size,
                 events,
                 &state_dir,
-                &resume_args,
-                !resume_args.is_empty(),
+                &resume.argv,
+                Some(&resume.native_key),
+                resume.store == nexus_harness_core::NativeResumeStore::OriginalRuntime,
                 viewer_backend,
                 Some(model_observation.reporting()),
             )
@@ -567,7 +492,9 @@ impl AppState {
                 message: format!("opencode native-plugin revive failed: {e}"),
             })?;
 
-        if !supervisor.has_opencode_plugin(&session) || !supervisor.transport().is_bound(&session) {
+        if !supervisor.has_opencode_plugin(&session)
+            || supervisor.transport().is_harness_alive(&session) != Some(true)
+        {
             return Err(nexus_contracts::ContractError {
                 code: -32004,
                 message: format!("timed out rebinding opencode plugin session {session}"),

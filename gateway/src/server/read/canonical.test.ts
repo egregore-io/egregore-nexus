@@ -324,42 +324,90 @@ describe("canonical Gateway REST reads", () => {
     db.close();
   });
 
-  it("projects fleet members and runtimes from Gateway-owned identity state", async () => {
-    const db = createClient({ url: ":memory:" });
-    await migrateGatewayStore(db);
-    await db.batch([
-      `INSERT INTO identities VALUES
-        ('a_ada','ada','alex','lead','admin',
-         '{"project":"default","kind":"agent","currentWork":"shipping"}',1),
-        ('a_blake','blake',NULL,'agent','agent',
-         '{"project":"other","kind":"agent"}',1)`,
-      `INSERT INTO runtime_descriptors (runtime_id,agent_id,session_id,harness,mode,backend,cwd,native_resume_key,status,updated_at) VALUES
-        ('r_old','a_ada','s_old','codex','headless','acp','/old',NULL,'stopped',2),
-        ('r_live','a_ada','s_live','codex','headed','tmux','/work',NULL,'busy',3),
-        ('r_blake','a_blake','s_blake','claude','headless','acp','/work',NULL,'online',4)`,
-    ], "write");
+  it.each(["agent", "local.agent", "external.agent", "trusted.agent"])(
+    "projects coherent fleet harnesses for %s members",
+    async (kind) => {
+      const db = createClient({ url: ":memory:" });
+      await migrateGatewayStore(db);
+      await db.batch([
+        `INSERT INTO identities VALUES
+          ('a_ada','ada','alex','lead','admin',
+           '{"project":"default","kind":"${kind}","currentWork":"shipping"}',1),
+          ('a_blake','blake',NULL,'agent','agent',
+           '{"project":"other","kind":"agent"}',1)`,
+        `INSERT INTO runtime_descriptors (runtime_id,agent_id,session_id,harness,mode,backend,cwd,native_resume_key,status,updated_at) VALUES
+          ('r_old','a_ada','s_old','codex','headless','acp','/old',NULL,'stopped',2),
+          ('r_live','a_ada','s_live','codex','headed','tmux','/work',NULL,'busy',3),
+          ('r_blake','a_blake','s_blake','claude','headless','acp','/work',NULL,'online',4)`,
+      ], "write");
 
-    await expect(canonicalMembers(db, {
-      includeOffline: false,
-      project: "default",
-    })).resolves.toEqual([
-      expect.objectContaining({
-        name: "ada",
-        agentId: "a_ada",
-        sessionId: "s_live",
-        agent: "codex",
-        presence: "busy",
-        currentWork: "shipping",
-      }),
-    ]);
-    await expect(canonicalRuntimes(db, {
-      includeStopped: true,
-      project: "default",
-    })).resolves.toEqual([
-      expect.objectContaining({ runtimeId: "r_live", name: "ada", active: true }),
-      expect.objectContaining({ runtimeId: "r_old", name: "ada", active: false }),
-    ]);
-    db.close();
+      await expect(canonicalMembers(db, {
+        includeOffline: false,
+        project: "default",
+      })).resolves.toEqual([
+        expect.objectContaining({
+          name: "ada",
+          agentId: "a_ada",
+          sessionId: "s_live",
+          agent: "codex",
+          kind,
+          presence: "busy",
+          currentWork: "shipping",
+        }),
+      ]);
+      await expect(canonicalRuntimes(db, {
+        includeStopped: true,
+        project: "default",
+      })).resolves.toEqual([
+        expect.objectContaining({ runtimeId: "r_live", name: "ada", active: true, harness: "codex" }),
+        expect.objectContaining({ runtimeId: "r_old", name: "ada", active: false, harness: "codex" }),
+      ]);
+      db.close();
+    },
+  );
+
+  it("does not invent roster harnesses for non-agents or missing evidence", async () => {
+    const db = createClient({ url: ":memory:" });
+    try {
+      await migrateGatewayStore(db);
+      const cases = [
+        ...["human", "local.human", "external.human", "trusted.human",
+          "app", "local.app", "notification", "local.notification",
+          "remote.agent", "local.agent.extra", "unknown"].map((kind) => ({
+          kind, harness: "codex", expected: undefined,
+        })),
+        { kind: "local.agent", harness: "", expected: undefined },
+        { kind: "local.agent", harness: "unknown", expected: "unknown" },
+      ];
+      for (const [index, value] of cases.entries()) {
+        const id = `a_${index}`;
+        await db.execute({
+          sql: "INSERT INTO identities VALUES (?, ?, NULL, 'agent', 'agent', ?, 1)",
+          args: [id, id, JSON.stringify({ kind: value.kind })],
+        });
+        await db.execute({
+          sql: `INSERT INTO runtime_descriptors
+            (runtime_id, agent_id, session_id, harness, mode, backend, status, updated_at)
+            VALUES (?, ?, ?, ?, 'headed', 'tmux', 'online', 1)`,
+          args: [`r_${index}`, id, `s_${index}`, value.harness],
+        });
+      }
+      await db.execute(`INSERT INTO identities VALUES
+        ('a_absent','absent',NULL,'agent','agent','{"kind":"local.agent"}',1),
+        ('a_default','default',NULL,'agent','agent',
+          '{"kind":"local.agent","defaultHarness":"claude"}',1)`);
+      const members = await canonicalMembers(db, { includeOffline: true });
+      for (const [index, value] of cases.entries()) {
+        const member = members.find((row) => row.agentId === `a_${index}`);
+        expect(member?.kind).toBe(value.kind);
+        if (value.expected === undefined) expect(member).not.toHaveProperty("agent");
+        else expect(member?.agent).toBe(value.expected);
+      }
+      expect(members.find((row) => row.agentId === "a_absent")).not.toHaveProperty("agent");
+      expect(members.find((row) => row.agentId === "a_default")?.agent).toBe("claude");
+    } finally {
+      db.close();
+    }
   });
 
   it("keeps project and display role inside metadata instead of agent.show", async () => {

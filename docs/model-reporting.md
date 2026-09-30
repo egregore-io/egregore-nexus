@@ -52,13 +52,39 @@ that the constructed backend still reports `claude.acp`; the other ACP cases req
 
 ## Usage, context and allowance
 
+Headed OpenCode 1.17.17 now has a source candidate for native assistant-response usage and its
+live UI context calculation. Usage keeps input/output/cache-read/cache-write/reasoning separate
+under `lastResponse`; no total or native turn/reset is inferred. Context sums the same five buckets
+and reads capacity from the exact observed provider/model. Used/remaining percentages and tokens
+are estimates with an explicit live-TUI basis; capacity is native. A bounded ordered observation
+queue preserves cross-message eviction across asynchronous local capacity lookups. The native
+100-message live window includes user rows, handles removals, and does not claim equivalence to
+the differently ordered history hydration path. Foreign roots cannot consume queue bounds; overflow
+revokes reporting without interrupting input. No account-window source exists on this inspected surface.
+
+Headed Claude 2.1.261 now has a separate processed-response usage candidate from the captured root
+transcript. Content-block records share an API message ID; the collector counts that response once,
+independently of earlier model evidence. Partial, explicit abort/error, synthetic, sidechain and
+zeroed-compaction records do not replace usage. Native input/output/cache counters and optional
+thinking remain separate under `lastResponse`, with no computed total or native measurement time.
+These are native processed snapshots, not a guarantee of successful provider-final billing totals.
+Usage does not enable context/allowance: those statusline sources remain unverified until capture can
+preserve the user's effective selected command. Neither new headed source is a rollout claim.
+
 The adapter and public report contracts support separate usage, context and account-allowance
 capabilities/observations. The headed Codex app-server collector now supplies native-session token
 snapshots, last-reported context estimates and passive account-window observations using the pinned
-0.154.0 protocol. Other modes remain unverified/unwired. Unsupported or unknown is not zero, and contract
+0.154.0 protocol. All four ACP adapters now supply explicitly scoped usage and last-reported context
+in the current candidate: Codex/OpenCode last response, Claude last prompt, Hermes resident-session
+cumulative. Their context proxies are mode-specific, not interchangeable measurements. Claude ACP
+capacity may come from a native default/heuristic and is marked estimated; the others preserve the
+supplied native capacity. Headed Hermes additionally samples persisted native session-row counters
+at exact-root gateway hooks; no total is manufactured from the independent breakdowns. These new
+collector changes are source candidates, not an installation or live-provider acceptance claim.
+Coverage varies by category and mode. Unsupported or unknown is not zero, and contract
 support is not a claim that every collector supplies live values.
 Consumers preserve each value's native/derived/estimated basis and timestamp. Usage snapshots retain
-per-turn versus native-session scope and counter/reset identity; repeated cumulative values are
+native-ID turn, last prompt, last response, or native-session scope and counter/reset identity; repeated cumulative values are
 replacements, not amounts to add. Remaining context must never be computed from lifetime token
 totals. Account allowance retains provider/account/window/reset scope, not per-session cost.
 
@@ -112,13 +138,38 @@ or invalid/overflowing snapshots clear retained evidence; native over-limit perc
 clamped. Provisional, disconnected and revoked owners cannot publish. No global account snapshot
 is relabeled as native thread/turn status.
 
+### Claude ACP selected account window
+
+ACP 0.58.1 can forward the SDK rate-limit event in `_meta["_claude/rateLimit"]` once assistant
+usage exists. This is a selected status/window, not a complete account inventory or an initial
+account query. The candidate converts native utilization fractions to percentages and Unix-second
+reset times to milliseconds; five-hour and distinct seven-day bucket identities retain their
+durations. It does not infer account identity, remaining balance, limit, cost, or overage entitlement.
+Only an explicit extension updates quota; one without utilization becomes Unknown rather than
+zero. A changed selected window replaces the earlier one instead of accumulating account windows.
+Repeated identical root/window/duration/reset/measurement tuples retain the earlier observation
+time because native status-only rejections can replay older values. No native measurement timestamp
+is exposed. The backing source is pinned to the bridge's bundled SDK 0.3.205/Claude 2.1.205;
+arbitrary executable overrides and live account-dashboard correspondence remain unverified.
+
+### Headed Hermes session usage
+
+The launch-local hook reads only the exact framework-selected session row in a read-only database
+transaction. Native input, output, cache-read, cache-write and reasoning counters are independent
+session-cumulative fields; they replace previous snapshots, even on decreases. No total, native turn
+ID or reset is synthesized. A native API-call count of zero leaves the fresh-row defaults Unknown;
+missing telemetry columns preserve independent model reporting. The timestamp records the row read,
+not a native API measurement timestamp. Context occupancy/capacity exists inside the native gateway
+footer logic but is not exported by these hooks or rows, and account allowances are absent from this
+surface. Those categories are unsupported here, not zero and not inferred from usage or costs.
+
 Source pins: the 0.154.0 [account protocol](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server-protocol/src/protocol/v2/account.rs)
 and [account processor](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server/src/request_processors/account_processor.rs)
 define the sparse notification and Codex/ChatGPT authentication boundary. Native-shaped fixtures
 exercise the real captured reporter, daemon/store and Gateway socket; they are not
 live account measurements.
 
-### Codex headless ACP context
+### Codex headless ACP context and usage
 
 The pinned `@agentclientprotocol/codex-acp@1.1.2` emits structured `usage_update` notifications
 with its last model sample's `used` tokens and effective context `size`. The captured ACP
@@ -129,11 +180,23 @@ matches the bridge's native rounded `(size - used) / size * 100` display, not th
 No turn/reset/compaction identity or native timestamp is invented from an ordered notification
 that does not supply one. Duplicates and decreases replace the prior sample, never add to it.
 
-This does not enable cumulative token usage or account windows for ACP. The pinned bridge's
-prompt `usage` is built from its **last model sample**, despite generic ACP schema comments
-about cumulative usage. Account windows remain internal to its `/status` text; there is no
+The pinned bridge's prompt `usage` is built from its **last model sample**, despite generic ACP
+schema comments about cumulative usage. It is reported as `scope: lastResponse`, not a whole
+prompt/turn or cumulative session total. Input/output/cache/reasoning and supplied total are
+forwarded unchanged; cache breakdowns must not be added again to the supplied total. There is no
+exported native turn/reset ID, so neither is invented from JSON-RPC request correlation. The
+captured connection, request and native root govern admission; canceled/replaced requests cannot
+publish a late response. Repeated or decreasing samples replace previous observations.
+
+The additive `lastResponse` and `lastPrompt` scope values require coordinated consumer updates:
+older validators reject the complete runtime snapshot on an unknown scope. A new contract value
+does not itself enable another producer. `lastPrompt` is reserved for a native prompt aggregate
+that may include several responses, without pretending the protocol exports a native turn ID.
+
+This does not enable cumulative token usage or account windows for Codex ACP.
+Account windows remain internal to its `/status` text; there is no
 verified structured quota export on this path. Requested command/package overrides do not
-establish additional capabilities. Other harness ACP profiles remain unchanged.
+establish additional capabilities. Other harness category enablement is tracked separately.
 
 ## Reproducible automated gate
 

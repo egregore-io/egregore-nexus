@@ -39,6 +39,9 @@ pub fn remote_command_with_executable(
 }
 
 /// Build a headed client that resumes a stored thread through the app-server.
+///
+/// Remote resume inherits permissions from the app-server thread. Do not inject CLI permission
+/// overrides here: Codex rejects them on this path. Caller-supplied native arguments remain intact.
 pub fn remote_resume_command_with_executable(
     executable: &str,
     endpoint: &str,
@@ -50,7 +53,6 @@ pub fn remote_resume_command_with_executable(
     command.arg("resume");
     command.arg("--remote");
     command.arg(remote_endpoint(endpoint));
-    command.arg("--dangerously-bypass-approvals-and-sandbox");
     command.arg("--dangerously-bypass-hook-trust");
     command.arg("-c");
     command.arg("check_for_update_on_startup=false");

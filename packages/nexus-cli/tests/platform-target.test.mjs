@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { readFileSync } from "node:fs";
 
 import { platformTarget } from "../lib/platform-target.mjs";
 
@@ -21,4 +22,11 @@ for (const [name, environment, expected] of environments) {
 test("unsupported libc and architectures fail closed", () => {
   assert.equal(platformTarget({ platform: "linux", arch: "x64" }), undefined);
   assert.equal(platformTarget({ platform: "win32", arch: "arm64" }), undefined);
+});
+
+test("beta npm manifests explicitly limit installation to Linux and Windows", () => {
+  for (const path of ["../package.json", "../../nexus/package.json"]) {
+    const manifest = JSON.parse(readFileSync(new URL(path, import.meta.url), "utf8"));
+    assert.deepEqual(manifest.os, ["linux", "win32"]);
+  }
 });

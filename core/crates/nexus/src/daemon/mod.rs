@@ -37,6 +37,8 @@ mod source_wake;
 pub mod stream_raw_writer;
 pub mod terminal_socket;
 pub mod transcript_archive;
+#[cfg(windows)]
+mod windows_shutdown;
 
 pub use app::{AppState, WsSink};
 // Keep the pre-v0.1 module/function paths source-compatible while routing internals use the

@@ -638,6 +638,13 @@ pub trait AgentTurnExecutionPort: Send + Sync {
         Vec::new()
     }
 
+    /// This exact backend owns a native operator-input queue. The daemon may dispatch a
+    /// prompt during native work, while retaining per-session command/input serialization.
+    /// Bus delivery and all non-opted-in backends retain boundary admission.
+    fn accepts_prompt_while_busy(&self, _recipient: &SessionId) -> bool {
+        false
+    }
+
     /// Await the adapter's authoritative final-turn boundary for an already active session.
     /// Implementations must use protocol completion, never rendered text or inferred tool counts.
     async fn wait_for_turn_completion(&self, _recipient: &SessionId) -> PortResult<()> {

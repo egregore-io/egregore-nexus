@@ -44,6 +44,9 @@ export interface DaemonPushConnection {
   ready: Promise<void>;
   /** Authenticated daemon boot currently backing this connection. */
   readonly daemonBootId?: string;
+  /** Only independently owned readers may apply socket/parser flow control. */
+  pause?(): void;
+  resume?(): void;
   subscribe(
     subscription: DaemonPushSubscription,
     handlers: {
@@ -93,6 +96,11 @@ export declare function createDaemonPushDeveloperEventSource(
 ): DaemonPushDeveloperEventSource | undefined;
 
 export declare function sharedDaemonPushConnector(): DaemonPushConnection | undefined;
+
+/** Caller owns and must close this isolated, manifest-authenticated connection. */
+export declare function createManifestDaemonPushConnection(deps?: {
+  readManifest?: (path: string) => Promise<string>;
+}): DaemonPushConnection | undefined;
 
 export declare function closeSharedDaemonPushConnector(): void;
 

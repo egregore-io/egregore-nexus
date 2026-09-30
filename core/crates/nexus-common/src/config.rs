@@ -131,16 +131,19 @@ impl Default for Config {
     }
 }
 
-/// Expand a leading `~` to `$HOME` before handing paths to libSQL or local filesystem APIs.
+/// Expand a leading `~` using explicit HOME or the OS user home (USERPROFILE on Windows).
 pub fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
-    }
-    if path == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            return home;
+    if path == "~" || path.starts_with("~/") {
+        let home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(std::env::home_dir);
+        if let Some(home) = home {
+            return if path == "~" {
+                home.to_string_lossy().into_owned()
+            } else {
+                home.join(&path[2..]).to_string_lossy().into_owned()
+            };
         }
     }
     path.to_string()

@@ -88,7 +88,12 @@ async fn wire_real_against_failing_load_fake() -> AppState {
             Arc::new(CodexAdapter::with_command(fake_command_failing_load())) as Arc<dyn Adapter>
         }),
     );
-    AppState::wire_with_registry(store, &Config::default(), registry)
+    let state = AppState::wire_with_registry(store, &Config::default(), registry);
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("real-adapter fixture ingress must finish boot before registration");
+    state
 }
 
 /// Build production daemon wiring with a registry that mints the **real** `CodexAdapter` (real
@@ -109,7 +114,37 @@ async fn wire_real_against_fake() -> AppState {
         Arc::new(|_cwd| Arc::new(CodexAdapter::with_command(fake_command())) as Arc<dyn Adapter>),
     );
 
-    AppState::wire_with_registry(store, &Config::default(), registry)
+    let state = AppState::wire_with_registry(store, &Config::default(), registry);
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("real-adapter fixture ingress must finish boot before launch");
+    state
+}
+
+// On a current-thread runtime the freshly spawned boot task cannot run until
+// the fixture yields. Require the actual ingress barrier to be ready at return,
+// rather than letting a fast background initializer hide missing synchronization.
+async fn assert_fixture_ingress_ready(state: AppState) {
+    let mut ready = Box::pin(state.wait_for_runtime_identity_ready());
+    let first_poll = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(ready.as_mut(), cx))
+    })
+    .await;
+    assert!(
+        matches!(first_poll, std::task::Poll::Ready(Ok(()))),
+        "real-adapter fixture returned before successful ingress readiness: {first_poll:?}"
+    );
+}
+
+#[tokio::test]
+async fn real_adapter_fixture_finishes_boot_before_returning() {
+    assert_fixture_ingress_ready(wire_real_against_fake().await).await;
+}
+
+#[tokio::test]
+async fn failing_load_fixture_finishes_boot_before_returning() {
+    assert_fixture_ingress_ready(wire_real_against_failing_load_fake().await).await;
 }
 
 /// A resolved caller (the daemon resolves identity server-side; here we build it directly for the

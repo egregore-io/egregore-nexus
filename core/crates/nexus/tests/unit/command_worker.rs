@@ -34,6 +34,8 @@ struct PromptDispatchBarrier {
 #[derive(Default)]
 struct FireAndForgetPromptBarrier {
     active: AtomicBool,
+    native_queue: bool,
+    calls: AtomicUsize,
     session: Mutex<Option<SessionId>>,
     prompt_entered: Notify,
     wait_entered: Notify,
@@ -515,6 +517,9 @@ impl AgentTurnExecutionPort for PromptDispatchBarrier {
 
 #[async_trait::async_trait]
 impl AgentTurnExecutionPort for FireAndForgetPromptBarrier {
+    fn accepts_prompt_while_busy(&self, recipient: &SessionId) -> bool {
+        self.native_queue && self.session.lock().unwrap().as_ref() == Some(recipient)
+    }
     async fn inject_turn(&self, _recipient: &SessionId, _batch: &NexusBatch) -> PortResult<()> {
         Ok(())
     }
@@ -528,6 +533,7 @@ impl AgentTurnExecutionPort for FireAndForgetPromptBarrier {
     }
 
     async fn prompt(&self, recipient: &SessionId, _text: String) -> PortResult<()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         *self.session.lock().unwrap() = Some(recipient.clone());
         self.active.store(true, Ordering::SeqCst);
         self.prompt_entered.notify_one();
@@ -978,6 +984,110 @@ async fn harness_prompt_claim_lease_outlives_execution_timeout() {
         HARNESS_PROMPT_LEASE_MS
             > i64::try_from(HARNESS_PROMPT_EXECUTION_TIMEOUT.as_millis()).unwrap(),
         "prompt claim must not expire before the prompt execution timeout fires"
+    );
+}
+
+#[tokio::test]
+async fn native_queue_admission_bypasses_busy_but_not_an_existing_command_actor() {
+    for native_queue in [false, true] {
+        let exec = Arc::new(FireAndForgetPromptBarrier {
+            native_queue,
+            ..Default::default()
+        });
+        let state = test_state_with_turn_exec(exec.clone()).await;
+        let operator = state
+            .identity
+            .register(human_register("Alex Morgan", "ck_operator"))
+            .await
+            .unwrap();
+        let target = state
+            .identity
+            .register(human_register("Target Human", "ck_target"))
+            .await
+            .unwrap();
+        *exec.session.lock().unwrap() = Some(target.session_id.clone());
+        exec.active.store(true, Ordering::SeqCst);
+        let repo = CommandIntents::new(&state.store);
+        repo.insert_pending(prompt_intent(
+            "native_queue_prompt",
+            &operator,
+            "Alex Morgan",
+            "ck_operator",
+            "normal input",
+            1,
+        ))
+        .await
+        .unwrap();
+        assert!(
+            claim_next_harness_prompt(&state, &[target.session_id.0.clone()])
+                .await
+                .unwrap()
+                .is_none(),
+            "one actor per session even for native queues"
+        );
+        let claimed = claim_next_harness_prompt(&state, &[]).await.unwrap();
+        assert_eq!(
+            claimed.is_some(),
+            native_queue,
+            "only the exact opted-in native session bypasses busy"
+        );
+        if let Some(row) = claimed {
+            assert_eq!(row.command_id, "native_queue_prompt");
+        }
+        assert!(
+            exec.active.load(Ordering::SeqCst),
+            "admission does not fabricate native idle"
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_queue_actor_continues_after_acceptance_while_native_work_remains_open() {
+    let exec = Arc::new(FireAndForgetPromptBarrier {
+        native_queue: true,
+        ..Default::default()
+    });
+    let state = test_state_with_turn_exec(exec.clone()).await;
+    let operator = state
+        .identity
+        .register(human_register("Alex Morgan", "ck_operator"))
+        .await
+        .unwrap();
+    let target = state
+        .identity
+        .register(human_register("Target Human", "ck_target"))
+        .await
+        .unwrap();
+    let repo = CommandIntents::new(&state.store);
+    for (id, at) in [("first", 1), ("second", 2)] {
+        repo.insert_pending(prompt_intent(
+            id,
+            &operator,
+            "Alex Morgan",
+            "ck_operator",
+            "native queue",
+            at,
+        ))
+        .await
+        .unwrap();
+    }
+    let row = claim_next_harness_prompt(&state, &[])
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        run_harness_prompt_session_actor(state.clone(), target.session_id.0, row),
+    )
+    .await
+    .unwrap();
+    assert_eq!(exec.calls.load(Ordering::SeqCst), 2);
+    for id in ["first", "second"] {
+        assert_eq!(repo.get(id).await.unwrap().unwrap().status, "done");
+    }
+    assert!(
+        exec.active.load(Ordering::SeqCst),
+        "command completion is not native turn completion"
     );
 }
 

@@ -1,0 +1,34 @@
+{
+  "runtimeId": "s_last_prompt_fixture",
+  "agentId": "a_last_prompt_fixture",
+  "harness": "claude",
+  "presence": "online",
+  "active": true,
+  "startedAt": 10,
+  "modelReport": {
+    "backend": "claude.acp",
+    "observerActive": true,
+    "reportRevision": 2,
+    "configured": {"capability": "supported", "status": "unknown"},
+    "turnSelected": {"capability": "unverified", "status": "unknown"},
+    "responseReported": {"capability": "unverified", "status": "unknown"},
+    "telemetry": {
+      "usage": {
+        "status": "observed",
+        "capability": "supported",
+        "observation": {
+          "metadata": {"nativeSessionId": "native/root", "source": "claude.acp.prompt.usage", "observedAt": 30},
+          "scope": "lastPrompt",
+          "counterId": "claude.acp.prompt.usage",
+          "inputTokens": 120,
+          "outputTokens": 30,
+          "cacheReadTokens": 80,
+          "cacheWriteTokens": 0,
+          "totalTokens": 230
+        }
+      },
+      "context": {"status": "unknown", "capability": "unverified"},
+      "quota": {"status": "unknown", "capability": "unverified"}
+    }
+  }
+}

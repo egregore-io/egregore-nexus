@@ -693,9 +693,31 @@ retried unless an operator explicitly requeues the delivery.
 `POST /agents` (admin spawn):
 
 ```jsonc
-{ "kind": "codex", "name": "dylan", "cwd": "/repo" }
+{
+  "kind": "codex",
+  "name": "dylan",
+  "cwd": "/repo",
+  "headless": true,
+  "initialPrompt": "Review the changes in <var.cwd>."
+}
 // kind required; the rest optional
 ```
+
+The supported request fields are exactly `kind`, `name`, `cwd`, `headless`, and `initialPrompt`.
+`kind` is a harness id; `name`, when supplied, is a nonempty string, and `cwd` is a string.
+`headless` must be a boolean: `true` requests the daemon's headless runner, while `false` requests
+a headed launch. If omitted, the Gateway leaves it absent and the daemon defaults to `false`.
+`initialPrompt` must be a string and is forwarded unchanged, including empty strings and whitespace;
+if omitted, it stays absent. It is the fresh-launch boot prompt template: the daemon expands
+`<var.*>` after allocating identity/runtime and rejects it on resume/reuse paths. The Gateway
+submits one `admin.spawn` command with these options and the authenticated caller, without a
+separate prompt send, launch-mode fallback, or retry. Harness/platform launch support remains the
+daemon's responsibility.
+
+Existing callers supplying only `kind`, `name`, and `cwd` retain their behavior. Older Gateways
+without these launch-option fields reject them; clients must not silently drop them or retry in
+another mode. Unknown keys and invalid field types (including `null`) return HTTP 400 before
+command submission. Authentication and admin authorization are unchanged.
 
 This spawns a runtime. It does not call `agent.create`; the daemon creates or reuses the durable
 identity behind the launch/spawn path. Project and display-role labels are consumer affordances,

@@ -6,9 +6,16 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import inspect
+import ast
+import asyncio
+import json
+import sqlite3
 import sys
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 _PATH = Path(__file__).resolve().parent / "nexus-load-gate"
 _loader = importlib.machinery.SourceFileLoader("nexus_load_gate", str(_PATH))
@@ -58,6 +65,152 @@ class LedgerTests(unittest.TestCase):
         led.record_receipt("m1", "a2", "row1", t=0.2)
         self.assertEqual(led.duplicates(allowed={"m1"}), [])
         self.assertEqual(len(led.duplicates(allowed=set())), 1)
+
+
+class SendPumpProgressTests(unittest.IsolatedAsyncioTestCase):
+    async def assert_pump_progress_during_send(self, target_kind):
+        # Exercise actual run_phases and Consumer._pump without Docker or a daemon.
+        # Only the pump can release the held synchronous CLI call. Its finite wait is
+        # a deadlock watchdog, not the success oracle: success requires a real receipt
+        # while the send is still held, on the event-loop thread.
+        class StopPhase(BaseException):
+            pass
+
+        loop = asyncio.get_running_loop()
+        loop_thread = threading.get_ident()
+        released = threading.Event()
+        held = threading.Event()
+        watchdog_used = []
+        receipt_threads = []
+        send_threads = []
+        consumers = []
+        calls = []
+        target_completed = False
+        real_sleep = asyncio.sleep
+
+        class TrackingLedger(lg.Ledger):
+            def record_receipt(self, *args, **kwargs):
+                super().record_receipt(*args, **kwargs)
+                receipt_threads.append(threading.get_ident())
+                if held.is_set():
+                    released.set()
+
+            def record_send(self, *args, **kwargs):
+                send_threads.append(threading.get_ident())
+                super().record_send(*args, **kwargs)
+
+        async def start_consumer(consumer):
+            consumer.proc = SimpleNamespace(
+                stdout=asyncio.StreamReader(), stderr=asyncio.StreamReader(), returncode=None
+            )
+            consumer.task = asyncio.create_task(consumer._pump())
+            consumer.stderr_task = asyncio.create_task(consumer._pump_stderr())
+            consumers.append(consumer)
+
+        def nexus(actor, *args, **kwargs):
+            nonlocal target_completed
+            if target_completed:
+                raise StopPhase()
+            calls.append((args, kwargs))
+            is_ghost = args[:2] == ("dm", "lgghost")
+            if is_ghost != (target_kind == "ghost"):
+                return ""
+            held.set()
+            batch = {"dms": [{"id": "row-proof", "body": "LG:abcdef: pump proof"}], "threads": []}
+            loop.call_soon_threadsafe(
+                consumers[0].proc.stdout.feed_data, json.dumps(batch).encode() + b"\n"
+            )
+            watchdog_used.append(not released.wait(1.0))
+            held.clear()
+            target_completed = True
+            return ""
+
+        async def yield_only(_delay):
+            await real_sleep(0)
+
+        actors = [lg.Actor("lg01", "key1"), lg.Actor("lg02", "key2")]
+        fleet = lg.Fleet(actors, lg.Actor("lgghost", "ghost"), {"load-a": [a.name for a in actors]})
+        env = SimpleNamespace(host_port="unused", nexus=nexus)
+        args = SimpleNamespace(seed=7, messages=10)
+        rng = lg.random.Random(7)
+        roll = {"ghost": 0.0, "post": 0.0, "dm": 0.8, "publish": 0.95}[target_kind]
+        lane = SimpleNamespace(start=mock.AsyncMock())
+        try:
+            with mock.patch.object(lg, "Ledger", TrackingLedger), \
+                 mock.patch.object(lg.Consumer, "start", start_consumer), \
+                 mock.patch.object(lg, "EventsLane", return_value=lane), \
+                 mock.patch.object(lg.asyncio, "sleep", yield_only), \
+                 mock.patch.object(lg.random, "Random", return_value=rng), \
+                 mock.patch.object(rng, "random", side_effect=[0.9, roll, 0.9, roll]):
+                with self.assertRaises(StopPhase):
+                    await lg.run_phases(env, fleet, lg.Summary(), args)
+        finally:
+            released.set()
+            # A RED run can leave feed_data queued behind the blocked send.
+            await real_sleep(0)
+            for consumer in consumers:
+                consumer.proc.stdout.feed_eof()
+                consumer.proc.stderr.feed_eof()
+            await asyncio.gather(*(task for c in consumers for task in (c.task, c.stderr_task)))
+
+        self.assertEqual(watchdog_used, [False], "listener pump could not progress while CLI send was held")
+        self.assertEqual(receipt_threads, [loop_thread])
+        self.assertTrue(all(kwargs == {"timeout": 35} for _, kwargs in calls))
+        self.assertEqual(len(calls), 1 if target_kind == "ghost" else 4)
+        if target_kind != "ghost":
+            self.assertEqual(calls[-1][0][0], target_kind)
+            self.assertEqual(send_threads, [loop_thread], "ledger must remain event-loop owned")
+
+    async def test_ghost_send_keeps_listener_pump_running(self):
+        await self.assert_pump_progress_during_send("ghost")
+
+    async def test_live_post_keeps_listener_pump_running(self):
+        await self.assert_pump_progress_during_send("post")
+
+    async def test_live_dm_keeps_listener_pump_running(self):
+        await self.assert_pump_progress_during_send("dm")
+
+    async def test_live_publish_keeps_listener_pump_running(self):
+        await self.assert_pump_progress_during_send("publish")
+
+    def test_all_cli_send_phases_await_the_send(self):
+        tree = ast.parse(inspect.getsource(lg.run_phases))
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == "cli_send"]
+        awaited = [node.value for node in ast.walk(tree) if isinstance(node, ast.Await)]
+        self.assertEqual(len(calls), 4, "cover burst, idle, restart, and rename sends")
+        self.assertTrue(all(call in awaited for call in calls))
+
+
+class CompletionTimeoutAuditTests(unittest.TestCase):
+    def test_actual_phase6_query_detects_structured_timeouts_independent_of_reason(self):
+        # Execute the actual audit query, not a second test-only implementation.
+        tree = ast.parse(inspect.getsource(lg.run_phase6_audits))
+        queries = [
+            node.args[0].value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "db_query"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and "turn completion timeout" in node.args[0].value
+        ]
+        self.assertEqual(len(queries), 1)
+        with sqlite3.connect(":memory:") as db:
+            db.execute("CREATE TABLE in_flight(state TEXT, error_code TEXT, error_reason TEXT)")
+            rows = [
+                ("error", "completion_timeout", "harness completion await timed out"),
+                ("error", "completion_timeout", "harness accepted the prompt but model completion was not observed"),
+                ("error", None, "turn completion timeout"),
+                ("error", "contract_error", "different failure"),
+                ("delivered", "completion_timeout", "turn completion timeout"),
+                ("notified", None, None),
+            ]
+            for index, row in enumerate(rows):
+                db.execute("INSERT INTO in_flight VALUES (?, ?, ?)", row)
+                self.assertEqual(db.execute(queries[0]).fetchone()[0], min(index + 1, 3))
 
 
 class ScanLogsTests(unittest.TestCase):
@@ -252,8 +405,8 @@ class ProvisioningTests(unittest.TestCase):
         docker_env = (_PATH.parent / "nexus-docker-test-env").read_text(encoding="utf-8")
 
         self.assertIn(
-            'docker exec --user 0:0 "$NAME" install -d -o "$HOST_UID" -g "$HOST_GID" -m 0700 /tmp/harness-home',
-            docker_env,
+            'docker exec --user 0:0 "${ACTIVE_CONTAINER_ID:-$NAME}" install -d -o "$HOST_UID" -g "$HOST_GID" -m 0700 /tmp/harness-home',
+            " ".join(docker_env.replace("\\\n", " ").split()),
         )
         self.assertLess(
             docker_env.index("ensure_harness_home_owned"),
@@ -263,8 +416,12 @@ class ProvisioningTests(unittest.TestCase):
     def test_docker_environment_reuses_the_only_container_without_an_image_probe(self):
         docker_env = (_PATH.parent / "nexus-docker-test-env").read_text(encoding="utf-8")
 
-        self.assertIn("if ! container_exists; then\n    ensure_image\n  fi", docker_env)
-        self.assertNotIn("  ensure_image\n  if container_exists; then", docker_env)
+        up = docker_env.split("cmd_up() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("if container_exists; then", up)
+        self.assertIn("normal) ACTIVE_CONTAINER_ID=$CONTAINER_ID ;;", up)
+        self.assertIn("else\n    ensure_image\n  fi", up)
+        self.assertEqual(up.count("ensure_image"), 1)
+        self.assertLess(up.index("if container_exists; then"), up.index("ensure_image"))
 
     def test_store_reset_reaps_the_container_and_removes_only_embedded_database(self):
         source = inspect.getsource(lg.Env.reset_state)
@@ -338,6 +495,7 @@ class EnduranceFixtureTests(unittest.TestCase):
         self.assertIn('"$NEXUS_BIN" --version', source)
         self.assertIn('VERSION=$(tr -d', source)
         self.assertIn('test "$(cat "$OUT/runtime/nexus-version.txt")" = "nexus $VERSION"', source)
+        self.assertIn('sha256sum "$NEXUS_BIN" > "$OUT/runtime/nexus-binary.sha256"', source)
         self.assertNotIn('NEXUS_BUILD_REVISION', source)
         self.assertNotIn('revision $FULL_CANDIDATE', source)
 

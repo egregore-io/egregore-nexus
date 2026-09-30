@@ -16,6 +16,7 @@ nexus-transcript = { workspace = true }
 # Pure ACP session/update → tagged StreamEvent transform (the full-stream pass-through).
 nexus-acp-stream = { workspace = true }
 nexus-harness-core = { workspace = true }
+nexus-harness-telemetry = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

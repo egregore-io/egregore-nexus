@@ -1,4 +1,5 @@
 import { createClient, type Client } from "@libsql/client";
+import { collectClosedSqliteHandles } from "../../../test-fixtures/closedSqliteHandles";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -46,7 +47,7 @@ describe("Gateway v0.1.0 store baseline", () => {
       await db.execute("UPDATE runtime_descriptors SET model_report_revision=2");
       await expect(migrateGatewayStore(db)).rejects.toThrow("invalid stored model report/revision pair");
       expect((await db.execute("SELECT model_report_revision FROM runtime_descriptors")).rows[0]?.model_report_revision).toBe(2);
-    } finally { db.close(); rmSync(directory, {recursive:true,force:true}); }
+    } finally { db.close(); await collectClosedSqliteHandles(); rmSync(directory, {recursive:true,force:true}); }
   });
 
   it("adds model report columns to v7 atomically, preserving rows and reopening", async () => {

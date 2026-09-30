@@ -33,6 +33,7 @@ impl Rows {
     }
 
     pub fn next(&self) -> Result<Option<Row>> {
+        let _guard = self.stmt.conn.lock()?;
         let err;
         let err_code;
         let err_msg;
@@ -64,6 +65,7 @@ impl Rows {
     }
 
     pub fn column_type(&self, idx: i32) -> Result<ValueType> {
+        let _guard = self.stmt.conn.lock()?;
         let val = self.stmt.inner.column_type(idx);
         match val {
             libsql_sys::ffi::SQLITE_INTEGER => Ok(ValueType::Integer),
@@ -122,16 +124,19 @@ impl Row {
     where
         T: FromValue,
     {
+        let _guard = self.stmt.conn.lock()?;
         let val = self.stmt.inner.column_value(idx);
         T::from_sql(val)
     }
 
     pub fn get_value(&self, idx: i32) -> Result<Value> {
+        let _guard = self.stmt.conn.lock()?;
         let val = self.stmt.inner.column_value(idx);
         <crate::Value as FromValue>::from_sql(val)
     }
 
     pub fn column_type(&self, idx: i32) -> Result<ValueType> {
+        let _guard = self.stmt.conn.lock()?;
         let val = self.stmt.inner.column_type(idx);
         match val {
             libsql_sys::ffi::SQLITE_INTEGER => Ok(ValueType::Integer),
@@ -148,6 +153,7 @@ impl Row {
     }
 
     pub fn get_ref(&self, idx: i32) -> Result<ValueRef<'_>> {
+        let _guard = self.stmt.conn.lock()?;
         Ok(crate::local::Statement::value_ref(
             &self.stmt.inner,
             idx as usize,

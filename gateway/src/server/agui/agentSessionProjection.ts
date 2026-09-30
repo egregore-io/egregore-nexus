@@ -13,6 +13,7 @@ import {
   acpToAguiEvents,
   closeRun,
   newBracket,
+  withMaterializedBlock,
 } from "@server/agui/mapAgentUpdate";
 import {
   agentSessionThreadId,
@@ -202,17 +203,19 @@ function parseJsonMaybe(text: string): unknown {
 function rowToAgentUpdates(row: MaterializedRow): AgentUpdateEvent[] {
   const content = parseContent(row.contentJson);
   const out: AgentUpdateEvent[] = [];
-  for (const raw of content.blocks ?? []) {
+  for (const [index, raw] of (content.blocks ?? []).entries()) {
     const block = blockObject(raw);
     if (!block) continue;
     for (const ev of eventsForBlock(row, block)) {
-      // Stamp the materialized row's stream anchor so history replay carries the
-      // same streamEventId field the live tail does (consumers dedupe on it).
+      // Retain the materialized row's stream anchor. It is row provenance, not
+      // proof of a distinct live source anchor for every contained block.
       const data = ev.data as Record<string, unknown> | undefined;
       if (data && typeof data === "object" && data.streamEventId === undefined) {
         data.streamEventId = row.firstStreamEventId;
       }
-      out.push(ev);
+      // firstStreamEventId anchors the whole row, not each text block. A stable
+      // row/block discriminator keeps text/tool/text and adjacent text separate.
+      out.push(withMaterializedBlock(ev, row.id, index));
     }
   }
   return out;

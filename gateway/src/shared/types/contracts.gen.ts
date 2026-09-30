@@ -307,6 +307,17 @@ export enum Presence {
 export enum TokenUsageScope {
 	Turn = "turn",
 	SessionCumulative = "sessionCumulative",
+	/**
+	 * Latest native response sample, not a whole prompt or cumulative session total.
+	 * Repeated/decreasing observations replace the prior sample; counter_id is provenance,
+	 * not an instruction to accumulate. A native turn/reset identity is not implied.
+	 */
+	LastResponse = "lastResponse",
+	/**
+	 * Latest completed native prompt's aggregate, potentially containing multiple responses.
+	 * A replaceable sample without an exported native turn ID; never accumulate snapshots.
+	 */
+	LastPrompt = "lastPrompt",
 }
 
 export interface TelemetryModelIdentity {
@@ -661,7 +672,10 @@ export interface CommandQueueEntry {
 	sessionId?: string;
 	text: string;
 	state: CommandQueueState;
-	/** `queue` retains the normal turn boundary; `redirect` uses the adapter strategy. */
+	/**
+	 * `queue` uses normal adapter admission (native queuing where supported);
+	 * `redirect` explicitly uses the adapter's interrupt/steer strategy.
+	 */
 	mode: string;
 	revision: number;
 	seq: number;

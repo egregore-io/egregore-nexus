@@ -5,6 +5,156 @@ use nexus_contracts::AgentUpdateKind;
 use nexus_transcript::ToolCallPhase;
 use serde_json::json;
 
+#[test]
+fn native_telemetry_uses_response_replacements_and_the_live_tui_context_formula() {
+    use nexus_agent::adapter::opencode::telemetry::OpenCodeTelemetry;
+    use nexus_contracts::telemetry::{
+        NativeTelemetryUpdate, NativeTelemetryValue, TokenUsageScope,
+    };
+    let mut collector = OpenCodeTelemetry::default();
+    let base = json!({"id":"msg_b","role":"assistant","sessionID":"root","modelID":"native-model","providerID":"native-provider",
+        "finish":"tool-calls","tokens":{"input":120,"output":30,"reasoning":12,"cache":{"read":80,"write":20}}});
+    for input in [120, 120, 12, 0] {
+        let mut info = base.clone();
+        info["tokens"]["input"] = json!(input);
+        let updates = collector.observe(&info, &json!(1000), "root", 10);
+        assert_eq!(updates.len(), 2);
+        let NativeTelemetryUpdate::Usage {
+            value: NativeTelemetryValue::Observed(usage),
+            ..
+        } = &updates[0]
+        else {
+            panic!("usage")
+        };
+        assert_eq!(usage.scope, TokenUsageScope::LastResponse);
+        assert_eq!(usage.input_tokens.unwrap().get(), input);
+        assert_eq!(usage.cache_write_tokens.unwrap().get(), 20);
+        assert!(
+            usage.total_tokens.is_none()
+                && usage.native_turn_id.is_none()
+                && usage.reset_id.is_none()
+        );
+        let NativeTelemetryUpdate::Context {
+            value: NativeTelemetryValue::Observed(context),
+            ..
+        } = &updates[1]
+        else {
+            panic!("context")
+        };
+        assert_eq!(
+            context.used_tokens.as_ref().unwrap().value.get(),
+            input + 142
+        );
+        assert_eq!(
+            context.used_percent.as_ref().unwrap().value.get(),
+            (((input + 142) as f64 / 1000.0) * 100.0).round()
+        );
+        assert_eq!(
+            context.remaining_tokens.as_ref().unwrap().value.get(),
+            1000 - input - 142
+        );
+        assert_eq!(
+            context
+                .effective_capacity_tokens
+                .as_ref()
+                .unwrap()
+                .provenance,
+            nexus_contracts::telemetry::TelemetryProvenance::Native
+        );
+    }
+    let mut older = base.clone();
+    older["id"] = json!("msg_a");
+    assert!(
+        collector
+            .observe(&older, &json!(1000), "root", 20)
+            .is_empty(),
+        "late older native live-sort ID cannot regress either category"
+    );
+    let mut child = base.clone();
+    child["sessionID"] = json!("child");
+    assert!(collector
+        .observe(&child, &json!(1000), "root", 20)
+        .is_empty());
+}
+
+#[test]
+fn native_telemetry_does_not_measure_constructor_zeros_or_infer_capacity() {
+    use nexus_agent::adapter::opencode::telemetry::OpenCodeTelemetry;
+    use nexus_contracts::telemetry::{NativeTelemetryUpdate, NativeTelemetryValue};
+    let mut collector = OpenCodeTelemetry::default();
+    let mut info = json!({"id":"msg_a","role":"assistant","sessionID":"root",
+        "tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}});
+    assert!(collector.observe(&info, &json!(1000), "root", 1).is_empty());
+    info["finish"] = json!("stop");
+    assert_eq!(
+        collector.observe(&info, &json!(1000), "root", 2).len(),
+        1,
+        "native completed zero usage, but TUI selects output-positive context only"
+    );
+    info["tokens"]["output"] = json!(1200);
+    let values = collector.observe(&info, &json!(1000), "root", 3);
+    let NativeTelemetryUpdate::Context {
+        value: NativeTelemetryValue::Observed(value),
+        ..
+    } = &values[1]
+    else {
+        panic!("context")
+    };
+    assert_eq!(value.used_percent.as_ref().unwrap().value.get(), 120.0);
+    assert!(value.remaining_percent.is_none() && value.remaining_tokens.is_none());
+    let values = collector.observe(&info, &serde_json::Value::Null, "root", 4);
+    let NativeTelemetryUpdate::Context {
+        value: NativeTelemetryValue::Observed(value),
+        ..
+    } = &values[1]
+    else {
+        panic!("context")
+    };
+    assert!(value.effective_capacity_tokens.is_none() && value.used_percent.is_none());
+}
+
+#[test]
+fn native_telemetry_removal_reselects_retained_messages_without_relabeling_root() {
+    use nexus_agent::adapter::opencode::telemetry::OpenCodeTelemetry;
+    use nexus_contracts::telemetry::{NativeTelemetryUpdate, NativeTelemetryValue};
+    let mut collector = OpenCodeTelemetry::default();
+    let mut info = json!({"id":"msg_a","role":"assistant","sessionID":"root","finish":"stop",
+        "tokens":{"input":100,"output":20,"reasoning":0,"cache":{"read":0,"write":0}}});
+    collector.observe(&info, &json!(1000), "root", 10);
+    info["id"] = json!("msg_b");
+    info["tokens"]["input"] = json!(200);
+    collector.observe(&info, &json!(1000), "root", 20);
+    assert!(
+        collector.remove("msg_b", "foreign").is_empty(),
+        "foreign removal cannot relabel or erase retained samples"
+    );
+    let values = collector.remove("msg_b", "root");
+    let NativeTelemetryUpdate::Usage {
+        value: NativeTelemetryValue::Observed(value),
+        ..
+    } = &values[0]
+    else {
+        panic!("fallback retained native row")
+    };
+    assert_eq!(value.input_tokens.unwrap().get(), 100);
+    assert_eq!(value.metadata.observed_at.get(), 10);
+    let values = collector.remove("msg_a", "root");
+    assert!(matches!(
+        &values[0],
+        NativeTelemetryUpdate::Usage {
+            value: NativeTelemetryValue::Unknown,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &values[1],
+        NativeTelemetryUpdate::Context {
+            value: NativeTelemetryValue::Unknown,
+            ..
+        }
+    ));
+}
+
 fn row(seq: i64, event_type: &str, data: serde_json::Value) -> OpenCodeEventRow {
     OpenCodeEventRow {
         seq,
@@ -25,7 +175,19 @@ fn native_selected_model_preserves_exact_assistant_metadata_without_response_pro
         profile.response_reported(),
         ModelEvidenceCapability::Unverified
     );
-    assert!(profile.telemetry().is_none());
+    let telemetry = profile.telemetry().unwrap();
+    assert_eq!(
+        telemetry.usage().capability(),
+        ModelEvidenceCapability::Supported
+    );
+    assert_eq!(
+        telemetry.context().capability(),
+        ModelEvidenceCapability::Supported
+    );
+    assert_eq!(
+        telemetry.quota().capability(),
+        ModelEvidenceCapability::Unsupported
+    );
     let update = selected_model(
         &json!({
             "sessionID": "ses_root", "id": "msg_native", "role": "assistant",

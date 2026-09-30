@@ -4,6 +4,26 @@ import { handleSessionEvents } from "./sessionEvents";
 import { SessionFanoutHub, encodeCursor, type SessionFanoutFrame } from "./sessionFanout";
 
 describe("canonical agent-session events endpoint", () => {
+  it.each([
+    "replay=unknown",
+    "replay=retained",
+    "replay=retained&agentId=a_ada&expectedSessionId=s_foreign",
+    "replay=retained&agentId=a_ada&expectedSessionId=s_ada&afterId=10",
+    "replay=retained&agentId=a_ada&expectedSessionId=s_ada&view=terminal",
+    "replay=retained&agentId=a_ada&agentId=a_foreign&expectedSessionId=s_ada",
+  ])("rejects invalid retained-source options: %s", async (query) => {
+    const response = handleSessionEvents(
+      new Request(`http://localhost/api/v1/agent-sessions/s_ada/events?${query}`),
+      "s_ada",
+      { fanout: preloadedFanout([], "boot-a") },
+    );
+    try {
+      expect(response.status).toBe(400);
+    } finally {
+      await response.body?.cancel();
+    }
+  });
+
   it("serves semantic Nexus SSE from the shared fanout", async () => {
     let emit!: (frame: SessionFanoutFrame) => void;
     const fanout = new SessionFanoutHub((_session, handlers) => {

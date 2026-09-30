@@ -253,6 +253,8 @@ The command reports the active Gateway hook generation, registered `before_send`
 ## Webconsole lifecycle
 
 ```bash
+nexus webconsole install
+nexus webconsole uninstall
 nexus webconsole launch
 nexus webconsole launch --no-open
 nexus webconsole start --host 127.0.0.1 --port 4200
@@ -265,7 +267,13 @@ nexus webconsole stop
 
 `launch` ensures daemon and Gateway health, starts or reuses one Webconsole process, waits for its
 health endpoint, and then opens the browser. `start` performs the same dependency and health work
-without opening a browser. The Webconsole is on demand and is not registered as a login service.
+without opening a browser. By default Webconsole is on demand. Accepting the first interactive
+Nexus background-startup prompt, or running `webconsole install`, registers its per-user login
+service without opening a browser. Explicit installation requires a healthy Gateway service
+(`nexus gateway install`). The service captures PATH and Gateway URL, binds to `127.0.0.1:4200`,
+and is removed with `webconsole uninstall`. Gateway/daemon uninstall removes this dependent
+service first. While registered, start/stop/restart control its supervisor; stop retains the
+login configuration. Uninstall before using custom host/port options.
 
 The default bind is loopback. A non-loopback `--host` prints a warning because Webconsole delegates
 authentication and all data access to its configured Gateway. It never connects to daemon IPC or

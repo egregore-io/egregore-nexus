@@ -25,20 +25,24 @@ impl Statement {
         raw: *mut libsql_sys::ffi::sqlite3,
         sql: &str,
     ) -> Result<Statement> {
-        match unsafe { libsql_sys::prepare_stmt(raw, sql) } {
-            Ok(stmt) => Ok(Statement {
-                conn,
-                inner: Arc::new(stmt),
-                sql: sql.to_string(),
-            }),
-            Err(libsql_sys::Error::LibError(_err)) => Err(Error::SqliteFailure(
-                errors::extended_error_code(raw),
-                errors::error_from_handle(raw),
-            )),
-            Err(err) => Err(Error::Misuse(format!(
-                "Unexpected error while preparing statement: {err}"
-            ))),
-        }
+        let prepared = {
+            let _guard = conn.lock()?;
+            match unsafe { libsql_sys::prepare_stmt(raw, sql) } {
+                Ok(stmt) => Ok(stmt),
+                Err(libsql_sys::Error::LibError(_err)) => Err(Error::SqliteFailure(
+                    errors::extended_error_code(raw),
+                    errors::error_from_handle(raw),
+                )),
+                Err(err) => Err(Error::Misuse(format!(
+                    "Unexpected error while preparing statement: {err}"
+                ))),
+            }
+        };
+        prepared.map(|stmt| Statement {
+            conn,
+            inner: Arc::new(stmt),
+            sql: sql.to_string(),
+        })
     }
 
     pub fn query_map<F, T>(&self, params: &Params, f: F) -> Result<MappedRows<F>>
@@ -51,6 +55,7 @@ impl Statement {
     }
 
     pub fn run(&self, params: &Params) -> Result<()> {
+        let _guard = self.conn.lock()?;
         self.bind(params);
         let err = self.inner.step();
         match err {
@@ -64,6 +69,7 @@ impl Statement {
     }
 
     pub fn query(&self, params: &Params) -> Result<Rows> {
+        let _guard = self.conn.lock()?;
         self.bind(params);
         let err = self.inner.step();
         Ok(Rows::new2(
@@ -122,6 +128,7 @@ impl Statement {
     }
 
     pub fn execute(&self, params: &Params) -> Result<u64> {
+        let _guard = self.conn.lock()?;
         self.bind(params);
         let err = self.inner.step();
         match err {
@@ -223,6 +230,7 @@ impl Statement {
 
     /// Returns true if this statement has rows ready to be read.
     pub(crate) fn step(&self) -> Result<bool> {
+        let _guard = self.conn.lock()?;
         let err = self.inner.step();
         match err {
             crate::ffi::SQLITE_DONE => Ok(false),
@@ -250,15 +258,15 @@ impl Statement {
     /// sure that current statement has already been stepped once before
     /// calling this method.
     pub fn column_names(&self) -> Vec<&str> {
-       let n = self.column_count();
-       let mut cols = Vec::with_capacity(n);
-       for i in 0..n {
-           let s = self.column_name(i);
-           if let Some(s) = s {
-               cols.push(s);
-           }
-       }
-       cols
+        let n = self.column_count();
+        let mut cols = Vec::with_capacity(n);
+        for i in 0..n {
+            let s = self.column_name(i);
+            if let Some(s) = s {
+                cols.push(s);
+            }
+        }
+        cols
     }
 
     /// Return the number of columns in the result set returned by the prepared

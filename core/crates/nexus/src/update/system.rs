@@ -180,6 +180,13 @@ impl UpdatePort for SystemUpdatePort {
                 .await
                 .map(|_| ())
                 .map_err(|error| error.to_string()),
+            ServiceFacet::Webconsole if crate::webconsole_service::installed() => {
+                // The captured running set decides whether this branch is called. Keep
+                // registered services under their manager; never race KeepAlive with a
+                // detached replacement. A stop/start error remains an update failure.
+                crate::webconsole_service::stop()?;
+                crate::webconsole_service::start().await
+            }
             ServiceFacet::Webconsole => crate::webconsole_lifecycle::restart_webconsole(
                 self.webconsole_restore.clone().unwrap_or(
                     crate::webconsole_lifecycle::WebconsoleStartOptions {

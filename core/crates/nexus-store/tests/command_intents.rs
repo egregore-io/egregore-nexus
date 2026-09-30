@@ -148,6 +148,240 @@ async fn concurrent_claimers_have_single_winner_before_lease_expiry() {
     assert_eq!(row.lease_until, Some(5_100));
 }
 
+fn claim_continuity(id: &str) -> NewDeliveryObligation {
+    NewDeliveryObligation {
+        message_id: id.into(),
+        recipient_agent_id: "a_recipient".into(),
+        recipient_runtime_id: Some("s_recipient".into()),
+        payload_json: "{}".into(),
+        dedupe_key: format!("delivery:{id}:a_recipient"),
+        attempt: 0,
+        state: "pending".into(),
+        created_at: 1,
+    }
+}
+
+#[tokio::test]
+async fn split_general_claim_waits_for_identity_owner() {
+    assert_split_claim_waits_for_identity_owner(false).await;
+}
+
+#[tokio::test]
+async fn split_targeted_claim_waits_for_identity_owner() {
+    assert_split_claim_waits_for_identity_owner(true).await;
+}
+
+#[tokio::test]
+async fn unified_claims_work_directly_and_under_existing_worker_gate() {
+    for targeted in [false, true] {
+        for worker_owned in [false, true] {
+            let store = migrated().await;
+            let repo = CommandIntents::new(&store);
+            repo.insert_pending(pending("cmd_unified_gate", 1))
+                .await
+                .unwrap();
+            let _worker_gate = if worker_owned {
+                Some(store.write_lock().lock_owned().await)
+            } else {
+                None
+            };
+            let claimed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                if targeted {
+                    repo.claim_next_ready_harness_command(
+                        100,
+                        5_000,
+                        command_kinds::message_post::SEND,
+                    )
+                    .await
+                } else {
+                    repo.claim_next(100, 5_000).await
+                }
+            })
+            .await
+            .expect("unified claim must not reacquire its worker's gate")
+            .unwrap()
+            .unwrap();
+            assert_eq!(claimed.command_id, "cmd_unified_gate");
+            assert_eq!(claimed.attempts, 1);
+        }
+    }
+}
+
+async fn assert_split_claim_waits_for_identity_owner(targeted: bool) {
+    use std::{sync::Arc, time::Duration};
+    let daemon = DaemonStore::open(":memory:").await.unwrap();
+    let store = Arc::new(daemon.compatibility_store());
+    CommandIntents::new(&store)
+        .insert_pending(pending("cmd_identity_gate", 1))
+        .await
+        .unwrap();
+    let owner = store
+        .begin_identity_write_txn("held_identity_owner")
+        .await
+        .unwrap();
+    let worker_store = store.clone();
+    let mut claim = tokio::spawn(async move {
+        // Match the daemon's existing transport->identity ownership order.
+        let _transport = worker_store.write_lock().lock_owned().await;
+        let repo = CommandIntents::new(&worker_store);
+        if targeted {
+            repo.claim_next_ready_harness_command(100, 5_000, command_kinds::message_post::SEND)
+                .await
+        } else {
+            repo.claim_next(100, 5_000).await
+        }
+    });
+    let premature = tokio::time::timeout(Duration::from_millis(100), &mut claim).await;
+    let completed_while_owned = premature.is_ok();
+    owner
+        .rollback(&nexus_common::NexusError::Store("owner rollback".into()))
+        .await
+        .unwrap();
+    let claimed = match premature {
+        Ok(result) => result,
+        Err(_) => tokio::time::timeout(Duration::from_secs(2), claim)
+            .await
+            .unwrap(),
+    }
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(claimed.command_id, "cmd_identity_gate");
+    assert_eq!(claimed.attempts, 1);
+    assert!(
+        !completed_while_owned,
+        "claim executed inside another identity owner's transaction; targeted={targeted}"
+    );
+    let persisted = CommandIntents::new(&store)
+        .get(&claimed.command_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.status, "claimed");
+    assert_eq!(persisted.attempts, 1);
+    DeliveryObligations::new(&store)
+        .insert(claim_continuity("m_after_claim"))
+        .await
+        .unwrap();
+    assert_eq!(
+        DeliveryObligations::new(&store)
+            .pending()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn held_raw_command_returning_blocks_identity_commit_control() {
+    let daemon = DaemonStore::open(":memory:").await.unwrap();
+    let store = daemon.compatibility_store();
+    CommandIntents::new(&store)
+        .insert_pending(pending("cmd_held_returning", 1))
+        .await
+        .unwrap();
+    let mut rows = store
+        .identity_conn()
+        .query(
+            "UPDATE command_intents SET status='claimed', attempts=attempts+1,
+         revision=revision+1, claimed_at=100, lease_until=5100
+         WHERE command_id='cmd_held_returning' RETURNING command_id",
+            (),
+        )
+        .await
+        .unwrap();
+    let held = rows.next().await.unwrap().unwrap();
+    assert_eq!(held.get::<String>(0).unwrap(), "cmd_held_returning");
+    let error = DeliveryObligations::new(&store)
+        .insert(claim_continuity("m_held_control"))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("cannot commit transaction - SQL statements in progress"),
+        "{error}"
+    );
+    drop(held);
+    drop(rows);
+    // This deliberately raw-held cursor is outside the repository gate contract.
+    // Releasing it, not a retry inside production, makes the next admission safe.
+    DeliveryObligations::new(&store)
+        .insert(claim_continuity("m_released_control"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn split_concurrent_command_claims_and_delivery_admission_commit() {
+    use std::sync::Arc;
+    let daemon = DaemonStore::open(":memory:").await.unwrap();
+    let store = Arc::new(daemon.compatibility_store());
+    for index in 0..400 {
+        let mut command = pending(&format!("cmd_claim_{index:04}"), index);
+        command.request_json = serde_json::json!({"body": "x".repeat(8_192)}).to_string();
+        CommandIntents::new(&store)
+            .insert_pending(command)
+            .await
+            .unwrap();
+    }
+    let barrier = Arc::new(tokio::sync::Barrier::new(4));
+    let mut workers = Vec::new();
+    for lane in 0..4 {
+        let store = store.clone();
+        let barrier = barrier.clone();
+        workers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let mut claimed = Vec::new();
+            let mut errors = Vec::new();
+            for index in 0..200 {
+                tokio::task::yield_now().await;
+                if lane < 2 {
+                    let _transport = store.write_lock().lock_owned().await;
+                    match CommandIntents::new(&store).claim_next(1_000, 5_000).await {
+                        Ok(Some(row)) => claimed.push(row.command_id),
+                        other => errors.push(format!("claim lane={lane} index={index}: {other:?}")),
+                    }
+                } else if let Err(error) = DeliveryObligations::new(&store)
+                    .insert(claim_continuity(&format!("m_admit_{lane}_{index}")))
+                    .await
+                {
+                    errors.push(format!("admission lane={lane} index={index}: {error}"));
+                }
+            }
+            (claimed, errors)
+        }));
+    }
+    let mut all_claims = std::collections::HashSet::new();
+    let mut all_errors = Vec::new();
+    let mut claim_count = 0;
+    for worker in workers {
+        let (claims, errors) = worker.await.unwrap();
+        claim_count += claims.len();
+        all_claims.extend(claims);
+        all_errors.extend(errors);
+    }
+    assert!(
+        all_errors.is_empty(),
+        "real split claim/admission overlap failed: {all_errors:?}"
+    );
+    assert_eq!(claim_count, 400);
+    assert_eq!(
+        all_claims.len(),
+        400,
+        "rollback must not make a claimed command eligible twice"
+    );
+    assert_eq!(
+        DeliveryObligations::new(&store)
+            .pending()
+            .await
+            .unwrap()
+            .len(),
+        400
+    );
+}
+
 #[test]
 fn command_kind_constants_are_the_published_ingress_contract() {
     assert_eq!(command_kinds::message_post::SEND, "message.post.send");
@@ -1612,6 +1846,94 @@ async fn harness_prompt_claim_waits_for_older_durable_delivery_obligation() {
     drop(store);
     drop(daemon);
     let _ = std::fs::remove_file(identity_path);
+}
+
+#[tokio::test]
+async fn native_operator_queue_can_submit_during_older_bus_obligation_without_settling_it() {
+    for actor in [false, true] {
+        let path = std::env::temp_dir().join(format!(
+            "nexus-native-queue-{}-{}-{actor}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let daemon = DaemonStore::open(path.to_str().unwrap()).await.unwrap();
+        let store = daemon.compatibility_store();
+        insert_session_with_agent_id(&store, "s_ada", "ada", "a_ada").await;
+        let repo = CommandIntents::new(&store);
+        repo.insert_pending(prompt_pending("cmd_ada", "ada", 20))
+            .await
+            .unwrap();
+        DeliveryObligations::new(&store)
+            .insert(NewDeliveryObligation {
+                message_id: "m_old".into(),
+                recipient_agent_id: "a_ada".into(),
+                recipient_runtime_id: Some("s_ada".into()),
+                payload_json: "{}".into(),
+                dedupe_key: "m_old:a_ada".into(),
+                attempt: 0,
+                state: "pending".into(),
+                created_at: 10,
+            })
+            .await
+            .unwrap();
+        assert!(repo
+            .claim_next_ready_harness_prompt_with_native_queues(100, 5000, &[], &["foreign".into()])
+            .await
+            .unwrap()
+            .is_none());
+        assert!(repo
+            .claim_next_ready_harness_prompt_with_native_queues(
+                100,
+                5000,
+                &["s_ada".into()],
+                &["s_ada".into()]
+            )
+            .await
+            .unwrap()
+            .is_none());
+        let claimed = if actor {
+            repo.claim_next_ready_harness_prompt_for_session_with_native_queue(
+                100, 5000, "s_ada", true,
+            )
+            .await
+            .unwrap()
+        } else {
+            repo.claim_next_ready_harness_prompt_with_native_queues(
+                100,
+                5000,
+                &[],
+                &["s_ada".into()],
+            )
+            .await
+            .unwrap()
+        };
+        assert_eq!(claimed.unwrap().command_id, "cmd_ada");
+        let mut rows = store
+            .identity_conn()
+            .query(
+                "SELECT state FROM delivery_obligations WHERE message_id = 'm_old'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<String>(0)
+                .unwrap(),
+            "pending"
+        );
+        drop(rows);
+        drop(repo);
+        drop(store);
+        drop(daemon);
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[tokio::test]

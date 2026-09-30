@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
+import { windowsFixtureAcl } from "../../../test-fixtures/windowsTransportAuthority";
 
 import {
   loadTransportManifest,
@@ -16,7 +17,7 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-describe("transport manifest authority", () => {
+describe("transport manifest authority", { timeout: process.platform === "win32" ? 60_000 : 5_000 }, () => {
   it("loads only a contained, owned, immutable manifest and entry", async () => {
     const fixture = await makeFixture();
     const loaded = await loadTransportManifest("fake", { nexusHome: fixture.home });
@@ -46,20 +47,31 @@ describe("transport manifest authority", () => {
       .rejects.toThrow(/unknown/i);
 
     await writeFile(fixture.manifest, manifestText("fake-bridge.mjs"));
-    await chmod(fixture.manifest, 0o622);
+    if (process.platform === "win32") await windowsFixtureAcl(fixture.manifest, "writable");
+    else await chmod(fixture.manifest, 0o622);
     await expect(loadTransportManifest("fake", { nexusHome: fixture.home }))
-      .rejects.toThrow(/writable|mode/i);
+      .rejects.toThrow(/writable|mode|mutation/i);
 
-    await chmod(fixture.manifest, 0o600);
-    await expect(loadTransportManifest("fake", {
-      nexusHome: fixture.home,
-      expectedUid: (process.getuid?.() ?? 1000) + 1,
-    })).rejects.toThrow(/owner/i);
+    if (process.platform === "win32") {
+      await windowsFixtureAcl(fixture.manifest, "secure");
+      await windowsFixtureAcl(fixture.manifest, "wrong-owner");
+      await expect(loadTransportManifest("fake", { nexusHome: fixture.home })).rejects.toThrow(/owner/i);
+      await windowsFixtureAcl(fixture.manifest, "secure");
+    } else {
+      await chmod(fixture.manifest, 0o600);
+      await expect(loadTransportManifest("fake", {
+        nexusHome: fixture.home, expectedUid: (process.getuid?.() ?? 1000) + 1,
+      })).rejects.toThrow(/owner/i);
+    }
 
     await rename(fixture.entry, `${fixture.entry}.real`);
-    await symlink(`${fixture.entry}.real`, fixture.entry);
+    if (process.platform === "win32") {
+      const target = join(fixture.dir, "junction-target");
+      await mkdir(target);
+      await symlink(target, fixture.entry, "junction");
+    } else await symlink(`${fixture.entry}.real`, fixture.entry);
     await expect(loadTransportManifest("fake", { nexusHome: fixture.home }))
-      .rejects.toThrow(/symlink|no-follow/i);
+      .rejects.toThrow(/symlink|no-follow|reparse/i);
   });
 
   it("fails spawn-time revalidation after manifest or entry replacement", async () => {
@@ -68,12 +80,22 @@ describe("transport manifest authority", () => {
 
     await writeFile(`${fixture.entry}.swap`, "#!/usr/bin/env node\nprocess.exit(2);\n", { mode: 0o700 });
     await rename(`${fixture.entry}.swap`, fixture.entry);
+    if (process.platform === "win32") await windowsFixtureAcl(fixture.entry, "secure");
     await expect(revalidateTransportManifest(loaded)).rejects.toThrow(/changed|identity|hash/i);
 
     const loadedAgain = await loadTransportManifest("fake", { nexusHome: fixture.home });
     await writeFile(`${fixture.manifest}.swap`, manifestText("fake-bridge.mjs").replace("hello", "bye"), { mode: 0o600 });
     await rename(`${fixture.manifest}.swap`, fixture.manifest);
+    if (process.platform === "win32") await windowsFixtureAcl(fixture.manifest, "secure");
     await expect(revalidateTransportManifest(loadedAgain)).rejects.toThrow(/changed|identity|hash/i);
+  });
+
+  it("rechecks directory authority before spawn even when both file bodies are unchanged", async () => {
+    const fixture = await makeFixture();
+    const loaded = await loadTransportManifest("fake", { nexusHome: fixture.home });
+    if (process.platform === "win32") await windowsFixtureAcl(fixture.dir, "writable");
+    else await chmod(fixture.dir, 0o722);
+    await expect(revalidateTransportManifest(loaded)).rejects.toThrow(/mutation|writable|mode/i);
   });
 });
 
@@ -90,6 +112,7 @@ async function makeFixture() {
   const manifest = join(dir, "fake.toml");
   await writeFile(entry, "#!/usr/bin/env node\nprocess.exit(0);\n", { mode: 0o700 });
   await writeFile(manifest, manifestText("fake-bridge.mjs"), { mode: 0o600 });
+  if (process.platform === "win32") await windowsFixtureAcl(home, "secure-tree");
   return { home, dir, entry, manifest };
 }
 

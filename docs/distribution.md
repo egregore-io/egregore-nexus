@@ -2,7 +2,7 @@
 
 [← Nexus docs](README.md)
 
-Nexus 0.1.5 has three runtime facets and three public npm entry packages. Cargo crates, npm
+Nexus 0.1.6-beta.5 has three runtime facets and three public npm entry packages. Cargo crates, npm
 packages, native binaries, and release evidence all use that one canonical version.
 
 ## Artifact map
@@ -14,7 +14,8 @@ packages, native binaries, and release evidence all use that one canonical versi
 | Gateway + WebUI | npm `@egregore/nexus-gateway` | `nexus`, `nexus-gateway`, `nexus-webui` | CLI/daemon plus REST, WebSocket, MCP, AG-UI, history, search, edge auth, browser UI |
 
 The npm CLI never compiles Rust. One `@egregore/nexus-cli` tarball contains the prebuilt binaries
-for Linux x64/arm64 glibc, macOS x64/arm64, Windows x64, and WSL. Its launcher selects the matching
+for Linux x64/arm64 glibc, Windows x64, and WSL. macOS is unsupported in beta.5.
+Its launcher selects the matching
 file locally. An explicit `NEXUS_NATIVE_BIN` takes precedence; Cargo-installed binaries remain a
 fallback. When no matching binary exists, the launcher prints an actionable installation error.
 
@@ -71,10 +72,24 @@ the Gateway service after daemon health succeeds. It never downloads a missing f
 `nexus gateway install` ensures the daemon service and registers an independently supervised
 Gateway with dependency ordering and restart-on-failure. `nexus gateway start` never installs
 software. If the Gateway executable is missing, it returns a precise error naming
-`@egregore/nexus-gateway`. Gateway restart affects the Gateway only; daemon lifecycle remains an
-explicit operator action.
+`@egregore/nexus-gateway`. Registered Gateway start/stop/restart commands use its native service
+manager; they do not fall back to a detached process when the manager fails.
 
-Webconsole is on demand rather than a login service. `nexus webconsole launch` starts or reuses it,
+On Linux, an atomic `nexus daemon restart` also restarts its running Gateway and Webconsole
+dependents; `nexus gateway restart` restarts a running Webconsole without restarting the daemon.
+Explicitly stopped dependents stay stopped. This uses systemd `PartOf` restart propagation, not
+reverse start dependencies: a separate stop followed by start leaves stopped dependents stopped.
+This restart-chain guarantee is Linux-specific, not a macOS/Windows login or recovery guarantee.
+
+The first interactive operator invocation offers one remembered prompt to run every installed
+component now and at login. It never downloads missing packages or opens a browser. Scripts,
+agent sessions, help/version, JSON/quiet and CI invocations skip this prompt.
+
+Webconsole can be registered as a login service with `nexus webconsole install`, or through that
+first-run prompt. Explicit installation requires a healthy Gateway service and captures its URL
+and the current PATH. `nexus webconsole uninstall` removes this registration; Gateway/daemon
+uninstall removes the dependent Webconsole service first. Without registration it remains on demand.
+`nexus webconsole launch` starts or reuses it,
 waits for daemon and Gateway health, and opens the browser. `--no-open` is available for remote and
 headless hosts. Non-loopback binding is explicit and emits a security warning.
 
@@ -101,9 +116,8 @@ operator can inspect the structured receipt under the Nexus home after completio
 
 ## Platform matrix
 
-The initial release hardens Linux and Windows/WSL. macOS artifacts remain part of the complete npm
-package and must pass native compilation, launcher selection, and command smoke, but macOS live
-harness behavior is experimental until it has equivalent real-machine evidence.
+The beta.5 release targets Linux and Windows/WSL. macOS artifacts are not included;
+npm platform declarations reject macOS installation rather than using stale binaries.
 
 | Platform | Native CLI/daemon | Gateway/WebUI | Headed harness note |
 |---|---:|---:|---|
@@ -111,8 +125,8 @@ harness behavior is experimental until it has equivalent real-machine evidence.
 | Linux arm64 | Release baseline | Release baseline | native build, tests, packaging, and command smoke; provider binaries remain external |
 | Windows x64 | Release baseline | Release baseline | named-pipe IPC/projection/attach, Task Scheduler lifecycle, native package and Gateway gates |
 | WSL | Release baseline | Release baseline | Linux package plus stable-identity and systemd handoff gates |
-| macOS x64 | Experimental | Experimental | packaged and command-smoked; live harness behavior is not release-blocking |
-| macOS arm64 | Experimental | Experimental | packaged and command-smoked; live harness behavior is not release-blocking |
+| macOS x64 | Unsupported in beta.5 | Not offered by this install | deferred |
+| macOS arm64 | Unsupported in beta.5 | Not offered by this install | deferred |
 
 Harness executables are external prerequisites. Nexus adapter support is maintained separately per
 harness but released and documented uniformly.

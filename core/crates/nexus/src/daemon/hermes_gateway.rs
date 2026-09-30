@@ -18,7 +18,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nexus_agent::adapter::hermes::skill::install_bus_skill_in_home;
+use nexus_agent::adapter::hermes::{native, skill::install_bus_skill_in_home};
 use nexus_common::NexusError;
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::EventSink;
@@ -77,11 +77,8 @@ pub fn write_hermes_gateway_profile(profile: &HermesGatewayProfile) -> Result<()
         "name: nexus-model\nevents: [agent:start, agent:end, 'session:compress']\n",
     )
     .map_err(|e| NexusError::Store(format!("write native model manifest: {e}")))?;
-    fs::write(
-        hook.join("handler.py"),
-        nexus_agent::adapter::hermes::native::MODEL_HOOK_SOURCE,
-    )
-    .map_err(|e| NexusError::Store(format!("write native model hook: {e}")))?;
+    fs::write(hook.join("handler.py"), native::MODEL_HOOK_SOURCE)
+        .map_err(|e| NexusError::Store(format!("write native model hook: {e}")))?;
     Ok(())
 }
 
@@ -252,6 +249,10 @@ impl ModelCapture {
             if !self.reporting.sink().observe(update) {
                 return Err(());
             }
+            self.publish_usage(
+                root,
+                nexus_contracts::telemetry::NativeTelemetryValue::Unknown,
+            )?;
             self.observed = false;
             return Ok(true);
         }
@@ -259,11 +260,8 @@ impl ModelCapture {
         if frame["row"]["id"] == root && !frame["row"]["ended_at"].is_null() {
             return Err(());
         }
-        let Some(update) = nexus_agent::adapter::hermes::native::configured_model(
-            &frame["row"],
-            root,
-            nexus_common::now(),
-        ) else {
+        let Some(update) = native::configured_model(&frame["row"], root, nexus_common::now())
+        else {
             return Ok(false);
         };
         let observed = matches!(
@@ -273,8 +271,36 @@ impl ModelCapture {
         if !self.reporting.sink().observe(update) {
             return Err(());
         }
+        if let Some(nexus_contracts::telemetry::NativeTelemetryUpdate::Usage { value, .. }) =
+            native::session_usage(&frame["row"], root, nexus_common::now())
+        {
+            self.publish_usage(root, value)?;
+        }
         self.observed = observed;
         Ok(true)
+    }
+
+    fn publish_usage(
+        &self,
+        root: &str,
+        value: nexus_contracts::telemetry::NativeTelemetryValue<
+            nexus_contracts::telemetry::TokenUsageObservation,
+        >,
+    ) -> Result<(), ()> {
+        let Some(capability) = self.reporting.profile().telemetry().map(|p| p.usage()) else {
+            return Ok(());
+        };
+        if capability.capability() != nexus_contracts::ModelEvidenceCapability::Supported {
+            return Ok(());
+        }
+        self.reporting
+            .sink()
+            .observe_telemetry(nexus_contracts::telemetry::NativeTelemetryUpdate::Usage {
+                native_session_id: root.into(),
+                value,
+            })
+            .then_some(())
+            .ok_or(())
     }
 }
 

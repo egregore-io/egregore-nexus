@@ -46,6 +46,7 @@ impl CodexAdapter {
     /// Configured model evidence from the adapter's ACP metadata surface. This does not
     /// advertise per-turn/response model selection, cumulative token usage or account windows.
     /// Context is the bridge's structured last-reported usage_update, not headed TUI telemetry.
+    /// Usage is the 1.1.2 bridge's lastTokenUsage prompt result, not the whole prompt's total.
     pub fn model_reporting_profile() -> nexus_agent::adapter::AdapterModelReportingProfile {
         use nexus_agent::adapter::{AcpModelMetadataDialect, AdapterModelReportingProfile};
         use nexus_contracts::{
@@ -60,23 +61,29 @@ impl CodexAdapter {
             AcpModelMetadataDialect::ConfigOptions { source },
         )
         .expect("builtin ACP reporting profile is valid")
-        .with_telemetry(nexus_agent::adapter::AdapterTelemetryReportingProfile::new(
-            nexus_agent::adapter::AdapterTelemetryCapability::new(
-                ModelEvidenceCapability::Unverified,
-                None,
+        .with_telemetry(
+            nexus_agent::adapter::AdapterTelemetryReportingProfile::new(
+                nexus_agent::adapter::AdapterTelemetryCapability::new(
+                    ModelEvidenceCapability::Supported,
+                    Some(ModelObservationSource::new("codex.acp.prompt.usage").unwrap()),
+                )
+                .unwrap(),
+                nexus_agent::adapter::AdapterTelemetryCapability::new(
+                    ModelEvidenceCapability::Supported,
+                    Some(ModelObservationSource::new("codex.acp.usage_update").unwrap()),
+                )
+                .unwrap(),
+                nexus_agent::adapter::AdapterTelemetryCapability::new(
+                    // Pinned 1.1.2 keeps account/rateLimits internally. Its _meta.quota
+                    // contains response tokens, not structured account windows.
+                    ModelEvidenceCapability::Unsupported,
+                    None,
+                )
+                .unwrap(),
             )
-            .unwrap(),
-            nexus_agent::adapter::AdapterTelemetryCapability::new(
-                ModelEvidenceCapability::Supported,
-                Some(ModelObservationSource::new("codex.acp.usage_update").unwrap()),
-            )
-            .unwrap(),
-            nexus_agent::adapter::AdapterTelemetryCapability::new(
-                ModelEvidenceCapability::Unverified,
-                None,
-            )
-            .unwrap(),
-        ))
+            .with_prompt_usage(nexus_agent::adapter::AcpPromptUsageScope::LastResponse)
+            .expect("builtin Codex ACP latest-response usage has a captured source"),
+        )
     }
 
     /// Construct a Codex adapter that will spawn the **real** Codex ACP bridge for the given

@@ -1,6 +1,107 @@
 # Changelog
 
-## [0.1.6-beta.4] - Unreleased
+## [0.1.6-beta.5] - Unreleased
+
+### Changed
+
+- Preserve mode-specific usage/context for all four ACP adapters and exact-session-row usage for
+  headed Hermes, plus headed OpenCode response/live-context samples and Claude transcript response
+  usage; add distinct last-response/last-prompt wire scopes without invented native turn
+  or reset IDs. Context proxies retain their native or estimated capacity and explicit basis.
+  Older telemetry consumers require a coordinated update before these new scopes are deployed.
+- Limit the beta.5 npm release to Linux x64/arm64 and Windows x64; macOS is deferred and
+  rejected by the native package platform declaration rather than receiving stale artifacts.
+- Offer a one-time interactive operator prompt to run installed daemon, Gateway and Webconsole
+  services now and at login. Remember consent, exclude automated/agent commands, and add explicit
+  Webconsole service install/uninstall without opening a browser or downloading packages.
+- Route registered Gateway lifecycle through its supervisor, propagate explicit manager failures,
+  and preserve running-dependent restart behavior on Linux without starting deliberately stopped
+  dependents. Restore registered Webconsole through its manager during updates.
+
+### Fixed
+
+- Restore accepted, unattempted deliveries by stable recipient after restart even when an
+  external agent has no live runtime capsule, without inventing registration or liveness.
+  Preserve original delivery timing, retire expired obligations, and project committed timeout
+  outcomes to Gateway. Explicit dead-letter requeue restores durable continuity; failed atomic
+  cleanup quarantines the local connection instead of allowing ambiguous reuse.
+- Keep an explicitly configured named stream database attached only to the split transport
+  authority, preventing an attached-file lock cycle between identity activation and delivery
+  acknowledgement. Anonymous defaults and legacy single-store named streams are unchanged.
+- Join Gateway transport children and outstanding authority/log work before shutdown returns,
+  preventing late bridge callbacks from accessing a closed store. Preserve shutdown errors and
+  serialize a new start behind an in-progress stop, including when initial loading is still pending.
+- Preserve connection-local SQLite diagnostics across concurrent operations on shared
+  libSQL handles, including deferred row stepping. The local driver now holds the native
+  serialized connection mutex through error copying and affected-row observation.
+
+- Forward native input acceptance through the headed OpenCode wrapper instead of
+  publishing its confirmation after turn completion. This prevents a second user
+  bubble after the reply without suppressing intentional repeated messages.
+- Restore stopped launch-local OpenCode runtimes through actual revival instead of returning
+  an offline owner as success. Keep native resume grammar, exact-key reconciliation and
+  accepted-ready capsule selection in the owning harness behind shared lifecycle contracts.
+  Preserve the original runtime/conversation, reject missing or conflicting identity before
+  hot reuse or launch, and persist fresh native IDs for the next daemon boot. Installation
+  and live recovery remain separate from source validation.
+- Keep ordinary/admin launch dispatch outside the large general RPC router's async poll
+  frame, preventing the observed command-worker stack overflow during cold OpenCode revival.
+  Launch remains awaited with the same caller, error mapping and cancellation lifetime;
+  no worker-stack increase or detached operation is introduced.
+
+- Stabilize source-anchored Gateway fallback message IDs and
+  identify their generated origin explicitly; mark whole tool argument values as replacements
+  for paired consumers. Preserve native plugin tool-call IDs/error text and remove fabricated
+  tool-activity thinking prose. Correlate persisted native input IDs with one pre-reply canonical
+  echo, keep plugin-backed display single-source, and pin inline MCP configuration to captured
+  launch identity. Compatible Lens versions preserve reasoning, exact-bound rename metadata and
+  missing-result tool state. Previously saved duplicate aliases are not repaired automatically;
+  these changes require matching producer and consumer versions.
+
+- Retain messages for busy agents when interruption is unavailable or refused; deliver the
+  unsubmitted batch at the next boundary, including after the original turn fails or times out.
+  No automatic replies or extra model calls are added.
+- Enable the raw-PTY terminal client on Windows with named-pipe authentication, console-mode
+  restoration and resize polling that continues under active output. Skip known foreign executable
+  formats when resolving OpenCode, including Windows binaries exposed through WSL's PATH.
+  Include available screen diagnostics when an OpenCode raw viewer fails before readiness.
+- Resolve default Windows paths without requiring a Unix `HOME` variable. Stop/restart detached
+  Windows daemons through boot-authenticated, exact-PID local shutdown and the existing graceful
+  drain; reserve forced termination for explicit `--force` and pin the process handle while waiting.
+  Installed Windows services cancel the task before draining a surviving daemon child, preventing
+  restart/uninstall from reporting success while the old daemon remains alive. Registration uses
+  the valid one-minute minimum failure-restart interval and a bounded 30-second installation budget;
+  other service commands retain their five-second budget.
+- Prevent detached Windows processes from inheriting their caller's captured standard pipes
+  alongside configured log handles, so a returned CLI does not leave output readers hanging.
+- Confirm Windows daemon startup through live PID and authenticated IPC before reporting success;
+  retain scheduled-task startup errors in `daemon.log` without discarding the native exit status.
+- Give Windows Task Scheduler startup a separate bounded 60-second readiness allowance so a
+  delayed action is not rejected by the direct-child 15-second limit; retain positive IPC checks
+  without adding CLI launch retries.
+- Forward Lens agent-launch mode and initial prompt through the strict Gateway launch API to the
+  existing daemon command. Preserve caller authorization and exact submitted prompt text without
+  fallback or duplicate submission; requires matching Gateway and Lens updates.
+- Allow exact-session recording replay directly from the daemon's retained current-boot agent
+  lane instead of the Gateway's 512-frame live fanout. Verify the original saved anchor, isolate
+  reader backpressure, and retry transport failures without inventing durable history or resetting
+  checkpoints. Missing anchors and changed daemon boots remain explicit gaps.
+- Prevent headed launch/rebind from overflowing the daemon worker stack in debug builds by
+  heap-pinning the shared router's internal future; retain the same command and ownership checks.
+- Recover lost plugin prompt and direct redirect acknowledgements by inspecting the original
+  caller-owned command ID. Preserve uncertainty across reconnects without replaying attempted input;
+  distinguish daemon admission from native receipt and completion.
+- Submit headed Claude operator prompts to its native input queue while work is active. Serialize
+  explicit interrupt-and-send through the captured input owner; settle on an exact native submit
+  receipt rather than requiring the previous Stop hook. Retain uncertainty after unproven writes.
+- Validate Windows transport ownership and mutation permissions through native SID/DACL and
+  no-reparse file evidence, rechecked immediately before literal process launch. Preserve the
+  existing POSIX permission policy and prevent bridge startup after host shutdown during loading.
+- Stop Unix daemons without requiring an external `kill` executable in minimal containers.
+- Protect Windows continuity snapshot artifacts with current-user ACLs and avoid unsupported
+  directory fsync; retain file-content flushing and explicit Windows durability limits.
+
+## [0.1.6-beta.4]
 
 ### Changed
 
@@ -50,6 +151,10 @@
 
 ### Fixed
 
+- Preserve harness identity in Gateway member reads for canonical dotted agent kinds such as
+  `local.agent`, preventing known Codex agents from appearing as Other / NX in roster consumers.
+- Stop injecting the permission-bypass CLI flag into Codex remote resume, which rejects permission
+  overrides. Existing app-server thread policy and fresh-launch arguments remain unchanged.
 - Reject obsolete full runtime projections carrying older model-report revisions, preventing
   delayed online snapshots from reviving stopped status while retaining newer model evidence.
   Equal-revision same-owner status updates and legacy report-absent frames remain compatible.

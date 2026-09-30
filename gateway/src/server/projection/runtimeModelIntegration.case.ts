@@ -79,19 +79,91 @@ for (const mode of ["headless", "headed"] as const) for (const harness of ["clau
         expect(body.modelReport.telemetry?.quota.observation).not.toHaveProperty("accountId");
       }
     }
-    if (harness === "codex" && mode === "headless") {
-      for (const body of [fresh, newer]) {
+    if (harness === "opencode" && mode === "headed") {
+      for (const body of [fresh, newer, stopped]) {
+        expect(body.modelReport.telemetry?.usage.observation).toMatchObject({
+          metadata: {source: "opencode.plugin.assistant.usage", nativeSessionId: "ses_exact"},
+          scope: "lastResponse", counterId: "opencode.plugin.assistant.usage",
+          inputTokens: 40000, outputTokens: 1000, reasoningTokens: 100, cacheReadTokens: 800, cacheWriteTokens: 100,
+        });
+        for (const key of ["totalTokens", "nativeTurnId", "resetId", "model"]) expect(body.modelReport.telemetry?.usage.observation).not.toHaveProperty(key);
         expect(body.modelReport.telemetry?.context.observation).toMatchObject({
-          metadata: {source: "codex.acp.usage_update", nativeSessionId: "fixture-root"},
+          metadata: {source: "opencode.plugin.assistant.context"},
           effectiveCapacityTokens: {value: 200000, provenance: "native"},
           usedTokens: {value: 42000, provenance: "estimated"},
           remainingTokens: {value: 158000, provenance: "estimated"},
+          remainingPercent: {value: 79, provenance: "estimated", basis: "opencode.1.17.17:live-tui-last-assistant-token-sum"},
+        });
+        expect(body.modelReport.telemetry?.quota.capability).toBe("unsupported");
+      }
+    }
+    if (harness === "claude" && mode === "headed") {
+      for (const body of [fresh, newer, stopped]) {
+        expect(body.modelReport.telemetry?.usage.observation).toMatchObject({
+          metadata: {source: "claude.transcript.assistant.usage", nativeSessionId: "native"},
+          scope: "lastResponse", counterId: "claude.transcript.assistant.usage",
+          inputTokens: 120, outputTokens: 30, cacheReadTokens: 80, cacheWriteTokens: 20, reasoningTokens: 12,
+        });
+        for (const key of ["totalTokens", "nativeTurnId", "resetId", "model"]) expect(body.modelReport.telemetry?.usage.observation).not.toHaveProperty(key);
+        expect(body.modelReport.telemetry?.usage.observation?.metadata).not.toHaveProperty("nativeReportedAt");
+        expect(body.modelReport.telemetry?.context.capability).toBe("unverified");
+        expect(body.modelReport.telemetry?.quota.capability).toBe("unverified");
+      }
+    }
+    if (harness === "hermes" && mode === "headed") {
+      for (const body of [fresh, newer, stopped]) {
+        expect(body.modelReport.telemetry?.usage.observation).toMatchObject({
+          metadata: {source: "hermes.gateway.session.usage", nativeSessionId: "native-root"},
+          scope: "sessionCumulative", counterId: "hermes.gateway.session.usage",
+          inputTokens: 120, outputTokens: 30, cacheReadTokens: 80, cacheWriteTokens: 20, reasoningTokens: 12,
+        });
+        for (const field of ["totalTokens", "resetId", "nativeTurnId", "model"]) {
+          expect(body.modelReport.telemetry?.usage.observation).not.toHaveProperty(field);
+        }
+        expect(body.modelReport.telemetry?.context.capability).toBe("unsupported");
+        expect(body.modelReport.telemetry?.quota.capability).toBe("unsupported");
+      }
+    }
+    if (mode === "headless") {
+      for (const body of [fresh, newer]) {
+        expect(body.modelReport.telemetry?.context.observation).toMatchObject({
+          metadata: {source: `${harness}.acp.usage_update`, nativeSessionId: "fixture-root"},
+          effectiveCapacityTokens: {value: 200000, provenance: harness === "claude" ? "estimated" : "native"},
+          usedTokens: {value: 42000, provenance: "estimated"},
+          remainingTokens: {value: 158000, provenance: "estimated"},
           remainingPercent: {value: 79, provenance: "estimated",
-            basis: "acp.usage_update:last-reported-context-ratio"},
+            basis: ({claude: "claude.acp.0.58.1:assistant-token-proxy-or-compaction-fallback",
+              codex: "acp.usage_update:last-reported-context-ratio",
+              opencode: "opencode.acp.1.17.17:last-assistant-input-and-cache-read",
+              hermes: "hermes.acp.0.17.0:rough-request-or-last-prompt-fallback"} as Record<string,string>)[harness]},
         });
         expect(body.modelReport.telemetry?.context.observation).not.toHaveProperty("resetId");
-        expect(body.modelReport.telemetry?.usage.observation).toBeUndefined();
-        expect(body.modelReport.telemetry?.quota.observation).toBeUndefined();
+        expect(body.modelReport.telemetry?.usage.observation).toMatchObject({
+          metadata: {source: `${harness}.acp.prompt.usage`, nativeSessionId: "fixture-root"},
+          scope: harness === "claude" ? "lastPrompt" : harness === "hermes" ? "sessionCumulative" : "lastResponse",
+          counterId: `${harness}.acp.prompt.usage`,
+          inputTokens: harness === "hermes" ? 200 : 120, outputTokens: 30, cacheReadTokens: 80,
+          totalTokens: harness === "opencode" ? 262 : 230,
+        });
+        for (const key of ["nativeTurnId", "resetId", "model"]) {
+          expect(body.modelReport.telemetry?.usage.observation).not.toHaveProperty(key);
+        }
+        const usage = body.modelReport.telemetry?.usage.observation;
+        if (harness === "claude") {
+          expect(usage).toMatchObject({cacheWriteTokens: 0});
+          expect(usage).not.toHaveProperty("reasoningTokens");
+          expect(body.modelReport.telemetry?.quota.observation).toMatchObject({
+            providerId: "anthropic", metadata: {source: "claude.acp.rate_limit.selected"},
+            windows: [{windowId: "claude/five_hour", units: "percent", usedPercent: 75,
+              windowSeconds: 18000, resetsAt: 1800000000000}],
+          });
+          expect(body.modelReport.telemetry?.quota.observation).not.toHaveProperty("accountId");
+        } else {
+          expect(usage).toMatchObject({reasoningTokens: 12});
+          if (harness === "opencode") expect(usage).toMatchObject({cacheWriteTokens: 20});
+          else expect(usage).not.toHaveProperty("cacheWriteTokens");
+        }
+        if (harness !== "claude") expect(body.modelReport.telemetry?.quota.observation).toBeUndefined();
       }
     }
     const bodies = [newer, fresh, stopped, fresh];

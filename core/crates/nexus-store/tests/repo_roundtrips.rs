@@ -1935,6 +1935,216 @@ mod inbox {
         );
     }
 
+    async fn split_ttl_fixture() -> Store {
+        use nexus_store::repos::{DeliveryObligations, NewDeliveryObligation};
+
+        let daemon = nexus_store::DaemonStore::open(":memory:").await.unwrap();
+        let store = daemon.compatibility_store();
+        for (id, created_at) in [
+            ("m_ttl_shared", 1),
+            ("m_ttl_fallback", 1),
+            ("m_ttl_fresh", 9_500),
+        ] {
+            let mut message = msg(id, "TTL exact-recipient control");
+            message.created_at = created_at;
+            Messages::new(&store).insert(&message).await.unwrap();
+        }
+        for (message_id, agent, runtime) in [
+            ("m_ttl_shared", "a_expire", "s_expire"),
+            ("m_ttl_shared", "a_injecting", "s_injecting"),
+            // Stable identity must win over a stale/reused runtime descriptor.
+            ("m_ttl_shared", "a_unrelated", "s_expire"),
+            ("m_ttl_fallback", "a_legacy", "s_legacy"),
+            ("m_ttl_fallback", "a_other", "s_other"),
+            ("m_ttl_fresh", "a_expire", "s_expire"),
+        ] {
+            DeliveryObligations::new(&store)
+                .insert(NewDeliveryObligation {
+                    message_id: message_id.into(),
+                    recipient_agent_id: agent.into(),
+                    recipient_runtime_id: Some(runtime.into()),
+                    payload_json: serde_json::to_string(&msg(message_id, "retained payload"))
+                        .unwrap(),
+                    dedupe_key: format!("delivery:{message_id}:{agent}"),
+                    attempt: 0,
+                    state: "pending".into(),
+                    created_at: 1,
+                })
+                .await
+                .unwrap();
+        }
+        store.conn.execute_batch(
+            "INSERT INTO in_flight (in_flight_id, message_id, recipient_session, recipient_agent_id, state, attempt_count) VALUES
+             ('if_ttl_shared', 'm_ttl_shared', 's_expire', 'a_expire', 'pending', 0),
+             ('if_ttl_injecting', 'm_ttl_shared', 's_injecting', 'a_injecting', 'injecting', 1),
+             ('if_ttl_fallback', 'm_ttl_fallback', 's_legacy', NULL, 'notified', 0),
+             ('if_ttl_fresh', 'm_ttl_fresh', 's_expire', 'a_expire', 'pending', 0);"
+        ).await.unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn delivery_ttl_split_settles_only_exact_expired_recipient_obligations() {
+        use nexus_store::repos::DeliveryObligations;
+
+        let store = split_ttl_fixture().await;
+        let mutation = Inbox::new(&store)
+            .dead_letter_expired_deliveries(10_000, 1_000)
+            .await
+            .unwrap();
+        assert_eq!(mutation.in_flight_ids, ["if_ttl_fallback", "if_ttl_shared"]);
+        assert_eq!(mutation.count, 2);
+        let mut remaining = DeliveryObligations::new(&store)
+            .pending()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.message_id, row.recipient_agent_id))
+            .collect::<Vec<_>>();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            [
+                ("m_ttl_fallback".into(), "a_other".into()),
+                ("m_ttl_fresh".into(), "a_expire".into()),
+                ("m_ttl_shared".into(), "a_injecting".into()),
+                ("m_ttl_shared".into(), "a_unrelated".into()),
+            ],
+            "expiry must retire only the actual settled message/recipient edges"
+        );
+        let mut rows = store.conn.query(
+            "SELECT state, attempt_count FROM in_flight WHERE in_flight_id = 'if_ttl_injecting'", (),
+        ).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "injecting");
+        assert_eq!(row.get::<i64>(1).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn delivery_ttl_split_durable_failure_rolls_back_entire_candidate_batch() {
+        assert_ttl_durable_failure_rolls_back("ABORT").await;
+    }
+
+    #[tokio::test]
+    async fn delivery_ttl_split_delete_fail_rolls_back_prior_durable_deletes() {
+        assert_ttl_durable_failure_rolls_back("FAIL").await;
+    }
+
+    async fn assert_ttl_durable_failure_rolls_back(failure: &str) {
+        use nexus_store::repos::DeliveryObligations;
+
+        let store = split_ttl_fixture().await;
+        store
+            .identity_conn()
+            .execute_batch(&format!(
+                "CREATE TRIGGER reject_ttl_settlement BEFORE DELETE ON delivery_obligations
+             WHEN OLD.message_id = 'm_ttl_fallback'
+             BEGIN SELECT RAISE({failure}, 'TTL continuity settlement rejected'); END;"
+            ))
+            .await
+            .unwrap();
+        let error = Inbox::new(&store)
+            .dead_letter_expired_deliveries(10_000, 1_000)
+            .await
+            .expect_err("durable failure must not report a successful terminal sweep");
+        assert!(error
+            .to_string()
+            .contains("TTL continuity settlement rejected"));
+        assert_eq!(
+            DeliveryObligations::new(&store)
+                .pending()
+                .await
+                .unwrap()
+                .len(),
+            6,
+            "a later recipient failure must not partially retire earlier obligations"
+        );
+        let mut rows = store
+            .conn
+            .query(
+                "SELECT state, attempt_count, error_code, failed_at FROM in_flight
+             WHERE in_flight_id IN ('if_ttl_fallback', 'if_ttl_shared') ORDER BY in_flight_id",
+                (),
+            )
+            .await
+            .unwrap();
+        for expected in ["notified", "pending"] {
+            let row = rows.next().await.unwrap().unwrap();
+            assert_eq!(row.get::<String>(0).unwrap(), expected);
+            assert_eq!(row.get::<i64>(1).unwrap(), 0);
+            assert_eq!(row.get::<Option<String>>(2).unwrap(), None);
+            assert_eq!(row.get::<Option<i64>>(3).unwrap(), None);
+        }
+        assert!(rows.next().await.unwrap().is_none());
+        drop(rows);
+        store
+            .identity_conn()
+            .execute("DROP TRIGGER reject_ttl_settlement", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            Inbox::new(&store)
+                .dead_letter_expired_deliveries(10_000, 1_000)
+                .await
+                .unwrap()
+                .count,
+            2,
+            "rolled-back expiry must remain retryable"
+        );
+        assert_eq!(
+            DeliveryObligations::new(&store)
+                .pending()
+                .await
+                .unwrap()
+                .len(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_ttl_split_owns_durable_commit_despite_other_identity_rollback() {
+        use nexus_store::repos::DeliveryObligations;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let store = Arc::new(split_ttl_fixture().await);
+        let held = store
+            .begin_identity_write_txn("unrelated_identity_owner")
+            .await
+            .unwrap();
+        let expiry_store = store.clone();
+        let mut expiry = tokio::spawn(async move {
+            Inbox::new(&expiry_store)
+                .dead_letter_expired_deliveries(10_000, 1_000)
+                .await
+        });
+        // Retain the task if blocked on the identity gate; timeout must not
+        // cancel the actual expiry operation before the other owner releases it.
+        let premature = tokio::time::timeout(Duration::from_millis(100), &mut expiry).await;
+        let finished_while_identity_owned = premature.is_ok();
+        held.rollback(&nexus_common::NexusError::Store(
+            "unrelated rollback".into(),
+        ))
+        .await
+        .unwrap();
+        let result = match premature {
+            Ok(result) => result,
+            Err(_) => tokio::time::timeout(Duration::from_secs(2), expiry)
+                .await
+                .expect("expiry must finish after the identity writer releases"),
+        };
+        assert_eq!(result.unwrap().unwrap().count, 2);
+        assert_eq!(
+            DeliveryObligations::new(&store).pending().await.unwrap().len(),
+            4,
+            "another owner's rollback must not resurrect TTL-settled obligations; completed while identity owned={finished_while_identity_owned}"
+        );
+        assert!(
+            !finished_while_identity_owned,
+            "expiry must own and commit its durable transaction before terminal success"
+        );
+    }
+
     #[test]
     fn dead_letter_mutations_stay_on_pinned_write_txn_connection() {
         let source = include_str!("../src/repos/inbox.rs");
@@ -1955,6 +2165,223 @@ mod inbox {
                 "{function} must not use StoreConnection inside a DLQ write transaction"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn delivery_obligation_insert_cannot_join_another_identity_rollback() {
+        use nexus_store::repos::{DeliveryObligations, NewDeliveryObligation};
+        use std::{sync::Arc, time::Duration};
+        let store = Arc::new(split_ttl_fixture().await);
+        let held = store
+            .begin_identity_write_txn("ttl_settlement_owner")
+            .await
+            .unwrap();
+        let writer_store = store.clone();
+        let mut writer = tokio::spawn(async move {
+            DeliveryObligations::new(&writer_store)
+                .insert(NewDeliveryObligation {
+                    message_id: "m_concurrent_admission".into(),
+                    recipient_agent_id: "a_new".into(),
+                    recipient_runtime_id: Some("s_new".into()),
+                    payload_json: "{}".into(),
+                    dedupe_key: "delivery:m_concurrent_admission:a_new".into(),
+                    attempt: 0,
+                    state: "pending".into(),
+                    created_at: 1,
+                })
+                .await
+        });
+        let premature = tokio::time::timeout(Duration::from_millis(100), &mut writer).await;
+        let joined_other_owner = premature.is_ok();
+        held.rollback(&nexus_common::NexusError::Store("TTL rollback".into()))
+            .await
+            .unwrap();
+        let result = match premature {
+            Ok(result) => result,
+            Err(_) => tokio::time::timeout(Duration::from_secs(2), writer)
+                .await
+                .unwrap(),
+        };
+        result.unwrap().unwrap();
+        assert!(DeliveryObligations::new(&store).pending().await.unwrap().iter()
+            .any(|row| row.message_id == "m_concurrent_admission"),
+            "acknowledged admission was rolled back with another identity owner; joined={joined_other_owner}");
+        assert!(!joined_other_owner);
+    }
+
+    #[tokio::test]
+    async fn delivery_ttl_requeue_restores_exact_payload_recipient_and_attempt() {
+        use nexus_store::repos::DeliveryObligations;
+        let store = split_ttl_fixture().await;
+        let inbox = Inbox::new(&store);
+        inbox
+            .dead_letter_expired_deliveries(10_000, 1_000)
+            .await
+            .unwrap();
+        store.conn.execute("UPDATE in_flight SET attempt_count = 3, delivery_timing = 'after_tool_loop' WHERE in_flight_id = 'if_ttl_shared'", ()).await.unwrap();
+        let mutation = inbox
+            .requeue_dead_letters(DeadLetterSelector::InFlightId("if_ttl_shared".into()))
+            .await
+            .unwrap();
+        assert_eq!(mutation.count, 1);
+        let obligations = DeliveryObligations::new(&store).pending().await.unwrap();
+        assert_eq!(obligations.len(), 5);
+        let restored = obligations
+            .iter()
+            .find(|row| row.message_id == "m_ttl_shared" && row.recipient_agent_id == "a_expire")
+            .unwrap();
+        assert_eq!(restored.recipient_runtime_id.as_deref(), Some("s_expire"));
+        assert_eq!(restored.dedupe_key, "delivery:m_ttl_shared:a_expire");
+        assert_eq!(restored.attempt, 3);
+        assert_eq!(restored.created_at, 1);
+        assert_eq!(restored.state, "pending");
+        let payload: serde_json::Value = serde_json::from_str(&restored.payload_json).unwrap();
+        assert_eq!(
+            payload["message"],
+            serde_json::to_value(
+                Messages::new(&store)
+                    .get("p_demo", &MessageId("m_ttl_shared".into()))
+                    .await
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        assert_eq!(payload["deliveryTiming"], "after_tool_loop");
+        // A legacy runtime-only row retains the same admission fallback key.
+        inbox
+            .requeue_dead_letters(DeadLetterSelector::InFlightId("if_ttl_fallback".into()))
+            .await
+            .unwrap();
+        let obligations = DeliveryObligations::new(&store).pending().await.unwrap();
+        assert_eq!(obligations.len(), 6);
+        assert!(obligations
+            .iter()
+            .any(|row| row.message_id == "m_ttl_fallback"
+                && row.recipient_agent_id == "s_legacy"
+                && row.recipient_runtime_id.as_deref() == Some("s_legacy")));
+    }
+
+    #[tokio::test]
+    async fn delivery_obligation_native_batch_preserves_quoted_unicode_and_nul_data() {
+        use nexus_store::repos::{DeliveryObligations, NewDeliveryObligation};
+        let store = split_ttl_fixture().await;
+        let row = NewDeliveryObligation {
+            message_id: "m_'quoted_雪\0_tail".into(),
+            recipient_agent_id: "a_'); DELETE FROM delivery_obligations; --雪\0tail".into(),
+            recipient_runtime_id: Some("s_雪\0tail".into()),
+            payload_json: "{\"body\":\"quotes ' 雪 \\u0000 tail\"}".into(),
+            dedupe_key: "dedupe_'雪\0tail".into(),
+            attempt: 3,
+            state: "pending".into(),
+            created_at: 42,
+        };
+        let repo = DeliveryObligations::new(&store);
+        repo.insert(row.clone()).await.unwrap();
+        let rows = repo.pending().await.unwrap();
+        assert_eq!(
+            rows.len(),
+            7,
+            "encoded data must never become executable SQL"
+        );
+        // Read exact bytes: the vendored legacy String row conversion uses
+        // CStr and truncates at NUL, independently of this SQL encoding path.
+        let mut persisted = store.identity_conn().query(
+            "SELECT CAST(message_id AS BLOB), CAST(recipient_agent_id AS BLOB),
+             CAST(recipient_runtime_id AS BLOB), CAST(payload_json AS BLOB), CAST(dedupe_key AS BLOB), attempt
+             FROM delivery_obligations WHERE message_id = ?1",
+            libsql::params![row.message_id.clone()],
+        ).await.unwrap();
+        let actual = persisted
+            .next()
+            .await
+            .unwrap()
+            .expect("complete NUL-containing identity persists");
+        for (column, expected) in [
+            &row.message_id,
+            &row.recipient_agent_id,
+            row.recipient_runtime_id.as_ref().unwrap(),
+            &row.payload_json,
+            &row.dedupe_key,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                actual.get::<Vec<u8>>(column as i32).unwrap(),
+                expected.as_bytes()
+            );
+        }
+        assert_eq!(actual.get::<i64>(5).unwrap(), 3);
+        drop(actual);
+        drop(persisted);
+        assert!(repo
+            .remove(&row.message_id, &row.recipient_agent_id)
+            .await
+            .unwrap());
+        assert_eq!(repo.pending().await.unwrap().len(), 6);
+    }
+
+    #[tokio::test]
+    async fn delivery_ttl_requeue_durable_failure_preserves_entire_terminal_batch() {
+        use nexus_store::repos::DeliveryObligations;
+        let store = split_ttl_fixture().await;
+        let inbox = Inbox::new(&store);
+        inbox
+            .dead_letter_expired_deliveries(10_000, 1_000)
+            .await
+            .unwrap();
+        store
+            .identity_conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_requeue BEFORE INSERT ON delivery_obligations
+             WHEN NEW.message_id = 'm_ttl_shared'
+             BEGIN SELECT RAISE(FAIL, 'requeue continuity rejected'); END;",
+            )
+            .await
+            .unwrap();
+        let error = inbox
+            .requeue_dead_letters(DeadLetterSelector::Filter(DeadLetterFilter::default()))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("requeue continuity rejected"));
+        assert_eq!(
+            DeliveryObligations::new(&store)
+                .pending()
+                .await
+                .unwrap()
+                .len(),
+            4
+        );
+        let mut rows = store.conn.query("SELECT state, error_code, attempt_count FROM in_flight WHERE in_flight_id IN ('if_ttl_fallback', 'if_ttl_shared')", ()).await.unwrap();
+        for _ in 0..2 {
+            let row = rows.next().await.unwrap().unwrap();
+            assert_eq!(row.get::<String>(0).unwrap(), "error");
+            assert_eq!(row.get::<String>(1).unwrap(), "delivery_timeout");
+            assert_eq!(row.get::<i64>(2).unwrap(), 0);
+        }
+        drop(rows);
+        store
+            .identity_conn()
+            .execute("DROP TRIGGER reject_requeue", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            inbox
+                .requeue_dead_letters(DeadLetterSelector::Filter(DeadLetterFilter::default()))
+                .await
+                .unwrap()
+                .count,
+            2
+        );
+        assert_eq!(
+            DeliveryObligations::new(&store)
+                .pending()
+                .await
+                .unwrap()
+                .len(),
+            6
+        );
     }
 
     fn function_body<'a>(source: &'a str, name: &str) -> &'a str {

@@ -719,3 +719,48 @@ fn default_archive_path_for_test(agent_id: &str, session: &SessionId) -> std::pa
         .join(&session.0)
         .join("transcript.jsonl")
 }
+
+#[tokio::test]
+async fn a_forked_claude_session_start_adopts_the_new_native_session() {
+    use nexus_contracts::TurnState;
+    use nexus_harness_claude::native::forwarder::ClaudeHookObservationSink;
+    use nexus_harness_claude::native::transcript::parse_hook_record;
+
+    let completion = ClaudeTurnCompletion::new(None, None);
+    let record =
+        |offset: u64, raw: &str| parse_hook_record(&serde_json::from_str(raw).unwrap(), offset);
+    completion.observe_hooks(
+        &[
+            record(1, r#"{"event":"SessionStart","session_id":"old"}"#),
+            record(2, r#"{"event":"UserPromptSubmit","session_id":"old","prompt_id":"p1","prompt":"one"}"#),
+            record(3, r#"{"event":"Stop","session_id":"old","prompt_id":"p1"}"#),
+        ],
+        Some(3),
+        true,
+    );
+    assert_eq!(completion.observe_turn().state, TurnState::VerifiedIdle);
+
+    completion.observe_hooks(
+        &[
+            record(4, r#"{"event":"SessionStart","session_id":"forked"}"#),
+            record(5, r#"{"event":"UserPromptSubmit","session_id":"forked","prompt_id":"p2","prompt":"two"}"#),
+        ],
+        Some(5),
+        true,
+    );
+    assert_eq!(
+        completion.observe_turn().state,
+        TurnState::NativeOpen,
+        "a forked session start is followed by the tracker, not marked ambiguous"
+    );
+
+    completion.observe_hooks(
+        &[record(
+            6,
+            r#"{"event":"Stop","session_id":"forked","prompt_id":"p2"}"#,
+        )],
+        Some(6),
+        true,
+    );
+    assert_eq!(completion.observe_turn().state, TurnState::VerifiedIdle);
+}

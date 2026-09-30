@@ -63,6 +63,12 @@ Only state needed to preserve transport correctness survives a daemon restart:
 Settled rows are deleted after settlement and Gateway acknowledgement. Boot-scoped routing,
 presence, live activity, raw terminal bytes, and the projection backlog are memory-only.
 
+The optional `NEXUS_STREAM_DB_PATH` named stream lane belongs only to the transport authority.
+The split identity connection retains an anonymous compatibility stream schema, never the same
+named attachment. SQLite `BEGIN IMMEDIATE` can acquire write locks on attached databases even
+when the operation targets another schema; sharing that file would couple the otherwise separate
+identity and transport writer gates. Legacy single-store callers retain their named-stream behavior.
+
 ### Acceptance and settlement
 
 ```text
@@ -89,6 +95,20 @@ no revival path.
 A target that cannot be revived settles with an explicit terminal error. Nexus does not attempt the
 same terminally failed message again unless an operator explicitly requests it. Transient bootstrap
 failures use the bounded retry policy before terminal settlement.
+
+Headed OpenCode revival is runtime-exact: its durable native binding and resurrection capsule
+identify the conversation, while the plugin supervisor restores the bridge and terminal. A saved
+owner row or a bound-but-dead transport is not proof of liveness. Fresh launches persist the native
+ready session ID, not just a caller-supplied resume argument. After restart, contradictory or absent
+resume identity must fail before native launch; revival must not create a replacement conversation.
+The original runtime's launch-local store remains separate from another runtime's conversation.
+The owning harness implements native argument parsing, resume-evidence reconciliation, storage
+selection and accepted-ready capsule policy through `nexus-harness-core`. The daemon gathers
+opaque keys, validates Nexus agent/runtime ownership under the revival gate and executes that
+plan; registry and process-supervisor code do not reimplement native grammar. Explicit requested
+keys constrain stored evidence before hot reuse as well as cold launch, and cannot substitute
+for missing stored identity. Existing imported/global-store provenance is not inferred.
+See [distribution](distribution.md) for installation and recovery procedures.
 
 ## Gateway ownership
 
@@ -174,6 +194,14 @@ resolved identity and transport values.
 Provider resume IDs are correlation hints, not Nexus identity. This distinction matters most for
 Claude Code, whose native resume namespace is provider-owned. Nexus preserves its own identity and
 reports correlation changes but cannot guarantee provider-side uniqueness.
+
+The runtime owns its native bridge. For Claude Code every hook and display record under
+`~/.nexus/claude-sessions/<runtime id>/bridge/` is that runtime's activity; Claude's own session id
+is a field on the record, never the owner. A `SessionStart` that names a new Claude session (a
+resume, a fork, a `/clear`) moves the runtime forward to that session and to its transcript; records
+naming a Claude session the runtime never started are stray and dropped. Only a bridge that names
+several Claude sessions with no `SessionStart` to order them stays ambiguous. The same rule picks
+the `--resume` id for a headed revive: the latest `SessionStart` wins.
 
 Project is a metadata string on identities and messages. It can filter product views but does not
 own identity, routing, or authorization.

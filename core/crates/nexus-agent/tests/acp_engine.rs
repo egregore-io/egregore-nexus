@@ -184,6 +184,21 @@ fn model_metadata_engine_with_context(
     legacy: bool,
     context: bool,
 ) -> (AcpEngine, Arc<ModelMetadataSink>) {
+    model_metadata_engine_with_telemetry(legacy, context, false)
+}
+fn model_metadata_engine_with_telemetry(
+    legacy: bool,
+    context: bool,
+    usage: bool,
+) -> (AcpEngine, Arc<ModelMetadataSink>) {
+    model_metadata_engine_with_categories(legacy, context, usage, false)
+}
+fn model_metadata_engine_with_categories(
+    legacy: bool,
+    context: bool,
+    usage: bool,
+    quota: bool,
+) -> (AcpEngine, Arc<ModelMetadataSink>) {
     use nexus_agent::adapter::{AcpModelMetadataDialect, AdapterModelReportingProfile};
     use nexus_contracts::{ModelEvidenceCapability, ModelObservationSource, ModelReportBackend};
     let source = ModelObservationSource::new("fixture-config").unwrap();
@@ -202,19 +217,45 @@ fn model_metadata_engine_with_context(
         },
     )
     .unwrap();
-    if context {
+    if context || usage || quota {
         use nexus_agent::adapter::{AdapterTelemetryCapability, AdapterTelemetryReportingProfile};
         let unavailable =
             AdapterTelemetryCapability::new(ModelEvidenceCapability::Unverified, None).unwrap();
-        profile = profile.with_telemetry(AdapterTelemetryReportingProfile::new(
-            unavailable.clone(),
+        let supported = |source| {
             AdapterTelemetryCapability::new(
                 ModelEvidenceCapability::Supported,
-                Some(ModelObservationSource::new("codex.acp.usage_update").unwrap()),
+                Some(ModelObservationSource::new(source).unwrap()),
             )
-            .unwrap(),
-            unavailable,
-        ));
+            .unwrap()
+        };
+        let mut telemetry = AdapterTelemetryReportingProfile::new(
+            if usage {
+                supported("codex.acp.prompt.usage")
+            } else {
+                unavailable.clone()
+            },
+            if context {
+                supported("codex.acp.usage_update")
+            } else {
+                unavailable.clone()
+            },
+            if quota {
+                supported("claude.acp.rate_limit.selected")
+            } else {
+                unavailable
+            },
+        );
+        if usage {
+            telemetry = telemetry
+                .with_prompt_usage(nexus_agent::adapter::AcpPromptUsageScope::LastResponse)
+                .unwrap();
+        }
+        if quota {
+            telemetry = telemetry
+                .with_quota_dialect(nexus_agent::adapter::AcpQuotaDialect::ClaudeSelectedRateLimit)
+                .unwrap();
+        }
+        profile = profile.with_telemetry(telemetry);
     }
     let sink = Arc::new(ModelMetadataSink {
         identity: profile.identity().clone(),
@@ -242,6 +283,212 @@ fn model_metadata_engine_with_context(
         .unwrap();
     let reporting = captured.lock().unwrap().take();
     (AcpEngine::new().with_reporting(reporting), sink)
+}
+
+#[tokio::test]
+async fn model_metadata_prompt_usage_is_bound_to_actual_request_and_explicit_scope() {
+    use nexus_contracts::telemetry::{
+        NativeTelemetryUpdate, NativeTelemetryValue, TokenUsageScope,
+    };
+    for enabled in [false, true] {
+        let (engine, sink) = model_metadata_engine_with_telemetry(false, false, enabled);
+        let mut command = fake_command();
+        command.env.push(("FAKE_ACP_RAW_PROMPT".into(), json!({"stopReason":"end_turn",
+            "usage":{"totalTokens":230,"inputTokens":120,"outputTokens":30,"cachedReadTokens":80,"thoughtTokens":12}}).to_string()));
+        engine.spawn_and_initialize(&command).await.unwrap();
+        engine
+            .new_session(None, &LaunchCtx::default())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            engine
+                .inject_completion_observed("usage fixture".into())
+                .await
+                .unwrap();
+        }
+        let values = sink.telemetry.lock().unwrap().clone();
+        engine.kill().await;
+        assert_eq!(
+            values.len(),
+            if enabled { 2 } else { 0 },
+            "supported samples remain independent replacements"
+        );
+        for update in values {
+            let NativeTelemetryUpdate::Usage {
+                native_session_id,
+                value: NativeTelemetryValue::Observed(value),
+            } = update
+            else {
+                panic!("expected usage")
+            };
+            assert_eq!(native_session_id, "fake-session-1");
+            assert_eq!(value.scope, TokenUsageScope::LastResponse);
+            assert_eq!(value.total_tokens.unwrap().get(), 230);
+            assert_eq!(value.cache_read_tokens.unwrap().get(), 80);
+            assert!(value.native_turn_id.is_none());
+            assert!(value.reset_id.is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn model_metadata_cancelled_prompt_cannot_publish_late_usage_and_next_prompt_progresses() {
+    assert_cancelled_prompt_usage(false).await;
+}
+
+#[tokio::test]
+async fn model_metadata_public_cancel_revokes_usage_before_unpolled_prompt_is_dropped() {
+    assert_cancelled_prompt_usage(true).await;
+}
+
+async fn assert_cancelled_prompt_usage(public_cancel: bool) {
+    let dir = std::env::temp_dir().join(nexus_common::new_binding_id());
+    std::fs::create_dir_all(&dir).unwrap();
+    let (engine, sink) = model_metadata_engine_with_telemetry(false, false, true);
+    let mut command = fake_command();
+    command.env.extend([
+        ("FAKE_ACP_RAW_PROMPT".into(), json!({"stopReason":"end_turn","usage":{"totalTokens":10,"inputTokens":8,"outputTokens":2}}).to_string()),
+        ("FAKE_ACP_PROMPT_RESPONSE_GATE".into(), dir.join("reply").display().to_string()),
+        ("FAKE_ACP_MODEL_RESPONSE_WITNESS".into(), "old-prompt-reply-processed".into()),
+    ]);
+    engine.spawn_and_initialize(&command).await.unwrap();
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    let mut pending = Box::pin(engine.inject_completion_observed("old prompt".into()));
+    let entered = dir.join("reply.entered");
+    tokio::select! {
+        value = &mut pending => panic!("prompt must wait: {value:?}"),
+        _ = wait_fixture_marker(&entered) => {}
+    }
+    let held_prompt = if public_cancel {
+        engine.cancel_active_turn().await.unwrap();
+        Some(pending)
+    } else {
+        drop(pending);
+        None
+    };
+    std::fs::write(dir.join("reply.release"), b"release").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while engine.take_updates().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("notification witnesses old reply dispatch before next prompt");
+    assert!(
+        sink.telemetry.lock().unwrap().is_empty(),
+        "cancelled prompt has no late usage authority"
+    );
+    // In the public-cancel case no poll or Drop may supply the revocation above.
+    drop(held_prompt);
+    engine
+        .inject_completion_observed("new prompt".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        sink.telemetry.lock().unwrap().len(),
+        1,
+        "next exact request remains usable"
+    );
+    engine.kill().await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn model_metadata_quota_requires_explicit_dialect_exact_root_and_extension() {
+    use nexus_contracts::telemetry::{NativeTelemetryUpdate, NativeTelemetryValue};
+    for enabled in [false, true] {
+        let (engine, sink) = model_metadata_engine_with_categories(false, false, false, enabled);
+        let mut command = fake_command();
+        let update = |root, metadata| json!({"sessionId":root,"update":{"sessionUpdate":"usage_update", "used":42,"size":200000,"_meta":metadata}});
+        let selected = json!({"_claude/rateLimit":{"status":"allowed","rateLimitType":"five_hour","utilization":0.75,"resetsAt":1800000000}});
+        command.env.extend([
+            (
+                "FAKE_ACP_RAW_PROMPT".into(),
+                json!({"stopReason":"end_turn"}).to_string(),
+            ),
+            (
+                "FAKE_ACP_RAW_MODEL_UPDATES".into(),
+                json!([
+                    update("child", selected.clone()),
+                    update("fake-session-1", selected.clone()),
+                    update("fake-session-1", json!({})),
+                    update("fake-session-1", selected),
+                    update(
+                        "fake-session-1",
+                        json!({"_claude/rateLimit":{"status":"allowed"}})
+                    ),
+                ])
+                .to_string(),
+            ),
+        ]);
+        engine.spawn_and_initialize(&command).await.unwrap();
+        engine
+            .new_session(None, &LaunchCtx::default())
+            .await
+            .unwrap();
+        engine
+            .inject_completion_observed("fixture quota".into())
+            .await
+            .unwrap();
+        let values = sink.telemetry.lock().unwrap().clone();
+        engine.kill().await;
+        assert_eq!(values.len(), if enabled { 3 } else { 0 });
+        if !enabled {
+            continue;
+        }
+        let NativeTelemetryUpdate::Quota {
+            native_session_id,
+            value: NativeTelemetryValue::Observed(first),
+        } = &values[0]
+        else {
+            panic!("first quota")
+        };
+        let NativeTelemetryUpdate::Quota {
+            value: NativeTelemetryValue::Observed(second),
+            ..
+        } = &values[1]
+        else {
+            panic!("repeat quota")
+        };
+        assert_eq!(native_session_id, "fake-session-1");
+        assert_eq!(
+            first, second,
+            "ordinary context update and repeated numbers do not refresh quota"
+        );
+        assert!(matches!(
+            &values[2],
+            NativeTelemetryUpdate::Quota {
+                value: NativeTelemetryValue::Unknown,
+                ..
+            }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn model_metadata_prompt_reply_cannot_relabel_an_explicit_foreign_session() {
+    let (engine, sink) = model_metadata_engine_with_telemetry(false, false, true);
+    let mut command = fake_command();
+    command.env.push((
+        "FAKE_ACP_RAW_PROMPT".into(),
+        json!({"sessionId":"foreign-child",
+        "stopReason":"end_turn","usage":{"totalTokens":10,"inputTokens":8,"outputTokens":2}})
+        .to_string(),
+    ));
+    engine.spawn_and_initialize(&command).await.unwrap();
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    engine
+        .inject_completion_observed("native reply".into())
+        .await
+        .unwrap();
+    assert!(sink.telemetry.lock().unwrap().is_empty());
+    engine.kill().await;
 }
 
 #[tokio::test]

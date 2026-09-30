@@ -331,8 +331,16 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let request = read_request_frame(&mut stream).await?;
+    let shutdown = matches!(&request.call, DaemonIpcCall::Query { method, .. }
+        if method == "local.daemon.shutdown");
     let response = handle_request(&state, &expected_token, request).await;
-    write_response_frame(&mut stream, &response).await
+    let written = write_response_frame(&mut stream, &response).await;
+    // Attempt the ACK before waking main, which drops the listening task. A lost ACK does not
+    // revoke an admitted stop; the caller verifies actual process exit, never resends to a new PID.
+    if shutdown && response.error.is_none() {
+        state.request_shutdown();
+    }
+    written
 }
 
 pub async fn write_request_frame<W>(
@@ -534,6 +542,35 @@ async fn handle_query(
     method: String,
     params: Value,
 ) -> DaemonIpcResponse {
+    if method == "local.daemon.shutdown" {
+        if !caller.as_ref().is_some_and(is_local_operator) {
+            return failure(
+                request_id,
+                codes::UNAUTHORIZED,
+                "daemon shutdown requires local operator authority",
+            );
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct ShutdownRequest {
+            process_id: u32,
+        }
+        let Ok(request) = serde_json::from_value::<ShutdownRequest>(params) else {
+            return failure(
+                request_id,
+                codes::INVALID_PARAMS,
+                "daemon shutdown requires exact processId",
+            );
+        };
+        if request.process_id != std::process::id() {
+            return failure(
+                request_id,
+                codes::INVALID_PARAMS,
+                "daemon process changed; refusing shutdown",
+            );
+        }
+        return DaemonIpcResponse::success(request_id, json!({"accepted": true}));
+    }
     if method == "local.store.export" {
         return handle_local_store_export_query(state, request_id, caller, params).await;
     }
@@ -888,6 +925,8 @@ struct LocalSessionQueueReadRequest {
     expected_session_id: Option<String>,
     #[serde(default)]
     events_after: Option<i64>,
+    #[serde(default)]
+    client_message_id: Option<String>,
 }
 
 async fn handle_local_session_queue_read(
@@ -905,6 +944,15 @@ async fn handle_local_session_queue_read(
     };
     if let Err(error) = nexus_contracts::prompt::validate_expected_session(&params) {
         return store_failure(request_id, error);
+    }
+    if let Some(id) = params.get("clientMessageId") {
+        if !id.as_str().is_some_and(|id| {
+            !id.trim().is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
+        }) || params.get("expectedSessionId").is_none()
+            || params.get("eventsAfter").is_some()
+        {
+            return failure(request_id, codes::INVALID_PARAMS, "submission lookup requires valid clientMessageId and an exact session pair, without eventsAfter");
+        }
     }
     let request: LocalSessionQueueReadRequest = match serde_json::from_value(params) {
         Ok(request) => request,
@@ -964,15 +1012,37 @@ async fn handle_local_session_queue_read(
                 );
             }
             let active_sessions = state.agent.active_turn_sessions();
-            queue
-                .snapshot_for_requester(
-                    name,
-                    request.agent_id.as_ref(),
-                    request.expected_session_id.as_deref(),
-                    &active_sessions,
-                    requester.as_ref(),
-                )
-                .await
+            let snapshot = if let Some(client_id) = request.client_message_id.as_deref() {
+                let Some(requester) = requester.as_ref() else {
+                    return failure(
+                        request_id,
+                        codes::UNAUTHORIZED,
+                        "submission lookup requires authenticated requester evidence",
+                    );
+                };
+                queue
+                    .snapshot_for_submission(
+                        request.agent_id.as_ref().expect("validated exact pair"),
+                        request
+                            .expected_session_id
+                            .as_deref()
+                            .expect("validated exact pair"),
+                        client_id,
+                        requester,
+                    )
+                    .await
+            } else {
+                queue
+                    .snapshot_for_requester(
+                        name,
+                        request.agent_id.as_ref(),
+                        request.expected_session_id.as_deref(),
+                        &active_sessions,
+                        requester.as_ref(),
+                    )
+                    .await
+            };
+            snapshot
                 .map_err(|error| error.to_contract_error())
                 .map(|mut snapshot| {
                     if let Some(session) = snapshot.session_id.clone() {

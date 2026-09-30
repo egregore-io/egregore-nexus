@@ -26,17 +26,22 @@ describe("plain-node serve path", () => {
     const temporaryRoot = await mkdtemp(join(tmpdir(), "nexus-plain-node-ws-"));
     temporaryRoots.push(temporaryRoot);
     const bundle = join(temporaryRoot, "headless.mjs");
-    await symlink(join(ROOT, "node_modules"), join(temporaryRoot, "node_modules"), "dir");
+    await symlink(join(ROOT, "node_modules"), join(temporaryRoot, "node_modules"),
+      process.platform === "win32" ? "junction" : "dir");
     await execFileAsync(
-      join(ROOT, "node_modules", ".bin", "esbuild"),
+      process.execPath,
       [
-        "src/server/gateway/headless.ts",
-        "--bundle",
-        "--platform=node",
-        "--format=esm",
-        "--target=node20",
-        "--packages=external",
-        `--outfile=${bundle}`,
+        "--eval",
+        'require("esbuild").buildSync(JSON.parse(process.argv[1]))',
+        JSON.stringify({
+          entryPoints: ["src/server/gateway/headless.ts"],
+          bundle: true,
+          platform: "node",
+          format: "esm",
+          target: "node20",
+          packages: "external",
+          outfile: bundle,
+        }),
       ],
       { cwd: ROOT, timeout: 60_000 },
     );

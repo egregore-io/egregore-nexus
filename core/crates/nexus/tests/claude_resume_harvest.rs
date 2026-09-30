@@ -81,10 +81,11 @@ async fn claude_resume_harvest_refuses_ambiguous_hook_log() {
     let tmp = tempdir().unwrap();
     let bridge_dir = tmp.path().join("claude-sessions/s_claude/bridge");
     let runtime = seed_missing_claude(&store, "s_claude", &bridge_dir).await;
+    // Two Claude ids and no SessionStart to order them: nothing says which one this runtime is.
     write_hooks(
         &bridge_dir,
         "\
-{\"event\":\"SessionStart\",\"payload\":{\"session_id\":\"claude-native-a\"}}\n\
+{\"event\":\"Stop\",\"payload\":{\"session_id\":\"claude-native-a\"}}\n\
 {\"event\":\"Stop\",\"payload\":{\"session_id\":\"claude-native-b\"}}\n",
     );
 
@@ -166,4 +167,39 @@ async fn daemon_boot_harvests_missing_claude_resume_ids() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+#[tokio::test]
+async fn claude_resume_harvest_follows_the_latest_session_start() {
+    let store = migrated_store().await;
+    let tmp = tempdir().unwrap();
+    let bridge_dir = tmp.path().join("claude-sessions/s_claude/bridge");
+    let runtime = seed_missing_claude(&store, "s_claude", &bridge_dir).await;
+    // A fork names a new Claude session in the same bridge; the runtime now resumes that one.
+    write_hooks(
+        &bridge_dir,
+        "\
+{\"event\":\"SessionStart\",\"payload\":{\"session_id\":\"claude-native-a\",\"transcript_path\":\"/tmp/claude-native-a.jsonl\"}}\n\
+{\"event\":\"Stop\",\"payload\":{\"session_id\":\"claude-native-a\"}}\n\
+{\"event\":\"SessionStart\",\"payload\":{\"session_id\":\"claude-native-b\",\"source\":\"fork\",\"transcript_path\":\"/tmp/claude-native-b.jsonl\"}}\n\
+{\"event\":\"Stop\",\"payload\":{\"session_id\":\"claude-native-b\"}}\n",
+    );
+
+    let report = harvest_missing_claude_resume_ids(&store, tmp.path())
+        .await
+        .unwrap();
+
+    assert_eq!(report.scanned, 1);
+    assert_eq!(report.updated, 1);
+    assert_eq!(report.items[0].status, ClaudeResumeHarvestStatus::Updated);
+    let state = ClaudeRuntimeStateRepo::new(&store)
+        .find_by_runtime_id(&runtime)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state.claude_session_id.as_deref(), Some("claude-native-b"));
+    assert_eq!(
+        state.transcript_path,
+        Some(PathBuf::from("/tmp/claude-native-b.jsonl"))
+    );
 }

@@ -19,6 +19,50 @@ struct CaptureSink {
     events: Arc<Mutex<Vec<WsEvent>>>,
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_sidecar_schema_checks_preserve_lookup_and_bad_schema_errors() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    let bad_store = Arc::new(Store::open(":memory:").await.unwrap());
+    bad_store
+        .conn
+        .execute(
+            "CREATE VIEW opencode_runtime_state AS SELECT 1 AS runtime_id",
+            (),
+        )
+        .await
+        .unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(4));
+    let mut tasks = Vec::new();
+    for lane in 0..4 {
+        let store = store.clone();
+        let bad_store = bad_store.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            for _ in 0..200 {
+                let repo = OpenCodeRuntimeStateRepo::new(&store);
+                repo.ensure_schema().await.unwrap();
+                assert!(repo
+                    .find_by_runtime_id(&SessionId(format!("missing_{lane}")))
+                    .await
+                    .unwrap()
+                    .is_none());
+                let error = OpenCodeRuntimeStateRepo::new(&bad_store)
+                    .ensure_schema()
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("view") || error.to_string().contains("not a table"),
+                    "bad schema must retain its own error: {error}"
+                );
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+}
+
 #[async_trait]
 impl EventSink for CaptureSink {
     async fn emit(&self, event: WsEvent) {
@@ -35,6 +79,89 @@ fn temp_db_path(label: &str) -> String {
         .join(format!("nexus-opencode-forwarder-{label}-{nanos}.db"))
         .to_string_lossy()
         .into_owned()
+}
+
+#[tokio::test]
+async fn plugin_runtime_db_poll_retains_tool_metadata_without_second_display_authority() {
+    use nexus::daemon::opencode_native_forwarder::{
+        forward_once_with_tool_observations, OpenCodeToolObservationSink,
+    };
+    #[derive(Default)]
+    struct Tools(Mutex<Vec<nexus_transcript::ToolCallObservation>>);
+    impl OpenCodeToolObservationSink for Tools {
+        fn publish_tool_call(
+            &self,
+            _: &SessionId,
+            observation: nexus_transcript::ToolCallObservation,
+        ) {
+            self.0.lock().unwrap().push(observation);
+        }
+    }
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let session = SessionId("s_plugin_display_owner".into());
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("native.db");
+    seed_opencode_db(db_path.to_str().unwrap()).await;
+    seed_active_opencode_runtime(store.clone(), session.clone(), db_path.clone()).await;
+    store
+        .conn
+        .execute(
+            "UPDATE agent_runtimes SET transport = 'opencode-plugin' WHERE runtime_id = ?1",
+            libsql::params![session.0.clone()],
+        )
+        .await
+        .unwrap();
+    let native = Store::open(db_path.to_str().unwrap()).await.unwrap();
+    insert_opencode_event(
+        &native,
+        6,
+        "message.part.updated.1",
+        json!({"sessionID":"ses_native",
+        "part":{"id":"part_tool", "callID":"call_native", "messageID":"msg_agent", "type":"tool",
+        "tool":"bash", "state":{"status":"error", "error":"native failure"}}}),
+    )
+    .await;
+    let events = CaptureSink::default();
+    let tools = Arc::new(Tools::default());
+    let stats = forward_once_with_tool_observations(
+        store.clone(),
+        session.clone(),
+        Arc::new(events.clone()),
+        Some(tools.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(tools.0.lock().unwrap().len(), 1);
+    assert!(!tools.0.lock().unwrap()[0].ok);
+    assert_eq!(
+        stats.total_events(),
+        0,
+        "plugin already owns visible text/tools/completion"
+    );
+    assert!(events.events.lock().unwrap().is_empty());
+    assert_eq!(
+        OpenCodeRuntimeStateRepo::new(&store)
+            .find_by_runtime_id(&session)
+            .await
+            .unwrap()
+            .unwrap()
+            .event_seq,
+        6
+    );
+    forward_once_with_tool_observations(
+        store,
+        session,
+        Arc::new(events.clone()),
+        Some(tools.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        tools.0.lock().unwrap().len(),
+        1,
+        "metadata cursor still advances"
+    );
 }
 
 #[tokio::test]

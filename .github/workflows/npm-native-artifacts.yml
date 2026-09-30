@@ -30,16 +30,6 @@ jobs:
             runner: ubuntu-22.04-arm
             rust_target: aarch64-unknown-linux-gnu
             executable: nexus
-          - target: darwin-x64
-            support: experimental package
-            runner: macos-15-intel
-            rust_target: x86_64-apple-darwin
-            executable: nexus
-          - target: darwin-arm64
-            support: experimental package
-            runner: macos-15
-            rust_target: aarch64-apple-darwin
-            executable: nexus
           - target: win32-x64-msvc
             support: release baseline
             runner: windows-latest
@@ -154,13 +144,9 @@ jobs:
         run: |
           chmod 755 \
             packages/nexus-cli/native/linux-x64-gnu/nexus \
-            packages/nexus-cli/native/linux-arm64-gnu/nexus \
-            packages/nexus-cli/native/darwin-x64/nexus \
-            packages/nexus-cli/native/darwin-arm64/nexus
+            packages/nexus-cli/native/linux-arm64-gnu/nexus
           test -x packages/nexus-cli/native/linux-x64-gnu/nexus
           test -x packages/nexus-cli/native/linux-arm64-gnu/nexus
-          test -x packages/nexus-cli/native/darwin-x64/nexus
-          test -x packages/nexus-cli/native/darwin-arm64/nexus
           test -f packages/nexus-cli/native/win32-x64-msvc/nexus.exe
       - name: Verify installer guidance
         run: node --test packages/nexus-cli/tests/*.test.mjs

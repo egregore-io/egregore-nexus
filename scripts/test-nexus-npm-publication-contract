@@ -35,8 +35,8 @@ fi
 grep -Fq '| Linux x64 | Release baseline |' "$ROOT/docs/distribution.md"
 grep -Fq '| Windows x64 | Release baseline |' "$ROOT/docs/distribution.md"
 grep -Fq '| WSL | Release baseline |' "$ROOT/docs/distribution.md"
-grep -Fq '| macOS x64 | Experimental |' "$ROOT/docs/distribution.md"
-grep -Fq '| macOS arm64 | Experimental |' "$ROOT/docs/distribution.md"
+grep -Fq '| macOS x64 | Unsupported in beta.5 |' "$ROOT/docs/distribution.md"
+grep -Fq '| macOS arm64 | Unsupported in beta.5 |' "$ROOT/docs/distribution.md"
 
 node - "$ROOT" <<'NODE'
 const fs = require("node:fs");
@@ -62,6 +62,9 @@ for (const pkg of packages) {
   }
 }
 const [all, cli, gateway] = packages;
+if (JSON.stringify(cli.os) !== JSON.stringify(["linux", "win32"])) {
+  throw new Error("@egregore/nexus-cli: beta.5 must reject unsupported macOS installs");
+}
 const expectedAll = {
   "@egregore/nexus-cli": version,
   "@egregore/nexus-gateway": version,
@@ -137,10 +140,13 @@ if grep -Fq 'release/v0.1.2-artifacts' "$WORKFLOW"; then
   echo "native artifacts must build from canonical main, not a release-only branch" >&2
   exit 1
 fi
-for target in \
-  linux-x64-gnu linux-arm64-gnu darwin-x64 darwin-arm64 win32-x64-msvc; do
+for target in linux-x64-gnu linux-arm64-gnu win32-x64-msvc; do
   grep -q "$target" "$WORKFLOW"
 done
+if grep -Eq 'darwin-(x64|arm64)' "$WORKFLOW"; then
+  echo "beta.5 artifact workflow must not offer unsupported macOS binaries" >&2
+  exit 1
+fi
 
 STORE_MANIFEST="$ROOT/core/crates/nexus-store/Cargo.toml"
 grep -Fq "[target.'cfg(windows)'.dependencies]" "$STORE_MANIFEST"

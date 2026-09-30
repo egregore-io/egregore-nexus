@@ -488,11 +488,14 @@ async fn run_harness_prompt_session_actor(
         let row = match next_row.take() {
             Some(row) => row,
             None => {
-                if state
+                if !state
                     .agent
-                    .active_turn_sessions()
-                    .iter()
-                    .any(|active| active.0 == session_id)
+                    .accepts_prompt_while_busy(&SessionId(session_id.clone()))
+                    && state
+                        .agent
+                        .active_turn_sessions()
+                        .iter()
+                        .any(|active| active.0 == session_id)
                 {
                     return;
                 }
@@ -666,17 +669,27 @@ async fn claim_next_harness_prompt(
     if state.command_worker_is_shutting_down() {
         return Ok(None);
     }
-    let mut busy_sessions = state
-        .agent
-        .active_turn_sessions()
+    let active = state.agent.active_turn_sessions();
+    let native_queues = active
+        .iter()
+        .filter(|session| state.agent.accepts_prompt_while_busy(session))
+        .map(|session| session.0.clone())
+        .collect::<Vec<_>>();
+    let mut busy_sessions = active
         .into_iter()
+        .filter(|session| !state.agent.accepts_prompt_while_busy(session))
         .map(|session| session.0)
         .chain(actor_sessions.iter().cloned())
         .collect::<Vec<_>>();
     busy_sessions.sort();
     busy_sessions.dedup();
     CommandIntents::new(&state.store)
-        .claim_next_ready_harness_prompt(now(), HARNESS_PROMPT_LEASE_MS, &busy_sessions)
+        .claim_next_ready_harness_prompt_with_native_queues(
+            now(),
+            HARNESS_PROMPT_LEASE_MS,
+            &busy_sessions,
+            &native_queues,
+        )
         .await
 }
 
@@ -697,7 +710,14 @@ async fn claim_next_harness_prompt_for_session(
         return Ok(None);
     }
     CommandIntents::new(&state.store)
-        .claim_next_ready_harness_prompt_for_session(now(), HARNESS_PROMPT_LEASE_MS, session_id)
+        .claim_next_ready_harness_prompt_for_session_with_native_queue(
+            now(),
+            HARNESS_PROMPT_LEASE_MS,
+            session_id,
+            state
+                .agent
+                .accepts_prompt_while_busy(&SessionId(session_id.to_owned())),
+        )
         .await
 }
 

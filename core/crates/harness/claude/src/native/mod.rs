@@ -10,4 +10,8 @@ pub mod forwarder;
 pub mod hooks;
 pub mod message_delta;
 pub mod model_reporting;
+pub mod response_usage;
+pub mod resume;
+pub mod statusline;
+pub mod statusline_capture;
 pub mod transcript;

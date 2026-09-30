@@ -28,6 +28,7 @@ nexus-agent = { workspace = true }
 nexus-harness-claude = { workspace = true }
 nexus-harness-core = { workspace = true }
 nexus-harness-codex = { workspace = true }
+nexus-harness-opencode = { workspace = true }
 nexus-search = { workspace = true }
 nexus-notify = { workspace = true }
 nexus-admin = { workspace = true }
@@ -61,6 +62,8 @@ libc = "0.2"
 windows-sys = { version = "0.61.2", features = [
   "Win32_Foundation",
   "Win32_Security",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Console",
   "Win32_System_JobObjects",
   "Win32_System_Threading",
 ] }

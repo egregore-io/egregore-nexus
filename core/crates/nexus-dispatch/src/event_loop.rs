@@ -23,8 +23,7 @@ use std::sync::Arc;
 use nexus_common::render_injected_turn_for;
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::{
-    AgentTurnExecutionPort, AgentUpdateKind, ContractError, DeliveryTiming, EventSink, InjectError,
-    NexusBatch, WsEvent,
+    AgentTurnExecutionPort, AgentUpdateKind, EventSink, InjectError, NexusBatch, WsEvent,
 };
 use nexus_store::repos::inbox::{
     Inbox, COMPLETION_TIMEOUT_ERROR_CODE, CONTRACT_ERROR_CODE, OPERATOR_ACTION_ERROR_CODE,
@@ -34,7 +33,7 @@ use nexus_store::Store;
 use tokio::task::JoinHandle;
 
 use crate::bell::Bell;
-use crate::delivery_timing::{delivery_action, DeliveryAction, DeliveryTimingError};
+use crate::delivery_timing::{delivery_action, DeliveryAction};
 use crate::drain::InboxDrainer;
 use crate::wake_policy::{AgentState, WakeDecision, WakePolicy};
 
@@ -42,6 +41,10 @@ use crate::wake_policy::{AgentState, WakeDecision, WakePolicy};
 /// applies `msg_preview_chars`; the per-agent loop must preserve full bodies so agents do not make
 /// decisions from truncated thread/DM input.
 const AGENT_DELIVERY_PREVIEW_CHARS: u32 = u32::MAX;
+
+/// Recheck an unavailable original-turn boundary without claiming or replaying
+/// queued input. Immediate observer errors must not spin, even under new bells.
+const BOUNDARY_RECHECK_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Last-resort backstop await for harness turn-completion. On elapse the batch is dead-lettered
 /// (moved to the `error` state), NOT marked delivered. This MUST stay above every adapter's own
@@ -95,8 +98,8 @@ impl EventLoop {
     }
 }
 
-/// The loop body. Parks, then drains-injects until the queue is empty (coalescing window), then
-/// re-parks. Runs until the task is aborted.
+/// The loop body. Parks on a bell or a scheduled pre-submission boundary recheck,
+/// then drains-injects until the queue is empty. Runs until the task is aborted.
 async fn run(session: SessionId, deps: LoopDeps) {
     tracing::info!(
         target: "nexus_dispatch::loop",
@@ -104,15 +107,23 @@ async fn run(session: SessionId, deps: LoopDeps) {
         project = %deps.project,
         "event loop parked (per-agent consumer attached)"
     );
+    let mut boundary_recheck_at = None;
     loop {
-        deps.bell.wait(&session).await;
-        // Hop 1: the bell woke us. If a live run stops here with no later "drained" line, the loop
+        if let Some(deadline) = boundary_recheck_at.take() {
+            // Keep the recheck in this task: teardown cancels it, and new mail
+            // cannot bypass the delay. A recovered observer or now-idle backend
+            // needs no additional inbound message to release retained mail.
+            tokio::time::sleep_until(deadline).await;
+        } else {
+            deps.bell.wait(&session).await;
+        }
+        // Hop 1: a bell or boundary recheck woke us. With no later "drained" line, the loop
         // is waking but the drain comes back empty — almost always a project-scope mismatch
         // (`project` here != the in-flight row's project; see `drain_once`).
         tracing::debug!(
             target: "nexus_dispatch::loop",
             session = %session,
-            "bell wake received"
+            "dispatch wake received"
         );
 
         // Consult the wake policy. `Hold` (paused/offline) → do not force a turn; re-park.
@@ -136,6 +147,13 @@ async fn run(session: SessionId, deps: LoopDeps) {
         // Drain → inject until the queue is empty. Each non-empty drain is one injected turn; a
         // drain that comes back empty closes the coalescing window.
         loop {
+            // A pause/offline hold can arrive while the original turn boundary
+            // is awaited. Re-read it before draining/claiming the next batch.
+            if WakePolicy::should_wake(deps.registry.get(&session), nexus_contracts::Kind::Agent)
+                == WakeDecision::Hold
+            {
+                break;
+            }
             let inbox = Inbox::new(&deps.store);
             // Each drain (including the coalesced turn-end drain) is a durable notification
             // boundary. Mid-turn enqueues are still `pending`, so advance them before reading.
@@ -189,24 +207,24 @@ async fn run(session: SessionId, deps: LoopDeps) {
                 turn_active,
                 deps.turn_exec.steer_capability(&session),
             ) {
-                Ok(DeliveryAction::WaitForTurnBoundary)
-                | Ok(DeliveryAction::WaitForFinalTurnCompletion) => {
+                DeliveryAction::WaitForTurnBoundary
+                | DeliveryAction::WaitForFinalTurnCompletion => {
                     if let Err(error) = deps.turn_exec.wait_for_turn_completion(&session).await {
-                        if !claim_batch(&session, &deps, &inbox, &batch).await {
-                            break;
-                        }
-                        handle_inject_error(
-                            &session,
-                            &deps,
-                            &inbox,
-                            &batch,
-                            InjectError::Contract(error),
-                        )
-                        .await;
+                        // This wait observes an earlier turn, not acceptance of
+                        // this batch. Preserve notified rows and zero attempts;
+                        // claiming here would terminalize mail never submitted.
+                        tracing::warn!(
+                            %error,
+                            %session,
+                            "active turn boundary unavailable; retaining unsent mail for bounded recheck"
+                        );
+                        boundary_recheck_at =
+                            Some(tokio::time::Instant::now() + BOUNDARY_RECHECK_DELAY);
+                        break;
                     }
                     continue;
                 }
-                Ok(DeliveryAction::NativeSteer) | Ok(DeliveryAction::InterruptAndSend) => {
+                DeliveryAction::NativeSteer | DeliveryAction::InterruptAndSend => {
                     if !claim_batch(&session, &deps, &inbox, &batch).await {
                         break;
                     }
@@ -215,21 +233,7 @@ async fn run(session: SessionId, deps: LoopDeps) {
                         SteerAttempt::Failed => break,
                     }
                 }
-                Err(error) => {
-                    if !claim_batch(&session, &deps, &inbox, &batch).await {
-                        break;
-                    }
-                    handle_inject_error(
-                        &session,
-                        &deps,
-                        &inbox,
-                        &batch,
-                        InjectError::Contract(delivery_timing_contract_error(timing, error)),
-                    )
-                    .await;
-                    continue;
-                }
-                Ok(DeliveryAction::StartTurn) => {}
+                DeliveryAction::StartTurn => {}
             }
 
             // Persist the one permitted attempt before crossing the harness boundary. If the
@@ -306,8 +310,8 @@ async fn run(session: SessionId, deps: LoopDeps) {
                         // admitted into the active turn. Dropping it here can block delivery for
                         // the full completion timeout.
                         if redrive_after_interrupt {
-                            // Cancellation has already been accepted. Coalesce later arrivals at
-                            // the same durable notified boundary without sending another cancel.
+                            // An interruption was already attempted. Keep later arrivals at the
+                            // same notified boundary without repeating even a refused cancel.
                             if let Err(error) = inbox.mark_notified(&session).await {
                                 tracing::error!(%error, session = %session, "mid-turn coalesce after interrupt failed");
                             }
@@ -462,35 +466,21 @@ async fn handle_pending_during_active_turn(
     let timing = timed_batch.timing;
     let batch = timed_batch.batch;
     match delivery_action(timing, true, deps.turn_exec.steer_capability(session)) {
-        Ok(DeliveryAction::NativeSteer) => {
+        DeliveryAction::NativeSteer => {
             if claim_batch(session, deps, inbox, &batch).await {
                 let _ = steer_claimed_batch(session, deps, inbox, &batch).await;
             }
             false
         }
-        Ok(DeliveryAction::InterruptAndSend) => {
-            interrupt_and_redrive_notified_batch(session, deps, inbox, &batch).await
+        DeliveryAction::InterruptAndSend => {
+            interrupt_and_redrive_notified_batch(session, deps, &batch).await
         }
-        Ok(DeliveryAction::WaitForTurnBoundary)
-        | Ok(DeliveryAction::WaitForFinalTurnCompletion) => {
+        DeliveryAction::WaitForTurnBoundary | DeliveryAction::WaitForFinalTurnCompletion => {
             // The current turn future is still being polled by the caller. Leave these rows
             // notified; its terminal branch immediately re-drains them.
             false
         }
-        Err(error) => {
-            if claim_batch(session, deps, inbox, &batch).await {
-                handle_inject_error(
-                    session,
-                    deps,
-                    inbox,
-                    &batch,
-                    InjectError::Contract(delivery_timing_contract_error(timing, error)),
-                )
-                .await;
-            }
-            false
-        }
-        Ok(DeliveryAction::StartTurn) => unreachable!("the caller owns an active turn"),
+        DeliveryAction::StartTurn => unreachable!("the caller owns an active turn"),
     }
 }
 
@@ -504,30 +494,25 @@ async fn handle_pending_during_active_turn(
 async fn interrupt_and_redrive_notified_batch(
     session: &SessionId,
     deps: &LoopDeps,
-    inbox: &Inbox<'_>,
     batch: &NexusBatch,
 ) -> bool {
     if let Err(error) = deps.turn_exec.interrupt_active_turn(session).await {
-        handle_inject_error(session, deps, inbox, batch, InjectError::Contract(error)).await;
-        return false;
+        // Interrupting is an optimization, never a precondition for delivery. A transport may
+        // advertise `InterruptAndSend` and still refuse the cancel, so failing here dead-lettered mail
+        // the agent never saw. Leave the batch at the durable `notified` boundary instead: the
+        // active turn's terminal branch re-drains it and delivers it normally.
+        tracing::warn!(
+            target: "nexus_dispatch::loop",
+            %session,
+            %error,
+            count = batch.counts.total,
+            "active-turn interrupt refused; leaving the batch for turn-boundary delivery"
+        );
+        // The replacement was never submitted. Preserve its wakeup even if the OLD turn
+        // subsequently fails or times out; this does not claim the cancellation succeeded.
+        return true;
     }
     true
-}
-
-fn delivery_timing_contract_error(
-    timing: DeliveryTiming,
-    error: DeliveryTimingError,
-) -> ContractError {
-    let message = match error {
-        DeliveryTimingError::InterruptUnsupported => format!(
-            "delivery timing {} is unsupported by this harness while a turn is active",
-            timing.as_str()
-        ),
-    };
-    ContractError {
-        code: nexus_contracts::codes::DELIVERY_TIMING_UNSUPPORTED,
-        message,
-    }
 }
 
 async fn steer_claimed_batch(

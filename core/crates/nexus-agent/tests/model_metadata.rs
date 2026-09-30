@@ -1,11 +1,218 @@
 //! Raw ACP replacements, before the SDK's tolerant field decoding. No native process.
-use nexus_agent::adapter::{AcpModelMetadataDialect, AdapterModelReporting};
+use nexus_agent::adapter::{
+    AcpContextUsageBasis, AcpModelMetadataDialect, AcpQuotaDialect, AdapterModelReporting,
+};
 use nexus_contracts::model_report::ModelEvidenceValue;
 use nexus_contracts::{ModelInvalidReason, ModelObservationSource, ModelUnknownReason};
 use serde_json::{json, Value};
 #[path = "../src/adapter/model_metadata.rs"]
 mod model_metadata;
 use model_metadata::{decode_configured, SnapshotKind};
+#[path = "../src/adapter/acp_quota.rs"]
+mod acp_quota;
+
+#[test]
+fn claude_acp_quota_uses_native_fraction_seconds_and_selected_window_only() {
+    use nexus_contracts::telemetry::NativeTelemetryValue;
+    let mut sample = acp_quota::AcpQuotaSnapshot::default();
+    for (kind, seconds) in [
+        ("five_hour", 18000),
+        ("seven_day", 604800),
+        ("seven_day_opus", 604800),
+        ("seven_day_sonnet", 604800),
+        ("seven_day_overage_included", 604800),
+    ] {
+        let NativeTelemetryValue::Observed(value) = sample.observe(AcpQuotaDialect::ClaudeSelectedRateLimit,
+            &json!({"status":"allowed_warning","rateLimitType":kind,"utilization":1.25,"resetsAt":1800000000}), "root", 50,
+        ) else { panic!("native allowance must be preserved") };
+        assert_eq!(
+            value.windows.len(),
+            1,
+            "selected window replaces prior window, not an inventory merge"
+        );
+        assert_eq!(
+            value.windows[0].window_id.as_str(),
+            format!("claude/{kind}")
+        );
+        assert_eq!(value.windows[0].used_percent.unwrap().get(), 125.0);
+        assert_eq!(value.windows[0].resets_at.unwrap().get(), 1800000000000);
+        assert_eq!(value.windows[0].window_seconds.unwrap().get(), seconds);
+        assert_eq!(value.provider_id.as_str(), "anthropic");
+        assert!(value.account_id.is_none());
+        assert!(value.windows[0].remaining_percent.is_none());
+        assert!(value.windows[0].limit.is_none());
+        assert!(value.metadata.native_reported_at.is_none());
+    }
+}
+
+#[test]
+fn claude_acp_quota_status_replay_does_not_refresh_old_numeric_sample() {
+    use nexus_contracts::telemetry::NativeTelemetryValue;
+    let mut sample = acp_quota::AcpQuotaSnapshot::default();
+    let mut raw = json!({"status":"allowed","rateLimitType":"five_hour","utilization":0.5,"resetsAt":1800000000});
+    for (at, expected) in [(10, 10), (20, 10)] {
+        raw["status"] = json!(if at == 10 { "allowed" } else { "rejected" });
+        let NativeTelemetryValue::Observed(value) =
+            sample.observe(AcpQuotaDialect::ClaudeSelectedRateLimit, &raw, "root", at)
+        else {
+            panic!("sample")
+        };
+        assert_eq!(value.metadata.observed_at.get(), expected);
+    }
+    raw["utilization"] = json!(0.0);
+    let NativeTelemetryValue::Observed(value) =
+        sample.observe(AcpQuotaDialect::ClaudeSelectedRateLimit, &raw, "root", 30)
+    else {
+        panic!("zero")
+    };
+    assert_eq!(value.metadata.observed_at.get(), 30);
+    assert_eq!(value.windows[0].used_percent.unwrap().get(), 0.0);
+    let NativeTelemetryValue::Observed(value) = sample.observe(
+        AcpQuotaDialect::ClaudeSelectedRateLimit,
+        &raw,
+        "replacement",
+        40,
+    ) else {
+        panic!("new root")
+    };
+    assert_eq!(value.metadata.observed_at.get(), 40);
+}
+
+#[test]
+fn claude_quota_unavailable_and_clock_rollback_do_not_retimestamp_an_identical_sample() {
+    use nexus_contracts::telemetry::NativeTelemetryValue;
+    let raw = json!({"status":"allowed","rateLimitType":"five_hour","utilization":0.5,"resetsAt":1800000000});
+    for unavailable in [
+        json!(null),
+        json!({"status":"allowed"}),
+        json!({"status":"allowed","utilization":-1}),
+    ] {
+        let mut sample = acp_quota::AcpQuotaSnapshot::default();
+        assert!(matches!(
+            sample.observe(AcpQuotaDialect::ClaudeSelectedRateLimit, &raw, "root", 10),
+            NativeTelemetryValue::Observed(_)
+        ));
+        assert!(!matches!(
+            sample.observe(
+                AcpQuotaDialect::ClaudeSelectedRateLimit,
+                &unavailable,
+                "root",
+                20
+            ),
+            NativeTelemetryValue::Observed(_)
+        ));
+        for at in [30, 5] {
+            let NativeTelemetryValue::Observed(value) =
+                sample.observe(AcpQuotaDialect::ClaudeSelectedRateLimit, &raw, "root", at)
+            else {
+                panic!("same sample")
+            };
+            assert_eq!(value.metadata.observed_at.get(), 10);
+        }
+    }
+}
+
+#[test]
+fn claude_acp_quota_absence_is_not_zero_and_malformed_values_are_not_salvaged() {
+    use nexus_contracts::telemetry::NativeTelemetryValue;
+    let mut sample = acp_quota::AcpQuotaSnapshot::default();
+    for raw in [
+        json!(null),
+        json!({"status":"allowed"}),
+        json!({"status":"rejected","rateLimitType":"five_hour","resetsAt":1800000000}),
+    ] {
+        assert!(matches!(
+            sample.observe(AcpQuotaDialect::ClaudeSelectedRateLimit, &raw, "root", 10),
+            NativeTelemetryValue::Unknown
+        ));
+    }
+    let base = json!({"status":"allowed","rateLimitType":"five_hour","utilization":0.5,"resetsAt":1800000000});
+    for changed in [
+        json!({"utilization":-1}),
+        json!({"utilization":"0.5"}),
+        json!({"resetsAt":1.5}),
+        json!({"resetsAt":9007199254741_u64}),
+        json!({"rateLimitType":"unknown_future"}),
+        json!({"status":"invented"}),
+    ] {
+        let mut raw = base.clone();
+        raw.as_object_mut()
+            .unwrap()
+            .extend(changed.as_object().unwrap().clone());
+        assert!(
+            matches!(
+                sample.observe(AcpQuotaDialect::ClaudeSelectedRateLimit, &raw, "root", 10),
+                NativeTelemetryValue::Invalid
+            ),
+            "{raw}"
+        );
+    }
+}
+
+#[test]
+fn acp_last_response_usage_preserves_native_breakdowns_without_invented_identity() {
+    use nexus_contracts::telemetry::{NativeTelemetryValue, TokenUsageScope};
+    let raw = json!({"usage":{"inputTokens":120,"outputTokens":30,"cachedReadTokens":80,
+        "thoughtTokens":12,"totalTokens":230}});
+    for total in [230, 230, 10, 0] {
+        let mut raw = raw.clone();
+        raw["usage"]["totalTokens"] = json!(total);
+        let NativeTelemetryValue::Observed(value) = model_metadata::decode_prompt_usage(
+            &raw,
+            "captured-root",
+            17,
+            &ModelObservationSource::new("codex.acp.prompt.usage").unwrap(),
+            TokenUsageScope::LastResponse,
+        ) else {
+            panic!("last response usage must be preserved")
+        };
+        let value = serde_json::to_value(value).unwrap();
+        assert_eq!(value["scope"], "lastResponse");
+        assert_eq!(value["metadata"]["nativeSessionId"], "captured-root");
+        assert_eq!(value["totalTokens"], total);
+        assert_eq!(value["inputTokens"], 120);
+        assert_eq!(value["cacheReadTokens"], 80);
+        assert_eq!(value["reasoningTokens"], 12);
+        assert_eq!(value["outputTokens"], 30);
+        for key in ["nativeTurnId", "resetId", "model", "cacheWriteTokens"] {
+            assert!(value.get(key).is_none(), "must not invent {key}");
+        }
+    }
+}
+
+#[test]
+fn acp_prompt_usage_distinguishes_absence_zero_and_invalid_native_fields() {
+    use nexus_contracts::telemetry::{NativeTelemetryValue, TokenUsageScope};
+    let decode = |raw| {
+        model_metadata::decode_prompt_usage(
+            &raw,
+            "root",
+            17,
+            &ModelObservationSource::new("codex.acp.prompt.usage").unwrap(),
+            TokenUsageScope::LastResponse,
+        )
+    };
+    for raw in [json!({}), json!({"usage":null})] {
+        assert!(matches!(decode(raw), NativeTelemetryValue::Unknown));
+    }
+    assert!(matches!(
+        decode(json!({"usage":{"totalTokens":0,"inputTokens":0,"outputTokens":0}})),
+        NativeTelemetryValue::Observed(_)
+    ));
+    for usage in [
+        json!({}),
+        json!(7),
+        json!({"totalTokens":1}),
+        json!({"totalTokens":1,"inputTokens":-1,"outputTokens":1}),
+        json!({"totalTokens":1,"inputTokens":1,"outputTokens":0,"thoughtTokens":1.5}),
+        json!({"totalTokens":9007199254740992_u64,"inputTokens":1,"outputTokens":0}),
+    ] {
+        assert!(matches!(
+            decode(json!({"usage":usage})),
+            NativeTelemetryValue::Invalid
+        ));
+    }
+}
 
 fn context(
     raw: Value,
@@ -16,7 +223,50 @@ fn context(
         "captured-root",
         17,
         &ModelObservationSource::new("codex.acp.usage_update").unwrap(),
+        AcpContextUsageBasis::CodexLastResponse,
     )
+}
+
+#[test]
+fn context_bases_do_not_promote_native_proxy_or_heuristic_capacity_to_measurement() {
+    use nexus_contracts::telemetry::NativeTelemetryValue;
+    for (semantics, basis, capacity_provenance) in [
+        (
+            AcpContextUsageBasis::ClaudeAssistantOrCompactionProxy,
+            "claude.acp.0.58.1:assistant-token-proxy-or-compaction-fallback",
+            "estimated",
+        ),
+        (
+            AcpContextUsageBasis::OpenCodeAssistantInput,
+            "opencode.acp.1.17.17:last-assistant-input-and-cache-read",
+            "native",
+        ),
+        (
+            AcpContextUsageBasis::HermesRequestEstimate,
+            "hermes.acp.0.17.0:rough-request-or-last-prompt-fallback",
+            "native",
+        ),
+    ] {
+        let NativeTelemetryValue::Observed(value) = model_metadata::decode_context(
+            &json!({"used":42000,"size":200000}),
+            "root",
+            17,
+            &ModelObservationSource::new("fixture/context").unwrap(),
+            semantics,
+        ) else {
+            panic!("native proxy still provides a useful explicitly estimated value")
+        };
+        let value = serde_json::to_value(value).unwrap();
+        assert_eq!(value["usedTokens"]["basis"], basis);
+        assert_eq!(value["usedTokens"]["provenance"], "estimated");
+        assert_eq!(
+            value["effectiveCapacityTokens"]["provenance"],
+            capacity_provenance
+        );
+        assert_eq!(value["remainingPercent"]["basis"], basis);
+        assert_eq!(value["remainingPercent"]["value"], 79.0);
+        assert!(value.get("resetId").is_none());
+    }
 }
 
 #[test]

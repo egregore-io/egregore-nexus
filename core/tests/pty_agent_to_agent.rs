@@ -78,6 +78,7 @@ impl PtyTestDaemon {
         let transport = PtyTransport::default();
         let state =
             AppState::wire_with_turn_exec(store, &Config::default(), Arc::new(transport.clone()));
+        state.wait_for_runtime_identity_ready().await.unwrap();
         PtyTestDaemon { state, transport }
     }
 

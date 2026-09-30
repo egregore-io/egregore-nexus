@@ -1,4 +1,8 @@
 use super::*;
+
+#[cfg(unix)]
+#[path = "opencode_revival.rs"]
+mod opencode_revival;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::daemon::gateway_stream_socket::{GatewayStreamFrame, GatewayStreamPublisher};
@@ -15,6 +19,13 @@ mod model_projection_artifacts {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/support/model_projection_artifacts.rs"
+    ));
+}
+
+mod claude_operator_live {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/claude_operator_live.rs"
     ));
 }
 
@@ -47,8 +58,8 @@ if (gates/'cancel').exists():
     (gates/'released').write_text('bridge processed receipt')
 while not (gates/'emit').exists(): time.sleep(.01)
 db=sqlite3.connect(home/'state.db')
-db.execute('CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, model TEXT, model_config TEXT, parent_session_id TEXT, ended_at REAL)')
-db.execute('INSERT OR REPLACE INTO sessions VALUES(?,?,?,?,?)',('native-root','native-configured','{}',None,None)); db.commit(); db.close()
+db.execute('CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, model TEXT, model_config TEXT, parent_session_id TEXT, ended_at REAL, input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, reasoning_tokens INTEGER, api_call_count INTEGER)')
+db.execute('INSERT OR REPLACE INTO sessions VALUES(?,?,?,?,?,?,?,?,?,?,?)',('native-root','native-configured','{}',None,None,120,30,80,20,12,3)); db.commit(); db.close()
 spec=importlib.util.spec_from_file_location('model_hook',home/'hooks/nexus-model/handler.py')
 hook=importlib.util.module_from_spec(spec); spec.loader.exec_module(hook)
 asyncio.run(hook.handle('agent:start',{'platform':'nexus','user_id':'nexus','chat_id':'nexus','chat_type':'dm','thread_id':'','session_id':'native-root'}))
@@ -170,6 +181,9 @@ while True: time.sleep(1)
                         if event.payload["runtimeId"] == session.0
                             && event.payload["modelReport"]["configured"]["observation"]["modelId"]
                                 == "native-configured"
+                            && event.payload["modelReport"]["telemetry"]["usage"]["observation"]
+                                ["inputTokens"]
+                                == 120
                         {
                             assert_eq!(event.payload["modelReport"]["observerActive"], true);
                             assert_eq!(event.payload["modelReport"]["backend"], "hermes.gateway");
@@ -225,7 +239,7 @@ while True: time.sleep(1)
             })
             .await
             .expect("cold native resume owns a fresh observed claim");
-            let newer = model_projection_artifacts::next(
+            let mut newer = model_projection_artifacts::next(
                 &mut frames,
                 &session.0,
                 fresh_frame["modelReport"]["reportRevision"]
@@ -235,6 +249,16 @@ while True: time.sleep(1)
                 "configured",
             )
             .await;
+            while newer["modelReport"]["telemetry"]["usage"]["observation"]["inputTokens"] != 120 {
+                newer = model_projection_artifacts::next(
+                    &mut frames,
+                    &session.0,
+                    newer["modelReport"]["reportRevision"].as_u64().unwrap(),
+                    true,
+                    "configured",
+                )
+                .await;
+            }
             state.presence.materialize_offline(&session).await.unwrap();
             let stopped = model_projection_artifacts::next(
                 &mut frames,
@@ -244,6 +268,19 @@ while True: time.sleep(1)
                 "configured",
             )
             .await;
+            for body in [&fresh_frame, &newer, &stopped] {
+                let usage = &body["modelReport"]["telemetry"]["usage"]["observation"];
+                assert_eq!(usage["scope"], "sessionCumulative");
+                assert_eq!(usage["inputTokens"], 120);
+                assert_eq!(usage["cacheReadTokens"], 80);
+                assert_eq!(usage["cacheWriteTokens"], 20);
+                assert!(usage.get("totalTokens").is_none());
+                assert!(usage.get("resetId").is_none());
+                assert_eq!(
+                    body["modelReport"]["telemetry"]["context"]["capability"],
+                    "unsupported"
+                );
+            }
             model_projection_artifacts::export("hermes", "headed", &fresh_frame, &newer, &stopped);
         }
     }
@@ -294,6 +331,7 @@ const wait = p => new Promise(resolve => { const t = setInterval(() => {if(fs.ex
   const realFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     if (String(url).endsWith('/turn/next')) return new Promise(() => {});
+    if (String(url).endsWith('/config/providers')) return new Response(JSON.stringify({providers:[{id:'native-provider',models:{'opaque-selected':{limit:{context:200000}}}}]}),{status:200});
     if (String(url).startsWith('http://native.invalid/')) return new Response(JSON.stringify({id:root}),{status:200});
     return realFetch(url,init);
   };
@@ -301,6 +339,7 @@ const wait = p => new Promise(resolve => { const t = setInterval(() => {if(fs.ex
   const hooks = await nexus();
   await wait(path.join(home,'emit'));
   await hooks.event({event:{type:'message.updated',properties:{info:{sessionID:root,id:'native-message',role:'assistant',modelID:'opaque-selected',providerID:'native-provider',time:{created:123}}}}});
+  await hooks.event({event:{type:'message.updated',properties:{info:{sessionID:root,id:'native-message',role:'assistant',modelID:'opaque-selected',providerID:'native-provider',finish:'stop',tokens:{input:40000,output:1000,reasoning:100,cache:{read:800,write:100}}}}}});
   setInterval(()=>{},1000);
 })().catch(e=>{console.error(e);process.exit(1)});
 "#).unwrap();
@@ -414,6 +453,9 @@ const wait = p => new Promise(resolve => { const t = setInterval(() => {if(fs.ex
                 if event.payload["runtimeId"] == session.0
                     && event.payload["modelReport"]["turnSelected"]["observation"]["modelId"]
                         == "opaque-selected"
+                    && event.payload["modelReport"]["telemetry"]["context"]["observation"]
+                        ["usedTokens"]["value"]
+                        == 42000
                 {
                     break event.payload;
                 }
@@ -513,7 +555,7 @@ const wait = p => new Promise(resolve => { const t = setInterval(() => {if(fs.ex
     })
     .await
     .unwrap();
-    let newer = model_projection_artifacts::next(
+    let mut newer = model_projection_artifacts::next(
         &mut frames,
         &session.0,
         fresh_frame["modelReport"]["reportRevision"]
@@ -523,6 +565,18 @@ const wait = p => new Promise(resolve => { const t = setInterval(() => {if(fs.ex
         "turnSelected",
     )
     .await;
+    while newer["modelReport"]["telemetry"]["context"]["observation"]["usedTokens"]["value"]
+        != 42000
+    {
+        newer = model_projection_artifacts::next(
+            &mut frames,
+            &session.0,
+            newer["modelReport"]["reportRevision"].as_u64().unwrap(),
+            true,
+            "turnSelected",
+        )
+        .await;
+    }
     state.presence.materialize_offline(&session).await.unwrap();
     let offline = AgentRuntimes::new(&store)
         .find_by_runtime_id(&session.0)
@@ -561,6 +615,7 @@ struct ClaudeModelCapture {
     identity: nexus_contracts::model_report::ModelProfileIdentity,
     updates: Mutex<Vec<nexus_contracts::model_report::NativeModelUpdate>>,
     closed: std::sync::atomic::AtomicBool,
+    telemetry: Mutex<Vec<nexus_contracts::telemetry::NativeTelemetryUpdate>>,
 }
 impl nexus_contracts::model_report::ModelObservationSink for ClaudeModelCapture {
     fn accepts_profile(
@@ -582,6 +637,13 @@ impl nexus_contracts::model_report::ModelObservationSink for ClaudeModelCapture 
     fn revoke(&self) {
         self.closed.store(true, Ordering::SeqCst);
     }
+    fn observe_telemetry(&self, update: nexus_contracts::telemetry::NativeTelemetryUpdate) -> bool {
+        if self.closed.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.telemetry.lock().unwrap().push(update);
+        true
+    }
 }
 
 fn claude_model_capture() -> (
@@ -593,9 +655,59 @@ fn claude_model_capture() -> (
         identity: profile.identity().clone(),
         updates: Mutex::new(Vec::new()),
         closed: std::sync::atomic::AtomicBool::new(false),
+        telemetry: Mutex::new(Vec::new()),
     });
     let pair = profile.capture(sink.clone()).unwrap();
     (sink, pair)
+}
+
+#[test]
+fn claude_response_usage_has_independent_api_message_dedupe_under_captured_source() {
+    use nexus_contracts::telemetry::{NativeTelemetryUpdate, NativeTelemetryValue};
+    use nexus_harness_claude::native::model_reporting::ClaudeTranscriptRead;
+    let dir = temp_test_dir("claude-usage-owner");
+    let path = dir.join("transcript.jsonl");
+    std::fs::write(&path, b"").unwrap();
+    let owner = ClaudeTurnCompletion::new(Some("native".into()), None);
+    let (sink, pair) = claude_model_capture();
+    assert!(owner.attach_model_reporting(pair, claude_model_source(&path)));
+    let mut bytes = String::new();
+    for (index, root, id, input, stop) in [
+        (0, "native", "api_one", 120, false),
+        (1, "native", "api_one", 120, true),
+        (2, "native", "api_one", 999, true),
+        (3, "child", "api_two", 999, true),
+        (4, "native", "api_two", 12, true),
+    ] {
+        let row = serde_json::json!({"type":"assistant","isSidechain":false,"sessionId":root,"uuid":format!("block-{index}"),"message":{"type":"message","role":"assistant","id":id,"model":"response-native","stop_reason":if stop {Some("end_turn")} else {None},"usage":{"input_tokens":input,"output_tokens":30,"cache_read_input_tokens":80,"cache_creation_input_tokens":20}}});
+        bytes.push_str(&serde_json::to_string(&row).unwrap());
+        bytes.push('\n');
+        std::fs::write(&path, &bytes).unwrap();
+        let read = ClaudeTranscriptRead::open(&path).unwrap();
+        owner.observe_models(&path, &read.response_models_after(0), Some(&read), true);
+        let expected = match index {
+            0 => 0,
+            1..=3 => 1,
+            _ => 2,
+        };
+        assert_eq!(
+            sink.telemetry.lock().unwrap().len(),
+            expected,
+            "row {index}: model dedupe must not suppress usage or count content blocks twice"
+        );
+    }
+    let values = sink.telemetry.lock().unwrap();
+    let NativeTelemetryUpdate::Usage {
+        value: NativeTelemetryValue::Observed(usage),
+        ..
+    } = values.last().unwrap()
+    else {
+        panic!("usage")
+    };
+    assert_eq!(usage.input_tokens.unwrap().get(), 12);
+    drop(values);
+    owner.close_model_reporting();
+    assert!(sink.closed.load(Ordering::SeqCst));
 }
 
 fn claude_model_source(
@@ -934,6 +1046,8 @@ async fn claude_model_actual_attachment(case: &str) {
     );
     row["message"]["id"] = serde_json::json!("fresh-response");
     row["message"]["model"] = serde_json::json!("claude-native-response");
+    row["message"]["stop_reason"] = serde_json::json!("end_turn");
+    row["message"]["usage"] = serde_json::json!({"input_tokens":120,"output_tokens":30,"cache_read_input_tokens":80,"cache_creation_input_tokens":20,"output_tokens_details":{"thinking_tokens":12}});
     std::fs::write(&path, format!("{unknown}\n{row}")).unwrap();
     let frame = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -942,6 +1056,8 @@ async fn claude_model_actual_attachment(case: &str) {
                 if payload["runtimeId"] == session.0
                     && payload["modelReport"]["responseReported"]["observation"]["modelId"]
                         == "claude-native-response"
+                    && payload["modelReport"]["telemetry"]["usage"]["observation"]["inputTokens"]
+                        == 120
                 {
                     break payload;
                 }
@@ -1082,6 +1198,7 @@ fn claude_model_completion_fences_history_replay_foreign_root_and_replaced_owner
         native_message_id: "msg-1".into(),
         model: Ok(Some("response-exact".into())),
         native_reported_at: Some(1),
+        usage: None,
     };
     owner.observe_models(&path, &[(model.clone(), 7)], Some(&initial), true);
     assert!(
@@ -1268,6 +1385,114 @@ fn opencode_viewer_backend_preserves_requested_mode() {
     assert!(opencode_viewer_backend_kind("screen").is_err());
 }
 
+#[tokio::test]
+async fn opencode_headed_observed_receipt_precedes_completion_without_late_echo() {
+    use crate::daemon::opencode_plugin_bridge::OpenCodePluginBridge;
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn request(
+        bridge: &OpenCodePluginBridge,
+        method: &str,
+        path: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        let body = body.to_string();
+        let mut stream = tokio::net::TcpStream::connect(
+            bridge
+                .endpoint()
+                .base_url()
+                .strip_prefix("http://")
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        stream.write_all(format!(
+            "{method} {path} HTTP/1.1\r\nHost: bridge\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            bridge.endpoint().token(), body.len()
+        ).as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        let status = response.split_whitespace().nth(1).unwrap().parse().unwrap();
+        let body = response.split_once("\r\n\r\n").unwrap().1;
+        (
+            status,
+            if body.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_str(body).unwrap()
+            },
+        )
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let bridge = OpenCodePluginBridge::start(
+            SessionId("s_headed_receipt_fixture".into()),
+            Arc::new(DiscardClaudeDisplay),
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let input = Arc::new(OpenCodeHeadedHarness::new(
+            bridge.input(),
+            Arc::new(LivenessProbeInput { alive: true }),
+        ));
+        let count = Arc::new(CountAcceptance::default());
+        // Equal text is two intentional submissions, not a content-deduplication key.
+        for ordinal in 1..=2 {
+            let (input, observer) = (input.clone(), count.clone());
+            let pending =
+                tokio::spawn(
+                    async move { input.send_turn_observed("still there?", observer).await },
+                );
+            let (status, turn) = request(&bridge, "GET", "/turn/next", Value::Null).await;
+            assert_eq!(status, 200);
+            let path = format!("/turn/{}", turn["id"].as_str().unwrap());
+            let binding = json!({"sessionID":"ses_exact", "messageID":format!("msg_{ordinal}")});
+            assert_eq!(
+                request(&bridge, "POST", &format!("{path}/bind"), binding.clone())
+                    .await
+                    .0,
+                204
+            );
+            for _ in 0..2 {
+                let (status, receipt) = request(
+                    &bridge,
+                    "POST",
+                    &format!("{path}/accepted"),
+                    binding.clone(),
+                )
+                .await;
+                assert_eq!(status, 200);
+                assert_eq!(
+                    receipt["canonicalEcho"], true,
+                    "headed wrapper must pass acceptance authority to the bridge"
+                );
+            }
+            assert_eq!(count.count.load(Ordering::SeqCst), ordinal);
+            assert!(
+                !pending.is_finished(),
+                "native admission must precede completion"
+            );
+            assert_eq!(
+                request(&bridge, "POST", &format!("{path}/complete"), json!({}))
+                    .await
+                    .0,
+                204
+            );
+            pending.await.unwrap().unwrap();
+            assert_eq!(
+                count.count.load(Ordering::SeqCst),
+                ordinal,
+                "completion must not emit another user echo"
+            );
+        }
+        bridge.shutdown();
+    })
+    .await
+    .expect("headed receipt fixture timed out");
+}
+
 #[test]
 fn opencode_native_viewer_does_not_use_daemon_terminal_query_replies() {
     assert!(!raw_pty_query_responder(HeadedRuntimeKind::OpenCodePlugin));
@@ -1323,17 +1548,31 @@ async fn claude_raw_submit_accepts_structured_hook_evidence_while_queue_preview_
     let input = ClaudeRawPtyInput {
         input: Arc::new(LivenessProbeInput { alive: true }),
         terminal,
-        completion,
+        completion: completion.clone(),
     };
+    completion.observe_hooks(&[native_hook("UserPromptSubmit", "old", 1)], Some(1), true);
     tokio::time::timeout(
         Duration::from_secs(2),
-        input.send_turn("queued during a tool loop"),
+        input.submit_prompt("queued during a tool loop"),
     )
     .await
     .expect("structured hook acceptance should settle before the screen preview disappears")
     .expect("Claude raw PTY submission should succeed");
 
     assert!(writes.lock().unwrap().iter().any(|bytes| bytes == b"\r"));
+    assert_eq!(
+        &writes.lock().unwrap()[..2],
+        &[vec![0x01], vec![0x0b]],
+        "editing keys must not be a single pasted control chunk"
+    );
+    assert!(
+        !writes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|bytes| bytes.contains(&3)),
+        "normal submission never sends Ctrl-C"
+    );
 }
 
 #[tokio::test]
@@ -1431,9 +1670,301 @@ struct BlockAcceptance {
     release: tokio::sync::Semaphore,
 }
 
+struct QueuedOperatorInput {
+    completion: Arc<ClaudeTurnCompletion>,
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl HarnessInput for QueuedOperatorInput {
+    async fn send_turn(&self, text: &str) -> Result<(), String> {
+        self.calls.lock().unwrap().push(format!("input:{text}"));
+        let submit = parse_hook_record(
+            &serde_json::json!({
+                "event": "UserPromptSubmit", "session_id": "native", "prompt_id": "B", "prompt": text
+            }),
+            2,
+        );
+        self.completion
+            .observe_hooks(&[submit.clone()], Some(2), true);
+        assert!(self.completion.accept_native_user_input(&submit).await);
+        Ok(())
+    }
+
+    async fn interrupt_active_turn(&self) -> Result<(), String> {
+        self.calls.lock().unwrap().push("interrupt".into());
+        // Ctrl-C delivery does not synchronously generate a Stop hook.
+        assert!(self.completion.has_open_turn());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn claude_operator_input_submits_during_native_work_without_interrupt_or_stop() {
+    check_claude_operator_input(false).await;
+}
+
+#[tokio::test]
+async fn claude_operator_redirect_interrupts_then_submits_without_old_stop() {
+    check_claude_operator_input(true).await;
+}
+
+async fn check_claude_operator_input(redirect: bool) {
+    let completion = Arc::new(ClaudeTurnCompletion::new(Some("native".into()), None));
+    completion.observe_hooks(&[native_hook("UserPromptSubmit", "old", 1)], Some(1), true);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let transport = PtyTransport::default();
+    let session = SessionId("isolated-claude-operator-input".into());
+    transport.bind(
+        session.clone(),
+        Arc::new(ClaudeNativeHarness {
+            input: Arc::new(QueuedOperatorInput {
+                completion: completion.clone(),
+                calls: calls.clone(),
+            }),
+            completion: completion.clone(),
+        }),
+    );
+    assert!(transport.accepts_prompt_while_busy(&session));
+    assert!(!transport.accepts_prompt_while_busy(&SessionId("foreign".into())));
+    let event = nexus_contracts::WsEvent::AgentUpdate {
+        session_id: session.clone(),
+        kind: nexus_contracts::AgentUpdateKind::UserInput,
+        data: serde_json::json!({"text":"new", "clientMessageId":"isolated-input"}),
+    };
+    let events = Arc::new(DiscardClaudeDisplay);
+    let result = tokio::time::timeout(Duration::from_secs(1), async {
+        if redirect {
+            transport
+                .steer_observed(&session, "new".into(), events, event)
+                .await
+                .map(|_| ())
+        } else {
+            transport
+                .prompt_observed(&session, "new".into(), events, event)
+                .await
+        }
+    })
+    .await
+    .expect("operator acceptance must not wait for native Stop");
+    result.expect("active Claude must accept operator input through its native queue");
+    let expected = if redirect {
+        vec!["interrupt", "input:new"]
+    } else {
+        vec!["input:new"]
+    };
+    assert_eq!(*calls.lock().unwrap(), expected);
+    assert!(
+        completion.has_open_turn(),
+        "input receipt must not synthesize turn completion"
+    );
+}
+
+#[tokio::test]
+async fn claude_operator_plain_prompt_uses_native_acceptance_without_stop() {
+    let completion = Arc::new(ClaudeTurnCompletion::new(Some("native".into()), None));
+    completion.observe_hooks(&[native_hook("UserPromptSubmit", "old", 1)], Some(1), true);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let transport = PtyTransport::default();
+    let session = SessionId("isolated-plain-operator".into());
+    transport.bind(
+        session.clone(),
+        Arc::new(ClaudeNativeHarness {
+            input: Arc::new(QueuedOperatorInput {
+                completion: completion.clone(),
+                calls: calls.clone(),
+            }),
+            completion: completion.clone(),
+        }),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        transport.prompt(&session, "plain".into()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(*calls.lock().unwrap(), ["input:plain"]);
+    assert!(completion.has_open_turn());
+}
+
+#[tokio::test]
+async fn claude_operator_receipt_does_not_accept_stop_only() {
+    struct StopOnlyInput(Arc<ClaudeTurnCompletion>);
+    #[async_trait]
+    impl HarnessInput for StopOnlyInput {
+        async fn send_turn(&self, _: &str) -> Result<(), String> {
+            self.0
+                .observe_hooks(&[native_hook("Stop", "", 1)], Some(1), true);
+            Ok(())
+        }
+    }
+    let completion = Arc::new(ClaudeTurnCompletion::new(Some("native".into()), None));
+    let input = ClaudeNativeHarness {
+        input: Arc::new(StopOnlyInput(completion.clone())),
+        completion,
+    };
+    let observer = Arc::new(CountAcceptance::default());
+    tokio::time::timeout(
+        Duration::from_millis(25),
+        input.submit_prompt_observed("unproven", observer.clone(), false),
+    )
+    .await
+    .expect_err("Stop cannot substitute for an exact submit receipt");
+    assert_eq!(observer.count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn claude_operator_overlap_preserves_exact_bus_terminal_authority() {
+    for same_native_turn in [false, true] {
+        let completion = Arc::new(ClaudeTurnCompletion::new(Some("native".into()), None));
+        let bus = completion.register_accepted_input("bus", Arc::new(CountAcceptance::default()));
+        let old = native_hook("UserPromptSubmit", "bus", 1);
+        completion.observe_hooks(&[old.clone()], Some(1), true);
+        assert!(completion.accept_native_user_input(&old).await);
+        let operator =
+            completion.register_accepted_input("operator", Arc::new(CountAcceptance::default()));
+        let id = if same_native_turn { "A" } else { "B" };
+        let new = parse_hook_record(
+            &serde_json::json!({"event":"UserPromptSubmit","session_id":"native","prompt_id":id,"prompt":"operator"}),
+            2,
+        );
+        completion.observe_hooks(&[new.clone()], Some(2), true);
+        assert!(completion.accept_native_user_input(&new).await);
+        operator
+            .wait_accepted(Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert!(completion.has_open_turn());
+        let stop = parse_hook_record(
+            &serde_json::json!({"event":"Stop","session_id":"native","prompt_id":id}),
+            3,
+        );
+        completion.observe_hooks(&[stop], Some(3), true);
+        operator.wait(Duration::from_millis(10)).await.unwrap();
+        assert_eq!(
+            bus.wait(Duration::from_millis(10)).await.is_ok(),
+            same_native_turn,
+            "NEW Stop cannot settle interrupted OLD bus turn"
+        );
+        assert!(!completion.has_open_turn());
+        assert!(!completion.is_unknown());
+    }
+}
+
 struct NativeWriteBarrier {
     entered: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
+}
+
+#[tokio::test]
+async fn claude_operator_cancel_after_write_releases_receipt_and_next_input_lane() {
+    let completion = Arc::new(ClaudeTurnCompletion::new(Some("native".into()), None));
+    let writer = Arc::new(NativeWriteBarrier {
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let input = Arc::new(ClaudeNativeHarness {
+        input: writer.clone(),
+        completion: completion.clone(),
+    });
+    let abandoned_observer = Arc::new(CountAcceptance::default());
+    let first_input = input.clone();
+    let first_observer = abandoned_observer.clone();
+    let first = tokio::spawn(async move {
+        first_input
+            .submit_prompt_observed("abandoned", first_observer, false)
+            .await
+    });
+    writer.entered.acquire().await.unwrap().forget();
+    writer.release.add_permits(1);
+    drop(
+        tokio::time::timeout(Duration::from_secs(1), completion.lock_input())
+            .await
+            .unwrap(),
+    );
+    assert!(
+        !first.is_finished(),
+        "write returned, exact receipt still pending"
+    );
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    let late = native_hook("UserPromptSubmit", "abandoned", 1);
+    completion.observe_hooks(&[late.clone()], Some(1), true);
+    assert!(
+        !completion.accept_native_user_input(&late).await,
+        "cancelled caller cannot acquire a late accepted event"
+    );
+    assert_eq!(abandoned_observer.count.load(Ordering::SeqCst), 0);
+    let next_observer = Arc::new(CountAcceptance::default());
+    let next_input = input.clone();
+    let observed = next_observer.clone();
+    let next = tokio::spawn(async move {
+        next_input
+            .submit_prompt_observed("next", observed, false)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), writer.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    writer.release.add_permits(1);
+    let receipt = native_hook("UserPromptSubmit", "next", 2);
+    completion.observe_hooks(&[receipt.clone()], Some(2), true);
+    assert!(completion.accept_native_user_input(&receipt).await);
+    tokio::time::timeout(Duration::from_secs(1), next)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(next_observer.count.load(Ordering::SeqCst), 1);
+    assert!(
+        completion.has_open_turn(),
+        "cancelled API future does not erase native work"
+    );
+}
+
+#[tokio::test]
+async fn claude_operator_waiting_lane_rechecks_replacement_before_interrupt_or_write() {
+    let completion = Arc::new(ClaudeTurnCompletion::new(Some("native".into()), None));
+    let writer = Arc::new(NativeWriteBarrier {
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let input = Arc::new(ClaudeNativeHarness {
+        input: writer.clone(),
+        completion: completion.clone(),
+    });
+    let first_input = input.clone();
+    let first = tokio::spawn(async move {
+        first_input
+            .submit_prompt_observed("first", Arc::new(CountAcceptance::default()), false)
+            .await
+    });
+    writer.entered.acquire().await.unwrap().forget();
+    let mut second = Box::pin(input.submit_prompt_observed(
+        "second",
+        Arc::new(CountAcceptance::default()),
+        true,
+    ));
+    assert!(
+        std::future::Future::poll(
+            second.as_mut(),
+            &mut std::task::Context::from_waker(std::task::Waker::noop())
+        )
+        .is_pending(),
+        "redirect must wait for captured input lane"
+    );
+    completion.invalidate();
+    writer.release.add_permits(1);
+    assert!(first.await.unwrap().unwrap_err().contains("replaced"));
+    assert!(second.await.unwrap_err().contains("replaced"));
+    assert_eq!(
+        writer.entered.available_permits(),
+        0,
+        "no second native write"
+    );
 }
 
 #[async_trait]
@@ -4370,14 +4901,15 @@ fn claude_headed_env_re_exports_custom_config_after_tmux_sanitization() {
 
 #[test]
 fn hermes_machine_home_collapses_runtime_profile_to_global_root() {
-    let home = PathBuf::from("/home/operator");
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("operator");
     let profile = home.join(".hermes/profiles/nexus-s_agent");
     assert_eq!(
         resolve_machine_hermes_home(None, Some(&profile), Some(&home)).unwrap(),
         home.join(".hermes")
     );
 
-    let custom_root = PathBuf::from("/srv/hermes-data");
+    let custom_root = fixture.path().join("hermes-data");
     let custom_profile = custom_root.join("profiles/nexus-s_agent");
     assert_eq!(
         resolve_machine_hermes_home(None, Some(&custom_profile), Some(&home)).unwrap(),
@@ -4387,8 +4919,9 @@ fn hermes_machine_home_collapses_runtime_profile_to_global_root() {
 
 #[test]
 fn hermes_machine_home_preserves_explicit_root_and_home_default() {
-    let home = PathBuf::from("/home/operator");
-    let explicit = PathBuf::from("/srv/hermes-data");
+    let fixture = tempfile::tempdir().unwrap();
+    let home = fixture.path().join("operator");
+    let explicit = fixture.path().join("hermes-data");
     assert_eq!(
         resolve_machine_hermes_home(None, Some(&explicit), Some(&home)).unwrap(),
         explicit
@@ -4484,6 +5017,109 @@ fn opencode_binary_preflight_resolves_path_and_override() {
         resolve_opencode_executable(Some(bin.to_string_lossy().as_ref()), Some("")).unwrap(),
         bin.to_string_lossy()
     );
+}
+
+#[test]
+fn opencode_launch_env_reaches_generated_shim_without_ambient_cli() {
+    // Other harness fixtures temporarily replace PATH. Hold the shared guard while
+    // capturing and executing Node so this test cannot inherit their toolchain.
+    let _env = crate::cli::ambient::TestEnvGuard::new(&[]);
+    for (opt_outs, expected_skip) in [
+        ([false, false], ""),
+        ([true, false], "NEXUS_SKIP_AGENT_BOOTSTRAP_INSTALL"),
+        ([false, true], "NEXUS_SKIP_AGENT_HOOK_INSTALL"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = SessionId("s_launch_env".into());
+        let files = write_opencode_plugin_files(tmp.path(), &session).unwrap();
+        let mut env = opencode_plugin_env(
+            &session,
+            "a_exact",
+            Some("exact"),
+            "project",
+            "fixture-key",
+            "/captured daemon/nexus",
+            opt_outs,
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(key, _)| key == "NEXUS_CLI")
+                .map(|(_, value)| value.as_str()),
+            Some("/captured daemon/nexus")
+        );
+        env.extend([
+            (
+                "NEXUS_OPENCODE_PLUGIN_PATH".into(),
+                files.plugin_path.to_string_lossy().into_owned(),
+            ),
+            (
+                "NEXUS_OPENCODE_HOME".into(),
+                tmp.path().join("home").to_string_lossy().into_owned(),
+            ),
+            ("NEXUS_OPENCODE_BIN".into(), "fixture-native".into()),
+        ]);
+        let driver = tmp.path().join("launch-env.mjs");
+        std::fs::write(&driver, r#"
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+globalThis.capture=(_bin,_args,options)=>{
+ const expected=process.argv[3], config=JSON.parse(options.env.OPENCODE_CONFIG_CONTENT);
+ for(const key of ['NEXUS_SKIP_AGENT_BOOTSTRAP_INSTALL','NEXUS_SKIP_AGENT_HOOK_INSTALL'])
+   assert.equal(options.env[key],key===expected?'1':'0','captured opt-out survives launch');
+ if(expected) assert.equal(config.mcp?.['nexus-bus'],undefined,'explicit opt-out does not install inline MCP');
+ else assert.deepEqual(config.mcp['nexus-bus'].command,['/captured daemon/nexus','mcp','--as','exact','--project','project','--client-key','fixture-key','--agent','opencode']);
+ process.exit(0);
+};
+const source=readFileSync(process.argv[2],'utf8').replace('import { spawn } from "node:child_process";','const spawn=globalThis.capture;');
+await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`);
+"#).unwrap();
+        let args = vec![
+            driver.to_string_lossy().into_owned(),
+            files.serve_path.to_string_lossy().into_owned(),
+            expected_skip.into(),
+        ];
+        let mut raw = std::process::Command::new("node");
+        raw.env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .envs(std::env::vars_os().filter(|(name, _)| {
+                cfg!(windows) && name.to_string_lossy().eq_ignore_ascii_case("SystemRoot")
+            }))
+            .env("NEXUS_CLI", "ambient-wrong")
+            .env("NEXUS_SKIP_AGENT_BOOTSTRAP_INSTALL", "1")
+            .env("NEXUS_SKIP_AGENT_HOOK_INSTALL", "1")
+            .envs(env.iter().cloned())
+            .args(&args);
+        let output = raw.output().unwrap();
+        assert!(
+            output.status.success(),
+            "raw: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        #[cfg(unix)]
+        {
+            let shell = nexus_pty::tmux_launch_shell_command(
+                "node",
+                &args,
+                tmp.path().to_str().unwrap(),
+                &env,
+            );
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &shell])
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("NEXUS_CLI", "ambient-wrong")
+                .env("NEXUS_CLIENT_KEY", "wrong-key")
+                .env("NEXUS_SKIP_AGENT_BOOTSTRAP_INSTALL", "1")
+                .env("NEXUS_SKIP_AGENT_HOOK_INSTALL", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "tmux shell: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 }
 
 #[test]
@@ -5160,6 +5796,73 @@ async fn kill_removes_terminal_socket_endpoint() {
 /// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
 fn hid(s: &str) -> nexus_contracts::HarnessId {
     nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
+}
+
+/// A program that prints one line to its terminal and exits non-zero — a stand-in for the
+/// OpenCode serve shim crashing during boot.
+fn crashing_pty_command(message: &str) -> CommandBuilder {
+    #[cfg(windows)]
+    {
+        let mut cmd = CommandBuilder::new("cmd.exe");
+        cmd.args(["/D", "/C", &format!("echo {message}& exit 1")]);
+        cmd
+    }
+    #[cfg(not(windows))]
+    {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.args(["-c", &format!("echo '{message}'; exit 1")]);
+        cmd
+    }
+}
+
+#[tokio::test]
+async fn raw_opencode_ready_wait_reports_last_screen_output_when_shim_exits() {
+    let size = PtySize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let pty =
+        Arc::new(PtySession::spawn(crashing_pty_command("serve boom: ENOENT"), size).unwrap());
+    let screen = ScreenModelBackend::wrap(pty.clone());
+    let ready_path = std::env::temp_dir().join(format!(
+        "nexus-opencode-ready-never-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&ready_path);
+
+    let err = wait_for_opencode_plugin_ready_raw(
+        pty.as_ref(),
+        screen.as_ref(),
+        &ready_path,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect_err("a shim that exits before writing the ready file must fail the launch");
+
+    assert!(
+        err.starts_with(
+            "raw PTY exited before OpenCode plugin reported ready; last screen output: "
+        ),
+        "{err}"
+    );
+    assert!(
+        err.contains("serve boom: ENOENT"),
+        "the operator-facing error must carry what the shim printed: {err}"
+    );
+}
+
+#[test]
+fn last_screen_output_is_omitted_when_the_screen_is_blank() {
+    assert_eq!(
+        with_last_screen_output("raw PTY exited", "  \n \n"),
+        "raw PTY exited"
+    );
+    assert_eq!(
+        with_last_screen_output("raw PTY exited", "\n  boom  \n"),
+        "raw PTY exited; last screen output: boom"
+    );
 }
 
 // Actual managed AppState + Agent + coordinator, with an inert metadata-emitting adapter.

@@ -93,6 +93,8 @@ export const spawnSchema = z.object({
   kind: harnessSchema,
   name: z.string().min(1).optional(),
   cwd: z.string().optional(),
+  headless: z.boolean().optional(),
+  initialPrompt: z.string().optional(),
 }).strict();
 
 /** POST /agents/:id/tier → admin.grantTier (name comes from the path param). */

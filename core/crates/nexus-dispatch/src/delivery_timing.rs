@@ -14,28 +14,27 @@ pub enum DeliveryAction {
     WaitForFinalTurnCompletion,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeliveryTimingError {
-    InterruptUnsupported,
-}
-
 /// Resolve one public timing value against authoritative active-turn state.
+///
+/// Infallible. A busy target whose backend cannot be interrupted waits for the turn boundary;
+/// that is a scheduling outcome, never a delivery failure. Returning an error here dead-lettered
+/// the batch, so an operator messaging a busy agent was silently ignored.
 pub fn delivery_action(
     timing: DeliveryTiming,
     turn_active: bool,
     capability: SteerCapability,
-) -> Result<DeliveryAction, DeliveryTimingError> {
+) -> DeliveryAction {
     if !turn_active {
-        return Ok(DeliveryAction::StartTurn);
+        return DeliveryAction::StartTurn;
     }
 
     match timing {
         DeliveryTiming::Interrupt => match capability {
-            SteerCapability::NativeSteer => Ok(DeliveryAction::NativeSteer),
-            SteerCapability::InterruptAndSend => Ok(DeliveryAction::InterruptAndSend),
-            SteerCapability::None => Err(DeliveryTimingError::InterruptUnsupported),
+            SteerCapability::NativeSteer => DeliveryAction::NativeSteer,
+            SteerCapability::InterruptAndSend => DeliveryAction::InterruptAndSend,
+            SteerCapability::None => DeliveryAction::WaitForTurnBoundary,
         },
-        DeliveryTiming::YieldTurn => Ok(DeliveryAction::WaitForTurnBoundary),
-        DeliveryTiming::AfterToolLoop => Ok(DeliveryAction::WaitForFinalTurnCompletion),
+        DeliveryTiming::YieldTurn => DeliveryAction::WaitForTurnBoundary,
+        DeliveryTiming::AfterToolLoop => DeliveryAction::WaitForFinalTurnCompletion,
     }
 }

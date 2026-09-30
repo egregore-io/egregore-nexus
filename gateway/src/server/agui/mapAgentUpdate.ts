@@ -18,6 +18,15 @@ import type { WsEvent } from "@shared/types";
 /** The contract `agent.update` wire event — the input this mapper consumes. */
 export type AgentUpdateEvent = Extract<WsEvent, { type: "agent.update" }>;
 
+// Internal projection metadata, not a property accepted from native wire data.
+// The materialized relay passes these objects directly to the mapper; object
+// spreads preserve the symbol, while serializing a raw wire event cannot forge it.
+const materializedBlock = Symbol("nexus.materializedBlock");
+type MaterializedUpdate = AgentUpdateEvent & { [materializedBlock]?: string };
+export function withMaterializedBlock(ev: AgentUpdateEvent, rowId: string, index: number): AgentUpdateEvent {
+  return { ...ev, [materializedBlock]: JSON.stringify([ev.sessionId, rowId, index]) } as MaterializedUpdate;
+}
+
 /** CUSTOM event name carrying a harness's advertised slash commands. */
 export const NEXUS_COMMANDS_EVENT = "nexus.commands";
 
@@ -25,6 +34,14 @@ export const NEXUS_COMMANDS_EVENT = "nexus.commands";
 
 /** Which streaming message channel is currently open (at most one). */
 type OpenChannel = "text" | "reasoning" | null;
+
+interface GeneratedMessageOrigin {
+  kind: "generated";
+  sessionId: string;
+  sourceEventId: number;
+  channel: "text" | "reasoning" | "user";
+  materializedBlock?: string;
+}
 
 /**
  * Per-run bracketing state. `messageId` is the id of the currently-open text /
@@ -37,6 +54,8 @@ export interface AguiBracket {
   messageId: string | null;
   /** Native harness item id for the open message, when the stream supplies one. */
   messageItemId: string | null;
+  messageOrigin: GeneratedMessageOrigin | null;
+  messageBlockId: string | null;
   openToolIds: Set<string>;
   userInputEchoes: Map<string, string | null>;
   /** Monotonic counter so each new message block gets a fresh id. */
@@ -49,6 +68,8 @@ export function newBracket(): AguiBracket {
     openChannel: null,
     messageId: null,
     messageItemId: null,
+    messageOrigin: null,
+    messageBlockId: null,
     openToolIds: new Set(),
     userInputEchoes: new Map(),
     seq: 0,
@@ -76,7 +97,9 @@ const reasoningEnd = (messageId: string): BaseEvent =>
 const toolStart = (toolCallId: string, toolCallName: string): BaseEvent =>
   ({ type: EventType.TOOL_CALL_START, toolCallId, toolCallName }) as BaseEvent;
 const toolArgs = (toolCallId: string, delta: string): BaseEvent =>
-  ({ type: EventType.TOOL_CALL_ARGS, toolCallId, delta }) as BaseEvent;
+  // Canonical input is a whole structured value, not a string fragment. Older
+  // consumers must be paired before rollout; absence of append remains a delta.
+  ({ type: EventType.TOOL_CALL_ARGS, toolCallId, delta, append: false }) as BaseEvent;
 const toolResult = (
   toolCallId: string,
   content: string,
@@ -144,10 +167,32 @@ function generatedMessageId(
   data: Record<string, unknown>,
   kind: "msg" | "user",
   seq: number,
+  blockId?: string,
 ): string {
+  if (blockId !== undefined) return `nexus-materialized:${encodeURIComponent(blockId)}:${kind}`;
   const id = streamEventId(data);
   const scope = id === undefined ? sessionId : `${sessionId}:stream:${id}`;
-  return `${scope}:${kind}:${seq}`;
+  // A retained source event opens at most one block of a given kind. Its identity
+  // must not depend on how many earlier blocks this particular replay observed.
+  // Epoch/authority remain carried by the enclosing exact-source stream.
+  return `${scope}:${kind}:${id === undefined ? seq : 1}`;
+}
+
+function generatedOrigin(
+  sessionId: string,
+  data: Record<string, unknown>,
+  channel: GeneratedMessageOrigin["channel"],
+  blockId?: string,
+): GeneratedMessageOrigin | null {
+  const sourceEventId = streamEventId(data);
+  return sourceEventId === undefined ? null : {
+    kind: "generated", sessionId, sourceEventId, channel,
+    ...(blockId !== undefined ? {materializedBlock: blockId} : {}),
+  };
+}
+
+function withOrigin(event: BaseEvent, origin: GeneratedMessageOrigin | null): BaseEvent {
+  return origin ? { ...event, nexusMessageOrigin: origin } as BaseEvent : event;
 }
 
 /** Convert tool output payloads into displayable text without dropping structured JSON. */
@@ -163,12 +208,14 @@ function toolContent(v: unknown): string | undefined {
 
 /** Close whatever message channel is open, appending its END event. */
 function endOpenChannel(b: AguiBracket, out: BaseEvent[]): void {
-  if (b.openChannel === "text" && b.messageId) out.push(textEnd(b.messageId));
+  if (b.openChannel === "text" && b.messageId) out.push(withOrigin(textEnd(b.messageId), b.messageOrigin));
   else if (b.openChannel === "reasoning" && b.messageId)
-    out.push(reasoningEnd(b.messageId));
+    out.push(withOrigin(reasoningEnd(b.messageId), b.messageOrigin));
   b.openChannel = null;
   b.messageId = null;
   b.messageItemId = null;
+  b.messageOrigin = null;
+  b.messageBlockId = null;
 }
 
 // --- OUT mapping ------------------------------------------------------------
@@ -192,12 +239,15 @@ export function acpToAguiEvents(
     openChannel: bracket.openChannel,
     messageId: bracket.messageId,
     messageItemId: bracket.messageItemId,
+    messageOrigin: bracket.messageOrigin,
+    messageBlockId: bracket.messageBlockId,
     openToolIds: new Set(bracket.openToolIds),
     userInputEchoes: new Map(bracket.userInputEchoes),
     seq: bracket.seq,
   };
   const out: BaseEvent[] = [];
   const data = asRecord(ev.data);
+  const blockId = (ev as MaterializedUpdate)[materializedBlock];
 
   switch (ev.kind) {
     case "text":
@@ -208,19 +258,22 @@ export function acpToAguiEvents(
       if (b.openChannel && b.openChannel !== channel) endOpenChannel(b, out);
       // Native item ids distinguish adjacent messages even when their AG-UI channel is the same.
       if (b.openChannel === channel && b.messageItemId !== itemId) endOpenChannel(b, out);
+      if (b.openChannel === channel && itemId === null && b.messageBlockId !== (blockId ?? null)) endOpenChannel(b, out);
       if (b.openChannel !== channel) {
-        const messageId = itemId ?? generatedMessageId(ev.sessionId, data, "msg", ++b.seq);
+        const messageId = itemId ?? generatedMessageId(ev.sessionId, data, "msg", ++b.seq, blockId);
         b.openChannel = channel;
         b.messageId = messageId;
         b.messageItemId = itemId;
-        out.push(channel === "text" ? textStart(messageId) : reasoningStart(messageId));
+        b.messageBlockId = itemId === null ? blockId ?? null : null;
+        b.messageOrigin = itemId === null ? generatedOrigin(ev.sessionId, data, channel, blockId) : null;
+        out.push(withOrigin(channel === "text" ? textStart(messageId) : reasoningStart(messageId), b.messageOrigin));
       }
       const delta = str(data.text) ?? "";
       const messageId = b.messageId as string;
       out.push(
-        channel === "text"
+        withOrigin(channel === "text"
           ? textContent(messageId, delta)
-          : reasoningContent(messageId, delta),
+          : reasoningContent(messageId, delta), b.messageOrigin),
       );
       break;
     }
@@ -285,10 +338,12 @@ export function acpToAguiEvents(
       const text = str(data.text) ?? "";
       const explicitMessageId =
         str(data.clientMessageId) ?? str(data.client_message_id) ?? null;
+      const scopedMessageId = explicitMessageId ?? (blockId === undefined ? null
+        : generatedMessageId(ev.sessionId, data, "user", 0, blockId));
       const seenMessageId = b.userInputEchoes.get(text);
       if (
         seenMessageId !== undefined &&
-        (explicitMessageId === null || seenMessageId === null || explicitMessageId === seenMessageId)
+        (scopedMessageId === null || seenMessageId === null || scopedMessageId === seenMessageId)
       ) {
         if (seenMessageId === null && explicitMessageId !== null) {
           b.userInputEchoes.set(text, explicitMessageId);
@@ -296,13 +351,14 @@ export function acpToAguiEvents(
         break;
       }
       const messageId =
-        explicitMessageId ?? generatedMessageId(ev.sessionId, data, "user", ++b.seq);
+        scopedMessageId ?? generatedMessageId(ev.sessionId, data, "user", ++b.seq);
       b.userInputEchoes.set(text, messageId);
       const metadata = userInputMetadata(data);
+      const origin = explicitMessageId === null ? generatedOrigin(ev.sessionId, data, "user", blockId) : null;
       out.push(
-        { ...(userStart(messageId) as Record<string, unknown>), ...metadata } as unknown as BaseEvent,
-        { ...(textContent(messageId, text) as Record<string, unknown>), ...metadata } as unknown as BaseEvent,
-        { ...(textEnd(messageId) as Record<string, unknown>), ...metadata } as unknown as BaseEvent,
+        withOrigin({ ...(userStart(messageId) as Record<string, unknown>), ...metadata } as unknown as BaseEvent, origin),
+        withOrigin({ ...(textContent(messageId, text) as Record<string, unknown>), ...metadata } as unknown as BaseEvent, origin),
+        withOrigin({ ...(textEnd(messageId) as Record<string, unknown>), ...metadata } as unknown as BaseEvent, origin),
       );
       break;
     }
@@ -328,8 +384,8 @@ export function acpToAguiEvents(
 export function closeRun(bracket: AguiBracket): BaseEvent[] {
   const out: BaseEvent[] = [];
   if (bracket.openChannel === "text" && bracket.messageId)
-    out.push(textEnd(bracket.messageId));
+    out.push(withOrigin(textEnd(bracket.messageId), bracket.messageOrigin));
   else if (bracket.openChannel === "reasoning" && bracket.messageId)
-    out.push(reasoningEnd(bracket.messageId));
+    out.push(withOrigin(reasoningEnd(bracket.messageId), bracket.messageOrigin));
   return out;
 }

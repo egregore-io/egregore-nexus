@@ -203,6 +203,13 @@ pub enum TelemetryProvenance {
 pub enum TokenUsageScope {
     Turn,
     SessionCumulative,
+    /// Latest native response sample, not a whole prompt or cumulative session total.
+    /// Repeated/decreasing observations replace the prior sample; counter_id is provenance,
+    /// not an instruction to accumulate. A native turn/reset identity is not implied.
+    LastResponse,
+    /// Latest completed native prompt's aggregate, potentially containing multiple responses.
+    /// A replaceable sample without an exported native turn ID; never accumulate snapshots.
+    LastPrompt,
 }
 
 #[typeshare]

@@ -15,6 +15,7 @@ use nexus_contracts::{
 };
 
 pub mod acp;
+mod acp_quota;
 pub mod bootstrap;
 pub mod engine;
 pub mod hermes;
@@ -133,6 +134,29 @@ pub struct AdapterTelemetryReportingProfile {
     usage: AdapterTelemetryCapability,
     context: AdapterTelemetryCapability,
     quota: AdapterTelemetryCapability,
+    prompt_usage_scope: Option<AcpPromptUsageScope>,
+    context_usage_basis: Option<AcpContextUsageBasis>,
+    quota_dialect: Option<AcpQuotaDialect>,
+}
+
+pub use nexus_harness_telemetry::{AcpContextUsageBasis, AcpQuotaDialect};
+
+/// Adapter-pinned semantics of session/prompt.usage, never inferred from the common ACP shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcpPromptUsageScope {
+    LastResponse,
+    LastPrompt,
+    SessionCumulative,
+}
+impl AcpPromptUsageScope {
+    pub fn wire(self) -> nexus_contracts::telemetry::TokenUsageScope {
+        use nexus_contracts::telemetry::TokenUsageScope;
+        match self {
+            Self::LastResponse => TokenUsageScope::LastResponse,
+            Self::LastPrompt => TokenUsageScope::LastPrompt,
+            Self::SessionCumulative => TokenUsageScope::SessionCumulative,
+        }
+    }
 }
 
 impl AdapterTelemetryReportingProfile {
@@ -145,7 +169,46 @@ impl AdapterTelemetryReportingProfile {
             usage,
             context,
             quota,
+            prompt_usage_scope: None,
+            context_usage_basis: None,
+            quota_dialect: None,
         }
+    }
+    pub fn with_prompt_usage(mut self, scope: AcpPromptUsageScope) -> Result<Self, NexusError> {
+        if self.usage.capability() != ModelEvidenceCapability::Supported {
+            return Err(NexusError::Adapter(
+                "ACP prompt usage needs a supported captured usage source".into(),
+            ));
+        }
+        self.prompt_usage_scope = Some(scope);
+        Ok(self)
+    }
+    pub fn prompt_usage_scope(&self) -> Option<AcpPromptUsageScope> {
+        self.prompt_usage_scope
+    }
+    pub fn with_context_usage(mut self, basis: AcpContextUsageBasis) -> Result<Self, NexusError> {
+        if self.context.capability() != ModelEvidenceCapability::Supported {
+            return Err(NexusError::Adapter(
+                "ACP context needs a supported captured context source".into(),
+            ));
+        }
+        self.context_usage_basis = Some(basis);
+        Ok(self)
+    }
+    pub fn context_usage_basis(&self) -> Option<AcpContextUsageBasis> {
+        self.context_usage_basis
+    }
+    pub fn with_quota_dialect(mut self, dialect: AcpQuotaDialect) -> Result<Self, NexusError> {
+        if self.quota.capability() != ModelEvidenceCapability::Supported {
+            return Err(NexusError::Adapter(
+                "ACP quota dialect requires a supported source".into(),
+            ));
+        }
+        self.quota_dialect = Some(dialect);
+        Ok(self)
+    }
+    pub fn quota_dialect(&self) -> Option<AcpQuotaDialect> {
+        self.quota_dialect
     }
     pub fn usage(&self) -> &AdapterTelemetryCapability {
         &self.usage

@@ -145,6 +145,13 @@ struct EmitAcceptedEvent {
     pending: Mutex<Option<(Arc<dyn EventSink>, WsEvent)>>,
 }
 
+struct IgnoreAcceptedEvent;
+
+#[async_trait]
+impl TurnAcceptanceObserver for IgnoreAcceptedEvent {
+    async fn accepted(&self) {}
+}
+
 impl EmitAcceptedEvent {
     fn new(events: Arc<dyn EventSink>, event: WsEvent) -> Self {
         Self {
@@ -244,19 +251,24 @@ impl AgentTurnExecutionPort for PtyTransport {
     /// DIRECT operator→agent prompt (the web `/agent` view's send): inject the operator's RAW text
     /// straight into the recipient's native harness — exactly like a person typing into the TUI —
     /// with NO `<nexus-batch>` envelope. That envelope is for drained agent-to-agent mail; an
-    /// operator prompt IS the harness's own input. Same bound `HarnessInput`/`send_turn` delivery as
-    /// `inject_turn`, only the payload is verbatim text. The trait's default `prompt` is a silent
+    /// operator prompt IS the harness's own input. Opt-in terminals use native input queuing and an
+    /// exact submit receipt; other backends retain their `send_turn` semantics. The trait's default `prompt` is a silent
     /// no-op (it assumed an ACP `session/prompt`); without this override every web→TUI send was
     /// accepted (`delivered: true`) yet dropped, because a tmux harness has no ACP session.
     async fn prompt(&self, recipient: &SessionId, text: String) -> PortResult<()> {
         let input = self.harness_for(recipient)?;
         let _active_turn = self.active_turns.begin(recipient);
-        send_turn_with_prompt_retries(input, &text)
-            .await
-            .map_err(|e| ContractError {
-                code: -32004,
-                message: e,
-            })?;
+        let result = if input.accepts_prompt_while_busy() {
+            input
+                .submit_prompt_observed(&text, Arc::new(IgnoreAcceptedEvent), false)
+                .await
+        } else {
+            send_turn_with_prompt_retries(input, &text).await
+        };
+        result.map_err(|e| ContractError {
+            code: -32004,
+            message: e,
+        })?;
         Ok(())
     }
 
@@ -269,17 +281,53 @@ impl AgentTurnExecutionPort for PtyTransport {
     ) -> PortResult<()> {
         let input = self.harness_for(recipient)?;
         let _active_turn = self.active_turns.begin(recipient);
-        send_turn_observed_with_prompt_retries(
-            input,
-            &text,
-            Arc::new(EmitAcceptedEvent::new(events, accepted_event)),
-        )
-        .await
-        .map_err(|e| ContractError {
+        let observer = Arc::new(EmitAcceptedEvent::new(events, accepted_event));
+        let result = if input.accepts_prompt_while_busy() {
+            input.submit_prompt_observed(&text, observer, false).await
+        } else {
+            send_turn_observed_with_prompt_retries(input, &text, observer).await
+        };
+        result.map_err(|e| ContractError {
             code: -32004,
             message: e,
         })?;
         Ok(())
+    }
+
+    async fn steer_observed(
+        &self,
+        recipient: &SessionId,
+        text: String,
+        events: Arc<dyn EventSink>,
+        accepted_event: WsEvent,
+    ) -> PortResult<nexus_contracts::SteerResponse> {
+        let input = self.harness_for(recipient)?;
+        let _active_turn = self.active_turns.begin(recipient);
+        let observer = Arc::new(EmitAcceptedEvent::new(events, accepted_event));
+        if input.accepts_prompt_while_busy() {
+            input.submit_prompt_observed(&text, observer, true).await
+        } else {
+            input
+                .interrupt_active_turn()
+                .await
+                .map_err(contract_harness_error)?;
+            send_turn_observed_with_prompt_retries(input, &text, observer).await
+        }
+        .map_err(contract_harness_error)?;
+        Ok(nexus_contracts::SteerResponse {
+            session_id: Some(recipient.clone()),
+            accepted: true,
+            delivery: nexus_contracts::SteerDelivery::InterruptedAndStarted,
+            turn_id: None,
+        })
+    }
+
+    fn accepts_prompt_while_busy(&self, recipient: &SessionId) -> bool {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(recipient)
+            .is_some_and(|input| input.accepts_prompt_while_busy())
     }
 
     fn steer_capability(&self, recipient: &SessionId) -> SteerCapability {

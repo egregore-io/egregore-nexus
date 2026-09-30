@@ -443,7 +443,7 @@ fn empty_registry_and_missing_adapter_errors_remain_compatible() {
 }
 
 #[test]
-fn builtin_registration_exposes_only_verified_configured_acp_capability_without_construction() {
+fn builtin_registration_keeps_model_and_explicit_native_telemetry_capabilities_separate() {
     let registry = AdapterRegistry::with_builtins();
     for id in ["hermes", "opencode"] {
         let id = HarnessId::new(id).unwrap();
@@ -459,11 +459,57 @@ fn builtin_registration_exposes_only_verified_configured_acp_capability_without_
             profile.response_reported(),
             ModelEvidenceCapability::Unverified
         );
-        assert!(
-            profile.telemetry().is_none(),
-            "model metadata does not prove usage support"
+        let telemetry = profile
+            .telemetry()
+            .expect("independently pinned native usage/context source");
+        assert_eq!(
+            telemetry.usage().capability(),
+            ModelEvidenceCapability::Supported
         );
+        assert_eq!(
+            telemetry.context().capability(),
+            ModelEvidenceCapability::Supported
+        );
+        assert_eq!(
+            telemetry.quota().capability(),
+            ModelEvidenceCapability::Unsupported
+        );
+        assert_eq!(
+            telemetry.usage().source().unwrap().as_str(),
+            format!("{id}.acp.prompt.usage")
+        );
+        assert_eq!(
+            telemetry.prompt_usage_scope().unwrap().wire(),
+            if id.as_str() == "hermes" {
+                nexus_contracts::telemetry::TokenUsageScope::SessionCumulative
+            } else {
+                nexus_contracts::telemetry::TokenUsageScope::LastResponse
+            }
+        );
+        assert!(telemetry.context_usage_basis().is_some());
     }
+}
+
+#[test]
+fn acp_usage_semantics_require_the_corresponding_supported_source() {
+    use nexus_agent::adapter::{
+        AcpContextUsageBasis, AcpPromptUsageScope, AdapterTelemetryCapability,
+        AdapterTelemetryReportingProfile,
+    };
+    let unavailable =
+        AdapterTelemetryCapability::new(ModelEvidenceCapability::Unverified, None).unwrap();
+    let profile = AdapterTelemetryReportingProfile::new(
+        unavailable.clone(),
+        unavailable.clone(),
+        unavailable,
+    );
+    assert!(profile
+        .clone()
+        .with_prompt_usage(AcpPromptUsageScope::LastResponse)
+        .is_err());
+    assert!(profile
+        .with_context_usage(AcpContextUsageBasis::HermesRequestEstimate)
+        .is_err());
 }
 
 #[test]

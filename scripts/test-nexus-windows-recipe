@@ -13,12 +13,36 @@ RECIPE = ROOT / "testing" / "windows" / "nexus.toml"
 def main() -> int:
     failures: list[str] = []
     recipe = RECIPE.read_text(encoding="utf-8")
+    if recipe.index('name = "gateway-install"') > recipe.index('name = "rust-tests"'):
+        failures.append("Gateway test dependencies must be installed before Rust's live Gateway fixtures")
+    if recipe.count("$GitTools = Join-Path (Split-Path (Split-Path (Get-Command git.exe).Source)) 'usr\\bin'") != 3:
+        failures.append("Rust and Gateway steps must expose actual Git copy/shell prerequisites")
+    if recipe.count('$env:Path = "$env:Path;$GitTools"') != 3:
+        failures.append("Git tools must follow MSVC tools so Git link.exe cannot shadow the native linker")
+    gateway_gates = recipe.split('name = "gateway-gates"', 1)[1].split('[[steps]]', 1)[0]
+    gateway_test_command = '& pnpm.cmd --dir gateway exec vitest run --maxWorkers=1'
+    if gateway_test_command not in gateway_gates:
+        failures.append("Windows Gateway gate must run the complete suite with one bounded worker")
+    elif gateway_gates.index('webconsole:build') > gateway_gates.index(gateway_test_command):
+        failures.append("Gateway packed tests require the actual Webconsole build before execution")
+    elif gateway_gates.split(gateway_test_command, 1)[1].strip() != "'''":
+        failures.append("Windows Gateway gate must not add test filters or timeout overrides")
+    for command in (
+        'pnpm.cmd --dir gateway typecheck',
+        'pnpm.cmd --dir gateway build:gateway-package',
+        'pnpm.cmd --dir gateway webconsole:build',
+        'node.exe packages/nexus-cli/bin/nexus.mjs daemon install --help',
+    ):
+        if f'& {command}\nif ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}' not in recipe:
+            failures.append(f"intermediate native command must fail the step immediately: {command}")
     required_fragments = (
         'schema = 1',
         'network = "internet"',
         'path = "../.."',
         '"packages/nexus-cli/native/**"',
         'name = "rust-cache-preflight"',
+        '$SourceTimestamp = [DateTime]::UtcNow',
+        '$_.LastWriteTimeUtc = $SourceTimestamp',
         '$MinimumFreeBytes = 40GB',
         'name = "rust-tests"',
         'cargo.exe test --workspace --no-fail-fast',
@@ -26,7 +50,7 @@ def main() -> int:
         'for ($iteration = 1; $iteration -le 100; $iteration++)',
         'original_revision',
         'name = "npm-cli-smoke"',
-        '$ExpectedVersion',
+        "$ExpectedVersion = (Get-Content -LiteralPath 'VERSION' -Raw).Trim()",
         '$VersionOutput -ne "nexus $ExpectedVersion"',
         'Windows npm launcher reports the wrong release version',
         "node.exe packages/nexus-cli/bin/nexus.mjs daemon install --help",
@@ -40,6 +64,9 @@ def main() -> int:
         'webconsole start --host 127.0.0.1 --port',
         'webconsole stop --force',
         'name = "nexus-exe"',
+        'name = "core-package-lifecycle"',
+        '& pwsh.exe -NoProfile -File testing/windows/core-lifecycle.ps1',
+        'name = "nexus-core-cli"',
         'name = "gateway-headless"',
         'name = "gateway-web"',
         'path = "C:\\\\w\\\\src\\\\egregore-nexus\\\\gateway\\\\webconsole\\\\dist"',

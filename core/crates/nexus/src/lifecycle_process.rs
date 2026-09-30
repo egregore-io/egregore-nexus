@@ -52,8 +52,35 @@ pub(crate) enum BoundedProcessError {
 }
 
 pub(crate) fn spawn_detached(command: &mut Command) -> io::Result<Child> {
+    #[cfg(windows)]
+    prevent_parent_stdio_pipe_inheritance()?;
     configure_detached(command);
     command.spawn()
+}
+
+#[cfg(windows)]
+fn prevent_parent_stdio_pipe_inheritance() -> io::Result<()> {
+    use windows_sys::Win32::{
+        Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{GetFileType, FILE_TYPE_PIPE},
+        System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
+    };
+    // Rust explicitly duplicates the requested child stdio, but CreateProcess also inherits
+    // other inheritable handles. Incoming CLI pipes must not leak alongside configured logs.
+    // Do not close/replace these handles: current CLI output stays usable, and explicit
+    // Stdio::inherit still works through Rust's per-spawn inheritable duplicates.
+    for stream in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        let handle = unsafe { GetStdHandle(stream) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        if unsafe { GetFileType(handle) } == FILE_TYPE_PIPE
+            && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn run_bounded(

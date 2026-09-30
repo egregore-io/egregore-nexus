@@ -9,6 +9,7 @@ import {
   newBracket,
 } from "@server/agui/mapAgentUpdate";
 import type { AgentUpdateEvent } from "@server/agui/mapAgentUpdate";
+import { newConversationState, reduceAguiEvents } from "../../modules/pane/aguiConversation";
 
 // Build a contract `agent.update` event (the shape `acpToAguiEvents` consumes).
 function upd(
@@ -35,6 +36,77 @@ function run(updates: AgentUpdateEvent[]) {
 const types = (events: BaseEvent[]) => events.map((e) => e.type);
 
 describe("acpToAguiEvents (agent.update → AG-UI BaseEvent[])", () => {
+  it.each(["text", "thinking", "user_input"] as const)(
+    "keeps %s fallback identity stable across replay-local bracket histories",
+    (kind) => {
+      const event = upd(kind, { text: "same native occurrence", streamEventId: 40557 });
+      const replay = newBracket();
+      const live = newBracket();
+      live.seq = 41;
+      expect(acpToAguiEvents(event, live).events).toEqual(
+        acpToAguiEvents(event, replay).events,
+      );
+      const next = acpToAguiEvents(
+        upd(kind, { text: "same native occurrence", streamEventId: 40558 }),
+        newBracket(),
+      );
+      expect(next.events[0]).not.toEqual(acpToAguiEvents(event, replay).events[0]);
+    },
+  );
+
+  it("marks repeated and replaced structured tool input as complete snapshots", () => {
+    const values = [{ command: "pwd" }, { command: "pwd" }, { command: "ls" }, {}];
+    const { events } = run(values.map((input) => upd("tool_call", {
+      id: "native-call", tool: "bash", input,
+    })));
+    const args = events.filter((event) => event.type === EventType.TOOL_CALL_ARGS);
+    expect(args).toEqual(values.map((input) => ({
+      type: EventType.TOOL_CALL_ARGS,
+      toolCallId: "native-call",
+      delta: JSON.stringify(input),
+      append: false,
+    })));
+  });
+
+  it("marks only Gateway-generated brackets with their opening source and channel", () => {
+    const { events, bracket } = run([
+      upd("text", { text: "first", streamEventId: 41 }),
+      upd("text", { text: " second", streamEventId: 42 }),
+    ]);
+    for (const event of [...events, ...closeRun(bracket)]) {
+      expect(event).toHaveProperty("nexusMessageOrigin", {
+        kind: "generated", sessionId: "s_ben", sourceEventId: 41, channel: "text",
+      });
+    }
+    const native = run([upd("text", {
+      itemId: "s_ben:stream:41:msg:99", text: "native lookalike", streamEventId: 41,
+    })]);
+    for (const event of [...native.events, ...closeRun(native.bracket)]) {
+      expect(event).not.toHaveProperty("nexusMessageOrigin");
+      expect(event).toHaveProperty("messageId", "s_ben:stream:41:msg:99");
+    }
+  });
+
+  it("preserves actual tool output through the Gateway reducer with replacement args", () => {
+    const { events } = run([
+      ...[{ command: "pwd" }, { command: "pwd" }, { command: "ls" }, {}].map((input) =>
+        upd("tool_call", { id: "call", tool: "bash", input })),
+      upd("tool_call", { id: "call", status: "failed", content: "native error output" }),
+    ]);
+    let state = newConversationState();
+    for (const event of [
+      { type: EventType.RUN_STARTED, threadId: "s_ben", runId: "run" } as BaseEvent,
+      ...events,
+      { type: EventType.RUN_FINISHED, threadId: "s_ben", runId: "run" } as BaseEvent,
+    ]) state = reduceAguiEvents(state, event);
+    expect(state.messages).toHaveLength(1);
+    // This consumer intentionally does not display args; snapshots must not
+    // create extra blocks or erase the separately supplied native output/error.
+    expect(state.messages[0]?.blocks).toEqual([
+      { b: "toolcall", name: "bash", status: "error", output: "native error output" },
+    ]);
+  });
+
   it("brackets the canonical turn: thinking a/b → tool(id1) start+result → text → closeRun", () => {
     const { events, bracket } = run([
       upd("thinking", { text: "a" }),

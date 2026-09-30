@@ -37,6 +37,14 @@ const FORCE_STOP_GRACE: Duration = Duration::from_secs(10);
 const SERVICE_START_GRACE: Duration = Duration::from_secs(5);
 const SERVICE_STABILITY_GRACE: Duration = Duration::from_millis(500);
 const SERVICE_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
+// Cold Windows PowerShell + CIM registration can exceed the ordinary query budget.
+#[cfg(windows)]
+const WINDOWS_TASK_INSTALL_TIMEOUT: Duration = Duration::from_secs(30);
+// Task Scheduler first launches its PowerShell action; cold action startup can consume the
+// direct-child readiness budget before Nexus even starts. Bound that whole scheduled launch
+// separately, without retrying /Run or treating manager acceptance as native readiness.
+#[cfg(windows)]
+const WINDOWS_TASK_START_TIMEOUT: Duration = Duration::from_secs(60);
 const SERVICE_HELPER_OUTPUT_LIMIT: usize = 64 * 1024;
 
 /// Parser for the daemon arm of the `nexus` binary.
@@ -367,6 +375,18 @@ async fn restart(args: RestartArgs) -> Result<(), LifecycleError> {
 }
 
 async fn install_service(args: InstallArgs) -> Result<(), LifecycleError> {
+    install_service_inner(args, true).await
+}
+
+/// First-run setup owns the complete dependency sequence, avoiding duplicate Gateway installation.
+pub(crate) async fn install_service_only() -> Result<(), LifecycleError> {
+    install_service_inner(InstallArgs { binary: None }, false).await
+}
+
+async fn install_service_inner(
+    args: InstallArgs,
+    include_gateway: bool,
+) -> Result<(), LifecycleError> {
     ensure_operator_supervision_for("install")?;
     let paths = DaemonPaths::resolve();
     fs::create_dir_all(&paths.home)?;
@@ -398,13 +418,14 @@ async fn install_service(args: InstallArgs) -> Result<(), LifecycleError> {
         "nexus daemon service installed and started ({})",
         supervisor.kind_label()
     );
-    if crate::update::install_context::detect_install_context()
-        .map(|context| {
-            context
-                .facets
-                .contains(&crate::update::install_context::InstalledFacet::Gateway)
-        })
-        .unwrap_or(false)
+    if include_gateway
+        && crate::update::install_context::detect_install_context()
+            .map(|context| {
+                context
+                    .facets
+                    .contains(&crate::update::install_context::InstalledFacet::Gateway)
+            })
+            .unwrap_or(false)
         && crate::gateway_lifecycle::resolve_installed_gateway().is_ok()
     {
         crate::gateway_service::install_gateway_service()
@@ -417,6 +438,10 @@ async fn install_service(args: InstallArgs) -> Result<(), LifecycleError> {
 
 async fn uninstall_service() -> Result<(), LifecycleError> {
     ensure_operator_supervision_for("uninstall")?;
+    // Also handles a partially installed stack whose Gateway service is absent.
+    if crate::webconsole_service::installed() {
+        crate::webconsole_service::uninstall().map_err(LifecycleError::Command)?;
+    }
     if crate::gateway_service::gateway_service_status()
         .map(|status| status.installed)
         .unwrap_or(false)
@@ -647,6 +672,8 @@ impl Supervisor for SelfDaemonSupervisor {
             .stderr(Stdio::from(err));
         let child = lifecycle_process::spawn_detached(&mut command)?;
         wait_for_pidfile(&self.paths.pid_file, child.id(), Duration::from_secs(3));
+        #[cfg(windows)]
+        wait_for_windows_daemon_ready(&self.paths, Some(child.id()), Duration::from_secs(15))?;
         Ok(())
     }
 
@@ -657,15 +684,21 @@ impl Supervisor for SelfDaemonSupervisor {
         if !process_alive(pid) {
             return Ok(());
         }
-        signal_process(pid, false)?;
         let grace = if force {
             FORCE_STOP_GRACE
         } else {
             DEFAULT_STOP_GRACE
         };
+        #[cfg(windows)]
+        return super::windows_shutdown::stop(&self.paths.home, pid, force, grace)
+            .map_err(Into::into);
+        #[cfg(unix)]
+        signal_process(pid, false)?;
+        #[cfg(unix)]
         if !wait_pid_down(pid, grace) && force {
             signal_process(pid, true)?;
         }
+        #[cfg(not(windows))]
         Ok(())
     }
 
@@ -922,7 +955,7 @@ impl Supervisor for WindowsTaskSupervisor {
                 windows_task_registration_script(&self.binary, &self.paths.home),
             ],
         )
-        .run_checked()
+        .run_checked_with_timeout(WINDOWS_TASK_INSTALL_TIMEOUT)
     }
 
     fn uninstall(&self) -> Result<(), LifecycleError> {
@@ -930,7 +963,7 @@ impl Supervisor for WindowsTaskSupervisor {
             let _ = fs::remove_file(self.paths.home.join("daemon-task.ps1"));
             return Ok(());
         }
-        let _ = CommandSpec::new("schtasks.exe", ["/End", "/TN", WINDOWS_TASK_NAME]).run_capture();
+        self.stop(false)?;
         CommandSpec::new("schtasks.exe", ["/Delete", "/TN", WINDOWS_TASK_NAME, "/F"])
             .run_checked()?;
         match fs::remove_file(self.paths.home.join("daemon-task.ps1")) {
@@ -941,19 +974,27 @@ impl Supervisor for WindowsTaskSupervisor {
     }
 
     fn start(&self) -> Result<(), LifecycleError> {
-        CommandSpec::new("schtasks.exe", ["/Run", "/TN", WINDOWS_TASK_NAME]).run_checked()
+        CommandSpec::new("schtasks.exe", ["/Run", "/TN", WINDOWS_TASK_NAME]).run_checked()?;
+        wait_for_windows_daemon_ready(&self.paths, None, WINDOWS_TASK_START_TIMEOUT)
     }
 
     fn stop(&self, force: bool) -> Result<(), LifecycleError> {
-        CommandSpec::new("schtasks.exe", ["/End", "/TN", WINDOWS_TASK_NAME]).run_checked()?;
-        if force {
-            if let Some(pid) = read_pid(&self.paths.pid_file)? {
-                CommandSpec::new_owned(
-                    "taskkill.exe",
-                    vec!["/PID".into(), pid.to_string(), "/F".into()],
-                )
-                .run_checked()?;
-            }
+        let stop_manager =
+            || CommandSpec::new("schtasks.exe", ["/End", "/TN", WINDOWS_TASK_NAME]).run_checked();
+        if let Some(pid) = read_pid(&self.paths.pid_file)? {
+            let grace = if force {
+                FORCE_STOP_GRACE
+            } else {
+                DEFAULT_STOP_GRACE
+            };
+            // /End terminates the PowerShell task action, but can leave its daemon child alive.
+            // Pin that child first; cancel the manager before draining it, and require exit before
+            // the default restart implementation can launch a replacement.
+            super::windows_shutdown::stop_after(&self.paths.home, pid, force, grace, || {
+                stop_manager().map_err(io::Error::other)
+            })?;
+        } else {
+            stop_manager()?;
         }
         Ok(())
     }
@@ -961,6 +1002,69 @@ impl Supervisor for WindowsTaskSupervisor {
     fn paths(&self) -> &DaemonPaths {
         &self.paths
     }
+}
+
+#[cfg(any(windows, test))]
+async fn wait_for_ready_probe<F, Fut>(timeout: Duration, mut probe: F) -> io::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    let ready = tokio::time::timeout_at(deadline, async {
+        loop {
+            let ready = probe().await;
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            if ready {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    if ready {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "daemon did not become ready; inspect daemon.log",
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_windows_daemon_ready(
+    paths: &DaemonPaths,
+    expected_pid: Option<u32>,
+    startup_timeout: Duration,
+) -> Result<(), LifecycleError> {
+    let paths = paths.clone();
+    // Service-manager acceptance is not startup evidence. Read only: never retry /Run or input.
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(wait_for_ready_probe(startup_timeout, || async {
+                let Ok(Some(pid)) = read_pid(&paths.pid_file) else {
+                    return false;
+                };
+                if expected_pid.is_some_and(|expected| expected != pid) || !process_alive(pid) {
+                    return false;
+                }
+                // Uses the boot-authenticated local IPC query; Gateway state, queue depth and
+                // dead letters are not startup gates. Recheck the same PID after the await.
+                let (_, _, _, _, error) = collect_store_status().await;
+                error.is_none()
+                    && read_pid(&paths.pid_file).ok().flatten() == Some(pid)
+                    && process_alive(pid)
+            }))
+    })
+    .join()
+    .map_err(|_| io::Error::other("daemon readiness thread failed"))??;
+    Ok(())
 }
 
 fn select_control_supervisor(paths: &DaemonPaths, binary: PathBuf) -> Box<dyn Supervisor> {
@@ -1040,12 +1144,16 @@ impl CommandSpec {
     }
 
     fn run_capture(&self) -> Result<CommandOutput, LifecycleError> {
+        self.run_capture_with_timeout(SERVICE_HELPER_TIMEOUT)
+    }
+
+    fn run_capture_with_timeout(&self, timeout: Duration) -> Result<CommandOutput, LifecycleError> {
         let mut command = Command::new(&self.program);
         command.args(&self.args);
         match lifecycle_process::run_bounded(
             &mut command,
             "daemon service-manager command",
-            SERVICE_HELPER_TIMEOUT,
+            timeout,
             SERVICE_HELPER_OUTPUT_LIMIT,
         ) {
             Ok(output) => Ok(CommandOutput {
@@ -1065,7 +1173,11 @@ impl CommandSpec {
     }
 
     fn run_checked(&self) -> Result<(), LifecycleError> {
-        let output = self.run_capture()?;
+        self.run_checked_with_timeout(SERVICE_HELPER_TIMEOUT)
+    }
+
+    fn run_checked_with_timeout(&self, timeout: Duration) -> Result<(), LifecycleError> {
+        let output = self.run_capture_with_timeout(timeout)?;
         if output.success {
             return Ok(());
         }
@@ -1661,19 +1773,27 @@ fn process_alive(pid: u32) -> bool {
                 return alive;
             }
         }
-        Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: a positive scalar PID and signal zero only probe process existence.
+        unsafe { libc::kill(pid, 0) == 0 }
     }
     #[cfg(windows)]
     {
-        CommandSpec::new_owned("tasklist.exe", vec!["/FI".into(), format!("PID eq {pid}")])
-            .run_capture()
-            .map(|out| out.success && out.stdout.contains(&pid.to_string()))
-            .unwrap_or(false)
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, WAIT_TIMEOUT},
+            System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE},
+        };
+        // Native nonblocking liveness: no localized tasklist parsing or subprocess wait inside
+        // the startup deadline. Access/query failure is not positive evidence of a live owner.
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let alive = unsafe { WaitForSingleObject(handle, 0) } == WAIT_TIMEOUT;
+        unsafe { CloseHandle(handle) };
+        alive
     }
 }
 
@@ -1689,32 +1809,18 @@ pub fn linux_proc_stat_is_alive(stat: &str) -> Option<bool> {
     Some(!matches!(state, 'Z' | 'X'))
 }
 
+#[cfg(unix)]
 fn signal_process(pid: u32, kill: bool) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let signal = if kill { "-KILL" } else { "-TERM" };
-        let status = Command::new("kill")
-            .arg(signal)
-            .arg(pid.to_string())
-            .status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!("kill {signal} {pid} failed")))
-        }
-    }
-    #[cfg(windows)]
-    {
-        let mut args = vec!["/PID".to_string(), pid.to_string()];
-        if kill {
-            args.push("/F".into());
-        }
-        let status = Command::new("taskkill.exe").args(args).status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(io::Error::other(format!("taskkill {pid} failed")))
-        }
+    let pid = libc::pid_t::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid process PID"))?;
+    let signal = if kill { libc::SIGKILL } else { libc::SIGTERM };
+    // SAFETY: positive PID excludes process-group/broadcast semantics. No pointers cross FFI.
+    if unsafe { libc::kill(pid, signal) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 
@@ -1827,6 +1933,7 @@ fn windows_task_registration_script_with_path(
 ) -> String {
     let wrapper_path =
         powershell_single_quote(&nexus_home.join("daemon-task.ps1").display().to_string());
+    let log_path = powershell_single_quote(&nexus_home.join("daemon.log").display().to_string());
     let binary = powershell_single_quote(&binary.display().to_string());
     let nexus_home = powershell_single_quote(&nexus_home.display().to_string());
     let service_path = powershell_single_quote(service_path);
@@ -1836,7 +1943,7 @@ $wrapperPath = '{wrapper_path}'\n\
 $wrapper = @'\n\
 $env:NEXUS_HOME = '{nexus_home}'\n\
 $env:Path = '{service_path}'\n\
-& '{binary}' daemon run\n\
+& '{binary}' daemon run 2>&1 | Out-File -LiteralPath '{log_path}' -Append -Encoding utf8\n\
 exit $LASTEXITCODE\n\
 '@\n\
 Set-Content -LiteralPath $wrapperPath -Value $wrapper -Encoding UTF8\n\
@@ -1844,7 +1951,7 @@ $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name\n\
 $actionArgs = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"' + $wrapperPath + '\"'\n\
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $actionArgs\n\
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity\n\
-$settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Seconds 5) -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)\n\
+$settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)\n\
 $principal = New-ScheduledTaskPrincipal -UserId $identity -LogonType Interactive -RunLevel Limited\n\
 Register-ScheduledTask -TaskName '{WINDOWS_TASK_NAME}' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null\n"
     )

@@ -8,6 +8,7 @@ import {
   materializedCursorForStreamAfter,
 } from "@server/agui/agentSessionProjection";
 import type { WsEvent } from "@shared/types";
+import { acpToAguiEvents, newBracket } from "@server/agui/mapAgentUpdate";
 
 async function createStore(): Promise<Client> {
   const db = createClient({ url: ":memory:" });
@@ -59,6 +60,43 @@ async function waitFor(
 }
 
 describe("agent session materialized projection", () => {
+  it.each(["assistant", "user"])("keeps every materialized %s block distinct with stable snapshot and relay identities", async (role) => {
+    const db = await createStore();
+    await db.batch([
+      {sql:"INSERT INTO agent_session_turns VALUES (?, ?, ?, ?, ?, ?, ?, ?)", args:["turn_blocks","s_blocks","final",10,18,100,120,120]},
+      {sql:"INSERT INTO agent_session_messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", args:[
+        "row_blocks","s_blocks","turn_blocks",0,role,null,
+        JSON.stringify({schema:1,blocks:[{type:"text",text:"equal"},
+          {type:"tool_call",id:"call",tool:"bash",status:"completed",output:"ok"},
+          {type:"text",text:"equal"},{type:"text",text:"adjacent"},
+          {type:"text",itemId:"native_exact",clientMessageId:"native_exact",text:"native"}]}),"final",10,18,100,119,120,
+      ]},
+    ]);
+    const snapshot = await loadAgentSessionSnapshot("s_blocks","blocks",{client:db});
+    const contents = (snapshot.events as Array<Record<string,unknown>>).filter(e=>e.type===EventType.TEXT_MESSAGE_CONTENT);
+    expect(contents.map(e=>e.delta)).toEqual(["equal","equal","adjacent","native"]);
+    expect(new Set(contents.map(e=>e.messageId)).size).toBe(4);
+    expect(contents[3]?.messageId).toBe("native_exact");
+    expect(contents[3]?.nexusMessageOrigin).toBeUndefined();
+    expect(contents.slice(0,3).map(e=>(e.nexusMessageOrigin as {materializedBlock:string}).materializedBlock))
+      .toEqual([0,2,3].map(index=>JSON.stringify(["s_blocks","row_blocks",index])));
+    const again = await loadAgentSessionSnapshot("s_blocks","blocks",{client:db});
+    expect(again.events).toEqual(snapshot.events);
+    let bracket = newBracket();
+    const replay: Array<Record<string,unknown>> = [];
+    const handle = createMaterializedTurnRelay("s_blocks",{client:db,pollMs:5})({
+      onEvent(event) {
+        if(event.type!=="agent.update") return;
+        const mapped=acpToAguiEvents(event,bracket); bracket=mapped.bracket;
+        replay.push(...mapped.events as unknown as Array<Record<string,unknown>>);
+      },
+    });
+    try {
+      await waitFor(()=>replay.filter(e=>e.type===EventType.TEXT_MESSAGE_CONTENT).length===4);
+      expect(replay.filter(e=>e.type===EventType.TEXT_MESSAGE_CONTENT)).toEqual(contents);
+    } finally { handle.close(); db.close(); }
+  });
+
   it("replays authenticated human provenance from durable user_input blocks", async () => {
     const db = await createStore();
     await db.batch([
@@ -342,10 +380,10 @@ describe("agent session materialized projection", () => {
       .map((ev) => String(ev.messageId));
 
     expect(startsAndEnds).toEqual([
-      "s_ada:stream:10:msg:1",
-      "s_ada:stream:10:msg:1",
-      "s_ada:stream:20:msg:1",
-      "s_ada:stream:20:msg:1",
+      `nexus-materialized:${encodeURIComponent(JSON.stringify(["s_ada","m_one",0]))}:msg`,
+      `nexus-materialized:${encodeURIComponent(JSON.stringify(["s_ada","m_one",0]))}:msg`,
+      `nexus-materialized:${encodeURIComponent(JSON.stringify(["s_ada","m_two",0]))}:msg`,
+      `nexus-materialized:${encodeURIComponent(JSON.stringify(["s_ada","m_two",0]))}:msg`,
     ]);
     expect(new Set(startsAndEnds).size).toBe(2);
   });

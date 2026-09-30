@@ -289,6 +289,7 @@ async fn main() -> Result<()> {
                     let variable = match request.method.as_str() {
                         "session/new" => Some("FAKE_ACP_RAW_NEW"),
                         "session/load" => Some("FAKE_ACP_RAW_LOAD"),
+                        "session/prompt" => Some("FAKE_ACP_RAW_PROMPT"),
                         _ => None,
                     };
                     if let Some(raw) = variable.and_then(|key| std::env::var(key).ok()) {
@@ -296,7 +297,21 @@ async fn main() -> Result<()> {
                         // typed serializer before the client receives them.
                         let payload = serde_json::from_str(&raw)
                             .map_err(agent_client_protocol::util::internal_error)?;
-                        fixture_gate("FAKE_ACP_MODEL_RESPONSE_GATE").await;
+                        if request.method == "session/prompt" {
+                            fixture_gate("FAKE_ACP_PROMPT_RESPONSE_GATE").await;
+                            if let Ok(raw) = std::env::var("FAKE_ACP_RAW_MODEL_UPDATES") {
+                                let updates: Vec<serde_json::Value> = serde_json::from_str(&raw)
+                                    .map_err(agent_client_protocol::util::internal_error)?;
+                                for update in updates {
+                                    cx.send_notification(UntypedMessage::new(
+                                        "session/update",
+                                        update,
+                                    )?)?;
+                                }
+                            }
+                        } else {
+                            fixture_gate("FAKE_ACP_MODEL_RESPONSE_GATE").await;
+                        }
                         responder.respond(payload)?;
                         if let Ok(witness) = std::env::var("FAKE_ACP_MODEL_RESPONSE_WITNESS") {
                             // Serialized after the raw reply: consuming this ordinary typed

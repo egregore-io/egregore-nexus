@@ -21,6 +21,9 @@ impl AppState {
                 message: "harness launch arguments require a headed launch".into(),
             });
         }
+        let requested_native_key = harness_registry_by_id(&req.kind)
+            .requested_native_resume_key(&req.harness_args)
+            .map_err(|error| NexusError::Invalid(error.to_string()).to_contract_error())?;
         if req.initial_prompt.is_some() && req.resume.is_some() {
             return Err(Self::initial_prompt_not_fresh_error());
         }
@@ -81,7 +84,9 @@ impl AppState {
                     .await
                     .map_err(|e| e.to_contract_error())?
                 {
-                    let session = self.ensure_alive_row(row).await?;
+                    let session = self
+                        .ensure_alive_row_with_native_request(row, requested_native_key)
+                        .await?;
                     return Ok(SpawnResponse {
                         session_id: session,
                     });
@@ -113,76 +118,7 @@ impl AppState {
         // Mock-port fallback (Self::new): no concrete agent → just delegate to the bare port and
         // register the member so it is at least addressable (no loop wiring either way).
         let Some(agent) = &self.agent_concrete else {
-            let resp = self.agent.launch(req.clone()).await?;
-            let identity = self
-                .resolve_launch_identity_for_session(&req, &project, &resp.session_id)
-                .await
-                .map_err(|e| e.to_contract_error())?;
-            let client_key = Self::new_client_key();
-            let registered = Self::runtime_descriptor(
-                &resp.session_id,
-                &identity.agent_id,
-                identity.name.as_deref(),
-                &identity.project,
-                req.kind.clone(),
-                req.role.clone(),
-                req.cwd.clone(),
-            );
-            let prepared_initial_prompt = if let Some(template) = req.initial_prompt.as_deref() {
-                Some(
-                    match self.prepare_initial_prompt(&registered, template).await? {
-                        Some(prepared) => prepared,
-                        None => {
-                            self.register_prepared_runtime(&registered, &client_key, "acp", owner)
-                                .await
-                                .map_err(|e| e.to_contract_error())?;
-                            self.wake_registered_runtime(&registered)
-                                .await
-                                .map_err(|e| e.to_contract_error())?;
-                            self.persist_runtime_resurrection_descriptor(
-                                &registered,
-                                "headless",
-                                "acp",
-                                None,
-                            )
-                            .await
-                            .map_err(|e| e.to_contract_error())?;
-                            return Ok(resp);
-                        }
-                    },
-                )
-            } else {
-                None
-            };
-            if prepared_initial_prompt.is_some() {
-                self.register_prepared_initial_prompt_runtime(
-                    &registered,
-                    &client_key,
-                    "acp",
-                    owner,
-                )
-                .await?;
-            } else {
-                self.register_prepared_runtime(&registered, &client_key, "acp", owner)
-                    .await
-                    .map_err(|e| e.to_contract_error())?;
-            }
-            if let Some(prepared) = prepared_initial_prompt {
-                if let Err(error) = self
-                    .deliver_prepared_initial_prompt(&registered, prepared)
-                    .await
-                {
-                    self.fail_initial_prompt_runtime(&registered).await;
-                    return Err(error);
-                }
-            }
-            self.wake_registered_runtime(&registered)
-                .await
-                .map_err(|e| e.to_contract_error())?;
-            self.persist_runtime_resurrection_descriptor(&registered, "headless", "acp", None)
-                .await
-                .map_err(|e| e.to_contract_error())?;
-            return Ok(resp);
+            return self.launch_agent_via_port(req, &project, owner).await;
         };
 
         // (1) Mint the canonical session id daemon-side so the member row, the adapter binding, and
@@ -348,6 +284,10 @@ impl AppState {
     ) -> Result<SpawnResponse, nexus_contracts::ContractError> {
         use portable_pty::PtySize;
 
+        let harness_contract = harness_registry_by_id(&req.kind);
+        let requested_native_key = harness_contract
+            .requested_native_resume_key(&req.harness_args)
+            .map_err(|error| NexusError::Invalid(error.to_string()).to_contract_error())?;
         let nexus_exe = std::env::current_exe()
             .ok()
             .and_then(|p| p.to_str().map(String::from))
@@ -426,7 +366,7 @@ impl AppState {
 
         if req.initial_prompt.is_some()
             && (claude_resume_session_id(&req.harness_args).is_some()
-                || opencode_resume_session_id(&req.harness_args).is_some())
+                || requested_native_key.is_some())
         {
             return Err(Self::initial_prompt_not_fresh_error());
         }
@@ -434,22 +374,27 @@ impl AppState {
         // Claude Code owns its native identity/session namespace. Nexus forwards an explicit
         // `--resume` key as an opaque best-effort hint and never reuses, replaces, or rejects a
         // Nexus runtime based on another row carrying the same Claude value.
-        if req.kind.as_str() == "opencode" {
-            if let Some(opencode_session_id) = opencode_resume_session_id(&req.harness_args) {
+        if harness_contract.headed_runtime_kind() == HeadedRuntimeKind::OpenCodePlugin {
+            if let Some(native_key) = requested_native_key {
                 if let Some(owner) = self
-                    .opencode_native_owner(opencode_session_id)
+                    .opencode_native_owner(native_key)
                     .await
                     .map_err(|e| e.to_contract_error())?
                 {
                     if owner.project != project || req.name.as_deref() != owner.name.as_deref() {
                         return Err(native_session_taken_error(
-                            "opencode session",
-                            opencode_session_id,
+                            harness_contract.resume_key_description(),
+                            native_key,
                             &owner,
                         ));
                     }
+                    // Durable ownership survives a stopped process or daemon restart. Reuse
+                    // the owner identity only after its actual transport has been restored.
+                    let session = self
+                        .ensure_alive_row_with_native_request(owner, Some(native_key))
+                        .await?;
                     return Ok(SpawnResponse {
-                        session_id: owner.session_id,
+                        session_id: session,
                     });
                 }
             }
@@ -683,6 +628,7 @@ impl AppState {
                     events,
                     &state_dir,
                     &effective_harness_args,
+                    requested_native_key,
                     false,
                     viewer_backend,
                     Some(model_observation.reporting()),
@@ -721,11 +667,20 @@ impl AppState {
                 req.role.clone(),
                 Some(cwd.clone()),
             );
+            // The harness decides which accepted native identity belongs in its capsule.
+            let reported_key = OpenCodeRuntimeStateRepo::new(&self.store)
+                .find_by_runtime_id(&session)
+                .await
+                .map_err(|e| e.to_contract_error())?
+                .and_then(|state| state.opencode_session_id);
+            let native_resume_key = harness_contract
+                .capture_resurrection_key(requested_native_key, reported_key.as_deref())
+                .map_err(|error| NexusError::Invalid(error.to_string()).to_contract_error())?;
             self.persist_runtime_resurrection_descriptor(
                 &descriptor,
                 "headed",
                 viewer_backend,
-                opencode_resume_session_id(&effective_harness_args).map(str::to_string),
+                native_resume_key,
             )
             .await
             .map_err(|e| e.to_contract_error())?;

@@ -7,6 +7,17 @@ const wireFixture = (name: string) => JSON.parse(readFileSync(resolve(`../core/c
 const fixture = () => ({ ...wireFixture("runtime.telemetry.json"), configured: wireFixture("runtime.model_report.json").configured });
 
 describe("ordinary canonical model/telemetry validation", () => {
+  it("preserves last-response snapshots without a fabricated turn, reset or cumulative total", () => {
+    const report = wireFixture("runtime.last-response-usage.json");
+    for (const count of [230, 230, 10, 0]) {
+      report.telemetry.usage.observation.totalTokens = count;
+      expect(parseRuntimeModelReport(report)).toEqual(report);
+    }
+    report.telemetry.usage.observation.scope = "turn";
+    expect(() => parseRuntimeModelReport(report)).toThrow();
+    report.telemetry.usage.observation.scope = "inventedScope";
+    expect(() => parseRuntimeModelReport(report)).toThrow();
+  });
   it("agrees with Rust on shared raw report revisions, slots and tombstones", () => {
     const cases = JSON.parse(readFileSync(resolve("../core/crates/nexus-contracts/fixtures/model-report-validation.json"), "utf8")).reports;
     for (const entry of cases) {
@@ -31,7 +42,7 @@ describe("ordinary canonical model/telemetry validation", () => {
     }
   });
   it("roundtrips the same Rust telemetry fixture without inventing totals or model identity", () => {
-    for (const name of ["runtime.telemetry.json", "runtime.model_report.json"]) {
+    for (const name of ["runtime.telemetry.json", "runtime.model_report.json", "runtime.last-prompt-usage.json"]) {
       expect(parseRuntimeModelReport(wireFixture(name))).toEqual(wireFixture(name));
     }
     expect(parseRuntimeModelReport(fixture())).toEqual(fixture());

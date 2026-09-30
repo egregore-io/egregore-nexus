@@ -11,6 +11,7 @@
 use libsql::params;
 
 use nexus_common::{now, NexusError};
+use nexus_contracts::EventSink;
 use nexus_store::{
     repos::{
         inbox::{DeadLetterMutation, Inbox, DELIVERY_TIMEOUT_REASON, DELIVERY_TIMEOUT_TTL_MS},
@@ -20,7 +21,6 @@ use nexus_store::{
 };
 
 use crate::daemon::app::AppState;
-use crate::daemon::services::presence::PresenceWriter;
 
 const DEFAULT_REAP_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 const DELIVERY_TIMEOUT_SWEEP_INTERVAL_MS: i64 = 60 * 1_000;
@@ -258,8 +258,7 @@ pub(crate) async fn maybe_reap_operational_tables(
     let ts = now();
     let mut sweep = RetentionSweep::default();
     if run_state.should_run_delivery_timeouts(policy, ts) {
-        let mutation =
-            dead_letter_delivery_timeouts(&state.store, ts, policy.delivery_timeout_ttl_ms).await?;
+        let mutation = sweep_delivery_timeouts(state, ts, policy.delivery_timeout_ttl_ms).await?;
         sweep.delivery_timeouts = mutation.count;
     }
     let db_size_bytes = match main_db_size_bytes(&state.store).await {
@@ -278,10 +277,7 @@ pub(crate) async fn maybe_reap_operational_tables(
         };
     }
 
-    sweep.add(
-        reap_operational_tables_with_presence(&state.store, policy, ts, Some(&state.presence))
-            .await?,
-    );
+    sweep.add(reap_operational_tables_with_presence(&state.store, policy, ts, Some(state)).await?);
     if sweep.total() > 0 {
         log_retention_sweep(sweep, policy);
     }
@@ -300,7 +296,7 @@ async fn reap_operational_tables_with_presence(
     store: &Store,
     policy: OperationalRetentionPolicy,
     ts: i64,
-    presence: Option<&PresenceWriter>,
+    state: Option<&AppState>,
 ) -> Result<RetentionSweep, NexusError> {
     let Some(cutoff) = policy.cutoff(ts) else {
         return Ok(RetentionSweep::default());
@@ -313,8 +309,10 @@ async fn reap_operational_tables_with_presence(
         ..RetentionSweep::default()
     };
 
-    let delivery_timeouts =
-        dead_letter_delivery_timeouts(store, ts, policy.delivery_timeout_ttl_ms).await?;
+    let delivery_timeouts = match state {
+        Some(state) => sweep_delivery_timeouts(state, ts, policy.delivery_timeout_ttl_ms).await?,
+        None => dead_letter_delivery_timeouts(store, ts, policy.delivery_timeout_ttl_ms).await?,
+    };
     sweep.delivery_timeouts = delivery_timeouts.count;
 
     sweep.initial_prompt_deliveries = store
@@ -463,7 +461,7 @@ async fn reap_operational_tables_with_presence(
         .await
         .map_err(sql_err)?;
 
-    sweep.agent_runtimes = match presence {
+    sweep.agent_runtimes = match state.map(|state| &state.presence) {
         Some(presence) => presence
             .reap_runtime_retention(cutoff)
             .await
@@ -579,6 +577,28 @@ fn log_retention_sweep(sweep: RetentionSweep, policy: OperationalRetentionPolicy
         size_threshold_mb = policy.size_threshold_mb,
         "reaped operational rows"
     );
+}
+
+/// Run the daemon's timeout settlement path at the supplied maintenance timestamp.
+#[doc(hidden)]
+pub async fn sweep_delivery_timeouts(
+    state: &AppState,
+    ts: i64,
+    ttl_ms: i64,
+) -> Result<DeadLetterMutation, NexusError> {
+    let mutation = dead_letter_delivery_timeouts(&state.store, ts, ttl_ms).await?;
+    // Settlement has committed before projection. A projection/read failure must never reverse
+    // it or re-admit the input. As with other RAM-backed effects, a process crash in this gap
+    // can lose the projection; there is no durable cross-authority outbox here. These are current
+    // terminal facts: an intervening explicit operator requeue/purge can remove a fact before
+    // this read. Never project a newly pending revision as the old timeout transition.
+    for effect in Inbox::new(&state.store)
+        .gateway_delivery_effects_for_ids(&mutation.in_flight_ids)
+        .await?
+    {
+        state.ws.project(effect).await;
+    }
+    Ok(mutation)
 }
 
 async fn dead_letter_delivery_timeouts(

@@ -828,20 +828,20 @@ async def run_phases(env: Env, fleet: Fleet, summary: Summary, args: argparse.Na
     topic_subscribers = {a.name for a in fleet.actors[: min(3, len(fleet.actors))]}
     thread_names = list(fleet.threads)
 
-    def cli_send(actor: Actor, kind: str) -> None:
+    async def cli_send(actor: Actor, kind: str) -> None:
         msg_id = f"{run_nonce}{rng.getrandbits(48):012x}"
         body = body_for(msg_id)
         started = time.monotonic()
         if kind == "post":
             thread = rng.choice([t for t, m in fleet.threads.items() if actor.name in m])
-            env.nexus(actor, "post", thread, "-m", body, timeout=35)
+            await asyncio.to_thread(env.nexus, actor, "post", thread, "-m", body, timeout=35)
             targets = (set(fleet.threads[thread]) - {actor.name, fleet.ghost.name}) & live_names
         elif kind == "dm":
             recipient = rng.choice([a for a in fleet.actors if a.name != actor.name])
-            env.nexus(actor, "dm", recipient.name, "-m", body, timeout=35)
+            await asyncio.to_thread(env.nexus, actor, "dm", recipient.name, "-m", body, timeout=35)
             targets = {recipient.name}
         else:
-            env.nexus(actor, "publish", fleet.topic, "-m", body, timeout=35)
+            await asyncio.to_thread(env.nexus, actor, "publish", fleet.topic, "-m", body, timeout=35)
             targets = topic_subscribers - {actor.name}
         elapsed = time.monotonic() - started
         ledger.record_send(msg_id, actor.name, kind, targets, t=started)
@@ -853,7 +853,11 @@ async def run_phases(env: Env, fleet: Fleet, summary: Summary, args: argparse.Na
     ghost_msg_ids = []
     for _ in range(3):
         msg_id = f"{run_nonce}{rng.getrandbits(48):012x}"
-        env.nexus(fleet.actors[0], "dm", fleet.ghost.name, "-m", body_for(msg_id), timeout=35)
+        # Keep listener pipe pumps running while the blocking CLI subprocess waits.
+        # Await each send in order; RNG and ledger mutations stay on this loop.
+        await asyncio.to_thread(
+            env.nexus, fleet.actors[0], "dm", fleet.ghost.name, "-m", body_for(msg_id), timeout=35
+        )
         ghost_msg_ids.append(msg_id)
     summary.info["ghost_msg_ids"] = ghost_msg_ids
 
@@ -868,7 +872,7 @@ async def run_phases(env: Env, fleet: Fleet, summary: Summary, args: argparse.Na
             roll = rng.random()
             kind = "post" if roll < 0.7 else ("dm" if roll < 0.9 else "publish")
             try:
-                cli_send(actor, kind)
+                await cli_send(actor, kind)
             except (GateError, Exception) as error:  # noqa: BLE001 — every failure is evidence
                 send_errors += 1
                 if send_errors <= 5:
@@ -899,7 +903,7 @@ async def run_phases(env: Env, fleet: Fleet, summary: Summary, args: argparse.Na
     # Phase 2: idle gap — total silence, then resume through the same daemon IPC client.
     await asyncio.sleep(30)
     try:
-        cli_send(fleet.actors[0], "post")
+        await cli_send(fleet.actors[0], "post")
         post_gap_ok = True
     except Exception as error:  # noqa: BLE001
         post_gap_ok = False
@@ -987,7 +991,7 @@ async def run_phases(env: Env, fleet: Fleet, summary: Summary, args: argparse.Na
         for i in range(max(12, 3 * len(fleet.actors))):
             actor = fleet.actors[i % len(fleet.actors)]
             try:
-                cli_send(actor, "post")
+                await cli_send(actor, "post")
             except Exception as error:  # noqa: BLE001
                 summary.check(f"post-restart-send-{i}", False, str(error)[:200])
             await asyncio.sleep(0.1)
@@ -1036,7 +1040,7 @@ async def run_phases(env: Env, fleet: Fleet, summary: Summary, args: argparse.Na
         for _ in range(4):
             sender = fleet.actors[0] if fleet.actors[0] is not rename_target else fleet.actors[-1]
             try:
-                cli_send(sender, "post")
+                await cli_send(sender, "post")
             except Exception as error:  # noqa: BLE001
                 summary.check("mid-run-rename", False, f"post-rename send failed: {error}"[:200])
                 renamed_ok = False
@@ -1350,17 +1354,17 @@ def run_phase6_audits(env: Env, ledger: Ledger, summary: Summary, args: argparse
     )
 
     # False dead-letters: no delivery may end 'error' with the completion-timeout
-    # reason. That reason means the daemon gave up awaiting turn completion for mail the
+    # code. That code means the daemon gave up awaiting turn completion for mail the
     # harness had ACCEPTED. An accepted response must not be recorded as failed.
     # Zero tolerance in a gate run.
     (false_dlq,) = env.db_query(
         "SELECT COUNT(*) FROM in_flight WHERE state = 'error' "
-        "AND error_reason = 'turn completion timeout'"
+        "AND (error_code = 'completion_timeout' OR error_reason = 'turn completion timeout')"
     )[0]
     summary.check(
         "no-completion-timeout-deadletters",
         false_dlq == 0,
-        f"{false_dlq} deliveries dead-lettered as 'turn completion timeout'",
+        f"{false_dlq} deliveries dead-lettered with completion_timeout (or legacy reason)",
     )
 
     # Daemon env: the daemon must own the embedded file and expose no remote URL.

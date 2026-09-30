@@ -299,3 +299,73 @@ fn daemon_service_manager_commands_use_the_shared_bounded_process_boundary() {
     assert!(source.contains("lifecycle_process::run_bounded"));
     assert!(!source.contains(".args(&self.args).output()"));
 }
+
+#[cfg(unix)]
+#[test]
+fn service_command_explicit_budget_is_honored_without_changing_default() {
+    let command = CommandSpec::new("sh", ["-c", "sleep 0.1"]);
+    assert!(command
+        .run_checked_with_timeout(Duration::from_millis(20))
+        .is_err());
+    command
+        .run_checked_with_timeout(Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(SERVICE_HELPER_TIMEOUT, Duration::from_secs(5));
+}
+#[tokio::test]
+async fn startup_confirmation_waits_for_positive_evidence_and_bounds_unresponsive_probe() {
+    let mut attempts = 0;
+    super::wait_for_ready_probe(std::time::Duration::from_secs(1), || {
+        attempts += 1;
+        std::future::ready(attempts == 2)
+    })
+    .await
+    .unwrap();
+    assert_eq!(attempts, 2);
+    assert!(
+        super::wait_for_ready_probe(std::time::Duration::from_millis(10), || {
+            std::future::ready(false)
+        })
+        .await
+        .is_err()
+    );
+    assert!(
+        super::wait_for_ready_probe(std::time::Duration::from_millis(10), || {
+            std::future::pending::<bool>()
+        })
+        .await
+        .is_err()
+    );
+    assert!(
+        super::wait_for_ready_probe(std::time::Duration::from_millis(10), || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::future::ready(true)
+        })
+        .await
+        .is_err(),
+        "late positive evidence must not defeat the deadline"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_liveness_observes_native_process_exit_without_tasklist() {
+    let mut child = Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 30",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let alive = process_alive(child.id());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(alive);
+    assert!(!process_alive(child.id()));
+    assert!(!process_alive(0));
+}

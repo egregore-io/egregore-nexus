@@ -7,7 +7,7 @@ import {
   type MessagePageOptions,
 } from "../store/repos/messages";
 import { Kind, Scope, type Message, type Provenance } from "@shared/types";
-import { parseEntityKind } from "@server/identity/entityKind";
+import { EntityKindError, parseEntityKind } from "@server/identity/entityKind";
 import type {
   AgentAccessGrantRow,
   AgentOwnerRow,
@@ -92,7 +92,7 @@ export async function canonicalMembers(
       name: optionalString(row.name) ?? agentId,
       sessionId: optionalString(row.session_id) ?? optionalString(row.runtime_id) ?? "",
       agentId,
-      ...(kind === "agent" && harness ? { agent: harness } : {}),
+      ...(isAgentMemberKind(kind) && harness ? { agent: harness } : {}),
       kind,
       tier: optionalString(row.tier),
       presence: status,
@@ -100,6 +100,16 @@ export async function canonicalMembers(
     });
   }
   return [...members.values()];
+}
+
+function isAgentMemberKind(kind: string): boolean {
+  try {
+    return parseEntityKind(kind).kind === Kind.Agent;
+  } catch (error) {
+    // Preserve unknown roster kinds without assigning them an agent harness.
+    if (error instanceof EntityKindError) return false;
+    throw error;
+  }
 }
 
 /** Project runtime fleet rows from Gateway-owned resurrection descriptors. */

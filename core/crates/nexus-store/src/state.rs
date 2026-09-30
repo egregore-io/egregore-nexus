@@ -280,6 +280,16 @@ impl Store {
         location: &str,
         _auth_token: Option<&str>,
     ) -> Result<Store, NexusError> {
+        Self::open_with_stream_path(location, crate::migrate::resolve_stream_db_path()).await
+    }
+
+    /// Select the attached stream authority explicitly without changing process configuration.
+    /// Split identity uses anonymous memory: BEGIN IMMEDIATE also locks attached databases, so
+    /// sharing transport's named stream file would couple otherwise independent write gates.
+    pub(crate) async fn open_with_stream_path(
+        location: &str,
+        stream_db_path: Option<String>,
+    ) -> Result<Store, NexusError> {
         let parsed = StoreLocation::parse(location);
         if let StoreLocation::RemoteUrl(url) = &parsed {
             return Err(NexusError::Invalid(format!(
@@ -317,8 +327,6 @@ impl Store {
                 while rows.next().await.map_err(store_err)?.is_some() {}
             }
         }
-
-        let stream_db_path = crate::migrate::resolve_stream_db_path();
 
         Ok(Store {
             conn: StoreConnection::new(conn),
@@ -374,6 +382,39 @@ impl Store {
             Some(identity) => identity.begin_write_txn(label).await,
             None => self.begin_write_txn(label).await,
         }
+    }
+
+    /// Guard a split authority's implicit write through its RETURNING cursor's
+    /// lifetime. Unified command workers already own this store's write gate;
+    /// reacquiring that same mutex here would deadlock them.
+    pub(crate) async fn lock_split_identity_write(&self) -> Option<OwnedMutexGuard<()>> {
+        match self.identity_authority.as_ref() {
+            Some(identity) => Some(identity.write_lock.clone().lock_owned().await),
+            None => None,
+        }
+    }
+
+    /// Execute one synchronous, clone-isolated native batch on the identity
+    /// authority. The async gate also excludes existing multi-step owners.
+    pub(crate) async fn execute_identity_write_batch(
+        &self,
+        label: &str,
+        sql: &str,
+    ) -> Result<(), NexusError> {
+        let identity = self.identity_authority.as_deref().unwrap_or(self);
+        identity.execute_write_batch(label, sql).await
+    }
+
+    pub(crate) async fn execute_identity_parameterized_write(
+        &self,
+        label: &str,
+        sql: &str,
+        params: impl IntoParams,
+    ) -> Result<u64, NexusError> {
+        let identity = self.identity_authority.as_deref().unwrap_or(self);
+        identity
+            .execute_parameterized_write(label, sql, params)
+            .await
     }
 
     /// Connection that owns the volatile `mem.stream_events` / `mem.stream_raw` lane.

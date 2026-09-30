@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(windows)]
 use std::net::TcpStream as BridgeTestStream;
 #[cfg(unix)]
@@ -19,11 +19,15 @@ use nexus_dispatch::Bell;
 use nexus_pty::TurnCompletionEvidence;
 use tempfile::tempdir;
 
+#[path = "support/hermes_parked_timing.rs"]
+mod hermes_parked_timing;
+
 struct NativeCapture {
     profile: nexus_contracts::model_report::ModelProfileIdentity,
     closed: std::sync::atomic::AtomicBool,
     root: Mutex<Option<String>>,
     updates: Mutex<Vec<nexus_contracts::model_report::NativeModelUpdate>>,
+    telemetry: Mutex<Vec<nexus_contracts::telemetry::NativeTelemetryUpdate>>,
 }
 impl nexus_contracts::model_report::ModelObservationSink for NativeCapture {
     fn accepts_profile(
@@ -55,6 +59,21 @@ impl nexus_contracts::model_report::ModelObservationSink for NativeCapture {
     fn revoke(&self) {
         self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
+    fn observe_telemetry(&self, update: nexus_contracts::telemetry::NativeTelemetryUpdate) -> bool {
+        let nexus_contracts::telemetry::NativeTelemetryUpdate::Usage {
+            native_session_id, ..
+        } = &update
+        else {
+            return false;
+        };
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst)
+            || self.root.lock().unwrap().as_deref() != Some(native_session_id)
+        {
+            return false;
+        }
+        self.telemetry.lock().unwrap().push(update);
+        true
+    }
 }
 fn native_capture() -> (
     Arc<NativeCapture>,
@@ -66,6 +85,7 @@ fn native_capture() -> (
         closed: false.into(),
         root: Mutex::new(None),
         updates: Mutex::new(vec![]),
+        telemetry: Mutex::new(vec![]),
     });
     let reporting = profile.capture(sink.clone()).unwrap();
     (sink, reporting)
@@ -89,6 +109,77 @@ fn send_model(bridge: &HermesGatewayBridge, frame: serde_json::Value) -> bool {
     serde_json::from_str::<serde_json::Value>(&reply)
         .ok()
         .is_some_and(|value| value["accepted"] == true)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_usage_is_exact_row_cumulative_replacement_not_context_or_total() {
+    use nexus_contracts::telemetry::{
+        NativeTelemetryUpdate, NativeTelemetryValue, TokenUsageScope,
+    };
+    let dir = tempdir().unwrap();
+    let (sink, reporting) = native_capture();
+    let bridge = HermesGatewayBridge::start_observed(
+        SessionId("s_usage".into()),
+        dir.path().join("bridge.sock"),
+        "model-token".into(),
+        Arc::new(CaptureSink::default()),
+        Bell::new(),
+        reporting,
+    )
+    .unwrap();
+    for (index, input) in [120, 120, 12, 0].into_iter().enumerate() {
+        let mut frame = model_frame("root", index as u64 + 1, "configured");
+        frame["row"]["usage"] = serde_json::json!({"api_call_count":3,"input_tokens":input,
+            "output_tokens":30,"cache_read_tokens":80,"cache_write_tokens":20,"reasoning_tokens":12});
+        assert!(send_model(&bridge, frame));
+        let values = sink.telemetry.lock().unwrap();
+        assert_eq!(
+            values.len(),
+            index + 1,
+            "each native row replaces independently"
+        );
+        let NativeTelemetryUpdate::Usage {
+            native_session_id,
+            value: NativeTelemetryValue::Observed(value),
+        } = &values[index]
+        else {
+            panic!("native row must supply usage");
+        };
+        assert_eq!(native_session_id, "root");
+        assert_eq!(value.scope, TokenUsageScope::SessionCumulative);
+        assert_eq!(value.input_tokens.unwrap().get(), input);
+        assert_eq!(value.cache_read_tokens.unwrap().get(), 80);
+        assert_eq!(value.cache_write_tokens.unwrap().get(), 20);
+        assert_eq!(value.reasoning_tokens.unwrap().get(), 12);
+        assert!(value.total_tokens.is_none());
+        assert!(
+            value.native_turn_id.is_none() && value.reset_id.is_none() && value.model.is_none()
+        );
+    }
+    for (index, usage, invalid) in [
+        (5, serde_json::Value::Null, false),
+        (6, serde_json::json!({"api_call_count":0}), false),
+        (
+            7,
+            serde_json::json!({"api_call_count":1,"input_tokens":-1}),
+            true,
+        ),
+    ] {
+        let mut frame = model_frame("root", index, "configured");
+        frame["row"]["usage"] = usage;
+        assert!(send_model(&bridge, frame));
+        let values = sink.telemetry.lock().unwrap();
+        let NativeTelemetryUpdate::Usage { value, .. } = values.last().unwrap() else {
+            panic!("usage only")
+        };
+        assert_eq!(matches!(value, NativeTelemetryValue::Invalid), invalid);
+        assert_eq!(matches!(value, NativeTelemetryValue::Unknown), !invalid);
+    }
+    let before = sink.telemetry.lock().unwrap().len();
+    let mut foreign = model_frame("root", 8, "child");
+    foreign["row"]["parent_session_id"] = serde_json::json!("parent");
+    assert!(!send_model(&bridge, foreign));
+    assert_eq!(sink.telemetry.lock().unwrap().len(), before);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -599,7 +690,12 @@ async fn native_model_generated_hook_reads_only_framework_selected_row() {
     .unwrap();
     let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/model_reporting/native.json");
-    let output = std::process::Command::new("python3").arg("-c").arg(r#"
+    let python = if cfg!(windows) {
+        "python.exe"
+    } else {
+        "python3"
+    };
+    let output = std::process::Command::new(python).arg("-c").arg(r#"
 import asyncio, importlib.util, json, os, pathlib, sqlite3, sys
 home=pathlib.Path(os.environ['HERMES_HOME'])
 spec=importlib.util.spec_from_file_location('captured_hook',home/'hooks/nexus-model/handler.py')
@@ -614,6 +710,9 @@ ctx={'platform':'nexus','user_id':'nexus','chat_id':'nexus','thread_id':'','chat
 async def run():
     await hook.handle('agent:start',{**ctx,'chat_id':'foreign','session_id':'fixture-foreign'})
     await hook.handle('agent:start',ctx)
+    for column in ('input_tokens','output_tokens','cache_read_tokens','cache_write_tokens','reasoning_tokens','api_call_count'):
+        db.execute('ALTER TABLE sessions ADD COLUMN '+column+' INTEGER DEFAULT 0')
+    db.execute('UPDATE sessions SET input_tokens=120,output_tokens=30,cache_read_tokens=80,cache_write_tokens=20,reasoning_tokens=12,api_call_count=3 WHERE id=?',('fixture-root',)); db.commit()
     db.execute('UPDATE sessions SET model=? WHERE id=?',('opaque/next','fixture-root')); db.commit()
     await hook.handle('agent:end',ctx)
     # A later root cannot turn a stale launch into a new native owner.
@@ -644,6 +743,28 @@ asyncio.run(run())
         panic!("native configured row");
     };
     assert_eq!(last.model_id, "opaque/next");
+    let telemetry = sink.telemetry.lock().unwrap();
+    assert_eq!(
+        telemetry.len(),
+        2,
+        "old-schema model read survives; upgraded row supplies usage"
+    );
+    assert!(matches!(
+        &telemetry[0],
+        nexus_contracts::telemetry::NativeTelemetryUpdate::Usage {
+            value: nexus_contracts::telemetry::NativeTelemetryValue::Unknown,
+            ..
+        }
+    ));
+    let nexus_contracts::telemetry::NativeTelemetryUpdate::Usage {
+        value: nexus_contracts::telemetry::NativeTelemetryValue::Observed(value),
+        ..
+    } = &telemetry[1]
+    else {
+        panic!("actual exact-row query must capture usage")
+    };
+    assert_eq!(value.input_tokens.unwrap().get(), 120);
+    assert_eq!(value.cache_write_tokens.unwrap().get(), 20);
     assert!(sink.closed.load(std::sync::atomic::Ordering::SeqCst));
 }
 
@@ -680,48 +801,97 @@ async fn native_model_parked_hook_cannot_publish_into_replacement_bridge() {
         session_id: SessionId("s_replace".into()),
     })
     .unwrap();
-    let child = std::process::Command::new("python3").arg("-c").arg(r#"
-import asyncio, importlib.util, os, pathlib, sqlite3, sys
+    let python = if cfg!(windows) {
+        "python.exe"
+    } else {
+        "python3"
+    };
+    let timing = hermes_parked_timing::Timeline::before_spawn();
+    let child = std::process::Command::new(python).arg("-c").arg(r#"
+import sys, time
+started=time.monotonic()
+def phase(name):
+    print('parked-hook phase='+name+' elapsed='+str(time.monotonic()-started),file=sys.stderr,flush=True)
+phase('python-started')
+import asyncio, importlib.util, os, pathlib, sqlite3
+phase('imports-complete')
 home=pathlib.Path(os.environ['HERMES_HOME'])
 db=sqlite3.connect(home/'state.db')
 db.execute('CREATE TABLE sessions(id TEXT PRIMARY KEY, model TEXT, model_config TEXT, parent_session_id TEXT, ended_at REAL)')
 db.execute('INSERT INTO sessions VALUES(?,?,?,?,?)',('old-root','old-model','{}',None,None)); db.commit(); db.close()
+phase('database-ready')
 spec=importlib.util.spec_from_file_location('captured_hook',home/'hooks/nexus-model/handler.py')
 hook=importlib.util.module_from_spec(spec); spec.loader.exec_module(hook)
+phase('hook-imported')
 read=hook._row
 def parked(root):
+    phase('row-read-entered')
     row=read(root)
+    assert row is not None and row['id']=='old-root' and row['model']=='old-model', 'exact fixture row unavailable'
+    phase('row-read-complete')
     print('exact native row captured',flush=True)
     assert sys.stdin.readline().strip()=='release'
+    phase('release-received')
     return row
 hook._row=parked
+phase('handle-entered')
 asyncio.run(hook.handle('agent:start',{'platform':'nexus','user_id':'nexus','chat_id':'nexus','thread_id':'','chat_type':'dm','session_id':'old-root'}))
+phase('handle-complete')
 "#).env("HERMES_HOME", &home).env("NEXUS_HERMES_BRIDGE_SOCKET",bridge.endpoint())
         .env("NEXUS_HERMES_BRIDGE_TOKEN","old-token")
         .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped()).spawn().expect("python3 is required");
-    struct ChildGuard(std::process::Child);
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
+    timing.record("spawn-return");
+    struct ChildGuard(std::process::Child, hermes_parked_timing::Timeline);
+    impl ChildGuard {
+        fn stop(&mut self) {
+            self.1
+                .record(&format!("owned-child-kill-request pid={}", self.0.id()));
             let _ = self.0.kill();
+            self.1.record("owned-child-kill-return");
             let _ = self.0.wait();
+            self.1.record("owned-child-wait-return");
         }
     }
-    let mut child = ChildGuard(child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+    let mut child = ChildGuard(child, timing.clone());
+    // Drain concurrently so a diagnostic pipe cannot itself stall the child.
+    // Keep only a bounded tail; these are hermetic fixture phases, never provider data.
+    let captured_timing = timing.clone();
+    let mut error_output = child.0.stderr.take().unwrap();
+    let stderr_reader = std::thread::spawn(move || {
+        let mut chunk = [0_u8; 1024];
+        loop {
+            match error_output.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => captured_timing.stderr_chunk(&chunk[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
     let output = child.0.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let stdout_reader = std::thread::spawn(move || {
         let mut line = String::new();
         let result = BufReader::new(output).read_line(&mut line).map(|_| line);
         let _ = tx.send(result);
     });
-    assert_eq!(
-        rx.recv_timeout(Duration::from_secs(3))
-            .unwrap()
-            .unwrap()
-            .trim(),
-        "exact native row captured"
-    );
+    let captured = timing.receive_marker(&rx);
+    if !matches!(&captured, Ok(Ok(line)) if line.trim() == "exact native row captured") {
+        let status = child.0.try_wait();
+        child.stop();
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        panic!(
+            "parked hook did not capture its exact row within the unchanged 3s watchdog; marker={captured:?}; child_status={status:?}; {}",
+            timing.report(),
+        );
+    }
     drop(bridge);
     assert!(old.closed.load(std::sync::atomic::Ordering::SeqCst));
     let (new, reporting) = native_capture();
@@ -737,18 +907,34 @@ asyncio.run(hook.handle('agent:start',{'platform':'nexus','user_id':'nexus','cha
     // Windows uses a different ephemeral endpoint; Unix deliberately reuses the socket path.
     // Both retain OLD's captured token, never replacing it with NEW's authority.
     writeln!(child.0.stdin.take().unwrap(), "release").unwrap();
+    timing.record("release-sent");
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    loop {
+    timing.record("finish-watchdog-start");
+    let status = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
-            assert!(status.success());
-            break;
+            timing.record("child-exit-observed");
+            break status;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "parked hook did not finish"
-        );
+        if std::time::Instant::now() >= deadline {
+            timing.record("finish-watchdog-timeout");
+            child.stop();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            panic!(
+                "parked hook did not finish within the unchanged 3s watchdog; {}",
+                timing.report(),
+            );
+        }
         tokio::task::yield_now().await;
-    }
+    };
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    eprintln!("parked-hook timing: {}", timing.report());
+    assert!(
+        status.success(),
+        "parked hook failed after release: status={status}; {}",
+        timing.report(),
+    );
     assert!(old.updates.lock().unwrap().is_empty());
     assert!(new.updates.lock().unwrap().is_empty());
     assert!(!new.closed.load(std::sync::atomic::Ordering::SeqCst));

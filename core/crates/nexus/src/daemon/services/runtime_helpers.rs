@@ -207,21 +207,6 @@ pub(crate) fn claude_resume_session_id(args: &[String]) -> Option<&str> {
     None
 }
 
-pub(crate) fn opencode_resume_session_id(args: &[String]) -> Option<&str> {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if arg == "--session" || arg == "-s" {
-            return iter.next().map(String::as_str).filter(|id| !id.is_empty());
-        }
-        if let Some(id) = arg.strip_prefix("--session=") {
-            if !id.is_empty() {
-                return Some(id);
-            }
-        }
-    }
-    None
-}
-
 const CODEX_THREAD_BINDING_CLAIM_ATTEMPTS: usize = 40;
 const CODEX_THREAD_BINDING_CLAIM_RETRY_MS: u64 = 25;
 

@@ -10,6 +10,9 @@
 use thiserror::Error;
 
 pub mod native_executable;
+pub mod native_resume;
+
+pub use native_resume::{NativeResumeEvidence, NativeResumePlan, NativeResumeStore};
 
 /// Process naming convention used when resolving provider-owned harness executables.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +328,42 @@ pub trait Harness: Send + Sync {
         ResumeStyle::Unsupported
     }
 
+    /// Validate runtime-scoped native evidence and describe a safe resume operation.
+    ///
+    /// The caller gathers evidence and validates Nexus ownership; the concrete harness owns
+    /// native key agreement, argv, and store selection. Existing harnesses opt in explicitly.
+    fn native_resume_plan(
+        &self,
+        _evidence: NativeResumeEvidence<'_>,
+    ) -> Result<NativeResumePlan, HarnessError> {
+        Err(HarnessError::UnsupportedResume {
+            harness: self.agent_token().to_string(),
+        })
+    }
+
+    /// Choose the native key to persist in a runtime's resurrection capsule after readiness.
+    ///
+    /// The default preserves existing requested-key behavior; harnesses with a native ready
+    /// result may require that observation and validate it against the original request.
+    fn capture_resurrection_key(
+        &self,
+        requested: Option<&str>,
+        _reported: Option<&str>,
+    ) -> Result<Option<String>, HarnessError> {
+        Ok(requested.map(str::to_string))
+    }
+
+    /// Parse an explicit native resume request, rejecting malformed flags when supported.
+    ///
+    /// The default does not interpret native arguments. A parsed request is a constraint, not
+    /// proof that an existing runtime owns that native conversation.
+    fn requested_native_resume_key<'a>(
+        &self,
+        _args: &'a [String],
+    ) -> Result<Option<&'a str>, HarnessError> {
+        Ok(None)
+    }
+
     /// Operator-facing description of the stored key named in revive errors,
     /// e.g. `--resume session id` or `thread id`.
     fn resume_key_description(&self) -> &'static str {
@@ -418,6 +457,15 @@ pub enum HarnessError {
     /// The harness-specific compatibility tail was malformed.
     #[error("{0}")]
     InvalidTail(String),
+    /// Native resume evidence or an explicit request is missing, malformed, or inconsistent.
+    #[error("{0}")]
+    InvalidResume(String),
+    /// The harness has not opted into runtime-scoped native resume planning.
+    #[error("native resume planning is unsupported for {harness}")]
+    UnsupportedResume {
+        /// Stable runtime token of the harness.
+        harness: String,
+    },
     /// The harness cannot execute this slash command natively.
     #[error("unsupported slash command {command} for {harness}")]
     UnsupportedSlashCommand {

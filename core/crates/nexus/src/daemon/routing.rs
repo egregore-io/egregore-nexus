@@ -593,7 +593,14 @@ pub(crate) async fn route_request_for_prompt_attempt(
     attempt: Option<&crate::daemon::command_worker::PromptAttempt>,
 ) -> Response {
     let id = req.id.clone();
-    match route_request_inner(state, &caller, &req, attempt).await {
+    // Launch can descend through cold revival into native process setup. Do not stack
+    // that path beneath the large general registry's poll frame. Both handlers remain
+    // one awaited operation with the same borrowed owner/attempt and cancellation lifetime.
+    let result = match req.method.as_str() {
+        "launch" | "admin.spawn" => Box::pin(route_launch(state, &caller, &req)).await,
+        _ => Box::pin(route_request_inner(state, &caller, &req, attempt)).await,
+    };
+    match result {
         Ok(resp_value) => ok(id, resp_value),
         Err(e) => err(id, e),
     }
@@ -604,6 +611,26 @@ pub(crate) async fn route_request_for_prompt_attempt(
 /// New daemon code calls [`route_request`]. This alias preserves the existing Rust composition API
 /// without retaining a second routing implementation or changing any CLI/wire method.
 pub use route_request as dispatch;
+
+/// Small launch dispatch frame shared by ordinary and admin ingress. Keep authorization
+/// before parsing, and use the same AppState orchestration that owns registration and wakeup.
+async fn route_launch(
+    state: &AppState,
+    caller: &Option<Caller>,
+    req: &Request,
+) -> Result<Value, RpcError> {
+    let caller = if req.method == "admin.spawn" {
+        require_admin(caller)?
+    } else {
+        require(caller)?
+    };
+    let request: SpawnRequest = parse(&req.params)?;
+    let out = state
+        .launch_agent(request, &caller.project, Some(caller))
+        .await
+        .map_err(|error| contract_to_rpc(&error))?;
+    Ok(serde_json::to_value(out).unwrap())
+}
 
 /// Inner registry: returns the success `Value` or an `RpcError`. Splitting it keeps the `match`
 /// arms terse (each ends in a serialized success value).
@@ -825,22 +852,6 @@ async fn route_request_inner(
             let r: AgentRuntimeListRequest = parse(p)?;
             let out = state
                 .list_agent_runtimes(c, r)
-                .await
-                .map_err(|e| contract_to_rpc(&e))?;
-            Ok(serde_json::to_value(out).unwrap())
-        }
-
-        // ---- Agent transport ----
-        "launch" => {
-            let c = require(caller)?;
-            let r: SpawnRequest = parse(p)?;
-            // `launch_agent` (not the bare `agent.launch`) is what makes the launched agent an
-            // addressable, wakeable bus member: open+bind adapter → register identity → spawn loop.
-            // Pass the CALLER'S project so the launched agent is registered in it (and thus visible to
-            // the caller's project-scoped `members`/`resolve`) when the request omits a project — the
-            // real `nexus launch <kind>` CLI invocation sends no `--project`.
-            let out = state
-                .launch_agent(r, &c.project, Some(c))
                 .await
                 .map_err(|e| contract_to_rpc(&e))?;
             Ok(serde_json::to_value(out).unwrap())
@@ -1385,18 +1396,6 @@ async fn route_request_inner(
         }
 
         // ---- Admin (tier-gated before target parsing/lookup; AdminPort also guards) ----
-        "admin.spawn" => {
-            let c = require_admin(caller)?;
-            let r: SpawnRequest = parse(p)?;
-            // `admin.spawn` must use the same AppState-owned orchestration as `launch`: open/bind
-            // the harness, register the member row, and start the wake loop. The AdminPort seam is
-            // delegate-only and its `agent.launch` target is below that orchestration.
-            let out = state
-                .launch_agent(r, &c.project, Some(c))
-                .await
-                .map_err(|e| contract_to_rpc(&e))?;
-            Ok(serde_json::to_value(out).unwrap())
-        }
         "admin.remove" => {
             let c = require_admin(caller)?;
             let r: RemoveRequest = parse(p)?;

@@ -370,6 +370,10 @@ impl GatewayBackend for SystemGatewayBackend {
 
 pub async fn start_gateway() -> Result<GatewayStatusReport, GatewayLifecycleError> {
     lifecycle::ensure_operator_supervision()?;
+    if crate::gateway_service::gateway_service_installed() {
+        crate::gateway_service::start_registered_gateway(false).await?;
+        return gateway_status();
+    }
     let backend = SystemGatewayBackend::new();
     let runtime = start_with(&backend).await?;
     Ok(report(&backend, runtime))
@@ -377,6 +381,10 @@ pub async fn start_gateway() -> Result<GatewayStatusReport, GatewayLifecycleErro
 
 pub fn stop_gateway(force: bool) -> Result<GatewayStatusReport, GatewayLifecycleError> {
     lifecycle::ensure_operator_supervision()?;
+    if crate::gateway_service::gateway_service_installed() {
+        crate::gateway_service::stop_registered_gateway()?;
+        return gateway_status();
+    }
     let backend = SystemGatewayBackend::new();
     let runtime = stop_with(&backend, force)?;
     Ok(report(&backend, runtime))
@@ -384,6 +392,10 @@ pub fn stop_gateway(force: bool) -> Result<GatewayStatusReport, GatewayLifecycle
 
 pub async fn restart_gateway(force: bool) -> Result<GatewayStatusReport, GatewayLifecycleError> {
     lifecycle::ensure_operator_supervision()?;
+    if crate::gateway_service::gateway_service_installed() {
+        crate::gateway_service::start_registered_gateway(true).await?;
+        return gateway_status();
+    }
     let backend = SystemGatewayBackend::new();
     let runtime = restart_with(&backend, force).await?;
     Ok(report(&backend, runtime))

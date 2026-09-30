@@ -31,6 +31,7 @@ import {
   type HostTransportFrame,
 } from "./protocol";
 import { resolveTransportSecretRefs } from "./secrets";
+import { windowsEntryCommand } from "./windowsAuthority";
 
 const MAX_WRITE_BUFFER_BYTES = TRANSPORT_MAX_FRAME_BYTES * 16;
 const MAX_CRASHES = 10;
@@ -71,32 +72,57 @@ export function createTransportHost(options: TransportHostOptions): TransportHos
   const controllers = new Map<string, TransportController>();
   let stopped = false;
   let closeWake: (() => void) | undefined;
+  let starting: Promise<void> | undefined;
+  let stopping: Promise<void> | undefined;
   return {
-    async start() {
+    start() {
+      // A new start must not reopen admission while the previous host is draining.
+      if (stopping) return stopping.then(() => this.start());
+      if (starting) return starting;
       stopped = false;
-      closeWake ??= onTransportOutboxWake(() => {
-        for (const controller of controllers.values()) void controller.wake();
-      });
-      const directory = join(options.nexusHome, "gateway", "transports.d");
-      const entries = await readdir(directory, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
-        if (error.code === "ENOENT") return [];
-        throw error;
-      });
-      for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-        if (!entry.isFile() || !entry.name.endsWith(".toml")) continue;
-        const name = entry.name.slice(0, -5);
-        const manifest = await loadTransportManifest(name, { nexusHome: options.nexusHome });
-        const controller = new TransportController(manifest, options);
-        controllers.set(name, controller);
-        await controller.start();
-      }
+      const work = (async () => {
+        closeWake ??= onTransportOutboxWake(() => {
+          for (const controller of controllers.values()) void controller.wake();
+        });
+        const directory = join(options.nexusHome, "gateway", "transports.d");
+        const entries = await readdir(directory, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return [];
+          throw error;
+        });
+        for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+          if (stopped) return;
+          if (!entry.isFile() || !entry.name.endsWith(".toml")) continue;
+          const name = entry.name.slice(0, -5);
+          const manifest = await loadTransportManifest(name, { nexusHome: options.nexusHome });
+          if (stopped) return;
+          const controller = new TransportController(manifest, options);
+          controllers.set(name, controller);
+          await controller.start();
+        }
+      })();
+      starting = work;
+      void work.then(() => { starting = undefined; }, () => { starting = undefined; });
+      return work;
     },
-    async stop() {
+    stop() {
+      if (stopping) return stopping;
       stopped = true;
       closeWake?.();
       closeWake = undefined;
-      await Promise.all([...controllers.values()].map((controller) => controller.stop()));
-      controllers.clear();
+      const work = (async () => {
+        // Stop each controller synchronously before joining startup. Startup cannot add
+        // another controller after its next await because admission is now closed.
+        const results = await Promise.allSettled([
+          ...[...controllers.values()].map((controller) => controller.stop()),
+          ...(starting ? [starting] : []),
+        ]);
+        controllers.clear();
+        const failure = results.find((result) => result.status === "rejected");
+        if (failure?.status === "rejected") throw failure.reason;
+      })();
+      stopping = work;
+      void work.then(() => { stopping = undefined; }, () => { stopping = undefined; });
+      return work;
     },
     states() {
       if (stopped && controllers.size === 0) return [];
@@ -119,6 +145,10 @@ class TransportController {
   private helloTimer?: NodeJS.Timeout;
   private stdoutBuffer = "";
   private frameQueue: Promise<void> = Promise.resolve();
+  private readonly work = new Set<Promise<void>>();
+  private readonly children = new Map<ChildProcessWithoutNullStreams, Promise<void>>();
+  private workFailure?: { error: unknown };
+  private stopWork?: Promise<void>;
   private readonly sent = new Set<string>();
   private secretValues: string[] = [];
 
@@ -131,10 +161,11 @@ class TransportController {
 
   async start(): Promise<void> {
     this.stopping = false;
-    await this.spawnGeneration();
+    await this.own(this.spawnGeneration());
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    if (this.stopWork) return this.stopWork;
     this.stopping = true;
     if (this.restartTimer) clearTimeout(this.restartTimer);
     if (this.helloTimer) clearTimeout(this.helloTimer);
@@ -144,30 +175,56 @@ class TransportController {
     this.child = undefined;
     this.state = "stopped";
     this.sent.clear();
-    if (!child || child.exitCode !== null || child.killed) return;
-    this.writeFrame({ t: "transport/shutdown" }, child);
-    await new Promise<void>((resolve) => {
-      const timeout = setTimeout(() => {
-        child.kill("SIGKILL");
-        resolve();
-      }, 1_000);
-      child.once("close", () => {
-        clearTimeout(timeout);
-        resolve();
-      });
-    });
+    if (child && child.exitCode === null && !child.killed) {
+      this.writeFrame({ t: "transport/shutdown" }, child);
+      const timeout = setTimeout(() => child.kill("SIGKILL"), 1_000);
+      child.once("close", () => clearTimeout(timeout));
+    }
+    // Only external entry points enter `work`; shutdown is never one of its own
+    // dependencies. Keep ownership of killed children until their actual close.
+    this.stopWork = (async () => {
+      while (this.work.size > 0) await Promise.allSettled([...this.work]);
+      await Promise.all([...this.children.values()]);
+      if (this.workFailure) throw this.workFailure.error;
+    })();
+    return this.stopWork;
   }
 
-  async wake(): Promise<void> {
-    await this.drain(this.generation);
+  wake(): Promise<void> {
+    if (this.stopping) return Promise.resolve();
+    return this.own(this.drain(this.generation));
+  }
+
+  private own(work: Promise<void>): Promise<void> {
+    this.work.add(work);
+    void work.then(() => this.work.delete(work), (error) => {
+      this.work.delete(work);
+      // Detached event handlers cannot reject to their caller. Retain their first
+      // failure for stop(), fail closed, and still drain all other admitted work.
+      this.workFailure ??= { error };
+      if (!this.stopping) {
+        this.state = "disabled";
+        if (this.restartTimer) clearTimeout(this.restartTimer);
+        if (this.helloTimer) clearTimeout(this.helloTimer);
+        this.restartTimer = undefined;
+        this.helloTimer = undefined;
+        if (this.child && this.child.exitCode === null && !this.child.killed) this.child.kill("SIGKILL");
+      }
+    });
+    return work;
+  }
+
+  private acceptsWork(): boolean {
+    return !this.stopping && this.state !== "disabled";
   }
 
   private async spawnGeneration(): Promise<void> {
-    if (this.stopping || this.state === "disabled") return;
+    if (!this.acceptsWork()) return;
     try {
-      await revalidateTransportManifest(this.manifest);
       const db = await this.options.db();
+      if (!this.acceptsWork()) return;
       const resolvedSecrets = await resolveTransportSecretRefs(db, this.manifest.secretRefs);
+      if (!this.acceptsWork()) return;
       this.secretValues = Object.values(resolvedSecrets).filter(Boolean);
       const sourceEnv = this.options.env ?? process.env;
       const environment: NodeJS.ProcessEnv = {
@@ -176,37 +233,70 @@ class TransportController {
         LANG: sourceEnv.LANG ?? "C.UTF-8",
         ...resolvedSecrets,
       };
+      if (process.platform === "win32") {
+        const root = sourceEnv.SystemRoot ?? sourceEnv.SYSTEMROOT;
+        if (!root) throw new Error("Windows transport requires SystemRoot");
+        environment.SystemRoot = root;
+      }
+      try {
+        await revalidateTransportManifest(this.manifest);
+      } catch (error) {
+        // Only this now-revoked launch authorization is discarded on shutdown.
+        // Database/logging failures still propagate to the owner below.
+        if (this.stopping) return;
+        throw error;
+      }
+      if (!this.acceptsWork()) return;
       this.generation += 1;
       const generation = this.generation;
       this.state = "starting";
       this.stdoutBuffer = "";
       this.frameQueue = Promise.resolve();
       this.sent.clear();
-      const child = spawn(this.manifest.entryPath, [...this.manifest.args], {
+      const launch = process.platform === "win32"
+        ? windowsEntryCommand(this.manifest.entryPath, this.manifest.args)
+        : { command: this.manifest.entryPath, args: [...this.manifest.args] };
+      const child = spawn(launch.command, launch.args, {
         env: environment,
         stdio: ["pipe", "pipe", "pipe"],
         shell: false,
       });
       this.child = child;
+      const closed = new Promise<void>((resolve) => child.once("close", () => {
+        this.children.delete(child);
+        resolve();
+      }));
+      this.children.set(child, closed);
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
       child.stdout.on("data", (chunk: string) => {
-        this.frameQueue = this.frameQueue
+        if (this.stopping) return;
+        this.frameQueue = this.own(this.frameQueue
           .then(() => this.onStdout(generation, chunk))
-          .catch((error) => this.crash(generation, error));
+          .catch((error) => {
+            // A failed crash/disable log is not a second bridge failure. Preserve
+            // it for the owner instead of losing it to crash's duplicate fence.
+            if (this.stopping || generation === this.failedGeneration || this.state === "disabled") throw error;
+            return this.crash(generation, error);
+          }));
       });
-      child.stderr.on("data", (chunk: string) => void this.log("warn", chunk.trim(), generation));
-      child.once("error", (error) => void this.crash(generation, error));
+      child.stderr.on("data", (chunk: string) => {
+        if (!this.stopping) this.own(this.log("warn", chunk.trim(), generation));
+      });
+      child.once("error", (error) => {
+        if (!this.stopping) this.own(this.crash(generation, error));
+      });
       child.once("close", (code, signal) => {
         if (this.stopping || this.state === "disabled" || generation !== this.generation) return;
-        void this.crash(generation, new Error(`bridge exited code=${code} signal=${signal}`));
+        this.own(this.crash(generation, new Error(`bridge exited code=${code} signal=${signal}`)));
       });
       this.helloTimer = setTimeout(() => {
         if (generation === this.generation && this.state === "starting") {
-          void this.crash(generation, new Error("bridge hello timeout"));
+          this.own(this.crash(generation, new Error("bridge hello timeout")));
         }
       }, 5_000);
     } catch (error) {
+      if (this.stopping) throw error;
       await this.disable(error);
     }
   }
@@ -240,7 +330,7 @@ class TransportController {
   }
 
   private async onFrame(generation: number, frame: BridgeTransportFrame): Promise<void> {
-    if (generation !== this.generation) return;
+    if (generation !== this.generation || this.stopping) return;
     if (this.state === "starting") {
       if (frame.t !== "transport/hello") {
         await this.disable(new Error("transport/hello must be the first bridge frame"));
@@ -264,6 +354,7 @@ class TransportController {
     }
     if (this.state !== "running") return;
     const db = await this.options.db();
+    if (generation !== this.generation || this.stopping) return;
     switch (frame.t) {
       case "transport/hello":
         await this.crash(generation, new Error("duplicate transport/hello"));
@@ -343,7 +434,7 @@ class TransportController {
   }
 
   private async drain(generation: number): Promise<void> {
-    if (generation !== this.generation || this.state !== "running") return;
+    if (generation !== this.generation || this.stopping || this.state !== "running") return;
     const available = TRANSPORT_MAX_UNSETTLED - this.sent.size;
     if (available <= 0) return;
     const pending = await listPendingObligations(
@@ -351,6 +442,7 @@ class TransportController {
       this.manifest.provider,
       available,
     );
+    if (generation !== this.generation || this.stopping || this.state !== "running") return;
     for (const obligation of pending) {
       if (this.sent.has(obligation.obligationId)) continue;
       this.writeDelivery(obligation);
@@ -376,7 +468,7 @@ class TransportController {
     const encoded = `${JSON.stringify(frame)}\n`;
     const bytes = Buffer.byteLength(encoded, "utf8");
     if (bytes > TRANSPORT_MAX_FRAME_BYTES || target.stdin.writableLength + bytes > MAX_WRITE_BUFFER_BYTES) {
-      void this.crash(this.generation, new Error("transport write buffer overflow"));
+      this.own(this.crash(this.generation, new Error("transport write buffer overflow")));
       return;
     }
     target.stdin.write(encoded);
@@ -394,6 +486,7 @@ class TransportController {
   }
 
   private async disable(error: unknown): Promise<void> {
+    if (this.stopping) return;
     this.state = "disabled";
     if (this.helloTimer) clearTimeout(this.helloTimer);
     this.helloTimer = undefined;
@@ -419,6 +512,7 @@ class TransportController {
     this.sent.clear();
     this.crashes += 1;
     await this.log("error", errorMessage(error), generation);
+    if (!this.acceptsWork() || generation !== this.generation) return;
     if (this.crashes >= MAX_CRASHES) {
       this.state = "disabled";
       return;
@@ -430,7 +524,7 @@ class TransportController {
     );
     this.restartTimer = setTimeout(() => {
       this.restartTimer = undefined;
-      void this.spawnGeneration();
+      if (!this.stopping) this.own(this.spawnGeneration());
     }, delay);
   }
 }

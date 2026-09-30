@@ -21,10 +21,25 @@ def _row(root):
     # Never create/migrate the native database or discover an owner by cwd/prefix.
     path = Path(os.environ["HERMES_HOME"]) / "state.db"
     with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25) as db:
+        db.execute("BEGIN")
         record = db.execute(
             "SELECT id, model, parent_session_id, model_config, ended_at FROM sessions WHERE id = ?",
             (root,),
         ).fetchone()
+        usage = None
+        if record is not None:
+            try:
+                counters = db.execute(
+                    "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+                    "reasoning_tokens, api_call_count FROM sessions WHERE id = ?", (root,),
+                ).fetchone()
+                if counters is not None:
+                    usage = dict(zip(("input_tokens", "output_tokens", "cache_read_tokens",
+                                      "cache_write_tokens", "reasoning_tokens", "api_call_count"), counters))
+            except sqlite3.Error:
+                # Older schemas or an unavailable usage read cannot erase valid model metadata.
+                # Both reads share this read-only snapshot; never guess zero or migrate the DB.
+                pass
     if record is None:
         return None
     native_id, model, parent, raw_config, ended_at = record
@@ -36,7 +51,7 @@ def _row(root):
     # Read native lineage conservatively, but never forward config credentials or prompts.
     lineage = {key: config[key] for key in ("_delegate_from", "_branched_from") if key in config}
     return {"id": native_id, "model": model, "parent_session_id": parent,
-            "model_config": json.dumps(lineage), "ended_at": ended_at}
+            "model_config": json.dumps(lineage), "ended_at": ended_at, "usage": usage}
 
 
 def _send(frame):

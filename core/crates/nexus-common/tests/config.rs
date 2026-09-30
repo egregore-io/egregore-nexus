@@ -20,6 +20,23 @@ fn temp_config_dir(label: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn tilde_uses_os_home_when_home_environment_is_missing() {
+    let _guard = env_lock();
+    let previous = std::env::var_os("HOME");
+    std::env::remove_var("HOME");
+    let expected = std::env::home_dir().expect("test user has a native home");
+    let actual = nexus_common::config::expand_tilde("~/.nexus/nexus.db");
+    match previous {
+        Some(value) => std::env::set_var("HOME", value),
+        None => std::env::remove_var("HOME"),
+    }
+    assert_eq!(
+        std::path::PathBuf::from(actual),
+        expected.join(".nexus/nexus.db")
+    );
+}
+
+#[test]
 fn gateway_projection_defaults_to_buffered_and_env_can_explicitly_opt_out() {
     let defaults = Config::default();
     assert_eq!(

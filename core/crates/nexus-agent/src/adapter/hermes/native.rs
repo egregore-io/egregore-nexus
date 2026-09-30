@@ -23,6 +23,30 @@ pub fn model_profile() -> super::super::NativeModelReportingProfile {
         Capability::Unverified,
     )
     .unwrap()
+    .with_telemetry(super::super::AdapterTelemetryReportingProfile::new(
+        super::super::AdapterTelemetryCapability::new(
+            Capability::Supported,
+            Some(
+                nexus_contracts::ModelObservationSource::new(
+                    nexus_harness_telemetry::HERMES_SESSION_USAGE_SOURCE,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap(),
+        super::super::AdapterTelemetryCapability::new(Capability::Unsupported, None).unwrap(),
+        super::super::AdapterTelemetryCapability::new(Capability::Unsupported, None).unwrap(),
+    ))
+}
+
+/// Validate the captured native row before entering the harness-owned usage decoder.
+pub fn session_usage(
+    row: &Value,
+    root: &str,
+    observed_at: i64,
+) -> Option<nexus_contracts::telemetry::NativeTelemetryUpdate> {
+    configured_model(row, root, observed_at)?;
+    nexus_harness_telemetry::decode_session_row_usage(row, root, observed_at)
 }
 
 /// Read only an exact root's configured model from its native persisted row.

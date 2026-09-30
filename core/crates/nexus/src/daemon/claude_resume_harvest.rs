@@ -7,12 +7,11 @@
 //! through [`ClaudeRuntimeStateRepo::set_claude_session`]. The harvested value is an opaque
 //! best-effort resume hint; Nexus does not validate Claude Code identity or uniqueness.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use nexus_common::NexusError;
 use nexus_contracts::SessionId;
-use nexus_harness_claude::native::transcript::{parse_transcript_jsonl, parse_transcript_line};
+use nexus_harness_claude::native::resume::{harvest_claude_hook_resume_id, HarvestError};
 use nexus_harness_claude::storage::{claude_runtime_revive_seed, ClaudeRuntimeStateRepo};
 use nexus_store::Store;
 
@@ -176,66 +175,6 @@ async fn harvest_claude_resume_id_for_state(
         }
     }
     Ok(item)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ClaudeHookHarvest {
-    session_id: String,
-    transcript_path: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum HarvestError {
-    MissingHookLog,
-    NoNativeSessionId,
-    AmbiguousNativeSessionId(BTreeSet<String>),
-    Io(String),
-}
-
-fn harvest_claude_hook_resume_id(path: &Path) -> Result<ClaudeHookHarvest, HarvestError> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(HarvestError::MissingHookLog)
-        }
-        Err(e) => return Err(HarvestError::Io(e.to_string())),
-    };
-
-    let mut candidates = Vec::new();
-    for record in parse_transcript_jsonl(&content) {
-        if let Some(session_id) = record.session_id {
-            candidates.push((session_id, record.transcript_path.map(PathBuf::from)));
-        }
-    }
-    for line in content.lines() {
-        let Some(record) = parse_transcript_line(line) else {
-            continue;
-        };
-        if let Some(session_id) = record.session_id {
-            candidates.push((session_id, record.transcript_path.map(PathBuf::from)));
-        }
-    }
-
-    let ids = candidates
-        .iter()
-        .map(|(session_id, _)| session_id.clone())
-        .collect::<BTreeSet<_>>();
-    match ids.len() {
-        0 => Err(HarvestError::NoNativeSessionId),
-        1 => {
-            let session_id = ids.into_iter().next().expect("one id");
-            let transcript_path = candidates
-                .into_iter()
-                .rev()
-                .find_map(|(id, transcript_path)| (id == session_id).then_some(transcript_path))
-                .flatten();
-            Ok(ClaudeHookHarvest {
-                session_id,
-                transcript_path,
-            })
-        }
-        _ => Err(HarvestError::AmbiguousNativeSessionId(ids)),
-    }
 }
 
 fn no_sidecar_harvest_status(

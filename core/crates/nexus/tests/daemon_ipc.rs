@@ -86,6 +86,77 @@ fn queue_operator() -> DaemonIpcCaller {
 }
 
 #[tokio::test]
+async fn local_shutdown_requires_boot_token_operator_and_exact_process() {
+    let state = state().await;
+    for (token, caller, pid, succeeds) in [
+        ("stale", Some(queue_operator()), std::process::id(), false),
+        ("boot-token", None, std::process::id(), false),
+        ("boot-token", Some(queue_operator()), 0, false),
+        (
+            "boot-token",
+            Some(queue_operator()),
+            std::process::id(),
+            true,
+        ),
+    ] {
+        let response = daemon_ipc::handle_request(
+            &state,
+            "boot-token",
+            DaemonIpcRequest {
+                version: DAEMON_IPC_PROTOCOL_VERSION,
+                token: token.into(),
+                request_id: "shutdown-check".into(),
+                caller,
+                call: DaemonIpcCall::Query {
+                    method: "local.daemon.shutdown".into(),
+                    params: serde_json::json!({"processId":pid}),
+                },
+            },
+        )
+        .await;
+        assert_eq!(response.error.is_none(), succeeds, "{response:?}");
+        if succeeds {
+            assert_eq!(response.result.unwrap()["accepted"], true);
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_shutdown_socket_acks_before_waking_and_rejections_do_not_wake() {
+    let state = state().await;
+    for token in ["stale", "boot-token"] {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(daemon_ipc::serve_connection(
+            server,
+            state.clone(),
+            "boot-token".into(),
+        ));
+        daemon_ipc::write_request_frame(
+            &mut client,
+            &DaemonIpcRequest {
+                version: DAEMON_IPC_PROTOCOL_VERSION,
+                token: token.into(),
+                request_id: "shutdown-socket".into(),
+                caller: Some(queue_operator()),
+                call: DaemonIpcCall::Query {
+                    method: "local.daemon.shutdown".into(),
+                    params: serde_json::json!({"processId":std::process::id()}),
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let response = daemon_ipc::read_response_frame(&mut client).await.unwrap();
+        task.await.unwrap().unwrap();
+        let wake =
+            tokio::time::timeout(Duration::from_millis(50), state.wait_for_shutdown_request())
+                .await;
+        assert_eq!(response.error.is_none(), token == "boot-token");
+        assert_eq!(wake.is_ok(), token == "boot-token");
+    }
+}
+
+#[tokio::test]
 async fn historical_queue_observation_never_substitutes_current_native_owner() {
     let original = state().await;
     let state = AppState::wire_with_turn_exec(
@@ -1446,6 +1517,39 @@ async fn local_queue_read_returns_typed_snapshot_and_transitions_without_raw_sto
     assert_eq!(snapshot["steerCapability"], "none");
     assert_eq!(snapshot["commands"][0]["commandId"], "cmd_queue_read");
     assert_eq!(snapshot["commands"][0]["state"], "queued");
+    state.store.identity_conn().execute_batch(
+        "INSERT INTO agents (agent_id, project, name, tier, created_at) VALUES ('a_queue_read', 'default', 'queue-reader', 'agent', 1);
+         INSERT INTO agent_runtimes (runtime_id, agent_id, harness, active, started_at) VALUES ('s_queue_read', 'a_queue_read', 'codex', 1, 1);"
+    ).await.unwrap();
+    for (client_id, expected_len) in [("cm_queue_read", 1), ("absent", 0)] {
+        let lookup = daemon_ipc::handle_request(&state, "boot-token", read("submission-lookup", serde_json::json!({
+            "project":"default", "requester":caller,
+            "agentId":"a_queue_read", "expectedSessionId":"s_queue_read", "clientMessageId":client_id
+        }))).await;
+        assert!(lookup.error.is_none(), "{:?}", lookup.error);
+        let body = lookup.result.unwrap();
+        assert_eq!(body["commands"].as_array().unwrap().len(), expected_len);
+        if expected_len == 1 {
+            assert_eq!(body["commands"][0]["correlationOwned"], true);
+            assert_eq!(body["commands"][0]["commandId"], "cmd_queue_read");
+        }
+    }
+    for params in [
+        serde_json::json!({"agentId":"a_queue_read", "clientMessageId":"cm_queue_read"}),
+        serde_json::json!({"agentId":"a_queue_read", "expectedSessionId":"s_queue_read", "clientMessageId":""}),
+        serde_json::json!({"agentId":"a_queue_read", "expectedSessionId":"s_queue_read", "clientMessageId":null}),
+    ] {
+        let invalid_lookup = daemon_ipc::handle_request(
+            &state,
+            "boot-token",
+            read("invalid-submission-lookup", params),
+        )
+        .await;
+        assert!(
+            invalid_lookup.error.is_some(),
+            "original-ID lookup requires exact scope and valid ID"
+        );
+    }
     assert_eq!(
         snapshot["commands"][0]["correlationOwned"], false,
         "the Gateway transport marker is not the requesting human"
@@ -2075,6 +2179,189 @@ async fn bounded_binary_frame_roundtrips_over_one_local_connection() {
     assert_eq!(response.request_id, "rpc-framed");
     assert!(response.error.is_none());
     task.await.unwrap().unwrap();
+}
+
+// Poll the real router on a Tokio worker's default stack, rather than the test
+// harness thread. Even a rejected method must not overflow the daemon stack.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn routed_ipc_request_fits_default_worker_stack() {
+    let state = state().await;
+    let (mut client, server) = tokio::io::duplex(16 * 1024);
+    let task = tokio::spawn(async move {
+        daemon_ipc::serve_connection(server, state, "boot-token".into()).await
+    });
+    let request = DaemonIpcRequest {
+        version: DAEMON_IPC_PROTOCOL_VERSION,
+        token: "boot-token".into(),
+        request_id: "stack-regression".into(),
+        caller: Some(queue_operator()),
+        call: DaemonIpcCall::Query {
+            method: "stack-regression.unknown".into(),
+            params: serde_json::Value::Null,
+        },
+    };
+    daemon_ipc::write_request_frame(&mut client, &request)
+        .await
+        .unwrap();
+    let response = daemon_ipc::read_response_frame(&mut client).await.unwrap();
+    assert_eq!(response.request_id, "stack-regression");
+    assert_eq!(
+        response.error.unwrap().code,
+        nexus_contracts::codes::METHOD_NOT_FOUND
+    );
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn request_router_does_not_embed_launch_state_in_every_caller() {
+    let state = state().await;
+    let future = nexus::daemon::routing::route_request(
+        &state,
+        None,
+        nexus_contracts::Request {
+            jsonrpc: nexus_contracts::JSONRPC_VERSION.into(),
+            id: None,
+            method: "stack-regression.unknown".into(),
+            params: None,
+        },
+    );
+    let bytes = std::mem::size_of_val(&future);
+    assert!(
+        bytes <= 16 * 1024,
+        "router future embeds {bytes} bytes in every IPC/worker caller"
+    );
+    assert_eq!(
+        future.await.error.unwrap().code,
+        nexus_contracts::codes::METHOD_NOT_FOUND
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn attach_command_fits_default_worker_stack() {
+    command_fits_default_worker_stack(
+        nexus_store::command_kinds::identity::ATTACH,
+        serde_json::json!({"sessionId":"missing-disposable-session"}),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn launch_command_fits_default_worker_stack() {
+    command_fits_default_worker_stack(
+        nexus_store::command_kinds::harness::LAUNCH,
+        serde_json::json!({"kind":"claude", "name":"stack-disabled", "headless":false}),
+    )
+    .await;
+}
+
+async fn command_fits_default_worker_stack(kind: &str, params: serde_json::Value) {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    // Reach headed launch dispatch, but reject identity before any process can start.
+    store.identity_conn().execute_batch("INSERT INTO agents (agent_id, project, name, tier, created_at, disabled_at) VALUES ('a_stack_disabled','default','stack-disabled','agent',1,1)").await.unwrap();
+    let state = AppState::wire_pty(store, &Config::default());
+    state.wait_for_runtime_identity_ready().await.unwrap();
+    CommandIntents::new(&state.store)
+        .insert_pending(nexus_store::repos::NewCommandIntent {
+            command_id: "stack-attach".into(),
+            kind: kind.into(),
+            project: "default".into(),
+            caller_name: "Local Operator".into(),
+            caller_session_id: Some("local-operator".into()),
+            caller_agent_id: None,
+            caller_runtime_id: Some("local-operator".into()),
+            caller_client_key: None,
+            caller_principal_id: None,
+            caller_kind: Some("local.human".into()),
+            caller_tier: Some("admin".into()),
+            idempotency_key: None,
+            request_json: params.to_string(),
+            created_at: nexus_common::now(),
+        })
+        .await
+        .unwrap();
+    let worker = command_worker::spawn(state.clone());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let row = CommandIntents::new(&state.store)
+                .get("stack-attach")
+                .await
+                .unwrap()
+                .unwrap();
+            if row.status == "error" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    command_worker::begin_shutdown(&state).await;
+    tokio::time::timeout(Duration::from_secs(3), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    let row = CommandIntents::new(&state.store)
+        .get("stack-attach")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.status, "error");
+}
+
+#[cfg(unix)]
+#[test]
+fn headed_rebind_through_worker_fits_default_stack() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let fake = bin.join("claude");
+    // Inert PTY peer: no provider, hooks, prompt, or operator session.
+    std::fs::write(&fake, "#!/bin/sh\nexec /bin/cat\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    with_test_env_vars(
+        &[("PATH", Some(&path)), ("NEXUS_HOME", temp.path().to_str())],
+        || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_stack_size(2 * 1024 * 1024)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+            let store = Arc::new(Store::open(":memory:").await.unwrap());
+            store.migrate().await.unwrap();
+            let state = AppState::wire_pty(store.clone(), &Config::default());
+            state.wait_for_runtime_identity_ready().await.unwrap();
+            store.conn.execute_batch("INSERT INTO sessions (session_id,name,agent,kind,tier,project,created_at,presence) VALUES ('s_stack_old','stack-rebind','claude','local.agent','agent','default',1,'offline')").await.unwrap();
+            CommandIntents::new(&store).insert_pending(nexus_store::repos::NewCommandIntent {
+                command_id:"stack-rebind".into(), kind:nexus_store::command_kinds::harness::LAUNCH.into(),
+                project:"default".into(), caller_name:"Local Operator".into(),
+                caller_session_id:Some("local-operator".into()), caller_runtime_id:Some("local-operator".into()),
+                caller_agent_id:None, caller_client_key:None, caller_principal_id:None,
+                caller_kind:Some("local.human".into()), caller_tier:Some("admin".into()),
+                idempotency_key:None, created_at:nexus_common::now(),
+                request_json:serde_json::json!({"kind":"claude","name":"stack-rebind","headless":false,"backend":"pty","cwd":temp.path()}).to_string(),
+            }).await.unwrap();
+            let worker = command_worker::spawn(state.clone());
+            let row = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let row = CommandIntents::new(&store).get("stack-rebind").await.unwrap().unwrap();
+                    if row.status == "done" || row.status == "error" { break row; }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            state.teardown_harness("stack-rebind", "default").await;
+            command_worker::begin_shutdown(&state).await;
+            tokio::time::timeout(Duration::from_secs(3), worker).await.unwrap().unwrap();
+            assert_eq!(row.status, "done", "{:?}", row.error_json);
+            let session = Sessions::new(&store).find_by_name("default", "stack-rebind").await.unwrap().unwrap();
+            assert_ne!(session.session_id.0, "s_stack_old");
+        });
+        },
+    );
 }
 
 #[cfg(unix)]

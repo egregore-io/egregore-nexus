@@ -14,36 +14,6 @@ use nexus_harness_core::{
 };
 
 #[derive(Debug, Clone, Copy)]
-struct OpenCodeHarness;
-
-impl HarnessContract for OpenCodeHarness {
-    fn program(&self) -> &'static str {
-        native_harness_program(self.agent_token(), NativeProcessPlatform::current())
-            .expect("built-in harness has a native headed executable")
-    }
-
-    fn agent_token(&self) -> &'static str {
-        "opencode"
-    }
-
-    fn headed_runtime_kind(&self) -> HeadedRuntimeKind {
-        HeadedRuntimeKind::OpenCodePlugin
-    }
-
-    fn display_name(&self) -> &'static str {
-        "OpenCode"
-    }
-
-    fn has_native_thread_binding(&self) -> bool {
-        true
-    }
-
-    fn resume_style(&self) -> ResumeStyle {
-        ResumeStyle::Flag(&["-s"])
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
 struct HermesHarness;
 
 impl HarnessContract for HermesHarness {
@@ -113,7 +83,7 @@ fn builtin_contracts() -> [&'static dyn HarnessContract; 6] {
     [
         &nexus_harness_claude::ClaudeHarness,
         &nexus_harness_codex::CodexHarness,
-        &OpenCodeHarness,
+        &nexus_harness_opencode::OpenCodeHarness,
         &HermesHarness,
         &PI,
         &OTHER,

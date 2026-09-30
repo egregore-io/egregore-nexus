@@ -1729,6 +1729,114 @@ describe("public API — EXTENDED surface dispatches to command ingress", () => 
     expect(res.body).toMatchObject({ sessionId: expect.any(String) });
   });
 
+  it.each(
+    ["claude", "codex", "opencode", "hermes"].flatMap((kind) =>
+      [false, true].map((headless) => ({ kind, headless })),
+    ),
+  )("POST /api/v1/agents forwards one full $kind spawn with headless=$headless", async ({ kind, headless }) => {
+    const commands = makeCommandSpy();
+    const body = {
+      kind,
+      name: "worker-1",
+      cwd: "/repo",
+      headless,
+      initialPrompt: "  Review <var.cwd>\nKeep this spacing.\t ",
+    };
+
+    const res = await handle(
+      req({ method: "POST", path: "/api/v1/agents", body }),
+      deps(undefined, commands),
+    );
+
+    expect(res.status).toBe(201);
+    expect(commands.calls).toStrictEqual([
+      { kind: COMMAND_KINDS.adminSpawn, req: body, caller: API_CALLER },
+    ]);
+    expect(commands.calls[0]!.caller).toBe(API_CALLER);
+  });
+
+  it.each(["claude", "codex", "opencode", "hermes"])(
+    "POST /api/v1/agents keeps omitted launch options absent for %s",
+    async (kind) => {
+      const commands = makeCommandSpy();
+      const body = { kind, name: "worker-1", cwd: "/repo" };
+
+      const res = await handle(
+        req({ method: "POST", path: "/api/v1/agents", body }),
+        deps(undefined, commands),
+      );
+
+      expect(res.status).toBe(201);
+      expect(commands.calls).toStrictEqual([
+        { kind: COMMAND_KINDS.adminSpawn, req: body, caller: API_CALLER },
+      ]);
+      expect(commands.calls[0]!.req).not.toHaveProperty("headless");
+      expect(commands.calls[0]!.req).not.toHaveProperty("initialPrompt");
+    },
+  );
+
+  it.each([
+    { headless: false },
+    { headless: true },
+    { initialPrompt: "" },
+    { initialPrompt: " \t\n " },
+  ])("POST /api/v1/agents forwards independent launch options %j unchanged", async (options) => {
+    const commands = makeCommandSpy();
+    const body = { kind: "codex", ...options };
+
+    const res = await handle(
+      req({ method: "POST", path: "/api/v1/agents", body }),
+      deps(undefined, commands),
+    );
+
+    expect(res.status).toBe(201);
+    expect(commands.calls).toStrictEqual([
+      { kind: COMMAND_KINDS.adminSpawn, req: body, caller: API_CALLER },
+    ]);
+  });
+
+  it.each([null, "false", "true", 0, 1, [], {}])(
+    "POST /api/v1/agents rejects headless=%j without submitting a command",
+    async (headless) => {
+      const commands = makeCommandSpy();
+      const res = await handle(
+        req({ method: "POST", path: "/api/v1/agents", body: { kind: "codex", headless } }),
+        deps(undefined, commands),
+      );
+
+      expect(res.status).toBe(400);
+      expect(commands.calls).toEqual([]);
+    },
+  );
+
+  it.each([null, false, 42, [], {}])(
+    "POST /api/v1/agents rejects initialPrompt=%j without submitting a command",
+    async (initialPrompt) => {
+      const commands = makeCommandSpy();
+      const res = await handle(
+        req({ method: "POST", path: "/api/v1/agents", body: { kind: "codex", initialPrompt } }),
+        deps(undefined, commands),
+      );
+
+      expect(res.status).toBe(400);
+      expect(commands.calls).toEqual([]);
+    },
+  );
+
+  it.each(["project", "role", "unexpected"])(
+    "POST /api/v1/agents rejects unsupported field %s without submitting a command",
+    async (field) => {
+      const commands = makeCommandSpy();
+      const res = await handle(
+        req({ method: "POST", path: "/api/v1/agents", body: { kind: "codex", [field]: "review" } }),
+        deps(undefined, commands),
+      );
+
+      expect(res.status).toBe(400);
+      expect(commands.calls).toEqual([]);
+    },
+  );
+
   it("POST /api/v1/topics/:name/subscribe → subscribe with the path-param topic", async () => {
     const commands = makeCommandSpy();
     const res = await handle(

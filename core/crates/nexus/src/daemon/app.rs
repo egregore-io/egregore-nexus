@@ -36,8 +36,10 @@ mod adoption;
 mod delivery_recovery;
 mod launch_lifecycle;
 mod launch_orchestration;
+mod native_resume;
 mod observed_adapter;
 mod observed_native;
+mod port_launch;
 mod presence_lifecycle;
 mod revive;
 mod routing_recovery;
@@ -102,9 +104,9 @@ use crate::daemon::services::presence::{PresenceWriter, TransportHandle, Transpo
 pub(crate) use crate::daemon::services::runtime_helpers::{
     claude_resume_session_id, codex_resume_agent_owner_matches, codex_resume_session_owner_matches,
     codex_thread_taken_error, default_agent_cwd_for, ensure_agent_launch_cwd, harness_token,
-    kind_token, native_session_taken_error, opencode_resume_session_id,
-    persist_codex_thread_binding_once, persist_codex_thread_binding_with_retry,
-    protected_remove_target, resolve_agent_launch_cwd, spawn_identity_policy, tier_token,
+    kind_token, native_session_taken_error, persist_codex_thread_binding_once,
+    persist_codex_thread_binding_with_retry, protected_remove_target, resolve_agent_launch_cwd,
+    spawn_identity_policy, tier_token,
 };
 pub use crate::daemon::services::runtime_helpers::{
     harness_from_token, headed_runtime_from_agent_token, launch_route, revive_route,
@@ -264,6 +266,8 @@ pub struct AppState {
     /// dispatch boundary they already own and refuse every later claim; newly accepted rows remain
     /// pending for the next daemon instead of becoming ambiguous during transport teardown.
     command_worker_shutting_down: Arc<AtomicBool>,
+    /// Boot-local operator shutdown wake; handled by the same drain as OS signals.
+    shutdown_requested: Arc<tokio::sync::Notify>,
     /// The concrete agent service (present only on the [`AppState::wire`] path). The daemon's launch
     /// orchestration calls [`nexus_agent::Agent::open_session_for`] on it to bind the adapter under a
     /// daemon-chosen session id. `None` on the mock-port [`AppState::new`] seam → launch falls back
@@ -365,9 +369,19 @@ impl AppState {
             runtime_revive_gate: RuntimeReviveGate::default(),
             boot_readiness: BootReadiness::unmanaged(),
             command_worker_shutting_down: Arc::new(AtomicBool::new(false)),
+            shutdown_requested: Arc::new(tokio::sync::Notify::new()),
             agent_concrete: None,
             pty: None,
         }
+    }
+
+    pub(crate) fn request_shutdown(&self) {
+        self.shutdown_requested.notify_one();
+    }
+
+    /// Wait for a validated local lifecycle request, including one received before this wait.
+    pub async fn wait_for_shutdown_request(&self) {
+        self.shutdown_requested.notified().await;
     }
 
     pub(crate) async fn begin_command_worker_shutdown(&self) {

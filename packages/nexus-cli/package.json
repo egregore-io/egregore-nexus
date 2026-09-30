@@ -1,7 +1,11 @@
 {
   "name": "@egregore/nexus-cli",
-  "version": "0.1.6-beta.4",
+  "version": "0.1.6-beta.5",
   "private": false,
+  "os": [
+    "linux",
+    "win32"
+  ],
   "type": "module",
   "license": "Apache-2.0",
   "description": "Egregore Nexus CLI and local transport daemon with automatic native installation.",

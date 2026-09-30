@@ -15,6 +15,7 @@
 pub mod cli;
 pub mod daemon;
 pub mod error;
+pub mod first_run;
 pub mod gateway_lifecycle;
 pub mod gateway_service;
 pub mod harness_registry;
@@ -25,5 +26,6 @@ pub mod names;
 pub mod spawn_spec;
 pub mod update;
 pub mod webconsole_lifecycle;
+pub mod webconsole_service;
 
 pub use daemon::{dispatch, AppState, WsSink};

@@ -725,6 +725,31 @@ impl<'a> Inbox<'a> {
         Ok(effects)
     }
 
+    /// Read committed terminal facts by exact mutation identity, including recipients that have
+    /// no registered runtime. This does not synthesize ACKs or alter settlement/requeue state.
+    pub async fn gateway_delivery_effects_for_ids(
+        &self,
+        in_flight_ids: &[String],
+    ) -> Result<Vec<GatewayProjectionEffect>, NexusError> {
+        let mut effects = Vec::new();
+        for ids in in_flight_ids.chunks(MAX_DLQ_LIMIT as usize) {
+            let ids_json =
+                serde_json::to_string(ids).map_err(|error| NexusError::Store(error.to_string()))?;
+            let mut rows = self.store.conn.query(
+                "SELECT in_flight_id, message_id, recipient_session, recipient_agent_id, state, \
+                 attempt_count, delivered_at, acked_at, failed_at, error_code, error_reason, \
+                 error_details_json FROM in_flight WHERE in_flight_id IN \
+                 (SELECT value FROM json_each(?1)) \
+                 AND state IN ('delivered','acked','error') ORDER BY rowid",
+                params![ids_json],
+            ).await.map_err(store_err)?;
+            while let Some(row) = rows.next().await.map_err(store_err)? {
+                effects.push(delivery_effect_from_row(&row)?);
+            }
+        }
+        Ok(effects)
+    }
+
     /// Drop the boot-scoped rich message and recipient attempt rows once every recipient is
     /// terminal and the caller has copied the settlement into the Gateway projection backlog.
     /// Legacy single-store callers retain their historical rows for compatibility.
@@ -1155,6 +1180,16 @@ impl<'a> Inbox<'a> {
                 None => false,
             };
             if !live_session && !active_runtime {
+                // Runtime absence is not a durable identity death. A reconstructed external
+                // recipient may have no capsule at all; retain its edge for adoption or TTL.
+                if let Some(agent_id) = recipient_agent_id.as_deref() {
+                    let agents = crate::repos::Agents::new(self.store);
+                    if agents.find_by_id(agent_id).await?.is_some()
+                        && agents.lifecycle_for_id(agent_id).await?.0.as_deref() != Some("dead")
+                    {
+                        continue;
+                    }
+                }
                 dead.push(in_flight_id);
             }
         }
@@ -1188,6 +1223,10 @@ impl<'a> Inbox<'a> {
     /// ids exist does a write transaction open; its UPDATEs re-check `state IN
     /// ('pending','notified')`, so rows that changed state after the probe are skipped, and the
     /// returned mutation counts only rows actually dead-lettered.
+    /// In split storage, the exact updated recipient obligations are retired atomically before
+    /// the volatile transaction commits. A durable failure rolls the staged errors back; once
+    /// durable settlement succeeds, restart cannot resurrect expired mail even if the volatile
+    /// commit is lost. This is the same durable-first boundary as pull ACK settlement.
     pub async fn dead_letter_expired_deliveries(
         &self,
         now_ms: i64,
@@ -1211,19 +1250,34 @@ impl<'a> Inbox<'a> {
                          delivered_at = NULL, acked_at = NULL \
                          WHERE state IN ('pending','notified') AND in_flight_id IN ( \
                            SELECT value FROM json_each(?1) \
-                         ) RETURNING in_flight_id",
+                         ) RETURNING in_flight_id, message_id, recipient_agent_id, recipient_session",
                         params![candidates_json, DELIVERY_TIMEOUT_REASON, now_ms],
                     )
                     .await?;
                 let mut updated = HashSet::new();
+                let mut recipients = Vec::new();
                 while let Some(row) = rows.next().await.map_err(store_err)? {
                     updated.insert(get_text(&row, 0)?);
+                    recipients.push((
+                        get_text(&row, 1)?,
+                        get_opt_text(&row, 2)?,
+                        get_opt_text(&row, 3)?,
+                    ));
                 }
-                Ok(updated)
+                Ok((updated, recipients))
             }
             .await;
             match result {
-                Ok(updated) => {
+                Ok((updated, recipients)) => {
+                    if self.store.has_split_authority() {
+                        if let Err(error) = DeliveryObligations::new(self.store)
+                            .settle_expired_recipients(&recipients)
+                            .await
+                        {
+                            txn.rollback(&error).await?;
+                            return Err(error);
+                        }
+                    }
                     txn.commit().await?;
                     dead_lettered.extend(
                         candidates
@@ -1398,7 +1452,39 @@ impl<'a> Inbox<'a> {
             if ids.is_empty() {
                 return Ok(DeadLetterMutation::default());
             }
+            let mut obligations = Vec::new();
             for id in &ids {
+                if self.store.has_split_authority() {
+                    let mut rows = txn.query(
+                        "SELECT f.in_flight_id, m.message_id, m.from_name, m.kind, m.thread_id,
+                         m.topic, m.summary, m.body, m.provenance, m.project, m.created_at,
+                         f.delivery_timing, f.recipient_agent_id, f.recipient_session, f.attempt_count
+                         FROM in_flight f JOIN messages m ON m.message_id = f.message_id
+                         WHERE f.in_flight_id = ?1 AND f.state = 'error'",
+                        params![id.clone()],
+                    ).await?;
+                    let row = rows.next().await.map_err(store_err)?
+                        .ok_or_else(|| NexusError::Store(format!("missing requeue payload for {id}")))?;
+                    let message = Messages::row_to_message_joined(&row)?;
+                    let timing_wire = get_text(&row, 11)?;
+                    let timing = DeliveryTiming::from_str(&timing_wire).ok_or_else(||
+                        NexusError::Store(format!("invalid in_flight delivery_timing value {timing_wire:?}")))?;
+                    let runtime = get_opt_text(&row, 13)?;
+                    let agent = get_opt_text(&row, 12)?.or_else(|| runtime.clone())
+                        .ok_or_else(|| NexusError::Store(format!("missing requeue recipient for {id}")))?;
+                    obligations.push(crate::repos::NewDeliveryObligation {
+                        message_id: message.id.0.clone(),
+                        dedupe_key: format!("delivery:{}:{agent}", message.id.0),
+                        recipient_agent_id: agent,
+                        recipient_runtime_id: runtime,
+                        payload_json: serde_json::to_string(&serde_json::json!({
+                            "message": message, "deliveryTiming": timing,
+                        })).map_err(store_msg)?,
+                        attempt: get_opt_int(&row, 14)?.unwrap_or_default(),
+                        state: "pending".into(),
+                        created_at: message.created_at,
+                    });
+                }
                 txn.execute(
                     "UPDATE in_flight SET state = 'pending', attempt_started_at = NULL, \
                      failed_at = NULL, error_code = NULL, error_reason = NULL, \
@@ -1407,6 +1493,11 @@ impl<'a> Inbox<'a> {
                     params![id.clone()],
                 )
                 .await?;
+            }
+            // An explicit retry is new durable intent. Commit it before exposing
+            // pending transport rows; a failed durable batch rolls all rows back.
+            if !obligations.is_empty() {
+                DeliveryObligations::new(self.store).restore_requeued(&obligations).await?;
             }
             Ok(DeadLetterMutation {
                 count: ids.len() as u64,

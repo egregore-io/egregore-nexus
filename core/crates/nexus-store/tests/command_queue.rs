@@ -45,6 +45,87 @@ fn prompt(command_id: &str, created_at: i64) -> NewCommandIntent {
 }
 
 #[tokio::test]
+async fn original_submission_lookup_is_owned_exact_and_not_viewport_limited() {
+    let store = store().await;
+    store.identity_conn().execute_batch(
+        "INSERT INTO agents (agent_id, project, name, tier, created_at) VALUES ('a_otto', 'default', 'otto', 'agent', 1);
+         INSERT INTO agent_runtimes (runtime_id, agent_id, harness, active, started_at) VALUES ('s_otto', 'a_otto', 'codex', 1, 1);"
+    ).await.unwrap();
+    let requester: nexus_contracts::DaemonIpcCaller = serde_json::from_value(serde_json::json!({
+        "project": "default", "sessionId": "local-operator", "runtimeId": "local-operator",
+        "kind": "human", "tier": "admin"
+    }))
+    .unwrap();
+    let intents = CommandIntents::new(&store);
+    for index in 0..105 {
+        let id = format!("cmd_{index}");
+        let mut entry = prompt(&id, index);
+        entry.request_json = serde_json::json!({
+            "agentId": "a_otto", "expectedSessionId": "s_otto", "text": "original",
+            "clientMessageId": format!("cm_{id}")
+        })
+        .to_string();
+        intents.insert_pending(entry).await.unwrap();
+    }
+    let queue = CommandQueue::new(&store);
+    let found = queue
+        .snapshot_for_submission(
+            &AgentId("a_otto".into()),
+            "s_otto",
+            "cm_cmd_104",
+            &requester,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        found.commands.len(),
+        1,
+        "lookup is not the bounded queue viewport"
+    );
+    assert_eq!(found.commands[0].command_id, "cmd_104");
+    assert_eq!(found.commands[0].correlation_owned, Some(true));
+    assert_eq!(found.commands[0].state, CommandQueueState::Queued);
+    let mut other = requester.clone();
+    other.session_id = Some("other-human".into());
+    assert!(queue
+        .snapshot_for_submission(&AgentId("a_otto".into()), "s_otto", "cm_cmd_104", &other)
+        .await
+        .unwrap()
+        .commands
+        .is_empty());
+    assert!(queue
+        .snapshot_for_submission(&AgentId("a_otto".into()), "s_otto", "absent", &requester)
+        .await
+        .unwrap()
+        .commands
+        .is_empty());
+    assert!(queue
+        .snapshot_for_submission(
+            &AgentId("a_other".into()),
+            "s_otto",
+            "cm_cmd_104",
+            &requester
+        )
+        .await
+        .is_err());
+    for invalid in [
+        "".to_string(),
+        " ".to_string(),
+        "a\nb".to_string(),
+        "x".repeat(257),
+    ] {
+        assert!(queue
+            .snapshot_for_submission(&AgentId("a_otto".into()), "s_otto", &invalid, &requester)
+            .await
+            .is_err());
+    }
+    assert_eq!(
+        intents.get("cmd_104").await.unwrap().unwrap().status,
+        "pending"
+    );
+}
+
+#[tokio::test]
 async fn exact_receipt_retains_original_owned_session_after_rebind() {
     let store = store().await;
     store.identity_conn().execute_batch(

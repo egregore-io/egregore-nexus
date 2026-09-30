@@ -1,4 +1,4 @@
-//! Operator-facing lifecycle commands for the on-demand Nexus Webconsole.
+//! Operator-facing lifecycle commands for the detached or supervised Nexus Webconsole.
 
 use std::process::ExitCode;
 
@@ -12,6 +12,10 @@ use crate::webconsole_lifecycle::{
 
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum WebconsoleCmd {
+    /// Enable the Webconsole server in the background now and at login (does not open a browser).
+    Install,
+    /// Stop and remove the Webconsole background service.
+    Uninstall,
     /// Ensure dependencies, start or reuse the Webconsole, and open it in a browser.
     Launch(WebconsoleLaunchArgs),
     /// Start the Webconsole detached without opening a browser.
@@ -65,7 +69,75 @@ pub struct WebconsoleLogsArgs {
 }
 
 pub async fn run(command: WebconsoleCmd, json: bool) -> ExitCode {
+    if crate::webconsole_service::installed() {
+        if matches!(command, WebconsoleCmd::Stop(_)) {
+            return match crate::webconsole_service::stop() {
+                Ok(()) => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({"service": "stopped", "installed": true})
+                        );
+                    } else {
+                        println!("Nexus Webconsole service stopped (login configuration retained)");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(error) => render_service_error(&error, json),
+            };
+        }
+        let server = match &command {
+            WebconsoleCmd::Start(args) | WebconsoleCmd::Restart(args) => Some(args),
+            WebconsoleCmd::Launch(args) => Some(&args.server),
+            _ => None,
+        };
+        if let Some(server) = server {
+            if server.host != "127.0.0.1" || server.port != 4200 {
+                return render_service_error("A registered service uses its saved settings; uninstall it before using custom --host/--port", json);
+            }
+            if matches!(command, WebconsoleCmd::Restart(_)) {
+                if let Err(error) = crate::webconsole_service::stop() {
+                    return render_service_error(&error, json);
+                }
+            }
+            if let Err(error) = crate::webconsole_service::start().await {
+                return render_service_error(&error, json);
+            }
+            if !matches!(command, WebconsoleCmd::Launch(_)) {
+                return match webconsole_status() {
+                    Ok(report) => render_report(&report, json, false),
+                    Err(error) => render_error(&error, json),
+                };
+            }
+        }
+    }
     match command {
+        WebconsoleCmd::Install | WebconsoleCmd::Uninstall => {
+            let installing = matches!(command, WebconsoleCmd::Install);
+            let result = if installing {
+                crate::webconsole_service::install().await
+            } else {
+                crate::webconsole_service::uninstall()
+            };
+            match result {
+                Ok(()) => {
+                    if json {
+                        println!("{}", serde_json::json!({"installed": installing}));
+                    } else {
+                        println!(
+                            "Nexus Webconsole service {}",
+                            if installing {
+                                "enabled and running"
+                            } else {
+                                "removed"
+                            }
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(error) => render_service_error(&error, json),
+            }
+        }
         WebconsoleCmd::Launch(args) => {
             security_notice(&args.server.host);
             match launch_webconsole(options(args.server), args.no_open).await {
@@ -111,6 +183,18 @@ pub async fn run(command: WebconsoleCmd, json: bool) -> ExitCode {
             Err(error) => render_error(&error, json),
         },
     }
+}
+
+fn render_service_error(error: &str, json: bool) -> ExitCode {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"error": {"code": "WEBCONSOLE_SERVICE_FAILED", "message": error}})
+        );
+    } else {
+        eprintln!("error: {error}");
+    }
+    ExitCode::from(1)
 }
 
 fn options(args: WebconsoleStartArgs) -> WebconsoleStartOptions {

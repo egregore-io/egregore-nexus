@@ -89,23 +89,33 @@ impl AppState {
         let mut restored = 0;
 
         for obligation in obligations {
-            let Some(runtime_id) = obligation.recipient_runtime_id.as_deref() else {
+            // A durable recipient edge does not require a live runtime. External agents have
+            // no runtime capsule to reconstruct, but their accepted obligations must still age
+            // into the normal timeout state machine without fabricating registration/presence.
+            let stable_agent = nexus_store::repos::Agents::new(&self.store)
+                .find_by_id(&obligation.recipient_agent_id)
+                .await?
+                .is_some();
+            let mut verified_runtime = None;
+            if let Some(runtime_id) = obligation.recipient_runtime_id.as_deref() {
+                let runtime = SessionId(runtime_id.to_string());
+                if let Some(row) = sessions.find_by_session_id(&runtime).await? {
+                    if (stable_agent
+                        && row.agent_id.as_deref() == Some(obligation.recipient_agent_id.as_str()))
+                        || (!stable_agent
+                            && runtime_id == obligation.recipient_agent_id
+                            && row.agent_id.is_none())
+                    {
+                        verified_runtime = Some(runtime);
+                    }
+                }
+            }
+            if !stable_agent && verified_runtime.is_none() {
                 tracing::warn!(
                     target: "nexus::delivery",
                     message_id = %obligation.message_id,
                     agent_id = %obligation.recipient_agent_id,
-                    "pending continuity row has no runtime descriptor yet; preserving it for a later wake"
-                );
-                continue;
-            };
-            let runtime = SessionId(runtime_id.to_string());
-            if sessions.find_by_session_id(&runtime).await?.is_none() {
-                tracing::warn!(
-                    target: "nexus::delivery",
-                    message_id = %obligation.message_id,
-                    agent_id = %obligation.recipient_agent_id,
-                    runtime_id,
-                    "pending continuity row has no reconstructed runtime; preserving it for a later wake"
+                    "pending continuity row has no verified recipient owner; preserving it without injection"
                 );
                 continue;
             }
@@ -123,18 +133,40 @@ impl AppState {
                 }
             };
             let message = payload.message;
+            if message.id.0 != obligation.message_id {
+                tracing::error!(
+                    target: "nexus::delivery",
+                    message_id = %obligation.message_id,
+                    "pending continuity payload has a mismatched message identity; preserving it without injection"
+                );
+                continue;
+            }
             if messages
                 .get(&message.project.0, &message.id)
                 .await?
                 .is_none()
             {
                 messages
-                    .insert_with_agents(&message, None, Some(&obligation.recipient_agent_id))
+                    .insert_with_agents(
+                        &message,
+                        None,
+                        stable_agent.then_some(obligation.recipient_agent_id.as_str()),
+                    )
                     .await?;
             }
-            inbox
-                .enqueue_with_timing(&message.id, &runtime, payload.delivery_timing)
-                .await?;
+            if let Some(runtime) = verified_runtime {
+                inbox
+                    .enqueue_with_timing(&message.id, &runtime, payload.delivery_timing)
+                    .await?;
+            } else if stable_agent {
+                inbox
+                    .enqueue_for_agent_with_timing(
+                        &message.id,
+                        &obligation.recipient_agent_id,
+                        payload.delivery_timing,
+                    )
+                    .await?;
+            }
             restored += 1;
         }
         Ok(restored)

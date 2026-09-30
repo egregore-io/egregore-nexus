@@ -1,0 +1,1 @@
+{"sessionId":"fixture-root","update":{"sessionUpdate":"usage_update","used":42000,"size":200000,"_meta":{"_claude/rateLimit":{"status":"allowed_warning","rateLimitType":"five_hour","utilization":0.75,"resetsAt":1800000000}}}}

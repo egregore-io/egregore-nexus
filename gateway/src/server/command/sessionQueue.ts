@@ -93,6 +93,7 @@ interface QueueReadInput {
   expectedSessionId?: string;
   requester?: DaemonIpcCaller;
   eventsAfter?: number;
+  clientMessageId?: string;
 }
 
 const gatewayCaller: DaemonIpcCaller = {
@@ -694,6 +695,26 @@ export async function handleConversationQueueGet(
   const auth = await authorizedProject(request, deps);
   if (isResponse(auth)) return auth;
   const url = new URL(request.url);
+  const clientMessageId = url.searchParams.get("clientMessageId");
+  if (clientMessageId !== null) {
+    if (!clientMessageId.trim() || Buffer.byteLength(clientMessageId, "utf8") > 256 || /\p{Cc}/u.test(clientMessageId)
+      || !url.searchParams.get("agentId")?.trim()
+      || !url.searchParams.get("expectedSessionId")?.trim()
+      || url.searchParams.has("eventsAfter")) {
+      return json({ error: "submission lookup requires a valid clientMessageId and exact session pair, without eventsAfter" }, 400);
+    }
+    const target = targetFromUrl(request);
+    if (isResponse(target)) return target;
+    try {
+      // Lookup is a daemon read, never an enqueue/retry or a viewport scan.
+      return json(await daemonQueueRead({
+        ...auth, agentId: target.agentId, expectedSessionId: target.expectedSessionId,
+        clientMessageId,
+      }, deps));
+    } catch (error) {
+      return json({ error: error instanceof Error ? error.message : String(error) }, 502);
+    }
+  }
   if (url.searchParams.has("eventsAfter")) {
     if (url.searchParams.has("expectedSessionId"))
       return json(

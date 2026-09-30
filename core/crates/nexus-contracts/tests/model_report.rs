@@ -372,6 +372,32 @@ fn telemetry_zero_only_counter_and_cumulative_scope_need_no_guessed_turn_or_mode
 }
 
 #[test]
+fn last_prompt_usage_is_not_a_native_id_turn_or_a_single_response() {
+    let original: Value =
+        serde_json::from_str(include_str!("../fixtures/runtime.last-prompt-usage.json")).unwrap();
+    assert_eq!(roundtrip(original.clone()), original);
+    let usage = &original["modelReport"]["telemetry"]["usage"]["observation"];
+    assert_eq!(usage["scope"], "lastPrompt");
+    assert!(usage.get("nativeTurnId").is_none());
+    assert!(usage.get("resetId").is_none());
+}
+
+#[test]
+fn last_response_usage_is_a_replaceable_sample_without_invented_turn_identity() {
+    let original: Value =
+        serde_json::from_str(include_str!("../fixtures/runtime.last-response-usage.json")).unwrap();
+    assert_eq!(roundtrip(original.clone()), original);
+    for count in [230, 230, 10, 0] {
+        let mut sample = original.clone();
+        sample["modelReport"]["telemetry"]["usage"]["observation"]["totalTokens"] = json!(count);
+        assert_eq!(roundtrip(sample.clone()), sample);
+    }
+    let mut turn = original;
+    turn["modelReport"]["telemetry"]["usage"]["observation"]["scope"] = json!("turn");
+    assert!(serde_json::from_value::<AgentRuntimeSummary>(turn).is_err());
+}
+
+#[test]
 fn telemetry_is_forbidden_on_corrupt_unknown_backend_tombstones() {
     for slots in [
         telemetry(),

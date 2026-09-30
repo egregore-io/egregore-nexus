@@ -23,11 +23,12 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use nexus_agent::adapter::opencode::{native, telemetry::OpenCodeTelemetry};
 use nexus_agent::adapter::NativeModelReporting;
 use nexus_contracts::events::{AgentUpdateKind, WsEvent};
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::EventSink;
-use nexus_pty::{HarnessInput, TurnCompletionEvidence};
+use nexus_pty::{HarnessInput, TurnAcceptanceObserver, TurnCompletionEvidence};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -117,6 +118,9 @@ impl OpenCodePluginBridge {
             root: None,
             seen: HashSet::new(),
             seen_bytes: 0,
+            telemetry: Default::default(),
+            telemetry_sequences: HashMap::new(),
+            telemetry_id_bytes: 0,
         };
         if reporter.reporting.profile().backend().as_str() != "opencode.plugin"
             || !reporter
@@ -194,8 +198,7 @@ impl OpenCodePluginBridge {
             token: endpoint.token.clone(),
             events,
             turn_timeout: options.turn_timeout,
-            queue: Mutex::new(VecDeque::new()),
-            active: Mutex::new(HashMap::new()),
+            turns: Mutex::new(Turns::default()),
             next_id: AtomicU64::new(1),
             notify: Notify::new(),
             alive: AtomicBool::new(true),
@@ -203,6 +206,8 @@ impl OpenCodePluginBridge {
         });
         let app = Router::new()
             .route("/turn/next", get(next_turn))
+            .route("/turn/:id/bind", post(bind_turn))
+            .route("/turn/:id/accepted", post(accept_turn))
             .route("/turn/:id/complete", post(complete_turn))
             .route("/turn/:id/error", post(error_turn))
             .route("/event", post(plugin_event))
@@ -248,6 +253,10 @@ impl OpenCodePluginBridge {
             model.take(); // Revoke before releasing native reporting exclusion.
         }
         self.state.notify.notify_waiters();
+        let mut turns = self.state.turns.lock().unwrap();
+        turns.queue.clear();
+        turns.active.clear();
+        drop(turns);
         if let Some(tx) = self.shutdown.lock().unwrap().take() {
             let _ = tx.send(());
         }
@@ -297,30 +306,17 @@ pub struct OpenCodePluginInput {
 #[async_trait]
 impl HarnessInput for OpenCodePluginInput {
     async fn send_turn(&self, text: &str) -> Result<(), String> {
-        if !self.is_alive() {
-            return Err("opencode plugin bridge is not alive".to_string());
-        }
-        let turn_id = self
-            .state
-            .next_id
-            .fetch_add(1, Ordering::SeqCst)
-            .to_string();
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut queue = self.state.queue.lock().unwrap();
-            queue.push_back(QueuedTurn {
-                id: turn_id,
-                text: text.to_string(),
-                completion: tx,
-            });
-        }
-        self.state.notify.notify_one();
-        match tokio::time::timeout(self.state.turn_timeout, rx).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(err))) => Err(err),
-            Ok(Err(_closed)) => Err("opencode plugin bridge completion channel closed".to_string()),
-            Err(_elapsed) => Err("opencode plugin turn timed out".to_string()),
-        }
+        self.send_captured(text, None).await
+    }
+
+    async fn send_turn_observed(
+        &self,
+        text: &str,
+        observer: Arc<dyn TurnAcceptanceObserver>,
+    ) -> Result<(), String> {
+        // Only the bound native persisted-user callback admits the display echo.
+        // Terminal completion must not publish a second, late synthetic input.
+        self.send_captured(text, Some(observer)).await
     }
 
     fn turn_completion_evidence(&self) -> TurnCompletionEvidence {
@@ -332,13 +328,87 @@ impl HarnessInput for OpenCodePluginInput {
     }
 }
 
+impl OpenCodePluginInput {
+    async fn send_captured(
+        &self,
+        text: &str,
+        observer: Option<Arc<dyn TurnAcceptanceObserver>>,
+    ) -> Result<(), String> {
+        if !self.is_alive() {
+            return Err("opencode plugin bridge is not alive".to_string());
+        }
+        let turn_id = self
+            .state
+            .next_id
+            .fetch_add(1, Ordering::SeqCst)
+            .to_string();
+        let (tx, rx) = oneshot::channel();
+        let _claim = PendingTurn {
+            state: self.state.clone(),
+            id: turn_id.clone(),
+        };
+        {
+            let mut turns = self.state.turns.lock().unwrap();
+            if !self.is_alive() {
+                return Err("opencode plugin bridge is not alive".into());
+            }
+            turns.queue.push_back(QueuedTurn {
+                id: turn_id,
+                text: text.to_string(),
+                completion: tx,
+                observer,
+            });
+        }
+        self.state.notify.notify_one();
+        match tokio::time::timeout(self.state.turn_timeout, rx).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(err))) => Err(err),
+            Ok(Err(_closed)) => Err("opencode plugin bridge completion channel closed".to_string()),
+            Err(_elapsed) => Err("opencode plugin turn timed out".to_string()),
+        }
+    }
+}
+
+struct PendingTurn {
+    state: Arc<BridgeState>,
+    id: String,
+}
+impl Drop for PendingTurn {
+    fn drop(&mut self) {
+        let mut turns = self.state.turns.lock().unwrap();
+        turns.queue.retain(|turn| turn.id != self.id);
+        turns.active.remove(&self.id);
+    }
+}
+
+#[derive(Default)]
+struct Turns {
+    queue: VecDeque<QueuedTurn>,
+    active: HashMap<String, ActiveTurn>,
+}
+
+struct ActiveTurn {
+    completion: oneshot::Sender<Result<(), String>>,
+    observer: Option<Arc<dyn TurnAcceptanceObserver>>,
+    binding: Option<NativeInputBinding>,
+    accepting: bool,
+    accepted: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+struct NativeInputBinding {
+    #[serde(rename = "sessionID")]
+    session_id: String,
+    #[serde(rename = "messageID")]
+    message_id: String,
+}
+
 struct BridgeState {
     session_id: SessionId,
     token: String,
     events: Arc<dyn EventSink>,
     turn_timeout: Duration,
-    queue: Mutex<VecDeque<QueuedTurn>>,
-    active: Mutex<HashMap<String, oneshot::Sender<Result<(), String>>>>,
+    turns: Mutex<Turns>,
     next_id: AtomicU64,
     notify: Notify,
     alive: AtomicBool,
@@ -350,6 +420,10 @@ struct ModelReporter {
     root: Option<String>,
     seen: HashSet<String>,
     seen_bytes: usize,
+    telemetry: OpenCodeTelemetry,
+    // Private event order, including removal tombstones. Not a native token counter or turn ID.
+    telemetry_sequences: HashMap<String, u64>,
+    telemetry_id_bytes: usize,
 }
 impl Drop for ModelReporter {
     fn drop(&mut self) {
@@ -370,6 +444,77 @@ impl ModelReporter {
         let Some(root) = self.root.as_deref() else {
             return true;
         };
+        if let Some(envelope) = info.get("telemetry") {
+            let Some(native) = info.get("info") else {
+                return true;
+            };
+            if native.get("sessionID").and_then(Value::as_str) != Some(root) {
+                return true;
+            }
+            if envelope.get("unavailable") == Some(&Value::Bool(true)) {
+                return false;
+            }
+            let Some(id) = native
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| nexus_contracts::telemetry::TelemetryId::new(*id).is_ok())
+            else {
+                return true;
+            };
+            let Some(sequence) = envelope
+                .get("sequence")
+                .and_then(Value::as_u64)
+                .filter(|n| *n > 0 && *n <= 9_007_199_254_740_991)
+            else {
+                return true;
+            };
+            if self
+                .telemetry_sequences
+                .get(id)
+                .is_some_and(|old| *old >= sequence)
+            {
+                return true;
+            }
+            if !self.telemetry_sequences.contains_key(id) {
+                if self.telemetry_sequences.len() >= 4096
+                    || id.len() > 262144usize.saturating_sub(self.telemetry_id_bytes)
+                {
+                    return false;
+                }
+                self.telemetry_id_bytes += id.len();
+            }
+            self.telemetry_sequences.insert(id.to_owned(), sequence);
+            let updates = if envelope.get("removed") == Some(&Value::Bool(true)) {
+                self.telemetry.remove(id, root)
+            } else {
+                self.telemetry.observe(
+                    native,
+                    &envelope["contextCapacity"],
+                    root,
+                    nexus_common::now(),
+                )
+            };
+            for update in updates {
+                let Some(profile) = self.reporting.profile().telemetry() else {
+                    continue;
+                };
+                let capability = match &update {
+                    nexus_contracts::telemetry::NativeTelemetryUpdate::Usage { .. } => {
+                        profile.usage()
+                    }
+                    nexus_contracts::telemetry::NativeTelemetryUpdate::Context { .. } => {
+                        profile.context()
+                    }
+                    _ => continue,
+                };
+                if capability.capability() == nexus_contracts::ModelEvidenceCapability::Supported
+                    && !self.reporting.sink().observe_telemetry(update)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
         // Once this message's selection is accepted, later partial snapshots of that same
         // message must not clear it or refresh it as new evidence.
         if info.get("sessionID").and_then(Value::as_str) == Some(root)
@@ -380,9 +525,7 @@ impl ModelReporter {
         {
             return true;
         }
-        let Some(update) =
-            nexus_agent::adapter::opencode::native::selected_model(info, root, nexus_common::now())
-        else {
+        let Some(update) = native::selected_model(info, root, nexus_common::now()) else {
             return true;
         };
         let message = match &update.value {
@@ -414,6 +557,7 @@ struct QueuedTurn {
     id: String,
     text: String,
     completion: oneshot::Sender<Result<(), String>>,
+    observer: Option<Arc<dyn TurnAcceptanceObserver>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -473,27 +617,110 @@ async fn next_turn(State(state): State<Arc<BridgeState>>, headers: HeaderMap) ->
         if !state.alive.load(Ordering::SeqCst) {
             return StatusCode::NO_CONTENT.into_response();
         }
-        let turn = {
-            let mut queue = state.queue.lock().unwrap();
-            queue.pop_front()
-        };
-        if let Some(turn) = turn {
-            state
-                .active
-                .lock()
-                .unwrap()
-                .insert(turn.id.clone(), turn.completion);
-            return Json(PluginTurn {
-                id: turn.id,
-                text: turn.text,
-            })
-            .into_response();
+        {
+            let mut turns = state.turns.lock().unwrap();
+            if !state.alive.load(Ordering::SeqCst) {
+                return StatusCode::NO_CONTENT.into_response();
+            }
+            if let Some(turn) = turns.queue.pop_front() {
+                turns.active.insert(
+                    turn.id.clone(),
+                    ActiveTurn {
+                        completion: turn.completion,
+                        observer: turn.observer,
+                        binding: None,
+                        accepting: false,
+                        accepted: false,
+                    },
+                );
+                return Json(PluginTurn {
+                    id: turn.id,
+                    text: turn.text,
+                })
+                .into_response();
+            }
         }
         tokio::select! {
             _ = state.notify.notified() => {}
             _ = &mut timeout => return StatusCode::NO_CONTENT.into_response(),
         }
     }
+}
+
+async fn bind_turn(
+    State(state): State<Arc<BridgeState>>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(binding): Json<NativeInputBinding>,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !binding.session_id.starts_with("ses_")
+        || !binding.message_id.starts_with("msg_")
+        || binding.session_id.len() > 4096
+        || binding.message_id.len() > 4096
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let mut turns = state.turns.lock().unwrap();
+    let Some(turn) = turns.active.get_mut(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !state.alive.load(Ordering::SeqCst)
+        || turn.binding.as_ref().is_some_and(|old| old != &binding)
+    {
+        return StatusCode::CONFLICT.into_response();
+    }
+    turn.binding = Some(binding);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn accept_turn(
+    State(state): State<Arc<BridgeState>>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(binding): Json<NativeInputBinding>,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let (observer, canonical_echo) = {
+        let mut turns = state.turns.lock().unwrap();
+        let Some(turn) = turns.active.get_mut(&id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        if !state.alive.load(Ordering::SeqCst) || turn.binding.as_ref() != Some(&binding) {
+            return StatusCode::CONFLICT.into_response();
+        }
+        if turn.accepting {
+            // Never replay the observer or acknowledge its still-pending effect.
+            return StatusCode::CONFLICT.into_response();
+        }
+        let observer = if turn.accepted {
+            None
+        } else {
+            turn.observer.clone()
+        };
+        turn.accepting = true;
+        (observer, turn.observer.is_some())
+    };
+    // Admission linearizes under the exact captured turn lock; no await holds it.
+    if let Some(observer) = observer {
+        observer.accepted().await;
+    }
+    {
+        let mut turns = state.turns.lock().unwrap();
+        let Some(turn) = turns.active.get_mut(&id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        if !state.alive.load(Ordering::SeqCst) || turn.binding.as_ref() != Some(&binding) {
+            return StatusCode::CONFLICT.into_response();
+        }
+        turn.accepting = false;
+        turn.accepted = true;
+    }
+    Json(json!({"canonicalEcho": canonical_echo})).into_response()
 }
 
 async fn complete_turn(
@@ -504,8 +731,20 @@ async fn complete_turn(
     if !authorized(&state, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if let Some(tx) = state.active.lock().unwrap().remove(&id) {
-        let _ = tx.send(Ok(()));
+    let turn = {
+        let mut turns = state.turns.lock().unwrap();
+        if turns.active.get(&id).is_some_and(|turn| turn.accepting) {
+            return StatusCode::CONFLICT.into_response();
+        }
+        turns.active.remove(&id)
+    };
+    if let Some(turn) = turn {
+        let outcome = if turn.observer.is_some() && !turn.accepted {
+            Err("opencode completed without a captured native input receipt".to_string())
+        } else {
+            Ok(())
+        };
+        let _ = turn.completion.send(outcome);
         StatusCode::NO_CONTENT.into_response()
     } else {
         (
@@ -525,9 +764,9 @@ async fn error_turn(
     if !authorized(&state, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if let Some(tx) = state.active.lock().unwrap().remove(&id) {
+    if let Some(turn) = state.turns.lock().unwrap().active.remove(&id) {
         let message = plugin_turn_error_message(body);
-        let _ = tx.send(Err(message));
+        let _ = turn.completion.send(Err(message));
         StatusCode::NO_CONTENT.into_response()
     } else {
         (
@@ -588,656 +827,9 @@ fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name)?.to_str().ok()
 }
 
-const OPENCODE_PLUGIN_JS: &str = r##"
-const guard = globalThis.__nexusOpenCodePlugin ??= {};
+const OPENCODE_PLUGIN_JS: &str = native::PLUGIN_SOURCE;
 
-function log(message) {
-  process.stderr.write(`[nexus-opencode-plugin] ${message}\n`);
-}
-
-export const nexus = async () => {
-  if (guard.hooks) return guard.hooks;
-
-  const bridgeUrl = process.env.NEXUS_OPENCODE_BRIDGE_URL?.trim();
-  const bridgeToken = process.env.NEXUS_OPENCODE_BRIDGE_TOKEN?.trim();
-  const serverUrl = process.env.NEXUS_OPENCODE_SERVER_URL?.trim();
-  const serverUser = process.env.OPENCODE_SERVER_USERNAME?.trim() || "opencode";
-  const serverPassword = process.env.OPENCODE_SERVER_PASSWORD?.trim();
-  const name = process.env.NEXUS_NAME?.trim() || process.env.NEXUS_AGENT_ID?.trim();
-  const project = process.env.NEXUS_PROJECT?.trim() || "default";
-  const explicitSession = process.env.NEXUS_OPENCODE_SESSION_ID?.trim();
-  const configuredPromptModel = process.env.NEXUS_OPENCODE_PROMPT_MODEL?.trim();
-  const configuredPromptAgent = process.env.NEXUS_OPENCODE_PROMPT_AGENT?.trim();
-
-  if (!bridgeUrl || !bridgeToken || !serverUrl || !serverPassword || !name) {
-    log("missing Nexus/OpenCode identity; plugin inert");
-    return {};
-  }
-
-  const serverAuth = `Basic ${Buffer.from(`${serverUser}:${serverPassword}`).toString("base64")}`;
-  let sessionID;
-  let busy = false;
-  let activeTurn;
-  let deferredTurn;
-  let pollStarted = false;
-  const roles = new Map();
-  const partText = new Map();
-  let turnEndEmitted = false;
-  let promptContext;
-
-  async function bridge(path, init = {}, timeoutMs = 30_000) {
-    const res = await fetch(`${bridgeUrl}${path}`, {
-      ...init,
-      signal: init.signal ?? AbortSignal.timeout(timeoutMs),
-      headers: {
-        authorization: `Bearer ${bridgeToken}`,
-        "content-type": "application/json",
-        ...(init.headers ?? {}),
-      },
-    });
-    if (res.status === 204) return undefined;
-    if (!res.ok) throw new Error(`Nexus bridge HTTP ${res.status} ${res.statusText} for ${path}`);
-    return await res.json();
-  }
-
-  async function opencode(path, init = {}, timeoutMs = 30_000) {
-    const res = await fetch(`${serverUrl}${path}`, {
-      ...init,
-      signal: init.signal ?? AbortSignal.timeout(timeoutMs),
-      headers: {
-        authorization: serverAuth,
-        "content-type": "application/json",
-        ...(init.headers ?? {}),
-      },
-    });
-    if (res.status === 204) return undefined;
-    if (!res.ok) throw new Error(`OpenCode HTTP ${res.status} ${res.statusText} for ${path}`);
-    return await res.json();
-  }
-
-  function parseModelRef(value) {
-    if (!value || !value.includes("/")) return undefined;
-    const [providerID, ...rest] = value.split("/");
-    const modelID = rest.join("/");
-    if (!providerID || !modelID) return undefined;
-    return { providerID, modelID };
-  }
-
-  function firstProviderModel(provider) {
-    const models = provider?.models ?? {};
-    const first = Object.values(models)[0];
-    if (typeof first === "string") return first;
-    if (first?.id) return first.id;
-    return Object.keys(models)[0];
-  }
-
-  async function resolvePromptContext() {
-    if (promptContext) return promptContext;
-    promptContext = (async () => {
-      let cfg = {};
-      try {
-        cfg = await opencode("/config", {}, 10_000) ?? {};
-      } catch (error) {
-        log(`config lookup failed: ${error.message}`);
-      }
-      let model = parseModelRef(configuredPromptModel) ?? parseModelRef(cfg.model);
-      if (!model) {
-        try {
-          const result = await opencode("/config/providers", {}, 10_000);
-          const providers = Array.isArray(result?.providers) ? result.providers : [];
-          for (const provider of providers) {
-            const providerID = provider?.id;
-            if (!providerID) continue;
-            const modelID = result?.default?.[providerID] ?? firstProviderModel(provider);
-            if (modelID) {
-              model = { providerID, modelID };
-              break;
-            }
-          }
-        } catch (error) {
-          log(`provider lookup failed: ${error.message}`);
-        }
-      }
-      return {
-        agent: configuredPromptAgent || cfg.default_agent || "build",
-        model,
-      };
-    })();
-    return promptContext;
-  }
-
-  async function emit(kind, data = {}) {
-    try {
-      await bridge("/event", { method: "POST", body: JSON.stringify({ kind, data }) }, 10_000);
-    } catch (error) {
-      log(`event bridge failed: ${error.message}`);
-    }
-  }
-
-  async function emitTurnEnd() {
-    if (turnEndEmitted) return;
-    turnEndEmitted = true;
-    await emit("turn_end", {});
-  }
-
-  function ours(id) {
-    if (!id) return true;
-    if (!sessionID) sessionID = id;
-    return id === sessionID;
-  }
-
-  const sessionReady = (async () => {
-    if (explicitSession) {
-      sessionID = explicitSession;
-      process.stderr.write(`[nexus-opencode-session] ${sessionID}\n`);
-      return sessionID;
-    }
-    try {
-      const res = await opencode("/session", {
-        method: "POST",
-        body: JSON.stringify({ title: `nexus:${project}:${name}` }),
-      }, 10_000);
-      if (res?.id) {
-        sessionID = res.id;
-        process.stderr.write(`[nexus-opencode-session] ${sessionID}\n`);
-      }
-    } catch (error) {
-      log(`session create failed: ${error.message}`);
-    }
-    return sessionID;
-  })();
-
-  async function ensureSession() {
-    return sessionID ?? await sessionReady;
-  }
-
-  async function completeActiveTurn() {
-    if (!busy && !activeTurn) return;
-    const turn = activeTurn;
-    activeTurn = undefined;
-    busy = false;
-    await emitTurnEnd();
-    if (turn) {
-      try {
-        await bridge(`/turn/${encodeURIComponent(turn.id)}/complete`, { method: "POST", body: "{}" }, 10_000);
-      } catch (error) {
-        log(`turn complete failed: ${error.message}`);
-      }
-    }
-    queueMicrotask(() => void pollTurns());
-  }
-
-  async function failActiveTurn(error, providerError) {
-    const turn = activeTurn;
-    activeTurn = undefined;
-    busy = false;
-    if (turn) {
-      try {
-        const payload = { error: error.message || String(error) };
-        if (providerError) payload.providerError = providerError;
-        await bridge(`/turn/${encodeURIComponent(turn.id)}/error`, {
-          method: "POST",
-          body: JSON.stringify(payload),
-        }, 10_000);
-      } catch (bridgeError) {
-        log(`turn error report failed: ${bridgeError.message}`);
-      }
-    }
-    setTimeout(() => void pollTurns(), 1_000).unref?.();
-  }
-
-  async function drive(turn) {
-    if (busy || activeTurn) {
-      // A bridge long-poll can already be outstanding when OpenCode begins a local/setup turn.
-      // The bridge has transferred ownership of this turn to the plugin, so returning here would
-      // strand the daemon's completion waiter forever. Retain it and submit it after the native
-      // session reports idle.
-      deferredTurn = turn;
-      return;
-    }
-    const id = await ensureSession();
-    if (!id) throw new Error("OpenCode session is not ready");
-    const prompt = await resolvePromptContext();
-    activeTurn = turn;
-    busy = true;
-    turnEndEmitted = false;
-    const body = {
-      agent: prompt.agent,
-      parts: [{ type: "text", text: turn.text }],
-    };
-    if (prompt.model) body.model = prompt.model;
-    await opencode(`/session/${encodeURIComponent(id)}/prompt_async`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    }, 10_000);
-  }
-
-  async function pollTurns() {
-    if (pollStarted || busy || activeTurn) return;
-    pollStarted = true;
-    try {
-      while (!busy && !activeTurn) {
-        const turn = deferredTurn ?? await bridge("/turn/next", {}, 35_000);
-        if (!turn) continue;
-        if (turn === deferredTurn) deferredTurn = undefined;
-        await drive(turn);
-      }
-    } catch (error) {
-      if (!busy && !activeTurn) setTimeout(() => void pollTurns(), 1_000).unref?.();
-    } finally {
-      pollStarted = false;
-    }
-  }
-
-  function textDelta(part) {
-    const key = `${part.messageID ?? part.messageId ?? ""}:${part.id ?? ""}`;
-    const text = typeof part.text === "string" ? part.text : typeof part.content === "string" ? part.content : "";
-    const prior = partText.get(key) ?? "";
-    partText.set(key, text);
-    return text.startsWith(prior) ? text.slice(prior.length) : text;
-  }
-
-  async function observePart(part) {
-    if (!ours(part.sessionID ?? part.sessionId)) return;
-    const type = part.type;
-    if (type === "text" || type === "reasoning") {
-      const delta = textDelta(part);
-      if (!delta) return;
-      const role = roles.get(part.messageID ?? part.messageId);
-      if (role === "user") await emit("user_input", { text: delta });
-      else await emit(type === "reasoning" ? "thinking" : "text", { text: delta });
-      return;
-    }
-    if (type === "tool") {
-      // C-TOOL v1 (docs/tool-call-contract.md): `tool` = the registered machine name,
-      // `input` = the structured args value; keys are omitted when absent, never null-padded.
-      const toolName = String(part.tool ?? part.name ?? "tool");
-      const payload = {
-        id: String(part.id ?? part.toolCallID ?? part.toolCallId ?? "tool"),
-        tool: toolName,
-        title: toolName,
-        status: part.state?.status ?? part.status ?? "in_progress",
-      };
-      const input = part.input ?? part.arguments ?? part.state?.input;
-      if (input != null) payload.input = input;
-      const output = part.output ?? part.result ?? part.state?.output;
-      if (output != null) payload.content = output;
-      await emit("tool_call", payload);
-      return;
-    }
-    if (type === "step-finish") {
-      await emitTurnEnd();
-    }
-  }
-
-  function eventErrorMessage(properties) {
-    const error = properties?.error;
-    if (!error) return properties?.message ?? "OpenCode session error";
-    return error.data?.message ?? error.message ?? error.name ?? JSON.stringify(error);
-  }
-
-  function firstPresent(...values) {
-    for (const value of values) {
-      if (value !== undefined && value !== null && value !== "") return value;
-    }
-    return undefined;
-  }
-
-  function assignIfPresent(target, key, ...values) {
-    const value = firstPresent(...values);
-    if (value !== undefined) target[key] = value;
-  }
-
-  function eventProviderError(properties) {
-    const error = properties?.error ?? {};
-    const data = error.data ?? properties?.data ?? {};
-    const nested = data.providerError ?? data.provider_error ?? properties?.providerError ?? properties?.provider_error ?? {};
-    const providerError = {};
-    assignIfPresent(providerError, "reason", nested.reason, data.reason, error.reason);
-    assignIfPresent(providerError, "code", nested.code, data.code, error.code);
-    assignIfPresent(providerError, "type", nested.type, data.type, error.type);
-    assignIfPresent(providerError, "errorCode", nested.errorCode, nested.error_code, data.errorCode, data.error_code, error.errorCode, error.error_code);
-    assignIfPresent(providerError, "providerErrorCode", nested.providerErrorCode, nested.provider_error_code, data.providerErrorCode, data.provider_error_code);
-    assignIfPresent(providerError, "status", nested.status, data.status, error.status);
-    assignIfPresent(providerError, "statusCode", nested.statusCode, nested.status_code, data.statusCode, data.status_code, error.statusCode, error.status_code);
-    assignIfPresent(providerError, "httpStatusCode", nested.httpStatusCode, nested.http_status_code, data.httpStatusCode, data.http_status_code, error.httpStatusCode, error.http_status_code);
-    assignIfPresent(providerError, "retryAfterMs", nested.retryAfterMs, nested.retry_after_ms, data.retryAfterMs, data.retry_after_ms);
-    assignIfPresent(providerError, "retryAfter", nested.retryAfter, nested.retry_after, nested["retry-after"], data.retryAfter, data.retry_after, data["retry-after"]);
-    assignIfPresent(providerError, "resetAt", nested.resetAt, nested.reset_at, data.resetAt, data.reset_at);
-    assignIfPresent(providerError, "resetsAt", nested.resetsAt, nested.resets_at, data.resetsAt, data.resets_at);
-    assignIfPresent(providerError, "provider", nested.provider, data.provider, error.provider);
-    assignIfPresent(providerError, "model", nested.model, data.model, error.model);
-    return Object.keys(providerError).length ? providerError : undefined;
-  }
-
-  const hooks = {
-    "chat.message": async (input) => {
-      if (!ours(input.sessionID)) return;
-      busy = true;
-      turnEndEmitted = false;
-    },
-    event: async ({ event }) => {
-      switch (event.type) {
-        case "session.created":
-          if (!event.properties?.info?.parentID && event.properties?.info?.id) sessionID = event.properties.info.id;
-          break;
-        case "message.updated": {
-          const info = event.properties?.info ?? {};
-          // Forward original native metadata, never requested prompt configuration. The bridge's
-          // immutable ready-handshake root owns attribution independently of mutable display state.
-          if (info.role === "assistant") {
-            try { await bridge("/model", { method: "POST", body: JSON.stringify(info) }); }
-            catch (error) { log(`model metadata unavailable: ${error}`); }
-          }
-          if (info.id && info.role) roles.set(info.id, info.role);
-          break;
-        }
-        case "message.part.updated":
-          await observePart(event.properties?.part ?? {});
-          break;
-        case "session.status":
-          if (!ours(event.properties?.sessionID)) return;
-          if (event.properties?.status?.type === "busy") {
-            busy = true;
-          } else if (event.properties?.status?.type === "idle") {
-            if (activeTurn) await completeActiveTurn();
-            else {
-              busy = false;
-              queueMicrotask(() => void pollTurns());
-            }
-          }
-          break;
-        case "session.idle":
-          if (!ours(event.properties?.sessionID)) return;
-          await completeActiveTurn();
-          break;
-        case "session.error":
-          if (event.properties?.sessionID && !ours(event.properties.sessionID)) return;
-          await failActiveTurn(
-            new Error(eventErrorMessage(event.properties)),
-            eventProviderError(event.properties),
-          );
-          break;
-      }
-    },
-    "tool.execute.before": async (input) => {
-      if (!ours(input.sessionID)) return;
-      await emit("thinking", { text: `Running tool: ${input.tool}` });
-    },
-    dispose: async () => {
-      busy = false;
-      activeTurn = undefined;
-      deferredTurn = undefined;
-    },
-  };
-
-  guard.hooks = hooks;
-  void pollTurns();
-  log(`ready for ${project}:${name}`);
-  return hooks;
-};
-"##;
-
-const OPENCODE_SERVE_JS: &str = r##"
-import { spawn } from "node:child_process";
-import { createServer } from "node:net";
-import { once } from "node:events";
-import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { delimiter, join } from "node:path";
-
-function resolveOpencodeBin() {
-  const override = process.env.NEXUS_OPENCODE_BIN?.trim();
-  if (override) return override;
-  const platform = { linux: "linux", darwin: "darwin", win32: "windows" }[process.platform];
-  const arch = { x64: "x64", arm64: "arm64" }[process.arch];
-  if (!platform || !arch) return process.platform === "win32" ? "opencode.exe" : "opencode";
-  const binary = platform === "windows" ? "opencode.exe" : "opencode";
-  const packageBase = `opencode-${platform}-${arch}`;
-  const provider = packageBase.slice(0, packageBase.indexOf("-"));
-  const providerPackage = `${provider}-ai`;
-  const stagedBinary = `${provider}.exe`;
-  const packages = [packageBase, `${packageBase}-baseline`];
-  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
-    if (!dir) continue;
-    const moduleRoots = [join(dir, "node_modules"), join(dir, "..", "lib", "node_modules")];
-    const candidates = [join(dir, binary)];
-    for (const modules of moduleRoots) {
-      candidates.push(join(modules, providerPackage, "bin", stagedBinary));
-      for (const packageName of packages) {
-        candidates.push(join(modules, packageName, "bin", binary));
-        candidates.push(join(modules, "opencode-ai", "node_modules", packageName, "bin", binary));
-      }
-    }
-    for (const exe of candidates) {
-      if (existsSync(exe)) return exe;
-    }
-  }
-  return binary;
-}
-
-async function freePort() {
-  const server = createServer();
-  server.listen(0, "127.0.0.1");
-  await once(server, "listening");
-  const port = server.address().port;
-  await new Promise((resolve) => server.close(resolve));
-  return port;
-}
-
-async function killServe(child) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  child.kill("SIGTERM");
-  const dead = await Promise.race([
-    once(child, "exit").then(() => true),
-    new Promise((resolve) => setTimeout(() => resolve(false), 3000)),
-  ]);
-  if (!dead) {
-    child.kill("SIGKILL");
-    await once(child, "exit");
-  }
-}
-
-function splitNativeArgs(args) {
-  const out = { model: undefined, agent: undefined, session: undefined, attachArgs: [] };
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i];
-    const next = args[i + 1];
-    if ((arg === "--model" || arg === "-m") && next) {
-      out.model = next;
-      i += 1;
-      continue;
-    }
-    if (arg.startsWith("--model=")) {
-      out.model = arg.slice("--model=".length);
-      continue;
-    }
-    if (arg === "--agent" && next) {
-      out.agent = next;
-      i += 1;
-      continue;
-    }
-    if (arg.startsWith("--agent=")) {
-      out.agent = arg.slice("--agent=".length);
-      continue;
-    }
-    if ((arg === "--session" || arg === "-s") && next) {
-      out.session = next;
-      i += 1;
-      continue;
-    }
-    if (arg.startsWith("--session=")) {
-      out.session = arg.slice("--session=".length);
-      continue;
-    }
-    // The attached TUI is only a viewer for the plugin-owned session. Keep UI-native flags that
-    // attach supports; do not pass session/model/prompt flags that apply to a normal launch and
-    // would either duplicate `--session` or be rejected by the attach subcommand.
-    if (arg === "--mini" || arg === "--no-replay") {
-      out.attachArgs.push(arg);
-      continue;
-    }
-    if (arg === "--replay-limit" && next) {
-      out.attachArgs.push(arg, next);
-      i += 1;
-      continue;
-    }
-    if (arg.startsWith("--replay-limit=")) {
-      out.attachArgs.push(arg);
-    }
-  }
-  return out;
-}
-
-async function main() {
-  const nativeArgs = process.argv.slice(2);
-  const native = splitNativeArgs(nativeArgs);
-  const pluginPath = process.env.NEXUS_OPENCODE_PLUGIN_PATH?.trim();
-  const dataRoot = process.env.NEXUS_OPENCODE_HOME?.trim();
-  const readyPath = process.env.NEXUS_OPENCODE_READY_PATH?.trim();
-  if (!pluginPath) throw new Error("NEXUS_OPENCODE_PLUGIN_PATH is required");
-  if (!dataRoot) throw new Error("NEXUS_OPENCODE_HOME is required");
-
-  const bin = resolveOpencodeBin();
-  const port = String(await freePort());
-  const url = `http://127.0.0.1:${port}`;
-  const secret = randomBytes(24).toString("hex");
-  const username = "opencode";
-  mkdirSync(dataRoot, { recursive: true });
-  const resumeIsolated = process.env.NEXUS_OPENCODE_RESUME_ISOLATED === "1";
-  const isolatedStore = !native.session || resumeIsolated;
-  const dbPath = join(dataRoot, "opencode.db");
-  const pidFile = join(dataRoot, "serve.pid");
-  const baseEnv = { ...process.env };
-  if (!isolatedStore) delete baseEnv.OPENCODE_DB;
-
-  if (existsSync(pidFile)) {
-    const pid = Number(readFileSync(pidFile, "utf8"));
-    try {
-      process.kill(pid, 0);
-      throw new Error(`opencode serve already running for this Nexus session (pid ${pid})`);
-    } catch (error) {
-      if (error.code !== "ESRCH") throw error;
-      rmSync(pidFile, { force: true });
-    }
-  }
-
-  const config = {
-    $schema: "https://opencode.ai/config.json",
-    permission: "allow",
-    plugin: [pluginPath],
-  };
-  if (native.model) {
-    config.model = native.model;
-    config.agent = { nexus: { mode: "primary", model: native.model } };
-    config.default_agent = "nexus";
-  }
-  if (native.agent) config.default_agent = native.agent;
-
-  const serve = spawn(bin, ["serve", "--hostname", "127.0.0.1", "--port", port], {
-    env: {
-      ...baseEnv,
-      NEXUS_OPENCODE_SERVER_URL: url,
-      NEXUS_OPENCODE_SESSION_ID: native.session ?? "",
-      OPENCODE_SERVER_USERNAME: username,
-      OPENCODE_SERVER_PASSWORD: secret,
-      NEXUS_OPENCODE_PROMPT_MODEL: native.model ?? "",
-      NEXUS_OPENCODE_PROMPT_AGENT: native.agent ?? (native.model ? "nexus" : ""),
-      ...(isolatedStore ? { OPENCODE_DB: dbPath } : {}),
-      OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  writeFileSync(pidFile, String(serve.pid));
-  serve.on("exit", () => rmSync(pidFile, { force: true }));
-
-  let sessionId;
-  let attached = false;
-  let onSession;
-  const scan = (data) => {
-    if (!attached) process.stderr.write(data);
-    if (!sessionId) {
-      const match = data.toString().match(/\[nexus-opencode-session\] (\S+)/);
-      if (match) {
-        sessionId = match[1];
-        onSession?.(sessionId);
-      }
-    }
-  };
-  serve.stdout?.on("data", scan);
-  serve.stderr?.on("data", scan);
-  serve.on("exit", (code, signal) => {
-    if (!attached) process.exit(code ?? (signal ? 1 : 0));
-  });
-
-  const auth = `Basic ${Buffer.from(`${username}:${secret}`).toString("base64")}`;
-  void (async () => {
-    for (let i = 0; i < 300 && !sessionId; i += 1) {
-      try {
-        await fetch(`${url}/session`, { headers: { authorization: auth }, signal: AbortSignal.timeout(1500) });
-      } catch {
-        // Serve not ready yet, or an early request hung during boot.
-      }
-      await new Promise((resolve) => setTimeout(resolve, 200));
-    }
-  })();
-
-  const id = await new Promise((resolve) => {
-    if (sessionId) return resolve(sessionId);
-    onSession = resolve;
-    setTimeout(() => resolve(sessionId), 60_000);
-  });
-  if (!id) {
-    process.stderr.write(`[nexus-opencode-serve] session never came up; aborting\n`);
-    await killServe(serve);
-    process.exit(1);
-  }
-  const tuiEnv = {
-    ...baseEnv,
-    OPENCODE_SERVER_USERNAME: username,
-    OPENCODE_SERVER_PASSWORD: secret,
-    ...(isolatedStore ? { OPENCODE_DB: dbPath } : {}),
-  };
-  delete tuiEnv.OPENCODE_CONFIG_CONTENT;
-  delete tuiEnv.NEXUS_OPENCODE_BRIDGE_URL;
-  delete tuiEnv.NEXUS_OPENCODE_BRIDGE_TOKEN;
-  delete tuiEnv.NEXUS_OPENCODE_PLUGIN_PATH;
-  delete tuiEnv.NEXUS_OPENCODE_SERVER_URL;
-
-  attached = true;
-  const tui = spawn(bin, ["attach", url, "--session", id, "--password", secret, ...native.attachArgs], {
-    env: tuiEnv,
-    stdio: "inherit",
-  });
-
-  for (const sig of ["SIGINT", "SIGTERM"]) {
-    process.on(sig, () => {
-      tui.kill(sig);
-      serve.kill(sig);
-    });
-  }
-  tui.on("exit", (code, signal) => {
-    void killServe(serve).then(() => process.exit(code ?? (signal ? 1 : 0)));
-  });
-  await new Promise((resolve) => setTimeout(resolve, 1000));
-  if (
-    serve.exitCode !== null ||
-    serve.signalCode !== null ||
-    tui.exitCode !== null ||
-    tui.signalCode !== null
-  ) {
-    await killServe(serve);
-    process.exit(tui.exitCode ?? serve.exitCode ?? 1);
-  }
-  if (readyPath) {
-    const readyTempPath = `${readyPath}.tmp-${process.pid}`;
-    writeFileSync(readyTempPath, JSON.stringify({ sessionId: id, url, pid: serve.pid, readyOwner: process.env.NEXUS_NATIVE_READY_OWNER }) + "\n");
-    renameSync(readyTempPath, readyPath);
-  }
-}
-
-void main();
-"##;
+const OPENCODE_SERVE_JS: &str = nexus_harness_opencode::SERVE_SOURCE;
 
 #[allow(dead_code)]
 fn _assert_send_sync() {

@@ -39,6 +39,11 @@ impl ModelObservationSink for GatewayRowObserver {
     fn revoke(&self) {
         self.handle.revoke();
     }
+    fn observe_telemetry(&self, update: nexus_contracts::telemetry::NativeTelemetryUpdate) -> bool {
+        // Metrics do not activate a provisional runtime; the configured-row/liveness boundary
+        // above remains the only activation authority. The captured handle fences root and close.
+        self.handle.observe_telemetry(update)
+    }
 }
 
 /// Response-only native evidence arrives later than forwarder attachment.
@@ -75,6 +80,10 @@ impl ModelObservationSink for ClaudeResponseObserver {
     }
     fn revoke(&self) {
         self.handle.revoke();
+    }
+    fn observe_telemetry(&self, update: nexus_contracts::telemetry::NativeTelemetryUpdate) -> bool {
+        // Response usage is observation only; model/liveness remains activation authority.
+        self.handle.observe_telemetry(update)
     }
 }
 

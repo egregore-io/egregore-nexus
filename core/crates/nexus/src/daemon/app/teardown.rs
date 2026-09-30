@@ -3,6 +3,121 @@
 use super::*;
 
 impl AppState {
+    /// UNIFIED TEARDOWN — best-effort; logs on failure. Dispatch based on `transport`:
+    ///
+    /// - `"acp"` → close the ACP child via `agent_concrete.detach_session`.
+    /// - `"pty"` / `NULL` → kill the tmux harness via [`AppState::kill_harness`].
+    pub async fn teardown_harness(&self, name: &str, project: &str) {
+        use nexus_store::repos::Sessions;
+        let sessions = Sessions::new(&self.store);
+        let row = sessions
+            .find_unique_by_name_any_project(name)
+            .await
+            .ok()
+            .flatten();
+        if let Some(row) = row.as_ref() {
+            self.teardown_harness_row(row).await;
+            return;
+        }
+        match teardown_route(None) {
+            TeardownRoute::Acp => unreachable!("missing rows cannot select ACP teardown"),
+            TeardownRoute::Pty => {
+                self.kill_harness(name, project).await;
+            }
+        }
+    }
+
+    /// Best-effort teardown for a resolved session row. This is the session-exact backend for
+    /// `admin.remove --kill`; it avoids the older generic `agent.remove(name)` route, which could
+    /// re-resolve a name after the app had already selected the row to remove.
+    pub(crate) async fn teardown_harness_row(&self, row: &SessionRow) {
+        match teardown_route(row.transport.as_deref()) {
+            TeardownRoute::Acp => {
+                if let Some(a) = &self.agent_concrete {
+                    let _ = a.detach_session(&row.session_id, true).await;
+                } else {
+                    // No ACP service to close the child — a leaked headless harness with no log is the
+                    // exact silent-reaper footgun we avoid elsewhere; make the gap observable.
+                    tracing::warn!(name = %row.display_name(), session = %row.session_id, "teardown_harness: agent_concrete absent for acp row — ACP child may leak");
+                }
+            }
+            TeardownRoute::Pty => {
+                self.kill_harness_row(row).await;
+            }
+        }
+    }
+
+    /// Best-effort daemon shutdown sweep for every agent session with an explicit transport record.
+    ///
+    /// Lifecycle stop/restart owns process cleanup at the daemon boundary: close/detach the recorded
+    /// transport, release native sidecar bindings, mark the session offline, and clear the active
+    /// runtime row. Rows without a transport are legacy or externally registered and are left alone
+    /// here; targeted admin remove/delete still handles those paths explicitly.
+    pub async fn teardown_owned_transports_for_shutdown(&self) -> usize {
+        // Quiesce and JOIN delivery loops before closing adapters. Closing an ACP/app-server
+        // channel first wakes the still-running loop with a synthetic contract error and turns a
+        // planned restart into a false DLQ row. The boot recovery boundary owns any attempt left
+        // `injecting` and records the intentionally conservative `delivery_outcome_unknown` state.
+        if let Some(wiring) = &self.loop_wiring {
+            let quiesced = wiring.quiesce_delivery_loops_for_shutdown().await;
+            tracing::info!(
+                quiesced,
+                "daemon shutdown quiesced delivery loops before adapter teardown"
+            );
+        }
+
+        let rows = match Sessions::new(&self.store).list_all().await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "daemon shutdown transport sweep could not list sessions"
+                );
+                return 0;
+            }
+        };
+
+        let mut torn_down = 0;
+        for row in rows {
+            if !row.is_agent() || row.transport.is_none() {
+                continue;
+            }
+            self.teardown_harness_row(&row).await;
+            if let Some(w) = &self.loop_wiring {
+                w.teardown_session_transports(&row.session_id);
+            }
+            if let Err(error) = self.presence.mark_transport_offline(&row.session_id).await {
+                tracing::warn!(
+                    session = %row.session_id,
+                    name = %row.display_name(),
+                    error = %error,
+                    "daemon shutdown transport sweep could not mark session offline"
+                );
+            }
+            if let Err(error) = self.archive_native_session_for_stop(&row.session_id).await {
+                tracing::warn!(
+                    session = %row.session_id,
+                    name = %row.display_name(),
+                    error = %error,
+                    "daemon shutdown transport sweep could not archive native state"
+                );
+            }
+            if let Err(error) = AgentRuntimes::new(&self.store)
+                .stop(&row.session_id.0)
+                .await
+            {
+                tracing::warn!(
+                    session = %row.session_id,
+                    name = %row.display_name(),
+                    error = %error,
+                    "daemon shutdown transport sweep could not stop runtime row"
+                );
+            }
+            torn_down += 1;
+        }
+        torn_down
+    }
+
     /// EVICT — remove the agent from EVERY thread it's a member of. The session itself (and its
     /// process/record) is untouched; it just leaves all rooms. `thread_members` stores stable
     /// `agent_id` when known and keeps the name as the compatibility fallback.

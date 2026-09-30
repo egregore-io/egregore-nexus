@@ -1,5 +1,5 @@
 //! Raw ACP metadata validation before the SDK's tolerant configuration decoder.
-use super::AcpModelMetadataDialect;
+use super::{AcpContextUsageBasis, AcpModelMetadataDialect};
 use agent_client_protocol::schema::v1::{
     SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
 };
@@ -15,11 +15,66 @@ use nexus_contracts::model_report::{ModelEvidenceField, NativeModelUpdate};
 use nexus_contracts::ModelEvidenceCapability;
 use std::sync::{Arc, Mutex};
 
+pub(crate) fn decode_prompt_usage(
+    raw: &Value,
+    root: &str,
+    observed_at: i64,
+    source: &ModelObservationSource,
+    scope: nexus_contracts::telemetry::TokenUsageScope,
+) -> nexus_contracts::telemetry::NativeTelemetryValue<
+    nexus_contracts::telemetry::TokenUsageObservation,
+> {
+    use nexus_contracts::telemetry::*;
+    let Some(raw) = raw.get("usage").filter(|value| !value.is_null()) else {
+        return NativeTelemetryValue::Unknown;
+    };
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Usage {
+        total_tokens: TelemetryCounter,
+        input_tokens: TelemetryCounter,
+        output_tokens: TelemetryCounter,
+        cached_read_tokens: Option<TelemetryCounter>,
+        cached_write_tokens: Option<TelemetryCounter>,
+        thought_tokens: Option<TelemetryCounter>,
+    }
+    let decode = || -> Option<TokenUsageObservation> {
+        let usage: Usage = serde_json::from_value(raw.clone()).ok()?;
+        let value = TokenUsageObservation {
+            metadata: TelemetryMetadata {
+                native_session_id: TelemetryId::new(root).ok()?,
+                source: source.clone(),
+                observed_at: TelemetryTimestamp::new(observed_at).ok()?,
+                native_reported_at: None,
+            },
+            scope,
+            // Stable provenance for replaceable native snapshots, not an accumulation key.
+            counter_id: TelemetryId::new(source.as_str()).ok()?,
+            reset_id: None,
+            native_turn_id: None,
+            model: None,
+            input_tokens: Some(usage.input_tokens),
+            output_tokens: Some(usage.output_tokens),
+            cache_read_tokens: usage.cached_read_tokens,
+            cache_write_tokens: usage.cached_write_tokens,
+            reasoning_tokens: usage.thought_tokens,
+            total_tokens: Some(usage.total_tokens),
+        };
+        value.validate().ok()?;
+        Some(value)
+    };
+    decode().map_or(
+        NativeTelemetryValue::Invalid,
+        NativeTelemetryValue::Observed,
+    )
+}
+
 pub(crate) fn decode_context(
     raw: &Value,
     root: &str,
     observed_at: i64,
     source: &ModelObservationSource,
+    semantics: AcpContextUsageBasis,
 ) -> nexus_contracts::telemetry::NativeTelemetryValue<nexus_contracts::telemetry::ContextObservation>
 {
     use nexus_contracts::telemetry::*;
@@ -33,7 +88,8 @@ pub(crate) fn decode_context(
         if usage.size.get() == 0 {
             return None;
         }
-        let basis = TelemetryId::new("acp.usage_update:last-reported-context-ratio").ok()?;
+        let (basis, capacity_estimated) = semantics.description();
+        let basis = TelemetryId::new(basis).ok()?;
         let token = |value, estimated| ContextTokenValue {
             value,
             provenance: if estimated {
@@ -52,7 +108,7 @@ pub(crate) fn decode_context(
                 native_reported_at: None,
             },
             model: None,
-            effective_capacity_tokens: Some(token(usage.size, false)),
+            effective_capacity_tokens: Some(token(usage.size, capacity_estimated)),
             used_tokens: Some(token(usage.used, true)),
             remaining_tokens: remaining
                 .map(|value| token(TelemetryCounter::new(value).unwrap(), true)),
@@ -101,7 +157,9 @@ pub(crate) struct ModelMetadataCollector {
     reporting: Option<AdapterModelReporting>,
     connection: Option<String>,
     pending: Option<(Value, OpenRequest)>,
+    pending_prompt: Option<(Value, String)>,
     root: Option<String>,
+    quota: super::acp_quota::AcpQuotaSnapshot,
 }
 impl ModelMetadataCollector {
     pub(crate) fn new(reporting: Option<AdapterModelReporting>) -> Self {
@@ -109,20 +167,52 @@ impl ModelMetadataCollector {
             reporting,
             connection: None,
             pending: None,
+            pending_prompt: None,
             root: None,
+            quota: Default::default(),
         }
     }
     pub(crate) fn begin(&mut self, owner: &str) {
         self.connection = Some(owner.into());
         self.pending = None;
+        self.pending_prompt = None;
         self.root = None;
+        self.quota = Default::default();
     }
     pub(crate) fn register(&mut self, owner: &str, id: Value, request: OpenRequest) {
         if self.connection.as_deref() == Some(owner) {
+            self.pending_prompt = None;
+            self.quota = Default::default();
             self.pending = Some((id, request));
         }
     }
+    pub(crate) fn register_prompt(&mut self, owner: &str, id: Value, root: &str) {
+        if self.connection.as_deref() == Some(owner)
+            && self.root.as_deref() == Some(root)
+            && self.pending.is_none()
+        {
+            self.pending_prompt = Some((id, root.into()));
+        }
+    }
+    pub(crate) fn cancel_prompt(&mut self, owner: &str, root: &str) {
+        if self.connection.as_deref() == Some(owner)
+            && self
+                .pending_prompt
+                .as_ref()
+                .is_some_and(|(_, pending_root)| pending_root == root)
+        {
+            self.pending_prompt = None;
+        }
+    }
     fn forget(&mut self, owner: &str, id: &Value) {
+        if self.connection.as_deref() == Some(owner)
+            && self
+                .pending_prompt
+                .as_ref()
+                .is_some_and(|(pending, _)| pending == id)
+        {
+            self.pending_prompt = None;
+        }
         if self.connection.as_deref() == Some(owner)
             && self
                 .pending
@@ -140,7 +230,9 @@ impl ModelMetadataCollector {
     pub(crate) fn close_current(&mut self) {
         self.connection = None;
         self.pending = None;
+        self.pending_prompt = None;
         self.root = None;
+        self.quota = Default::default();
         if let Some(reporting) = &self.reporting {
             reporting.sink().revoke();
         }
@@ -150,6 +242,50 @@ impl ModelMetadataCollector {
             return;
         }
         match dispatch {
+            Dispatch::Response(result, router) if router.method() == "session/prompt" => {
+                let Some((id, root)) = &self.pending_prompt else {
+                    return;
+                };
+                if *id != router.id() || self.root.as_ref() != Some(root) {
+                    return;
+                }
+                let (_, root) = self.pending_prompt.take().expect("matching prompt request");
+                let Ok(payload) = result else { return };
+                // Some adapters attach optional session metadata. Never relabel an explicit
+                // foreign identity even when the response request ID is ours.
+                if !payload.is_object()
+                    || payload
+                        .get("sessionId")
+                        .is_some_and(|id| id.as_str() != Some(&root))
+                {
+                    return;
+                }
+                let reporting = self.reporting.as_ref().unwrap();
+                let Some(telemetry) = reporting.profile().telemetry() else {
+                    return;
+                };
+                let Some(scope) = telemetry.prompt_usage_scope() else {
+                    return;
+                };
+                if telemetry.usage().capability() != ModelEvidenceCapability::Supported {
+                    return;
+                }
+                let Some(source) = telemetry.usage().source() else {
+                    return;
+                };
+                reporting.sink().observe_telemetry(
+                    nexus_contracts::telemetry::NativeTelemetryUpdate::Usage {
+                        native_session_id: root.clone(),
+                        value: decode_prompt_usage(
+                            payload,
+                            &root,
+                            nexus_common::now(),
+                            source,
+                            scope.wire(),
+                        ),
+                    },
+                );
+            }
             Dispatch::Response(result, router) => {
                 let Some((id, request)) = self.pending.as_ref() else {
                     return;
@@ -216,6 +352,28 @@ impl ModelMetadataCollector {
                     == Some("usage_update")
                 {
                     let reporting = self.reporting.as_ref().unwrap();
+                    if let Some(dialect) = reporting.profile().telemetry().and_then(|profile| {
+                        (profile.quota().capability() == ModelEvidenceCapability::Supported)
+                            .then(|| profile.quota_dialect())
+                            .flatten()
+                    }) {
+                        if let Some(raw) = update
+                            .get("_meta")
+                            .and_then(|meta| meta.get(dialect.extension_key()))
+                        {
+                            reporting.sink().observe_telemetry(
+                                nexus_contracts::telemetry::NativeTelemetryUpdate::Quota {
+                                    native_session_id: root.clone(),
+                                    value: self.quota.observe(
+                                        dialect,
+                                        raw,
+                                        root,
+                                        nexus_common::now(),
+                                    ),
+                                },
+                            );
+                        }
+                    }
                     let Some(capability) =
                         reporting.profile().telemetry().map(|value| value.context())
                     else {
@@ -230,7 +388,18 @@ impl ModelMetadataCollector {
                     reporting.sink().observe_telemetry(
                         nexus_contracts::telemetry::NativeTelemetryUpdate::Context {
                             native_session_id: root.clone(),
-                            value: decode_context(update, root, nexus_common::now(), source),
+                            value: decode_context(
+                                update,
+                                root,
+                                nexus_common::now(),
+                                source,
+                                reporting
+                                    .profile()
+                                    .telemetry()
+                                    .unwrap()
+                                    .context_usage_basis()
+                                    .unwrap_or_default(),
+                            ),
                         },
                     );
                 }
@@ -263,7 +432,7 @@ impl ModelMetadataCollector {
     }
 }
 
-/// Dropping a session-open waiter cannot leave its request id eligible for a late reply.
+/// Dropping a session-open or prompt waiter cannot leave its request id eligible for a late reply.
 pub(crate) struct PendingMetadataRequest {
     collector: Arc<Mutex<ModelMetadataCollector>>,
     owner: String,

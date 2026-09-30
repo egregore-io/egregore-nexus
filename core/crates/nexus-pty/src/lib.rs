@@ -95,6 +95,32 @@ pub trait HarnessInput: Send + Sync {
         TurnCompletionEvidence::InputAcceptedOnly
     }
 
+    /// Operator input may use a native queue even while a bus turn is running. This is an
+    /// internal scheduling capability, not proof that a terminal write was accepted.
+    fn accepts_prompt_while_busy(&self) -> bool {
+        false
+    }
+
+    /// Write an operator prompt without requiring the previous native turn to finish.
+    /// Backends opt in explicitly; bus `send_turn` retains its existing contract.
+    async fn submit_prompt(&self, text: &str) -> Result<(), String> {
+        self.send_turn(text).await
+    }
+
+    /// Submit through one captured owner. Explicit interrupt and submission must share the
+    /// same input exclusion; the observer still runs only at native acceptance.
+    async fn submit_prompt_observed(
+        &self,
+        text: &str,
+        observer: Arc<dyn TurnAcceptanceObserver>,
+        interrupt: bool,
+    ) -> Result<(), String> {
+        if interrupt {
+            self.interrupt_active_turn().await?;
+        }
+        self.send_turn_observed(text, observer).await
+    }
+
     /// Binding-local native work, including manual input not represented by a daemon call.
     fn has_observed_open_turn(&self) -> bool {
         false

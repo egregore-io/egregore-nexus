@@ -50,7 +50,8 @@ pub struct HermesAdapter {
 
 impl HermesAdapter {
     /// Configured model evidence from the adapter's ACP metadata surface. This does not
-    /// advertise per-turn/response model selection or token/context/account telemetry.
+    /// advertise per-turn/response model selection. Usage follows the pinned ACP producer's
+    /// explicit scope; context and account sources are independent capabilities.
     pub fn model_reporting_profile() -> crate::adapter::AdapterModelReportingProfile {
         use crate::adapter::{AcpModelMetadataDialect, AdapterModelReportingProfile};
         use nexus_contracts::{
@@ -68,6 +69,37 @@ impl HermesAdapter {
             },
         )
         .expect("builtin ACP reporting profile is valid")
+        .with_telemetry({
+            use crate::adapter::{
+                AcpPromptUsageScope, AdapterTelemetryCapability, AdapterTelemetryReportingProfile,
+            };
+            AdapterTelemetryReportingProfile::new(
+                AdapterTelemetryCapability::new(
+                    ModelEvidenceCapability::Supported,
+                    Some(
+                        ModelObservationSource::new(
+                            nexus_harness_telemetry::HERMES_PROMPT_USAGE_SOURCE,
+                        )
+                        .unwrap(),
+                    ),
+                )
+                .unwrap(),
+                AdapterTelemetryCapability::new(
+                    ModelEvidenceCapability::Supported,
+                    Some(
+                        ModelObservationSource::new(nexus_harness_telemetry::HERMES_CONTEXT_SOURCE)
+                            .unwrap(),
+                    ),
+                )
+                .unwrap(),
+                AdapterTelemetryCapability::new(ModelEvidenceCapability::Unsupported, None)
+                    .unwrap(),
+            )
+            .with_prompt_usage(AcpPromptUsageScope::SessionCumulative)
+            .expect("builtin ACP usage semantics have a captured source")
+            .with_context_usage(crate::adapter::AcpContextUsageBasis::HermesRequestEstimate)
+            .expect("builtin ACP context semantics have a captured source")
+        })
     }
 
     /// Construct a Hermes adapter that will spawn the **real** `hermes acp` process for the given

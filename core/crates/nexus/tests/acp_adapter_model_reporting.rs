@@ -63,11 +63,26 @@ fn command(harness: &str, cwd: String) -> HarnessCommand {
         ],
         ..Default::default()
     };
-    if harness == "codex" {
-        let context: Value = serde_json::from_str(include_str!(
-            "fixtures/model_reporting/codex-acp-context.json"
-        ))
-        .unwrap();
+    command.env.push((
+        "FAKE_ACP_RAW_PROMPT".into(),
+        match harness {
+            "claude" => include_str!("fixtures/model_reporting/claude-acp-usage.json"),
+            "codex" => include_str!("fixtures/model_reporting/codex-acp-usage.json"),
+            "opencode" => include_str!("fixtures/model_reporting/opencode-acp-usage.json"),
+            "hermes" => include_str!("fixtures/model_reporting/hermes-acp-usage.json"),
+            _ => unreachable!(),
+        }
+        .into(),
+    ));
+    {
+        let raw = if harness == "codex" {
+            include_str!("fixtures/model_reporting/codex-acp-context.json")
+        } else if harness == "claude" {
+            include_str!("fixtures/model_reporting/claude-acp-context-quota.json")
+        } else {
+            include_str!("fixtures/model_reporting/acp-context-proxy.json")
+        };
+        let context: Value = serde_json::from_str(raw).unwrap();
         command.env.push((
             "FAKE_ACP_RAW_MODEL_UPDATES".into(),
             json!([context]).to_string(),
@@ -94,10 +109,10 @@ async fn next_report(
                     && event.payload["modelReport"]["reportRevision"]
                         .as_u64()
                         .is_some_and(|r| r > after_revision)
-                    && (event.payload["modelReport"]["backend"] != "codex.acp"
-                        || event.payload["modelReport"]["telemetry"]["context"]["observation"]
-                            ["usedTokens"]["value"]
-                            == 42000)
+                    && event.payload["modelReport"]["telemetry"]["usage"]["status"] == "observed"
+                    && event.payload["modelReport"]["telemetry"]["context"]["observation"]
+                        ["usedTokens"]["value"]
+                        == 42000
                 {
                     return event.payload;
                 }
@@ -115,13 +130,20 @@ fn export_projection_run(harness: &str, fresh: &Value, resumed: &Value, stopped:
 }
 
 async fn run(harness: &'static str) {
-    if harness == "codex" {
+    assert!(
+        profile(harness)
+            .telemetry()
+            .is_some_and(|value| value.usage().capability()
+                == nexus_contracts::ModelEvidenceCapability::Supported),
+        "actual {harness} registration enables its source-specific usage scope"
+    );
+    {
         assert!(
             profile(harness)
                 .telemetry()
                 .is_some_and(|value| value.context().capability()
                     == nexus_contracts::ModelEvidenceCapability::Supported),
-            "actual Codex ACP registration enables its structured context source"
+            "actual {harness} ACP registration enables its pinned structured context source"
         );
     }
     let dir = tempfile::tempdir().unwrap();
@@ -173,10 +195,10 @@ async fn run(harness: &'static str) {
         panic!("actual {harness} launch must carry its reporting context: {error:?}");
     }
     let sid = launched.unwrap().session_id;
-    if harness == "codex" {
+    {
         let adapter = native.lock().unwrap()[0].clone();
         adapter
-            .inject_completion_observed("native-shaped context fixture".into())
+            .inject_completion_observed("native-shaped usage fixture".into())
             .await
             .unwrap();
     }
@@ -195,10 +217,11 @@ async fn run(harness: &'static str) {
                 .unwrap();
             if row.model_report.as_ref().is_some_and(|r| {
                 r.observer_active
-                    && (harness != "codex"
-                        || serde_json::to_value(r).unwrap()["telemetry"]["context"]["observation"]
-                            ["usedTokens"]["value"]
-                            == 42000)
+                    && serde_json::to_value(r).unwrap()["telemetry"]["usage"]["status"]
+                        == "observed"
+                    && serde_json::to_value(r).unwrap()["telemetry"]["context"]["observation"]
+                        ["usedTokens"]["value"]
+                        == 42000
             }) {
                 break row;
             }
@@ -221,15 +244,76 @@ async fn run(harness: &'static str) {
     assert!(row.stopped_at.is_none());
     assert!(report.observer_active);
     assert_eq!(frame["modelReport"], serde_json::to_value(report).unwrap());
-    if harness == "codex" {
+    let usage = &frame["modelReport"]["telemetry"]["usage"]["observation"];
+    assert_eq!(
+        usage["scope"],
+        match harness {
+            "claude" => "lastPrompt",
+            "hermes" => "sessionCumulative",
+            _ => "lastResponse",
+        }
+    );
+    assert_eq!(
+        usage["totalTokens"],
+        if harness == "opencode" { 262 } else { 230 }
+    );
+    assert_eq!(
+        usage["inputTokens"],
+        if harness == "hermes" { 200 } else { 120 }
+    );
+    assert_eq!(usage["outputTokens"], 30);
+    assert_eq!(usage["cacheReadTokens"], 80);
+    assert_eq!(
+        usage["metadata"]["source"],
+        format!("{harness}.acp.prompt.usage")
+    );
+    assert!(usage.get("nativeTurnId").is_none());
+    assert!(usage.get("resetId").is_none());
+    assert!(usage.get("model").is_none());
+    if harness == "claude" {
+        assert_eq!(usage["cacheWriteTokens"], 0);
+        assert!(usage.get("reasoningTokens").is_none());
+        let quota = &frame["modelReport"]["telemetry"]["quota"]["observation"];
+        assert_eq!(quota["providerId"], "anthropic");
+        assert_eq!(quota["windows"][0]["usedPercent"], 75.0);
+        assert_eq!(quota["windows"][0]["windowId"], "claude/five_hour");
+        assert_eq!(quota["windows"][0]["resetsAt"], 1800000000000_i64);
+        assert!(quota.get("accountId").is_none());
+    } else {
+        assert_eq!(usage["reasoningTokens"], 12);
+        if harness == "opencode" {
+            assert_eq!(usage["cacheWriteTokens"], 20);
+        } else {
+            assert!(usage.get("cacheWriteTokens").is_none());
+        }
+    }
+    {
         let context = &frame["modelReport"]["telemetry"]["context"]["observation"];
         assert_eq!(context["remainingPercent"]["value"], 79.0);
         assert_eq!(context["effectiveCapacityTokens"]["value"], 200000);
-        assert_eq!(context["metadata"]["source"], "codex.acp.usage_update");
+        assert_eq!(
+            context["metadata"]["source"],
+            format!("{harness}.acp.usage_update")
+        );
+        assert_eq!(
+            context["effectiveCapacityTokens"]["provenance"],
+            if harness == "claude" {
+                "estimated"
+            } else {
+                "native"
+            }
+        );
+        assert_eq!(context["usedTokens"]["provenance"], "estimated");
+        assert_eq!(
+            context["remainingPercent"]["basis"],
+            match harness {
+                "claude" => "claude.acp.0.58.1:assistant-token-proxy-or-compaction-fallback",
+                "opencode" => "opencode.acp.1.17.17:last-assistant-input-and-cache-read",
+                "hermes" => "hermes.acp.0.17.0:rough-request-or-last-prompt-fallback",
+                _ => "acp.usage_update:last-reported-context-ratio",
+            }
+        );
         assert!(context.get("resetId").is_none());
-        assert!(frame["modelReport"]["telemetry"]["usage"]
-            .get("observation")
-            .is_none());
     }
     assert!(frame.get("modelObserverToken").is_none());
     assert!(!frame
@@ -243,10 +327,10 @@ async fn run(harness: &'static str) {
         .await
         .unwrap();
     assert_eq!(resumed.session_id, sid);
-    if harness == "codex" {
+    {
         let adapter = native.lock().unwrap()[1].clone();
         adapter
-            .inject_completion_observed("resumed native-shaped context fixture".into())
+            .inject_completion_observed("resumed native-shaped usage fixture".into())
             .await
             .unwrap();
     }

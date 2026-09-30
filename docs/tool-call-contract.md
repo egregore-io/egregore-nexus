@@ -55,7 +55,18 @@ Rules:
   double-encoding would turn the argument object into an opaque string.
 - The AG-UI mapping (`mapAgentUpdate.ts`) sets `toolCallName` from `tool` (title only as
   fallback) and emits `TOOL_CALL_ARGS.delta = JSON.stringify(input)` — stringified
-  exactly once, so `JSON.parse(delta)` returns the original object.
+  exactly once, so `JSON.parse(delta)` returns the original object. These complete
+  values carry `append: false`: consumers replace the prior argument snapshot,
+  including a non-prefix change or empty replacement. An absent `append` or
+  `append: true` retains legacy delta semantics. Consumers must be paired before
+  activating this additive marker; a legacy concatenating reader is incompatible.
+  Result content/status remains independent of argument updates.
+- A `TOOL_CALL_RESULT` can carry partial output with `status: "in_progress"` and
+  `append: true`; its event type alone is not terminal success evidence. Preserve
+  the accumulated bytes and running status. If observation ends without a native
+  terminal result, report the result as unavailable, not successful. An explicit
+  completed result with empty output remains successful; an explicit failed result
+  remains failed. Legacy result events without a status keep their existing meaning.
 
 ## The fidelity gate
 

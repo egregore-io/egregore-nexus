@@ -644,6 +644,33 @@ describe("durable session command queue", () => {
     });
   });
 
+  it("forwards exact original submission lookup without enqueueing", async () => {
+    const daemonQueueRead = vi.fn(async () => ({ target: "otto", sessionId: "s_otto", turnActive: false, steerCapability: SteerCapability.None, seq: 12, revision: 12, commands: [] }));
+    const response = await handleConversationQueueGet(new Request(
+      "http://localhost/api/conversation/prompt?agentId=a_otto&expectedSessionId=s_otto&clientMessageId=cm_original",
+    ), { env: { NEXUS_WEB_AUTH_MODE: "local" }, daemonQueueRead });
+    expect(response.status).toBe(200);
+    expect(daemonQueueRead).toHaveBeenCalledWith(expect.objectContaining({
+      agentId: "a_otto", expectedSessionId: "s_otto", clientMessageId: "cm_original",
+      requester: expect.objectContaining({ sessionId: "local-operator" }),
+    }));
+  });
+
+  it.each([
+    "agentId=a_otto&clientMessageId=cm_original",
+    "agentId=a_otto&expectedSessionId=s_otto&clientMessageId=",
+    "agentId=a_otto&expectedSessionId=s_otto&clientMessageId=a%0Ab",
+    `agentId=a_otto&expectedSessionId=s_otto&clientMessageId=${"x".repeat(257)}`,
+    "eventsAfter=1&clientMessageId=cm_original",
+  ])("rejects unscoped or invalid submission lookup: %s", async (query) => {
+    const daemonQueueRead = vi.fn();
+    const response = await handleConversationQueueGet(new Request(
+      `http://localhost/api/conversation/prompt?${query}`,
+    ), { env: { NEXUS_WEB_AUTH_MODE: "local" }, daemonQueueRead });
+    expect(response.status).toBe(400);
+    expect(daemonQueueRead).not.toHaveBeenCalled();
+  });
+
   it("reads production reconnect transitions through the typed daemon queue read", async () => {
     const daemonQueueRead = vi.fn(async () => ({
       events: [

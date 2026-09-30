@@ -6,6 +6,7 @@ import { createClient, type Client } from "@libsql/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { migrateGatewayStore } from "../migrations";
+import { collectClosedSqliteHandles } from "../../../../test-fixtures/closedSqliteHandles";
 import {
   bindLane,
   chatsForLane,
@@ -83,6 +84,7 @@ describe("Gateway transport lane bindings", () => {
     } finally {
       db.close();
       db = createClient({ url: ":memory:" });
+      await collectClosedSqliteHandles();
       await rm(root, { recursive: true, force: true });
     }
   });

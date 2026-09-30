@@ -725,14 +725,14 @@ describe("streamStoreRelay lane 1", () => {
       fallbackClient,
       // This assertion is about lane selection after a live frame, not whether a SQLite read
       // completes inside 100 ms while the full suite shares two CPU-capped validator cores.
-      // Keep the silence deadline comfortably outside scheduler noise; other tests exercise the
-      // actual fallback timer with deliberately short intervals.
-      fallbackPollMs: 2_000,
+      // Keep the silence deadline outside native Windows file-open latency as well;
+      // other tests exercise the actual fallback timer with deliberately short intervals.
+      fallbackPollMs: process.platform === "win32" ? 10_000 : 2_000,
     })({
       onEvent: (ev) => seen.push(ev),
     });
     await relay.ready;
-    await waitFor(() => seen.length === 1);
+    await waitFor(() => seen.length === 1, process.platform === "win32" ? 2_000 : 300);
     await new Promise((resolve) => setTimeout(resolve, 30));
     relay.close();
 
@@ -831,7 +831,7 @@ describe("streamStoreRelay lane 1", () => {
 
     await insertStreamEvent(streamClient, "s_iris", "text", { text: "live resumes" });
     watchListener?.("change", `${basename(path)}-wal`);
-    await waitFor(() => seen.length === 3);
+    await waitFor(() => seen.length === 3, process.platform === "win32" ? 2_000 : 300);
     await new Promise((resolve) => setTimeout(resolve, 20));
     relay.close();
     doorbell.close();

@@ -23,6 +23,55 @@ const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const SERVICE_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVICE_COMMAND_OUTPUT_LIMIT: usize = 64 * 1024;
 
+#[doc(hidden)]
+pub fn launchd_start_with(
+    domain: &str,
+    label: &str,
+    definition: &str,
+    restart: bool,
+    mut run: impl FnMut(&[&str]) -> Result<(), (Option<i32>, String)>,
+) -> Result<(), String> {
+    let target = format!("{domain}/{label}");
+    match run(&["print", &target]) {
+        Ok(()) if restart => run(&["kickstart", "-k", &target]),
+        Ok(()) => run(&["kickstart", &target]),
+        // launchctl's ENOSERVICE, not a generic failed query or missing GUI domain.
+        Err((Some(113), _)) => run(&["bootstrap", domain, definition]),
+        Err((_, error)) => return Err(error),
+    }
+    .map_err(|(_, error)| error)
+}
+
+#[doc(hidden)]
+pub fn launchd_stop_with(
+    target: &str,
+    mut run: impl FnMut(&[&str]) -> Result<(), (Option<i32>, String)>,
+) -> Result<(), String> {
+    match run(&["print", target]) {
+        Ok(()) => run(&["bootout", target]).map_err(|(_, error)| error),
+        Err((Some(113), _)) => Ok(()),
+        Err((_, error)) => Err(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn launchd_command(args: &[&str]) -> Result<(), (Option<i32>, String)> {
+    lifecycle_process::run_bounded(
+        Command::new("launchctl").args(args),
+        "launchd service command",
+        SERVICE_COMMAND_TIMEOUT,
+        SERVICE_COMMAND_OUTPUT_LIMIT,
+    )
+    .map(|_| ())
+    .map_err(|error| {
+        let code = match &error {
+            lifecycle_process::BoundedProcessError::Exit { status, .. } => status.code(),
+            _ => None,
+        };
+        (code, error.to_string())
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayServiceSpec {
     pub executable: PathBuf,
@@ -105,6 +154,10 @@ pub async fn install_gateway_service() -> Result<GatewayServiceReport, GatewayLi
 
 pub fn uninstall_gateway_service() -> Result<GatewayServiceReport, GatewayLifecycleError> {
     lifecycle::ensure_operator_supervision()?;
+    // Remove the dependent supervisor first (especially launchd's KeepAlive job).
+    if crate::webconsole_service::installed() {
+        crate::webconsole_service::uninstall().map_err(GatewayLifecycleError::lifecycle)?;
+    }
     let mut backend = SystemGatewayServiceBackend::new();
     let mut report =
         uninstall_gateway_service_with(&mut backend).map_err(GatewayLifecycleError::lifecycle)?;
@@ -138,6 +191,67 @@ pub fn gateway_service_status() -> Result<GatewayServiceReport, GatewayLifecycle
         supervisor: platform_label().into(),
         definition: Some(backend.definition_path()),
     })
+}
+
+/// Registration selects the supervisor path; health never permits a detached fallback.
+pub(crate) fn gateway_service_installed() -> bool {
+    SystemGatewayServiceBackend::new().installed()
+}
+
+pub(crate) async fn start_registered_gateway(restart: bool) -> Result<(), GatewayLifecycleError> {
+    lifecycle::ensure_operator_supervision()?;
+    let mut backend = SystemGatewayServiceBackend::new();
+    if !backend.installed() {
+        return Err(GatewayLifecycleError::lifecycle(
+            "Gateway service is not installed",
+        ));
+    }
+    backend
+        .ensure_daemon_service()
+        .await
+        .map_err(GatewayLifecycleError::lifecycle)?;
+    #[cfg(target_os = "linux")]
+    backend
+        .command_checked(
+            "systemctl",
+            &[
+                "--user".into(),
+                if restart { "restart" } else { "start" }.into(),
+                SYSTEMD_SERVICE.into(),
+            ],
+        )
+        .map_err(GatewayLifecycleError::lifecycle)?;
+    #[cfg(target_os = "macos")]
+    launchd_start_with(
+        &format!("gui/{}", current_uid()),
+        LAUNCHD_LABEL,
+        &backend.definition_path().display().to_string(),
+        restart,
+        launchd_command,
+    )
+    .map_err(GatewayLifecycleError::lifecycle)?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        if restart {
+            backend
+                .stop_checked()
+                .map_err(GatewayLifecycleError::lifecycle)?;
+        }
+        if restart || !gateway_service_status()?.running {
+            backend.start().map_err(GatewayLifecycleError::lifecycle)?;
+        }
+    }
+    backend
+        .wait_healthy()
+        .await
+        .map_err(GatewayLifecycleError::lifecycle)
+}
+
+pub(crate) fn stop_registered_gateway() -> Result<(), GatewayLifecycleError> {
+    lifecycle::ensure_operator_supervision()?;
+    SystemGatewayServiceBackend::new()
+        .stop_checked()
+        .map_err(GatewayLifecycleError::lifecycle)
 }
 
 struct SystemGatewayServiceBackend {
@@ -181,6 +295,27 @@ impl SystemGatewayServiceBackend {
         )
         .map(|_| ())
         .map_err(|error| format!("{program} service command failed: {error}"))
+    }
+
+    // Explicit lifecycle commands must not use install/uninstall's best-effort cleanup.
+    fn stop_checked(&self) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        return self.command_checked(
+            "systemctl",
+            &["--user".into(), "stop".into(), SYSTEMD_SERVICE.into()],
+        );
+        #[cfg(target_os = "macos")]
+        return launchd_stop_with(
+            &format!("gui/{}/{}", current_uid(), LAUNCHD_LABEL),
+            launchd_command,
+        );
+        #[cfg(target_os = "windows")]
+        return self.command_checked(
+            "schtasks.exe",
+            &["/End".into(), "/TN".into(), WINDOWS_TASK_NAME.into()],
+        );
+        #[allow(unreachable_code)]
+        Err("unsupported Gateway service platform".into())
     }
 }
 
@@ -299,26 +434,7 @@ impl GatewayServiceBackend for SystemGatewayServiceBackend {
     }
 
     fn stop(&mut self) -> Result<(), String> {
-        #[cfg(target_os = "linux")]
-        return ignore_absent(self.command_checked(
-            "systemctl",
-            &["--user".into(), "stop".into(), SYSTEMD_SERVICE.into()],
-        ));
-        #[cfg(target_os = "macos")]
-        return ignore_absent(self.command_checked(
-            "launchctl",
-            &[
-                "bootout".into(),
-                format!("gui/{}/{}", current_uid(), LAUNCHD_LABEL),
-            ],
-        ));
-        #[cfg(target_os = "windows")]
-        return ignore_absent(self.command_checked(
-            "schtasks.exe",
-            &["/End".into(), "/TN".into(), WINDOWS_TASK_NAME.into()],
-        ));
-        #[allow(unreachable_code)]
-        Ok(())
+        ignore_absent(self.stop_checked())
     }
 
     fn disable(&mut self) -> Result<(), String> {
@@ -371,7 +487,7 @@ impl GatewayServiceBackend for SystemGatewayServiceBackend {
 
 pub fn systemd_unit(spec: &GatewayServiceSpec) -> String {
     format!(
-        "[Unit]\nDescription=Egregore Nexus Gateway\nRequires=nexus-daemon.service\nAfter=nexus-daemon.service\n\n[Service]\nType=simple\nExecStart={}\nEnvironment={}\nEnvironment=NEXUS_GATEWAY_DISCOVERY=write\nRestart=on-failure\nRestartSec=2\nStandardOutput={}\nStandardError={}\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Egregore Nexus Gateway\nRequires=nexus-daemon.service\nAfter=nexus-daemon.service\nPartOf=nexus-daemon.service\n\n[Service]\nType=simple\nExecStart={}\nEnvironment={}\nEnvironment=NEXUS_GATEWAY_DISCOVERY=write\nRestart=on-failure\nRestartSec=2\nStandardOutput={}\nStandardError={}\n\n[Install]\nWantedBy=default.target\n",
         systemd_quote(&spec.executable),
         systemd_quote_value(&format!("NEXUS_HOME={}", spec.home.display())),
         systemd_quote_value(&format!("append:{}", spec.log.display())),

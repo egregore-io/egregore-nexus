@@ -220,6 +220,23 @@ pub fn profile() -> NativeModelReportingProfile {
         ModelEvidenceCapability::Supported,
     )
     .unwrap()
+    .with_telemetry(nexus_agent::adapter::AdapterTelemetryReportingProfile::new(
+        nexus_agent::adapter::AdapterTelemetryCapability::new(
+            ModelEvidenceCapability::Supported,
+            Some(ModelObservationSource::new("claude.transcript.assistant.usage").unwrap()),
+        )
+        .unwrap(),
+        nexus_agent::adapter::AdapterTelemetryCapability::new(
+            ModelEvidenceCapability::Unverified,
+            None,
+        )
+        .unwrap(),
+        nexus_agent::adapter::AdapterTelemetryCapability::new(
+            ModelEvidenceCapability::Unverified,
+            None,
+        )
+        .unwrap(),
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +245,7 @@ pub struct ClaudeResponseModel {
     pub native_message_id: String,
     pub model: Result<Option<String>, ModelInvalidReason>,
     pub native_reported_at: Option<i64>,
+    pub usage: Option<super::response_usage::ClaudeResponseUsage>,
 }
 
 impl ClaudeResponseModel {
@@ -324,5 +342,6 @@ pub fn parse_response_model(value: &Value) -> Option<ClaudeResponseModel> {
         native_message_id: id.into(),
         model,
         native_reported_at,
+        usage: super::response_usage::parse(value, message),
     })
 }

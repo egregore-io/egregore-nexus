@@ -1066,7 +1066,37 @@ async fn observed_prompt_requires_native_user_message_receipt_before_success() {
 
 #[tokio::test]
 async fn prompt_returns_after_acceptance_and_holds_boundary_until_turn_completion() {
-    let dir = tempdir("prompt-accepted");
+    assert_prompt_acceptance_completion_gate(true).await;
+}
+
+#[tokio::test]
+async fn prompt_missing_completion_does_not_release_accepted_boundary() {
+    assert_prompt_acceptance_completion_gate(false).await;
+}
+
+async fn assert_prompt_acceptance_completion_gate(emit_completion: bool) {
+    // These are deadlock watchdogs, not acceptance/completion latency requirements.
+    // The post-reply rendezvous proves ordering independently of machine load.
+    const WATCHDOG: Duration = Duration::from_secs(10);
+    let dir = tempdir(if emit_completion {
+        "prompt-accepted"
+    } else {
+        "prompt-missing-completion"
+    });
+    let entered = dir.join("notifications-entered");
+    let release = dir.join("notifications-release");
+    let mut script = vec![serde_json::json!({
+        "method": "item/agentMessage/delta",
+        "params": {
+            "delta": "hello", "threadId": "THREAD_ID", "turnId": "t1", "itemId": "i1"
+        }
+    })];
+    if emit_completion {
+        script.push(serde_json::json!({
+            "method": "turn/completed",
+            "params": {"threadId": "THREAD_ID", "turnId": "t1"}
+        }));
+    }
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
@@ -1076,7 +1106,19 @@ async fn prompt_returns_after_acceptance_and_holds_boundary_until_turn_completio
         cwd: None,
         env: vec![
             ("FAKE_CODEX_REPLY_BEFORE_NOTIFICATIONS".into(), "1".into()),
-            ("FAKE_CODEX_NOTIFICATION_DELAY_MS".into(), "1000".into()),
+            (
+                "FAKE_CODEX_SCRIPT".into(),
+                serde_json::to_string(&script).unwrap(),
+            ),
+            (
+                "FAKE_CODEX_NOTIFICATION_ENTERED".into(),
+                entered.to_string_lossy().into_owned(),
+            ),
+            (
+                "FAKE_CODEX_NOTIFICATION_RELEASE".into(),
+                release.to_string_lossy().into_owned(),
+            ),
+            ("FAKE_CODEX_TRACE_TURN".into(), "1".into()),
         ],
     })
     .await
@@ -1095,38 +1137,114 @@ async fn prompt_returns_after_acceptance_and_holds_boundary_until_turn_completio
     let session = SessionId("s_codex_prompt_wait".into());
     let transport = CodexAppServerTransport::new();
     transport.bind(session.clone(), client.clone(), thread);
+    let sink = Arc::new(RecSink::default());
     let forwarder = spawn_codex_forwarder(
         session.clone(),
         client,
-        Arc::new(NullSink),
+        sink.clone(),
         Arc::new(AutoApprove),
         transport.turn_tracker(),
     );
 
-    tokio::time::timeout(
-        Duration::from_millis(250),
-        transport.prompt(&session, "direct operator prompt".to_string()),
-    )
-    .await
-    .expect("prompt should return after turn/start acceptance, not turn completion")
-    .expect("prompt should succeed once Codex accepts the turn");
+    let acceptance = tokio::time::timeout(WATCHDOG, async {
+        // Poll both futures: observing the gate must not prevent the prompt from
+        // being sent, and returning acceptance must not release notifications.
+        let (prompt, ()) = tokio::join!(
+            transport.prompt(&session, "direct operator prompt".to_string()),
+            async {
+                let mut poll = tokio::time::interval(Duration::from_millis(5));
+                while !entered.exists() {
+                    poll.tick().await;
+                }
+            }
+        );
+        prompt
+    })
+    .await;
+    assert!(
+        matches!(&acceptance, Ok(Ok(()))),
+        "post-reply notification gate must be entered and prompt accepted while held; result={acceptance:?}; entered={}; observation={:?}; fake_trace={}",
+        entered.exists(),
+        transport.observe_turn(&session),
+        std::fs::read_to_string(dir.join("app-server.stderr.log")).unwrap_or_default(),
+    );
+    assert!(!release.exists(), "notifications must still be held");
 
     assert_eq!(
         transport.active_turn_sessions(),
         vec![session.clone()],
         "accepted direct prompts must hold later prompt rows at the native turn boundary"
     );
+    let accepted = transport.observe_turn(&session);
+    assert_eq!(accepted.state, nexus_contracts::TurnState::NativeOpen);
+    let accepted_stamp = accepted
+        .stamp
+        .expect("accepted turn must have an owner stamp");
+    assert!(
+        sink.0.lock().await.is_empty(),
+        "no notifications before release"
+    );
+    std::fs::write(&release, b"release").expect("release native notifications");
 
-    tokio::time::timeout(Duration::from_secs(3), async {
+    // Prove the released native stream is flowing even in the missing-terminal
+    // control. A blocked reader or entirely absent script must fail here, not
+    // pass merely because the accepted boundary stays open.
+    let arrival = tokio::time::timeout(WATCHDOG, async {
+        let mut poll = tokio::time::interval(Duration::from_millis(5));
         loop {
-            if transport.active_turn_sessions().is_empty() {
+            if sink.0.lock().await.iter().any(|event| {
+                matches!(
+                    event,
+                    WsEvent::AgentUpdate { session_id, kind: AgentUpdateKind::Text, data }
+                        if session_id == &session && data["text"].as_str() == Some("hello")
+                )
+            }) {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            poll.tick().await;
         }
     })
-    .await
-    .expect("turn completion should release the durable prompt boundary");
+    .await;
+    assert!(
+        arrival.is_ok(),
+        "released native Text hello must arrive for the captured session before testing terminal closure; emit_completion={emit_completion}; observation={:?}; forwarder_finished={}; fake_trace={}",
+        transport.observe_turn(&session),
+        forwarder.is_finished(),
+        std::fs::read_to_string(dir.join("app-server.stderr.log")).unwrap_or_default(),
+    );
+
+    // Both the positive and missing-terminal control use this exact predicate.
+    // A lost binding/disconnect must not masquerade as successful completion.
+    let completion = tokio::time::timeout(WATCHDOG, async {
+        let mut poll = tokio::time::interval(Duration::from_millis(5));
+        loop {
+            let observed = transport.observe_turn(&session);
+            if observed.state == nexus_contracts::TurnState::VerifiedIdle
+                && observed.stamp.as_ref().is_some_and(|stamp| {
+                    stamp.owner == accepted_stamp.owner && stamp.revision > accepted_stamp.revision
+                })
+                && transport.active_turn_sessions().is_empty()
+            {
+                break;
+            }
+            poll.tick().await;
+        }
+    })
+    .await;
+    assert!(
+        completion.is_ok() == emit_completion,
+        "only native turn completion should release the durable prompt boundary; emit_completion={emit_completion}; observation={:?}; active={:?}; forwarder_finished={}; fake_trace={}",
+        transport.observe_turn(&session),
+        transport.active_turn_sessions(),
+        forwarder.is_finished(),
+        std::fs::read_to_string(dir.join("app-server.stderr.log")).unwrap_or_default(),
+    );
+    if !emit_completion {
+        let observed = transport.observe_turn(&session);
+        assert_eq!(observed.state, nexus_contracts::TurnState::NativeOpen);
+        assert_eq!(observed.stamp.as_ref(), Some(&accepted_stamp));
+        assert_eq!(transport.active_turn_sessions(), vec![session.clone()]);
+    }
 
     forwarder.abort();
     srv.shutdown().await;

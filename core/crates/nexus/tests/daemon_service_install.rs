@@ -19,6 +19,39 @@ fn nexus() -> Command {
     Command::new(env!("CARGO_BIN_EXE_nexus"))
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn self_daemon_stop_does_not_require_an_external_kill_program() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("nexus");
+    fs::create_dir_all(&home).unwrap();
+    let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    fs::write(home.join("daemon.pid"), child.id().to_string()).unwrap();
+    let output = nexus()
+        .args(["daemon", "stop"])
+        .env("PATH", root.path().join("no-programs"))
+        .env("HOME", root.path())
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("NEXUS_HOME", &home)
+        .env_remove("NEXUS_NAME")
+        .env_remove("NEXUS_CLIENT_KEY")
+        .env_remove("NEXUS_SESSION_ID")
+        .output()
+        .unwrap();
+    let was_stopped = child.try_wait().unwrap().is_some();
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        was_stopped,
+        "the captured child must actually receive the stop signal"
+    );
+}
+
 #[test]
 fn daemon_install_and_uninstall_are_the_canonical_service_commands() {
     let install = nexus()
@@ -60,10 +93,15 @@ fn windows_install_plan_is_user_scoped_and_restarts_failures() {
     assert!(script.contains("New-ScheduledTaskAction"));
     assert!(script.contains(r"C:\Users\nexus-user\AppData\Roaming\npm\nexus.exe"));
     assert!(script.contains("daemon run"));
+    assert!(script.contains("2>&1 | Out-File -LiteralPath"));
+    assert!(script.contains("daemon.log"));
+    assert!(script.contains("-Append -Encoding utf8"));
+    assert!(script.contains("exit $LASTEXITCODE"));
     assert!(script.contains(r"C:\Users\nexus-user\.nexus"));
     assert!(script.contains("New-ScheduledTaskTrigger -AtLogOn"));
     assert!(script.contains("-RestartCount 999"));
-    assert!(script.contains("-RestartInterval"));
+    // Task Scheduler rejects sub-minute RestartOnFailure intervals at registration.
+    assert!(script.contains("-RestartInterval (New-TimeSpan -Minutes 1)"));
     assert!(script.contains("-RunLevel Limited"));
     assert!(script.contains("Register-ScheduledTask"));
     assert!(!script.contains("RunLevel Highest"));

@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, type SpawnOptionsWithoutStdio } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -15,12 +15,17 @@ import { promisify } from "node:util";
 import { createClient } from "@libsql/client";
 import WebSocket, { type RawData } from "ws";
 import { afterEach, describe, expect, it } from "vitest";
+import { collectClosedSqliteHandles } from "../../../test-fixtures/closedSqliteHandles";
 
 const execFileAsync = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const temporaryRoots: string[] = [];
+const npmProgram = process.platform === "win32" ? process.execPath : "npm";
+const npmArgs = process.platform === "win32"
+  ? [join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js")] : [];
 
 afterEach(async () => {
+  await collectClosedSqliteHandles();
   await Promise.all(
     temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })),
   );
@@ -79,34 +84,32 @@ async function installPackedGateway(temporaryRoot: string): Promise<PackedInstal
     );
   }
   await execFileAsync(
-    join(root, "node_modules", ".bin", "esbuild"),
+    process.execPath,
     [
-      "src/server/gateway/headless.ts",
-      "--bundle",
-      "--platform=node",
-      "--format=esm",
-      "--target=node20",
-      "--packages=external",
-      `--outfile=${join(stage, "dist-gateway", "headless.mjs")}`,
+      "--eval", 'require("esbuild").buildSync(JSON.parse(process.argv[1]))',
+      JSON.stringify({ entryPoints: ["src/server/gateway/headless.ts"], bundle: true,
+        platform: "node", format: "esm", target: "node20", packages: "external",
+        outfile: join(stage, "dist-gateway", "headless.mjs") }),
     ],
     { cwd: root, timeout: 60_000 },
   );
   const packed = await execFileAsync(
-    "npm",
-    ["pack", "--ignore-scripts", "--json", "--pack-destination", packs],
+    npmProgram,
+    [...npmArgs, "pack", "--ignore-scripts", "--json", "--pack-destination", packs],
     { cwd: stage, timeout: 60_000 },
   );
   const [{ filename }] = JSON.parse(packed.stdout) as [{ filename: string }];
   const cliPacked = await execFileAsync(
-    "npm",
-    ["pack", "--ignore-scripts", "--json", "--pack-destination", packs],
+    npmProgram,
+    [...npmArgs, "pack", "--ignore-scripts", "--json", "--pack-destination", packs],
     { cwd: resolve(root, "../packages/nexus-cli"), timeout: 60_000 },
   );
   const [{ filename: cliFilename }] = JSON.parse(cliPacked.stdout) as [{ filename: string }];
-  await execFileAsync("npm", ["init", "-y"], { cwd: installRoot, timeout: 30_000 });
+  await execFileAsync(npmProgram, [...npmArgs, "init", "-y"], { cwd: installRoot, timeout: 30_000 });
   await execFileAsync(
-    "npm",
+    npmProgram,
     [
+      ...npmArgs,
       "install",
       "--ignore-scripts",
       "--no-audit",
@@ -124,7 +127,7 @@ async function installPackedGateway(temporaryRoot: string): Promise<PackedInstal
   return {
     foreignCwd,
     packageRoot,
-    gatewayBin: join(installRoot, "node_modules", ".bin", "nexus-gateway"),
+    gatewayBin: join(packageRoot, "scripts", "nexus-gateway.mjs"),
   };
 }
 
@@ -135,19 +138,18 @@ async function exerciseConcurrentPackedInitialization(
   const nexusHome = join(temporaryRoot, "concurrent-home", ".nexus");
   const url = `file:${join(nexusHome, "gateway.db")}`;
   await mkdir(nexusHome, { recursive: true });
-  const headless = (await import(
-    `${pathToFileURL(join(installed.packageRoot, "dist-gateway", "headless.mjs")).href}` +
-      `?packed-concurrent=${Date.now()}`
-  )) as {
-    migrateHeadlessGatewayStore(env: NodeJS.ProcessEnv): Promise<{ schemaVersion: number }>;
-  };
   const lock = await holdExclusiveStoreLock(url);
   const startedAt = Date.now();
   try {
-    await expect(headless.migrateHeadlessGatewayStore({
-      ...process.env,
-      NEXUS_GATEWAY_DB: url,
-    })).resolves.toEqual({ schemaVersion: expect.any(Number) });
+    // Load the installed native addon in an owned child. Windows holds a loaded
+    // .node DLL until process exit, even after every DB/statement is closed.
+    const result = await execFileAsync(process.execPath, [
+      "--input-type=module", "--eval",
+      'const { migrateHeadlessGatewayStore } = await import(process.argv[1]); ' +
+      'console.log(JSON.stringify(await migrateHeadlessGatewayStore()));',
+      pathToFileURL(join(installed.packageRoot, "dist-gateway", "headless.mjs")).href,
+    ], { env: isolatedEnv({ NEXUS_GATEWAY_DB: url }), timeout: 30_000 });
+    expect(JSON.parse(result.stdout)).toEqual({ schemaVersion: expect.any(Number) });
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(250);
   } finally {
     await lock.exit;
@@ -209,7 +211,7 @@ async function exerciseLocalFacet(
   const port = await reservePort();
   const discovery = join(nexusHome, "gateway.json");
   const ipc = await startDaemonIpcFixture(nexusHome);
-  const child = spawn(installed.gatewayBin, [], {
+  const child = spawnGateway(installed.gatewayBin, {
     cwd: installed.foreignCwd,
     env: isolatedEnv({
       HOME: home,
@@ -220,7 +222,6 @@ async function exerciseLocalFacet(
       NEXUS_GATEWAY_CLOSE_TIMEOUT_MS: "1000",
       NEXUS_WEB_AUTH_MODE: "local-operator",
     }),
-    stdio: ["ignore", "pipe", "pipe"],
   });
   const sockets: WebSocket[] = [];
   try {
@@ -286,7 +287,7 @@ async function exerciseRemotePackedLanes(
   const cookie = `nexus_human=human-packed; nexus_csrf=${csrfToken}`;
   const bearerToken = "nx_at_packed_bearer";
   try {
-    await execFileAsync(installed.gatewayBin, ["--migrate-only"], {
+    await execFileAsync(process.execPath, [installed.gatewayBin, "--migrate-only"], {
       cwd: installed.foreignCwd,
       env,
       timeout: 30_000,
@@ -413,10 +414,9 @@ async function exerciseRemotePackedLanes(
       seed.close();
     }
 
-    child = spawn(installed.gatewayBin, [], {
+    child = spawnGateway(installed.gatewayBin, {
       cwd: installed.foreignCwd,
       env,
-      stdio: ["ignore", "pipe", "pipe"],
     });
     try {
       // Health is the unauthenticated startup/readiness contract even when the
@@ -1029,10 +1029,27 @@ function isolatedEnv(overrides: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return { ...env, ...overrides };
 }
 
+function spawnGateway(entry: string, options: SpawnOptionsWithoutStdio) {
+  // Windows child.kill(SIGTERM) uses TerminateProcess: it cannot exercise a JS
+  // signal handler. This fixture-only parent IPC invokes that same handler in the
+  // actual installed launcher. Native CLI/task termination is a separate gate.
+  const args = process.platform === "win32"
+    ? ["--input-type=module", "--eval",
+      'import { pathToFileURL } from "node:url"; ' +
+      'process.on("message", (message) => { if (message === "fixture-sigterm") process.emit("SIGTERM"); }); ' +
+      'await import(pathToFileURL(process.argv[1]).href);', entry]
+    : [entry];
+  return spawn(process.execPath, args, {
+    ...options,
+    stdio: process.platform === "win32" ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"],
+  });
+}
+
 async function terminateChildGracefully(child: ReturnType<typeof spawn>): Promise<void> {
   if (child.exitCode !== null) return;
   const gracefulExit = once(child, "exit");
-  child.kill("SIGTERM");
+  if (process.platform === "win32") child.send!("fixture-sigterm");
+  else child.kill("SIGTERM");
   if (await settledWithin(gracefulExit, 2_500)) return;
   const forcedExit = once(child, "exit");
   child.kill("SIGKILL");

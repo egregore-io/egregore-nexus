@@ -22,6 +22,11 @@
 //! turn notifications, and `FAKE_CODEX_NOTIFICATION_DELAY_MS=<ms>` delays that broadcast. Together
 //! they model the real app-server race where a `turn/start` request can return before the turn has
 //! completed.
+//! With reply-before-notifications enabled, `FAKE_CODEX_NOTIFICATION_ENTERED=<path>` and
+//! `FAKE_CODEX_NOTIFICATION_RELEASE=<path>` replace timing assumptions with a post-reply gate.
+//! The fake writes entered, then waits for release before broadcasting. Its 30-second watchdog
+//! fails closed (no notifications), and the independent outbound writer can send acceptance
+//! while the gate is held.
 //! `FAKE_CODEX_RESUME_RESPONSE=<json>` overrides the `thread/resume` result so restart tests can
 //! model a persisted in-progress native turn.
 //! `FAKE_CODEX_RESUME_DELAY_MS=<ms>` delays the `thread/resume` response so readiness tests can
@@ -103,6 +108,10 @@ fn error_frame(id: &Value, message: &str, data: Option<Value>) -> String {
     .unwrap()
 }
 
+#[path = "../../../tests/support/fake_steer_gate.rs"]
+mod steer_gate;
+use steer_gate::{steer_gate_action, SteerGateAction};
+
 /// Serve a single WebSocket connection.
 ///
 /// Runs two concurrent loops:
@@ -133,7 +142,18 @@ where
     // Spawn the writer task.
     let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
-            if ws_sink.send(Message::Text(frame.into())).await.is_err() {
+            let method = serde_json::from_str::<Value>(&frame)
+                .ok()
+                .and_then(|value| value["method"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| "reply".into());
+            let result = ws_sink.send(Message::Text(frame.into())).await;
+            if std::env::var_os("FAKE_CODEX_TRACE_TURN").is_some() {
+                eprintln!(
+                    "fake-trace {:?} write {method} result={result:?}",
+                    std::time::SystemTime::now()
+                );
+            }
+            if result.is_err() {
                 break;
             }
         }
@@ -307,6 +327,30 @@ where
 
                 if reply_before_notifications {
                     let _ = out_tx.send(response_frame(&id, json!({"turn": {"id": turn_id}})));
+                    if std::env::var_os("FAKE_CODEX_TRACE_TURN").is_some() {
+                        eprintln!(
+                            "fake-trace {:?} accepted; delay={notification_delay_ms}",
+                            std::time::SystemTime::now()
+                        );
+                    }
+                    if let Some(entered) = std::env::var_os("FAKE_CODEX_NOTIFICATION_ENTERED") {
+                        let release = std::env::var_os("FAKE_CODEX_NOTIFICATION_RELEASE")
+                            .ok_or("notification gate requires a release path")?;
+                        std::fs::write(entered, b"entered")?;
+                        tokio::time::timeout(Duration::from_secs(30), async {
+                            let mut poll = tokio::time::interval(Duration::from_millis(5));
+                            while !std::path::Path::new(&release).exists() {
+                                poll.tick().await;
+                            }
+                        })
+                        .await
+                        .map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "post-reply notification gate was not released",
+                            )
+                        })?;
+                    }
                     if notification_delay_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(notification_delay_ms)).await;
                     }
@@ -316,6 +360,14 @@ where
                 {
                     let reg = registry.lock().await;
                     let subs: Vec<_> = reg.iter().filter(|s| s.thread_id == thread_id).collect();
+                    if std::env::var_os("FAKE_CODEX_TRACE_TURN").is_some() {
+                        eprintln!(
+                            "fake-trace {:?} broadcast subscribers={} entries={}",
+                            std::time::SystemTime::now(),
+                            subs.len(),
+                            script.len()
+                        );
+                    }
 
                     for entry in script.iter() {
                         let m = entry
@@ -403,10 +455,21 @@ where
                             for tx in &targets {
                                 let _ = tx.send(busy.clone());
                             }
-                            while !std::path::Path::new(&gate).exists() {
+                            // File creation/truncation precedes command publication. Never
+                            // turn an empty/partial write into a fabricated native receipt.
+                            let action = loop {
+                                match std::fs::read(&gate) {
+                                    Ok(bytes) => {
+                                        if let Some(action) = steer_gate_action(&bytes) {
+                                            break action;
+                                        }
+                                    }
+                                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                                    Err(error) => return Err(error.into()),
+                                }
                                 tokio::time::sleep(Duration::from_millis(5)).await;
-                            }
-                            let receipt = if std::fs::read(&gate).unwrap() == b"abort" {
+                            };
+                            let receipt = if action == SteerGateAction::Abort {
                                 notification_frame(
                                     "turn/completed",
                                     &json!({

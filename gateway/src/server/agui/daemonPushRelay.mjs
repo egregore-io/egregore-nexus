@@ -146,10 +146,11 @@ export function gatewayStreamEndpointManifestPath(env = process.env) {
   return join(home, "gateway-stream-endpoint.json");
 }
 
-function createManifestDaemonPushConnection() {
+/** A separately owned connection; its subscription cursors never share the live fanout's tail. */
+export function createManifestDaemonPushConnection(deps = {}) {
   const manifestPath = gatewayStreamEndpointManifestPath();
   if (!existsSync(manifestPath)) return undefined;
-  return new DaemonPushConnection(manifestPath);
+  return new DaemonPushConnection(manifestPath, deps.readManifest);
 }
 
 class DaemonPushConnection {
@@ -160,6 +161,7 @@ class DaemonPushConnection {
   #manifest;
   #daemonBootId;
   #manifestPath;
+  #readManifest;
   #subscriptions = new Map();
   #projectionHandlers = new Set();
   #hookProvider;
@@ -167,9 +169,12 @@ class DaemonPushConnection {
   #opening = false;
   #reconnectAttempt = 0;
   #reconnectTimer;
+  #paused = false;
+  #consumeControl = () => false;
 
-  constructor(manifestPath) {
+  constructor(manifestPath, readManifest = (path) => readFile(path, "utf8")) {
     this.#manifestPath = manifestPath;
+    this.#readManifest = readManifest;
     this.ready = this.#connect().catch((error) => {
       this.#broadcastError(error);
       this.#scheduleReconnect();
@@ -245,12 +250,29 @@ class DaemonPushConnection {
     };
   }
 
+  /** Flow control for an independently owned reader; never pause the shared fanout connector. */
+  pause() {
+    if (this.#closed) return;
+    this.#paused = true;
+    this.#socket?.pause();
+  }
+
+  resume() {
+    if (this.#closed || !this.#paused) return;
+    this.#paused = false;
+    // Finish already-read framing bytes before admitting another socket chunk. A downstream
+    // callback may pause us again in the middle of this buffer.
+    this.#onData(Buffer.alloc(0));
+    if (!this.#paused && !this.#closed) this.#socket?.resume();
+  }
+
   close() {
     this.#closed = true;
     if (this.#reconnectTimer) clearTimeout(this.#reconnectTimer);
     this.#reconnectTimer = undefined;
     this.#socket?.destroy();
     this.#socket = undefined;
+    this.#buffer = Buffer.alloc(0);
     this.#subscriptions.clear();
     this.#projectionHandlers.clear();
     this.#hookProvider = undefined;
@@ -264,7 +286,8 @@ class DaemonPushConnection {
     try {
       // The daemon replaces this boot-scoped manifest on every restart. Always reread it instead of
       // retaining the old socket path/token in the long-lived gateway process.
-      const nextManifest = JSON.parse(await readFile(this.#manifestPath, "utf8"));
+      const nextManifest = JSON.parse(await this.#readManifest(this.#manifestPath));
+      if (this.#closed) return;
       const previousBoot = this.#manifest?.daemonBootId;
       if (previousBoot && nextManifest.daemonBootId && previousBoot !== nextManifest.daemonBootId) {
         for (const entry of this.#subscriptions.values()) {
@@ -288,6 +311,7 @@ class DaemonPushConnection {
   }
 
   async #openSocket() {
+    if (this.#closed) return;
     await new Promise((resolve, reject) => {
       const socket = createConnection({ path: this.#manifest.path });
       this.#socket = socket;
@@ -376,9 +400,10 @@ class DaemonPushConnection {
     this.#reconnectTimer.unref?.();
   }
 
-  #onData(chunk, consumeControl = () => false) {
+  #onData(chunk, consumeControl) {
+    if (consumeControl) this.#consumeControl = consumeControl;
     this.#buffer = Buffer.concat([this.#buffer, chunk]);
-    while (this.#buffer.length >= 4) {
+    while (!this.#paused && !this.#closed && this.#buffer.length >= 4) {
       const len = this.#buffer.readUInt32BE(0);
       if (this.#buffer.length < len + 4) return;
       const payload = this.#buffer.subarray(4, len + 4);
@@ -390,7 +415,7 @@ class DaemonPushConnection {
         this.#broadcastError(error);
         continue;
       }
-      if (!consumeControl(frame)) this.#routeFrame(frame);
+      if (!this.#consumeControl(frame)) this.#routeFrame(frame);
     }
   }
 

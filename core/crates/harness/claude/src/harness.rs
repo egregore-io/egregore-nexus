@@ -44,7 +44,8 @@ pub struct ClaudeAdapter {
 
 impl ClaudeAdapter {
     /// Configured model evidence from the adapter's ACP metadata surface. This does not
-    /// advertise per-turn/response model selection or token/context/account telemetry.
+    /// advertise per-turn/response model selection. Usage follows the pinned ACP producer's
+    /// explicit scope; context and account sources are independent capabilities.
     pub fn model_reporting_profile() -> nexus_agent::adapter::AdapterModelReportingProfile {
         use nexus_agent::adapter::{AcpModelMetadataDialect, AdapterModelReportingProfile};
         use nexus_contracts::{
@@ -59,6 +60,36 @@ impl ClaudeAdapter {
             AcpModelMetadataDialect::ConfigOptions { source },
         )
         .expect("builtin ACP reporting profile is valid")
+        .with_telemetry({
+            use nexus_agent::adapter::{
+                AcpPromptUsageScope, AdapterTelemetryCapability, AdapterTelemetryReportingProfile,
+            };
+            AdapterTelemetryReportingProfile::new(
+                AdapterTelemetryCapability::new(
+                    ModelEvidenceCapability::Supported,
+                    Some(ModelObservationSource::new("claude.acp.prompt.usage").unwrap()),
+                )
+                .unwrap(),
+                AdapterTelemetryCapability::new(
+                    ModelEvidenceCapability::Supported,
+                    Some(ModelObservationSource::new("claude.acp.usage_update").unwrap()),
+                )
+                .unwrap(),
+                AdapterTelemetryCapability::new(
+                    ModelEvidenceCapability::Supported,
+                    Some(ModelObservationSource::new("claude.acp.rate_limit.selected").unwrap()),
+                )
+                .unwrap(),
+            )
+            .with_prompt_usage(AcpPromptUsageScope::LastPrompt)
+            .expect("builtin ACP usage semantics have a captured source")
+            .with_context_usage(
+                nexus_agent::adapter::AcpContextUsageBasis::ClaudeAssistantOrCompactionProxy,
+            )
+            .expect("builtin ACP context semantics have a captured source")
+            .with_quota_dialect(nexus_agent::adapter::AcpQuotaDialect::ClaudeSelectedRateLimit)
+            .expect("builtin Claude account extension has a captured source")
+        })
     }
 
     /// Construct a Claude adapter that will spawn the **real** Claude Code ACP bridge for the

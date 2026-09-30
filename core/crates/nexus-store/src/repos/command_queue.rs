@@ -104,6 +104,33 @@ impl<'a> CommandQueue<'a> {
         Self { store }
     }
 
+    /// Read original submission evidence, without enqueueing or claiming work.
+    pub async fn snapshot_for_submission(
+        &self,
+        agent_id: &AgentId,
+        session_id: &str,
+        client_message_id: &str,
+        requester: &DaemonIpcCaller,
+    ) -> Result<CommandQueueSnapshot, NexusError> {
+        if client_message_id.trim().is_empty()
+            || client_message_id.len() > 256
+            || client_message_id.chars().any(char::is_control)
+        {
+            return Err(NexusError::Invalid(
+                "invalid original client message id".into(),
+            ));
+        }
+        self.snapshot_selected(
+            None,
+            Some(agent_id),
+            Some(session_id),
+            &[],
+            Some(requester),
+            Some(client_message_id),
+        )
+        .await
+    }
+
     /// Hydrate one daemon-owned session queue without exposing the raw store over IPC.
     pub async fn snapshot_with_active_sessions(
         &self,
@@ -123,6 +150,26 @@ impl<'a> CommandQueue<'a> {
         expected_session_id: Option<&str>,
         active_sessions: &[SessionId],
         requester: Option<&DaemonIpcCaller>,
+    ) -> Result<CommandQueueSnapshot, NexusError> {
+        self.snapshot_selected(
+            name,
+            agent_id,
+            expected_session_id,
+            active_sessions,
+            requester,
+            None,
+        )
+        .await
+    }
+
+    async fn snapshot_selected(
+        &self,
+        name: Option<&str>,
+        agent_id: Option<&AgentId>,
+        expected_session_id: Option<&str>,
+        active_sessions: &[SessionId],
+        requester: Option<&DaemonIpcCaller>,
+        client_message_id: Option<&str>,
     ) -> Result<CommandQueueSnapshot, NexusError> {
         let target = QueueTarget {
             name: name.map(str::trim).filter(|name| !name.is_empty()),
@@ -159,7 +206,14 @@ impl<'a> CommandQueue<'a> {
             target_runtime(self.store, target, active_sessions).await?
         };
         let seq = latest_queue_seq_store(self.store).await?;
-        let mut commands = queue_entries(self.store, target, runtime.session_id.as_deref()).await?;
+        let mut commands = queue_entries(
+            self.store,
+            target,
+            runtime.session_id.as_deref(),
+            client_message_id,
+            requester,
+        )
+        .await?;
         for command in &mut commands {
             command.correlation_owned =
                 Some(correlation_owned(self.store, &command.command_id, requester).await?);
@@ -455,6 +509,8 @@ async fn queue_entries(
     store: &Store,
     target: QueueTarget<'_>,
     session_id: Option<&str>,
+    client_message_id: Option<&str>,
+    requester: Option<&DaemonIpcCaller>,
 ) -> Result<Vec<CommandQueueEntry>, NexusError> {
     let has_agent_id = i64::from(target.agent_id.is_some());
     let has_session_id = i64::from(session_id.is_some());
@@ -465,7 +521,8 @@ async fn queue_entries(
              claimed_at, started_at, completed_at, COALESCE((SELECT MAX(seq) \
              FROM command_intent_events e WHERE e.command_id = command_intents.command_id), 0), \
              (SELECT session_id FROM command_intent_events e WHERE e.command_id = command_intents.command_id ORDER BY seq LIMIT 1) \
-             FROM command_intents WHERE kind IN (?1, ?2) AND ( \
+             FROM command_intents WHERE kind IN (?1, ?2) \
+             AND (?8 IS NULL OR json_extract(request_json, '$.clientMessageId') = ?8) AND ( \
                (?3 = 1 AND json_extract(request_json, '$.agentId') = ?4) OR \
                (?3 = 0 AND json_extract(request_json, '$.agentId') IS NULL \
                   AND json_extract(request_json, '$.name') = ?5) OR \
@@ -480,7 +537,8 @@ async fn queue_entries(
                 target.agent_id.unwrap_or(""),
                 target.name.unwrap_or(""),
                 has_session_id,
-                session_id.unwrap_or("")
+                session_id.unwrap_or(""),
+                client_message_id
             ],
         )
         .await
@@ -493,6 +551,16 @@ async fn queue_entries(
             command_session_binding(store, &request, get_opt_text(&row, 11)?.as_deref()).await?;
         if binding.as_deref() != session_id || binding.is_none() {
             continue;
+        }
+        if client_message_id.is_some()
+            && !correlation_owned(store, &get_text(&row, 0)?, requester).await?
+        {
+            continue;
+        }
+        if client_message_id.is_some() && !entries.is_empty() {
+            return Err(NexusError::Invalid(
+                "original client message id has conflicting durable commands".into(),
+            ));
         }
         let status = get_text(&row, 2)?;
         let started_at = get_opt_int(&row, 8)?;

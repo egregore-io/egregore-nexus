@@ -149,7 +149,12 @@ pub async fn forward_once_with_observations(
         .map(|(value, _)| value)
         .collect();
 
-    let (transcript_path, transcript_start_cursor, transcript_rebound) = resolve_transcript_tail(
+    let ResolvedTail {
+        transcript_path,
+        start_cursor: transcript_start_cursor,
+        rebound: transcript_rebound,
+        owned_sessions,
+    } = resolve_transcript_tail(
         &repo,
         &session,
         state_ref,
@@ -161,6 +166,11 @@ pub async fn forward_once_with_observations(
     if transcript_rebound {
         producer_ids.clear_runtime(&session.0).await?;
     }
+    // The bridge belongs to the runtime. Records that name a Claude session this runtime never
+    // started are stray and are dropped; they never stall the owner's stream.
+    let (hook_values, hook_records) =
+        retain_owned_hooks(hook_values, hook_records, &owned_sessions);
+    let message_values = retain_owned_values(message_values, &owned_sessions);
     count_hook_session_starts(&hook_values, &mut stats);
     emit_hook_user_inputs(
         &session,
@@ -270,6 +280,20 @@ fn string_from(value: &Value, fields: &[&str]) -> Option<String> {
         .map(str::to_string)
 }
 
+/// What one forward pass follows: the transcript to tail, where to start in it, whether the
+/// runtime moved to a new Claude session, and which Claude session ids this runtime owns.
+struct ResolvedTail {
+    transcript_path: PathBuf,
+    start_cursor: i64,
+    rebound: bool,
+    owned_sessions: Vec<String>,
+}
+
+/// Ownership of the bridge belongs to the runtime. Claude's own session id is a
+/// field on each record, not the owner: a `SessionStart` naming a new id (a resume, fork or
+/// `/clear`) moves the runtime forward to that session; records naming any id the runtime never
+/// started are stray. Only a batch that names several ids while nothing is known yet cannot be
+/// ordered, and that one case stays fail-closed.
 async fn resolve_transcript_tail(
     repo: &ClaudeRuntimeStateRepo<'_>,
     session: &SessionId,
@@ -277,124 +301,194 @@ async fn resolve_transcript_tail(
     paths: &ClaudeNativeBridgePaths,
     message_values: &[Value],
     hook_values: &[Value],
-) -> Result<(PathBuf, i64, bool), NexusError> {
+) -> Result<ResolvedTail, NexusError> {
     let default_path = default_transcript_path(paths);
     let stored_path = state
         .and_then(|state| state.transcript_path.clone())
         .unwrap_or_else(|| default_path.clone());
-    let mut discovered = latest_transcript_path(message_values)
-        .or_else(|| latest_transcript_path(hook_values))
-        .map(PathBuf::from);
-    let mut discovered_session_ids = distinct_claude_session_ids(message_values, hook_values);
-    if discovered_session_ids.len() > 1 {
-        return Err(NexusError::Ambiguous(format!(
-            "mixed native Claude session ids in one bridge batch: {}",
-            discovered_session_ids.join(", ")
-        )));
-    }
-    let batch_discovered_session_id = discovered_session_ids.first().cloned();
+    let stored_session = state.and_then(|state| state.claude_session_id.clone());
 
-    if should_reconcile_from_full_hook_log(
-        state,
-        &stored_path,
-        batch_discovered_session_id.as_deref(),
-    ) {
-        let (all_hook_values, _) = read_new_json_values(&paths.hook_log_path, 0)?;
-        let hook_session_ids = distinct_claude_session_ids(&[], &all_hook_values);
-        if hook_session_ids.len() > 1 {
-            return Err(NexusError::Ambiguous(format!(
-                "mixed native Claude session ids in bridge hook log: {}",
-                hook_session_ids.join(", ")
-            )));
-        }
-        if let Some(hook_session_id) = hook_session_ids.first() {
-            match discovered_session_ids.first() {
-                Some(batch_session_id) if batch_session_id != hook_session_id => {
+    let mut current_session = match last_session_start_id(hook_values) {
+        Some(started) => Some(started),
+        None => match stored_session.clone() {
+            Some(stored) => Some(stored),
+            None => {
+                let discovered = distinct_claude_session_ids(message_values, hook_values);
+                if discovered.len() > 1 {
                     return Err(NexusError::Ambiguous(format!(
-                        "native Claude session id changed between bridge batch ({batch_session_id}) and full hook log ({hook_session_id})"
+                        "mixed native Claude session ids in one bridge batch: {}",
+                        discovered.join(", ")
                     )));
                 }
-                Some(_) => {}
-                None => discovered_session_ids.push(hook_session_id.clone()),
+                discovered.into_iter().next()
+            }
+        },
+    };
+
+    // A batch that names only sessions the runtime does not know, without a `SessionStart`,
+    // means the start was consumed before its id was persisted. The full hook log is the
+    // runtime's own record: its latest `SessionStart` decides.
+    let batch_ids = distinct_claude_session_ids(message_values, hook_values);
+    let stored_transcript_missing = !stored_path.exists();
+    let batch_disowns_current = !batch_ids.is_empty()
+        && current_session
+            .as_deref()
+            .is_some_and(|current| !batch_ids.iter().any(|id| id == current));
+    let mut discovered_path = current_session
+        .as_deref()
+        .and_then(|current| latest_transcript_path_for(message_values, hook_values, current))
+        .map(PathBuf::from);
+    if stored_transcript_missing || batch_disowns_current {
+        let (all_hook_values, _) = read_new_json_values(&paths.hook_log_path, 0)?;
+        if let Some(latest_started) = last_session_start_id(&all_hook_values) {
+            if current_session.as_deref() != Some(latest_started.as_str()) {
+                current_session = Some(latest_started);
+                discovered_path = None;
             }
         }
-        if discovered.is_none() && !discovered_session_ids.is_empty() {
-            discovered = latest_transcript_path(&all_hook_values).map(PathBuf::from);
+        if discovered_path.is_none() {
+            discovered_path = current_session
+                .as_deref()
+                .and_then(|current| latest_transcript_path_for(&[], &all_hook_values, current))
+                .map(PathBuf::from);
         }
     }
-    let discovered_session_id = discovered_session_ids.first().map(String::as_str);
-    let session_rebound = discovered_session_id
-        .zip(state.and_then(|value| value.claude_session_id.as_deref()))
-        .is_some_and(|(discovered, stored)| discovered != stored);
 
-    if let Some(claude_session_id) = discovered_session_id {
-        repo.set_claude_session(session, claude_session_id, discovered.clone())
+    let rebound = current_session
+        .as_deref()
+        .zip(stored_session.as_deref())
+        .is_some_and(|(current, stored)| current != stored);
+    let mut owned_sessions = Vec::new();
+    if let Some(stored) = stored_session.clone() {
+        owned_sessions.push(stored);
+    }
+    if let Some(current) = current_session.clone() {
+        if !owned_sessions.contains(&current) {
+            owned_sessions.push(current);
+        }
+    }
+
+    if let Some(claude_session_id) = current_session.as_deref() {
+        repo.set_claude_session(session, claude_session_id, discovered_path.clone())
             .await?;
     }
 
-    let Some(discovered_path) = discovered else {
-        return Ok((
-            stored_path,
-            cursor(state, CursorKind::Transcript),
-            session_rebound,
-        ));
+    let Some(discovered_path) = discovered_path else {
+        return Ok(ResolvedTail {
+            transcript_path: stored_path,
+            start_cursor: cursor(state, CursorKind::Transcript),
+            rebound,
+            owned_sessions,
+        });
     };
 
     if discovered_path == stored_path {
-        return Ok((
-            discovered_path,
-            cursor(state, CursorKind::Transcript),
-            session_rebound,
-        ));
+        return Ok(ResolvedTail {
+            transcript_path: discovered_path,
+            start_cursor: cursor(state, CursorKind::Transcript),
+            rebound,
+            owned_sessions,
+        });
     }
 
+    // A new transcript file (first discovery, or a fork that copied the history) starts at its
+    // current end: what it already holds was either forwarded from the previous file or never
+    // this runtime's live output.
     let start_cursor = transcript_end_offset(&discovered_path)?;
     repo.set_transcript_path_and_cursor(session, discovered_path.clone(), start_cursor)
         .await?;
-    Ok((discovered_path, start_cursor, true))
+    Ok(ResolvedTail {
+        transcript_path: discovered_path,
+        start_cursor,
+        rebound: true,
+        owned_sessions,
+    })
 }
 
-fn should_reconcile_from_full_hook_log(
-    state: Option<&ClaudeRuntimeState>,
-    stored_path: &Path,
-    discovered_session_id: Option<&str>,
-) -> bool {
-    let Some(state) = state else {
-        return false;
+/// The Claude session id named by the latest `SessionStart` hook in `hook_values`, if any.
+fn last_session_start_id(hook_values: &[Value]) -> Option<String> {
+    hook_values.iter().rev().find_map(|value| {
+        if hook_event_name(value).as_deref() != Some("SessionStart") {
+            return None;
+        }
+        parse_transcript_value(value)
+            .and_then(|record| record.session_id)
+            .filter(|id| !id.is_empty())
+    })
+}
+
+fn record_session_id(value: &Value) -> Option<String> {
+    parse_message_display_value(value)
+        .and_then(|delta| delta.session_id)
+        .or_else(|| parse_transcript_value(value).and_then(|record| record.session_id))
+        .filter(|session| !session.is_empty())
+}
+
+/// The latest transcript path named by a record of `session_id`, searching message deltas
+/// first and hook records second, newest first.
+fn latest_transcript_path_for(
+    message_values: &[Value],
+    hook_values: &[Value],
+    session_id: &str,
+) -> Option<String> {
+    let path_of = |value: &Value| {
+        (record_session_id(value).as_deref() == Some(session_id))
+            .then(|| {
+                parse_message_display_value(value)
+                    .and_then(|delta| delta.transcript_path)
+                    .or_else(|| {
+                        parse_transcript_value(value).and_then(|record| record.transcript_path)
+                    })
+            })
+            .flatten()
+            .filter(|path| !path.is_empty())
     };
-    let stored_transcript_missing = !stored_path.exists();
-    let hook_disagrees = discovered_session_id
-        .zip(state.claude_session_id.as_deref())
-        .is_some_and(|(discovered, stored)| discovered != stored);
-    stored_transcript_missing || hook_disagrees
-}
-
-fn latest_transcript_path(values: &[Value]) -> Option<String> {
-    values
+    message_values
         .iter()
         .rev()
-        .find_map(|value| {
-            parse_message_display_value(value)
-                .and_then(|delta| delta.transcript_path)
-                .or_else(|| parse_transcript_value(value).and_then(|record| record.transcript_path))
-        })
-        .filter(|path| !path.is_empty())
+        .find_map(path_of)
+        .or_else(|| hook_values.iter().rev().find_map(path_of))
 }
 
 fn distinct_claude_session_ids(message_values: &[Value], hook_values: &[Value]) -> Vec<String> {
     let mut out = Vec::new();
     for value in message_values.iter().chain(hook_values) {
-        let session_id = parse_message_display_value(value)
-            .and_then(|delta| delta.session_id)
-            .or_else(|| parse_transcript_value(value).and_then(|record| record.session_id));
-        let Some(session_id) = session_id.filter(|session| !session.is_empty()) else {
+        let Some(session_id) = record_session_id(value) else {
             continue;
         };
-        if !out.iter().any(|existing| existing == &session_id) {
+        if !out.contains(&session_id) {
             out.push(session_id);
         }
     }
     out
+}
+
+/// Keep hook records (and their parsed provenance, index-aligned) that carry no Claude session
+/// id or one this runtime owns.
+fn retain_owned_hooks(
+    values: Vec<Value>,
+    records: Vec<ClaudeHookRecord>,
+    owned: &[String],
+) -> (Vec<Value>, Vec<ClaudeHookRecord>) {
+    values
+        .into_iter()
+        .zip(records)
+        .filter(|(value, _)| is_owned_record(value, owned))
+        .unzip()
+}
+
+fn retain_owned_values(values: Vec<Value>, owned: &[String]) -> Vec<Value> {
+    values
+        .into_iter()
+        .filter(|value| is_owned_record(value, owned))
+        .collect()
+}
+
+fn is_owned_record(value: &Value, owned: &[String]) -> bool {
+    match record_session_id(value) {
+        Some(session_id) => owned.iter().any(|id| *id == session_id),
+        None => true,
+    }
 }
 
 async fn emit_message_deltas(

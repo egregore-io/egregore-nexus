@@ -1037,8 +1037,319 @@ async fn after_tool_loop_waits_for_authoritative_final_completion_before_injecti
     assert_eq!(turn_exec.injected.lock().unwrap().len(), 1);
 }
 
+/// An already-active native turn whose completion observer can fail without the
+/// queued bus batch ever crossing the harness boundary.
+struct UnavailableBoundaryExec {
+    session: SessionId,
+    active: AtomicBool,
+    available: AtomicBool,
+    block_wait: bool,
+    wait_gate: Notify,
+    waits: Notify,
+    wait_times: Mutex<Vec<tokio::time::Instant>>,
+    injected: Mutex<Vec<NexusBatch>>,
+}
+
+#[async_trait]
+impl AgentTurnExecutionPort for UnavailableBoundaryExec {
+    fn active_turn_sessions(&self) -> Vec<SessionId> {
+        self.active
+            .load(Ordering::SeqCst)
+            .then(|| self.session.clone())
+            .into_iter()
+            .collect()
+    }
+
+    async fn wait_for_turn_completion(&self, _: &SessionId) -> Result<(), ContractError> {
+        self.wait_times
+            .lock()
+            .unwrap()
+            .push(tokio::time::Instant::now());
+        self.waits.notify_one();
+        if self.block_wait {
+            self.wait_gate.notified().await;
+        }
+        if self.available.load(Ordering::SeqCst) {
+            self.active.store(false, Ordering::SeqCst);
+            Ok(())
+        } else {
+            Err(ContractError {
+                code: -32004,
+                message: "original active-turn boundary unavailable".into(),
+            })
+        }
+    }
+
+    async fn inject_turn(&self, _: &SessionId, batch: &NexusBatch) -> Result<(), ContractError> {
+        self.injected.lock().unwrap().push(batch.clone());
+        Ok(())
+    }
+
+    async fn inject_turn_observed(
+        &self,
+        recipient: &SessionId,
+        batch: &NexusBatch,
+        events: Arc<dyn EventSink>,
+        accepted_event: WsEvent,
+    ) -> InjectResult<()> {
+        self.inject_turn(recipient, batch)
+            .await
+            .map_err(InjectError::Contract)?;
+        events.emit(accepted_event).await;
+        Ok(())
+    }
+
+    async fn launch(&self, _: SpawnRequest) -> Result<SpawnResponse, ContractError> {
+        unreachable!()
+    }
+    async fn remove(&self, _: RemoveRequest) -> Result<RemoveResponse, ContractError> {
+        unreachable!()
+    }
+}
+
+struct BoundaryRetryFixture {
+    store: Arc<Store>,
+    session: SessionId,
+    exec: Arc<UnavailableBoundaryExec>,
+    events: RecordingSink,
+    deps: LoopDeps,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for BoundaryRetryFixture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl BoundaryRetryFixture {
+    async fn new(timing: DeliveryTiming, block_wait: bool) -> Self {
+        let store = Arc::new(Store::open(":memory:").await.unwrap());
+        store.migrate().await.unwrap();
+        let session = SessionId("s_boundary_retry".into());
+        let exec = Arc::new(UnavailableBoundaryExec {
+            session: session.clone(),
+            active: AtomicBool::new(true),
+            available: AtomicBool::new(false),
+            block_wait,
+            wait_gate: Notify::new(),
+            waits: Notify::new(),
+            wait_times: Mutex::new(Vec::new()),
+            injected: Mutex::new(Vec::new()),
+        });
+        let events = RecordingSink::default();
+        insert(
+            &store,
+            &dm("m_boundary_retry", "peer", "retain my unsent mail"),
+        )
+        .await;
+        Inbox::new(&store)
+            .enqueue_with_timing(&MessageId("m_boundary_retry".into()), &session, timing)
+            .await
+            .unwrap();
+        let cfg = Config::default();
+        let deps = LoopDeps {
+            store: store.clone(),
+            bell: Bell::new(),
+            registry: AgentRegistry::new(),
+            turn_exec: exec.clone(),
+            events: Arc::new(events.clone()),
+            project: PROJECT.into(),
+            drain_limit: cfg.drain_limit,
+            preview_chars: cfg.msg_preview_chars,
+            completion_timeout: Duration::from_secs(45),
+            provider_limit_default_cooldown: Duration::from_millis(50),
+        };
+        let task = EventLoop::spawn(session.clone(), deps.clone());
+        Self {
+            store,
+            session,
+            exec,
+            events,
+            deps,
+            task,
+        }
+    }
+
+    async fn wait_for_boundary_calls(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while self.exec.wait_times.lock().unwrap().len() < count {
+                self.exec.waits.notified().await;
+            }
+        })
+        .await
+        .expect("boundary recheck must not be stranded without another bell");
+        tokio::task::yield_now().await;
+    }
+
+    async fn assert_row(&self, state: &str, attempts: i64) {
+        let mut rows = self.store.conn.query(
+            "SELECT state, attempt_count, error_code FROM in_flight WHERE message_id = 'm_boundary_retry'", (),
+        ).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            row.get::<String>(0).unwrap(),
+            state,
+            "an unavailable original-turn boundary must not settle unsent mail"
+        );
+        assert_eq!(
+            row.get::<i64>(1).unwrap(),
+            attempts,
+            "waiting is not a delivery attempt"
+        );
+        assert_eq!(row.get::<Option<String>>(2).unwrap(), None);
+    }
+
+    async fn assert_unsubmitted(&self) {
+        self.assert_row("notified", 0).await;
+        assert!(self.exec.injected.lock().unwrap().is_empty());
+        assert!(
+            self.events.events().is_empty(),
+            "unsent mail must have no canonical input echo or settlement"
+        );
+    }
+
+    async fn assert_delivered_once(&self) {
+        wait_for_delivery_state(&self.store, "m_boundary_retry", "delivered").await;
+        self.assert_row("delivered", 1).await;
+        assert_eq!(self.exec.injected.lock().unwrap().len(), 1);
+        assert_eq!(
+            self.events
+                .events()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    WsEvent::AgentUpdate {
+                        kind: AgentUpdateKind::UserInput,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            self.events
+                .events()
+                .iter()
+                .filter(|event| matches!(event, WsEvent::MessageDelivered { .. }))
+                .count(),
+            1
+        );
+    }
+}
+
 #[tokio::test]
-async fn active_turn_interrupt_without_adapter_support_is_a_typed_terminal_error() {
+async fn initial_boundary_wait_error_retains_yield_turn_mail_until_idle_without_another_bell() {
+    boundary_wait_idle_recovery(DeliveryTiming::YieldTurn).await;
+}
+
+#[tokio::test]
+async fn initial_boundary_wait_error_retains_after_tool_loop_mail_until_idle_without_another_bell()
+{
+    boundary_wait_idle_recovery(DeliveryTiming::AfterToolLoop).await;
+}
+
+async fn boundary_wait_idle_recovery(timing: DeliveryTiming) {
+    let fixture = BoundaryRetryFixture::new(timing, false).await;
+    fixture.wait_for_boundary_calls(1).await;
+    fixture.assert_unsubmitted().await;
+    fixture.exec.active.store(false, Ordering::SeqCst);
+    fixture.assert_delivered_once().await;
+    fixture.deps.bell.ring(&fixture.session);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    fixture.assert_delivered_once().await;
+}
+
+#[tokio::test]
+async fn initial_boundary_wait_error_recovers_observer_without_replaying_input() {
+    let fixture = BoundaryRetryFixture::new(DeliveryTiming::AfterToolLoop, false).await;
+    fixture.wait_for_boundary_calls(1).await;
+    fixture.assert_unsubmitted().await;
+    fixture.exec.available.store(true, Ordering::SeqCst);
+    fixture.wait_for_boundary_calls(2).await;
+    fixture.assert_delivered_once().await;
+}
+
+#[tokio::test]
+async fn initial_boundary_wait_errors_are_backed_off_even_when_new_bells_arrive() {
+    let fixture = BoundaryRetryFixture::new(DeliveryTiming::YieldTurn, false).await;
+    fixture.wait_for_boundary_calls(1).await;
+    fixture.assert_unsubmitted().await;
+    for _ in 0..20 {
+        fixture.deps.bell.ring(&fixture.session);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        fixture.exec.wait_times.lock().unwrap().len(),
+        1,
+        "bells must not bypass error backoff"
+    );
+    fixture.wait_for_boundary_calls(3).await;
+    fixture.assert_unsubmitted().await;
+    let times = fixture.exec.wait_times.lock().unwrap().clone();
+    assert!(
+        times
+            .windows(2)
+            .all(|pair| pair[1].duration_since(pair[0]) >= Duration::from_millis(500)),
+        "immediate errors must not become a busy loop: {times:?}"
+    );
+    fixture.exec.active.store(false, Ordering::SeqCst);
+    fixture.assert_delivered_once().await;
+}
+
+#[tokio::test]
+async fn initial_boundary_wait_honors_holds_set_during_failed_wait() {
+    boundary_wait_hold_case(false).await;
+}
+
+#[tokio::test]
+async fn initial_boundary_wait_honors_holds_set_during_successful_wait() {
+    boundary_wait_hold_case(true).await;
+}
+
+async fn boundary_wait_hold_case(available: bool) {
+    for state in [AgentState::Paused, AgentState::Offline] {
+        let fixture = BoundaryRetryFixture::new(DeliveryTiming::AfterToolLoop, true).await;
+        fixture.wait_for_boundary_calls(1).await;
+        fixture.deps.registry.set(&fixture.session, state);
+        fixture.exec.available.store(available, Ordering::SeqCst);
+        fixture.exec.wait_gate.notify_one();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        fixture.assert_unsubmitted().await;
+        assert_eq!(
+            fixture.deps.registry.get(&fixture.session),
+            state,
+            "drain cleanup must preserve external holds"
+        );
+        assert_eq!(fixture.exec.wait_times.lock().unwrap().len(), 1);
+        fixture.exec.active.store(false, Ordering::SeqCst);
+        fixture
+            .deps
+            .registry
+            .set(&fixture.session, AgentState::Idle);
+        fixture.deps.bell.ring(&fixture.session);
+        fixture.assert_delivered_once().await;
+    }
+}
+
+#[tokio::test]
+async fn initial_boundary_wait_abort_cancels_recheck_and_reattach_preserves_unsent_mail() {
+    let mut fixture = BoundaryRetryFixture::new(DeliveryTiming::YieldTurn, false).await;
+    fixture.wait_for_boundary_calls(1).await;
+    fixture.assert_unsubmitted().await;
+    fixture.task.abort();
+    assert!((&mut fixture.task).await.unwrap_err().is_cancelled());
+    fixture.exec.active.store(false, Ordering::SeqCst);
+    fixture.deps.bell.ring(&fixture.session);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    fixture.assert_unsubmitted().await;
+    assert_eq!(fixture.exec.wait_times.lock().unwrap().len(), 1);
+    fixture.task = EventLoop::spawn(fixture.session.clone(), fixture.deps.clone());
+    fixture.assert_delivered_once().await;
+}
+
+#[tokio::test]
+async fn active_turn_interrupt_without_adapter_support_waits_and_delivers_at_the_boundary() {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
     let cfg = Config::default();
@@ -1050,7 +1361,7 @@ async fn active_turn_interrupt_without_adapter_support_is_a_typed_terminal_error
         &dm(
             "m_interrupt_unsupported",
             "casey",
-            "do not silently downgrade interrupt",
+            "a busy uninterruptible agent must still receive this",
         ),
     )
     .await;
@@ -1079,21 +1390,37 @@ async fn active_turn_interrupt_without_adapter_support_is_a_typed_terminal_error
         },
     );
 
-    wait_for_delivery_state(&store, "m_interrupt_unsupported", "error").await;
-    assert!(turn_exec.injected.lock().unwrap().is_empty());
+    // The loop must WAIT on the adapter boundary rather than settle the batch as an error.
+    tokio::time::timeout(Duration::from_secs(2), turn_exec.wait_started.notified())
+        .await
+        .expect("a busy uninterruptible target must wait for the turn boundary");
+    tokio::task::yield_now().await;
+    assert!(
+        turn_exec.injected.lock().unwrap().is_empty(),
+        "nothing may be injected while the original turn is still active"
+    );
+
+    turn_exec.final_completion.notify_one();
+    wait_for_delivery_state(&store, "m_interrupt_unsupported", "delivered").await;
+    assert_eq!(
+        turn_exec.injected.lock().unwrap().len(),
+        1,
+        "a busy uninterruptible agent must still receive the message at its turn boundary"
+    );
+
     let mut rows = store
         .conn
         .query(
-            "SELECT error_details_json FROM in_flight WHERE message_id = ?1",
+            "SELECT COUNT(*) FROM in_flight WHERE message_id = ?1 AND state = 'error'",
             ["m_interrupt_unsupported"],
         )
         .await
         .unwrap();
     let row = rows.next().await.unwrap().unwrap();
-    let details: serde_json::Value = serde_json::from_str(&row.get::<String>(0).unwrap()).unwrap();
     assert_eq!(
-        details["rpcCode"],
-        nexus_contracts::codes::DELIVERY_TIMING_UNSUPPORTED
+        row.get::<i64>(0).unwrap(),
+        0,
+        "the message must never be dead-lettered"
     );
 }
 
@@ -1697,20 +2024,41 @@ async fn interrupted_turn_error_still_redrives_the_unclaimed_replacement_once() 
 }
 
 #[tokio::test]
-async fn interrupt_failure_settles_replacement_without_injection_or_accepted_event() {
+async fn refused_interrupt_keeps_the_replacement_for_turn_boundary_delivery() {
+    refused_interrupt_replacement_case(false, false).await;
+}
+
+#[tokio::test]
+async fn refused_interrupt_redrives_unsubmitted_replacement_after_turn_error() {
+    refused_interrupt_replacement_case(true, false).await;
+}
+
+#[tokio::test]
+async fn refused_interrupt_redrives_unsubmitted_replacement_after_turn_timeout() {
+    refused_interrupt_replacement_case(false, true).await;
+}
+
+async fn refused_interrupt_replacement_case(first_errors: bool, first_times_out: bool) {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
     let cfg = Config::default();
     let bell = Bell::new();
     let registry = AgentRegistry::new();
     let session = SessionId("s_interrupt_failure".into());
-    let turn_exec = Arc::new(SerializedInterruptAndSendTurnExec::with_interrupt_error(
+    let mut turn_exec = SerializedInterruptAndSendTurnExec::with_interrupt_error(
         session.clone(),
         ContractError {
             code: -32001,
             message: "session/cancel failed".into(),
         },
-    ));
+    );
+    if first_errors {
+        turn_exec.first_error = Some(ContractError {
+            code: -32000,
+            message: "the original turn failed independently".into(),
+        });
+    }
+    let turn_exec = Arc::new(turn_exec);
     let events = RecordingSink::default();
     let service = DispatchService::new(ServiceDeps {
         store: store.clone(),
@@ -1731,7 +2079,11 @@ async fn interrupt_failure_settles_replacement_without_injection_or_accepted_eve
             project: PROJECT.into(),
             drain_limit: cfg.drain_limit,
             preview_chars: cfg.msg_preview_chars,
-            completion_timeout: Duration::from_secs(45),
+            completion_timeout: if first_times_out {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_secs(45)
+            },
             provider_limit_default_cooldown: Duration::from_millis(50),
         },
     );
@@ -1754,7 +2106,7 @@ async fn interrupt_failure_settles_replacement_without_injection_or_accepted_eve
         &dm(
             "m_interrupt_failure_replacement",
             "casey",
-            "must fail before prompt injection",
+            "retain this unsubmitted message until the boundary",
         ),
     )
     .await;
@@ -1766,26 +2118,35 @@ async fn interrupt_failure_settles_replacement_without_injection_or_accepted_eve
         .await
         .unwrap();
 
-    wait_for_delivery_state(&store, "m_interrupt_failure_replacement", "error").await;
+    // The refused cancel must not invent an attempt, inject, or emit an accepted event — but it
+    // must also not discard the message. It stays queued for turn-boundary delivery.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while turn_exec.interrupts.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the interrupt should have been attempted");
     assert_eq!(turn_exec.interrupts.load(Ordering::SeqCst), 1);
     assert_eq!(turn_exec.injected.lock().unwrap().len(), 1);
     let mut rows = store
         .conn
         .query(
-            "SELECT attempt_count FROM in_flight WHERE message_id = ?1",
+            "SELECT attempt_count, state FROM in_flight WHERE message_id = ?1",
             ["m_interrupt_failure_replacement"],
         )
         .await
         .unwrap();
+    let row = rows.next().await.unwrap().expect("replacement row");
     assert_eq!(
-        rows.next()
-            .await
-            .unwrap()
-            .expect("replacement row")
-            .get::<i64>(0)
-            .unwrap(),
+        row.get::<i64>(0).unwrap(),
         0,
         "a failed cancel must not invent a replacement prompt attempt"
+    );
+    assert_ne!(
+        row.get::<String>(1).unwrap(),
+        "error",
+        "a refused cancel must not dead-letter the replacement"
     );
     let accepted_client_ids = events
         .events()
@@ -1807,10 +2168,57 @@ async fn interrupt_failure_settles_replacement_without_injection_or_accepted_eve
         vec!["bus:m_interrupt_failure_first".to_string()]
     );
 
-    // Let the original test turn finish so the spawned loop does not outlive this fixture.
-    turn_exec.interrupt_requested.notify_one();
-    turn_exec.terminal_release.notify_one();
-    wait_for_delivery_state(&store, "m_interrupt_failure_first", "delivered").await;
+    // Let the original turn finish. The replacement the refused cancel could not deliver early
+    // must now be delivered at the turn boundary rather than stay lost.
+    if !first_times_out {
+        turn_exec.interrupt_requested.notify_one();
+        turn_exec.terminal_release.notify_one();
+    }
+    wait_for_delivery_state(
+        &store,
+        "m_interrupt_failure_first",
+        if first_errors || first_times_out {
+            "error"
+        } else {
+            "delivered"
+        },
+    )
+    .await;
+    wait_for_delivery_state(&store, "m_interrupt_failure_replacement", "delivered").await;
+    assert_eq!(
+        turn_exec.injected.lock().unwrap().len(),
+        2,
+        "the replacement must reach the agent once the active turn ends"
+    );
+    assert_eq!(turn_exec.interrupts.load(Ordering::SeqCst), 1);
+    assert_eq!(turn_exec.steer_calls.load(Ordering::SeqCst), 0);
+    let mut rows = store
+        .conn
+        .query(
+            "SELECT attempt_count FROM in_flight WHERE message_id = ?1",
+            ["m_interrupt_failure_replacement"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        1
+    );
+    let replacement_accepts = events
+        .events()
+        .into_iter()
+        .filter(|event| {
+            matches!(event, WsEvent::AgentUpdate {
+            kind: AgentUpdateKind::UserInput, data, ..
+        } if data.get("clientMessageId").and_then(Value::as_str)
+            == Some("bus:m_interrupt_failure_replacement"))
+        })
+        .count();
+    assert_eq!(
+        replacement_accepts, 1,
+        "replacement acceptance must not be duplicated"
+    );
+    _loop.abort();
 }
 
 #[tokio::test]
@@ -2657,6 +3065,7 @@ async fn completion_timeout_dead_letters_not_delivered() {
     });
     let events = RecordingSink::default();
     let session = SessionId("s_codex_hung".into());
+    let later_bell = bell.clone();
 
     let service = DispatchService::new(ServiceDeps {
         store: store.clone(),
@@ -2731,4 +3140,23 @@ async fn completion_timeout_dead_letters_not_delivered() {
         }),
         "completion timeout must not emit a false MessageDelivered"
     );
+
+    // A failed pre-submission wait may be rechecked, but a claimed submission
+    // with unknown completion must remain terminal even when more bells arrive.
+    drop(rows);
+    for _ in 0..3 {
+        later_bell.ring(&session);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut rows = store.conn.query(
+        "SELECT state, attempt_count, error_code FROM in_flight WHERE message_id = 'm_hung_codex'", (),
+    ).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<String>(0).unwrap(), "error");
+    assert_eq!(
+        row.get::<i64>(1).unwrap(),
+        1,
+        "an uncertain submission must never be replayed"
+    );
+    assert_eq!(row.get::<String>(2).unwrap(), "completion_timeout");
 }
