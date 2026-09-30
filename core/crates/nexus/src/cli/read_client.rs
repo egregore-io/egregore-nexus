@@ -16,12 +16,12 @@ use nexus_common::{now, Config};
 use nexus_contracts::{
     codes, AgentId, AgentRuntimeListRequest, AgentRuntimeListResponse, AgentRuntimeSummary,
     AgentShowRequest, AgentShowResponse, AgentSummary, Caller, ContractError, DaemonIpcCall,
-    DaemonIpcCaller, DaemonIpcRequest, Harness, HeartbeatResponse, HistoryRequest, HistoryResponse,
-    IdentityPort, Kind, MemberListRequest, MemberListResponse, MemberSummary, Message, MessageId,
-    Presence, RegisterRequest, RegisterResponse, SearchPort, SearchRequest, SearchResponse,
-    SessionId, Source, SourceListResponse, SourceRef, SpawnRequest, StatusRequest, StatusResponse,
-    ThreadListResponse, ThreadMembersRequest, ThreadSummary, Tier, TopicListResponse, TopicSummary,
-    Whoami, DAEMON_IPC_PROTOCOL_VERSION,
+    DaemonIpcCaller, DaemonIpcRequest, HarnessId, HeartbeatResponse, HistoryRequest,
+    HistoryResponse, IdentityPort, Kind, MemberListRequest, MemberListResponse, MemberSummary,
+    Message, MessageId, Presence, RegisterRequest, RegisterResponse, SearchPort, SearchRequest,
+    SearchResponse, SessionId, Source, SourceListResponse, SourceRef, SpawnRequest, StatusRequest,
+    StatusResponse, ThreadListResponse, ThreadMembersRequest, ThreadSummary, Tier,
+    TopicListResponse, TopicSummary, Whoami, DAEMON_IPC_PROTOCOL_VERSION,
 };
 use nexus_store::repos::{
     AgentRef, AgentRuntimes, Agents, DeveloperEvents, Messages, NativeThreadBindings, Sessions,
@@ -36,11 +36,13 @@ use crate::daemon::claude_resume_harvest::{
 };
 use crate::daemon::hermes_native_forwarder::HermesRuntimeStateRepo;
 use crate::daemon::opencode_native_forwarder::OpenCodeRuntimeStateRepo;
+use crate::harness_registry::harness_registry_by_id;
 use crate::local_operator::{
     display_name as local_operator_display_name, LOCAL_OPERATOR_SESSION_ID,
 };
 use nexus_harness_claude::storage::ClaudeRuntimeStateRepo;
 use nexus_harness_codex::storage::CodexRuntimeStateRepo;
+use nexus_harness_core::ResumeStyle;
 
 use super::gateway_read_client::GatewayReadClient;
 
@@ -543,7 +545,7 @@ impl ReadClient {
             });
         }
         let kind = harness_from_session_row(&row)?;
-        if !is_attach_revivable_transport(row.transport.as_deref(), kind) {
+        if !is_attach_revivable_transport(row.transport.as_deref(), &kind) {
             return Err(ContractError {
                 code: codes::INVALID_PARAMS,
                 message: format!(
@@ -559,9 +561,9 @@ impl ReadClient {
                 row_name, row.session_id.0
             ),
         })?;
-        let resume_key = self.harness_resume_key(&row, kind).await?;
-        let (resume, harness_args) = revive_tail(kind, resume_key.as_deref())?;
-        let backend = Self::attach_revive_backend(kind);
+        let resume_key = self.harness_resume_key(&row, &kind).await?;
+        let (resume, harness_args) = revive_tail(&kind, resume_key.as_deref())?;
+        let backend = Self::attach_revive_backend(&kind);
         let spawn = SpawnRequest {
             kind,
             name: Some(row_name.clone()),
@@ -583,12 +585,10 @@ impl ReadClient {
         })
     }
 
-    fn attach_revive_backend(kind: Harness) -> Option<String> {
-        match kind {
-            Harness::Claude => Some("pty".to_string()),
-            Harness::Hermes => Some("tmux".to_string()),
-            _ => None,
-        }
+    fn attach_revive_backend(kind: &HarnessId) -> Option<String> {
+        harness_registry_by_id(kind)
+            .attach_backend()
+            .map(str::to_string)
     }
 
     /// Return the local terminal attach descriptor for a headed runtime resolved by Nexus session id.
@@ -795,15 +795,15 @@ impl ReadClient {
     async fn harness_resume_key(
         &self,
         row: &SessionRow,
-        kind: Harness,
+        kind: &HarnessId,
     ) -> Result<Option<String>, ContractError> {
         let session_id = SessionId(row.session_id.0.clone());
         let session_key = row.harness_session_id.clone();
         if let Some(key) = self.native_thread_binding_resume_key(row, kind).await? {
             return Ok(Some(key));
         }
-        match kind {
-            Harness::Claude => {
+        match kind.as_str() {
+            "claude" => {
                 let repo = ClaudeRuntimeStateRepo::new(self.store());
                 let mut key = if let Some(key) = session_key.filter(|key| !key.is_empty()) {
                     Some(key)
@@ -840,7 +840,7 @@ impl ReadClient {
                 // exact value only as an opaque, best-effort provider resume hint.
                 Ok(key)
             }
-            Harness::OpenCode => {
+            "opencode" => {
                 if let Some(key) = session_key {
                     return Ok(Some(key));
                 }
@@ -855,7 +855,7 @@ impl ReadClient {
                 }
                 Ok(opencode_ready_session_id(&session_id))
             }
-            Harness::Hermes => {
+            "hermes" => {
                 if let Some(key) = session_key {
                     return Ok(Some(key));
                 }
@@ -865,7 +865,7 @@ impl ReadClient {
                     .map_err(store_err)?
                     .and_then(|state| state.hermes_session_id))
             }
-            Harness::Codex => {
+            "codex" => {
                 let sidecar_thread = CodexRuntimeStateRepo::new(self.store())
                     .find_by_runtime_id(&session_id)
                     .await
@@ -886,7 +886,7 @@ impl ReadClient {
     async fn native_thread_binding_resume_key(
         &self,
         row: &SessionRow,
-        kind: Harness,
+        kind: &HarnessId,
     ) -> Result<Option<String>, ContractError> {
         let Some(harness) = native_thread_binding_harness(kind) else {
             return Ok(None);
@@ -1031,37 +1031,37 @@ fn raw_pty_attach_descriptor(session: &SessionId) -> PtyAttachDescriptor {
 
 /// Transports that `nexus attach` may repair by submitting a headed daemon launch.
 ///
-/// Direct tmux attach remains stricter: `acp` rows have no local terminal. Claude is the one
-/// exception here because a headless ACP row can be replaced with a headed `claude --resume` launch
-/// using the stored native session id.
-fn is_attach_revivable_transport(transport: Option<&str>, kind: Harness) -> bool {
+/// Direct tmux attach remains stricter: `acp` rows have no local terminal. Harnesses whose
+/// contract opts into [`ResumeStyle`]-backed ACP repair (`acp_attach_revivable`) may replace a
+/// headless ACP row with a headed resume launch using the stored native session id.
+fn is_attach_revivable_transport(transport: Option<&str>, kind: &HarnessId) -> bool {
     matches!(
         transport,
         Some("pty") | Some("codex-appserver") | Some("opencode-plugin")
-    ) || matches!((transport, kind), (Some("acp"), Harness::Claude))
+    ) || (transport == Some("acp") && harness_registry_by_id(kind).acp_attach_revivable())
 }
 
-fn harness_from_session_row(row: &SessionRow) -> Result<Harness, ContractError> {
+fn harness_from_session_row(row: &SessionRow) -> Result<HarnessId, ContractError> {
     let harness = match row.agent.as_deref() {
-        Some("claude") => Harness::Claude,
-        Some("codex") => Harness::Codex,
-        Some("opencode") => Harness::OpenCode,
-        Some("hermes") => Harness::Hermes,
-        Some("pi") => Harness::Pi,
-        Some("other") => Harness::Other,
-        Some(other) => {
-            return Err(ContractError {
-                code: codes::INVALID_PARAMS,
-                message: format!("unsupported harness for attach revive: {other}"),
-            });
-        }
+        // Stored `sessions.agent` label is the harness id. Malformed labels fail closed
+        // (unlike the daemon's legacy-row default) because attach revive must not guess;
+        // well-formed but unregistered ids fall back to the generic non-headed contract,
+        // which fails the `attach_revivable` gate below.
+        Some(token) => HarnessId::new(token).map_err(|_| ContractError {
+            code: codes::INVALID_PARAMS,
+            message: format!("unsupported harness for attach revive: {token}"),
+        })?,
         None => match row.transport.as_deref() {
-            Some("codex-appserver") => Harness::Codex,
-            Some("opencode-plugin") => Harness::OpenCode,
-            _ => Harness::Claude,
+            Some("codex-appserver") => {
+                HarnessId::new("codex").expect("builtin harness id is valid")
+            }
+            Some("opencode-plugin") => {
+                HarnessId::new("opencode").expect("builtin harness id is valid")
+            }
+            _ => HarnessId::new("claude").expect("builtin harness id is valid"),
         },
     };
-    if matches!(harness, Harness::Pi | Harness::Other) {
+    if !harness_registry_by_id(&harness).attach_revivable() {
         return Err(ContractError {
             code: codes::INVALID_PARAMS,
             message: format!(
@@ -1074,65 +1074,55 @@ fn harness_from_session_row(row: &SessionRow) -> Result<Harness, ContractError> 
     Ok(harness)
 }
 
-fn native_thread_binding_harness(kind: Harness) -> Option<&'static str> {
-    match kind {
-        Harness::Claude => Some("claude"),
-        Harness::Codex => Some("codex"),
-        Harness::OpenCode => Some("opencode"),
-        Harness::Hermes => Some("hermes"),
-        _ => None,
-    }
+fn native_thread_binding_harness(kind: &HarnessId) -> Option<&'static str> {
+    let contract = harness_registry_by_id(kind);
+    contract
+        .has_native_thread_binding()
+        .then(|| contract.agent_token())
 }
 
 fn revive_tail(
-    kind: Harness,
+    kind: &HarnessId,
     resume_key: Option<&str>,
 ) -> Result<(Option<String>, Vec<String>), ContractError> {
-    let args = match kind {
-        Harness::Claude => {
-            let key = resume_key
-                .filter(|key| !key.is_empty())
-                .ok_or_else(|| ContractError {
-                    code: codes::INVALID_PARAMS,
-                    message: "cannot revive headed Claude runtime without a stored --resume session id; refusing unsafe --continue".into(),
-                })?;
-            vec!["--resume".to_string(), key.to_string()]
-        }
-        Harness::Codex => {
-            let key = resume_key
-                .filter(|key| !key.is_empty())
-                .ok_or_else(|| ContractError {
-                    code: codes::INVALID_PARAMS,
-                    message: "cannot revive headed Codex runtime without a stored thread id".into(),
-                })?;
-            return Ok((Some(key.to_string()), Vec::new()));
-        }
-        Harness::OpenCode => {
-            let key = resume_key
-                .filter(|key| !key.is_empty())
-                .ok_or_else(|| ContractError {
-                    code: codes::INVALID_PARAMS,
-                    message: "cannot revive headed OpenCode runtime without a stored native session id; refusing unsafe --continue".into(),
-                })?;
-            vec!["-s".to_string(), key.to_string()]
-        }
-        Harness::Hermes => {
-            let key = resume_key
-                .filter(|key| !key.is_empty())
-                .ok_or_else(|| ContractError {
-                    code: codes::INVALID_PARAMS,
-                    message: "cannot revive headed Hermes runtime without a stored native session id; refusing unsafe --continue".into(),
-                })?;
-            vec!["--session".to_string(), key.to_string()]
-        }
-        Harness::Pi | Harness::Other => {
-            return Err(ContractError {
-                code: codes::INVALID_PARAMS,
-                message: "unsupported harness for attach revive".into(),
-            });
-        }
-    };
-    Ok((None, args))
+    let contract = harness_registry_by_id(kind);
+    let style = contract.resume_style();
+    if matches!(style, ResumeStyle::Unsupported) {
+        return Err(ContractError {
+            code: codes::INVALID_PARAMS,
+            message: "unsupported harness for attach revive".into(),
+        });
+    }
+    let key = resume_key
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| ContractError {
+            code: codes::INVALID_PARAMS,
+            message: match style {
+                // Sidecar keys are structured metadata, not argv; no `--continue` fallback exists.
+                ResumeStyle::Sidecar => format!(
+                    "cannot revive headed {} runtime without a stored {}",
+                    contract.display_name(),
+                    contract.resume_key_description()
+                ),
+                _ => format!(
+                    "cannot revive headed {} runtime without a stored {}; refusing unsafe --continue",
+                    contract.display_name(),
+                    contract.resume_key_description()
+                ),
+            },
+        })?;
+    match style {
+        ResumeStyle::Unsupported => unreachable!("rejected above"),
+        ResumeStyle::Sidecar => Ok((Some(key.to_string()), Vec::new())),
+        ResumeStyle::Flag(prefix) => Ok((
+            None,
+            prefix
+                .iter()
+                .map(|arg| arg.to_string())
+                .chain(std::iter::once(key.to_string()))
+                .collect(),
+        )),
+    }
 }
 
 fn is_nexus_session_id_like(value: &str) -> bool {
@@ -1308,8 +1298,11 @@ fn runtime_summary_from_row(row: AgentRuntimeRow) -> AgentRuntimeSummary {
     }
 }
 
-fn harness_from_store(value: &str) -> Harness {
-    serde_json::from_value(serde_json::Value::String(value.to_string())).unwrap_or(Harness::Other)
+fn harness_from_store(value: &str) -> HarnessId {
+    // Store rows written before validation (or by hand) may hold malformed labels;
+    // collapse those to the generic "other" id rather than failing a read path.
+    HarnessId::new(value)
+        .unwrap_or_else(|_| HarnessId::new("other").expect("builtin harness id is valid"))
 }
 
 fn runtime_presence(value: Option<&str>, active: bool) -> Presence {

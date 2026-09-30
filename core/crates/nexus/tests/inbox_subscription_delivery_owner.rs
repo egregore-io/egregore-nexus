@@ -7,7 +7,7 @@ use nexus::daemon::{dispatch, AppState};
 use nexus_agent::AdapterRegistry;
 use nexus_common::Config;
 use nexus_contracts::{
-    AgentTurnExecutionPort, BatchCounts, Caller, ConsumeRequest, CreateThreadRequest, Harness,
+    AgentTurnExecutionPort, BatchCounts, Caller, ConsumeRequest, CreateThreadRequest,
     InboxSubscribeRequest, InboxSubscribeResponse, InboxUnsubscribeRequest, Kind, NexusBatch,
     PortResult, Presence, RegisterRequest, RemoveRequest, RemoveResponse, Request, RequestId,
     SendRequest, SendTarget, SessionId, SpawnRequest, SpawnResponse, Tier,
@@ -37,7 +37,12 @@ impl AgentTurnExecutionPort for CountingTurnExec {
     }
 }
 
-fn register(name: &str, client_key: &str, kind: Kind, harness: Harness) -> RegisterRequest {
+fn register(
+    name: &str,
+    client_key: &str,
+    kind: Kind,
+    harness: nexus_contracts::HarnessId,
+) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(name.into()),
@@ -69,7 +74,7 @@ async fn active_inbox_subscription_owns_delivery_instead_of_harness_event_loop()
 
     state
         .identity
-        .register(register("sender", "ck_sender", Kind::Human, Harness::Other))
+        .register(register("sender", "ck_sender", Kind::Human, hid("other")))
         .await
         .unwrap();
     state
@@ -78,7 +83,7 @@ async fn active_inbox_subscription_owns_delivery_instead_of_harness_event_loop()
             "receiver",
             "ck_receiver",
             Kind::Agent,
-            Harness::Claude,
+            hid("claude"),
         ))
         .await
         .unwrap();
@@ -191,7 +196,7 @@ async fn inbox_unsubscribe_restores_daemon_owned_harness_delivery() {
 
     state
         .identity
-        .register(register("sender", "ck_sender", Kind::Human, Harness::Other))
+        .register(register("sender", "ck_sender", Kind::Human, hid("other")))
         .await
         .unwrap();
     state
@@ -200,7 +205,7 @@ async fn inbox_unsubscribe_restores_daemon_owned_harness_delivery() {
             "receiver",
             "ck_receiver",
             Kind::Agent,
-            Harness::Claude,
+            hid("claude"),
         ))
         .await
         .unwrap();
@@ -296,7 +301,7 @@ async fn external_other_thread_member_is_pull_delivered_and_never_revived() {
 
     state
         .identity
-        .register(register("sender", "ck_sender", Kind::Human, Harness::Other))
+        .register(register("sender", "ck_sender", Kind::Human, hid("other")))
         .await
         .unwrap();
     state
@@ -305,7 +310,7 @@ async fn external_other_thread_member_is_pull_delivered_and_never_revived() {
             "external-controller",
             "ck_external_controller",
             Kind::Agent,
-            Harness::Other,
+            hid("other"),
         ))
         .await
         .unwrap();
@@ -383,4 +388,9 @@ async fn external_other_thread_member_is_pull_delivered_and_never_revived() {
     drop(store);
     drop(daemon);
     let _ = std::fs::remove_file(identity_path);
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

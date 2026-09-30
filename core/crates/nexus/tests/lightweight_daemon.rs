@@ -7,7 +7,7 @@ use nexus::daemon::{daemon_ipc, AppState};
 use nexus_agent::{Adapter, AdapterInjectError, AdapterRegistry, MockAdapter, StreamEvent};
 use nexus_common::{Config, NexusError};
 use nexus_contracts::{
-    ConsumeRequest, DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, Harness, Kind, Message,
+    ConsumeRequest, DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, HarnessId, Kind, Message,
     MessageId, ProjectId, Provenance, RegisterRequest, Request, Scope, SendRequest, SendTarget,
     SessionId, SpawnRequest, ThreadId, Tier, DAEMON_IPC_PROTOCOL_VERSION,
 };
@@ -154,7 +154,7 @@ async fn daemon_owned_launch_persists_its_resurrection_descriptor() {
     let mock = MockAdapter::new();
     let mut registry = AdapterRegistry::new();
     registry.register(
-        Harness::Codex,
+        &hid("codex"),
         Arc::new(move |_cwd| Arc::new(mock.clone()) as Arc<dyn Adapter>),
     );
     let state = AppState::wire_with_registry(store.clone(), &Config::default(), registry);
@@ -162,7 +162,7 @@ async fn daemon_owned_launch_persists_its_resurrection_descriptor() {
     let spawned = state
         .launch_agent(
             SpawnRequest {
-                kind: Harness::Codex,
+                kind: hid("codex"),
                 name: Some("persistent-codex".into()),
                 identity_policy: None,
                 cwd: Some("/work/repo".into()),
@@ -217,7 +217,7 @@ async fn graceful_shutdown_cancels_delivery_loops_before_killing_adapters() {
     let observed = adapter.clone();
     let mut registry = AdapterRegistry::new();
     registry.register(
-        Harness::Codex,
+        &hid("codex"),
         Arc::new(move |_cwd| Arc::new(adapter.clone()) as Arc<dyn Adapter>),
     );
     let state = AppState::wire_with_registry(store.clone(), &Config::default(), registry);
@@ -225,7 +225,7 @@ async fn graceful_shutdown_cancels_delivery_loops_before_killing_adapters() {
     let spawned = state
         .launch_agent(
             SpawnRequest {
-                kind: Harness::Codex,
+                kind: hid("codex"),
                 name: Some("shutdown-order-target".into()),
                 identity_policy: None,
                 cwd: Some("/work/shutdown-order".into()),
@@ -357,7 +357,7 @@ async fn daemon_owned_headless_launch_persists_the_adapter_resume_key() {
     };
     let mut registry = AdapterRegistry::new();
     registry.register(
-        Harness::OpenCode,
+        &hid("opencode"),
         Arc::new(move |_cwd| Arc::new(adapter.clone()) as Arc<dyn Adapter>),
     );
     let state = AppState::wire_with_registry(store.clone(), &Config::default(), registry);
@@ -365,7 +365,7 @@ async fn daemon_owned_headless_launch_persists_the_adapter_resume_key() {
     let spawned = state
         .launch_agent(
             SpawnRequest {
-                kind: Harness::OpenCode,
+                kind: hid("opencode"),
                 name: Some("persistent-opencode".into()),
                 identity_policy: None,
                 cwd: Some("/work/opencode".into()),
@@ -412,14 +412,14 @@ async fn daemon_owned_resume_key_updates_the_opaque_resurrection_capsule() {
     let mock = MockAdapter::new();
     let mut registry = AdapterRegistry::new();
     registry.register(
-        Harness::Codex,
+        &hid("codex"),
         Arc::new(move |_cwd| Arc::new(mock.clone()) as Arc<dyn Adapter>),
     );
     let state = AppState::wire_with_registry(store.clone(), &Config::default(), registry);
     let spawned = state
         .launch_agent(
             SpawnRequest {
-                kind: Harness::Codex,
+                kind: hid("codex"),
                 name: Some("resume-codex".into()),
                 identity_policy: None,
                 cwd: Some("/work/resume".into()),
@@ -473,7 +473,7 @@ async fn daemon_owned_headed_launch_persists_its_exact_mode_and_backend() {
     let spawned = state
         .launch_agent_with_program(
             SpawnRequest {
-                kind: Harness::Hermes,
+                kind: hid("hermes"),
                 name: Some("persistent-hermes-pty".into()),
                 identity_policy: None,
                 cwd: Some("/work/hermes".into()),
@@ -561,7 +561,7 @@ async fn daemon_boot_rehydrates_the_nexus_runtime_identity_from_its_capsule() {
     let mock = MockAdapter::new();
     let mut registry = AdapterRegistry::new();
     registry.register(
-        Harness::Codex,
+        &hid("codex"),
         Arc::new(move |_cwd| Arc::new(mock.clone()) as Arc<dyn Adapter>),
     );
     let state = AppState::wire_with_registry(store.clone(), &Config::default(), registry);
@@ -637,7 +637,7 @@ async fn concurrent_acp_revives_open_one_adapter_for_the_runtime() {
     let observed = adapter.clone();
     let mut registry = AdapterRegistry::new();
     registry.register(
-        Harness::Hermes,
+        &hid("hermes"),
         Arc::new(move |_ctx| Arc::new(adapter.clone()) as Arc<dyn Adapter>),
     );
     let state = AppState::wire_with_registry(store.clone(), &Config::default(), registry);
@@ -746,7 +746,7 @@ async fn claude_revive_uses_the_capsule_key_as_an_opaque_best_effort_hint() {
     let state = AppState::wire_pty(store.clone(), &Config::default());
 
     let tail = state
-        .headed_revive_tail_for_row(&row, Harness::Claude)
+        .headed_revive_tail_for_row(&row, &hid("claude"))
         .await
         .expect("Claude resume should consume the opaque capsule without native identity checks");
     assert_eq!(tail, ["--resume", "claude-native-opaque"]);
@@ -836,7 +836,7 @@ async fn daemon_boot_replays_one_unsettled_delivery_and_auto_wakes_its_target() 
     let observed = mock.clone();
     let mut registry = AdapterRegistry::new();
     registry.register(
-        Harness::Codex,
+        &hid("codex"),
         Arc::new(move |_cwd| Arc::new(mock.clone()) as Arc<dyn Adapter>),
     );
     let state = AppState::wire_with_registry(store.clone(), &Config::default(), registry);
@@ -950,7 +950,7 @@ async fn daemon_boot_restores_minimal_thread_routing_and_wakes_the_same_agent_id
     let observed = mock.clone();
     let mut registry = AdapterRegistry::new();
     registry.register(
-        Harness::Codex,
+        &hid("codex"),
         Arc::new(move |_cwd| Arc::new(mock.clone()) as Arc<dyn Adapter>),
     );
     let state = AppState::wire_with_registry(store.clone(), &Config::default(), registry);
@@ -1112,7 +1112,7 @@ fn agent(name: &str, client_key: &str) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(name.into()),
-        harness: Harness::Other,
+        harness: hid("other"),
         harness_session_id: format!("native-{client_key}"),
         project: "default".into(),
         client_key: client_key.into(),
@@ -1284,4 +1284,9 @@ async fn ten_thousand_session_frames_remain_boot_scoped_and_create_no_transcript
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("db-wal"));
     let _ = std::fs::remove_file(path.with_extension("db-shm"));
+}
+
+/// A validated [`HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> HarnessId {
+    HarnessId::new(s).expect("valid harness id literal")
 }

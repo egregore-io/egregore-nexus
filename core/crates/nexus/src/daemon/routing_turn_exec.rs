@@ -654,7 +654,7 @@ mod tests {
 
         let launch_err = router
             .launch(SpawnRequest {
-                kind: nexus_contracts::Harness::Claude,
+                kind: nexus_contracts::HarnessId::new("claude").unwrap(),
                 name: None,
                 identity_policy: None,
                 cwd: None,

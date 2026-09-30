@@ -25,8 +25,8 @@ use std::time::Duration;
 use nexus::daemon::{dispatch, AppState};
 use nexus_common::Config;
 use nexus_contracts::{
-    Caller, Harness, Kind, RegisterRequest, RegisterResponse, Request, RequestId, SendRequest,
-    SendTarget, SpawnRequest, SpawnResponse, Tier,
+    Caller, Kind, RegisterRequest, RegisterResponse, Request, RequestId, SendRequest, SendTarget,
+    SpawnRequest, SpawnResponse, Tier,
 };
 use nexus_store::repos::StreamEvents;
 use nexus_store::Store;
@@ -120,7 +120,7 @@ async fn live_claude_receives_a_dm_and_its_reply_reaches_the_store() {
         Some(operator),
         "launch",
         SpawnRequest {
-            kind: Harness::Claude,
+            kind: hid("claude"),
             name: Some("ada".into()),
             identity_policy: None,
             role: None,
@@ -147,7 +147,7 @@ async fn live_claude_receives_a_dm_and_its_reply_reaches_the_store() {
         RegisterRequest {
             name: Some("ben".into()),
             agent_id: None,
-            harness: Harness::Claude,
+            harness: hid("claude"),
             harness_session_id: "hs_ben".into(),
             project: PROJECT.into(),
             client_key: "ck_ben".into(),
@@ -222,4 +222,9 @@ async fn live_claude_receives_a_dm_and_its_reply_reaches_the_store() {
         "real claude must receive the injected DM and reply OK/{marker} into its transcript \
          (tailed to stream_events). saw rows: {last_seen:?}"
     );
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

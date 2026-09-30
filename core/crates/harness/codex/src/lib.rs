@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use nexus_harness_core::{
     native_harness_program, Harness, HarnessIdentity, HeadedCommand, HeadedRuntimeKind,
-    NativeProcessPlatform, ResolvedTail, SlashCommand, SlashCommandAction,
+    NativeProcessPlatform, ResolvedTail, ResumeStyle, SlashCommand, SlashCommandAction,
 };
 
 /// Headed Codex harness contract implementation.
@@ -49,17 +49,29 @@ use nexus_harness_core::{
 pub struct CodexHarness;
 
 impl Harness for CodexHarness {
-    fn kind(&self) -> nexus_contracts::Harness {
-        nexus_contracts::Harness::Codex
-    }
-
     fn program(&self) -> &'static str {
-        native_harness_program(self.kind(), NativeProcessPlatform::current())
+        native_harness_program("codex", NativeProcessPlatform::current())
             .expect("Codex has a native headed executable")
     }
 
     fn headed_runtime_kind(&self) -> HeadedRuntimeKind {
         HeadedRuntimeKind::CodexAppServer
+    }
+
+    fn resume_style(&self) -> ResumeStyle {
+        ResumeStyle::Sidecar
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Codex"
+    }
+
+    fn has_native_thread_binding(&self) -> bool {
+        true
+    }
+
+    fn resume_key_description(&self) -> &'static str {
+        "thread id"
     }
 
     fn resolve_tail(
@@ -124,7 +136,7 @@ impl Harness for CodexHarness {
             Ok(SlashCommandAction::NativeCompact)
         } else {
             Err(nexus_harness_core::HarnessError::UnsupportedSlashCommand {
-                harness: self.kind(),
+                harness: self.agent_token().to_string(),
                 command: command.display_name(),
             })
         }
@@ -135,7 +147,7 @@ impl Harness for CodexHarness {
 /// replacement for the former `AdapterRegistry::with_builtins()` codex arm).
 pub fn register(registry: &mut nexus_agent::AdapterRegistry) {
     registry.register(
-        nexus_contracts::Harness::Codex,
+        &nexus_contracts::HarnessId::new("codex").expect("builtin harness id is valid"),
         Arc::new(|ctx| Arc::new(CodexAdapter::new(ctx)) as Arc<dyn nexus_agent::Adapter>),
     );
 }

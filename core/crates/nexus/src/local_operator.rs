@@ -21,7 +21,7 @@ fn operator_config_name() -> Option<String> {
     clean_name(parsed.get("name")?.as_str())
 }
 
-fn nexus_home() -> Option<PathBuf> {
+pub(crate) fn nexus_home() -> Option<PathBuf> {
     std::env::var("NEXUS_HOME")
         .ok()
         .and_then(|value| clean_name(Some(&value)))

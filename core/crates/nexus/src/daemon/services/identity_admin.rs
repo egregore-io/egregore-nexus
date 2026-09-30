@@ -14,7 +14,7 @@ use nexus_contracts::{
     AgentRuntimeListRequest, AgentRuntimeListResponse, AgentRuntimeSummary, AgentShowRequest,
     AgentShowResponse, AgentSummary, AssignProjectRequest, AssignProjectResponse,
     AssignRoleRequest, AssignRoleResponse, Caller, ContractError, EventSink, GrantTierRequest,
-    GrantTierResponse, Harness, Kind, MetadataEntityKind, MetadataResponse, MetadataSetRequest,
+    GrantTierResponse, HarnessId, Kind, MetadataEntityKind, MetadataResponse, MetadataSetRequest,
     Presence, Tier, WsEvent,
 };
 use nexus_store::repos::{
@@ -73,16 +73,13 @@ impl IdentityAdminService {
         format!("nexus_rt_{}", Self::random_suffix())
     }
 
-    pub(crate) fn harness_to_store(harness: Harness) -> String {
-        serde_json::to_value(harness)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_else(|| "other".to_string())
+    pub(crate) fn harness_to_store(harness: HarnessId) -> String {
+        harness.as_str().to_string()
     }
 
-    fn harness_from_store(value: &str) -> Harness {
-        serde_json::from_value(serde_json::Value::String(value.to_string()))
-            .unwrap_or(Harness::Other)
+    fn harness_from_store(value: &str) -> HarnessId {
+        HarnessId::new(value)
+            .unwrap_or_else(|_| HarnessId::new("other").expect("builtin harness id is valid"))
     }
 
     fn presence_from_store(value: Option<&str>, active: bool) -> Presence {

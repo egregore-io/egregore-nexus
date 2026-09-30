@@ -7,7 +7,7 @@ use nexus_contracts::events::WsEvent;
 use nexus_contracts::ids::{AgentId, SessionId};
 use nexus_contracts::ports::{Caller, EventSink, IdentityPort};
 use nexus_contracts::register::{RegisterRequest, RenameRequest};
-use nexus_contracts::{codes, Harness, Tier};
+use nexus_contracts::{codes, HarnessId, Tier};
 use nexus_identity::Identity;
 use nexus_store::repos::{
     AgentCredentials, Agents, NativeThreadBindings, NewAgent, NewAgentCredential,
@@ -40,7 +40,7 @@ fn register_request(name: &str, client_key: &str) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(name.into()),
-        harness: Harness::Claude,
+        harness: HarnessId::new("claude").unwrap(),
         harness_session_id: format!("hs_{client_key}"),
         project: "p_demo".into(),
         client_key: client_key.into(),

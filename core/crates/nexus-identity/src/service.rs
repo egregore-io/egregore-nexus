@@ -33,9 +33,7 @@ use nexus_store::repos::{
 use nexus_store::types::{AgentRow, SessionRow};
 use nexus_store::Store;
 
-use crate::binding::{
-    assert_project, caller_from_row, harness_str, is_live, tier_str, whoami_from_row,
-};
+use crate::binding::{assert_project, caller_from_row, is_live, tier_str, whoami_from_row};
 use crate::error::to_port;
 use crate::presence::{is_stale, presence_for_state, presence_from_str};
 use crate::registry::{resolve_register, RegisterOutcome};
@@ -124,7 +122,7 @@ impl Identity {
                     row.session_id.0.clone(),
                     req.harness_session_id.clone(),
                     req.client_key.clone(),
-                    harness_str(req.harness).to_string(),
+                    req.harness.as_str().to_string(),
                     tier_str(req.tier).to_string(),
                     now()
                 ],

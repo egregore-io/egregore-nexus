@@ -84,7 +84,7 @@ fn opencode_command_defaults_to_opencode_acp() {
     assert_eq!(
         cmd.program,
         nexus_harness_core::native_harness_program(
-            nexus_contracts::Harness::OpenCode,
+            "opencode",
             nexus_harness_core::NativeProcessPlatform::current(),
         )
         .unwrap()
@@ -206,7 +206,7 @@ fn hermes_command_defaults_to_hermes_acp_accept_hooks() {
     assert_eq!(
         cmd.program,
         nexus_harness_core::native_harness_program(
-            nexus_contracts::Harness::Hermes,
+            "hermes",
             nexus_harness_core::NativeProcessPlatform::current(),
         )
         .unwrap()

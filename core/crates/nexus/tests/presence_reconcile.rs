@@ -4,9 +4,9 @@ use std::time::Duration;
 use nexus::daemon::AppState;
 use nexus_common::Config;
 use nexus_contracts::{
-    AgentRuntimeListRequest, AgentTurnExecutionPort, Caller, Harness, Kind, Message, MessageId,
-    NexusBatch, PortResult, Presence, ProjectId, Provenance, RemoveRequest, RemoveResponse, Scope,
-    SessionId, SpawnRequest, SpawnResponse, Tier, WsEvent,
+    AgentRuntimeListRequest, AgentTurnExecutionPort, Caller, Kind, Message, MessageId, NexusBatch,
+    PortResult, Presence, ProjectId, Provenance, RemoveRequest, RemoveResponse, Scope, SessionId,
+    SpawnRequest, SpawnResponse, Tier, WsEvent,
 };
 use nexus_harness_claude::storage::{ClaudeRuntimeLaunch, ClaudeRuntimeStateRepo};
 use nexus_harness_codex::storage::{CodexRuntimeLaunch, CodexRuntimeStateRepo};
@@ -418,7 +418,7 @@ async fn heartbeat_keeper_restamps_live_acp_runtime_projection() {
             "a_acp_projection",
             Some("acp-projection"),
             PROJECT,
-            Harness::Claude,
+            hid("claude"),
             None,
             "ck_acp_projection",
             None,
@@ -933,4 +933,9 @@ fn cleanup_archive(path: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::remove_dir_all(parent);
     }
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

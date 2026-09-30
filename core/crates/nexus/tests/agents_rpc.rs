@@ -13,7 +13,7 @@ use nexus_contracts::{
     AgentOwnerTransferRequest, AgentOwnerTransferResponse, AgentRuntimeListRequest,
     AgentRuntimeListResponse, AgentShowRequest, AgentShowResponse, AssignProjectRequest,
     AssignProjectResponse, AssignRoleRequest, AssignRoleResponse, Caller, GrantTierRequest,
-    GrantTierResponse, Harness, Kind, MemberListRequest, MemberListResponse, RegisterRequest,
+    GrantTierResponse, Kind, MemberListRequest, MemberListResponse, RegisterRequest,
     RegisterResponse, RemoveRequest, RemoveResponse, Request, RequestId, RpcError, SessionId, Tier,
 };
 use nexus_store::repos::{
@@ -76,7 +76,7 @@ async fn create_agent(state: &AppState, name: &str) -> AgentCreateResponse {
         "agent.create",
         &AgentCreateRequest {
             name: name.into(),
-            default_harness: Some(Harness::Codex),
+            default_harness: Some(hid("codex")),
             project: None,
             role: Some("backend".into()),
         },
@@ -113,7 +113,7 @@ async fn register_agent_runtime_with_client_key(
     let register = RegisterRequest {
         name: Some(name.into()),
         agent_id: None,
-        harness: Harness::Codex,
+        harness: hid("codex"),
         harness_session_id: format!("{client_key}-native-session"),
         project: project.into(),
         client_key: client_key.into(),
@@ -141,7 +141,7 @@ async fn register_human_runtime(
     let register = RegisterRequest {
         name: Some(name.into()),
         agent_id: None,
-        harness: Harness::Codex,
+        harness: hid("codex"),
         harness_session_id: format!("{name}-human-session"),
         project: project.into(),
         client_key: format!("ck-{name}-human"),
@@ -168,7 +168,7 @@ async fn agent_create_show_and_list_roundtrip_by_project() {
     assert!(created.agent.agent_id.0.starts_with("a_"));
     assert_eq!(created.agent.name.as_deref(), Some("ember"));
     assert_eq!(created.agent.project, "demo");
-    assert_eq!(created.agent.default_harness, Some(Harness::Codex));
+    assert_eq!(created.agent.default_harness, Some(hid("codex")));
     assert!(created.credential.is_none());
 
     let reader = caller("reader", "demo", Tier::Agent);
@@ -1901,7 +1901,7 @@ async fn runtime_list_returns_registered_runtime_for_agent() {
     let register = RegisterRequest {
         name: Some("ember".into()),
         agent_id: Some(created.agent.agent_id.clone()),
-        harness: Harness::Codex,
+        harness: hid("codex"),
         harness_session_id: "codex-session".into(),
         project: "demo".into(),
         client_key: "ck-ember-runtime".into(),
@@ -1934,7 +1934,7 @@ async fn runtime_list_returns_registered_runtime_for_agent() {
     assert_eq!(runtimes.agent_id, created.agent.agent_id);
     assert_eq!(runtimes.runtimes.len(), 1);
     assert_eq!(runtimes.runtimes[0].runtime_id, registered.session_id);
-    assert_eq!(runtimes.runtimes[0].harness, Harness::Codex);
+    assert_eq!(runtimes.runtimes[0].harness, hid("codex"));
     assert!(runtimes.runtimes[0].active);
 }
 
@@ -1949,7 +1949,7 @@ async fn agent_policy_gates_mutations_and_cross_project_reads() {
         "agent.create",
         &AgentCreateRequest {
             name: "unauthorized".into(),
-            default_harness: Some(Harness::Codex),
+            default_harness: Some(hid("codex")),
             project: None,
             role: None,
         },
@@ -1980,4 +1980,9 @@ async fn agent_policy_gates_mutations_and_cross_project_reads() {
     )
     .await;
     assert_eq!(denied_show.code, codes::NOT_FOUND);
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

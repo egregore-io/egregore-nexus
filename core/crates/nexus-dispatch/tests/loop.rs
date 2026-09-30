@@ -25,7 +25,7 @@ use nexus_contracts::ports::{
     InjectResult,
 };
 use nexus_contracts::{
-    AgentUpdateKind, Harness, OperatorAction, ProviderError, ProviderLimit, ProviderLimitReason,
+    AgentUpdateKind, HarnessId, OperatorAction, ProviderError, ProviderLimit, ProviderLimitReason,
     ResetHint, SteerCapability, SteerDelivery, SteerResponse,
 };
 use nexus_store::repos::{Inbox, Messages};
@@ -382,7 +382,7 @@ impl AgentTurnExecutionPort for ProviderLimitOnceTurnExec {
         self.started.notify_waiters();
         if attempt == 1 {
             return Err(InjectError::ProviderLimit(ProviderLimit {
-                harness: Harness::Codex,
+                harness: HarnessId::new("codex").unwrap(),
                 session: recipient.clone(),
                 reason: ProviderLimitReason::UsageLimit,
                 reset_hint: Some(ResetHint {
@@ -446,7 +446,7 @@ impl AgentTurnExecutionPort for ProviderErrorTurnExec {
     ) -> InjectResult<()> {
         self.attempts.fetch_add(1, Ordering::SeqCst);
         Err(InjectError::ProviderError(ProviderError {
-            harness: Harness::Claude,
+            harness: HarnessId::new("claude").unwrap(),
             session: recipient.clone(),
             reason: "server_error".into(),
             provider: Some("anthropic".into()),
@@ -484,7 +484,7 @@ impl AgentTurnExecutionPort for OperatorActionTurnExec {
     ) -> InjectResult<()> {
         self.attempts.fetch_add(1, Ordering::SeqCst);
         Err(InjectError::OperatorAction(OperatorAction {
-            harness: Harness::Codex,
+            harness: HarnessId::new("codex").unwrap(),
             session: recipient.clone(),
             reason: "sign in required".into(),
             provider: Some("codex".into()),

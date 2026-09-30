@@ -21,8 +21,9 @@ pub use headed::{
 use std::sync::Arc;
 
 use nexus_harness_core::{
-    native_harness_program, Harness, HarnessIdentity, HeadedCommand, HeadedRuntimeKind,
-    NativeProcessPlatform, ResolvedTail, SlashCommand, SlashCommandAction,
+    native_harness_program, Harness, HarnessIdentity, HarnessLaunchSpec, HeadedCommand,
+    HeadedRuntimeKind, NativeProcessPlatform, ResolvedTail, ResumeStyle, SlashCommand,
+    SlashCommandAction,
 };
 
 /// Headed Claude harness contract implementation.
@@ -33,17 +34,37 @@ use nexus_harness_core::{
 pub struct ClaudeHarness;
 
 impl Harness for ClaudeHarness {
-    fn kind(&self) -> nexus_contracts::Harness {
-        nexus_contracts::Harness::Claude
-    }
-
     fn program(&self) -> &'static str {
-        native_harness_program(self.kind(), NativeProcessPlatform::current())
+        native_harness_program("claude", NativeProcessPlatform::current())
             .expect("Claude has a native headed executable")
     }
 
     fn headed_runtime_kind(&self) -> HeadedRuntimeKind {
         HeadedRuntimeKind::ClaudeNative
+    }
+
+    fn resume_style(&self) -> ResumeStyle {
+        ResumeStyle::Flag(&["--resume"])
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Claude"
+    }
+
+    fn attach_backend(&self) -> Option<&'static str> {
+        Some("pty")
+    }
+
+    fn acp_attach_revivable(&self) -> bool {
+        true
+    }
+
+    fn has_native_thread_binding(&self) -> bool {
+        true
+    }
+
+    fn resume_key_description(&self) -> &'static str {
+        "--resume session id"
     }
 
     fn resolve_tail(
@@ -106,12 +127,50 @@ impl Harness for ClaudeHarness {
     ) -> Result<SlashCommandAction, nexus_harness_core::HarnessError> {
         Ok(SlashCommandAction::InjectVerbatim)
     }
+
+    /// The claude quirk: claude's transcript jsonl is keyed
+    /// by the launch cwd's project slug
+    /// (`~/.claude/projects/<slug>/<sid>.jsonl`), and our streaming/observe
+    /// capture reads that file. Spawning every session in the SAME folder makes
+    /// their transcripts collide under one slug, so a fresh claude launch gets
+    /// its own private per-SESSION folder, and the folder the caller actually
+    /// wanted to work in is granted via `--add-dir <target>` instead of being
+    /// the spawn cwd.
+    ///
+    /// Resume invariant: `--resume <sid>` must reuse the session's ORIGINAL
+    /// cwd (the transcript lives under that slug), so resume launches keep the
+    /// status-quo policy (caller-provided cwd verbatim).
+    fn launch_spec(
+        &self,
+        agent_root: &str,
+        session_id: &str,
+        requested_cwd: Option<String>,
+        is_resume: bool,
+    ) -> HarnessLaunchSpec {
+        if is_resume {
+            return HarnessLaunchSpec::status_quo(agent_root, requested_cwd);
+        }
+        // Fresh claude: private per-session folder; the target folder (if
+        // any) is granted, not inhabited.
+        let cwd = format!("{agent_root}/sessions/{session_id}");
+        let extra_args = match requested_cwd {
+            Some(target) if !target.trim().is_empty() => {
+                vec!["--add-dir".to_string(), target]
+            }
+            _ => Vec::new(),
+        };
+        HarnessLaunchSpec {
+            cwd,
+            private_cwd: true,
+            extra_args,
+        }
+    }
 }
 
 /// Install the real Claude adapter factory into a registry.
 pub fn register(registry: &mut nexus_agent::AdapterRegistry) {
     registry.register(
-        nexus_contracts::Harness::Claude,
+        &nexus_contracts::HarnessId::new("claude").expect("builtin harness id is valid"),
         Arc::new(|ctx| Arc::new(ClaudeAdapter::new(ctx)) as Arc<dyn nexus_agent::Adapter>),
     );
 }

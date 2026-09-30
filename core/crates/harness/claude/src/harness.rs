@@ -21,7 +21,7 @@
 use async_trait::async_trait;
 
 use nexus_common::NexusError;
-use nexus_contracts::{Harness, SteerCapability};
+use nexus_contracts::{HarnessId, SteerCapability};
 
 use nexus_agent::adapter::engine::{AcpEngine, HarnessCommand, LaunchCtx};
 use nexus_agent::{Adapter, AdapterInjectError, StreamEvent};
@@ -57,7 +57,9 @@ impl ClaudeAdapter {
         command.env = ctx.env.clone();
         Self {
             command,
-            engine: AcpEngine::for_harness(Harness::Claude),
+            engine: AcpEngine::for_harness(
+                HarnessId::new("claude").expect("builtin harness id is valid"),
+            ),
             ctx,
         }
     }
@@ -71,7 +73,9 @@ impl ClaudeAdapter {
         };
         Self {
             command,
-            engine: AcpEngine::for_harness(Harness::Claude),
+            engine: AcpEngine::for_harness(
+                HarnessId::new("claude").expect("builtin harness id is valid"),
+            ),
             ctx,
         }
     }

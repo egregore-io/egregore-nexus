@@ -55,7 +55,7 @@ use tracing::{debug, info, warn};
 
 use nexus_common::process_ids::runtime_process_ids_for_pid;
 use nexus_common::{NexusError, RuntimeProcessIds};
-use nexus_contracts::Harness;
+use nexus_contracts::HarnessId;
 
 use super::provider_limit::classify_acp_prompt_error;
 use super::{AdapterInjectError, AdapterOperatorAction};
@@ -995,7 +995,7 @@ pub struct AcpEngine {
     /// Optional harness identity used only to classify structured ACP prompt failures before they
     /// flatten into `session/prompt failed: ...` strings. Engines without a harness keep legacy
     /// generic error behavior.
-    harness: Option<Harness>,
+    harness: Option<HarnessId>,
     /// Bounded lifecycle request window. Production uses [`SESSION_OPEN_TIMEOUT`]; the explicit
     /// builder lets hermetic tests exercise the failure path without a minute-long wait.
     session_open_timeout: Duration,
@@ -1024,7 +1024,7 @@ impl AcpEngine {
     }
 
     /// A fresh engine that can classify structured ACP prompt failures for `harness`.
-    pub fn for_harness(harness: Harness) -> Self {
+    pub fn for_harness(harness: HarnessId) -> Self {
         Self {
             harness: Some(harness),
             ..Self::new()
@@ -1382,7 +1382,11 @@ impl AcpEngine {
         // starts immediately, its observed-delivery snapshot mistakes that replay for a fresh model
         // response and can settle mail that never reached the new context. Drain to a bounded quiet
         // boundary before exposing the resumed session to prompt injection, then discard the replay.
-        if self.harness == Some(Harness::Hermes) {
+        if self
+            .harness
+            .as_ref()
+            .is_some_and(|h| h.as_str() == "hermes")
+        {
             wait_for_activity_quiescence(&self.updates, load_replay_settle_window()).await;
             self.updates.reset_buffer();
         }
@@ -1473,7 +1477,12 @@ impl AcpEngine {
         let quiescence = quiescence_window();
         let mut prompt_response = Box::pin(prompt_turn.block_task());
         let outcome = tokio::time::timeout(timeout, async {
-            if require_terminal_response && self.harness == Some(Harness::Hermes) {
+            if require_terminal_response
+                && self
+                    .harness
+                    .as_ref()
+                    .is_some_and(|h| h.as_str() == "hermes")
+            {
                 tokio::select! {
                     // Canonical Hermes completion remains preferred when available.
                     response = &mut prompt_response => {
@@ -1540,7 +1549,7 @@ impl AcpEngine {
                     "ACP session/prompt timed out without permitted turn-completion evidence"
                 );
                 Err(AdapterInjectError::CompletionTimeout {
-                    origin: acp_completion_source(self.harness),
+                    origin: acp_completion_source(self.harness.as_ref()),
                 })
             }
             // (1) Canonical turn-end.
@@ -1557,7 +1566,10 @@ impl AcpEngine {
                 // operator-action error and is never retried automatically. Direct/legacy drive
                 // keeps its existing empty-turn behavior.
                 if require_terminal_response
-                    && self.harness == Some(Harness::Hermes)
+                    && self
+                        .harness
+                        .as_ref()
+                        .is_some_and(|h| h.as_str() == "hermes")
                     && model_events == 0
                     && !provider_input_observed
                 {
@@ -1568,7 +1580,7 @@ impl AcpEngine {
                         "Hermes ACP returned EndTurn without a model update; refusing false delivery"
                     );
                     return Err(AdapterInjectError::OperatorAction(AdapterOperatorAction {
-                        harness: Harness::Hermes,
+                        harness: HarnessId::new("hermes").expect("builtin harness id is valid"),
                         reason: "Hermes ACP completed without model output; provider completion was not observed"
                             .to_string(),
                         provider: None,
@@ -1589,16 +1601,9 @@ impl AcpEngine {
             }
             Ok(TurnEnd::Response(Err(e))) => {
                 warn!(target: "nexus_agent::acp", acp_session = %acp_session, error = %e, "ACP session/prompt failed");
-                if let Some(harness) = self.harness {
-                    let source = match harness {
-                        Harness::Claude => "claude.acp.prompt_error",
-                        Harness::Hermes => "hermes.acp.prompt_error",
-                        Harness::OpenCode => "opencode.acp.prompt_error",
-                        Harness::Codex => "codex.acp.prompt_error",
-                        Harness::Pi => "pi.acp.prompt_error",
-                        Harness::Other => "other.acp.prompt_error",
-                    };
-                    if let Some(classified) = classify_acp_prompt_error(harness, &e, source) {
+                if let Some(harness) = self.harness.clone() {
+                    let source = format!("{harness}.acp.prompt_error");
+                    if let Some(classified) = classify_acp_prompt_error(harness, &e, &source) {
                         return Err(classified);
                     }
                 }
@@ -1635,15 +1640,8 @@ impl AcpEngine {
     }
 }
 
-fn acp_completion_source(harness: Option<Harness>) -> String {
-    let harness = match harness {
-        Some(Harness::Claude) => "claude",
-        Some(Harness::Codex) => "codex",
-        Some(Harness::OpenCode) => "opencode",
-        Some(Harness::Hermes) => "hermes",
-        Some(Harness::Pi) => "pi",
-        Some(Harness::Other) | None => "other",
-    };
+fn acp_completion_source(harness: Option<&HarnessId>) -> String {
+    let harness = harness.map(|h| h.as_str()).unwrap_or("other");
     format!("{harness}.acp.turn_completion")
 }
 

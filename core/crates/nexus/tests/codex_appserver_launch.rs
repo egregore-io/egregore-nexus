@@ -13,7 +13,7 @@ use nexus_common::Config;
 use nexus_contracts::events::WsEvent;
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::EventSink;
-use nexus_contracts::{AgentUpdateKind, Harness, SpawnRequest};
+use nexus_contracts::{AgentUpdateKind, HarnessId, SpawnRequest};
 use nexus_harness_codex::{CodexAppServerClient, CodexBridge, SupervisorOpts};
 use nexus_store::repos::IdentitySessions;
 use nexus_store::DaemonStore;
@@ -158,7 +158,7 @@ async fn fresh_headed_codex_launch_persists_discovered_thread_in_resurrection_ca
     let spawned = state
         .launch_agent_with_program(
             SpawnRequest {
-                kind: Harness::Codex,
+                kind: HarnessId::new("codex").unwrap(),
                 name: Some("headed-codex".into()),
                 identity_policy: None,
                 cwd: Some(work.to_string_lossy().into_owned()),

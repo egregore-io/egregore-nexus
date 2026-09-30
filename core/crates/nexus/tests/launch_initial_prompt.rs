@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use nexus::daemon::AppState;
 use nexus_common::Config;
 use nexus_contracts::{
-    AgentTurnExecutionPort, CreateThreadRequest, Harness, Kind, NexusBatch, PortResult,
-    RegisterRequest, RemoveRequest, RemoveResponse, SendRequest, SendTarget, SessionId,
-    SpawnRequest, SpawnResponse, Tier, WsEvent,
+    AgentTurnExecutionPort, CreateThreadRequest, Kind, NexusBatch, PortResult, RegisterRequest,
+    RemoveRequest, RemoveResponse, SendRequest, SendTarget, SessionId, SpawnRequest, SpawnResponse,
+    Tier, WsEvent,
 };
 use nexus_store::repos::{AgentRuntimes, InitialPromptDeliveries, Sessions};
 use nexus_store::Store;
@@ -118,7 +118,7 @@ fn human(name: &str, client_key: &str) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(name.into()),
-        harness: Harness::Other,
+        harness: hid("other"),
         harness_session_id: format!("hs_{client_key}"),
         project: PROJECT.into(),
         client_key: client_key.into(),
@@ -132,7 +132,7 @@ fn human(name: &str, client_key: &str) -> RegisterRequest {
 
 fn launch_request(name: &str, initial_prompt: Option<&str>) -> SpawnRequest {
     SpawnRequest {
-        kind: Harness::Codex,
+        kind: hid("codex"),
         name: Some(name.into()),
         identity_policy: None,
         cwd: Some(format!("/tmp/nexus-initial-prompt-{name}")),
@@ -369,4 +369,9 @@ async fn invalid_initial_prompt_template_is_rejected_before_runtime_is_addressab
             .is_err(),
         "invalid initial prompt must not reach the harness or emit accepted input"
     );
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

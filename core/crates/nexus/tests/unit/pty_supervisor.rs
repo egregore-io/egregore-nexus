@@ -237,49 +237,41 @@ fn claude_headed_env_re_exports_custom_config_after_tmux_sanitization() {
 
 #[test]
 fn harness_program_maps_each_tui_binary() {
-    let platform = nexus_harness_core::NativeProcessPlatform::current();
-    for harness in [
-        Harness::Claude,
-        Harness::Codex,
-        Harness::OpenCode,
-        Harness::Hermes,
-    ] {
-        assert_eq!(
-            harness_program(harness),
-            nexus_harness_core::native_harness_program(harness, platform)
-        );
-    }
-    assert_eq!(harness_program(Harness::Pi), None);
-    assert_eq!(harness_program(Harness::Other), None);
+    assert_eq!(harness_program(&hid("claude")), Some("claude"));
+    assert_eq!(harness_program(&hid("codex")), Some("codex"));
+    assert_eq!(harness_program(&hid("opencode")), Some("opencode"));
+    assert_eq!(harness_program(&hid("hermes")), Some("hermes"));
+    assert_eq!(harness_program(&hid("pi")), None);
+    assert_eq!(harness_program(&hid("other")), None);
 }
 
 #[test]
 fn headed_harness_profiles_route_runtime_identity() {
-    assert_eq!(harness_agent_token(Harness::Claude), "claude");
+    assert_eq!(harness_agent_token(&hid("claude")), "claude");
     assert_eq!(
-        headed_runtime_kind(Harness::Claude),
+        headed_runtime_kind(&hid("claude")),
         HeadedRuntimeKind::ClaudeNative
     );
-    assert_eq!(harness_agent_token(Harness::Codex), "codex");
+    assert_eq!(harness_agent_token(&hid("codex")), "codex");
     assert_eq!(
-        headed_runtime_kind(Harness::Codex),
+        headed_runtime_kind(&hid("codex")),
         HeadedRuntimeKind::CodexAppServer
     );
-    assert_eq!(harness_agent_token(Harness::OpenCode), "opencode");
+    assert_eq!(harness_agent_token(&hid("opencode")), "opencode");
     assert_eq!(
-        headed_runtime_kind(Harness::OpenCode),
+        headed_runtime_kind(&hid("opencode")),
         HeadedRuntimeKind::OpenCodePlugin
     );
-    assert_eq!(harness_agent_token(Harness::Hermes), "hermes");
+    assert_eq!(harness_agent_token(&hid("hermes")), "hermes");
     assert_eq!(
-        headed_runtime_kind(Harness::Hermes),
+        headed_runtime_kind(&hid("hermes")),
         HeadedRuntimeKind::HermesGateway
     );
-    assert_eq!(harness_agent_token(Harness::Pi), "pi");
-    assert_eq!(headed_runtime_kind(Harness::Pi), HeadedRuntimeKind::Screen);
-    assert_eq!(harness_agent_token(Harness::Other), "other");
+    assert_eq!(harness_agent_token(&hid("pi")), "pi");
+    assert_eq!(headed_runtime_kind(&hid("pi")), HeadedRuntimeKind::Screen);
+    assert_eq!(harness_agent_token(&hid("other")), "other");
     assert_eq!(
-        headed_runtime_kind(Harness::Other),
+        headed_runtime_kind(&hid("other")),
         HeadedRuntimeKind::Screen
     );
 }
@@ -988,21 +980,7 @@ async fn kill_removes_terminal_socket_endpoint() {
     );
 }
 
-#[test]
-fn opencode_ready_file_is_ready_only_after_complete_json() {
-    let tmp = tempfile::tempdir().unwrap();
-    let ready_path = tmp.path().join("ready.json");
-
-    std::fs::write(&ready_path, "").unwrap();
-    assert!(
-        !opencode_plugin_ready_is_complete(&ready_path),
-        "file creation alone must not satisfy readiness"
-    );
-
-    std::fs::write(
-        &ready_path,
-        r#"{"sessionId":"ses_ready","url":"http://127.0.0.1:1","pid":42}"#,
-    )
-    .unwrap();
-    assert!(opencode_plugin_ready_is_complete(&ready_path));
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

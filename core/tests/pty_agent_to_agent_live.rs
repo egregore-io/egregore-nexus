@@ -27,8 +27,8 @@ use nexus::daemon::{dispatch, AppState};
 use nexus_common::Config;
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::{
-    Caller, CreateThreadRequest, Harness, Request, RequestId, SendRequest, SendTarget,
-    SpawnRequest, SpawnResponse, ThreadMemberRequest, Tier,
+    Caller, CreateThreadRequest, Request, RequestId, SendRequest, SendTarget, SpawnRequest,
+    SpawnResponse, ThreadMemberRequest, Tier,
 };
 use nexus_store::repos::StreamEvents;
 use nexus_store::Store;
@@ -99,7 +99,7 @@ async fn launch_claude(state: &AppState, name: &str) -> SessionId {
         Some(operator),
         "launch",
         SpawnRequest {
-            kind: Harness::Claude,
+            kind: hid("claude"),
             name: Some(name.into()),
             identity_policy: None,
             role: None,
@@ -254,4 +254,9 @@ async fn two_live_claude_agents_dm_and_thread_over_the_pty_bus() {
         "ada's thread post must reach ben's real claude PTY and be tailed to his stream_events. \
          saw: {post_rows:?}"
     );
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

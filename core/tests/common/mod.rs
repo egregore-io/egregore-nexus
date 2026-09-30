@@ -16,9 +16,14 @@ use nexus::daemon::{dispatch, AppState};
 use nexus_agent::{Adapter, AdapterRegistry, MockAdapter};
 use nexus_common::Config;
 use nexus_contracts::{
-    Caller, ContractError, Harness, RegisterRequest, RemoveRequest, Request, RequestId, Response,
+    Caller, ContractError, HarnessId, RegisterRequest, RemoveRequest, Request, RequestId, Response,
     SendRequest, SendTarget, SessionId, SpawnRequest, SpawnResponse, Tier, JSONRPC_VERSION,
 };
+
+/// Shorthand: a validated [`HarnessId`] from a literal (panics on invalid — test-only).
+pub fn hid(s: &str) -> HarnessId {
+    HarnessId::new(s).expect("valid harness id literal")
+}
 use nexus_store::Store;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -46,12 +51,12 @@ impl TestDaemon {
         let mut registry = AdapterRegistry::new();
         let m1 = mock.clone();
         registry.register(
-            Harness::Claude,
+            &hid("claude"),
             Arc::new(move |_cwd| Arc::new(m1.clone()) as Arc<dyn Adapter>),
         );
         let m2 = mock.clone();
         registry.register(
-            Harness::Codex,
+            &hid("codex"),
             Arc::new(move |_cwd| Arc::new(m2.clone()) as Arc<dyn Adapter>),
         );
 
@@ -209,7 +214,7 @@ pub fn reg(name: &str, ck: &str, project: &str) -> RegisterRequest {
     RegisterRequest {
         name: Some(name.into()),
         agent_id: None,
-        harness: Harness::Claude,
+        harness: hid("claude"),
         harness_session_id: format!("hs_{name}"),
         project: project.into(),
         client_key: ck.into(),
@@ -230,7 +235,7 @@ pub fn reg_admin(name: &str, ck: &str, project: &str) -> RegisterRequest {
 }
 
 /// A `SpawnRequest` to launch an agent of `kind` named `name` in `project`.
-pub fn spawn(kind: Harness, name: &str, project: &str) -> SpawnRequest {
+pub fn spawn(kind: HarnessId, name: &str, project: &str) -> SpawnRequest {
     SpawnRequest {
         kind,
         name: Some(name.into()),
@@ -249,7 +254,7 @@ pub fn spawn(kind: Harness, name: &str, project: &str) -> SpawnRequest {
 /// A `SpawnRequest` with **no project** — mirrors the real CLI `nexus launch <kind> --name <n>`
 /// invocation (no `--project`). The daemon must register the launched agent in the **caller's**
 /// project, not an empty/default one. Used by the reproduction test for the launch→project bug.
-pub fn spawn_no_project(kind: Harness, name: &str) -> SpawnRequest {
+pub fn spawn_no_project(kind: HarnessId, name: &str) -> SpawnRequest {
     SpawnRequest {
         kind,
         name: Some(name.into()),
@@ -266,7 +271,7 @@ pub fn spawn_no_project(kind: Harness, name: &str) -> SpawnRequest {
 }
 
 /// A `SpawnRequest` with no explicit name, matching `nexus launch codex`.
-pub fn spawn_no_name(kind: Harness, project: &str) -> SpawnRequest {
+pub fn spawn_no_name(kind: HarnessId, project: &str) -> SpawnRequest {
     SpawnRequest {
         kind,
         name: None,

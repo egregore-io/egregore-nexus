@@ -12,7 +12,7 @@ use nexus_agent::adapter::engine::{AcpEngine, HarnessCommand, LaunchCtx};
 use nexus_agent::adapter::{
     Adapter, AdapterInjectError, HermesAdapter, OpenCodeAdapter, StreamEvent,
 };
-use nexus_contracts::{AgentUpdateKind, Harness, InjectError, ProviderLimitReason, SessionId};
+use nexus_contracts::{AgentUpdateKind, HarnessId, InjectError, ProviderLimitReason, SessionId};
 use serde_json::json;
 
 /// The compiled fake harness binary. `CARGO_BIN_EXE_<name>` is injected by Cargo because the
@@ -248,7 +248,7 @@ async fn opencode_adapter_maps_structured_acp_provider_limit_before_contract_col
     let AdapterInjectError::ProviderLimit(limit) = err else {
         panic!("expected ProviderLimit, got {err:?}");
     };
-    assert_eq!(limit.harness, Harness::OpenCode);
+    assert_eq!(limit.harness, HarnessId::new("opencode").unwrap());
     assert_eq!(limit.reason, ProviderLimitReason::RateLimit);
     assert_eq!(limit.provider.as_deref(), Some("openrouter"));
     assert_eq!(limit.model.as_deref(), Some("free-model"));
@@ -315,7 +315,7 @@ async fn hermes_adapter_full_turn_over_acp() {
 
 #[tokio::test]
 async fn engine_classifies_structured_acp_provider_limit_before_string_collapse() {
-    let engine = AcpEngine::for_harness(Harness::Claude);
+    let engine = AcpEngine::for_harness(HarnessId::new("claude").unwrap());
     let command = fake_prompt_error_command(json!({
         "error": "rate_limit",
         "error_details": { "retry_after_ms": 5_000 },
@@ -338,7 +338,7 @@ async fn engine_classifies_structured_acp_provider_limit_before_string_collapse(
     let AdapterInjectError::ProviderLimit(limit) = err else {
         panic!("expected provider limit, got {err:?}");
     };
-    assert_eq!(limit.harness, Harness::Claude);
+    assert_eq!(limit.harness, HarnessId::new("claude").unwrap());
     assert_eq!(limit.reason, ProviderLimitReason::RateLimit);
     assert_eq!(limit.provider.as_deref(), Some("anthropic"));
     assert_eq!(limit.model.as_deref(), Some("claude-opus"));
@@ -351,7 +351,7 @@ async fn engine_classifies_structured_acp_provider_limit_before_string_collapse(
 
 #[tokio::test]
 async fn engine_preserves_structured_acp_server_error_as_retryable_provider_failure() {
-    let engine = AcpEngine::for_harness(Harness::Claude);
+    let engine = AcpEngine::for_harness(HarnessId::new("claude").unwrap());
     let command = fake_prompt_error_command(json!({
         "errorKind": "server_error"
     }));
@@ -371,7 +371,7 @@ async fn engine_preserves_structured_acp_server_error_as_retryable_provider_fail
     let AdapterInjectError::ProviderError(error) = err else {
         panic!("expected provider error, got {err:?}");
     };
-    assert_eq!(error.harness, Harness::Claude);
+    assert_eq!(error.harness, HarnessId::new("claude").unwrap());
     assert_eq!(error.reason, "server_error");
     assert_eq!(error.source, "claude.acp.prompt_error");
     assert!(error.retryable);
@@ -396,7 +396,7 @@ async fn hermes_adapter_classifies_structured_acp_provider_limit() {
     let AdapterInjectError::ProviderLimit(limit) = err else {
         panic!("expected provider limit, got {err:?}");
     };
-    assert_eq!(limit.harness, Harness::Hermes);
+    assert_eq!(limit.harness, HarnessId::new("hermes").unwrap());
     assert_eq!(limit.reason, ProviderLimitReason::QuotaExhausted);
     assert_eq!(limit.provider.as_deref(), Some("openai"));
     assert_eq!(limit.model.as_deref(), Some("gpt-5"));
@@ -431,7 +431,7 @@ async fn hermes_observed_empty_completion_fails_closed() {
     let AdapterInjectError::OperatorAction(action) = err else {
         panic!("expected operator-action settlement, got {err:?}");
     };
-    assert_eq!(action.harness, Harness::Hermes);
+    assert_eq!(action.harness, HarnessId::new("hermes").unwrap());
     assert_eq!(action.source, "hermes.acp.empty_completion");
 }
 
@@ -585,7 +585,7 @@ async fn observed_engine_inject_rejects_quiescence_without_terminal_response() {
     std::env::set_var("NEXUS_ACP_TURN_TIMEOUT_SECS", "1");
     std::env::set_var("NEXUS_ACP_QUIESCENCE_MS", "100");
 
-    let engine = AcpEngine::for_harness(Harness::OpenCode);
+    let engine = AcpEngine::for_harness(HarnessId::new("opencode").unwrap());
     let cmd = HarnessCommand {
         program: FAKE_HARNESS.to_string(),
         args: vec![],
@@ -634,7 +634,7 @@ async fn hermes_observed_engine_settles_rendered_reply_via_quiescence() {
     std::env::set_var("NEXUS_ACP_TURN_TIMEOUT_SECS", "2");
     std::env::set_var("NEXUS_ACP_QUIESCENCE_MS", "100");
 
-    let engine = AcpEngine::for_harness(Harness::Hermes);
+    let engine = AcpEngine::for_harness(HarnessId::new("hermes").unwrap());
     let cmd = HarnessCommand {
         program: FAKE_HARNESS.to_string(),
         args: vec![],
@@ -690,7 +690,7 @@ async fn hermes_observed_engine_settles_rendered_reply_via_quiescence() {
 async fn hermes_busy_queue_ack_waits_for_prompt_promotion_before_delivery() {
     std::env::set_var("NEXUS_ACP_QUIESCENCE_MS", "100");
 
-    let engine = AcpEngine::for_harness(Harness::Hermes);
+    let engine = AcpEngine::for_harness(HarnessId::new("hermes").unwrap());
     let cmd = HarnessCommand {
         program: FAKE_HARNESS.to_string(),
         args: vec![],
@@ -746,7 +746,7 @@ async fn hermes_busy_queue_ack_waits_for_prompt_promotion_before_delivery() {
 async fn hermes_resume_replay_cannot_settle_the_next_observed_prompt() {
     std::env::set_var("NEXUS_ACP_LOAD_REPLAY_SETTLE_MS", "100");
 
-    let engine = AcpEngine::for_harness(Harness::Hermes);
+    let engine = AcpEngine::for_harness(HarnessId::new("hermes").unwrap());
     let cmd = HarnessCommand {
         program: FAKE_HARNESS.to_string(),
         args: vec![],

@@ -1,7 +1,7 @@
 //! Codex-specific `nexus-bus` skill + SessionStart hook bootstrap.
 //!
 //! `install(cwd)` is the exact equivalent of the old
-//! `adapter::bootstrap::install(cwd, Harness::Codex)`: it writes the `nexus-bus` skill into
+//! the legacy Codex bootstrap installer: it writes the `nexus-bus` skill into
 //! `<cwd>/.codex/skills/nexus-bus/SKILL.md`, writes the bootstrap shell script into
 //! `<cwd>/.nexus/bootstrap-register.sh`, and writes the SessionStart hook into
 //! `<cwd>/.codex/hooks.json`. All three operations are guarded by the same
@@ -18,7 +18,7 @@ pub const SKILL_MD: &str = include_str!("skill.md");
 
 /// Install all launch-local bootstrap files for a Codex agent launched in `cwd`.
 ///
-/// Equivalent to the old `adapter::bootstrap::install(cwd, Harness::Codex)`.
+/// Equivalent to the old Codex arm in the shared bootstrap installer.
 /// Respects the same env-flag escape hatches:
 /// - `NEXUS_SKIP_AGENT_BOOTSTRAP_INSTALL=1` → skip everything
 /// - `NEXUS_SKIP_AGENT_SKILL_INSTALL=1`     → skip the skill but still write hook + script

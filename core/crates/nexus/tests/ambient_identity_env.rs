@@ -1,5 +1,5 @@
 use nexus::cli::ambient::with_test_env_vars;
-use nexus_contracts::{Harness, Kind, Tier};
+use nexus_contracts::{Kind, Tier};
 
 #[test]
 fn ambient_identity_reads_human_kind_and_admin_tier() {
@@ -17,7 +17,7 @@ fn ambient_identity_reads_human_kind_and_admin_tier() {
             assert_eq!(identity.name.as_deref(), Some("Alex Morgan"));
             assert_eq!(identity.client_key, "ck_human");
             assert_eq!(identity.project, "default");
-            assert_eq!(identity.harness, Harness::Other);
+            assert_eq!(identity.harness, hid("other"));
             assert_eq!(identity.tier, Tier::Admin);
             assert_eq!(identity.kind, Some(Kind::Human));
         },
@@ -43,7 +43,7 @@ fn ambient_identity_prefers_stable_session_id_over_client_key() {
             assert_eq!(identity.client_key, "ck_human");
             assert_eq!(identity.harness_session_id, "stable-runtime-session");
             assert_eq!(identity.project, "default");
-            assert_eq!(identity.harness, Harness::Other);
+            assert_eq!(identity.harness, hid("other"));
             assert_eq!(identity.tier, Tier::Admin);
             assert_eq!(identity.kind, Some(Kind::Human));
         },
@@ -92,7 +92,7 @@ fn ambient_identity_accepts_staged_agent_id_without_name() {
             assert_eq!(identity.client_key, "ck_staged");
             assert_eq!(identity.harness_session_id, "s_staged");
             assert_eq!(identity.project, "default");
-            assert_eq!(identity.harness, Harness::Codex);
+            assert_eq!(identity.harness, hid("codex"));
             assert_eq!(identity.tier, Tier::Agent);
             assert_eq!(identity.kind, Some(Kind::Agent));
         },
@@ -135,4 +135,9 @@ fn ambient_identity_rejects_agent_id_without_client_key() {
             assert!(error.message.contains("NEXUS_CLIENT_KEY"));
         },
     );
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

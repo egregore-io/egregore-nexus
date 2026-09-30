@@ -2,7 +2,7 @@
 //
 // `registerHuman` creates or verifies a web-console human account, enqueues a
 // daemon-owned identity registration command (Kind::Human / Tier::Admin /
-// Harness::Other),
+// the open-set `other` harness id),
 // and persists a `human_session` row in the front door's own store
 // (webconsole.db). The durable `human_user.client_key` is stable across browser
 // sessions, so daemon registration resumes the same human identity instead of
@@ -17,7 +17,12 @@
 // on globals.
 import type { Client } from "@libsql/client";
 import { randomBytes, scrypt as scryptCb, timingSafeEqual } from "node:crypto";
-import { Harness, Tier, Kind, type RegisterResponse } from "@shared/types";
+import {
+  Tier,
+  Kind,
+  type HarnessId,
+  type RegisterResponse,
+} from "@shared/types";
 import type { CommandIntentSender, GatewayCallerIdentity } from "@server/api/http";
 import { humanPrincipalAttributes } from "@server/auth/principal";
 import { COMMAND_KINDS } from "@server/command/ingress";
@@ -26,6 +31,7 @@ const SCRYPT_N = 16_384;
 const SCRYPT_R = 8;
 const SCRYPT_P = 1;
 const PASSWORD_KEY_BYTES = 32;
+const HUMAN_HARNESS = "other" satisfies HarnessId;
 
 function normalizeName(name: string): string {
   return name.trim().toLowerCase();
@@ -190,7 +196,7 @@ export async function registerHuman(
     COMMAND_KINDS.identityRegister,
     {
       name: displayName,
-      harness: Harness.Other,
+      harness: HUMAN_HARNESS,
       harnessSessionId: `hs_${clientKey}`,
       project,
       clientKey,

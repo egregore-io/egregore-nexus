@@ -55,9 +55,9 @@ use nexus_contracts::{
     AgentRuntimeListRequest, AgentRuntimeListResponse, AgentShowRequest, AgentShowResponse,
     AgentTurnExecutionPort, AssignProjectRequest, AssignProjectResponse, AssignRoleRequest,
     AssignRoleResponse, BusPort, Caller, ContractError, DispatchPort, EventSink, GrantTierRequest,
-    GrantTierResponse, Harness, IdentityPort, Kind, Message, MetadataResponse, MetadataSetRequest,
-    NotifyPort, PushRequest, PushResponse, ReadRequest, SearchPort, SpawnRequest, SpawnResponse,
-    Tier, WsEvent,
+    GrantTierResponse, HarnessId, IdentityPort, Kind, Message, MetadataResponse,
+    MetadataSetRequest, NotifyPort, PushRequest, PushResponse, ReadRequest, SearchPort,
+    SpawnRequest, SpawnResponse, Tier, WsEvent,
 };
 use nexus_dispatch::{AgentRegistry, Bell};
 use nexus_harness_core::HeadedRuntimeKind;
@@ -109,7 +109,7 @@ pub use crate::daemon::services::runtime_helpers::{
 use crate::daemon::services::source::SourceService;
 pub use crate::daemon::services::ws_sink::WsSink;
 use crate::daemon::transcript_archive::{archive_claude_once, archive_codex_once};
-use crate::harness_registry::harness_registry;
+use crate::harness_registry::harness_registry_by_id;
 
 const PENDING_RESPAWN_BASE_BACKOFF_MS: i64 = 30_000;
 const PENDING_RESPAWN_MAX_BACKOFF_MS: i64 = 5 * 60_000;
@@ -174,7 +174,7 @@ pub(crate) struct RegisterRuntimeRequest<'a> {
     agent_id: &'a str,
     name: Option<&'a str>,
     project: &'a str,
-    kind: Harness,
+    kind: HarnessId,
     role: Option<String>,
     client_key: &'a str,
     cwd: Option<String>,
@@ -188,7 +188,7 @@ pub(crate) struct RegisteredRuntime {
     agent_id: String,
     name: Option<String>,
     project: String,
-    kind: Harness,
+    kind: HarnessId,
     role: Option<String>,
     cwd: Option<String>,
 }
@@ -361,6 +361,7 @@ impl AppState {
         let mut registry = nexus_agent::AdapterRegistry::with_builtins();
         nexus_harness_claude::register(&mut registry);
         nexus_harness_codex::register(&mut registry);
+        crate::spawn_spec::install_spawn_specs(&mut registry);
         Self::wire_with_registry(store, config, registry)
     }
 
@@ -470,6 +471,7 @@ impl AppState {
         let mut registry = AdapterRegistry::with_builtins();
         nexus_harness_claude::register(&mut registry);
         nexus_harness_codex::register(&mut registry);
+        crate::spawn_spec::install_spawn_specs(&mut registry);
         let agent_svc = Arc::new(Agent::new(registry, identity.clone(), events.clone()));
 
         // (3) Build the PTY supervisor.
@@ -730,7 +732,7 @@ impl AppState {
         format!("nexus_ck_{}", Self::random_suffix())
     }
 
-    fn harness_to_store(harness: Harness) -> String {
+    fn harness_to_store(harness: HarnessId) -> String {
         IdentityAdminService::harness_to_store(harness)
     }
 

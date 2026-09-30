@@ -17,7 +17,7 @@ use nexus_contracts::{
     StatusResponse, SubscribeRequest, SubscribeResponse, ThreadListResponse, ThreadMemberRequest,
     ThreadMembersRequest, ThreadMembersResponse, TopicListResponse, UnsubscribeRequest, Whoami,
 };
-use nexus_contracts::{Harness, SpawnIdentityPolicy, Tier};
+use nexus_contracts::{SpawnIdentityPolicy, Tier};
 use nexus_harness_claude::storage::{ClaudeRuntimeLaunch, ClaudeRuntimeStateRepo};
 use nexus_harness_codex::storage::{CodexRuntimeLaunch, CodexRuntimeStateRepo};
 use nexus_store::repos::{
@@ -319,7 +319,7 @@ fn offline_row() -> NewSession {
 
 fn spawn_request() -> SpawnRequest {
     SpawnRequest {
-        kind: Harness::Codex,
+        kind: hid("codex"),
         name: Some(AGENT_NAME.into()),
         identity_policy: None,
         cwd: Some("/tmp/new-cwd".into()),
@@ -335,7 +335,7 @@ fn spawn_request() -> SpawnRequest {
 
 fn id_launch_request(agent_id: &str) -> SpawnRequest {
     SpawnRequest {
-        kind: Harness::Codex,
+        kind: hid("codex"),
         name: Some(agent_id.into()),
         identity_policy: None,
         cwd: Some("/tmp/should-not-replace-existing-cwd".into()),
@@ -408,7 +408,7 @@ async fn stamp_session_agent_id(store: &Store, session_id: &str, agent_id: &str)
 
 fn codex_resume_request(name: &str) -> SpawnRequest {
     SpawnRequest {
-        kind: Harness::Codex,
+        kind: hid("codex"),
         name: Some(name.into()),
         identity_policy: None,
         cwd: Some("/tmp/codex-cwd".into()),
@@ -424,7 +424,7 @@ fn codex_resume_request(name: &str) -> SpawnRequest {
 
 fn codex_resume_request_without_name() -> SpawnRequest {
     SpawnRequest {
-        kind: Harness::Codex,
+        kind: hid("codex"),
         name: None,
         identity_policy: Some(SpawnIdentityPolicy::Implicit),
         cwd: Some("/tmp/codex-cwd".into()),
@@ -440,7 +440,7 @@ fn codex_resume_request_without_name() -> SpawnRequest {
 
 fn claude_resume_request(name: &str) -> SpawnRequest {
     SpawnRequest {
-        kind: Harness::Claude,
+        kind: hid("claude"),
         name: Some(name.into()),
         identity_policy: None,
         cwd: Some("/tmp/claude-cwd".into()),
@@ -456,7 +456,7 @@ fn claude_resume_request(name: &str) -> SpawnRequest {
 
 fn opencode_resume_request(name: &str) -> SpawnRequest {
     SpawnRequest {
-        kind: Harness::OpenCode,
+        kind: hid("opencode"),
         name: Some(name.into()),
         identity_policy: None,
         cwd: Some("/tmp/opencode-cwd".into()),
@@ -589,7 +589,7 @@ async fn explicit_launch_rejects_cross_project_name_collision() {
     let err = state
         .launch_agent(
             SpawnRequest {
-                kind: Harness::Claude,
+                kind: hid("claude"),
                 name: Some("dylan".into()),
                 identity_policy: Some(SpawnIdentityPolicy::Implicit),
                 cwd: Some("/tmp/implicit-cwd".into()),
@@ -1175,7 +1175,7 @@ async fn daemon_launch_without_cwd_uses_stable_agent_id_fallback_workspace() {
     let state = AppState::wire_pty(store.clone(), &Config::default());
     let name = "claude-daemon-fallback-cwd";
     let request = SpawnRequest {
-        kind: Harness::Claude,
+        kind: hid("claude"),
         name: Some(name.into()),
         identity_policy: Some(SpawnIdentityPolicy::ExplicitName),
         cwd: None,
@@ -1794,4 +1794,9 @@ fn cleanup_archive(path: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::remove_dir_all(parent);
     }
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

@@ -18,7 +18,7 @@ use nexus_common::process_ids::runtime_process_ids_for_pid;
 use nexus_common::RuntimeProcessIds;
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::EventSink;
-use nexus_contracts::Harness;
+use nexus_contracts::HarnessId;
 use nexus_dispatch::Bell;
 use nexus_harness_claude::native::bridge::{
     write_launch_settings_with_identity, ClaudeNativeBridgePaths,
@@ -57,7 +57,7 @@ use crate::daemon::opencode_plugin_bridge::{
 };
 use crate::daemon::pty_transport::PtyTransport;
 use crate::daemon::terminal_socket::{TerminalSocketEndpoint, TerminalSocketRegistry};
-use crate::harness_registry::harness_registry;
+use crate::harness_registry::harness_registry_by_id;
 
 const OPENCODE_PLUGIN_READY_TIMEOUT: Duration = Duration::from_secs(75);
 const OPENCODE_PLUGIN_READY_POLL: Duration = Duration::from_millis(200);
@@ -544,24 +544,24 @@ impl Default for PtySupervisor {
 
 /// The interactive binary name for a harness kind. `claude`/`codex` run native TUIs in a PTY;
 /// other kinds have no PTY-native binary (Pi/Other → ACP path), so this returns `None`.
-pub fn harness_program(kind: Harness) -> Option<&'static str> {
-    let program = harness_registry(kind).program();
+pub fn harness_program(kind: &HarnessId) -> Option<&'static str> {
+    let program = harness_registry_by_id(kind).program();
     (!program.is_empty()).then_some(program)
 }
 
-pub fn harness_agent_token(kind: Harness) -> &'static str {
-    harness_registry(kind).agent_token()
+pub fn harness_agent_token(kind: &HarnessId) -> &'static str {
+    harness_registry_by_id(kind).agent_token()
 }
 
-pub fn headed_runtime_kind(kind: Harness) -> HeadedRuntimeKind {
-    harness_registry(kind).headed_runtime_kind()
+pub fn headed_runtime_kind(kind: &HarnessId) -> HeadedRuntimeKind {
+    harness_registry_by_id(kind).headed_runtime_kind()
 }
 
-fn require_headed_harness(kind: Harness) -> Result<&'static dyn HarnessContract, PtyError> {
-    let harness = harness_registry(kind);
+fn require_headed_harness(kind: &HarnessId) -> Result<&'static dyn HarnessContract, PtyError> {
+    let harness = harness_registry_by_id(kind);
     if harness.program().is_empty() {
         return Err(PtyError::Spawn(format!(
-            "harness {kind:?} has no headed TUI program"
+            "harness {kind} has no headed TUI program"
         )));
     }
     Ok(harness)
@@ -701,7 +701,7 @@ impl PtySupervisor {
     pub async fn launch_headed_pty(
         &self,
         session: &SessionId,
-        kind: Harness,
+        kind: &HarnessId,
         agent_id: &str,
         name: Option<&str>,
         project: &str,
@@ -857,7 +857,7 @@ impl PtySupervisor {
     pub async fn launch_headed_raw_pty(
         &self,
         session: &SessionId,
-        kind: Harness,
+        kind: &HarnessId,
         agent_id: &str,
         name: Option<&str>,
         project: &str,
@@ -1038,7 +1038,7 @@ impl PtySupervisor {
     pub async fn respawn_headed_pty(
         &self,
         session: &SessionId,
-        kind: Harness,
+        kind: &HarnessId,
         name: &str,
         project: &str,
         client_key: &str,

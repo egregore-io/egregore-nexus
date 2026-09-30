@@ -5,7 +5,7 @@ use nexus_agent::{Adapter, AdapterRegistry, MockAdapter};
 use nexus_common::Config;
 use nexus_contracts::ids::ThreadId;
 use nexus_contracts::{
-    ArchiveThreadRequest, CreateThreadRequest, DeleteThreadRequest, Harness, InboxSubscribeRequest,
+    ArchiveThreadRequest, CreateThreadRequest, DeleteThreadRequest, InboxSubscribeRequest,
     InboxSubscriptionAckRequest, InboxSubscriptionNextRequest, InboxSubscriptionNextResponse, Kind,
     MetadataEntityKind, MetadataSetRequest, NotifyCommandRequest, NotifyRequest, NotifySendRequest,
     NotifyTarget, Presence, PushRequest, RegisterRequest, RegisterResponse, Request, SendRequest,
@@ -42,7 +42,7 @@ async fn test_state_with_notify_secret_and_mock() -> (AppState, MockAdapter) {
     let mut registry = AdapterRegistry::new();
     let adapter = mock.clone();
     registry.register(
-        Harness::Claude,
+        &hid("claude"),
         Arc::new(move |_cwd| Arc::new(adapter.clone()) as Arc<dyn Adapter>),
     );
     (AppState::wire_with_registry(store, &config, registry), mock)
@@ -52,7 +52,7 @@ fn human_register(name: &str, client_key: &str) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(name.into()),
-        harness: Harness::Other,
+        harness: hid("other"),
         harness_session_id: format!("hs_{client_key}"),
         project: "default".into(),
         client_key: client_key.into(),
@@ -68,7 +68,7 @@ fn agent_register(name: &str, client_key: &str) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(name.into()),
-        harness: Harness::Other,
+        harness: hid("other"),
         harness_session_id: format!("hs_{client_key}"),
         project: "default".into(),
         client_key: client_key.into(),
@@ -1157,7 +1157,7 @@ async fn verified_notification_command_reclaim_reuses_the_routed_message_and_del
     let recipient = state
         .launch_agent(
             SpawnRequest {
-                kind: Harness::Claude,
+                kind: hid("claude"),
                 name: Some("notify-recipient".into()),
                 identity_policy: None,
                 cwd: None,
@@ -1867,4 +1867,9 @@ async fn reclaimed_keyless_local_source_command_uses_its_command_id_once() {
         row.get::<String>(2).unwrap(),
         "source-command:cmd_local_source_reclaim"
     );
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

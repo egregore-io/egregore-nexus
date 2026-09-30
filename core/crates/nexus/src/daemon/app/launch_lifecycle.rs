@@ -143,7 +143,7 @@ impl AppState {
         let vars = crate::initial_prompt::InitialPromptVars {
             name: registered.name.clone(),
             role: registered.role.clone(),
-            harness: harness_token(registered.kind).to_string(),
+            harness: harness_token(&registered.kind).to_string(),
             agent_id: registered.agent_id.clone(),
             session_id: registered.session.0.clone(),
             runtime_id: registered.session.0.clone(),
@@ -157,7 +157,7 @@ impl AppState {
                 runtime_id: registered.session.0.clone(),
                 agent_id: registered.agent_id.clone(),
                 session_id: registered.session.0.clone(),
-                harness: harness_token(registered.kind).to_string(),
+                harness: harness_token(&registered.kind).to_string(),
                 template: template.to_string(),
                 rendered_prompt: rendered_prompt.clone(),
                 client_message_id: client_message_id.clone(),
@@ -186,7 +186,7 @@ impl AppState {
         agent_id: &str,
         name: Option<&str>,
         project: &str,
-        kind: Harness,
+        kind: HarnessId,
         role: Option<String>,
         cwd: Option<String>,
     ) -> RegisteredRuntime {
@@ -213,7 +213,7 @@ impl AppState {
                 "clientMessageId": prepared.client_message_id,
                 "source": "initial_prompt",
                 "name": registered.name,
-                "harness": harness_token(registered.kind),
+                "harness": harness_token(&registered.kind),
                 "runtimeId": registered.session.0,
             }),
         }
@@ -382,7 +382,7 @@ impl AppState {
                 agent_key,
                 Some(name),
                 project,
-                kind,
+                kind.clone(),
                 client_key,
                 row.cwd.clone(),
             );

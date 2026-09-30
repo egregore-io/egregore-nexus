@@ -7,7 +7,7 @@ use nexus_agent::{
 };
 use nexus_contracts::{
     codes, AgentTurnExecutionPort, AgentUpdateKind, AssignProjectResponse, BatchCounts,
-    BatchMessage, Caller, ContractError, EventSink, Harness, HeartbeatResponse, IdentityPort,
+    BatchMessage, Caller, ContractError, EventSink, HarnessId, HeartbeatResponse, IdentityPort,
     InjectError, Kind, MemberListRequest, MemberListResponse, NexusBatch, ProviderLimitReason,
     RegisterRequest, RegisterResponse, RemoveRequest, Scope, SessionId, SpawnRequest,
     StatusRequest, StatusResponse, Whoami, WsEvent,
@@ -184,13 +184,13 @@ async fn adapter_init_failure_surfaces_errored_status_and_retains_session() {
     let failing = MockAdapter::new();
     failing.fail_open_session("acp handshake refused");
     registry.register(
-        Harness::Claude,
+        &HarnessId::new("claude").unwrap(),
         Arc::new(move |_cwd| Arc::new(failing.clone()) as Arc<dyn Adapter>),
     );
     let agent = Agent::new(registry, Arc::new(StubIdentity), Arc::new(sink.clone()));
 
     let req = SpawnRequest {
-        kind: Harness::Claude,
+        kind: HarnessId::new("claude").unwrap(),
         name: Some("ben".into()),
         identity_policy: None,
         cwd: None,
@@ -371,7 +371,7 @@ async fn observed_bus_inject_emits_user_input_before_reply_stream() {
 async fn observed_inject_preserves_adapter_provider_limit() {
     let (agent, mock, _sink, session) = agent_with_bound_mock();
     mock.fail_inject_provider_limit(AdapterProviderLimit {
-        harness: Harness::Claude,
+        harness: HarnessId::new("claude").unwrap(),
         reason: ProviderLimitReason::RateLimit,
         reset_hint: None,
         provider: Some("anthropic".into()),
@@ -398,7 +398,7 @@ async fn observed_inject_preserves_adapter_provider_limit() {
         panic!("expected provider limit, got {err:?}");
     };
     assert_eq!(limit.session, session);
-    assert_eq!(limit.harness, Harness::Claude);
+    assert_eq!(limit.harness, HarnessId::new("claude").unwrap());
     assert_eq!(limit.reason, ProviderLimitReason::RateLimit);
     assert_eq!(limit.source, "test.structured_frame");
 }

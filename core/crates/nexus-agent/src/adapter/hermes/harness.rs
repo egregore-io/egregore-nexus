@@ -35,7 +35,7 @@
 use async_trait::async_trait;
 
 use nexus_common::NexusError;
-use nexus_contracts::{Harness, SteerCapability};
+use nexus_contracts::{HarnessId, SteerCapability};
 use nexus_harness_core::{native_harness_program, NativeProcessPlatform};
 
 use super::super::engine::{AcpEngine, HarnessCommand, LaunchCtx};
@@ -66,7 +66,9 @@ impl HermesAdapter {
         command.env = ctx.env.clone();
         Self {
             command,
-            engine: AcpEngine::for_harness(Harness::Hermes),
+            engine: AcpEngine::for_harness(
+                HarnessId::new("hermes").expect("builtin harness id is valid"),
+            ),
             ctx,
         }
     }
@@ -81,7 +83,9 @@ impl HermesAdapter {
         };
         Self {
             command,
-            engine: AcpEngine::for_harness(Harness::Hermes),
+            engine: AcpEngine::for_harness(
+                HarnessId::new("hermes").expect("builtin harness id is valid"),
+            ),
             ctx,
         }
     }
@@ -112,7 +116,7 @@ pub fn hermes_command(cwd: Option<String>) -> HarnessCommand {
         };
     }
     HarnessCommand {
-        program: native_harness_program(Harness::Hermes, NativeProcessPlatform::current())
+        program: native_harness_program("hermes", NativeProcessPlatform::current())
             .expect("supported harness has a native executable")
             .into(),
         args: vec!["acp".into(), "--accept-hooks".into()],

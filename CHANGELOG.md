@@ -29,6 +29,7 @@
   URL, log, restart, and stop commands.
 - Installation-aware `nexus update` with exclusive locking, exact npm/Cargo versions, service-state
   preservation, post-install verification, and exact-version rollback.
+- ACP-pure harness plug-ins through validated `<NEXUS_HOME>/harnesses/<id>.toml` spawn specs.
 
 ### Changed
 
@@ -43,6 +44,9 @@
   `@egregore/nexus-gateway` installs and exposes the CLI without a separate platform package.
 - Complete npm installs coordinate daemon and Gateway service registration in dependency order;
   missing facets are never downloaded implicitly.
+- Harness identity is an open validated token rather than a closed wire enum. Headed contracts and
+  headless adapter factories resolve through composition-root registries, while existing provider
+  behavior and wire spellings remain compatible.
 
 ### Fixed
 

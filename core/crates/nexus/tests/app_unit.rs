@@ -8,8 +8,8 @@ use nexus::daemon::app::{
     revive_route, teardown_route, AppState, LaunchRoute, ReviveRoute, TeardownRoute,
 };
 use nexus_common::{now, Config};
-use nexus_contracts::{Caller, Harness, Kind, Message, SessionId, SpawnRequest, Tier};
-use nexus_harness_core::{native_harness_program, HeadedRuntimeKind, NativeProcessPlatform};
+use nexus_contracts::{Caller, Kind, Message, SessionId, SpawnRequest, Tier};
+use nexus_harness_core::HeadedRuntimeKind;
 use nexus_store::repos::{Inbox, Messages, NativeThreadBindings, NewSession, Sessions};
 use nexus_store::types::SessionRow;
 use nexus_store::Store;
@@ -85,7 +85,7 @@ async fn launch_identity_without_name_stages_stable_id_only() {
     let state = AppState::wire(store, &Config::default());
     let session = SessionId("s_stage_launch".into());
     let req = SpawnRequest {
-        kind: Harness::Codex,
+        kind: hid("codex"),
         name: None,
         identity_policy: None,
         cwd: None,
@@ -130,7 +130,7 @@ async fn claude_daemon_revive_tail_uses_stored_native_resume_id() {
         .unwrap();
 
     let tail = state
-        .headed_revive_tail_for_row(&row, Harness::Claude)
+        .headed_revive_tail_for_row(&row, &hid("claude"))
         .await
         .unwrap();
 
@@ -145,7 +145,7 @@ async fn claude_daemon_revive_tail_rejects_missing_native_resume_id() {
     row.harness_session_id = None;
 
     let err = state
-        .headed_revive_tail_for_row(&row, Harness::Claude)
+        .headed_revive_tail_for_row(&row, &hid("claude"))
         .await
         .unwrap_err();
 
@@ -780,14 +780,14 @@ fn teardown_route_unknown_transport_is_pty() {
 /// respawn them as claude on revive).
 #[test]
 fn harness_from_token_resolves_each_runtime() {
-    assert_eq!(harness_from_token(Some("codex")), Harness::Codex);
-    assert_eq!(harness_from_token(Some("opencode")), Harness::OpenCode);
-    assert_eq!(harness_from_token(Some("hermes")), Harness::Hermes);
-    assert_eq!(harness_from_token(Some("pi")), Harness::Pi);
-    assert_eq!(harness_from_token(Some("other")), Harness::Other);
+    assert_eq!(harness_from_token(Some("codex")), hid("codex"));
+    assert_eq!(harness_from_token(Some("opencode")), hid("opencode"));
+    assert_eq!(harness_from_token(Some("hermes")), hid("hermes"));
+    assert_eq!(harness_from_token(Some("pi")), hid("pi"));
+    assert_eq!(harness_from_token(Some("other")), hid("other"));
     // Unknown / legacy / NULL → Claude (historical default for pre-label rows).
-    assert_eq!(harness_from_token(None), Harness::Claude);
-    assert_eq!(harness_from_token(Some("claude")), Harness::Claude);
+    assert_eq!(harness_from_token(None), hid("claude"));
+    assert_eq!(harness_from_token(Some("claude")), hid("claude"));
 }
 
 #[test]
@@ -825,10 +825,8 @@ fn headed_runtime_from_stored_agent_token_preserves_legacy_attach_behavior() {
 #[test]
 fn launch_route_headed_claude_pty_present() {
     assert_eq!(
-        launch_route(false, true, Harness::Claude),
-        LaunchRoute::Headed(
-            native_harness_program(Harness::Claude, NativeProcessPlatform::current()).unwrap(),
-        ),
+        launch_route(false, true, &hid("claude")),
+        LaunchRoute::Headed("claude"),
     );
 }
 
@@ -836,10 +834,8 @@ fn launch_route_headed_claude_pty_present() {
 #[test]
 fn launch_route_headed_codex_pty_present() {
     assert_eq!(
-        launch_route(false, true, Harness::Codex),
-        LaunchRoute::Headed(
-            native_harness_program(Harness::Codex, NativeProcessPlatform::current()).unwrap(),
-        ),
+        launch_route(false, true, &hid("codex")),
+        LaunchRoute::Headed("codex"),
     );
 }
 
@@ -847,7 +843,7 @@ fn launch_route_headed_codex_pty_present() {
 #[test]
 fn launch_route_headed_pi_no_tui_binary() {
     assert_eq!(
-        launch_route(false, true, Harness::Pi),
+        launch_route(false, true, &hid("pi")),
         LaunchRoute::NoTuiBinary,
     );
 }
@@ -856,7 +852,7 @@ fn launch_route_headed_pi_no_tui_binary() {
 #[test]
 fn launch_route_headless_claude_pty_present() {
     assert_eq!(
-        launch_route(true, true, Harness::Claude),
+        launch_route(true, true, &hid("claude")),
         LaunchRoute::Headless,
     );
 }
@@ -865,7 +861,7 @@ fn launch_route_headless_claude_pty_present() {
 #[test]
 fn launch_route_headed_claude_no_pty() {
     assert_eq!(
-        launch_route(false, false, Harness::Claude),
+        launch_route(false, false, &hid("claude")),
         LaunchRoute::Headless,
     );
 }
@@ -874,7 +870,7 @@ fn launch_route_headed_claude_no_pty() {
 #[test]
 fn launch_route_headless_claude_no_pty() {
     assert_eq!(
-        launch_route(true, false, Harness::Claude),
+        launch_route(true, false, &hid("claude")),
         LaunchRoute::Headless,
     );
 }
@@ -1251,4 +1247,9 @@ async fn show_and_token_on_missing_source_return_not_found() {
 
     let e3 = state.rotate_source(&caller, "no-such").await.unwrap_err();
     assert_eq!(e3.code, nexus_contracts::codes::NOT_FOUND);
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

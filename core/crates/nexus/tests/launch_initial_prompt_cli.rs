@@ -2,12 +2,12 @@ use nexus::cli::commands::lifecycle::{
     build_spawn_request, launch_mode, resolve_launch_cwd_for, resolve_launch_resume,
     validate_initial_prompt_launch, Mode,
 };
-use nexus_contracts::{Harness, SpawnIdentityPolicy};
+use nexus_contracts::SpawnIdentityPolicy;
 
 #[test]
 fn build_spawn_request_carries_initial_prompt_and_role() {
     let req = build_spawn_request(
-        Harness::Codex,
+        hid("codex"),
         Some("ada".into()),
         "unused-generated".into(),
         None,
@@ -28,7 +28,7 @@ fn build_spawn_request_carries_initial_prompt_and_role() {
 #[test]
 fn build_spawn_request_keeps_initial_prompt_empty_for_existing_launches() {
     let req = build_spawn_request(
-        Harness::Claude,
+        hid("claude"),
         Some("ben".into()),
         "unused-generated".into(),
         None,
@@ -46,7 +46,7 @@ fn build_spawn_request_keeps_initial_prompt_empty_for_existing_launches() {
 #[test]
 fn initial_prompt_rejects_codex_resume_before_daemon_request() {
     let resolved = resolve_launch_resume(
-        &Harness::Codex,
+        &hid("codex"),
         &["resume".to_string(), "019f3374-thread".to_string()],
     )
     .expect("codex resume tail resolves");
@@ -61,18 +61,18 @@ fn initial_prompt_rejects_codex_resume_before_daemon_request() {
 fn initial_prompt_rejects_native_resume_and_session_tails_before_daemon_request() {
     for (kind, args) in [
         (
-            Harness::Claude,
+            hid("claude"),
             vec!["--resume".to_string(), "claude-session".to_string()],
         ),
         (
-            Harness::OpenCode,
+            hid("opencode"),
             vec!["--session".to_string(), "opencode-session".to_string()],
         ),
         (
-            Harness::Hermes,
+            hid("hermes"),
             vec!["-s".to_string(), "hermes-session".to_string()],
         ),
-        (Harness::Claude, vec!["continue".to_string()]),
+        (hid("claude"), vec!["continue".to_string()]),
     ] {
         let resolved = resolve_launch_resume(&kind, &args).expect("native tail resolves");
         assert_eq!(
@@ -86,7 +86,7 @@ fn initial_prompt_rejects_native_resume_and_session_tails_before_daemon_request(
 #[test]
 fn initial_prompt_allows_fresh_native_launch_args() {
     let resolved = resolve_launch_resume(
-        &Harness::OpenCode,
+        &hid("opencode"),
         &[
             "--model".to_string(),
             "anthropic/claude-sonnet-4".to_string(),
@@ -103,16 +103,13 @@ fn initial_prompt_allows_fresh_native_launch_args() {
 #[test]
 fn claude_launch_without_explicit_cwd_keeps_cli_process_cwd() {
     let expected = std::env::current_dir().unwrap().to_str().map(String::from);
-    assert_eq!(
-        resolve_launch_cwd_for(&Harness::Claude, None, &[]),
-        expected
-    );
+    assert_eq!(resolve_launch_cwd_for(&hid("claude"), None, &[]), expected);
 }
 
 #[test]
 fn claude_launch_preserves_explicit_cwd() {
     assert_eq!(
-        resolve_launch_cwd_for(&Harness::Claude, Some("/work/claude-bianca".into()), &[]),
+        resolve_launch_cwd_for(&hid("claude"), Some("/work/claude-bianca".into()), &[]),
         Some("/work/claude-bianca".into())
     );
 }
@@ -122,7 +119,7 @@ fn claude_resume_without_explicit_cwd_keeps_cli_process_cwd_for_native_lookup() 
     let expected = std::env::current_dir().unwrap().to_str().map(String::from);
     assert_eq!(
         resolve_launch_cwd_for(
-            &Harness::Claude,
+            &hid("claude"),
             None,
             &["--resume".to_string(), "claude-native-session".to_string()],
         ),
@@ -133,5 +130,10 @@ fn claude_resume_without_explicit_cwd_keeps_cli_process_cwd_for_native_lookup() 
 #[test]
 fn non_claude_launch_without_explicit_cwd_keeps_cli_process_cwd_default() {
     let expected = std::env::current_dir().unwrap().to_str().map(String::from);
-    assert_eq!(resolve_launch_cwd_for(&Harness::Codex, None, &[]), expected);
+    assert_eq!(resolve_launch_cwd_for(&hid("codex"), None, &[]), expected);
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

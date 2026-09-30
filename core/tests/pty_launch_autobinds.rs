@@ -10,7 +10,7 @@ use std::sync::Arc;
 use nexus::daemon::{dispatch, AppState};
 use nexus_common::Config;
 use nexus_contracts::{
-    Caller, Harness, Kind, PromptRequest, RegisterRequest, RegisterResponse, Request, RequestId,
+    Caller, Kind, PromptRequest, RegisterRequest, RegisterResponse, Request, RequestId,
     SendRequest, SendTarget, SpawnRequest, Tier,
 };
 use nexus_store::repos::StreamEvents;
@@ -125,7 +125,7 @@ async fn launch_autobinds_pty_but_durable_dm_fails_before_raw_write() {
     let launched = state
         .launch_agent_with_program(
             SpawnRequest {
-                kind: Harness::Claude,
+                kind: hid("claude"),
                 name: Some("ada".into()),
                 identity_policy: None,
                 role: None,
@@ -159,7 +159,7 @@ async fn launch_autobinds_pty_but_durable_dm_fails_before_raw_write() {
         RegisterRequest {
             name: Some("ben".into()),
             agent_id: None,
-            harness: Harness::Claude,
+            harness: hid("claude"),
             harness_session_id: "hs_ben".into(),
             project: PROJECT.into(),
             client_key: "ck_ben".into(),
@@ -221,7 +221,7 @@ async fn passive_pty_text_reaches_stream_events() {
     let launched = state
         .launch_agent_with_program(
             SpawnRequest {
-                kind: Harness::Claude,
+                kind: hid("claude"),
                 name: Some("ada".into()),
                 identity_policy: None,
                 role: None,
@@ -288,4 +288,9 @@ async fn passive_pty_text_reaches_stream_events() {
         "marker '{marker}' must appear as a 'text' stream_events row: \
          PtyReplyReader must be wired into launch_agent_with_program"
     );
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

@@ -13,7 +13,7 @@ use nexus_agent::adapter::OpenCodeAdapter;
 use nexus_agent::{Adapter, AdapterRegistry, HermesAdapter};
 use nexus_common::Config;
 use nexus_contracts::{
-    Harness, Kind, RegisterRequest, SendRequest, SendTarget, SpawnRequest, Tier,
+    HarnessId, Kind, RegisterRequest, SendRequest, SendTarget, SpawnRequest, Tier,
 };
 use nexus_harness_claude::ClaudeAdapter;
 use nexus_harness_codex::CodexAdapter;
@@ -33,44 +33,44 @@ fn fake_command(env: Vec<(String, String)>) -> HarnessCommand {
 
 fn register_actual_adapter(
     registry: &mut AdapterRegistry,
-    harness: Harness,
+    harness: &HarnessId,
     command: HarnessCommand,
 ) {
-    match harness {
-        Harness::Claude => registry.register(
+    match harness.as_str() {
+        "claude" => registry.register(
             harness,
             Arc::new(move |_ctx| {
                 Arc::new(ClaudeAdapter::with_command(command.clone())) as Arc<dyn Adapter>
             }),
         ),
-        Harness::Codex => registry.register(
+        "codex" => registry.register(
             harness,
             Arc::new(move |_ctx| {
                 Arc::new(CodexAdapter::with_command(command.clone())) as Arc<dyn Adapter>
             }),
         ),
-        Harness::OpenCode => registry.register(
+        "opencode" => registry.register(
             harness,
             Arc::new(move |_ctx| {
                 Arc::new(OpenCodeAdapter::with_command(command.clone())) as Arc<dyn Adapter>
             }),
         ),
-        Harness::Hermes => registry.register(
+        "hermes" => registry.register(
             harness,
             Arc::new(move |_ctx| {
                 Arc::new(HermesAdapter::with_command(command.clone())) as Arc<dyn Adapter>
             }),
         ),
-        Harness::Pi | Harness::Other => panic!("not in the public v0.1 harness parity matrix"),
+        _ => panic!("not in the public v0.1 harness parity matrix"),
     }
 }
 
-async fn state_with_adapters(configs: &[(Harness, HarnessCommand)]) -> AppState {
+async fn state_with_adapters(configs: &[(HarnessId, HarnessCommand)]) -> AppState {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
     let mut registry = AdapterRegistry::new();
     for (harness, command) in configs {
-        register_actual_adapter(&mut registry, *harness, command.clone());
+        register_actual_adapter(&mut registry, harness, command.clone());
     }
     AppState::wire_with_registry(store, &Config::default(), registry)
 }
@@ -79,7 +79,7 @@ fn operator_request() -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some("parity-operator".into()),
-        harness: Harness::Other,
+        harness: hid("other"),
         harness_session_id: "parity-operator-native".into(),
         project: PROJECT.into(),
         client_key: "parity-operator-client".into(),
@@ -91,7 +91,7 @@ fn operator_request() -> RegisterRequest {
     }
 }
 
-fn spawn_request(harness: Harness, name: &str) -> SpawnRequest {
+fn spawn_request(harness: HarnessId, name: &str) -> SpawnRequest {
     SpawnRequest {
         kind: harness,
         name: Some(name.into()),
@@ -146,14 +146,14 @@ async fn wait_for_state(state: &AppState, message_id: &str, expected: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concrete_acp_adapters_deliver_unique_markers_once_without_cross_runtime_leak() {
     let harnesses = [
-        (Harness::Claude, "parity-claude", "PARITY-CLAUDE-71"),
-        (Harness::Codex, "parity-codex", "PARITY-CODEX-72"),
-        (Harness::OpenCode, "parity-opencode", "PARITY-OPENCODE-73"),
-        (Harness::Hermes, "parity-hermes", "PARITY-HERMES-74"),
+        (hid("claude"), "parity-claude", "PARITY-CLAUDE-71"),
+        (hid("codex"), "parity-codex", "PARITY-CODEX-72"),
+        (hid("opencode"), "parity-opencode", "PARITY-OPENCODE-73"),
+        (hid("hermes"), "parity-hermes", "PARITY-HERMES-74"),
     ];
     let configs: Vec<_> = harnesses
         .iter()
-        .map(|(harness, _, _)| (*harness, fake_command(vec![])))
+        .map(|(harness, _, _)| (harness.clone(), fake_command(vec![])))
         .collect();
     let state = state_with_adapters(&configs).await;
     state.identity.register(operator_request()).await.unwrap();
@@ -245,10 +245,10 @@ async fn concrete_acp_adapters_deliver_unique_markers_once_without_cross_runtime
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concrete_acp_adapter_provider_and_contract_errors_never_settle_delivered() {
     for (harness, token) in [
-        (Harness::Claude, "claude"),
-        (Harness::Codex, "codex"),
-        (Harness::OpenCode, "opencode"),
-        (Harness::Hermes, "hermes"),
+        (hid("claude"), "claude"),
+        (hid("codex"), "codex"),
+        (hid("opencode"), "opencode"),
+        (hid("hermes"), "hermes"),
     ] {
         for (error_data, expected_code) in [
             (
@@ -268,7 +268,7 @@ async fn concrete_acp_adapter_provider_and_contract_errors_never_settle_delivere
                 "FAKE_ACP_PROMPT_ERROR_DATA".into(),
                 error_data.to_string(),
             )]);
-            let state = state_with_adapters(&[(harness, command)]).await;
+            let state = state_with_adapters(&[(harness.clone(), command)]).await;
             state.identity.register(operator_request()).await.unwrap();
             let caller = state
                 .identity
@@ -278,7 +278,11 @@ async fn concrete_acp_adapter_provider_and_contract_errors_never_settle_delivere
             let mut events = state.ws.subscribe();
             let name = format!("{token}-{expected_code}");
             state
-                .launch_agent(spawn_request(harness, &name), PROJECT, Some(&caller))
+                .launch_agent(
+                    spawn_request(harness.clone(), &name),
+                    PROJECT,
+                    Some(&caller),
+                )
                 .await
                 .unwrap();
             let ack = state
@@ -319,4 +323,9 @@ async fn concrete_acp_adapter_provider_and_contract_errors_never_settle_delivere
             );
         }
     }
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

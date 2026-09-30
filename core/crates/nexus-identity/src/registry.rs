@@ -8,7 +8,7 @@ use nexus_store::repos::{Agents, NativeThreadBindings, NewSession, Sessions};
 use nexus_store::types::SessionRow;
 use nexus_store::Store;
 
-use crate::binding::{harness_str, is_live, kind_str, tier_str};
+use crate::binding::{is_live, kind_str, tier_str};
 
 /// The outcome of resolving a [`RegisterRequest`] against existing identity rows.
 pub(crate) enum RegisterOutcome {
@@ -44,7 +44,7 @@ pub(crate) async fn resolve_register(
     })?;
 
     if !req.harness_session_id.is_empty() {
-        let harness = harness_str(req.harness);
+        let harness = req.harness.as_str();
         if let Some(binding) = NativeThreadBindings::new(store)
             .find(harness, &req.harness_session_id)
             .await?
@@ -143,7 +143,7 @@ pub(crate) async fn resolve_register(
     let new = NewSession {
         session_id: new_session_id(),
         name: Some(req_name.to_string()),
-        agent: Some(harness_str(req.harness).to_string()),
+        agent: Some(req.harness.as_str().to_string()),
         kind: kind_str(req.kind).to_string(),
         role: req.role.clone(),
         tier: tier_str(req.tier).to_string(),

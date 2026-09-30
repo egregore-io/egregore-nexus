@@ -14,6 +14,7 @@
 //! emitted kinds, in order, must be: `commands, thinking, tool_call, tool_call, text`.
 
 mod common;
+use common::hid;
 
 use std::sync::Arc;
 
@@ -22,7 +23,7 @@ use nexus_agent::adapter::engine::HarnessCommand;
 use nexus_agent::{Adapter, AdapterRegistry};
 use nexus_common::Config;
 use nexus_contracts::{
-    Caller, Harness, Notification, Request, RequestId, SendRequest, SendTarget, SpawnRequest, Tier,
+    Caller, Notification, Request, RequestId, SendRequest, SendTarget, SpawnRequest, Tier,
 };
 use nexus_harness_codex::CodexAdapter;
 use nexus_store::Store;
@@ -55,13 +56,13 @@ async fn wire_real_passthrough() -> AppState {
 
     let mut registry = AdapterRegistry::new();
     registry.register(
-        Harness::Codex,
+        &hid("codex"),
         Arc::new(|_cwd| {
             Arc::new(CodexAdapter::with_command(fake_passthrough_command())) as Arc<dyn Adapter>
         }),
     );
     registry.register(
-        Harness::Claude,
+        &hid("claude"),
         Arc::new(|_cwd| {
             Arc::new(CodexAdapter::with_command(fake_passthrough_command())) as Arc<dyn Adapter>
         }),
@@ -151,7 +152,7 @@ async fn full_acp_stream_relays_as_ordered_tagged_agent_updates() {
 
     // (1) Launch a real-adapter agent (spawns the fake harness + ACP initialize + session/new).
     let spawn = SpawnRequest {
-        kind: Harness::Codex,
+        kind: hid("codex"),
         name: Some("worker1".into()),
         identity_policy: None,
         cwd: None,

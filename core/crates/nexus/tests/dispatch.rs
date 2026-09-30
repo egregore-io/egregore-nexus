@@ -430,7 +430,7 @@ async fn send_commits_before_a_cold_target_finishes_reviving() {
     let opens = slow.opens.clone();
     let mut registry = nexus_agent::AdapterRegistry::new();
     registry.register(
-        nexus_contracts::Harness::Claude,
+        &hid("claude"),
         Arc::new(move |_cwd| Arc::new(slow.clone()) as Arc<dyn nexus_agent::Adapter>),
     );
     let state = AppState::wire_with_registry(store, &nexus_common::Config::default(), registry);
@@ -439,7 +439,7 @@ async fn send_commits_before_a_cold_target_finishes_reviving() {
         .register(RegisterRequest {
             agent_id: None,
             name: Some("operator".into()),
-            harness: nexus_contracts::Harness::Other,
+            harness: hid("other"),
             harness_session_id: "native-operator".into(),
             project: "proj".into(),
             client_key: "ck-operator".into(),
@@ -456,7 +456,7 @@ async fn send_commits_before_a_cold_target_finishes_reviving() {
         .register(RegisterRequest {
             agent_id: None,
             name: Some("cold-claude".into()),
-            harness: nexus_contracts::Harness::Claude,
+            harness: hid("claude"),
             harness_session_id: "native-cold-claude".into(),
             project: "proj".into(),
             client_key: "ck-cold-claude".into(),
@@ -542,7 +542,7 @@ async fn registration_does_not_start_a_drain_loop_before_the_harness_is_live() {
         .register(RegisterRequest {
             agent_id: None,
             name: Some("operator".into()),
-            harness: nexus_contracts::Harness::Other,
+            harness: hid("other"),
             harness_session_id: "native-operator".into(),
             project: "proj".into(),
             client_key: "ck-operator".into(),
@@ -559,7 +559,7 @@ async fn registration_does_not_start_a_drain_loop_before_the_harness_is_live() {
         .register(RegisterRequest {
             agent_id: None,
             name: Some("opening-claude".into()),
-            harness: nexus_contracts::Harness::Claude,
+            harness: hid("claude"),
             harness_session_id: "native-opening".into(),
             project: "proj".into(),
             client_key: "ck-opening".into(),
@@ -786,7 +786,7 @@ async fn bad_params_returns_invalid_params() {
 async fn admin_method_from_agent_returns_unauthorized() {
     let state = mock_state().await;
     let params = serde_json::to_value(SpawnRequest {
-        kind: nexus_contracts::Harness::Claude,
+        kind: hid("claude"),
         name: Some("x".into()),
         identity_policy: None,
         cwd: None,
@@ -812,7 +812,7 @@ async fn admin_method_from_agent_returns_unauthorized() {
 async fn admin_spawn_uses_appstate_launch_path_not_admin_delegate() {
     let state = mock_state().await;
     let params = serde_json::to_value(SpawnRequest {
-        kind: nexus_contracts::Harness::Other,
+        kind: hid("other"),
         name: Some("admin-spawned".into()),
         identity_policy: None,
         cwd: None,
@@ -955,7 +955,7 @@ async fn every_admin_method_from_agent_returns_unauthorized_before_lookup() {
         (
             "admin.spawn",
             serde_json::to_value(SpawnRequest {
-                kind: nexus_contracts::Harness::Claude,
+                kind: hid("claude"),
                 name: Some("missing-agent".into()),
                 identity_policy: None,
                 cwd: None,
@@ -1502,7 +1502,7 @@ async fn admin_spawn_uses_daemon_launch_path_and_registers_member() {
             "admin.spawn",
             Some(
                 serde_json::to_value(SpawnRequest {
-                    kind: nexus_contracts::Harness::Other,
+                    kind: hid("other"),
                     name: Some("admin-spawned".into()),
                     identity_policy: None,
                     cwd: None,
@@ -1763,7 +1763,7 @@ async fn prompt_by_agent_id_rejects_cross_project_target_before_revive() {
 #[tokio::test]
 async fn ensure_in_workspace_moves_a_cross_workspace_agent() {
     use nexus_common::Config;
-    use nexus_contracts::{Harness, RegisterRequest};
+    use nexus_contracts::RegisterRequest;
 
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
@@ -1775,7 +1775,7 @@ async fn ensure_in_workspace_moves_a_cross_workspace_agent() {
         .register(RegisterRequest {
             agent_id: None,
             name: Some("carol".into()),
-            harness: Harness::Claude,
+            harness: hid("claude"),
             harness_session_id: "hs_carol".into(),
             project: "team".into(),
             client_key: "ck_carol".into(),
@@ -1796,4 +1796,9 @@ async fn ensure_in_workspace_moves_a_cross_workspace_agent() {
         .unwrap()
         .unwrap();
     assert_eq!(row.project, "default");
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

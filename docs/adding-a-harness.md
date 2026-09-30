@@ -1,209 +1,288 @@
 # Adding a harness
 
-A harness is an agent runtime that Nexus can launch, address, wake, and observe. v0.1.0 ships
-Claude Code, Codex, OpenCode, and Hermes adapters.
+Nexus identifies every agent runtime with an open-set
+[`nexus_contracts::HarnessId`]. A harness ID is a lowercase ASCII token matching
+`^[a-z][a-z0-9_-]{0,63}$`; it is not a closed enum. Adding an ID therefore does not require a
+wire-contract or generated-TypeScript change.
 
-A complete adapter supports the launch shapes the harness can actually provide and reports its
-capabilities truthfully. Nexus must not advertise native steering, headed attach, or resume when the
-adapter cannot perform it.
+The built-in adapters are `claude`, `codex`, `opencode`, and `hermes`. Integrate new providers
+through the registries below instead of adding a new `match` ladder across the daemon.
 
-## Common contract
+## Architecture
 
-Every harness integrates with the same boundaries:
+Harness behavior has two separate registries:
 
 ```text
-daemon launch/revive
-       │
-       ├─ headless adapter (ACP where supported)
-       └─ headed adapter (native bridge + raw PTY or tmux)
-                    │
-                    ▼
-          normalized agent.update stream
-                    │
-                    ▼
-        Gateway nexus/agui live views
+HarnessId
+   |
+   +-- contract registry -- headed program, launch policy, resume, slash commands
+   |
+   `-- adapter registry --- headless session, inject, stream, cancel, process lifecycle
 ```
 
-Raw terminal bytes travel on a separate terminal lane. Do not parse a full-screen TUI into
-canonical message history when the harness provides structured events.
+The contract registry lives at the `egregore-nexus` composition root because it may depend on all
+in-tree harness crates. The adapter registry lives in `nexus-agent` and maps a `HarnessId` to a
+factory. Both registries are keyed by the validated string token.
 
-## 1. Add the public harness token
+An unknown but valid ID is accepted by the contract layer and resolves to a generic non-headed
+contract. Launch still fails clearly unless an adapter factory was registered for that ID. There is
+no implicit provider fallback and no normalization to a built-in ID.
 
-Add the variant to `nexus_contracts::Harness` in
-`core/crates/nexus-contracts/src/enums.rs`, then update every compiler-enforced `match` site.
-Typical sites include:
+There are two integration paths:
 
-- CLI parsing under `core/crates/nexus/src/cli/`;
-- identity token conversion under `core/crates/nexus-identity/`;
-- adapter registration under `core/crates/nexus-agent/`;
-- headed program selection under `core/crates/nexus/src/daemon/`;
-- generated TypeScript contracts.
+1. **Spawn-spec manifest** for an ACP-pure, headless runtime. This is the runtime plug-in surface and
+   requires no Nexus rebuild.
+2. **Harness crate** for a provider that needs headed launch, native resume, bootstrap, a structured
+   bridge, or other provider-owned behavior. Rust harness crates are linked at build time; v0.1.4
+   does not define a dynamic Rust ABI.
 
-Regenerate and verify contracts:
+## Path 1: ACP spawn-spec manifest
+
+Use a manifest when the complete integration is “start this command and speak ACP over stdio.”
+Create `<NEXUS_HOME>/harnesses/<id>.toml`; the file stem is the harness ID.
+
+```toml
+[command]
+program = "goose"
+args = ["acp"]
+cwd = "/opt/goose"                # optional; launch cwd is used when omitted
+env = { GOOSE_MODE = "acp" }      # optional
+```
+
+Only `command.program` is required. Unknown fields and an empty program are rejected. At daemon
+startup, manifests are read in deterministic ID order and installed into both registries:
+
+- the contract side is a generic **non-headed** contract;
+- the adapter side uses the shared `AcpEngine` with the manifest command.
+
+The command belongs only to the ACP adapter. It is deliberately not advertised as a TUI program,
+so `nexus launch --tui <id>` fails closed. Launch it explicitly in headless mode:
 
 ```bash
-pnpm --dir gateway gen:contracts
-pnpm --dir gateway check:contracts
+nexus launch --headless --name goose-worker goose
 ```
 
-Never edit `gateway/src/shared/types/contracts.gen.ts` by hand.
+Manifest environment entries are applied first. Nexus then applies its per-runtime identity
+environment so a manifest cannot replace `NEXUS_AGENT_ID`, `NEXUS_CLIENT_KEY`, or the other
+daemon-issued launch values.
 
-## 2. Implement the adapter
+Invalid or unreadable manifests are logged and skipped independently. A missing manifest directory
+means no external harnesses. A runtime that needs hook installation, provider configuration,
+permission flags, or native session discovery has outgrown a manifest and should use a harness
+crate.
 
-Harness implementations live in `core/crates/harness/<name>/` or the corresponding adapter module
-under `core/crates/nexus-agent/src/adapter/` while older adapters are being split into crates.
+Relevant files:
 
-The adapter must define:
+| Purpose | Path |
+|---|---|
+| Manifest parser and composition-root installation | `core/crates/nexus/src/spawn_spec.rs` |
+| Generic ACP adapter | `core/crates/nexus-agent/src/adapter/spawn_spec.rs` |
+| Manifest parser regressions | `core/crates/nexus/tests/spawn_spec.rs` |
+| Adapter command regressions | `core/crates/nexus-agent/tests/spawn_spec.rs` |
 
-- the executable and argument builder;
-- environment isolation;
-- headless session creation and prompt injection;
-- structured event translation;
-- completion observation;
-- interrupt/steer behavior, if supported;
-- native resume discovery and invocation, if supported;
-- shutdown and child-process cleanup.
+## Path 2: code-owned harness crate
 
-Use the harness's native completion signal. A process staying alive, terminal text appearing, or a
-provider accepting input is not sufficient proof that the target context observed the message.
+Use a crate under `core/crates/harness/<name>/` when the integration has provider-specific
+behavior. Keep that behavior inside the crate and expose it through shared contracts.
 
-## 3. Support headed launches
+### 1. Implement the headed contract
 
-Headed runtimes use a daemon-owned raw PTY by default. tmux is an explicit backend. Preserve these
-properties in the runtime resurrection descriptor:
+Implement `nexus_harness_core::Harness`. The most important methods are:
 
-- harness;
-- headed mode;
-- selected backend;
-- working directory;
-- executable and compatible native arguments;
-- native resume correlation where the harness exposes one.
+| Method | Responsibility |
+|---|---|
+| `program` | Native headed executable, or `""` when the harness has no headed mode |
+| `agent_token` | Stable harness ID stored in runtime identity; normally override this explicitly |
+| `headed_runtime_kind` | Existing generic screen path or an in-tree structured bridge |
+| `resolve_tail` | Preserve provider-native argv or lift documented sidecar resume metadata |
+| `headed_cli_command` / `headed_pty_command` | Build the headed command without invoking it |
+| `launch_spec` | Resolve cwd isolation and provider-specific extra argv |
+| `resume_style` | Exact native resume-key handling, or unsupported |
+| `translate_slash_command` | Opt in only to native commands the provider actually supports |
 
-Prefer a structured native bridge for normalized model activity. The PTY/tmux byte stream exists
-for attachment and visual presentation.
+The default tail contract is verbatim pass-through. Do not add friendly Nexus aliases for native
+provider flags. The default slash-command contract is fail-fast unsupported.
 
-If the harness has no headed mode, reject `--tui` with a capability error. Do not silently launch a
-different shape.
+Return an empty `program()` for an ACP-only harness. A non-empty program makes headed launch and
+attach eligible, so it must name an executable that can actually run interactively on the current
+platform.
 
-## 4. Support headless launches
+### 2. Implement the headless adapter
 
-Headless adapters normally open an ACP session, inject one complete prompt, and translate the
-session update stream. If a harness uses another protocol, keep that protocol inside its adapter and
-emit the same Nexus contracts.
+Implement `nexus_agent::Adapter`, normally over the shared `AcpEngine`. The adapter owns:
 
-Per-runtime configuration must be isolated. Do not share writable session databases, config files,
-or native identity state between concurrent Nexus agents unless the upstream harness explicitly
-guarantees safe multi-session use.
+- process creation and cleanup;
+- ACP initialize and session create/load;
+- complete-prompt injection;
+- completion receipts and timeout classification;
+- update translation;
+- interrupt/steer behavior;
+- provider session correlation;
+- harness-specific bootstrap and configuration isolation.
 
-## 5. Bind identity and revival
+`LaunchCtx` supplies the working directory and daemon-issued identity environment. Do not inherit
+ambient `NEXUS_*`, provider-home, or another runtime's writable configuration.
 
-Nexus identity is stable across runtime replacement. The adapter provides runtime facts; the daemon
-owns the binding.
+Probe the provider's ACP MCP capabilities before injecting a stdio MCP server. Set
+`LaunchCtx::suppress_acp_mcp` when the provider does not accept it, and use the `nexus` CLI on the
+runtime `PATH` as the harness-neutral bus path.
 
-The durable descriptor includes the stable agent ID, harness, launch shape, backend, working
-directory, runtime credential binding, and native resume information. Project is optional metadata;
-it is not part of routing identity or authorization.
+### 3. Register both halves at the composition root
 
-On revival:
+Export a function like this from the harness crate:
 
-1. select the original launch shape;
-2. start or resume the native harness;
-3. prove the new runtime adopted the same Nexus identity;
-4. wait for the inbound bridge to become ready;
-5. inject the unsettled delivery exactly once;
-6. settle only after a completion/receipt signal defined by the adapter.
+```rust
+pub fn register(registry: &mut nexus_agent::AdapterRegistry) {
+    registry.register(
+        &nexus_contracts::HarnessId::new("acme").expect("valid built-in id"),
+        std::sync::Arc::new(|ctx| {
+            std::sync::Arc::new(AcmeAdapter::new(ctx)) as std::sync::Arc<dyn nexus_agent::Adapter>
+        }),
+    );
+}
+```
 
-If native resume data is unavailable, record that explicitly. Do not invent a correlation from a
-new session ID.
+Then wire the contract and adapter at the two explicit composition-root sites:
 
-## 6. Install bus participation
+| File | Change |
+|---|---|
+| `core/crates/nexus/src/harness_registry.rs` | Add the contract to `builtin_contracts()` |
+| `core/crates/nexus/src/daemon/app.rs` | Call the harness crate's `register()` while building the adapter registry |
 
-Every launched harness receives the `nexus` CLI on `PATH` plus session-scoped Nexus identity
-environment. The harness-specific bootstrap installs the `nexus-bus` instructions and, when the
-harness supports it, a stdio MCP entry.
+Do not add the ID to a contract enum; none exists. Do not hand-edit
+`gateway/src/shared/types/contracts.gen.ts`.
 
-Registration is idempotent for the daemon-issued client key. A harness must not copy another
-runtime's Nexus environment or reuse its writable home.
+## Runtime and identity invariants
 
-MCP is a client interface to the same daemon transport; it is not a second routing authority.
+The generic identity graph stays provider-neutral:
 
-## 7. Normalize session updates
+- `agents` owns the durable agent ID, mutable display name, role, tier, and metadata;
+- runtime rows own launch mode, harness ID, backend, cwd, process ledger, and lifecycle state;
+- messages, memberships, subscriptions, and grants resolve to stable agent IDs;
+- project remains metadata, not a routing or authorization authority.
 
-Emit structured `agent.update` frames for supported native events. At minimum, cover:
+Harness-specific resume and bridge state belongs to the harness crate or its sidecar repository, not
+in shared identity tables. Provider resume IDs are correlation keys, not Nexus identity.
 
-- accepted user input;
+On revive, preserve the original launch shape:
+
+1. resolve the stable agent and runtime descriptor;
+2. select the original headless/headed mode and terminal backend;
+3. reuse an exact native resume key only when the provider supports it;
+4. wait for the provider bridge to become ready;
+5. inject the unsettled delivery once;
+6. settle only after the adapter's completion/receipt signal.
+
+Never substitute “continue latest” for a missing exact resume key.
+
+## Message and activity boundaries
+
+Every harness uses the same high-level lanes:
+
+```text
+message delivery -> harness-safe injection -> normalized agent.update events
+                                      |
+                                      `-> raw PTY/tmux attach bytes (headed only)
+```
+
+Raw terminal bytes are ephemeral attach data, not canonical model text. Prefer a structured native
+bridge when the provider exposes one. The generic PTY reader is only a fallback for providers that
+do not expose structured activity.
+
+At minimum, normalized activity should cover:
+
+- accepted user input, once;
 - assistant text;
 - reasoning when exposed;
-- tool-call lifecycle;
-- usage/metadata when exposed;
-- turn completion;
-- terminal errors.
+- tool-call start/update/end;
+- usage or provider metadata when exposed;
+- turn completion and terminal failure.
 
-Tool updates must conform to [C-TOOL v1](tool-call-contract.md) using
-`nexus_contracts::ToolCallData` or an exactly compatible wire shape.
+Do not emit cumulative text snapshots as separate completed messages. Do not turn terminal redraws
+into accepted user input.
 
-Do not emit cumulative text snapshots as independent completed messages. Do not convert terminal
-redraws into user input. Accepted input should appear once.
+Tool events must conform to [C-TOOL v1](tool-call-contract.md): `tool` is the machine tool name and
+`input` is the structured argument object. Use `nexus_contracts::ToolCallData` where possible.
 
-## 8. Declare capabilities
+## Capabilities
 
-Capabilities are runtime-effective and caller-visible through Nexus contracts. Keep provider
-support separate from effective authorization.
-
-Relevant capabilities include:
+Report only behavior the live adapter can perform. Relevant capabilities include:
 
 - headless prompt injection;
 - headed attach;
 - native resume;
-- native steering;
+- native steer;
 - interrupt-and-send;
 - structured tool events;
 - raw terminal streaming.
 
-A terminal runtime may mask input capabilities until explicitly reactivated. Define that lifecycle
-instead of leaving the frontend to guess from presence alone.
+Presence alone is not an input capability. If a terminal runtime masks input or is inside a tool
+loop, expose that runtime state instead of asking the frontend to infer it.
 
-## 9. Required tests
+## Required verification
 
-Add focused tests before daemon wiring:
+Keep tests outside production source files. Add focused coverage for:
 
-- command and environment construction;
-- argument preservation;
-- session creation and prompt injection;
+- harness-ID validation and serialization;
+- registry lookup and unknown-ID failure behavior;
+- command, argv, cwd, and environment construction;
+- ACP create/load/inject/cancel;
+- accepted-input deduplication and completion receipts;
 - update translation and C-TOOL fields;
-- accepted-input deduplication;
-- completion receipt and timeout classification;
-- process cleanup;
-- native resume correlation;
-- raw PTY and tmux headed startup, when supported.
+- process cleanup and exact resume correlation;
+- raw PTY and tmux startup when headed mode is supported.
 
-Then add integration coverage for:
+Add integration coverage for:
 
 - launch and registration;
 - five direct-message turns;
-- shared-thread delivery;
-- explicit notifications;
+- a shared-thread turn;
 - offline wake in the original launch shape;
 - active-traffic daemon restart;
-- Gateway `nexus` and `agui` views;
-- terminal attach for each headed backend;
+- Gateway normalized-text and AG-UI views;
+- terminal attach for every supported headed backend;
 - zero unexplained dead-letter rows.
 
-The release matrix is documented in [Release regression](release-regression.md).
-
-## 10. Verification
-
-Run focused crate tests while developing, then the repository gates:
+Run the repository gates:
 
 ```bash
 scripts/check core-test-layout
+scripts/check release-identity
 scripts/check architecture
+scripts/check boundaries
 scripts/check rust-workspace
-scripts/check rust
 pnpm --dir gateway typecheck
 pnpm --dir gateway test
 pnpm --dir gateway build
+pnpm --dir gateway check:contracts
 ```
 
-Run live harness validation only in the resource-bounded disposable Docker environment. Never point
-adapter or resurrection tests at an operator's live Nexus home.
+Live provider and resurrection testing belongs in the resource-bounded disposable Docker validator.
+Never point it at an operator's live Nexus home.
+
+## File reference
+
+| Purpose | Path |
+|---|---|
+| Open harness identifier | `core/crates/nexus-contracts/src/harness.rs` |
+| Shared headed contract | `core/crates/harness/core/src/lib.rs` |
+| Headless adapter registry | `core/crates/nexus-agent/src/registry.rs` |
+| Contract registry | `core/crates/nexus/src/harness_registry.rs` |
+| Launch routing | `core/crates/nexus/src/daemon/app/launch_orchestration.rs` |
+| Headed supervisor | `core/crates/nexus/src/daemon/pty_supervisor.rs` |
+| Shared ACP engine | `core/crates/nexus-agent/src/adapter/engine.rs` |
+| PTY text fallback | `core/crates/nexus-pty/src/screen_text.rs` |
+| Gateway stream fidelity gate | `gateway/src/server/agui/streamFidelity.test.ts` |
+
+## Built-in status
+
+| Harness | Headless | Headed | Structured headed activity |
+|---|---|---|---|
+| Claude Code | yes | raw PTY or tmux | native hook/transcript forwarder |
+| Codex | yes | app-server-backed TUI | app-server notifications |
+| OpenCode | yes | native plugin + raw PTY or tmux viewer | native plugin events |
+| Hermes | yes | raw PTY or tmux | generic PTY fallback |
+
+This table describes the adapters shipped with Nexus. It does not make the identifier set closed.
+
+[`nexus_contracts::HarnessId`]: ../core/crates/nexus-contracts/src/harness.rs

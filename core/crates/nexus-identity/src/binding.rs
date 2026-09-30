@@ -4,25 +4,13 @@
 //! own the enum↔string mapping so the service layer never hand-stringifies.
 
 use nexus_common::NexusError;
-use nexus_contracts::enums::{Harness, Kind, Tier};
+use nexus_contracts::enums::{Kind, Tier};
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::Caller;
 use nexus_contracts::register::Whoami;
 use nexus_store::types::SessionRow;
 
 use crate::presence::presence_from_str;
-
-/// The harness/runtime label as it is stored on `sessions.agent` (display/addressing only).
-pub(crate) fn harness_str(h: Harness) -> &'static str {
-    match h {
-        Harness::Claude => "claude",
-        Harness::Codex => "codex",
-        Harness::OpenCode => "opencode",
-        Harness::Hermes => "hermes",
-        Harness::Pi => "pi",
-        Harness::Other => "other",
-    }
-}
 
 /// The tier token stored on `sessions.tier`.
 pub(crate) fn tier_str(t: Tier) -> &'static str {

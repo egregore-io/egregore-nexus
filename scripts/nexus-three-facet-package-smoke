@@ -164,11 +164,11 @@ if (gateway.name !== "@egregore/nexus-gateway" || gateway.private) process.exit(
 if (webui.name !== "@egregore/nexus-webui-workspace" || !webui.private) process.exit(1);
 if (cli.name !== "@egregore/nexus-cli" || cli.private) process.exit(1);
 if (nexus.name !== "@egregore/nexus" || nexus.private) process.exit(1);
-if ([gateway, webui, cli, nexus].some((pkg) => pkg.license !== "Apache-2.0" || pkg.version !== "0.1.2")) process.exit(1);
-if (gateway.dependencies?.["@egregore/nexus-cli"] !== "0.1.2") process.exit(1);
+if ([gateway, webui, cli, nexus].some((pkg) => pkg.license !== "Apache-2.0" || pkg.version !== "0.1.3")) process.exit(1);
+if (gateway.dependencies?.["@egregore/nexus-cli"] !== "0.1.3") process.exit(1);
 if (gateway.bin?.nexus !== "scripts/nexus.mjs") process.exit(1);
-if (nexus.dependencies?.["@egregore/nexus-cli"] !== "0.1.2") process.exit(1);
-if (nexus.dependencies?.["@egregore/nexus-gateway"] !== "0.1.2") process.exit(1);
+if (nexus.dependencies?.["@egregore/nexus-cli"] !== "0.1.3") process.exit(1);
+if (nexus.dependencies?.["@egregore/nexus-gateway"] !== "0.1.3") process.exit(1);
 ' "$ROOT"
 
 NEXUS_HOME="$TMP/nexus-home" NEXUS_DB_PATH="$TMP/nexus-home/nexus.db" \

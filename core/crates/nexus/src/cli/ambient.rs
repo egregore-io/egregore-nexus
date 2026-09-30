@@ -5,7 +5,7 @@
 //! parser separate lets the store-backed command-intent and read-view paths use the same identity
 //! without depending on a daemon transport.
 
-use nexus_contracts::{codes, AgentId, ContractError, Harness, Kind, RegisterRequest, Tier};
+use nexus_contracts::{codes, AgentId, ContractError, HarnessId, Kind, RegisterRequest, Tier};
 
 #[cfg(test)]
 const IDENTITY_ENV_KEYS: &[&str] = &[
@@ -53,14 +53,10 @@ pub fn identity_from_env_result() -> Result<Option<RegisterRequest>, ContractErr
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "default".into());
-    let harness = match std::env::var("NEXUS_AGENT").ok().as_deref() {
-        Some("codex") => Harness::Codex,
-        Some("opencode") => Harness::OpenCode,
-        Some("hermes") => Harness::Hermes,
-        Some("pi") => Harness::Pi,
-        Some("other") => Harness::Other,
-        _ => Harness::Claude,
-    };
+    let harness = std::env::var("NEXUS_AGENT")
+        .ok()
+        .and_then(|s| HarnessId::new(s).ok())
+        .unwrap_or_else(|| HarnessId::new("claude").expect("builtin harness id is valid"));
     let tier = match std::env::var("NEXUS_TIER").ok().as_deref() {
         Some("admin") => Tier::Admin,
         _ => Tier::Agent,

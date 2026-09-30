@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use nexus::daemon::{command_worker, AppState};
 use nexus_agent::{Adapter, AdapterInjectError, AdapterRegistry, MockAdapter, StreamEvent};
 use nexus_common::{Config, NexusError};
-use nexus_contracts::{Caller, Harness, Kind, PushRequest, RegisterRequest, SpawnRequest, Tier};
+use nexus_contracts::{Caller, Kind, PushRequest, RegisterRequest, SpawnRequest, Tier};
 use nexus_store::command_kinds;
 use nexus_store::repos::{Agents, CommandIntents, NewCommandIntent, Sessions, Sources, Topics};
 use nexus_store::Store;
@@ -50,7 +50,7 @@ async fn state_with_counting_fail_adapter(adapter: CountingFailOpenAdapter) -> A
 
     let mut registry = AdapterRegistry::new();
     registry.register(
-        Harness::Claude,
+        &hid("claude"),
         Arc::new(move |_cwd| Arc::new(adapter.clone()) as Arc<dyn Adapter>),
     );
     AppState::wire_with_registry(store, &Config::default(), registry)
@@ -62,7 +62,7 @@ async fn state_with_mock(mock: MockAdapter) -> AppState {
 
     let mut registry = AdapterRegistry::new();
     registry.register(
-        Harness::Claude,
+        &hid("claude"),
         Arc::new(move |_cwd| Arc::new(mock.clone()) as Arc<dyn Adapter>),
     );
     AppState::wire_with_registry(store, &Config::default(), registry)
@@ -72,7 +72,7 @@ fn operator_request() -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some("operator".into()),
-        harness: Harness::Other,
+        harness: hid("other"),
         harness_session_id: "source-wake-operator-native".into(),
         project: PROJECT.into(),
         client_key: "source-wake-operator-client".into(),
@@ -88,7 +88,7 @@ fn agent_request(name: &str, client_key: &str) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(name.into()),
-        harness: Harness::Claude,
+        harness: hid("claude"),
         harness_session_id: format!("native-{client_key}"),
         project: PROJECT.into(),
         client_key: client_key.into(),
@@ -102,7 +102,7 @@ fn agent_request(name: &str, client_key: &str) -> RegisterRequest {
 
 fn spawn_request(name: &str) -> SpawnRequest {
     SpawnRequest {
-        kind: Harness::Claude,
+        kind: hid("claude"),
         name: Some(name.into()),
         identity_policy: None,
         cwd: None,
@@ -439,4 +439,9 @@ async fn reclaimed_source_command_does_not_repeat_an_exhausted_revive() {
     assert_eq!(state_name, "error");
     assert_eq!(error_code.as_deref(), Some("target_unreachable"));
     assert_eq!(attempt_count, 0);
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

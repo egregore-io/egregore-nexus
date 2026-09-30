@@ -24,6 +24,7 @@
 //! echo arrives.
 
 mod common;
+use common::hid;
 
 use std::sync::Arc;
 
@@ -32,7 +33,7 @@ use nexus_agent::adapter::engine::HarnessCommand;
 use nexus_agent::{Adapter, AdapterRegistry};
 use nexus_common::Config;
 use nexus_contracts::{
-    Caller, Harness, Notification, Request, RequestId, SendRequest, SendTarget, SpawnRequest, Tier,
+    Caller, Notification, Request, RequestId, SendRequest, SendTarget, SpawnRequest, Tier,
 };
 use nexus_harness_codex::CodexAdapter;
 use nexus_store::Store;
@@ -76,13 +77,13 @@ async fn wire_real_against_failing_load_fake() -> AppState {
     store.migrate().await.unwrap();
     let mut registry = AdapterRegistry::new();
     registry.register(
-        Harness::Codex,
+        &hid("codex"),
         Arc::new(|_cwd| {
             Arc::new(CodexAdapter::with_command(fake_command_failing_load())) as Arc<dyn Adapter>
         }),
     );
     registry.register(
-        Harness::Claude,
+        &hid("claude"),
         Arc::new(|_cwd| {
             Arc::new(CodexAdapter::with_command(fake_command_failing_load())) as Arc<dyn Adapter>
         }),
@@ -100,11 +101,11 @@ async fn wire_real_against_fake() -> AppState {
     // Both kinds resolve to a real ACP adapter over the fake harness, so `launch <kind>` is
     // hermetic for either while still exercising the genuine open→inject→stream protocol path.
     registry.register(
-        Harness::Codex,
+        &hid("codex"),
         Arc::new(|_cwd| Arc::new(CodexAdapter::with_command(fake_command())) as Arc<dyn Adapter>),
     );
     registry.register(
-        Harness::Claude,
+        &hid("claude"),
         Arc::new(|_cwd| Arc::new(CodexAdapter::with_command(fake_command())) as Arc<dyn Adapter>),
     );
 
@@ -200,7 +201,7 @@ async fn dm_to_launched_real_adapter_agent_reaches_harness_as_session_prompt() {
     // (1) Launch a real-adapter agent named worker1 (spawns the fake harness + ACP initialize +
     // session/new under a daemon-minted session id; registers the member; spawns its EventLoop).
     let spawn = SpawnRequest {
-        kind: Harness::Codex,
+        kind: hid("codex"),
         name: Some("worker1".into()),
         identity_policy: None,
         cwd: None,
@@ -277,7 +278,7 @@ async fn boot_respawn_with_stale_resume_key_delivers_pending_dm() {
         RegisterRequest {
             name: Some("boss".into()),
             agent_id: None,
-            harness: Harness::Codex,
+            harness: hid("codex"),
             harness_session_id: "ck_boss".into(),
             project: DEMO.into(),
             client_key: "ck_boss".into(),
@@ -296,7 +297,7 @@ async fn boot_respawn_with_stale_resume_key_delivers_pending_dm() {
         RegisterRequest {
             name: Some("worker1".into()),
             agent_id: None,
-            harness: Harness::Codex,
+            harness: hid("codex"),
             harness_session_id: "stale-acp-session-uuid".into(),
             project: DEMO.into(),
             client_key: "ck_w1".into(),

@@ -1,0 +1,101 @@
+[claude]
+program = "claude"
+agent_token = "claude"
+headed_runtime_kind = ClaudeNative
+uses_structured_output = true
+attach_revivable = true
+resolve_tail [] = resume=None argv=[] requires_tui=false
+resolve_tail ["--model", "opus"] = resume=None argv=["--model", "opus"] requires_tui=true
+resolve_tail ["resume", "t-999"] = resume=None argv=["resume", "t-999"] requires_tui=true
+revive_tail = err(Claude revive requires an exact --resume <session_id>; refusing unsafe --continue)
+headed_cli_command = program="claude" args=["--mcp-config", "{\"mcpServers\":{\"nexus-bus\":{\"command\":\"/usr/bin/nexus\",\"args\":[\"mcp\",\"--as\",\"golden\",\"--project\",\"proj\",\"--client-key\",\"ck-1\",\"--agent\",\"claude\"]}}}", "--flag", "value"]
+headed_pty_command = program="claude" args=["--mcp-config", "{\"mcpServers\":{\"nexus-bus\":{\"command\":\"/usr/bin/nexus\",\"args\":[\"mcp\",\"--as\",\"golden\",\"--project\",\"proj\",\"--client-key\",\"ck-1\",\"--agent\",\"claude\"]}}}", "--permission-mode", "bypassPermissions", "--flag", "value"]
+slash "/compact" = InjectVerbatim
+slash "/compress" = InjectVerbatim
+slash "/compact now" = InjectVerbatim
+slash "/clear" = InjectVerbatim
+
+[codex]
+program = "codex"
+agent_token = "codex"
+headed_runtime_kind = CodexAppServer
+uses_structured_output = true
+attach_revivable = true
+resolve_tail [] = resume=None argv=[] requires_tui=false
+resolve_tail ["--model", "opus"] = resume=None argv=["--model", "opus"] requires_tui=true
+resolve_tail ["resume", "t-999"] = resume=Some("t-999") argv=[] requires_tui=true
+revive_tail = resume=None argv=[] requires_tui=false
+headed_cli_command = program="codex" args=["-c", "mcp_servers.nexus-bus.command=\"/usr/bin/nexus\"", "-c", "mcp_servers.nexus-bus.args=[\"mcp\", \"--as\", \"golden\", \"--project\", \"proj\", \"--client-key\", \"ck-1\", \"--agent\", \"codex\"]", "--flag", "value"]
+headed_pty_command = program="codex" args=["-c", "mcp_servers.nexus-bus={ command = \"/usr/bin/nexus\", args = [\"mcp\", \"--as\", \"golden\", \"--project\", \"proj\", \"--client-key\", \"ck-1\", \"--agent\", \"codex\"] }", "--dangerously-bypass-approvals-and-sandbox", "--flag", "value"]
+slash "/compact" = NativeCompact
+slash "/compress" = err(unsupported slash command /compress for codex)
+slash "/compact now" = err(unsupported slash command /compact for codex)
+slash "/clear" = err(unsupported slash command /clear for codex)
+
+[opencode]
+program = "opencode"
+agent_token = "opencode"
+headed_runtime_kind = OpenCodePlugin
+uses_structured_output = true
+attach_revivable = true
+resolve_tail [] = resume=None argv=[] requires_tui=false
+resolve_tail ["--model", "opus"] = resume=None argv=["--model", "opus"] requires_tui=true
+resolve_tail ["resume", "t-999"] = resume=None argv=["resume", "t-999"] requires_tui=true
+revive_tail = resume=None argv=[] requires_tui=false
+headed_cli_command = program="opencode" args=["--flag", "value"]
+headed_pty_command = program="opencode" args=["--flag", "value"]
+slash "/compact" = err(unsupported slash command /compact for opencode)
+slash "/compress" = err(unsupported slash command /compress for opencode)
+slash "/compact now" = err(unsupported slash command /compact for opencode)
+slash "/clear" = err(unsupported slash command /clear for opencode)
+
+[hermes]
+program = "hermes"
+agent_token = "hermes"
+headed_runtime_kind = HermesGateway
+uses_structured_output = true
+attach_revivable = true
+resolve_tail [] = resume=None argv=[] requires_tui=false
+resolve_tail ["--model", "opus"] = resume=None argv=["--model", "opus"] requires_tui=true
+resolve_tail ["resume", "t-999"] = resume=None argv=["resume", "t-999"] requires_tui=true
+revive_tail = resume=None argv=[] requires_tui=false
+headed_cli_command = program="hermes" args=["gateway", "run", "--flag", "value"]
+headed_pty_command = program="hermes" args=["gateway", "run", "--flag", "value"]
+slash "/compact" = NativeCompact
+slash "/compress" = NativeCompact
+slash "/compact now" = err(unsupported slash command /compact for hermes)
+slash "/clear" = err(unsupported slash command /clear for hermes)
+
+[pi]
+program = ""
+agent_token = "pi"
+headed_runtime_kind = Screen
+uses_structured_output = false
+attach_revivable = false
+resolve_tail [] = resume=None argv=[] requires_tui=false
+resolve_tail ["--model", "opus"] = resume=None argv=["--model", "opus"] requires_tui=true
+resolve_tail ["resume", "t-999"] = resume=None argv=["resume", "t-999"] requires_tui=true
+revive_tail = resume=None argv=[] requires_tui=false
+headed_cli_command = program="" args=["--flag", "value"]
+headed_pty_command = program="" args=["--flag", "value"]
+slash "/compact" = err(unsupported slash command /compact for pi)
+slash "/compress" = err(unsupported slash command /compress for pi)
+slash "/compact now" = err(unsupported slash command /compact for pi)
+slash "/clear" = err(unsupported slash command /clear for pi)
+
+[other]
+program = ""
+agent_token = "other"
+headed_runtime_kind = Screen
+uses_structured_output = false
+attach_revivable = false
+resolve_tail [] = resume=None argv=[] requires_tui=false
+resolve_tail ["--model", "opus"] = resume=None argv=["--model", "opus"] requires_tui=true
+resolve_tail ["resume", "t-999"] = resume=None argv=["resume", "t-999"] requires_tui=true
+revive_tail = resume=None argv=[] requires_tui=false
+headed_cli_command = program="" args=["--flag", "value"]
+headed_pty_command = program="" args=["--flag", "value"]
+slash "/compact" = err(unsupported slash command /compact for other)
+slash "/compress" = err(unsupported slash command /compress for other)
+slash "/compact now" = err(unsupported slash command /compact for other)
+slash "/clear" = err(unsupported slash command /clear for other)

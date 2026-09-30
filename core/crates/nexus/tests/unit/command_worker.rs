@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use nexus_common::Config;
 use nexus_contracts::{
-    AgentTurnExecutionPort, Harness, Kind, NexusBatch, PortResult, PromptRequest, RegisterRequest,
+    AgentTurnExecutionPort, Kind, NexusBatch, PortResult, PromptRequest, RegisterRequest,
     RemoveRequest, RemoveResponse, SessionId, SpawnRequest, SpawnResponse, SteerRequest, Tier,
 };
 use nexus_store::command_kinds;
@@ -63,7 +63,7 @@ fn human_register(name: &str, client_key: &str) -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some(name.into()),
-        harness: Harness::Other,
+        harness: hid("other"),
         harness_session_id: format!("hs_{client_key}"),
         project: "default".into(),
         client_key: client_key.into(),
@@ -432,4 +432,9 @@ async fn maintenance_reaps_terminal_command_intents_by_retention() {
         repo.get("cmd_pending").await.unwrap().unwrap().status,
         "pending"
     );
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

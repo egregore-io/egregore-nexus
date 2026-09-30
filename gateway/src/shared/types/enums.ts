@@ -8,7 +8,6 @@ export {
   Scope,
   Tier,
   Presence,
-  Harness,
   DeliveryState,
   SearchMode,
   ChannelOp,

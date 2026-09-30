@@ -4,7 +4,8 @@
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
-use crate::enums::{Harness, Tier};
+use crate::enums::Tier;
+use crate::harness::HarnessId;
 use crate::ids::{AgentId, MessageId, SessionId};
 
 /// `nexus admin route <notif> --to <name|thread>` — ad-hoc, one-shot forward (NOT a standing rule).
@@ -35,7 +36,7 @@ pub enum SpawnIdentityPolicy {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct SpawnRequest {
-    pub kind: Harness,
+    pub kind: HarnessId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Whether `name` was caller-supplied identity intent or generated/implicit launch metadata.
@@ -87,7 +88,7 @@ impl SpawnRequest {
     pub fn resolved_backend<'a>(&'a self, configured_default: Option<&'a str>) -> &'a str {
         match self.backend.as_deref() {
             Some(explicit) => explicit,
-            None if self.kind == crate::enums::Harness::Hermes => "tmux",
+            None if self.kind.as_str() == "hermes" => "tmux",
             None => configured_default.unwrap_or("pty"),
         }
     }

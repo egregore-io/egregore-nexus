@@ -1,4 +1,4 @@
-//! The runtime-agnostic adapter seam (backend spec §5). Each agent `kind`/[`nexus_contracts::Harness`] maps to an
+//! The runtime-agnostic adapter seam (backend spec §5). Each agent `kind`/[`nexus_contracts::HarnessId`] maps to an
 //! [`Adapter`] implementing a common inject/stream contract so the bus stays runtime-agnostic:
 //! harnesses over the same uniform ACP transport, and [`MockAdapter`] for
 //! tests/acceptance. ACP `session/prompt` is the injection transport; `session/update` is the
@@ -9,7 +9,7 @@ use async_trait::async_trait;
 
 use nexus_common::{NexusError, RuntimeProcessIds};
 use nexus_contracts::{
-    ContractError, Harness, InjectError, OperatorAction, ProviderError, ProviderLimit,
+    ContractError, HarnessId, InjectError, OperatorAction, ProviderError, ProviderLimit,
     ProviderLimitReason, ResetHint, SessionId, SteerCapability,
 };
 
@@ -21,18 +21,20 @@ pub mod mock;
 pub mod opencode;
 pub mod provider_limit;
 pub mod skill;
+pub mod spawn_spec;
 
 pub use engine::{AcpEngine, HarnessCommand};
 pub use hermes::HermesAdapter;
 pub use mock::MockAdapter;
 pub use opencode::OpenCodeAdapter;
+pub use spawn_spec::SpawnSpecAdapter;
 
 /// Adapter-owned structured provider-limit metadata before the daemon has attached the Nexus
 /// session id. The agent service wraps this into [`InjectError::ProviderLimit`] at the observed
 /// injection seam.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdapterProviderLimit {
-    pub harness: Harness,
+    pub harness: HarnessId,
     pub reason: ProviderLimitReason,
     pub reset_hint: Option<ResetHint>,
     pub provider: Option<String>,
@@ -43,7 +45,7 @@ pub struct AdapterProviderLimit {
 /// Adapter-owned structured provider failure before the daemon attaches the Nexus session id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdapterProviderError {
-    pub harness: Harness,
+    pub harness: HarnessId,
     pub reason: String,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -55,7 +57,7 @@ pub struct AdapterProviderError {
 /// session id. These are account/auth/billing stops, not rapid retry candidates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdapterOperatorAction {
-    pub harness: Harness,
+    pub harness: HarnessId,
     pub reason: String,
     pub provider: Option<String>,
     pub model: Option<String>,

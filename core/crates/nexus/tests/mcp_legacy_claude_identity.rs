@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use nexus::cli::ambient::TestEnvGuard;
 use nexus::cli::commands::mcp::{mcp_identity_for_store_with_claude_session, McpArgs};
-use nexus_contracts::{Harness, SessionId};
+use nexus_contracts::SessionId;
 use nexus_harness_claude::storage::{ClaudeRuntimeLaunch, ClaudeRuntimeStateRepo};
 use nexus_store::repos::{NewSession, Sessions};
 use nexus_store::Store;
@@ -94,7 +94,7 @@ async fn claude_native_session_never_authenticates_a_nexus_mcp_identity() {
     assert_eq!(identity.project, "default");
     assert_eq!(identity.client_key, "mcp:hugo");
     assert_eq!(identity.harness_session_id, "mcp:hugo");
-    assert!(matches!(identity.harness, Harness::Other));
+    assert_eq!(identity.harness.as_str(), "other");
 }
 
 #[tokio::test(flavor = "current_thread")]

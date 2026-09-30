@@ -4,14 +4,14 @@ use std::time::Duration;
 use nexus::cli::ambient::with_test_env_vars;
 use nexus::cli::read_client::ReadClient;
 use nexus::cli::store_client::StoreClient;
-use nexus::daemon::{
-    command_worker, daemon_ipc, gateway_stream_socket::GatewayStreamPublisher, AppState,
-};
-use nexus_common::{Config, GatewayProjectionDeliveryMode};
+use nexus::daemon::gateway_stream_socket::GatewayStreamPublisher;
+use nexus::daemon::{command_worker, daemon_ipc, AppState};
+use nexus_common::config::GatewayProjectionDeliveryMode;
+use nexus_common::Config;
 use nexus_contracts::{
-    DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, Harness, HistoryRequest, Kind,
-    MemberListRequest, RegisterRequest, RegisterResponse, SearchMode, SearchRequest, SessionId,
-    ThreadId, Tier, Whoami, DAEMON_IPC_PROTOCOL_VERSION,
+    DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, HistoryRequest, Kind, MemberListRequest,
+    RegisterRequest, RegisterResponse, SearchMode, SearchRequest, SessionId, ThreadId, Tier,
+    Whoami, DAEMON_IPC_PROTOCOL_VERSION,
 };
 use nexus_store::repos::{
     Agents, CommandIntents, NewAgent, NewSession, Sessions, Sources, Threads,
@@ -28,7 +28,7 @@ fn register_request() -> RegisterRequest {
     RegisterRequest {
         agent_id: None,
         name: Some("ipc-agent".into()),
-        harness: Harness::Other,
+        harness: hid("other"),
         harness_session_id: "harness-ipc-agent".into(),
         project: "metadata-only".into(),
         client_key: "client-ipc-agent".into(),
@@ -713,7 +713,7 @@ async fn legacy_mcp_identity_resolution_runs_inside_daemon_store_owner() {
     let identity: RegisterRequest = serde_json::from_value(response.result.unwrap()).unwrap();
     assert_eq!(identity.name.as_deref(), Some("legacy-mcp"));
     assert_eq!(identity.client_key, "mcp:legacy-mcp");
-    assert_eq!(identity.harness, Harness::Claude);
+    assert_eq!(identity.harness, hid("claude"));
 }
 
 #[tokio::test]
@@ -1259,7 +1259,7 @@ async fn read_client_terminal_queries_execute_inside_daemon() {
     let state = state().await;
     let mut registration = register_request();
     registration.project = "default".into();
-    registration.harness = Harness::Claude;
+    registration.harness = hid("claude");
     registration.harness_session_id = "claude-native-ipc".into();
     let registered = state.identity.register(registration).await.unwrap();
     state
@@ -1295,8 +1295,13 @@ async fn read_client_terminal_queries_execute_inside_daemon() {
         .await
         .unwrap();
     assert_eq!(revive.session_id, registered.session_id);
-    assert_eq!(revive.spawn.kind, Harness::Claude);
+    assert_eq!(revive.spawn.kind, hid("claude"));
 
     drop(handle);
     std::fs::remove_dir_all(home).unwrap();
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

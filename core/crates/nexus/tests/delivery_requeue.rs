@@ -9,10 +9,9 @@ use async_trait::async_trait;
 use nexus::daemon::{dispatch, AppState};
 use nexus_common::{now, Config};
 use nexus_contracts::{
-    AgentTurnExecutionPort, Caller, ContractError, DlqRequeueRequest, EventSink, Harness,
-    InjectError, InjectResult, Message, MessageId, NexusBatch, ProjectId, ProviderLimit,
-    ProviderLimitReason, Request, RequestId, Scope, SessionId, SpawnRequest, SpawnResponse, Tier,
-    WsEvent,
+    AgentTurnExecutionPort, Caller, ContractError, DlqRequeueRequest, EventSink, InjectError,
+    InjectResult, Message, MessageId, NexusBatch, ProjectId, ProviderLimit, ProviderLimitReason,
+    Request, RequestId, Scope, SessionId, SpawnRequest, SpawnResponse, Tier, WsEvent,
 };
 use nexus_store::repos::{Messages, NewSession, Sessions};
 use nexus_store::Store;
@@ -41,7 +40,7 @@ impl AgentTurnExecutionPort for LimitOnceTurnExec {
         let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
         if attempt == 1 {
             return Err(InjectError::ProviderLimit(ProviderLimit {
-                harness: Harness::Claude,
+                harness: hid("claude"),
                 session: recipient.clone(),
                 reason: ProviderLimitReason::UsageLimit,
                 reset_hint: None,
@@ -204,4 +203,9 @@ async fn terminal_delivery_retries_only_after_explicit_admin_requeue() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("explicitly requeued delivery did not settle delivered");
+}
+
+/// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).
+fn hid(s: &str) -> nexus_contracts::HarnessId {
+    nexus_contracts::HarnessId::new(s).expect("valid harness id literal")
 }

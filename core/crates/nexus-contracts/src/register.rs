@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
-use crate::enums::{Harness, Kind, Presence, Tier};
+use crate::enums::{Kind, Presence, Tier};
+use crate::harness::HarnessId;
 use crate::ids::{AgentId, SessionId};
 
 /// `POST /register` / `nexus register` payload. Idempotent on `clientKey`.
@@ -20,7 +21,7 @@ pub struct RegisterRequest {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
-    pub harness: Harness,
+    pub harness: HarnessId,
     /// The harness's own session id (bound to `name`).
     pub harness_session_id: String,
     /// Project label (from cwd or explicit) — descriptive metadata, never an identity or routing
