@@ -197,6 +197,13 @@ impl AppState {
         req.project = Some(identity.project.clone());
         let launch_label = identity.launch_label().to_string();
 
+        let prepared_adapter = agent.prepare_adapter(&req.kind)?;
+        let mut observation = self.reserve_adapter_observation(
+            &identity.agent_id,
+            &session,
+            prepared_adapter.profile(),
+        )?;
+
         // Build the per-agent launch context before registration so the persisted runtime cwd
         // matches the actual adapter cwd, including the daemon default when `req.cwd` is omitted.
         let (cwd, env) = self.agent_launch_ctx(
@@ -246,18 +253,37 @@ impl AppState {
 
         // (5) Open + bind the adapter under that id + project. An init failure retains the (errored)
         // session and surfaces `agent.status=errored`, then propagates — the member row + loop remain.
-        let process_ledger = match agent
-            .open_session_for(
-                session.clone(),
-                &launch_label,
-                &identity.project,
-                req.kind.clone(),
-                cwd,
-                env,
-                None, // fresh launch — a new session/new (resume is the not-fresh `ensure_live` path)
-            )
-            .await
-        {
+        let opened = if let Some(observation) = observation.as_mut() {
+            match observation.commit(self).await {
+                Ok(()) => agent
+                    .open_session_for_observed(
+                        session.clone(),
+                        &launch_label,
+                        &identity.project,
+                        prepared_adapter,
+                        cwd,
+                        env,
+                        None,
+                        observation.sink(),
+                    )
+                    .await
+                    .map(|opened| observation.opened(opened)),
+                Err(error) => Err(error),
+            }
+        } else {
+            agent
+                .open_session_for(
+                    session.clone(),
+                    &launch_label,
+                    &identity.project,
+                    req.kind.clone(),
+                    cwd,
+                    env,
+                    None, // fresh launch — a new session/new (resume is the not-fresh `ensure_live` path)
+                )
+                .await
+        };
+        let process_ledger = match opened {
             Ok(process_ledger) => process_ledger,
             Err(error) => {
                 if req.initial_prompt.is_some() {
@@ -271,6 +297,19 @@ impl AppState {
         if let Some(entry) = process_ledger {
             self.set_runtime_process_ledger_best_effort(&session, entry, "acp launch")
                 .await;
+        }
+
+        if let Some(observation) = observation.as_mut() {
+            // Registration already materialized this fresh runtime. Revalidate its exact active
+            // binding under presence before accepting native observations or delivering a prompt.
+            if let Err(error) = observation.activate(self, agent).await {
+                if req.initial_prompt.is_some() {
+                    self.mark_initial_prompt_failed(&registered, &error.message)
+                        .await;
+                    self.fail_initial_prompt_runtime(&registered).await;
+                }
+                return Err(error);
+            }
         }
 
         if let Some(prepared) = prepared_initial_prompt {
@@ -485,6 +524,12 @@ impl AppState {
             // Create the resurrection capsule before the app-server eagerly creates its thread.
             // Thread discovery updates this row in place; inserting it afterward with a fresh
             // launch's `None` resume key either misses or erases the only native correlation.
+            let mut model_observation = self.reserve_native_observation(
+                &identity.agent_id,
+                &session,
+                nexus_harness_codex::app_server::model_reporting::profile(),
+            )?;
+            model_observation.commit(self).await?;
             self.persist_runtime_resurrection_descriptor(
                 &registered,
                 "headed",
@@ -528,6 +573,7 @@ impl AppState {
                     &effective_harness_args,
                     Some(self.codex_thread_persistence_callback()),
                     req.resolved_backend(self.launch_backend_default()),
+                    Some(model_observation.reporting()),
                 )
                 .await
                 .map_err(|e| nexus_contracts::ContractError {
@@ -561,30 +607,33 @@ impl AppState {
                     code: -32004,
                     message: format!("codex process-ledger persistence failed: {e}"),
                 })?;
-            self.spawn_raw_stream_writer_for_terminal(&session);
+            self.spawn_raw_stream_writer_for_terminal(&session).await;
+            model_observation
+                .activate_codex(self, &supervisor.codex_transport())
+                .await?;
             return Ok(SpawnResponse {
                 session_id: session,
             });
         }
 
-        // (0b) Headed OpenCode uses a native OpenCode plugin loaded inside `opencode serve`, plus a
+        // (0b) Headed OpenCode uses a native plugin loaded inside `opencode serve`, plus a
         // foreground `opencode attach` TUI in the requested raw PTY or tmux backend. The transport
         // binding is the plugin bridge, not terminal keystrokes.
         if req.kind.as_str() == "opencode" {
-            let registered = if let Some(template) = req.initial_prompt.as_deref() {
-                let registered = Self::runtime_descriptor(
-                    &session,
-                    &identity.agent_id,
-                    name.as_deref(),
-                    &project,
-                    req.kind.clone(),
-                    req.role.clone(),
-                    Some(cwd.clone()),
-                );
-                let prepared = match self.prepare_initial_prompt(&registered, template).await {
-                    Ok(prepared) => prepared,
-                    Err(error) => return Err(error),
-                };
+            let registered = Self::runtime_descriptor(
+                &session,
+                &identity.agent_id,
+                name.as_deref(),
+                &project,
+                req.kind.clone(),
+                req.role.clone(),
+                Some(cwd.clone()),
+            );
+            let prepared = match req.initial_prompt.as_deref() {
+                Some(template) => self.prepare_initial_prompt(&registered, template).await?,
+                None => None,
+            };
+            if req.initial_prompt.is_some() {
                 self.register_prepared_initial_prompt_runtime(
                     &registered,
                     &client_key,
@@ -592,10 +641,19 @@ impl AppState {
                     owner,
                 )
                 .await?;
-                Some((registered, prepared))
             } else {
-                None
-            };
+                // The captured model claim needs a durable runtime before native setup. Like the
+                // app-server path, registration may survive a later failed/canceled launch.
+                self.register_prepared_runtime(&registered, &client_key, "opencode-plugin", owner)
+                    .await
+                    .map_err(|e| e.to_contract_error())?;
+            }
+            let mut model_observation = self.reserve_native_observation(
+                &identity.agent_id,
+                &session,
+                nexus_agent::adapter::opencode::native::model_profile(),
+            )?;
+            model_observation.commit(self).await?;
             let events = self
                 .loop_wiring
                 .as_ref()
@@ -627,6 +685,7 @@ impl AppState {
                     &effective_harness_args,
                     false,
                     viewer_backend,
+                    Some(model_observation.reporting()),
                 )
                 .await
                 .map_err(|e| nexus_contracts::ContractError {
@@ -634,42 +693,25 @@ impl AppState {
                     message: format!("opencode native-plugin launch failed: {e}"),
                 });
             if let Err(error) = launch_result {
-                if let Some((registered, _)) = &registered {
-                    self.mark_initial_prompt_failed(registered, &error.message)
+                if req.initial_prompt.is_some() {
+                    self.mark_initial_prompt_failed(&registered, &error.message)
                         .await;
-                    self.fail_initial_prompt_runtime(registered).await;
                 }
+                self.fail_initial_prompt_runtime(&registered).await;
                 return Err(error);
             }
-            if let Some((registered, prepared)) = registered {
-                if let Some(prepared) = prepared {
-                    if let Err(error) = self
-                        .deliver_prepared_initial_prompt(&registered, prepared)
-                        .await
-                    {
-                        self.fail_initial_prompt_runtime(&registered).await;
-                        return Err(error);
-                    }
-                }
-                self.wake_registered_runtime(&registered)
+            if let Some(prepared) = prepared {
+                if let Err(error) = self
+                    .deliver_prepared_initial_prompt(&registered, prepared)
                     .await
-                    .map_err(|e| e.to_contract_error())?;
-            } else {
-                self.register_and_wake(
-                    &session,
-                    &identity.agent_id,
-                    name.as_deref(),
-                    &project,
-                    req.kind.clone(),
-                    req.role.clone(),
-                    &client_key,
-                    Some(cwd.clone()),
-                    "opencode-plugin",
-                    owner,
-                )
+                {
+                    self.fail_initial_prompt_runtime(&registered).await;
+                    return Err(error);
+                }
+            }
+            self.wake_registered_runtime(&registered)
                 .await
                 .map_err(|e| e.to_contract_error())?;
-            }
             let descriptor = Self::runtime_descriptor(
                 &session,
                 &identity.agent_id,
@@ -694,44 +736,36 @@ impl AppState {
                     code: -32004,
                     message: format!("opencode process-ledger persistence failed: {e}"),
                 })?;
-            self.spawn_raw_stream_writer_for_terminal(&session);
+            self.spawn_raw_stream_writer_for_terminal(&session).await;
+            model_observation.activate_plugin(self, &supervisor).await?;
             return Ok(SpawnResponse {
                 session_id: session,
             });
         }
 
-        // (1) Spawn the harness; AppState minted the session id and client key above, and the
-        // supervisor binds that exact runtime identity on the transport so injected turns reach
-        // THIS harness. Real headed harnesses default to the daemon-owned raw PTY backend; tmux is
-        // now only the explicit legacy backend (`--backend tmux` / `--tmux`). The deterministic,
-        // offline stand-in always uses the raw PTY path because it echoes its input, which the
-        // fixture proofs assert on.
-        //
-        // We capture a broadcast::Receiver<Vec<u8>> of the harness's raw PTY output here, to hand
-        // to `spawn_pty_reply_reader` below.  The two backends produce it differently:
-        //  - raw PtySession (passive fixture): `PtySession::subscribe()` returns the receiver directly.
-        //  - TmuxHarness (real harnesses): `TmuxHarness::pipe_output()` sets up `tmux pipe-pane`
-        //    and returns a receiver of the pane's raw byte stream.
-        let registered = if let Some(template) = req.initial_prompt.as_deref() {
-            let registered = Self::runtime_descriptor(
-                &session,
-                &identity.agent_id,
-                name.as_deref(),
-                &project,
-                req.kind.clone(),
-                req.role.clone(),
-                Some(cwd.clone()),
-            );
-            let prepared = match self.prepare_initial_prompt(&registered, template).await {
-                Ok(prepared) => prepared,
-                Err(error) => return Err(error),
-            };
-            self.register_prepared_initial_prompt_runtime(&registered, &client_key, "pty", owner)
-                .await?;
-            Some((registered, prepared))
-        } else {
-            None
-        };
+        // (1) Bind the minted runtime identity to its native transport. Raw PTY is the default;
+        // tmux requires an explicit backend choice. The passive fixture always uses raw PTY.
+        // Capture output for the later reader: raw subscribe() or tmux pipe_output()/pipe-pane.
+        let descriptor = Self::runtime_descriptor(
+            &session,
+            &identity.agent_id,
+            name.as_deref(),
+            &project,
+            req.kind.clone(),
+            req.role.clone(),
+            Some(cwd.clone()),
+        );
+        let profile = (headed_runtime == HeadedRuntimeKind::HermesGateway)
+            .then(nexus_agent::adapter::hermes::native::model_profile);
+        let (registered, mut gateway_observation) = self
+            .prepare_terminal_reporting(
+                descriptor,
+                req.initial_prompt.as_deref(),
+                &client_key,
+                owner,
+                profile,
+            )
+            .await?;
         let size = PtySize {
             rows: 24,
             cols: 80,
@@ -766,7 +800,7 @@ impl AppState {
             // tmux. tmux runs only when explicitly requested (`--backend tmux`). Hermes
             // launches here too because its gateway bridge is backend-agnostic.
             let launch_result = supervisor
-                .launch_headed_raw_pty(
+                .launch_headed_raw_pty_observed(
                     &session,
                     &req.kind,
                     &identity.agent_id,
@@ -779,6 +813,9 @@ impl AppState {
                     &effective_harness_args,
                     self.loop_wiring.as_ref().map(|w| w.events()),
                     self.loop_wiring.as_ref().map(|w| w.bell()),
+                    gateway_observation
+                        .as_ref()
+                        .map(|observation| observation.reporting()),
                 )
                 .await
                 .map_err(|e| nexus_contracts::ContractError {
@@ -797,7 +834,7 @@ impl AppState {
             })
         } else {
             let launch_result = supervisor
-                .launch_headed_pty(
+                .launch_headed_pty_observed(
                     &session,
                     &req.kind,
                     &identity.agent_id,
@@ -810,13 +847,16 @@ impl AppState {
                     &effective_harness_args,
                     self.loop_wiring.as_ref().map(|w| w.events()),
                     self.loop_wiring.as_ref().map(|w| w.bell()),
+                    gateway_observation
+                        .as_ref()
+                        .map(|observation| observation.reporting()),
                 )
                 .await
                 .map_err(|e| nexus_contracts::ContractError {
                     code: -32004,
                     message: format!("tmux harness launch failed: {e}"),
                 });
-            // Claude/OpenCode/Hermes stream from structured native stores; do not scrape their
+            // Structured native harnesses stream from their stores; do not scrape their
             // full-screen TUIs. Other tmux harnesses still use pipe-pane + ScreenText.
             launch_result.map(|()| {
                 if headed_runtime != HeadedRuntimeKind::Screen {
@@ -914,9 +954,13 @@ impl AppState {
                 message: format!("pty process-ledger persistence failed: {e}"),
             })?;
 
+        if let Some(observation) = gateway_observation.as_mut() {
+            observation.finish_gateway(self, &supervisor).await?;
+        }
+
         // (3) Wire the output stream. Headed structured harnesses use native forwarders; remaining
         // PTY harnesses still use the generic screen scraper.
-        self.spawn_raw_stream_writer_for_terminal(&session);
+        self.spawn_raw_stream_writer_for_terminal(&session).await;
         if let Some(w) = &self.loop_wiring {
             match headed_runtime {
                 HeadedRuntimeKind::ClaudeNative => {

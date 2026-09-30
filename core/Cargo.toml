@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/nexus-contracts", "crates/nexus-common", "crates/nexus-store", "crates/nexus-dispatch", "crates/nexus-identity", "crates/nexus-bus", "crates/nexus-acp-stream", "crates/nexus-agent", "crates/nexus-search", "crates/nexus-notify", "crates/nexus-admin", "crates/nexus-pty", "crates/nexus-transcript", "crates/nexus", "crates/harness/core", "crates/harness/claude", "crates/harness/codex", "tests"]
 
 [workspace.package]
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/egregore-io/egregore-nexus"
@@ -42,22 +42,22 @@ libsql = { path = "vendor/libsql" }
 portable-pty = { path = "vendor/portable-pty" }
 
 [workspace.dependencies]
-nexus-contracts = { path = "crates/nexus-contracts", version = "=0.1.6-beta.2" }
-nexus-common = { package = "egregore-nexus-common", path = "crates/nexus-common", version = "=0.1.6-beta.2" }
-nexus-store = { path = "crates/nexus-store", version = "=0.1.6-beta.2" }
-nexus-dispatch = { path = "crates/nexus-dispatch", version = "=0.1.6-beta.2" }
-nexus-identity = { path = "crates/nexus-identity", version = "=0.1.6-beta.2" }
-nexus-bus = { path = "crates/nexus-bus", version = "=0.1.6-beta.2" }
-nexus-acp-stream = { path = "crates/nexus-acp-stream", version = "=0.1.6-beta.2" }
-nexus-agent = { path = "crates/nexus-agent", version = "=0.1.6-beta.2" }
-nexus-search = { path = "crates/nexus-search", version = "=0.1.6-beta.2" }
-nexus-notify = { package = "egregore-nexus-notify", path = "crates/nexus-notify", version = "=0.1.6-beta.2" }
-nexus-admin = { path = "crates/nexus-admin", version = "=0.1.6-beta.2" }
-nexus-pty = { path = "crates/nexus-pty", version = "=0.1.6-beta.2" }
-nexus-transcript = { path = "crates/nexus-transcript", version = "=0.1.6-beta.2" }
-nexus-harness-core = { path = "crates/harness/core", version = "=0.1.6-beta.2" }
-nexus-harness-claude = { path = "crates/harness/claude", version = "=0.1.6-beta.2" }
-nexus-harness-codex = { path = "crates/harness/codex", version = "=0.1.6-beta.2" }
+nexus-contracts = { path = "crates/nexus-contracts", version = "=0.1.6-beta.3" }
+nexus-common = { package = "egregore-nexus-common", path = "crates/nexus-common", version = "=0.1.6-beta.3" }
+nexus-store = { path = "crates/nexus-store", version = "=0.1.6-beta.3" }
+nexus-dispatch = { path = "crates/nexus-dispatch", version = "=0.1.6-beta.3" }
+nexus-identity = { path = "crates/nexus-identity", version = "=0.1.6-beta.3" }
+nexus-bus = { path = "crates/nexus-bus", version = "=0.1.6-beta.3" }
+nexus-acp-stream = { path = "crates/nexus-acp-stream", version = "=0.1.6-beta.3" }
+nexus-agent = { path = "crates/nexus-agent", version = "=0.1.6-beta.3" }
+nexus-search = { path = "crates/nexus-search", version = "=0.1.6-beta.3" }
+nexus-notify = { package = "egregore-nexus-notify", path = "crates/nexus-notify", version = "=0.1.6-beta.3" }
+nexus-admin = { path = "crates/nexus-admin", version = "=0.1.6-beta.3" }
+nexus-pty = { path = "crates/nexus-pty", version = "=0.1.6-beta.3" }
+nexus-transcript = { path = "crates/nexus-transcript", version = "=0.1.6-beta.3" }
+nexus-harness-core = { path = "crates/harness/core", version = "=0.1.6-beta.3" }
+nexus-harness-claude = { path = "crates/harness/claude", version = "=0.1.6-beta.3" }
+nexus-harness-codex = { path = "crates/harness/codex", version = "=0.1.6-beta.3" }
 
 agent-client-protocol = { version = "0.15", features = ["unstable_end_turn_token_usage"] }
 tokio-util = { version = "0.7", features = ["compat"] }

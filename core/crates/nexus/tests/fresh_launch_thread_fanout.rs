@@ -73,6 +73,7 @@ async fn fresh_codex_launch_receives_thread_fanout_without_self_register_or_bus_
         &Config::default(),
         Arc::new(RecordingTurnExec { tx }),
     );
+    state.wait_for_runtime_identity_ready().await.unwrap();
 
     state
         .identity

@@ -111,7 +111,12 @@ impl AgentTurnExecutionPort for InitialPromptExec {
 async fn state_with_exec(exec: Arc<dyn AgentTurnExecutionPort>) -> AppState {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
-    AppState::wire_with_turn_exec(store, &Config::default(), exec)
+    let state = AppState::wire_with_turn_exec(store, &Config::default(), exec);
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
+    state
 }
 
 fn human(name: &str, client_key: &str) -> RegisterRequest {

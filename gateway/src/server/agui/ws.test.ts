@@ -1,5 +1,7 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
+import { createRuntimeSnapshotSource } from "./runtimeSnapshots";
+import { GatewayChangeBus } from "../store/changeBus";
 
 type WsModule = typeof import("./ws.mjs");
 
@@ -76,6 +78,92 @@ async function loadWs(): Promise<WsModule> {
 }
 
 describe("AG-UI WebSocket server transport", () => {
+  it("canonical_runtime unsubscribe uses the shared bounded ID grammar without disturbing readers", async () => {
+    const {handleWs}=await loadWs();
+    const close=vi.fn();
+    const socket=new FakeSocket();
+    const handle=handleWs(socket,new Request("http://localhost/api/agui/ws"),{
+      runtimeSnapshots:{subscribe:()=>({ready:Promise.resolve(),close}),close(){}},
+    });
+    const send=(frame:unknown)=>socket.emit("message",JSON.stringify(frame));
+    try {
+      send({t:"runtime.subscribe",subscriptionId:"kept",agentId:"a"});
+      for(const subscriptionId of ["", "\u0085", "bad\n", "x".repeat(129), "é".repeat(65), "\ud800", 42]) {
+        const before=socket.sent.length;
+        send({t:"runtime.unsubscribe",subscriptionId});
+        expect(socket.sent).toHaveLength(before+1);
+        expect(JSON.parse(socket.sent.at(-1)!)).toEqual({t:"input.err",error:"invalid runtime unsubscribe"});
+        expect(close).not.toHaveBeenCalled();
+      }
+      const before=socket.sent.length;
+      for(const subscriptionId of ["\ufeff", "😀", "x".repeat(128)]) send({t:"runtime.unsubscribe",subscriptionId});
+      expect(socket.sent).toHaveLength(before);
+      send({t:"runtime.unsubscribe",subscriptionId:"kept"});
+      expect(close).toHaveBeenCalledTimes(1);
+    } finally {handle.close();}
+  });
+
+  it("canonical_runtime bounds active and lifetime subscriptions and rejects replay cursors", async () => {
+    const {handleWs}=await loadWs();
+    const closes:Array<ReturnType<typeof vi.fn>>=[];
+    const subscribe=vi.fn(()=>{const close=vi.fn();closes.push(close);return {ready:Promise.resolve(),close};});
+    const socket=new FakeSocket();
+    const handle=handleWs(socket,new Request("http://localhost/api/agui/ws"),{runtimeSnapshots:{subscribe,close(){}}});
+    const send=(frame:unknown)=>socket.emit("message",JSON.stringify(frame));
+    try {
+      send({t:"runtime.subscribe",subscriptionId:"bad",agentId:"a",afterSeq:100});
+      expect(subscribe).not.toHaveBeenCalled();
+      for(let i=0;i<17;i++) send({t:"runtime.subscribe",subscriptionId:`sub${i}`,agentId:"a"});
+      expect(subscribe).toHaveBeenCalledTimes(16);
+      expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({t:"input.err",error:expect.stringContaining("limit")});
+      for(let i=0;i<16;i++) send({t:"runtime.unsubscribe",subscriptionId:`sub${i}`});
+      for(let i=16;i<129;i++) {
+        send({t:"runtime.subscribe",subscriptionId:`sub${i}`,agentId:"a"});
+        send({t:"runtime.unsubscribe",subscriptionId:`sub${i}`});
+      }
+      expect(subscribe).toHaveBeenCalledTimes(128);
+      for(const close of closes) expect(close).toHaveBeenCalledTimes(1);
+    } finally {handle.close();}
+  });
+
+  it("canonical_runtime subscription sends a complete snapshot and rejects reused IDs without replacing it", async () => {
+    const {handleWs}=await loadWs();
+    const bus=new GatewayChangeBus();
+    const reads=vi.fn(async () => Response.json({agentId:"a_current",runtimes:[]}));
+    const source=createRuntimeSnapshotSource({fetchHandler:reads,changeBus:bus});
+    const socket=new FakeSocket();
+    const handle=handleWs(socket,new Request("http://localhost/api/agui/ws"),{runtimeSnapshots:source});
+    try {
+      socket.emit("message",JSON.stringify({t:"runtime.subscribe",subscriptionId:"sub1",agentId:"a_current"}));
+      await vi.waitFor(()=>expect(socket.sent.length).toBeGreaterThan(0));
+      expect(JSON.parse(socket.sent[0]!)).toEqual({t:"runtime.snapshot",subscriptionId:"sub1",agentId:"a_current",sequence:1,runtimes:[]});
+      socket.emit("message",JSON.stringify({t:"runtime.subscribe",subscriptionId:"sub1",agentId:"a_foreign"}));
+      expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({t:"input.err"});
+      bus.publish("runtime-snapshots");
+      await vi.waitFor(()=>expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({t:"runtime.snapshot",agentId:"a_current",sequence:2}));
+      socket.emit("message",JSON.stringify({t:"runtime.unsubscribe",subscriptionId:"sub1"}));
+      const count=reads.mock.calls.length;
+      bus.publish("runtime-snapshots");
+      await Promise.resolve();
+      expect(reads).toHaveBeenCalledTimes(count);
+      socket.emit("message",JSON.stringify({t:"runtime.subscribe",subscriptionId:"sub1",agentId:"a_current"}));
+      expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({t:"input.err"});
+    } finally {handle.close();source.close();}
+  });
+
+  it("canonical_runtime never sends snapshot data after backpressure or a closed socket", async () => {
+    const {handleWs}=await loadWs();
+    const source=createRuntimeSnapshotSource({fetchHandler:async()=>Response.json({agentId:"a_current",runtimes:[]}),changeBus:new GatewayChangeBus()});
+    const socket=new FakeSocket();socket.bufferedAmount=1024*1024;
+    const handle=handleWs(socket,new Request("http://localhost/api/agui/ws"),{runtimeSnapshots:source});
+    try {
+      socket.emit("message",JSON.stringify({t:"runtime.subscribe",subscriptionId:"sub1",agentId:"a_current"}));
+      await vi.waitFor(()=>expect(socket.closed).not.toBeNull());
+      expect(socket.closed).toMatchObject({code:1013});
+      expect(socket.sent).toEqual([]);
+    } finally {handle.close();source.close();}
+  });
+
   it("refreshes same-cursor native activity once per shared exact lane at elapsed cadence", async () => {
     const { CommandQueueHub } = await loadWs();
     vi.useFakeTimers();

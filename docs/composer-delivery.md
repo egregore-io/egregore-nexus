@@ -18,6 +18,22 @@ Queue redirection preserves the original request JSON, so converted pending rows
 command kind. Ordinary explicit steer and redirects with omitted/null options
 retain their existing behavior.
 
+Codex `turn/steer` acknowledgement means queued native input, not model consumption.
+The accepted-input presentation and successful steer result wait for the matching
+native user-message record, not the RPC response or unrelated turn output. That
+record establishes native history admission; it does not by itself prove the
+provider sampled the input. Tool work can delay recording, and interruption can
+discard acknowledged pending input. Nexus never blindly resends that input.
+
+After the serial forwarder processes a terminal, unresolved input-receipt waiters
+for that exact turn settle as unavailable instead of holding the steer lane until
+the 600-second receipt ceiling. Earlier recorded receipts still succeed; a newer
+turn is untouched. This deliberately uses projected terminal ordering, not early
+reader activity: an earlier input record may still be behind a blocked sink.
+Indefinitely blocked projection remains a separate limitation. Protocol-fixture
+tests cover gated history admission, interruption without a receipt, and a later
+successful steer; they do not certify live provider completion.
+
 ## Exact session dispatch and Gateway carriers
 
 Daemon and Gateway HTTP `prompt`, `steer`, `interrupt`, `compact`, and queue-mutation requests accept optional
@@ -164,7 +180,7 @@ flush and response waits; a backpressured writer can still delay a control reque
 Cancellation removes only the original pending response correlation. Before local
 admission it leaves no request frame; afterward it does not retract an admitted
 frame or establish retry-safe rejection. A later flush may deliver that original
-frame. The durable journal applies the separate ordinary-prompt attempt policy
+frame. The durable journal applies the separate prompt/steer attempt policy
 described below; local native admission is not a durable receipt.
 
 This reuses the existing reader, tracker and serial notification channel. It does
@@ -255,15 +271,16 @@ admission checks retain their responsibilities. Unknown observations do not add
 permanent scheduler blockers; established open work is not cleared by missing
 evidence. No snapshot reserves input against a later native or direct-human turn.
 
-## Durable prompt attempts and uncertain outcomes
+## Durable prompt and steer attempts and uncertain outcomes
 
 The existing `command_intents` identity-store journal protects ordinary prompt
-attempts and retained automatic rows against replay, independently of the
+and explicit steer attempts (including redirected rows), and retained automatic
+rows against replay, independently of the
 boot-scoped transport database. This does not enable automatic delivery:
 
 - `claimed` without `started_at` means the worker has not armed admission. An
   expired claim may be reclaimed.
-- For `harness.prompt`, `started_at` means **may have attempted native delivery**.
+- For `harness.prompt` and `harness.steer`, `started_at` means **may have attempted native delivery**.
   It is persisted before execution, under command id, claim timestamp, attempt
   number, the captured lease value, and an unexpired current lease. It is not an
   acceptance receipt. Prompt slash-compaction uses the same attempt protection.
@@ -294,11 +311,18 @@ statement is not cancelled midway; late completion cannot overwrite the terminal
 uncertainty. A typed shutdown-before-entry result may release its exact claim.
 The short shutdown exclusion is released after the adapter's first poll, not held
 through its later I/O or receipt wait.
+Steer claims use that same shutdown boundary. Pending and pre-entry-deferred steer
+rows remain pending for the next worker lifetime, not repeatedly claimed during
+drain. An already entered steer retains its owned settlement work.
 
 This retains the original command's replay protection, not an indefinite block on
 all subsequent commands for that session. Native activity and existing admission
-rules still govern later work. Explicit steer, interrupt and standalone compact
-retain their existing delivery policies; this slice fences `harness.prompt` only.
+rules still govern later work. Strict `ACTIVE_TURN_REQUIRED` from steer remains a
+known rejection with no prompt fallback. Other errors after entry are uncertain.
+The dedicated steer lane retains a 630-second final report ceiling within its
+660-second lease, preserving completion-bound ACP interrupt-and-send (600 seconds);
+it does not apply the ordinary prompt's 45-second limit to those adapters.
+Interrupt and standalone compact retain their existing delivery policies.
 
 The combined native-auto admission/lifecycle path, its capability advertisement,
 and active-eligible scheduling remain disabled until their combined tests pass.

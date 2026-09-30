@@ -60,6 +60,12 @@ const INBOX_CONSUME_SLICE_MS: u32 = 1_000;
 const HARNESS_PROMPT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(test)]
 const HARNESS_PROMPT_EXECUTION_TIMEOUT: Duration = Duration::from_millis(250);
+// Preserve completion-bound interrupt-and-send adapters (600s), within the redirect lease.
+// Receipt-aware adapters settle a closed native turn promptly; this is the final safety ceiling.
+#[cfg(not(test))]
+const HARNESS_STEER_EXECUTION_TIMEOUT: Duration = Duration::from_secs(630);
+#[cfg(test)]
+const HARNESS_STEER_EXECUTION_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// One in-memory attempt, not a session owner or evidence of native acceptance. The durable
 /// started fence is armed first; this permit only prevents detached preflight from entering late.
@@ -625,6 +631,11 @@ async fn claim_next_for_lane(
         }
         WorkerLane::HarnessPrompt => claim_next_harness_prompt(state, &[]).await?,
         WorkerLane::HarnessSteer => {
+            // The claim gate is shared with begin_shutdown. Pending input belongs to the
+            // next worker lifetime; repeatedly arming and deferring it would prevent drain.
+            if state.command_worker_is_shutting_down() {
+                return Ok(None);
+            }
             repo.claim_next_ready_harness_command(
                 now(),
                 HARNESS_REDIRECT_LEASE_MS,
@@ -698,7 +709,10 @@ async fn complete_claimed_row(
     let repo = CommandIntents::new(&state.store);
     let command_id = row.command_id.clone();
     let claimed_at = row.claimed_at;
-    if row.kind == command_kinds::harness::PROMPT {
+    if matches!(
+        row.kind.as_str(),
+        command_kinds::harness::PROMPT | command_kinds::harness::STEER
+    ) {
         if !repo.mark_prompt_started_for_claim(&row, now()).await? {
             return Ok(());
         }
@@ -848,7 +862,16 @@ async fn lane_has_unsettled_commands(
         .lane_depths()
         .await?
         .into_iter()
-        .any(|depth| lane.owns_kind(&depth.kind) && depth.pending + depth.claimed > 0))
+        .any(|depth| {
+            let pending = if matches!(lane, WorkerLane::HarnessSteer)
+                && state.command_worker_is_shutting_down()
+            {
+                0
+            } else {
+                depth.pending
+            };
+            lane.owns_kind(&depth.kind) && pending + depth.claimed > 0
+        }))
 }
 
 async fn execute(
@@ -1187,12 +1210,17 @@ fn promote_message_post_idempotency_key(row: &CommandIntentRow, params: &mut Val
 
 async fn execute_prompt_attempt(state: &AppState, row: CommandIntentRow) -> PromptAttemptOutcome {
     let command_id = row.command_id.clone();
+    let is_steer = row.kind == command_kinds::harness::STEER;
     // Any/process_next claims use the generic lease. Never keep their preflight permission
     // open beyond that captured lease, even though the dedicated prompt lane has a longer lease.
     let lease_remaining =
         Duration::from_millis(row.lease_until.unwrap_or(0).saturating_sub(now()).max(0) as u64);
-    let deadline =
-        tokio::time::Instant::now() + HARNESS_PROMPT_EXECUTION_TIMEOUT.min(lease_remaining);
+    let budget = if is_steer {
+        HARNESS_STEER_EXECUTION_TIMEOUT
+    } else {
+        HARNESS_PROMPT_EXECUTION_TIMEOUT
+    };
+    let deadline = tokio::time::Instant::now() + budget.min(lease_remaining);
     let attempt = PromptAttempt::new(deadline);
     let owned_attempt = attempt.clone();
     let owned_state = state.clone();
@@ -1210,6 +1238,11 @@ async fn execute_prompt_attempt(state: &AppState, row: CommandIntentRow) -> Prom
                     PromptAttemptOutcome::Completed(value)
                 }
                 Err(error) if attempt.close_before_entry() => PromptAttemptOutcome::Rejected(error),
+                // This published code is native known-no-admission, not a transport timeout.
+                // Explicit steer remains strict: reject; never catch-and-prompt or retry.
+                Err(error) if is_steer && error.code == codes::ACTIVE_TURN_REQUIRED => {
+                    PromptAttemptOutcome::Rejected(error)
+                }
                 _ => PromptAttemptOutcome::Uncertain,
             }
         }

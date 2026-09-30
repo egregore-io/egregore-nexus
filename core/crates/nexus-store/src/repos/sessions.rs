@@ -11,7 +11,7 @@ use nexus_contracts::ids::SessionId;
 
 use crate::error::store_err;
 use crate::repos::{AgentRuntimes, Agents, DeveloperEvents};
-use crate::state::Store;
+use crate::state::{Store, WriteTxn};
 use crate::types::SessionRow;
 
 /// Fields needed to create a session row. Named rows are globally addressable; `None` means this
@@ -32,15 +32,390 @@ pub struct NewSession {
     pub transport: Option<String>,
 }
 
+/// Opaque authority over the exact persisted image of one staged registration.
+///
+/// Use only with the same `Store` that issued it. The normalized projection is convenience,
+/// not authority. This is not a cross-store, dual-store atomicity, or same-value delete/reinsert
+/// incarnation guarantee, and does not exclude arbitrary direct writers bypassing the gate.
+/// Deliberately has no public constructor, serialization, or raw/client-key debug output.
+pub struct CapturedStagedSession {
+    raw: [libsql::Value; 20],
+    row: SessionRow,
+}
+
+impl CapturedStagedSession {
+    /// Read-only normalized projection; never use projection equality to authorize a write.
+    pub fn row(&self) -> &SessionRow {
+        &self.row
+    }
+}
+
+/// Result after selecting and, if still exact, committing only the agent binding update.
+pub enum SelectedStagedSessionStamp {
+    SelectionChanged,
+    Updated(CapturedStagedSession),
+}
+
+/// Result of a selected staged-row cleanup; no lifecycle fact is appended.
+pub enum SelectedStagedSessionCleanup {
+    AlreadyAbsent,
+    SelectionChanged,
+    Removed,
+}
+
+/// Identity-store phase only; a failed commit never supplies a deletion receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityPurgeCommitState {
+    /// Submission did not begin, or an explicit rollback completed successfully.
+    NotCommitted,
+    /// Commit/rollback failure or transaction-state loss prevents confirmation.
+    Unknown,
+}
+
+/// Exact identity deletion association, not transport cleanup or authentication authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityPurgeReceipt {
+    session_id: SessionId,
+    agent_id: Option<String>,
+    project: String,
+    name: Option<String>,
+    runtime_pairs: Vec<(String, String)>,
+}
+
+impl IdentityPurgeReceipt {
+    /// Original selection label, binding downstream name-based cleanup to this receipt.
+    pub fn project(&self) -> &str {
+        &self.project
+    }
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+    /// Target association captured by the identity transaction, not a Session ownership proof.
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+    /// Exact supplied stable identity; None never authorizes name-based agent deletion.
+    pub fn agent_id(&self) -> Option<&str> {
+        self.agent_id.as_deref()
+    }
+    /// Sorted bindings whose IDs were verified absent before the confirmed identity commit.
+    pub fn runtime_pairs(&self) -> &[(String, String)] {
+        &self.runtime_pairs
+    }
+}
+
+/// Successful identity transaction outcome; no transport deletion or lifecycle publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectedIdentityPurge {
+    SelectionChanged,
+    Purged(IdentityPurgeReceipt),
+}
+
+/// Transport-only outcome after confirmed commit. Purged confirms Session absence with
+/// best-effort child cleanup, not all-history erasure or rollback of the identity phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectedTransportPurge {
+    SelectionChanged,
+    Purged,
+}
+
+#[derive(Debug)]
+pub struct IdentityPurgeFailure {
+    cause: NexusError,
+    commit_state: IdentityPurgeCommitState,
+}
+
+impl IdentityPurgeFailure {
+    /// Original cause, retaining any explicit rollback failure context.
+    pub fn cause(&self) -> &NexusError {
+        &self.cause
+    }
+    /// Durable disposition obtained from transaction operations, never error-text inference.
+    pub fn commit_state(&self) -> IdentityPurgeCommitState {
+        self.commit_state
+    }
+}
+
+impl std::fmt::Display for IdentityPurgeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.cause.fmt(f)
+    }
+}
+impl std::error::Error for IdentityPurgeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+const CAPTURED_SESSION_COLUMNS: [&str; 20] = [
+    "session_id",
+    "name",
+    "agent",
+    "kind",
+    "role",
+    "tier",
+    "harness_session_id",
+    "client_key",
+    "cwd",
+    "project",
+    "current_work",
+    "presence",
+    "paused",
+    "paused_by",
+    "callback_url",
+    "last_heartbeat",
+    "created_at",
+    "transport",
+    "metadata_json",
+    "agent_id",
+];
+
+fn staged_raw_image(row: &libsql::Row) -> Result<[libsql::Value; 20], NexusError> {
+    let mut raw = std::array::from_fn(|_| libsql::Value::Null);
+    for (index, value) in raw.iter_mut().enumerate() {
+        *value = row.get_value(index as i32).map_err(store_err)?;
+    }
+    Ok(raw)
+}
+
+fn capture_staged_row(row: &libsql::Row) -> Result<CapturedStagedSession, NexusError> {
+    Ok(CapturedStagedSession {
+        raw: staged_raw_image(row)?,
+        row: row_to_session(row)?,
+    })
+}
+
+fn same_staged_image(left: &[libsql::Value; 20], right: &[libsql::Value; 20]) -> bool {
+    left.iter()
+        .zip(right)
+        .all(|(left, right)| match (left, right) {
+            (libsql::Value::Real(left), libsql::Value::Real(right)) => {
+                left.to_bits() == right.to_bits()
+            }
+            _ => left == right,
+        })
+}
+
+async fn select_staged_row(
+    txn: &WriteTxn,
+    id: &libsql::Value,
+) -> Result<Option<libsql::Row>, NexusError> {
+    let mut rows = txn
+        .query(
+            &format!(
+                "SELECT {} FROM sessions WHERE session_id=?1",
+                CAPTURED_SESSION_COLUMNS.join(", ")
+            ),
+            params![id.clone()],
+        )
+        .await?;
+    rows.next().await.map_err(store_err)
+}
+
+async fn selected_transport_session_matches(
+    txn: &WriteTxn,
+    selected: &SessionRow,
+) -> Result<bool, NexusError> {
+    let row = select_staged_row(txn, &libsql::Value::Text(selected.session_id.0.clone())).await?;
+    match row {
+        Some(row) => Ok(row_to_session(&row)? == *selected),
+        None => Ok(false),
+    }
+}
+
+async fn best_effort_transport_delete(
+    txn: &WriteTxn,
+    sql: &str,
+    params: impl libsql::params::IntoParams,
+) -> Result<(), NexusError> {
+    if let Err(cause) = txn.execute(sql, params).await {
+        // Ordinary child failures retain legacy best effort. A trigger may instead have ended
+        // the transaction: never execute the remaining cleanup outside its pinned transaction.
+        let check = txn.query("SELECT 1", ()).await.map_err(|state| {
+            NexusError::Store(format!(
+                "{cause}; selected transport purge cannot continue child cleanup: {state}"
+            ))
+        })?;
+        drop(check);
+    }
+    Ok(())
+}
+
+async fn commit_staged_result<T>(
+    txn: WriteTxn,
+    result: Result<T, NexusError>,
+) -> Result<T, NexusError> {
+    match result {
+        Ok(value) => {
+            // A commit error is uncertain: never return successful/advanced authority.
+            txn.commit().await?;
+            Ok(value)
+        }
+        Err(error) => {
+            txn.rollback(&error).await?;
+            Err(error)
+        }
+    }
+}
+
 /// Persistence for the `sessions` table.
 pub struct Sessions<'a> {
     store: &'a Store,
+}
+
+enum PresenceLifecyclePolicy {
+    Strict,
+    BestEffort,
 }
 
 impl<'a> Sessions<'a> {
     /// Bind a repo to the shared store connection.
     pub fn new(store: &'a Store) -> Self {
         Sessions { store }
+    }
+
+    /// Stage and capture the actual persisted row in one transport write transaction.
+    /// Projection decoding and raw capture precede commit; no `started` fact or signal is emitted.
+    /// A receipt is returned only on confirmed commit. An error at commit may be ambiguous.
+    pub async fn create_staged_registration_captured(
+        &self,
+        s: NewSession,
+        metadata_json: Option<String>,
+    ) -> Result<CapturedStagedSession, NexusError> {
+        let txn = self
+            .store
+            .begin_write_txn("session_create_staged_captured")
+            .await?;
+        let result = async {
+            let ts = now();
+            let id = libsql::Value::Text(s.session_id.0.clone());
+            let kind = canonical_kind(&s.kind)?;
+            let changed = txn
+                .execute(
+                    "INSERT INTO sessions (session_id, name, agent, kind, role, tier, \
+                 harness_session_id, client_key, cwd, project, presence, paused, created_at, \
+                 transport, metadata_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'online', 0, ?11, ?12, ?13)",
+                    params![
+                        s.session_id.0,
+                        s.name,
+                        s.agent,
+                        kind,
+                        s.role,
+                        s.tier,
+                        s.harness_session_id,
+                        s.client_key,
+                        s.cwd,
+                        s.project,
+                        ts,
+                        s.transport,
+                        metadata_json
+                    ],
+                )
+                .await?;
+            if changed != 1 {
+                return Err(NexusError::Store(
+                    "staged insertion did not insert exactly one row".into(),
+                ));
+            }
+            let row = select_staged_row(&txn, &id)
+                .await?
+                .ok_or_else(|| NexusError::Store("staged insertion row missing".into()))?;
+            capture_staged_row(&row)
+        }
+        .await;
+        commit_staged_result(txn, result).await
+    }
+
+    /// Stamp only an exact same-store selection and return its advanced image after commit.
+    /// Only `agent_id` may change. Precommit failure rolls back; commit errors are uncertain and
+    /// must not be interpreted as permission to clean up by ID or to fabricate a new receipt.
+    /// If the binding value does not change, the original image still matches; this is not an
+    /// incarnation counter or an ABA guard.
+    pub async fn set_agent_id_selected(
+        &self,
+        selected: &CapturedStagedSession,
+        agent_id: &str,
+    ) -> Result<SelectedStagedSessionStamp, NexusError> {
+        let txn = self
+            .store
+            .begin_write_txn("session_set_agent_id_selected")
+            .await?;
+        let result = async {
+            let Some(row) = select_staged_row(&txn, &selected.raw[0]).await? else {
+                return Ok(SelectedStagedSessionStamp::SelectionChanged);
+            };
+            if !same_staged_image(&staged_raw_image(&row)?, &selected.raw) {
+                return Ok(SelectedStagedSessionStamp::SelectionChanged);
+            }
+            let changed = txn
+                .execute(
+                    "UPDATE sessions SET agent_id=?2 WHERE session_id=?1",
+                    params![selected.raw[0].clone(), agent_id],
+                )
+                .await?;
+            if changed != 1 {
+                return Err(NexusError::Store(
+                    "selected staged stamp did not update exactly one row".into(),
+                ));
+            }
+            let row = select_staged_row(&txn, &selected.raw[0])
+                .await?
+                .ok_or_else(|| {
+                    NexusError::Store("selected staged stamp row missing after update".into())
+                })?;
+            let mut expected = selected.raw.clone();
+            expected[19] = libsql::Value::Text(agent_id.into());
+            if !same_staged_image(&staged_raw_image(&row)?, &expected) {
+                return Err(NexusError::Store(
+                    "selected staged stamp changed unexpected fields".into(),
+                ));
+            }
+            Ok(SelectedStagedSessionStamp::Updated(capture_staged_row(
+                &row,
+            )?))
+        }
+        .await;
+        commit_staged_result(txn, result).await
+    }
+
+    /// Remove only an exact same-store selection, signaling a change only after confirmed commit.
+    /// No lifecycle fact is appended. Commit failure returns uncertainty, not successful cleanup;
+    /// this API does not authorize generated-agent cleanup or mutations in another authority.
+    pub async fn remove_staged_registration_selected(
+        &self,
+        selected: &CapturedStagedSession,
+    ) -> Result<SelectedStagedSessionCleanup, NexusError> {
+        let txn = self
+            .store
+            .begin_write_txn("session_remove_staged_selected")
+            .await?;
+        let result = async {
+            let Some(row) = select_staged_row(&txn, &selected.raw[0]).await? else {
+                return Ok(SelectedStagedSessionCleanup::AlreadyAbsent);
+            };
+            if !same_staged_image(&staged_raw_image(&row)?, &selected.raw) {
+                return Ok(SelectedStagedSessionCleanup::SelectionChanged);
+            }
+            let changed = txn
+                .execute(
+                    "DELETE FROM sessions WHERE session_id=?1",
+                    params![selected.raw[0].clone()],
+                )
+                .await?;
+            if changed != 1 {
+                return Err(NexusError::Store(
+                    "selected staged cleanup did not delete exactly one row".into(),
+                ));
+            }
+            Ok(SelectedStagedSessionCleanup::Removed)
+        }
+        .await;
+        let outcome = commit_staged_result(txn, result).await?;
+        if matches!(outcome, SelectedStagedSessionCleanup::Removed) {
+            self.store.events().session_lifecycle_changed().signal();
+        }
+        Ok(outcome)
     }
 
     /// Insert a new session row (presence `online`, not paused, `created_at = now()`).
@@ -187,6 +562,34 @@ impl<'a> Sessions<'a> {
         session: &SessionId,
         presence: Presence,
     ) -> Result<(), NexusError> {
+        self.set_presence_with_lifecycle_policy(session, presence, PresenceLifecyclePolicy::Strict)
+            .await
+    }
+
+    /// Update required presence state while treating only its lifecycle append as best-effort.
+    ///
+    /// Lookup and UPDATE errors remain load-bearing. After a successful UPDATE, an append error
+    /// is warned and the lifecycle-change signal is still sent. This does not add a transaction,
+    /// retry, or an exactly-once guarantee; callers choose whether this telemetry policy fits.
+    pub async fn set_presence_with_best_effort_lifecycle(
+        &self,
+        session: &SessionId,
+        presence: Presence,
+    ) -> Result<(), NexusError> {
+        self.set_presence_with_lifecycle_policy(
+            session,
+            presence,
+            PresenceLifecyclePolicy::BestEffort,
+        )
+        .await
+    }
+
+    async fn set_presence_with_lifecycle_policy(
+        &self,
+        session: &SessionId,
+        presence: Presence,
+        lifecycle_policy: PresenceLifecyclePolicy,
+    ) -> Result<(), NexusError> {
         let before = self.find_by_session_id(session).await?;
         self.store
             .conn
@@ -201,12 +604,102 @@ impl<'a> Sessions<'a> {
                 row.presence.as_deref().unwrap_or("offline"),
                 presence_token(presence),
             ) {
-                self.append_lifecycle(&row.display_name(), session, lifecycle, None, now())
-                    .await?;
+                if let Err(error) = self
+                    .append_lifecycle(&row.display_name(), session, lifecycle, None, now())
+                    .await
+                {
+                    match lifecycle_policy {
+                        PresenceLifecyclePolicy::Strict => return Err(error),
+                        PresenceLifecyclePolicy::BestEffort => tracing::warn!(
+                            target: "nexus::presence",
+                            session = %session,
+                            error = %error,
+                            "failed best-effort Session presence lifecycle append"
+                        ),
+                    }
+                }
             }
         }
         self.store.events().session_lifecycle_changed().signal();
         Ok(())
+    }
+
+    /// Mark one previously selected compatibility session offline only if its transport-local
+    /// identity and staleness still match.
+    ///
+    /// Selection and the conditional mutation share one transaction on the transport store;
+    /// `expected_agent_id = None` matches SQL `NULL` exactly and is not a wildcard. Only presence
+    /// changes. The transaction commits before the lifecycle append because that append opens its
+    /// own transport transaction. Consequently an append failure is returned after the offline
+    /// row is already durable and must not be interpreted as a retry-safe no-effect result.
+    /// Attribution comes from the row captured in the transaction, without a post-commit reread.
+    /// This boundary does not claim protection from same-session/same-agent ABA before entry or
+    /// coordinate a later transition in another store authority.
+    pub async fn set_offline_if_stale_selected(
+        &self,
+        session: &SessionId,
+        expected_agent_id: Option<&str>,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<bool, NexusError> {
+        let txn = self
+            .store
+            .begin_write_txn("session_set_offline_if_stale_selected")
+            .await?;
+        let result = async {
+            let identity_matches = "(agent_id = ?2 OR (agent_id IS NULL AND ?2 IS NULL))";
+            let stale = "COALESCE(presence, 'offline') <> 'offline' \
+                         AND ?3 - COALESCE(last_heartbeat, created_at) > ?4";
+            let mut rows = txn
+                .query(
+                    &format!("{SELECT} WHERE session_id = ?1 AND {identity_matches} AND {stale}"),
+                    params![session.0.clone(), expected_agent_id, now_ms, ttl_ms],
+                )
+                .await?;
+            let selected = match rows.next().await.map_err(store_err)? {
+                Some(row) => Some(row_to_session(&row)?),
+                None => None,
+            };
+            drop(rows);
+            let Some(selected) = selected else {
+                return Ok(None);
+            };
+            let changed = txn
+                .execute(
+                    &format!(
+                        "UPDATE sessions SET presence = 'offline' \
+                         WHERE session_id = ?1 AND {identity_matches} AND {stale}"
+                    ),
+                    params![session.0.clone(), expected_agent_id, now_ms, ttl_ms],
+                )
+                .await?;
+            Ok((changed == 1).then_some(selected))
+        }
+        .await;
+
+        let selected = match result {
+            Ok(selected) => {
+                txn.commit().await?;
+                selected
+            }
+            Err(error) => {
+                txn.rollback(&error).await?;
+                return Err(error);
+            }
+        };
+        let Some(selected) = selected else {
+            return Ok(false);
+        };
+        self.append_lifecycle(
+            &selected.display_name(),
+            &selected.session_id,
+            "offline",
+            None,
+            now(),
+        )
+        .await?;
+        self.store.events().session_lifecycle_changed().signal();
+        Ok(true)
     }
 
     /// Update the operator-visible work-state field and emit a metadata-only lifecycle event.
@@ -467,7 +960,9 @@ impl<'a> Sessions<'a> {
     /// PURGE — erase a durable agent identity entirely (the `delete` op): the compatibility
     /// session row, stable runtime/credential rows, in-flight rows, thread memberships, ACL grant
     /// edges, and every message it sent or received. Caller kills the live process first.
-    /// Best-effort per statement; a missing row is not an error.
+    /// Identity retirement, ACL, runtime, credential, and agent deletion commit atomically;
+    /// invalid model authority or retirement failure aborts that identity transaction. Transport
+    /// cleanup is separate and best-effort. A missing row is not an error.
     ///
     /// Legacy callers may only have `session_id` and the requested name, so this wrapper derives the
     /// stable id from the selected session/runtime before falling back to a name lookup.
@@ -538,6 +1033,271 @@ impl<'a> Sessions<'a> {
             .map(|agent| agent.agent_id))
     }
 
+    /// Capture the full identity purge predicate; this read alone authorizes no deletion.
+    pub async fn runtime_pairs_for_purge(
+        &self,
+        session: &SessionId,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<(String, String)>, NexusError> {
+        let mut rows = self.store.identity_conn().query(
+            "SELECT runtime_id,agent_id FROM agent_runtimes WHERE (?1 IS NOT NULL AND agent_id=?1) OR runtime_id=?2 ORDER BY runtime_id,agent_id",
+            params![agent_id, session.0.as_str()],
+        ).await.map_err(store_err)?;
+        let mut pairs = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            pairs.push((get_text(&row, 0)?, get_text(&row, 1)?));
+        }
+        Ok(pairs)
+    }
+
+    /// Delete only the selected identity-store predicate after matching its entire runtime set.
+    ///
+    /// The caller must authorize this row's session, stable agent and name-based ACL predicates
+    /// under the same Store's managed lifecycle exclusion. This method provides neither Session
+    /// binding validation, native teardown, transport cleanup nor same-value incarnation proof.
+    /// Empty selection is exact, not a wildcard. A confirmed receipt must be retained before any
+    /// subsequent fallible transport work; do not call legacy purge as its tail.
+    pub async fn purge_identity_selected(
+        &self,
+        row: &SessionRow,
+        captured_agent_id: Option<&str>,
+        expected_pairs: &[(String, String)],
+    ) -> Result<SelectedIdentityPurge, IdentityPurgeFailure> {
+        let mut pairs = expected_pairs.to_vec();
+        pairs.sort();
+        pairs.dedup();
+        self.purge_identity(
+            &row.session_id,
+            &row.project,
+            row.name.as_deref(),
+            captured_agent_id,
+            Some(&pairs),
+        )
+        .await
+    }
+
+    async fn purge_identity(
+        &self,
+        session: &SessionId,
+        project: &str,
+        name: Option<&str>,
+        agent_id: Option<&str>,
+        expected_pairs: Option<&[(String, String)]>,
+    ) -> Result<SelectedIdentityPurge, IdentityPurgeFailure> {
+        let tx = self
+            .store
+            .begin_identity_write_txn("session_purge_identity")
+            .await
+            .map_err(|cause| IdentityPurgeFailure {
+                cause,
+                commit_state: IdentityPurgeCommitState::NotCommitted,
+            })?;
+        let result = async {
+            let mut selection = tx.query(
+                "SELECT runtime_id,agent_id FROM agent_runtimes WHERE (?1 IS NOT NULL AND agent_id=?1) OR runtime_id=?2 ORDER BY runtime_id,agent_id",
+                params![agent_id, session.0.as_str()],
+            ).await?;
+            let mut actual = Vec::new();
+            while let Some(row) = selection.next().await.map_err(store_err)? {
+                actual.push((get_text(&row, 0)?, get_text(&row, 1)?));
+            }
+            drop(selection);
+            if expected_pairs.is_some_and(|expected| expected != actual) {
+                return Ok(SelectedIdentityPurge::SelectionChanged);
+            }
+            // Use the deletion predicate inside the writer transaction: stopped siblings and the
+            // exact-runtime fallback must retire alongside the selected stable identity. Reuse
+            // the runtime decoder so malformed authority fails closed, but malformed JSON alone
+            // never prevents erasing the observation payload.
+            let mut rows = tx
+                .query(
+                    "SELECT runtime_id, agent_id, harness, cwd, transport, presence, active, \
+                 started_at, stopped_at, last_heartbeat, os_pid, os_pgid, model_observer_token, \
+                 model_observer_sequence, model_report_revision, model_report_json \
+                 FROM agent_runtimes WHERE (?1 IS NOT NULL AND agent_id = ?1) OR runtime_id = ?2",
+                    params![agent_id, session.0.as_str()],
+                )
+                .await?;
+            let mut retired_ids = Vec::new();
+            while let Some(row) = rows.next().await.map_err(store_err)? {
+                let runtime = crate::repos::agent_runtimes::row_to_runtime(&row)?;
+                if runtime.model_report_revision > 0 {
+                    retired_ids.push(runtime.runtime_id);
+                }
+            }
+            drop(rows);
+            for runtime_id in retired_ids {
+                tx.execute(
+                    "INSERT INTO retired_model_runtime_ids(runtime_id) VALUES (?1) \
+                     ON CONFLICT(runtime_id) DO NOTHING",
+                    params![runtime_id.as_str()],
+                )
+                .await?;
+                // A silently ignored insert is not retirement. Existing guards are idempotent.
+                let mut guard = tx
+                    .query(
+                        "SELECT 1 FROM retired_model_runtime_ids WHERE runtime_id = ?1",
+                        params![runtime_id.as_str()],
+                    )
+                    .await?;
+                if guard.next().await.map_err(store_err)?.is_none() {
+                    return Err(NexusError::Store(
+                        "runtime identity retirement did not persist".into(),
+                    ));
+                }
+            }
+            // Keep AgentAccessGrants::purge_deleted_agent's exact actor/target predicate, but
+            // execute it here so a failed retirement cannot destructively change the ACL graph.
+            tx.execute(
+                "DELETE FROM agent_acl_grants \
+                 WHERE (?1 IS NOT NULL AND agent_id = ?1) \
+                    OR (?3 IS NOT NULL AND principal_project = ?2 AND principal_name = ?3) \
+                    OR (?3 IS NOT NULL AND granted_by_project = ?2 AND granted_by_name = ?3) \
+                    OR (?1 IS NOT NULL AND principal_agent_id = ?1)",
+                params![agent_id, project, name],
+            )
+            .await?;
+            tx.execute(
+                "DELETE FROM agent_credentials WHERE ?1 IS NOT NULL AND agent_id = ?1",
+                params![agent_id],
+            )
+            .await?;
+            let deleted = tx.execute(
+                "DELETE FROM agent_runtimes WHERE (?1 IS NOT NULL AND agent_id = ?1) \
+                 OR runtime_id = ?2",
+                params![agent_id, session.0.as_str()],
+            )
+            .await?;
+            if expected_pairs.is_some() && deleted != actual.len() as u64 {
+                return Err(NexusError::Store("selected purge runtime deletion count mismatch".into()));
+            }
+            tx.execute(
+                "DELETE FROM agents WHERE (?1 IS NOT NULL AND agent_id = ?1) \
+                 OR (?4 AND ?1 IS NULL AND ?3 IS NOT NULL AND project = ?2 AND name = ?3)",
+                params![agent_id, project, name, expected_pairs.is_none()],
+            )
+            .await?;
+            // Verify the final transaction image after all identity writes and their triggers.
+            if expected_pairs.is_some() {
+                let mut remaining = tx.query(
+                    "SELECT 1 FROM agent_runtimes WHERE (?1 IS NOT NULL AND agent_id=?1) OR runtime_id=?2 LIMIT 1",
+                    params![agent_id, session.0.as_str()],
+                ).await?;
+                if remaining.next().await.map_err(store_err)?.is_some() {
+                    return Err(NexusError::Store("selected purge runtime deletion left rows".into()));
+                }
+                drop(remaining);
+                // A trigger could recreate a sibling ID under another agent, outside the original
+                // predicate. The receipt must not certify that captured ID as absent either.
+                for (runtime_id, _) in &actual {
+                    let mut remaining = tx.query(
+                        "SELECT 1 FROM agent_runtimes WHERE runtime_id=?1",
+                        params![runtime_id.as_str()],
+                    ).await?;
+                    if remaining.next().await.map_err(store_err)?.is_some() {
+                        return Err(NexusError::Store("selected purge runtime deletion left rows".into()));
+                    }
+                }
+                let mut remaining = tx.query(
+                    "SELECT 1 FROM agents WHERE ?1 IS NOT NULL AND agent_id=?1
+                     UNION ALL SELECT 1 FROM agent_credentials WHERE ?1 IS NOT NULL AND agent_id=?1
+                     UNION ALL SELECT 1 FROM agent_acl_grants WHERE
+                       (?1 IS NOT NULL AND agent_id=?1)
+                       OR (?3 IS NOT NULL AND principal_project=?2 AND principal_name=?3)
+                       OR (?3 IS NOT NULL AND granted_by_project=?2 AND granted_by_name=?3)
+                       OR (?1 IS NOT NULL AND principal_agent_id=?1) LIMIT 1",
+                    params![agent_id, project, name],
+                ).await?;
+                if remaining.next().await.map_err(store_err)?.is_some() {
+                    return Err(NexusError::Store("selected purge identity deletion left rows".into()));
+                }
+            }
+            Ok(SelectedIdentityPurge::Purged(IdentityPurgeReceipt {
+                session_id: session.clone(), agent_id: agent_id.map(str::to_owned), runtime_pairs: actual,
+                project: project.to_owned(), name: name.map(str::to_owned),
+            }))
+        }
+        .await;
+        match result {
+            Ok(outcome) => {
+                tx.commit().await.map_err(|cause| IdentityPurgeFailure {
+                    cause,
+                    commit_state: IdentityPurgeCommitState::Unknown,
+                })?;
+                Ok(outcome)
+            }
+            Err(cause) => Err(match tx.rollback_confirmed(&cause).await {
+                Ok(true) => IdentityPurgeFailure {
+                    cause,
+                    commit_state: IdentityPurgeCommitState::NotCommitted,
+                },
+                Ok(false) => IdentityPurgeFailure {
+                    cause,
+                    commit_state: IdentityPurgeCommitState::Unknown,
+                },
+                Err(cause) => IdentityPurgeFailure {
+                    cause,
+                    commit_state: IdentityPurgeCommitState::Unknown,
+                },
+            }),
+        }
+    }
+
+    /// Continue a confirmed identity purge without repeating any identity-store effects.
+    ///
+    /// Caller retains the same Store's managed exclusion and the original normalized Session
+    /// selection. This is not authentication, raw-image equality, or incarnation authority.
+    /// Every error/veto follows an already committed identity phase; lifecycle append may also
+    /// fail after transport commit. Preserve the identity receipt when reporting that partial
+    /// outcome. Missing Session is a veto, not permission to delete by a possibly reused name.
+    pub async fn purge_transport_selected(
+        &self,
+        selected: &SessionRow,
+        receipt: &IdentityPurgeReceipt,
+    ) -> Result<SelectedTransportPurge, NexusError> {
+        let txn = self
+            .store
+            .begin_write_txn("session_purge_transport_selected")
+            .await?;
+        let result = async {
+            if receipt.session_id() != &selected.session_id || receipt.project() != selected.project
+                || receipt.name() != selected.name.as_deref()
+                || !selected_transport_session_matches(&txn, selected).await? {
+                return Ok(SelectedTransportPurge::SelectionChanged);
+            }
+            // The authorized runtime fallback agent is distinct from a nullable Session stamp.
+            best_effort_transport_delete(&txn,
+                "DELETE FROM in_flight WHERE recipient_session=?1 OR (?2 IS NOT NULL AND recipient_agent_id=?2)",
+                params![receipt.session_id().0.as_str(), receipt.agent_id()]).await?;
+            best_effort_transport_delete(&txn,
+                "DELETE FROM thread_members WHERE (?1 IS NOT NULL AND session_name=?1) OR (?2 IS NOT NULL AND agent_id=?2)",
+                params![receipt.name(), receipt.agent_id()]).await?;
+            best_effort_transport_delete(&txn,
+                "DELETE FROM messages WHERE (?1 IS NOT NULL AND (from_name=?1 OR to_name=?1)) OR (?2 IS NOT NULL AND (from_agent_id=?2 OR to_agent_id=?2))",
+                params![receipt.name(), receipt.agent_id()]).await?;
+            if !selected_transport_session_matches(&txn, selected).await? {
+                return Err(NexusError::Store("selected transport purge Session changed during child cleanup".into()));
+            }
+            let changed = txn.execute("DELETE FROM sessions WHERE session_id=?1", params![selected.session_id.0.as_str()]).await?;
+            if changed != 1 {
+                return Err(NexusError::Store("selected transport purge did not delete exactly one Session".into()));
+            }
+            if select_staged_row(&txn, &libsql::Value::Text(selected.session_id.0.clone())).await?.is_some() {
+                return Err(NexusError::Store("selected transport purge left a Session row".into()));
+            }
+            Ok(SelectedTransportPurge::Purged)
+        }.await;
+        let outcome = commit_staged_result(txn, result).await?;
+        if outcome == SelectedTransportPurge::Purged {
+            if let Some(name) = receipt.name() {
+                self.append_lifecycle(name, receipt.session_id(), "stopped", None, now())
+                    .await?;
+            }
+            self.store.events().session_lifecycle_changed().signal();
+        }
+        Ok(outcome)
+    }
+
     async fn purge_exact(
         &self,
         session: &SessionId,
@@ -545,11 +1305,11 @@ impl<'a> Sessions<'a> {
         name: Option<&str>,
         agent_id: Option<&str>,
     ) -> Result<(), NexusError> {
+        self.purge_identity(session, project, name, agent_id, None)
+            .await
+            .map_err(|failure| failure.cause)?;
         let conn = &self.store.conn;
-        let identity = self.store.identity_conn();
-        let _ = crate::repos::AgentAccessGrants::new(self.store)
-            .purge_deleted_agent(agent_id, project, name)
-            .await;
+        // Transport has a separate authority in split stores; do not imply cross-DB rollback.
         let _ = conn
             .execute(
                 "DELETE FROM in_flight WHERE recipient_session = ?1 \
@@ -569,26 +1329,6 @@ impl<'a> Sessions<'a> {
                 "DELETE FROM messages WHERE (?1 IS NOT NULL AND (from_name = ?1 OR to_name = ?1)) \
                  OR (?2 IS NOT NULL AND (from_agent_id = ?2 OR to_agent_id = ?2))",
                 params![name, agent_id],
-            )
-            .await;
-        let _ = identity
-            .execute(
-                "DELETE FROM agent_credentials WHERE ?1 IS NOT NULL AND agent_id = ?1",
-                params![agent_id],
-            )
-            .await;
-        let _ = identity
-            .execute(
-                "DELETE FROM agent_runtimes WHERE (?1 IS NOT NULL AND agent_id = ?1) \
-                 OR runtime_id = ?2",
-                params![agent_id, session.0.clone()],
-            )
-            .await;
-        let _ = identity
-            .execute(
-                "DELETE FROM agents WHERE (?1 IS NOT NULL AND agent_id = ?1) \
-                 OR (?1 IS NULL AND ?3 IS NOT NULL AND project = ?2 AND name = ?3)",
-                params![agent_id, project, name],
             )
             .await;
         conn.execute(

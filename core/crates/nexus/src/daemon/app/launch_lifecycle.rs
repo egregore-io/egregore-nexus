@@ -373,11 +373,24 @@ impl AppState {
         // has_session=true but can't be injected, so we must (re-)spawn it.
         let was_live = agent.is_live(&session);
         let durable_was_offline = row.presence.as_deref() == Some("offline");
+        let mut observation = None;
         if !was_live {
             // The harness label lives on the `agent` column.
             let kind = harness_from_token(row.agent.as_deref());
+            let prepared = agent.prepare_adapter(&kind)?;
+            let reporting_agent = self
+                .capture_adapter_reporting_agent(&row, prepared.profile())
+                .await?;
+            observation = self.reserve_adapter_observation(
+                reporting_agent.as_deref().unwrap_or(""),
+                &session,
+                prepared.profile(),
+            )?;
             let client_key = row.client_key.as_deref().unwrap_or(session.0.as_str());
-            let agent_key = row.agent_id.as_deref().unwrap_or(name);
+            let agent_key = reporting_agent
+                .as_deref()
+                .or(row.agent_id.as_deref())
+                .unwrap_or(name);
             let (cwd, env) = self.agent_launch_ctx(
                 agent_key,
                 Some(name),
@@ -386,17 +399,34 @@ impl AppState {
                 client_key,
                 row.cwd.clone(),
             );
-            let process_ledger = agent
-                .open_session_for(
-                    session.clone(),
-                    name,
-                    project,
-                    kind,
-                    cwd,
-                    env,
-                    row.harness_session_id.as_deref(), // the persisted ACP resume key (session/load)
-                )
-                .await?;
+            let process_ledger = if let Some(observation) = observation.as_mut() {
+                observation.commit(self).await?;
+                let opened = agent
+                    .open_session_for_observed(
+                        session.clone(),
+                        name,
+                        project,
+                        prepared,
+                        cwd,
+                        env,
+                        row.harness_session_id.as_deref(),
+                        observation.sink(),
+                    )
+                    .await?;
+                observation.opened(opened)
+            } else {
+                agent
+                    .open_session_for(
+                        session.clone(),
+                        name,
+                        project,
+                        kind,
+                        cwd,
+                        env,
+                        row.harness_session_id.as_deref(), // the persisted ACP resume key (session/load)
+                    )
+                    .await?
+            };
             if let Some(entry) = process_ledger {
                 self.set_runtime_process_ledger_best_effort(&session, entry, "acp ensure-live")
                     .await;
@@ -438,14 +468,18 @@ impl AppState {
             if !was_live || durable_was_offline {
                 self.mark_rebound_agent_live(&session).await?;
             }
+            if let Some(observation) = observation.as_mut() {
+                observation.activate(self, agent).await?;
+            }
             if let Some(w) = &self.loop_wiring {
+                let transition = w.store.lock_presence_transition().await;
                 if !row.paused {
                     w.registry.set(&session, nexus_dispatch::AgentState::Idle);
                 }
                 // Spawn the loop (no-op if already running) AND ring: `spawn_loop` re-rings only on a
                 // FRESH spawn, so after a rebind whose loop already existed we must ring here or the
                 // newly-live adapter's pending mail never drains.
-                w.spawn_loop(&session, project);
+                w.spawn_loop_under_transition(&session, project, &transition);
                 w.ring(&session);
             }
         }

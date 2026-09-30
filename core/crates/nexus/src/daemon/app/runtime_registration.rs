@@ -311,7 +311,8 @@ impl AppState {
             .await?
             .map(|row| row.paused)
             .unwrap_or(false);
-        self.make_live_agent_wakeable(&registered.session, &registered.project, paused);
+        self.make_live_agent_wakeable(&registered.session, &registered.project, paused)
+            .await;
         Ok(())
     }
 
@@ -448,7 +449,8 @@ impl AppState {
                 &SessionId(row.session_id.0.clone()),
                 &row.project,
                 row.paused,
-            );
+            )
+            .await;
         }
     }
 
@@ -581,6 +583,9 @@ impl AppState {
     /// name.
     /// The durable `agents`/`agent_runtimes` graph is bound in the same path so daemon-owned launches
     /// are immediately addressable by stable identity, even before a harness self-register hook runs.
+    /// Presence admission covers selection, binding, and online materialization, not native launch
+    /// or wakeup. Cancellation before admission has no effects; after binding commits it remains a
+    /// partial operation, not an atomic launch transaction.
     pub(crate) async fn bind_member(
         &self,
         session: &SessionId,
@@ -594,6 +599,7 @@ impl AppState {
         transport: &str,
         owner: Option<&Caller>,
     ) -> Result<(), NexusError> {
+        let transition = self.presence.binding_transition().await;
         let repo = Sessions::new(&self.store);
         let new = NewSession {
             session_id: SessionId(session.0.clone()),
@@ -639,7 +645,8 @@ impl AppState {
                     .await?;
                     repo.set_transport(session, transport).await?;
                     repo.set_agent_id(session, agent_id).await?;
-                    self.presence.materialize_online(session).await?;
+                    transition.materialize_online(session).await?;
+                    drop(transition);
                     self.ws
                         .project_runtime_binding(session, &AgentId(agent_id.to_string()))
                         .await;
@@ -686,7 +693,8 @@ impl AppState {
                     "dead-name bind_member",
                 )
                 .await;
-                self.presence.materialize_online(session).await?;
+                transition.materialize_online(session).await?;
+                drop(transition);
                 self.ws
                     .emit(WsEvent::AgentSpawned {
                         session_id: SessionId(session.0.clone()),
@@ -711,7 +719,8 @@ impl AppState {
         }
         // The daemon just launched this agent, so it is live now: stamp a heartbeat so it shows in
         // `members` immediately (a never-beaten row is treated as stale → offline → hidden).
-        self.presence.materialize_online(session).await?;
+        transition.materialize_online(session).await?;
+        drop(transition);
         // Announce the launched member so local observers and directory projections see it immediately.
         self.ws
             .emit(WsEvent::AgentSpawned {

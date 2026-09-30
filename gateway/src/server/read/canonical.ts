@@ -1,4 +1,5 @@
 import type { Client, Row } from "@libsql/client";
+import { readStoredModelReport } from "../projection/modelReport";
 
 import {
   pageCanonicalMessages,
@@ -122,6 +123,7 @@ export async function canonicalRuntimes(
     return [{
       runtimeId: String(row.runtime_id),
       agentId: String(row.agent_id),
+      modelReport: readStoredModelReport(row.model_report_revision, row.model_report_json),
       name: optionalString(row.name),
       harness: String(row.harness),
       cwd: optionalString(row.cwd),

@@ -260,6 +260,10 @@ async fn listen_ack_activity_keeps_consumer_heartbeat_fresh() {
     let store = migrated_store().await;
     let config = Config::default();
     let state = AppState::wire(store.clone(), &config);
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
     let target = state
         .identity
         .register(app_register("listen-target", "ck_listen_target"))
@@ -374,6 +378,10 @@ async fn durable_listen_subscription_replays_pending_batch_until_subscription_ac
     let store = migrated_store().await;
     let config = Config::default();
     let state = AppState::wire(store.clone(), &config);
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
     let target = state
         .identity
         .register(app_register("sub-target", "ck_sub_target"))
@@ -508,6 +516,10 @@ async fn durable_listen_subscription_replays_pending_batch_until_subscription_ac
 async fn durable_subscription_ack_does_not_resurrect_a_terminal_delivery() {
     let store = migrated_store().await;
     let state = AppState::wire(store.clone(), &Config::default());
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
     let target = state
         .identity
         .register(app_register(
@@ -621,6 +633,10 @@ async fn durable_subscription_ack_does_not_resurrect_a_terminal_delivery() {
 async fn listen_retries_an_initial_subscription_timeout() {
     let store = migrated_store().await;
     let state = AppState::wire(store.clone(), &Config::default());
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
     state
         .identity
         .register(app_register("retrying-listener", "ck_retrying_listener"))
@@ -791,6 +807,10 @@ async fn inbox_consume_reissues_after_daemon_boot_epoch_changes() {
 
     let config = Config::default();
     let state_before = AppState::wire(daemon_store.clone(), &config);
+    state_before
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
     let target = state_before
         .identity
         .register(app_register("restart-target", "ck_restart_target"))
@@ -925,6 +945,10 @@ async fn store_client_consume_helper_reissues_after_boot_epoch_change() {
 
     let config = Config::default();
     let state = AppState::wire(daemon_store.clone(), &config);
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
     state
         .identity
         .register(agent_register("mcp-target", "ck_mcp_target"))

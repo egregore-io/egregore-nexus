@@ -41,6 +41,180 @@ fn passive_pty_program() -> &'static str {
     }
 }
 
+async fn boot_model_fixture() -> (tempfile::TempDir, Arc<nexus_store::Store>) {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = DaemonStore::open(dir.path().join("identity.db").to_str().unwrap())
+        .await
+        .unwrap();
+    let store = Arc::new(daemon.compatibility_store());
+    Agents::new(&store)
+        .create(NewAgent {
+            agent_id: "a_boot_model".into(),
+            project: "default".into(),
+            name: Some("boot-model".into()),
+            default_harness: Some("other".into()),
+            role: None,
+            tier: None,
+            owner: None,
+        })
+        .await
+        .unwrap();
+    AgentRuntimes::new(&store)
+        .create(NewAgentRuntime {
+            runtime_id: "s_boot_model".into(),
+            agent_id: "a_boot_model".into(),
+            harness: "other".into(),
+            cwd: None,
+            transport: None,
+            presence: Some("offline".into()),
+            active: true,
+        })
+        .await
+        .unwrap();
+    IdentitySessions::new(&store)
+        .upsert(NewIdentitySession {
+            runtime_id: "s_boot_model".into(),
+            agent_id: "a_boot_model".into(),
+            project: "default".into(),
+            harness: "other".into(),
+            mode: "headless".into(),
+            backend: None,
+            cwd: None,
+            native_resume_key: None,
+            client_key: Some("boot-model-key".into()),
+        })
+        .await
+        .unwrap();
+    (dir, store)
+}
+
+#[tokio::test]
+async fn corrupt_model_authority_blocks_valid_boot_directory_restoration() {
+    let (_dir, store) = boot_model_fixture().await;
+    store.identity_conn().execute(
+        "UPDATE agent_runtimes SET model_observer_token='', model_report_revision=1 WHERE runtime_id='s_boot_model'",
+        (),
+    ).await.unwrap();
+    let state = AppState::wire(store.clone(), &Config::default());
+    let mut current = Box::pin(state.wait_for_runtime_identity_ready());
+    assert!(futures::poll!(&mut current).is_pending());
+    let failed = tokio::time::timeout(std::time::Duration::from_secs(2), current)
+        .await
+        .expect("terminal boot outcome")
+        .unwrap_err();
+    let later = state.wait_for_runtime_identity_ready().await.unwrap_err();
+    assert_eq!(failed.to_string(), later.to_string());
+    assert!(
+        Sessions::new(&store)
+            .find_by_session_id(&SessionId("s_boot_model".into()))
+            .await
+            .unwrap()
+            .is_none(),
+        "failed model authority must prevent directory restoration"
+    );
+}
+
+async fn claim_boot_model_owner(store: &nexus_store::Store, token: &str) {
+    let report = serde_json::from_value(serde_json::json!({
+        "backend": "fixture/opaque", "observerActive": true, "reportRevision": 1,
+        "configured": {"status": "unknown", "capability": "unverified"},
+        "turnSelected": {"status": "unknown", "capability": "unverified"},
+        "responseReported": {"status": "unknown", "capability": "unsupported"}
+    }))
+    .unwrap();
+    assert!(AgentRuntimes::new(store)
+        .claim_model_observer("s_boot_model", "a_boot_model", None, token, &report)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn boot_invalidates_surviving_model_owner_before_directory_insert_failure() {
+    let (_dir, store) = boot_model_fixture().await;
+    claim_boot_model_owner(&store, "surviving-owner").await;
+    store.conn.execute_batch(
+        "CREATE TRIGGER reject_boot_directory BEFORE INSERT ON sessions BEGIN SELECT RAISE(ABORT, 'boot directory insertion rejected'); END;"
+    ).await.unwrap();
+    let state = AppState::wire(store.clone(), &Config::default());
+    let mut current = Box::pin(state.wait_for_runtime_identity_ready());
+    assert!(futures::poll!(&mut current).is_pending());
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), current)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("boot directory insertion rejected"));
+    assert_eq!(
+        state
+            .wait_for_runtime_identity_ready()
+            .await
+            .unwrap_err()
+            .to_string(),
+        error.to_string()
+    );
+    let row = AgentRuntimes::new(&store)
+        .find_by_runtime_id("s_boot_model")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        row.model_observer_token.is_none(),
+        "model invalidation precedes attempted directory insert"
+    );
+    assert_eq!(row.model_report_revision, 2);
+    assert!(!row.model_report.unwrap().observer_active);
+    assert!(Sessions::new(&store)
+        .find_by_session_id(&SessionId("s_boot_model".into()))
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn boot_invalidates_surviving_owner_before_successful_directory_read() {
+    let (_dir, store) = boot_model_fixture().await;
+    claim_boot_model_owner(&store, "surviving-owner").await;
+    let state = AppState::wire(store.clone(), &Config::default());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.wait_for_runtime_identity_ready(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(Sessions::new(&store)
+        .find_by_session_id(&SessionId("s_boot_model".into()))
+        .await
+        .unwrap()
+        .is_some());
+    let row = AgentRuntimes::new(&store)
+        .find_by_runtime_id("s_boot_model")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.model_observer_token.is_none());
+    assert_eq!(row.model_report_revision, 2);
+    assert!(!row.model_report.unwrap().observer_active);
+    // Cloning state and later readiness waits do not construct another coordinator or resweep.
+    for _ in 0..3 {
+        state
+            .clone()
+            .wait_for_runtime_identity_ready()
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        AgentRuntimes::new(&store)
+            .find_by_runtime_id("s_boot_model")
+            .await
+            .unwrap()
+            .unwrap()
+            .model_report_revision,
+        2
+    );
+}
+
 #[derive(Clone)]
 struct ResumeKeyAdapter {
     inner: MockAdapter,
@@ -160,6 +334,10 @@ async fn daemon_owned_launch_persists_its_resurrection_descriptor() {
         Arc::new(move |_cwd| Arc::new(mock.clone()) as Arc<dyn Adapter>),
     );
     let state = AppState::wire_with_registry(store.clone(), &Config::default(), registry);
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
 
     let spawned = state
         .launch_agent(
@@ -223,6 +401,11 @@ async fn graceful_shutdown_cancels_delivery_loops_before_killing_adapters() {
         Arc::new(move |_cwd| Arc::new(adapter.clone()) as Arc<dyn Adapter>),
     );
     let state = AppState::wire_with_registry(store.clone(), &Config::default(), registry);
+    // Match production ingress: direct launch must not run ahead of model/identity readiness.
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("boot ingress readiness");
 
     let spawned = state
         .launch_agent(
@@ -365,6 +548,10 @@ async fn daemon_owned_headless_launch_persists_the_adapter_resume_key() {
         Arc::new(move |_cwd| Arc::new(adapter.clone()) as Arc<dyn Adapter>),
     );
     let state = AppState::wire_with_registry(store.clone(), &Config::default(), registry);
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
 
     let spawned = state
         .launch_agent(
@@ -420,6 +607,10 @@ async fn daemon_owned_resume_key_updates_the_opaque_resurrection_capsule() {
         Arc::new(move |_cwd| Arc::new(mock.clone()) as Arc<dyn Adapter>),
     );
     let state = AppState::wire_with_registry(store.clone(), &Config::default(), registry);
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
     let spawned = state
         .launch_agent(
             SpawnRequest {
@@ -473,6 +664,10 @@ async fn daemon_owned_headed_launch_persists_its_exact_mode_and_backend() {
         .expect("split store");
     let store = Arc::new(daemon.compatibility_store());
     let state = AppState::wire_pty(store.clone(), &Config::default());
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
 
     let spawned = state
         .launch_agent_with_program(
@@ -575,7 +770,8 @@ async fn daemon_boot_rehydrates_the_nexus_runtime_identity_from_its_capsule() {
         state.wait_for_runtime_identity_ready(),
     )
     .await
-    .expect("boot identity readiness");
+    .expect("boot identity readiness")
+    .expect("successful model and identity boot");
     let row = Sessions::new(&store)
         .find_by_session_id(&SessionId("s_boot_codex".into()))
         .await
@@ -683,7 +879,8 @@ async fn daemon_boot_projects_only_the_newest_runtime_capsule_per_agent() {
         state.wait_for_runtime_identity_ready(),
     )
     .await
-    .expect("boot identity readiness");
+    .expect("boot identity readiness")
+    .expect("successful model and identity boot");
 
     let sessions = Sessions::new(&store);
     let latest = sessions
@@ -828,7 +1025,8 @@ async fn concurrent_acp_revives_open_one_adapter_for_the_runtime() {
         state.wait_for_runtime_identity_ready(),
     )
     .await
-    .expect("runtime identity readiness");
+    .expect("runtime identity readiness")
+    .expect("successful model and identity boot");
 
     let first_state = state.clone();
     let first =
@@ -1325,6 +1523,10 @@ async fn gateway_absent_delivery_uses_memory_transport_and_only_unsettled_contin
         .expect("split store");
     let store = Arc::new(daemon.compatibility_store());
     let state = AppState::wire(store.clone(), &Config::default());
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
 
     state
         .identity

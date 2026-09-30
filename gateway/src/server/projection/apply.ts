@@ -1,4 +1,5 @@
 import type { Client, Transaction } from "@libsql/client";
+import { parseRuntimeModelReport, readStoredModelReport } from "./modelReport";
 
 import {
   applyProjectionEvent,
@@ -85,6 +86,20 @@ async function materialize(tx: Transaction, event: CanonicalProjectionEvent): Pr
       const runtimeId = requiredString(payload, "runtimeId");
       const agentId = requiredString(payload, "agentId");
       const transport = optionalString(payload.transport);
+      const report = payload.modelReport == null ? undefined : parseRuntimeModelReport(payload.modelReport);
+      const previous = (await tx.execute({
+        sql: "SELECT agent_id, model_report_revision, model_report_json FROM runtime_descriptors WHERE runtime_id = ?",
+        args: [runtimeId],
+      })).rows[0];
+      if (previous) {
+        const stored = readStoredModelReport(previous.model_report_revision, previous.model_report_json);
+        // A captured full runtime body with an older report is obsolete too: accepting its
+        // liveness could revive a stopped runtime while retaining the newer inactive report.
+        // Equal-revision same-owner status writes and absent-report legacy frames retain their
+        // stream semantics. Never attach NEW evidence to an OLD agent label.
+        if (stored && report && report.reportRevision < stored.reportRevision) return;
+        if (stored && previous.agent_id !== agentId && (!report || report.reportRevision <= stored.reportRevision)) return;
+      }
       await tx.execute({
         sql: `INSERT INTO runtime_descriptors
               (runtime_id, agent_id, session_id, harness, mode, backend, cwd,
@@ -108,6 +123,13 @@ async function materialize(tx: Transaction, event: CanonicalProjectionEvent): Pr
           event.occurredAt,
         ],
       });
+      if (report) {
+        await tx.execute({
+          sql: `UPDATE runtime_descriptors SET model_report_revision = ?, model_report_json = ?
+                WHERE runtime_id = ? AND agent_id = ? AND model_report_revision < ?`,
+          args: [report.reportRevision, JSON.stringify(report), runtimeId, agentId, report.reportRevision],
+        });
+      }
       return;
     }
     case "runtime.stopped": {

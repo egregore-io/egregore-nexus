@@ -14,12 +14,13 @@ use nexus_common::{now, NexusError};
 use nexus_store::{
     repos::{
         inbox::{DeadLetterMutation, Inbox, DELIVERY_TIMEOUT_REASON, DELIVERY_TIMEOUT_TTL_MS},
-        CommandIntents, DeveloperEvents, NewDeveloperEvent, AGENT_LIFECYCLE_TOPIC,
+        AgentRuntimes, CommandIntents, DeveloperEvents, NewDeveloperEvent, AGENT_LIFECYCLE_TOPIC,
     },
     Store,
 };
 
 use crate::daemon::app::AppState;
+use crate::daemon::services::presence::PresenceWriter;
 
 const DEFAULT_REAP_INTERVAL_MS: i64 = 24 * 60 * 60 * 1_000;
 const DELIVERY_TIMEOUT_SWEEP_INTERVAL_MS: i64 = 60 * 1_000;
@@ -277,7 +278,10 @@ pub(crate) async fn maybe_reap_operational_tables(
         };
     }
 
-    sweep.add(reap_operational_tables(&state.store, policy, ts).await?);
+    sweep.add(
+        reap_operational_tables_with_presence(&state.store, policy, ts, Some(&state.presence))
+            .await?,
+    );
     if sweep.total() > 0 {
         log_retention_sweep(sweep, policy);
     }
@@ -288,6 +292,15 @@ pub async fn reap_operational_tables(
     store: &Store,
     policy: OperationalRetentionPolicy,
     ts: i64,
+) -> Result<RetentionSweep, NexusError> {
+    reap_operational_tables_with_presence(store, policy, ts, None).await
+}
+
+async fn reap_operational_tables_with_presence(
+    store: &Store,
+    policy: OperationalRetentionPolicy,
+    ts: i64,
+    presence: Option<&PresenceWriter>,
 ) -> Result<RetentionSweep, NexusError> {
     let Some(cutoff) = policy.cutoff(ts) else {
         return Ok(RetentionSweep::default());
@@ -450,17 +463,21 @@ pub async fn reap_operational_tables(
         .await
         .map_err(sql_err)?;
 
-    sweep.agent_runtimes = store
-        .identity_conn()
-        .execute(
-            "DELETE FROM agent_runtimes
-             WHERE active = 0
-               AND stopped_at IS NOT NULL
-               AND stopped_at <= ?1",
-            params![cutoff],
-        )
-        .await
-        .map_err(sql_err)?;
+    sweep.agent_runtimes = match presence {
+        Some(presence) => presence
+            .reap_runtime_retention(cutoff)
+            .await
+            .map_err(|cause| {
+                NexusError::Store(format!(
+                    "{cause}; earlier operational cleanup may already have committed"
+                ))
+            })?,
+        None => {
+            AgentRuntimes::new(store)
+                .reap_retention_unmanaged(cutoff)
+                .await?
+        }
+    };
 
     Ok(sweep)
 }

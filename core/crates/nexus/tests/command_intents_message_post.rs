@@ -22,7 +22,12 @@ use nexus_store::Store;
 async fn test_state() -> AppState {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
-    AppState::wire(store, &Config::default())
+    let state = AppState::wire(store, &Config::default());
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
+    state
 }
 
 async fn test_state_with_notify_secret() -> AppState {
@@ -30,7 +35,12 @@ async fn test_state_with_notify_secret() -> AppState {
     store.migrate().await.unwrap();
     let mut config = Config::default();
     config.hmac_secret = "notify-test-secret".into();
-    AppState::wire(store, &config)
+    let state = AppState::wire(store, &config);
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
+    state
 }
 
 async fn test_state_with_notify_secret_and_mock() -> (AppState, MockAdapter) {
@@ -45,7 +55,12 @@ async fn test_state_with_notify_secret_and_mock() -> (AppState, MockAdapter) {
         &hid("claude"),
         Arc::new(move |_cwd| Arc::new(adapter.clone()) as Arc<dyn Adapter>),
     );
-    (AppState::wire_with_registry(store, &config, registry), mock)
+    let state = AppState::wire_with_registry(store, &config, registry);
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
+    (state, mock)
 }
 
 fn human_register(name: &str, client_key: &str) -> RegisterRequest {

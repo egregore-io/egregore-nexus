@@ -169,6 +169,7 @@ export interface WhoamiRow {
 }
 
 export interface AgentRuntimeRow {
+  modelReport?: import("@shared/types").RuntimeModelReport;
   runtimeId: string;
   agentId: string;
   harness: string;

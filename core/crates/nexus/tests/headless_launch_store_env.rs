@@ -40,6 +40,10 @@ async fn headless_launch_pins_daemon_ipc_home_without_store_credentials() {
         ..Config::default()
     };
     let state = AppState::wire_with_registry(store, &config, registry);
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
 
     state
         .launch_agent(
@@ -119,6 +123,10 @@ async fn headless_codex_launch_pins_the_daemons_resolved_home_in_child_env() {
 
     let state = AppState::wire_with_registry(store, &Config::default(), registry);
     state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
+    state
         .launch_agent(
             SpawnRequest {
                 kind: hid("codex"),
@@ -177,6 +185,10 @@ async fn headless_hermes_launch_pins_the_daemons_resolved_home_in_child_env() {
     );
 
     let state = AppState::wire_with_registry(store, &Config::default(), registry);
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
     state
         .launch_agent(
             SpawnRequest {
@@ -237,6 +249,10 @@ async fn headless_claude_re_exports_machine_config_home_after_acp_scrub() {
     );
 
     let state = AppState::wire_with_registry(store, &Config::default(), registry);
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
     state
         .launch_agent(
             SpawnRequest {

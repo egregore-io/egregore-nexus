@@ -77,6 +77,7 @@ export interface AguiWsPumpOptions {
 }
 
 export interface AguiWsDeps {
+  runtimeSnapshots?: import("./runtimeSnapshots").RuntimeSnapshotSource;
   fetchHandler?: (request: Request) => Promise<Response>;
   observe?: (request: Request) => Promise<Response>;
   sessionInput?: (input: AguiWsInput, request: Request) => Promise<Response>;

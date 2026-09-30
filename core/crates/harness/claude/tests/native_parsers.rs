@@ -303,3 +303,112 @@ fn transcript_summary_record_recovers_compaction_marker() {
     assert_eq!(marker.phase, CompactionPhase::Transcript);
     assert_eq!(marker.summary.as_deref(), Some("compacted conversation"));
 }
+#[test]
+fn response_model_retains_native_identity_time_and_thinking_only_evidence() {
+    use nexus_contracts::model_report::{ModelEvidenceField, ModelEvidenceValue};
+    use nexus_harness_claude::native::model_reporting::{parse_response_model, profile};
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../nexus/tests/fixtures/model_reporting/native.json"
+    ))
+    .unwrap();
+    let mut raw = fixture["rows"]["claude.headed"]["events"][0]["payload"].clone();
+    for content in [
+        serde_json::json!([]),
+        serde_json::json!([{"type":"thinking","thinking":"private"}]),
+    ] {
+        raw["message"]["content"] = content;
+        let record = parse_response_model(&raw).expect("native root assistant model");
+        let update = record.update(1);
+        assert_eq!(update.field, ModelEvidenceField::ResponseReported);
+        assert_eq!(update.native_session_id, "native-root");
+        let ModelEvidenceValue::Observed(observation) = update.value else {
+            panic!("observed native response")
+        };
+        assert_eq!(observation.model_id, "fixture-response-model");
+        assert_eq!(
+            observation.native_message_id.as_deref(),
+            Some("fixture-response")
+        );
+        assert_eq!(observation.native_reported_at, Some(1788912000000));
+        assert_eq!(observation.observed_at, 1);
+        assert!(observation.provider_id.is_none());
+        assert!(observation.native_turn_id.is_none());
+    }
+    assert_eq!(
+        profile().response_reported(),
+        nexus_contracts::ModelEvidenceCapability::Supported
+    );
+    assert_eq!(
+        profile().configured(),
+        nexus_contracts::ModelEvidenceCapability::Unverified
+    );
+}
+
+#[test]
+fn response_model_excludes_child_synthetic_and_conflicting_native_identity() {
+    use nexus_harness_claude::native::model_reporting::parse_response_model;
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../nexus/tests/fixtures/model_reporting/native.json"
+    ))
+    .unwrap();
+    let root = fixture["rows"]["claude.headed"]["events"][0]["payload"].clone();
+    assert!(parse_response_model(&root).is_some());
+    assert!(
+        parse_response_model(&fixture["rows"]["claude.headed"]["events"][1]["payload"]).is_none()
+    );
+    for (path, value) in [
+        ("/isSidechain", serde_json::json!(true)),
+        ("/isSidechain", serde_json::Value::Null),
+        ("/message/model", serde_json::json!("<synthetic>")),
+        ("/message/id", serde_json::json!(" ")),
+        ("/message/role", serde_json::json!("user")),
+    ] {
+        let mut raw = root.clone();
+        *raw.pointer_mut(path).unwrap() = value;
+        assert!(parse_response_model(&raw).is_none(), "reject {path}");
+    }
+    let mut raw = root;
+    raw["session_id"] = serde_json::json!("foreign");
+    assert!(parse_response_model(&raw).is_none());
+}
+
+#[test]
+fn response_model_distinguishes_missing_malformed_and_opaque_model() {
+    use nexus_contracts::model_report::ModelEvidenceValue;
+    use nexus_harness_claude::native::model_reporting::parse_response_model;
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../nexus/tests/fixtures/model_reporting/native.json"
+    ))
+    .unwrap();
+    let mut raw = fixture["rows"]["claude.headed"]["events"][0]["payload"].clone();
+    raw["message"].as_object_mut().unwrap().remove("model");
+    assert!(matches!(
+        parse_response_model(&raw).unwrap().update(1).value,
+        ModelEvidenceValue::Unknown(_)
+    ));
+    for invalid in [
+        serde_json::Value::Null,
+        serde_json::json!(" "),
+        serde_json::json!(3),
+    ] {
+        raw["message"]["model"] = invalid;
+        assert!(matches!(
+            parse_response_model(&raw).unwrap().update(1).value,
+            ModelEvidenceValue::Invalid(_)
+        ));
+    }
+    raw["message"]["model"] = serde_json::json!("opaque/unlisted model");
+    raw.as_object_mut().unwrap().remove("timestamp");
+    let ModelEvidenceValue::Observed(observation) =
+        parse_response_model(&raw).unwrap().update(1).value
+    else {
+        panic!("opaque")
+    };
+    assert_eq!(observation.model_id, "opaque/unlisted model");
+    assert!(observation.native_reported_at.is_none());
+    raw["timestamp"] = serde_json::json!("not a native timestamp");
+    assert!(matches!(
+        parse_response_model(&raw).unwrap().update(1).value,
+        ModelEvidenceValue::Invalid(_)
+    ));
+}

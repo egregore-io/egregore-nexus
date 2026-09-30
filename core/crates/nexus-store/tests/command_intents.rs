@@ -417,6 +417,54 @@ fn auto_prompt_pending(id: &str) -> NewCommandIntent {
 }
 
 #[tokio::test]
+async fn persisted_started_steer_survives_restart_without_replay() {
+    let path = std::env::temp_dir().join(format!(
+        "steer-restart-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let daemon = DaemonStore::open(path.to_str().unwrap()).await.unwrap();
+        let store = daemon.compatibility_store();
+        let repo = CommandIntents::new(&store);
+        let mut input = prompt_pending("started-steer", "recipient", 1);
+        input.kind = command_kinds::harness::STEER.into();
+        repo.insert_pending(input).await.unwrap();
+        let claim = repo.claim_next(100, 10).await.unwrap().unwrap();
+        assert_eq!(claim.attempts, 1);
+        // Reproduce an already-persisted started row from the existing steer worker.
+        // The native effect may have happened before the daemon stopped.
+        store
+            .identity_conn()
+            .execute(
+                "UPDATE command_intents SET started_at = 101 WHERE command_id = 'started-steer'",
+                (),
+            )
+            .await
+            .unwrap();
+    }
+    let daemon = DaemonStore::open(path.to_str().unwrap()).await.unwrap();
+    let store = daemon.compatibility_store();
+    let repo = CommandIntents::new(&store);
+    let replay = repo
+        .claim_next_kind(111, 10, command_kinds::harness::STEER)
+        .await
+        .unwrap();
+    assert!(
+        replay.is_none(),
+        "a possibly admitted steer must not be claimed again after restart: {replay:?}"
+    );
+    assert_eq!(
+        repo.get("started-steer").await.unwrap().unwrap().attempts,
+        1
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn ordinary_prompt_attempt_survives_split_restart_without_replay() {
     let path = std::env::temp_dir().join(format!(
         "ordinary-restart-{}-{}.db",
@@ -488,63 +536,70 @@ async fn ordinary_prompt_attempt_survives_split_restart_without_replay() {
 
 #[tokio::test]
 async fn ordinary_prompt_shutdown_and_generic_setters_cannot_clear_attempt() {
-    let store = migrated().await;
-    let repo = CommandIntents::new(&store);
-    repo.insert_pending(prompt_pending("ordinary", "recipient", 1))
-        .await
-        .unwrap();
-    let claim = repo.claim_next(100, 10).await.unwrap().unwrap();
-    assert!(repo
-        .mark_prompt_started_for_claim(&claim, 101)
-        .await
-        .unwrap());
-    let before = repo.get("ordinary").await.unwrap().unwrap();
-    assert!(!repo
-        .release_claim_for_shutdown_retry("ordinary", 100)
-        .await
-        .unwrap());
-    assert!(!repo
-        .mark_done_for_claim("ordinary", 100, "{}", 102)
-        .await
-        .unwrap());
-    assert!(!repo
-        .mark_error_for_claim("ordinary", 100, "{}", 102)
-        .await
-        .unwrap());
-    repo.mark_done("ordinary", "{}", 102).await.unwrap();
-    repo.mark_error("ordinary", "{}", 102).await.unwrap();
-    assert_eq!(repo.get("ordinary").await.unwrap().unwrap(), before);
-    repo.reap_claimed_for_shutdown(103).await.unwrap();
-    let after = repo.get("ordinary").await.unwrap().unwrap();
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(after.error_json.as_deref().unwrap()).unwrap()
-            ["code"],
-        -32011
-    );
-    assert!(!repo
-        .settle_prompt_claim(
-            &claim,
-            nexus_store::repos::PromptCommandOutcome::Completed("{}"),
-            104
-        )
-        .await
-        .unwrap());
-    assert_eq!(repo.reap_terminal_older_than(200).await.unwrap(), 0);
+    for kind in [
+        command_kinds::harness::PROMPT,
+        command_kinds::harness::STEER,
+    ] {
+        let store = migrated().await;
+        let repo = CommandIntents::new(&store);
+        let mut input = prompt_pending("ordinary", "recipient", 1);
+        input.kind = kind.into();
+        repo.insert_pending(input).await.unwrap();
+        let claim = repo.claim_next(100, 10).await.unwrap().unwrap();
+        assert!(repo
+            .mark_prompt_started_for_claim(&claim, 101)
+            .await
+            .unwrap());
+        let before = repo.get("ordinary").await.unwrap().unwrap();
+        assert!(!repo
+            .release_claim_for_shutdown_retry("ordinary", 100)
+            .await
+            .unwrap());
+        assert!(!repo
+            .mark_done_for_claim("ordinary", 100, "{}", 102)
+            .await
+            .unwrap());
+        assert!(!repo
+            .mark_error_for_claim("ordinary", 100, "{}", 102)
+            .await
+            .unwrap());
+        repo.mark_done("ordinary", "{}", 102).await.unwrap();
+        repo.mark_error("ordinary", "{}", 102).await.unwrap();
+        assert_eq!(repo.get("ordinary").await.unwrap().unwrap(), before);
+        repo.reap_claimed_for_shutdown(103).await.unwrap();
+        let after = repo.get("ordinary").await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(after.error_json.as_deref().unwrap())
+                .unwrap()["code"],
+            -32011
+        );
+        assert!(!repo
+            .settle_prompt_claim(
+                &claim,
+                nexus_store::repos::PromptCommandOutcome::Completed("{}"),
+                104
+            )
+            .await
+            .unwrap());
+        assert_eq!(repo.reap_terminal_older_than(200).await.unwrap(), 0);
+    }
 }
 
 #[tokio::test]
 async fn prompt_attempt_cas_rejects_changed_lease_even_with_same_timestamp_and_attempt() {
     use nexus_store::repos::PromptCommandOutcome;
-    for ordinary in [false, true] {
+    for mode in ["auto", "prompt", "steer"] {
         let store = migrated().await;
         let repo = CommandIntents::new(&store);
-        repo.insert_pending(if ordinary {
-            prompt_pending("cas", "recipient", 1)
-        } else {
+        let mut input = if mode == "auto" {
             auto_prompt_pending("cas")
-        })
-        .await
-        .unwrap();
+        } else {
+            prompt_pending("cas", "recipient", 1)
+        };
+        if mode == "steer" {
+            input.kind = command_kinds::harness::STEER.into();
+        }
+        repo.insert_pending(input).await.unwrap();
         let claim = repo.claim_next(100, 20).await.unwrap().unwrap();
         assert!(
             !repo.mark_started_for_claim("cas", 100, 101).await.unwrap(),
@@ -597,56 +652,63 @@ async fn prompt_attempt_cas_rejects_changed_lease_even_with_same_timestamp_and_a
 #[tokio::test]
 async fn ordinary_same_timestamp_reclaim_rejects_old_attempt_and_known_results_expire() {
     use nexus_store::repos::PromptCommandOutcome;
-    for rejected in [false, true] {
-        let store = migrated().await;
-        let repo = CommandIntents::new(&store);
-        repo.insert_pending(prompt_pending("ordinary", "recipient", 1))
-            .await
-            .unwrap();
-        let first = repo.claim_next(100, 20).await.unwrap().unwrap();
-        assert!(repo
-            .mark_prompt_started_for_claim(&first, 101)
-            .await
-            .unwrap());
-        assert!(repo
-            .defer_prompt_claim_known_not_accepted(&first, 102)
-            .await
-            .unwrap());
-        // Deliberately identical timestamp and lease: attempts must still distinguish owners.
-        let second = repo.claim_next(100, 20).await.unwrap().unwrap();
-        assert_eq!(first.claimed_at, second.claimed_at);
-        assert_eq!(first.lease_until, second.lease_until);
-        assert_ne!(first.attempts, second.attempts);
-        assert!(!repo
-            .mark_prompt_started_for_claim(&first, 103)
-            .await
-            .unwrap());
-        assert!(repo
-            .mark_prompt_started_for_claim(&second, 103)
-            .await
-            .unwrap());
-        assert!(!repo
-            .defer_prompt_claim_known_not_accepted(&first, 104)
-            .await
-            .unwrap());
-        assert!(!repo
-            .settle_prompt_claim(&first, PromptCommandOutcome::Completed("{}"), 104)
-            .await
-            .unwrap());
-        let outcome = if rejected {
-            PromptCommandOutcome::Rejected(r#"{"code":-32602,"message":"invalid exact target"}"#)
-        } else {
-            PromptCommandOutcome::Completed("{}")
-        };
-        assert!(repo
-            .settle_prompt_claim(&second, outcome, 104)
-            .await
-            .unwrap());
-        assert!(!repo
-            .settle_prompt_claim(&second, PromptCommandOutcome::Uncertain, 105)
-            .await
-            .unwrap());
-        assert_eq!(repo.reap_terminal_older_than(200).await.unwrap(), 1);
+    for kind in [
+        command_kinds::harness::PROMPT,
+        command_kinds::harness::STEER,
+    ] {
+        for rejected in [false, true] {
+            let store = migrated().await;
+            let repo = CommandIntents::new(&store);
+            let mut input = prompt_pending("ordinary", "recipient", 1);
+            input.kind = kind.into();
+            repo.insert_pending(input).await.unwrap();
+            let first = repo.claim_next(100, 20).await.unwrap().unwrap();
+            assert!(repo
+                .mark_prompt_started_for_claim(&first, 101)
+                .await
+                .unwrap());
+            assert!(repo
+                .defer_prompt_claim_known_not_accepted(&first, 102)
+                .await
+                .unwrap());
+            // Deliberately identical timestamp and lease: attempts must still distinguish owners.
+            let second = repo.claim_next(100, 20).await.unwrap().unwrap();
+            assert_eq!(first.claimed_at, second.claimed_at);
+            assert_eq!(first.lease_until, second.lease_until);
+            assert_ne!(first.attempts, second.attempts);
+            assert!(!repo
+                .mark_prompt_started_for_claim(&first, 103)
+                .await
+                .unwrap());
+            assert!(repo
+                .mark_prompt_started_for_claim(&second, 103)
+                .await
+                .unwrap());
+            assert!(!repo
+                .defer_prompt_claim_known_not_accepted(&first, 104)
+                .await
+                .unwrap());
+            assert!(!repo
+                .settle_prompt_claim(&first, PromptCommandOutcome::Completed("{}"), 104)
+                .await
+                .unwrap());
+            let outcome = if rejected {
+                PromptCommandOutcome::Rejected(
+                    r#"{"code":-32602,"message":"invalid exact target"}"#,
+                )
+            } else {
+                PromptCommandOutcome::Completed("{}")
+            };
+            assert!(repo
+                .settle_prompt_claim(&second, outcome, 104)
+                .await
+                .unwrap());
+            assert!(!repo
+                .settle_prompt_claim(&second, PromptCommandOutcome::Uncertain, 105)
+                .await
+                .unwrap());
+            assert_eq!(repo.reap_terminal_older_than(200).await.unwrap(), 1);
+        }
     }
 }
 

@@ -47,6 +47,47 @@ fn policy_with_materializer_window(window_ms: i64) -> OperationalRetentionPolicy
     }
 }
 
+#[tokio::test]
+async fn runtime_retention_preserves_versioned_stopped_rows_even_with_corrupt_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = nexus_store::DaemonStore::open(dir.path().join("identity.db").to_str().unwrap())
+        .await
+        .unwrap();
+    let store = daemon.compatibility_store();
+    store
+        .identity_conn()
+        .execute_batch(
+            "INSERT INTO agent_runtimes(runtime_id,agent_id,harness,active,started_at,stopped_at,
+             model_report_revision,model_report_json)
+         VALUES ('versioned','a','opaque',0,1,2,1,'{broken'),
+                ('legacy','b','opaque',0,1,2,0,NULL),
+                ('active','c','opaque',1,1,NULL,0,NULL);",
+        )
+        .await
+        .unwrap();
+    let sweep = reap_operational_tables(&store, policy_with_materializer_window(0), 1000)
+        .await
+        .unwrap();
+    assert_eq!(
+        sweep.agent_runtimes, 1,
+        "versioned history must not block legacy cleanup"
+    );
+    let mut rows = store.identity_conn().query(
+        "SELECT runtime_id,model_report_revision,model_report_json FROM agent_runtimes ORDER BY runtime_id", ()
+    ).await.unwrap();
+    let active = rows.next().await.unwrap().unwrap();
+    assert_eq!(active.get::<String>(0).unwrap(), "active");
+    let versioned = rows
+        .next()
+        .await
+        .unwrap()
+        .expect("versioned stopped history survives");
+    assert_eq!(versioned.get::<String>(0).unwrap(), "versioned");
+    assert_eq!(versioned.get::<i64>(1).unwrap(), 1);
+    assert_eq!(versioned.get::<String>(2).unwrap(), "{broken");
+    assert!(rows.next().await.unwrap().is_none());
+}
+
 /// A backlog larger than one reap chunk (5000 rows) is fully deleted — the chunked
 /// delete loops until the tail is gone instead of stopping after the first batch.
 #[tokio::test]

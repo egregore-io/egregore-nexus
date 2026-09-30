@@ -22,8 +22,9 @@ npm install --global @egregore/nexus-gateway   # CLI + daemon + Gateway + Webcon
 cargo install egregore-nexus                   # native CLI + transport daemon
 ```
 
-The npm package selects a prebuilt binary for Linux x64/arm64, macOS x64/arm64, Windows x64, or
-WSL. It does not compile Rust during installation. If npm's command directory is not on `PATH`,
+The npm package selects a prebuilt binary for Linux x64/arm64 (glibc 2.35 or newer),
+macOS x64/arm64, Windows x64, or WSL. It does not compile Rust during installation.
+If npm's command directory is not on `PATH`,
 the installer prints one copyable command for the current shell.
 
 ## Start
@@ -73,10 +74,14 @@ Codex native activity is ingested before display processing, so a blocked displa
 does not hold a subsequently read completed turn busy. Private binding ownership also
 prevents a superseded request from entering native submission; an already admitted request
 remains potentially accepted after cancellation, not safe to resend automatically.
-Ordinary queued prompts also retain a durable attempt fence: a timeout after adapter
+Ordinary queued prompts and explicit steers retain a durable attempt fence: a timeout after adapter
 entry, restart, or unresolved lease expiry cannot automatically replay that command.
 Such outcomes remain delivery-uncertain under their original identity, not rejected
 or delivered. A deadline that wins before adapter entry prevents later invocation.
+Codex steer presentation waits for the matching native input record, not its queue
+acknowledgement. A closed turn without that receipt settles unconfirmed and releases
+the waiter without resending; recorded input still succeeds. Native history admission
+is not itself proof of provider consumption.
 Observed ACP prompts wait for their correlated protocol response rather than relay
 spawn. This is completion-bound evidence, not an early native acknowledgement;
 strict output follows the accepted-input event, while legacy streaming is unchanged.
@@ -144,6 +149,29 @@ native binaries out of the box, while live macOS harness behavior remains experi
 has equivalent real-machine validation.
 
 ## Documentation
+
+Canonical runtime reads preserve optional, validated `modelReport` evidence, including native
+usage, context and allowance snapshots when supplied. Missing data is unavailable, not zero;
+headless Claude, Codex, OpenCode and Hermes report configured models from ACP metadata through
+the canonical runtime projection. Headed Codex also reports configured-model evidence from its
+captured app-server setup response across fresh launch and cold resume. Configured evidence is not
+a response-model claim. Headed Claude reports response models from newly observed, exact-root
+assistant transcript records. Model-enabled Claude input waits up to 30 seconds for its captured
+SessionStart source before native input handoff; unavailable sources return an error, not a guessed
+model. Rejected model attachment does not suppress independent native display/archive forwarding.
+Historical/synthetic/child records do not activate reporting. Headed OpenCode reports native
+assistant-message turn selection under its captured plugin/ready-handshake owner; it does not
+promote requested configuration into provider response evidence. Headed Hermes reads configured
+metadata from the exact session selected by its launch-local framework hook. Missing metadata stays
+unknown; native root replacement, disconnect or compaction closes the captured reporter. Cold
+Gateway resume retains the isolated native profile and requires its prior exact root evidence;
+process startup alone does not certify restored context. Final live session-brief verification
+remains open. These collectors do not infer usage or quota.
+`scripts/check model-reporting` composes all eight headed/headless collector paths with captured
+native fixtures, the Rust publisher and Gateway canonical snapshots in disposable storage. It
+requires fresh artifacts for every mode and verifies that delayed older reports cannot restore a
+stopped runtime's status. This is not live-provider or visual acceptance. See the
+[model/status reporting matrix](docs/model-reporting.md) for exact evidence and remaining limits.
 
 - [Getting started](docs/getting-started.md)
 - [CLI reference](docs/cli.md)

@@ -41,6 +41,9 @@ export class GatewayProjectionService {
       afterCommit: async (event, result) => {
         if (result !== "applied") return;
         if (event.kind === "message.accepted") await options.afterReceipt?.(event);
+        // Any committed event may cross a daemon epoch and mark runtime descriptors stopped.
+        // This is a canonical reread wake-up only; no raw event/report is broadcast here.
+        changeBus.publish("runtime-snapshots");
         for (const key of projectionChangeKeys(event)) changeBus.publish(key);
       },
     });
@@ -79,6 +82,14 @@ export class GatewayProjectionService {
 }
 
 function projectionChangeKeys(event: CanonicalProjectionEvent): string[] {
+  if (["runtime.upserted", "runtime.stopped", "presence.changed"].includes(event.kind)) {
+    if (!event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return [];
+    const payload = event.payload as Record<string, unknown>;
+    const keys = ["runtimes"];
+    addKey(keys, "runtime", payload.runtimeId);
+    addKey(keys, "agent-runtimes", payload.agentId);
+    return keys;
+  }
   if (event.kind !== "message.accepted" && event.kind !== "notification.emitted") return [];
   if (!event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return [];
   const payload = event.payload as Record<string, unknown>;

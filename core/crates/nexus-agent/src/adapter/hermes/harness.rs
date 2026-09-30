@@ -49,6 +49,27 @@ pub struct HermesAdapter {
 }
 
 impl HermesAdapter {
+    /// Configured model evidence from the adapter's ACP metadata surface. This does not
+    /// advertise per-turn/response model selection or token/context/account telemetry.
+    pub fn model_reporting_profile() -> crate::adapter::AdapterModelReportingProfile {
+        use crate::adapter::{AcpModelMetadataDialect, AdapterModelReportingProfile};
+        use nexus_contracts::{
+            ModelEvidenceCapability, ModelObservationSource, ModelReportBackend,
+        };
+        let source = ModelObservationSource::new("acp.config_options").unwrap();
+        AdapterModelReportingProfile::new(
+            ModelReportBackend::new("hermes.acp").unwrap(),
+            ModelEvidenceCapability::Supported,
+            ModelEvidenceCapability::Unverified,
+            ModelEvidenceCapability::Unverified,
+            AcpModelMetadataDialect::ConfigOptionsAndLegacyModels {
+                config_options_source: source,
+                legacy_models_source: ModelObservationSource::new("acp.models").unwrap(),
+            },
+        )
+        .expect("builtin ACP reporting profile is valid")
+    }
+
     /// Construct a Hermes adapter that will spawn the **real** `hermes acp` process for the given
     /// working directory.
     pub fn new(mut ctx: LaunchCtx) -> Self {
@@ -64,13 +85,7 @@ impl HermesAdapter {
         ctx.suppress_acp_mcp = true;
         let mut command = hermes_command(ctx.cwd.clone());
         command.env = ctx.env.clone();
-        Self {
-            command,
-            engine: AcpEngine::for_harness(
-                HarnessId::new("hermes").expect("builtin harness id is valid"),
-            ),
-            ctx,
-        }
+        Self::with_command_and_context(command, ctx)
     }
 
     /// Construct a Hermes adapter over an explicit [`HarnessCommand`] (the hermetic tests point
@@ -81,11 +96,20 @@ impl HermesAdapter {
             suppress_acp_mcp: true,
             ..Default::default()
         };
+        Self::with_command_and_context(command, ctx)
+    }
+
+    /// Construct over an explicit command with an already-captured launch context.
+    /// The command is used verbatim; launch bootstrap/config preparation stays in `new`.
+    /// Reporting is seeded before initialize through the same assembly as normal launches.
+    pub fn with_command_and_context(command: HarnessCommand, mut ctx: LaunchCtx) -> Self {
+        ctx.suppress_acp_mcp = true;
         Self {
             command,
             engine: AcpEngine::for_harness(
                 HarnessId::new("hermes").expect("builtin harness id is valid"),
-            ),
+            )
+            .with_reporting(ctx.model_reporting.clone()),
             ctx,
         }
     }

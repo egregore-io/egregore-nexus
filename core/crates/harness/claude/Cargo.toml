@@ -19,6 +19,9 @@ nexus-transcript = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+time = { workspace = true, features = ["parsing"] }
+same-file = "1.0.6"
+sha2 = { workspace = true }
 libsql = { workspace = true }
 # Normal deps because the cross-crate fake ACP binary is a binary target.
 agent-client-protocol = { workspace = true }

@@ -70,7 +70,8 @@ impl AppState {
                 }
                 HeadedRuntimeKind::CodexAppServer => {}
                 HeadedRuntimeKind::Screen => {
-                    self.spawn_generic_pty_reader_if_needed(&session, runtime.harness.as_str());
+                    self.spawn_generic_pty_reader_if_needed(&session, runtime.harness.as_str())
+                        .await;
                 }
             }
             if let Err(error) = self
@@ -84,9 +85,11 @@ impl AppState {
                     error = %error,
                     "failed to materialize adopted PTY runtime presence"
                 );
+                // Earlier adoption/attachment work remains; only the later wakeable tail stops.
+                continue;
             }
             if let Some(w) = &self.loop_wiring {
-                w.spawn_loop(&session, &row.project);
+                w.spawn_loop(&session, &row.project).await;
                 w.ring(&session);
             }
         }
@@ -238,12 +241,22 @@ impl AppState {
             .as_ref()
             .map(|supervisor| supervisor.claude_turn_completion(session));
         let claimed = match self.pty.as_ref().zip(completion.as_ref()) {
-            Some((supervisor, owner)) => supervisor
-                .with_claude_owner(session, owner, || {
-                    w.claim_native_forwarder_for_owner(HARNESS, session, owner.owner_id())
-                })
-                .unwrap_or(false),
-            None => w.claim_native_forwarder(HARNESS, session),
+            Some((supervisor, owner)) => {
+                // Owner capture above must precede this await. The synchronous owner gate then
+                // rejects OLD if a replacement appeared while waiting for the same Store guard.
+                let transition = w.store.lock_presence_transition().await;
+                supervisor
+                    .with_claude_owner(session, owner, || {
+                        w.claim_native_forwarder_for_owner(
+                            HARNESS,
+                            session,
+                            owner.owner_id(),
+                            &transition,
+                        )
+                    })
+                    .unwrap_or(false)
+            }
+            None => w.claim_native_forwarder(HARNESS, session).await,
         };
         if !claimed {
             tracing::debug!(
@@ -316,6 +329,17 @@ impl AppState {
                 return;
             }
         }
+        if let Some(owner) = &completion {
+            if let Err(error) = self
+                .attach_claude_model_reporting(session, owner, &paths)
+                .await
+            {
+                // Display/archive are independent from model admission. The failed captured
+                // setup already revoked its claim and left modeled input unavailable; keep
+                // forwarding native output without fabricating a reporting fallback.
+                tracing::warn!(session=%session,error=%error,"failed to attach captured Claude model reporting");
+            }
+        }
         let attach = || {
             let handle = spawn_claude_native_forwarder_with_tool_events(
                 self.store.clone(),
@@ -349,7 +373,7 @@ impl AppState {
     /// Start the headed OpenCode native SQLite event forwarder once for a session.
     pub(crate) async fn spawn_opencode_native_forwarder_if_needed(&self, session: &SessionId) {
         let Some(w) = &self.loop_wiring else { return };
-        if !w.claim_native_forwarder("opencode", session) {
+        if !w.claim_native_forwarder("opencode", session).await {
             tracing::debug!(
                 target: "nexus::opencode_native_forwarder",
                 session = %session,
@@ -426,7 +450,7 @@ impl AppState {
     /// Start the headed Hermes native SQLite message forwarder once for a session.
     pub(crate) async fn spawn_hermes_native_forwarder_if_needed(&self, session: &SessionId) {
         let Some(w) = &self.loop_wiring else { return };
-        if !w.claim_native_forwarder("hermes", session) {
+        if !w.claim_native_forwarder("hermes", session).await {
             tracing::debug!(
                 target: "nexus::hermes_native_forwarder",
                 session = %session,
@@ -505,7 +529,11 @@ impl AppState {
     /// rows through their own bridge/forwarder, so they must not also receive PTY screen-scraped
     /// stream rows during daemon boot adoption. Unknown tokens resolve to `Screen` and keep the
     /// scraper.
-    pub(crate) fn spawn_generic_pty_reader_if_needed(&self, session: &SessionId, harness: &str) {
+    pub(crate) async fn spawn_generic_pty_reader_if_needed(
+        &self,
+        session: &SessionId,
+        harness: &str,
+    ) {
         if !matches!(
             headed_runtime_from_agent_token(Some(harness)),
             HeadedRuntimeKind::Screen
@@ -520,7 +548,8 @@ impl AppState {
                 let (_, rx) = broadcast::channel::<Vec<u8>>(1);
                 rx
             });
-        w.spawn_raw_stream_writer(session, pty_output.resubscribe());
+        w.spawn_raw_stream_writer(session, pty_output.resubscribe())
+            .await;
         spawn_pty_reply_reader(
             session.clone(),
             pty_output,
@@ -530,14 +559,14 @@ impl AppState {
         );
     }
 
-    pub(crate) fn spawn_raw_stream_writer_for_terminal(&self, session: &SessionId) {
+    pub(crate) async fn spawn_raw_stream_writer_for_terminal(&self, session: &SessionId) {
         let (Some(supervisor), Some(w)) = (&self.pty, &self.loop_wiring) else {
             return;
         };
         let Some(output) = supervisor.pty_output(session) else {
             return;
         };
-        w.spawn_raw_stream_writer(session, output);
+        w.spawn_raw_stream_writer(session, output).await;
     }
 
     /// The daemon-owned [`PtySupervisor`], if this `AppState` was built by [`wire_pty`].

@@ -67,14 +67,19 @@ impl AgentTurnExecutionPort for CountingExec {
 async fn test_state(turn_exec: Arc<dyn AgentTurnExecutionPort>) -> AppState {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
-    AppState::wire_with_turn_exec(
+    let state = AppState::wire_with_turn_exec(
         store,
         &Config {
             heartbeat_ttl_ms: 86_400_000,
             ..Config::default()
         },
         turn_exec,
-    )
+    );
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
+    state
 }
 
 fn human_register(name: &str, client_key: &str) -> RegisterRequest {

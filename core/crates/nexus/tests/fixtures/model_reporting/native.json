@@ -1,0 +1,784 @@
+{
+  "version": 1,
+  "rows": {
+    "codex.acp": {
+      "events": [
+        {
+          "kind": "session/new",
+          "payload": {
+            "sessionId": "fixture-root",
+            "models": {
+              "currentModelId": "gpt-astra[medium]",
+              "availableModels": []
+            },
+            "modes": {
+              "availableModes": [
+                {
+                  "id": "read-only",
+                  "name": "Read-only",
+                  "description": "Requires approval to edit files and run commands."
+                },
+                {
+                  "id": "agent",
+                  "name": "Agent",
+                  "description": "Read and edit files, and run commands."
+                },
+                {
+                  "id": "agent-full-access",
+                  "name": "Agent (full access)",
+                  "description": "Codex can edit files outside this workspace and run commands with network access. Exercise caution when using."
+                }
+              ],
+              "currentModeId": "read-only"
+            },
+            "configOptions": [
+              {
+                "id": "mode",
+                "name": "Mode",
+                "description": "Approval and sandboxing preset for the session",
+                "category": "mode",
+                "type": "select",
+                "currentValue": "read-only",
+                "options": [
+                  {
+                    "value": "read-only",
+                    "name": "Read-only",
+                    "description": "Requires approval to edit files and run commands."
+                  },
+                  {
+                    "value": "agent",
+                    "name": "Agent",
+                    "description": "Read and edit files, and run commands."
+                  },
+                  {
+                    "value": "agent-full-access",
+                    "name": "Agent (full access)",
+                    "description": "Codex can edit files outside this workspace and run commands with network access. Exercise caution when using."
+                  }
+                ]
+              },
+              {
+                "id": "model",
+                "name": "Model",
+                "description": "Model Codex uses for the session",
+                "category": "model",
+                "type": "select",
+                "currentValue": "gpt-astra",
+                "options": [
+                  {
+                    "value": "gpt-astra",
+                    "name": "gpt-astra",
+                    "description": null
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "kind": "session/load",
+          "payload": {
+            "models": {
+              "currentModelId": "gpt-astra[medium]",
+              "availableModels": []
+            },
+            "modes": {
+              "availableModes": [
+                {
+                  "id": "read-only",
+                  "name": "Read-only",
+                  "description": "Requires approval to edit files and run commands."
+                },
+                {
+                  "id": "agent",
+                  "name": "Agent",
+                  "description": "Read and edit files, and run commands."
+                },
+                {
+                  "id": "agent-full-access",
+                  "name": "Agent (full access)",
+                  "description": "Codex can edit files outside this workspace and run commands with network access. Exercise caution when using."
+                }
+              ],
+              "currentModeId": "read-only"
+            },
+            "configOptions": [
+              {
+                "id": "mode",
+                "name": "Mode",
+                "description": "Approval and sandboxing preset for the session",
+                "category": "mode",
+                "type": "select",
+                "currentValue": "read-only",
+                "options": [
+                  {
+                    "value": "read-only",
+                    "name": "Read-only",
+                    "description": "Requires approval to edit files and run commands."
+                  },
+                  {
+                    "value": "agent",
+                    "name": "Agent",
+                    "description": "Read and edit files, and run commands."
+                  },
+                  {
+                    "value": "agent-full-access",
+                    "name": "Agent (full access)",
+                    "description": "Codex can edit files outside this workspace and run commands with network access. Exercise caution when using."
+                  }
+                ]
+              },
+              {
+                "id": "model",
+                "name": "Model",
+                "description": "Model Codex uses for the session",
+                "category": "model",
+                "type": "select",
+                "currentValue": "gpt-astra",
+                "options": [
+                  {
+                    "value": "gpt-astra",
+                    "name": "gpt-astra",
+                    "description": null
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "hermes.acp": {
+      "events": [
+        {
+          "kind": "session/new",
+          "payload": {
+            "models": {
+              "availableModels": [
+                {
+                  "description": "Provider: fixture-provider • current",
+                  "modelId": "fixture-provider:gpt-astra",
+                  "name": "gpt-astra"
+                }
+              ],
+              "currentModelId": "fixture-provider:gpt-astra"
+            },
+            "modes": {
+              "availableModes": [
+                {
+                  "description": "Ask before edits.",
+                  "id": "default",
+                  "name": "Default"
+                },
+                {
+                  "description": "Auto-allow workspace and /tmp edits; still asks for sensitive paths.",
+                  "id": "accept_edits",
+                  "name": "Accept Edits"
+                },
+                {
+                  "description": "Auto-allow file edits for this session except sensitive paths.",
+                  "id": "dont_ask",
+                  "name": "Don't Ask"
+                }
+              ],
+              "currentModeId": "default"
+            },
+            "sessionId": "fixture-root"
+          }
+        },
+        {
+          "kind": "session/load",
+          "payload": {
+            "models": {
+              "availableModels": [
+                {
+                  "description": "Provider: fixture-provider • current",
+                  "modelId": "fixture-provider:gpt-astra",
+                  "name": "gpt-astra"
+                }
+              ],
+              "currentModelId": "fixture-provider:gpt-astra"
+            },
+            "modes": {
+              "availableModes": [
+                {
+                  "description": "Ask before edits.",
+                  "id": "default",
+                  "name": "Default"
+                },
+                {
+                  "description": "Auto-allow workspace and /tmp edits; still asks for sensitive paths.",
+                  "id": "accept_edits",
+                  "name": "Accept Edits"
+                },
+                {
+                  "description": "Auto-allow file edits for this session except sensitive paths.",
+                  "id": "dont_ask",
+                  "name": "Don't Ask"
+                }
+              ],
+              "currentModeId": "default"
+            }
+          }
+        }
+      ]
+    },
+    "claude.headed": {
+      "events": [
+        {
+          "kind": "transcript/assistant",
+          "payload": {
+            "parentUuid": null,
+            "isSidechain": false,
+            "type": "assistant",
+            "uuid": "fixture-message",
+            "timestamp": "2026-09-09T00:00:00.000Z",
+            "message": {
+              "id": "fixture-response",
+              "type": "message",
+              "role": "assistant",
+              "model": "fixture-response-model",
+              "content": []
+            },
+            "sessionKind": "interactive",
+            "userType": "fixture",
+            "entrypoint": "cli",
+            "cwd": "/tmp",
+            "sessionId": "native-root",
+            "version": "2.1.261"
+          }
+        },
+        {
+          "kind": "transcript/assistant",
+          "payload": {
+            "parentUuid": null,
+            "isSidechain": true,
+            "agentId": "child-1",
+            "type": "assistant",
+            "uuid": "fixture-message",
+            "timestamp": "2026-09-09T00:00:00.000Z",
+            "message": {
+              "id": "fixture-response",
+              "type": "message",
+              "role": "assistant",
+              "model": "fixture-response-model",
+              "content": []
+            },
+            "sessionKind": "interactive",
+            "userType": "fixture",
+            "entrypoint": "cli",
+            "cwd": "/tmp",
+            "sessionId": "native-root",
+            "version": "2.1.261"
+          }
+        }
+      ]
+    },
+    "hermes.headed": {
+      "events": [
+        {
+          "kind": "session/model",
+          "payload": {
+            "id": "fixture-root",
+            "source": "cli",
+            "user_id": null,
+            "model": "gpt-astra",
+            "model_config": "{\"model\": \"gpt-astra\"}",
+            "system_prompt": null,
+            "parent_session_id": null,
+            "started_at": 1788912000,
+            "ended_at": null,
+            "end_reason": null,
+            "message_count": 0,
+            "tool_call_count": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "cwd": "/tmp/same-cwd",
+            "billing_provider": null,
+            "billing_base_url": null,
+            "billing_mode": null,
+            "estimated_cost_usd": null,
+            "actual_cost_usd": null,
+            "cost_status": null,
+            "cost_source": null,
+            "pricing_version": null,
+            "title": null,
+            "api_call_count": 0,
+            "handoff_state": null,
+            "handoff_platform": null,
+            "handoff_error": null,
+            "rewind_count": 0,
+            "archived": 0
+          }
+        },
+        {
+          "kind": "session/model",
+          "payload": {
+            "id": "fixture-foreign",
+            "source": "cli",
+            "user_id": null,
+            "model": "foreign-model",
+            "model_config": "{\"model\": \"foreign-model\"}",
+            "system_prompt": null,
+            "parent_session_id": null,
+            "started_at": 1788912000,
+            "ended_at": null,
+            "end_reason": null,
+            "message_count": 0,
+            "tool_call_count": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "cwd": "/tmp/same-cwd",
+            "billing_provider": null,
+            "billing_base_url": null,
+            "billing_mode": null,
+            "estimated_cost_usd": null,
+            "actual_cost_usd": null,
+            "cost_status": null,
+            "cost_source": null,
+            "pricing_version": null,
+            "title": null,
+            "api_call_count": 0,
+            "handoff_state": null,
+            "handoff_platform": null,
+            "handoff_error": null,
+            "rewind_count": 0,
+            "archived": 0
+          }
+        },
+        {
+          "kind": "session/model",
+          "payload": {
+            "id": "fixture-child",
+            "source": "cli",
+            "user_id": null,
+            "model": "child-model",
+            "model_config": "{\"model\": \"child-model\"}",
+            "system_prompt": null,
+            "parent_session_id": "fixture-root",
+            "started_at": 1788912000,
+            "ended_at": null,
+            "end_reason": null,
+            "message_count": 0,
+            "tool_call_count": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "cwd": "/tmp/same-cwd",
+            "billing_provider": null,
+            "billing_base_url": null,
+            "billing_mode": null,
+            "estimated_cost_usd": null,
+            "actual_cost_usd": null,
+            "cost_status": null,
+            "cost_source": null,
+            "pricing_version": null,
+            "title": null,
+            "api_call_count": 0,
+            "handoff_state": null,
+            "handoff_platform": null,
+            "handoff_error": null,
+            "rewind_count": 0,
+            "archived": 0
+          }
+        }
+      ]
+    },
+    "codex.headed": {
+      "events": [
+        {
+          "kind": "thread/start",
+          "payload": {
+            "thread": {
+              "id": "fixture-native-start",
+              "extra": null,
+              "sessionId": "fixture-native-start",
+              "forkedFromId": null,
+              "parentThreadId": null,
+              "preview": "",
+              "ephemeral": false,
+              "section": null,
+              "sectionEnteredAt": null,
+              "projectId": null,
+              "historyMode": "paginated",
+              "modelProvider": "fixture",
+              "model": "gpt-astra",
+              "reasoningEffort": null,
+              "createdAt": 1788912000,
+              "updatedAt": 1788912000,
+              "recencyAt": 1788912000,
+              "status": {
+                "type": "idle"
+              },
+              "path": "/home/.codex/sessions/fixture/fixture-native-start.jsonl",
+              "cwd": "/tmp",
+              "cliVersion": "0.153.4",
+              "source": "vscode",
+              "canAcceptDirectInput": true,
+              "threadSource": null,
+              "agentNickname": null,
+              "agentRole": null,
+              "gitInfo": null,
+              "name": null,
+              "turns": []
+            },
+            "model": "gpt-astra",
+            "modelProvider": "fixture",
+            "serviceTier": null,
+            "cwd": "/tmp",
+            "runtimeWorkspaceRoots": [
+              "/tmp"
+            ],
+            "instructionSources": [],
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "user",
+            "sandbox": {
+              "type": "readOnly",
+              "networkAccess": false
+            },
+            "activePermissionProfile": {
+              "id": ":read-only",
+              "extends": null
+            },
+            "reasoningEffort": null,
+            "multiAgentMode": "explicitRequestOnly"
+          }
+        },
+        {
+          "kind": "thread/resume",
+          "payload": {
+            "thread": {
+              "id": "fixture-native-resume",
+              "extra": null,
+              "sessionId": "fixture-native-resume",
+              "forkedFromId": null,
+              "parentThreadId": null,
+              "preview": "fixture history; no generation requested",
+              "ephemeral": false,
+              "section": null,
+              "sectionEnteredAt": null,
+              "projectId": null,
+              "historyMode": "legacy",
+              "modelProvider": "fixture",
+              "model": "gpt-astra",
+              "reasoningEffort": null,
+              "createdAt": 1788912000,
+              "updatedAt": 1788912000,
+              "recencyAt": 1788912000,
+              "status": {
+                "type": "idle"
+              },
+              "path": "/home/.codex/sessions/fixture/fixture-native-resume.jsonl",
+              "cwd": "/tmp",
+              "cliVersion": "0.153.4",
+              "source": "vscode",
+              "canAcceptDirectInput": true,
+              "threadSource": null,
+              "agentNickname": null,
+              "agentRole": null,
+              "gitInfo": null,
+              "name": null,
+              "turns": []
+            },
+            "model": "gpt-astra",
+            "modelProvider": "fixture",
+            "serviceTier": null,
+            "cwd": "/tmp",
+            "runtimeWorkspaceRoots": [
+              "/tmp"
+            ],
+            "instructionSources": [],
+            "approvalPolicy": "on-request",
+            "approvalsReviewer": "user",
+            "sandbox": {
+              "type": "readOnly",
+              "networkAccess": false
+            },
+            "activePermissionProfile": {
+              "id": ":read-only",
+              "extends": null
+            },
+            "reasoningEffort": null,
+            "multiAgentMode": "explicitRequestOnly",
+            "initialTurnsPage": null,
+            "turnsBackwardsCursor": null,
+            "itemsBackwardsCursor": null
+          }
+        }
+      ]
+    },
+    "claude.acp": {
+      "events": [
+        {
+          "kind": "session/new",
+          "payload": {
+            "sessionId": "fixture-root",
+            "modes": {
+              "currentModeId": "default",
+              "availableModes": [
+                {
+                  "id": "default",
+                  "name": "Manual",
+                  "description": "Standard behavior, prompts for dangerous operations"
+                },
+                {
+                  "id": "acceptEdits",
+                  "name": "Accept Edits",
+                  "description": "Auto-accept file edit operations"
+                },
+                {
+                  "id": "plan",
+                  "name": "Plan Mode",
+                  "description": "Planning mode, no actual tool execution"
+                },
+                {
+                  "id": "dontAsk",
+                  "name": "Don't Ask",
+                  "description": "Don't prompt for permissions, deny if not pre-approved"
+                }
+              ]
+            },
+            "configOptions": [
+              {
+                "id": "mode",
+                "name": "Mode",
+                "description": "Session permission mode",
+                "category": "mode",
+                "type": "select",
+                "currentValue": "default",
+                "options": [
+                  {
+                    "value": "default",
+                    "name": "Manual",
+                    "description": "Standard behavior, prompts for dangerous operations"
+                  },
+                  {
+                    "value": "acceptEdits",
+                    "name": "Accept Edits",
+                    "description": "Auto-accept file edit operations"
+                  },
+                  {
+                    "value": "plan",
+                    "name": "Plan Mode",
+                    "description": "Planning mode, no actual tool execution"
+                  },
+                  {
+                    "value": "dontAsk",
+                    "name": "Don't Ask",
+                    "description": "Don't prompt for permissions, deny if not pre-approved"
+                  }
+                ]
+              },
+              {
+                "id": "model",
+                "name": "Model",
+                "description": "AI model to use",
+                "category": "model",
+                "type": "select",
+                "currentValue": "gpt-astra",
+                "options": [
+                  {
+                    "value": "gpt-astra",
+                    "name": "Opaque fixture model",
+                    "description": "native fixture"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "kind": "session/load",
+          "payload": {
+            "sessionId": "fixture-root",
+            "modes": {
+              "currentModeId": "default",
+              "availableModes": [
+                {
+                  "id": "default",
+                  "name": "Manual",
+                  "description": "Standard behavior, prompts for dangerous operations"
+                },
+                {
+                  "id": "acceptEdits",
+                  "name": "Accept Edits",
+                  "description": "Auto-accept file edit operations"
+                },
+                {
+                  "id": "plan",
+                  "name": "Plan Mode",
+                  "description": "Planning mode, no actual tool execution"
+                },
+                {
+                  "id": "dontAsk",
+                  "name": "Don't Ask",
+                  "description": "Don't prompt for permissions, deny if not pre-approved"
+                }
+              ]
+            },
+            "configOptions": [
+              {
+                "id": "mode",
+                "name": "Mode",
+                "description": "Session permission mode",
+                "category": "mode",
+                "type": "select",
+                "currentValue": "default",
+                "options": [
+                  {
+                    "value": "default",
+                    "name": "Manual",
+                    "description": "Standard behavior, prompts for dangerous operations"
+                  },
+                  {
+                    "value": "acceptEdits",
+                    "name": "Accept Edits",
+                    "description": "Auto-accept file edit operations"
+                  },
+                  {
+                    "value": "plan",
+                    "name": "Plan Mode",
+                    "description": "Planning mode, no actual tool execution"
+                  },
+                  {
+                    "value": "dontAsk",
+                    "name": "Don't Ask",
+                    "description": "Don't prompt for permissions, deny if not pre-approved"
+                  }
+                ]
+              },
+              {
+                "id": "model",
+                "name": "Model",
+                "description": "AI model to use",
+                "category": "model",
+                "type": "select",
+                "currentValue": "gpt-astra",
+                "options": [
+                  {
+                    "value": "gpt-astra",
+                    "name": "Opaque fixture model",
+                    "description": "native fixture"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "opencode.acp": {
+      "events": [
+        {
+          "kind": "session/new",
+          "payload": {
+            "sessionId": "fixture-root",
+            "configOptions": [
+              {
+                "id": "model",
+                "name": "Model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "fixture-provider/gpt-astra",
+                "options": []
+              }
+            ]
+          }
+        },
+        {
+          "kind": "session/load",
+          "payload": {
+            "configOptions": [
+              {
+                "id": "model",
+                "name": "Model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "fixture-provider/opaque-resumed-model",
+                "options": []
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "opencode.headed": {
+      "events": [
+        {
+          "kind": "message.updated",
+          "payload": {
+            "sessionID": "fixture-root",
+            "info": {
+              "id": "fixture-assistant",
+              "parentID": "fixture-user",
+              "role": "assistant",
+              "mode": "build",
+              "agent": "build",
+              "path": {
+                "cwd": "/tmp",
+                "root": "/tmp"
+              },
+              "cost": 0,
+              "tokens": {
+                "input": 0,
+                "output": 0,
+                "reasoning": 0,
+                "cache": {
+                  "read": 0,
+                  "write": 0
+                }
+              },
+              "modelID": "gpt-astra",
+              "providerID": "fixture-provider",
+              "time": {
+                "created": 1788912000000
+              },
+              "sessionID": "fixture-root"
+            }
+          }
+        },
+        {
+          "kind": "message.updated",
+          "payload": {
+            "sessionID": "fixture-child",
+            "info": {
+              "id": "fixture-assistant",
+              "parentID": "fixture-user",
+              "role": "assistant",
+              "mode": "build",
+              "agent": "build",
+              "path": {
+                "cwd": "/tmp",
+                "root": "/tmp"
+              },
+              "cost": 0,
+              "tokens": {
+                "input": 0,
+                "output": 0,
+                "reasoning": 0,
+                "cache": {
+                  "read": 0,
+                  "write": 0
+                }
+              },
+              "modelID": "child-model",
+              "providerID": "fixture-provider",
+              "time": {
+                "created": 1788912000000
+              },
+              "sessionID": "fixture-child"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

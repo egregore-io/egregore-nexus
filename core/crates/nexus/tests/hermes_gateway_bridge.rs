@@ -19,6 +19,164 @@ use nexus_dispatch::Bell;
 use nexus_pty::TurnCompletionEvidence;
 use tempfile::tempdir;
 
+struct NativeCapture {
+    profile: nexus_contracts::model_report::ModelProfileIdentity,
+    closed: std::sync::atomic::AtomicBool,
+    root: Mutex<Option<String>>,
+    updates: Mutex<Vec<nexus_contracts::model_report::NativeModelUpdate>>,
+}
+impl nexus_contracts::model_report::ModelObservationSink for NativeCapture {
+    fn accepts_profile(
+        &self,
+        profile: &nexus_contracts::model_report::ModelProfileIdentity,
+    ) -> bool {
+        !self.closed.load(std::sync::atomic::Ordering::SeqCst) && self.profile.matches(profile)
+    }
+    fn bind_native_root(&self, root: &str) -> bool {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        let mut current = self.root.lock().unwrap();
+        if current.as_deref().is_some_and(|old| old != root) {
+            return false;
+        }
+        *current = Some(root.into());
+        true
+    }
+    fn observe(&self, update: nexus_contracts::model_report::NativeModelUpdate) -> bool {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst)
+            || self.root.lock().unwrap().as_deref() != Some(&update.native_session_id)
+        {
+            return false;
+        }
+        self.updates.lock().unwrap().push(update);
+        true
+    }
+    fn revoke(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+fn native_capture() -> (
+    Arc<NativeCapture>,
+    nexus_agent::adapter::NativeModelReporting,
+) {
+    let profile = nexus_agent::adapter::hermes::native::model_profile();
+    let sink = Arc::new(NativeCapture {
+        profile: profile.identity().clone(),
+        closed: false.into(),
+        root: Mutex::new(None),
+        updates: Mutex::new(vec![]),
+    });
+    let reporting = profile.capture(sink.clone()).unwrap();
+    (sink, reporting)
+}
+fn model_frame(root: &str, sequence: u64, model: &str) -> serde_json::Value {
+    serde_json::json!({"t":"model_source", "token":"model-token", "sequence":sequence,
+        "event":"agent:start", "context":{"platform":"nexus","user_id":"nexus",
+        "chat_id":"nexus","thread_id":"","chat_type":"dm","session_id":root},
+        "row":{"id":root,"model":model,"parent_session_id":null,"model_config":"{}"}})
+}
+fn send_model(bridge: &HermesGatewayBridge, frame: serde_json::Value) -> bool {
+    let mut stream = connect_bridge(bridge);
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    writeln!(stream, "{frame}").unwrap();
+    let mut reply = String::new();
+    if BufReader::new(stream).read_line(&mut reply).is_err() {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(&reply)
+        .ok()
+        .is_some_and(|value| value["accepted"] == true)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_model_source_requires_exact_hook_root_and_rejects_replay_or_child() {
+    let dir = tempdir().unwrap();
+    let (sink, reporting) = native_capture();
+    let bridge = HermesGatewayBridge::start_observed(
+        SessionId("s_model".into()),
+        dir.path().join("bridge.sock"),
+        "model-token".into(),
+        Arc::new(CaptureSink::default()),
+        Bell::new(),
+        reporting,
+    )
+    .unwrap();
+    let mut foreign_source = model_frame("foreign", 1, "wrong");
+    foreign_source["context"]["chat_id"] = serde_json::json!("other");
+    assert!(!send_model(&bridge, foreign_source));
+    assert!(sink.root.lock().unwrap().is_none());
+    let mut absent = model_frame("root", 1, "configured");
+    absent["row"] = serde_json::Value::Null;
+    assert!(
+        send_model(&bridge, absent),
+        "positive hook selects root before DB row exists"
+    );
+    assert_eq!(sink.root.lock().unwrap().as_deref(), Some("root"));
+    assert!(matches!(
+        sink.updates
+            .lock()
+            .unwrap()
+            .last()
+            .map(|update| &update.value),
+        Some(nexus_contracts::model_report::ModelEvidenceValue::Unknown(
+            _
+        ))
+    ));
+    assert!(send_model(&bridge, model_frame("root", 2, "configured")));
+    assert!(!send_model(&bridge, model_frame("root", 2, "stale-repeat")));
+    let mut unavailable = model_frame("root", 3, "unused");
+    unavailable["row"] = serde_json::Value::Null;
+    assert!(send_model(&bridge, unavailable));
+    assert!(matches!(
+        sink.updates
+            .lock()
+            .unwrap()
+            .last()
+            .map(|update| &update.value),
+        Some(nexus_contracts::model_report::ModelEvidenceValue::Unknown(
+            _
+        ))
+    ));
+    let mut child = model_frame("root", 4, "child");
+    child["row"]["id"] = serde_json::json!("child");
+    assert!(!send_model(&bridge, child));
+    assert_eq!(sink.updates.lock().unwrap().len(), 3);
+    assert!(send_model(
+        &bridge,
+        model_frame("root", 5, "configured-new")
+    ));
+    assert!(!send_model(
+        &bridge,
+        model_frame("replacement", 6, "new-root")
+    ));
+    assert!(sink.closed.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!send_model(&bridge, model_frame("root", 7, "late-old")));
+    assert_eq!(sink.updates.lock().unwrap().len(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_model_bridge_drop_revokes_captured_sink_with_retained_listener() {
+    let dir = tempdir().unwrap();
+    let (sink, reporting) = native_capture();
+    let bridge = HermesGatewayBridge::start_observed(
+        SessionId("s_drop".into()),
+        dir.path().join("bridge.sock"),
+        "model-token".into(),
+        Arc::new(CaptureSink::default()),
+        Bell::new(),
+        reporting,
+    )
+    .unwrap();
+    drop(bridge);
+    assert!(
+        sink.closed.load(std::sync::atomic::Ordering::SeqCst),
+        "bridge lifetime owns captured reporter"
+    );
+}
+
 #[derive(Clone, Default)]
 struct CaptureSink {
     events: Arc<Mutex<Vec<WsEvent>>>,
@@ -416,6 +574,79 @@ fn connect_bridge(bridge: &HermesGatewayBridge) -> BridgeTestStream {
     BridgeTestStream::connect(bridge.endpoint()).unwrap()
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn native_model_generated_hook_reads_only_framework_selected_row() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    let (sink, reporting) = native_capture();
+    let bridge = HermesGatewayBridge::start_observed(
+        SessionId("s_hook".into()),
+        dir.path().join("bridge.sock"),
+        "model-token".into(),
+        Arc::new(CaptureSink::default()),
+        Bell::new(),
+        reporting,
+    )
+    .unwrap();
+    write_hermes_gateway_profile(&HermesGatewayProfile {
+        home: home.clone(),
+        source_home: dir.path().join("source"),
+        bridge_socket: dir.path().join("bridge.sock"),
+        bridge_token: "model-token".into(),
+        nexus_name: "test".into(),
+        session_id: SessionId("s_hook".into()),
+    })
+    .unwrap();
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/model_reporting/native.json");
+    let output = std::process::Command::new("python3").arg("-c").arg(r#"
+import asyncio, importlib.util, json, os, pathlib, sqlite3, sys
+home=pathlib.Path(os.environ['HERMES_HOME'])
+spec=importlib.util.spec_from_file_location('captured_hook',home/'hooks/nexus-model/handler.py')
+hook=importlib.util.module_from_spec(spec); spec.loader.exec_module(hook)
+db=sqlite3.connect(home/'state.db')
+db.execute('CREATE TABLE sessions(id TEXT PRIMARY KEY, model TEXT, model_config TEXT, parent_session_id TEXT, ended_at REAL)')
+for event in json.loads(pathlib.Path(sys.argv[1]).read_text())['rows']['hermes.headed']['events']:
+    row=event['payload']
+    db.execute('INSERT INTO sessions VALUES(?,?,?,?,?)',(row['id'],row['model'],row['model_config'],row['parent_session_id'],row['ended_at']))
+db.commit()
+ctx={'platform':'nexus','user_id':'nexus','chat_id':'nexus','thread_id':'','chat_type':'dm','session_id':'fixture-root'}
+async def run():
+    await hook.handle('agent:start',{**ctx,'chat_id':'foreign','session_id':'fixture-foreign'})
+    await hook.handle('agent:start',ctx)
+    db.execute('UPDATE sessions SET model=? WHERE id=?',('opaque/next','fixture-root')); db.commit()
+    await hook.handle('agent:end',ctx)
+    # A later root cannot turn a stale launch into a new native owner.
+    await hook.handle('agent:start',{**ctx,'session_id':'replacement'})
+asyncio.run(run())
+"#).arg(fixture).env("HERMES_HOME",&home).env("NEXUS_HERMES_BRIDGE_SOCKET",bridge.endpoint())
+        .env("NEXUS_HERMES_BRIDGE_TOKEN","model-token").output().expect("python3 is required for generated hook gate");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let updates = sink.updates.lock().unwrap();
+    assert_eq!(
+        updates.len(),
+        2,
+        "actual generated hook must publish both exact native row snapshots"
+    );
+    for update in updates.iter() {
+        assert_eq!(update.native_session_id, "fixture-root");
+        assert_eq!(
+            update.field,
+            nexus_contracts::model_report::ModelEvidenceField::Configured
+        );
+    }
+    let nexus_contracts::model_report::ModelEvidenceValue::Observed(last) = &updates[1].value
+    else {
+        panic!("native configured row");
+    };
+    assert_eq!(last.model_id, "opaque/next");
+    assert!(sink.closed.load(std::sync::atomic::Ordering::SeqCst));
+}
+
 #[cfg(windows)]
 fn connect_bridge(bridge: &HermesGatewayBridge) -> BridgeTestStream {
     let address = bridge
@@ -423,4 +654,107 @@ fn connect_bridge(bridge: &HermesGatewayBridge) -> BridgeTestStream {
         .strip_prefix("tcp://")
         .expect("Windows Hermes bridge endpoint must be loopback TCP");
     BridgeTestStream::connect(address).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_model_parked_hook_cannot_publish_into_replacement_bridge() {
+    let dir = tempdir().unwrap();
+    let home = dir.path().join("home");
+    let socket = dir.path().join("bridge.sock");
+    let (old, reporting) = native_capture();
+    let bridge = HermesGatewayBridge::start_observed(
+        SessionId("s_replace".into()),
+        socket.clone(),
+        "old-token".into(),
+        Arc::new(CaptureSink::default()),
+        Bell::new(),
+        reporting,
+    )
+    .unwrap();
+    write_hermes_gateway_profile(&HermesGatewayProfile {
+        home: home.clone(),
+        source_home: dir.path().join("source"),
+        bridge_socket: socket.clone(),
+        bridge_token: "old-token".into(),
+        nexus_name: "test".into(),
+        session_id: SessionId("s_replace".into()),
+    })
+    .unwrap();
+    let child = std::process::Command::new("python3").arg("-c").arg(r#"
+import asyncio, importlib.util, os, pathlib, sqlite3, sys
+home=pathlib.Path(os.environ['HERMES_HOME'])
+db=sqlite3.connect(home/'state.db')
+db.execute('CREATE TABLE sessions(id TEXT PRIMARY KEY, model TEXT, model_config TEXT, parent_session_id TEXT, ended_at REAL)')
+db.execute('INSERT INTO sessions VALUES(?,?,?,?,?)',('old-root','old-model','{}',None,None)); db.commit(); db.close()
+spec=importlib.util.spec_from_file_location('captured_hook',home/'hooks/nexus-model/handler.py')
+hook=importlib.util.module_from_spec(spec); spec.loader.exec_module(hook)
+read=hook._row
+def parked(root):
+    row=read(root)
+    print('exact native row captured',flush=True)
+    assert sys.stdin.readline().strip()=='release'
+    return row
+hook._row=parked
+asyncio.run(hook.handle('agent:start',{'platform':'nexus','user_id':'nexus','chat_id':'nexus','thread_id':'','chat_type':'dm','session_id':'old-root'}))
+"#).env("HERMES_HOME", &home).env("NEXUS_HERMES_BRIDGE_SOCKET",bridge.endpoint())
+        .env("NEXUS_HERMES_BRIDGE_TOKEN","old-token")
+        .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped()).spawn().expect("python3 is required");
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = ChildGuard(child);
+    let output = child.0.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(output).read_line(&mut line).map(|_| line);
+        let _ = tx.send(result);
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap()
+            .trim(),
+        "exact native row captured"
+    );
+    drop(bridge);
+    assert!(old.closed.load(std::sync::atomic::Ordering::SeqCst));
+    let (new, reporting) = native_capture();
+    let replacement = HermesGatewayBridge::start_observed(
+        SessionId("s_replace".into()),
+        socket,
+        "model-token".into(),
+        Arc::new(CaptureSink::default()),
+        Bell::new(),
+        reporting,
+    )
+    .unwrap();
+    // Windows uses a different ephemeral endpoint; Unix deliberately reuses the socket path.
+    // Both retain OLD's captured token, never replacing it with NEW's authority.
+    writeln!(child.0.stdin.take().unwrap(), "release").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "parked hook did not finish"
+        );
+        tokio::task::yield_now().await;
+    }
+    assert!(old.updates.lock().unwrap().is_empty());
+    assert!(new.updates.lock().unwrap().is_empty());
+    assert!(!new.closed.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(send_model(
+        &replacement,
+        model_frame("new-root", 1, "new-model")
+    ));
+    assert_eq!(new.updates.lock().unwrap().len(), 1);
 }

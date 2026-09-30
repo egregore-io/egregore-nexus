@@ -73,7 +73,6 @@ fn webconsole_uses_shared_detach_and_never_waits_for_browser_exit() {
 #[cfg(unix)]
 #[test]
 fn browser_opener_returns_after_spawn_instead_of_process_exit() {
-    use std::fs;
     use std::process::Command;
     use std::thread;
     use std::time::{Duration, Instant};
@@ -94,14 +93,50 @@ fn browser_opener_returns_after_spawn_instead_of_process_exit() {
 
     assert!(started.elapsed() < Duration::from_millis(500));
     let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline && !pid_path.exists() {
+    let mut pid = None;
+    while Instant::now() < deadline {
+        pid = read_ready_pid(&pid_path);
+        if pid.is_some() {
+            break;
+        }
         thread::sleep(Duration::from_millis(20));
     }
-    let pid: i32 = fs::read_to_string(pid_path)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let pid = pid.expect("browser pid became ready");
     assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+}
+
+#[cfg(unix)]
+fn read_ready_pid(path: &std::path::Path) -> Option<i32> {
+    let contents = std::fs::read(path).ok()?;
+    let contents = std::str::from_utf8(&contents).ok()?;
+    let pid_text = contents.strip_suffix('\n')?;
+    if pid_text.is_empty() || pid_text.contains('\n') {
+        return None;
+    }
+    let pid: i32 = pid_text.parse().ok()?;
+    (pid > 0).then_some(pid)
+}
+
+#[cfg(unix)]
+#[test]
+fn browser_pid_readiness_requires_one_complete_valid_record() {
+    use std::fs;
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("browser.pid");
+
+    assert_eq!(read_ready_pid(&path), None);
+    for contents in ["", "123"] {
+        fs::write(&path, contents).unwrap();
+        assert_eq!(read_ready_pid(&path), None, "contents: {contents:?}");
+    }
+    for contents in ["0\n", "-123\n", "not-a-pid\n", "2147483648\n", "123\n456\n"] {
+        fs::write(&path, contents).unwrap();
+        assert_eq!(read_ready_pid(&path), None, "contents: {contents:?}");
+    }
+    fs::write(&path, [0xff, b'\n']).unwrap();
+    assert_eq!(read_ready_pid(&path), None);
+    fs::write(&path, "123\n").unwrap();
+    assert_eq!(read_ready_pid(&path), Some(123));
 }

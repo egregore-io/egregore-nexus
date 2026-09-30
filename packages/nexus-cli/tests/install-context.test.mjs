@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -67,10 +67,12 @@ function runLauncher(launcher, overrides = {}) {
   const output = join(directory, "env.json");
   let executedLauncher = resolve(launcher.path);
   let managedRoot = resolve(launcher.root);
-  if (launcher.name === "@egregore/nexus") {
+  // Both forwarding packages need their declared CLI dependency. Construct the package
+  // fixture explicitly; a fresh release checkout has no workspace node_modules yet.
+  if (launcher.name !== "@egregore/nexus-cli") {
     managedRoot = join(directory, "nexus-package");
-    executedLauncher = join(managedRoot, "bin/nexus.mjs");
-    mkdirSync(join(managedRoot, "bin"), { recursive: true });
+    executedLauncher = join(managedRoot, relative(launcher.root, launcher.path));
+    mkdirSync(dirname(executedLauncher), { recursive: true });
     mkdirSync(join(managedRoot, "node_modules/@egregore"), { recursive: true });
     copyFileSync(launcher.path, executedLauncher);
     symlinkSync(

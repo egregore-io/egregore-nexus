@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "rows": [
+    {
+      "id": "opencode.headed",
+      "version": "1.17.17",
+      "artifactSha256": "095b00fda839fe2f038e35b9e174bbbb2c0b7f70bbb7e2ed30b6a79287a23f8b",
+      "sourcePath": "opencode-ai/bin/opencode.exe:selected assistant constructor -> Session.updateMessage publish payload",
+      "nativeFixtureSha256": "438e3780ff57ba59c27c491467b8f42605191f08802ce9adef717d2f2ca81978",
+      "meaning": "turn_selected",
+      "proofKind": "artifact_serialization"
+    },
+    {
+      "id": "opencode.acp",
+      "version": "1.17.17",
+      "artifactSha256": "095b00fda839fe2f038e35b9e174bbbb2c0b7f70bbb7e2ed30b6a79287a23f8b",
+      "sourcePath": "opencode-ai/bin/opencode.exe:ACP.newSession/ACP.loadSession generators and native config serializers",
+      "nativeFixtureSha256": "3b0683c6a149f34e19c32576402a4da6526d62ca4f1d052470e2af7e985db56e",
+      "meaning": "configured",
+      "proofKind": "artifact_serialization"
+    },
+    {
+      "id": "claude.acp",
+      "version": "0.58.1",
+      "artifactSha256": "c62e8a74cfa5b73fdd32d12e7a6f3b8848297f3cd0de6ef3f28137ef3bd95fde",
+      "sourcePath": "@agentclientprotocol/claude-agent-acp/dist/acp-agent.js:newSession/createSession/loadSession(existing)/buildConfigOptions",
+      "nativeFixtureSha256": "6ec9392e5314bd42fc7357e76198edf8c9722686f12a7c1b795013ab1155a84d",
+      "meaning": "configured",
+      "proofKind": "artifact_serialization"
+    },
+    {
+      "id": "codex.headed",
+      "version": "0.153.4",
+      "artifactSha256": "56ef98ab4032d317ab26e9b5e5a175650717351edb16ed9cde0cb6d1734d62da",
+      "sourcePath": "@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex:thread/start and thread/resume(history)",
+      "nativeFixtureSha256": "0f5de659894bf3a03a3c95c2179e69a94c2e48405bae188c4b873d9735d748e3",
+      "meaning": "configured",
+      "proofKind": "isolated_protocol_capture"
+    },
+    {
+      "id": "codex.acp",
+      "version": "1.1.2",
+      "artifactSha256": "d05351bc8c47367969a340ac92b013f6fdce538cdf89f38ec046847bd6c2ef84",
+      "sourcePath": "@agentclientprotocol/codex-acp/dist/index.js:CodexAcpServer.newSession/loadSession",
+      "nativeFixtureSha256": "218045d4c2f432189d165bf37287e5d937fe08b6b6d48b5f418624b582772420",
+      "meaning": "configured",
+      "proofKind": "artifact_serialization"
+    },
+    {
+      "id": "hermes.acp",
+      "version": "0.17.0",
+      "artifactSha256": "4b2f1e2b1a5df583955e1c97acdf527d95eca6bb641bfa2f0d5d4dd03240a8f0",
+      "sourcePath": "hermes-agent/acp_adapter/server.py:HermesACPAgent.new_session/load_session",
+      "nativeFixtureSha256": "539c58063845c4b6612a91c6612c1cb146e737c515b8abc74f7d92509b23f776",
+      "meaning": "configured",
+      "proofKind": "artifact_serialization"
+    },
+    {
+      "id": "claude.headed",
+      "version": "2.1.261",
+      "artifactSha256": "4ae40dd1784e85753e742e09f267d29ecbb82890361ad3817d27560866d364a6",
+      "sourcePath": "@anthropic-ai/claude-code/bin/claude.exe:insertMessageChain/Pzt/V3",
+      "nativeFixtureSha256": "3420cce0388dbde376a1d33e1692b59a8b2a989628597057c4fea771ed904a3b",
+      "meaning": "response_reported",
+      "proofKind": "artifact_serialization"
+    },
+    {
+      "id": "hermes.headed",
+      "version": "0.17.0",
+      "artifactSha256": "7a36be48ffdc0fe62b855263683d55c1c7138cc65acf597175920fcf86b45bd5",
+      "sourcePath": "hermes-agent/run_agent.py:AIAgent._ensure_db_session -> hermes_state.py:SessionDB",
+      "nativeFixtureSha256": "fe2afaeb827ef88ae534441a54abb0e55cc76af5f994d2a3aee52d6200cefb17",
+      "meaning": "configured",
+      "proofKind": "artifact_serialization"
+    }
+  ]
+}

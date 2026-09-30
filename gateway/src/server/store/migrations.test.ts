@@ -1,4 +1,7 @@
 import { createClient, type Client } from "@libsql/client";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -10,6 +13,62 @@ import { GATEWAY_CANONICAL_TABLES } from "./schema";
 import { currentHuman } from "../identity/human";
 
 describe("Gateway v0.1.0 store baseline", () => {
+  it("rolls back model columns when marker validation fails after an ignored write", async () => {
+    const db = createClient({ url: ":memory:" });
+    try {
+      await migrateGatewayStore(db);
+      await db.batch([
+        "ALTER TABLE runtime_descriptors DROP COLUMN model_report_revision",
+        "ALTER TABLE runtime_descriptors DROP COLUMN model_report_json",
+        "UPDATE gateway_schema_migrations SET version=7,name='v0.1.6_transport_host'",
+        "CREATE TRIGGER ignore_model_marker BEFORE UPDATE ON gateway_schema_migrations BEGIN SELECT RAISE(IGNORE); END",
+      ], "write");
+      await expect(migrateGatewayStore(db)).rejects.toThrow();
+      expect(await columnNames(db, "runtime_descriptors")).not.toContain("model_report_revision");
+      expect(await columnNames(db, "runtime_descriptors")).not.toContain("model_report_json");
+      expect((await db.execute("SELECT version FROM gateway_schema_migrations")).rows[0]?.version).toBe(7);
+      await db.execute("DROP TRIGGER ignore_model_marker");
+      await migrateGatewayStore(db);
+    } finally { db.close(); }
+  });
+
+  it("reopens persisted report columns and fails closed on corrupt revision/JSON pairs", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "nexus-model-migration-"));
+    const url = `file:${join(directory, "gateway.db")}`;
+    let db = createClient({ url });
+    try {
+      await migrateGatewayStore(db);
+      await db.execute("INSERT INTO runtime_descriptors(runtime_id,agent_id,harness,mode,status,updated_at) VALUES('retain','a','test','headless','online',1)");
+      db.close();
+      db = createClient({ url });
+      await migrateGatewayStore(db);
+      expect((await db.execute("SELECT model_report_revision,model_report_json FROM runtime_descriptors")).rows).toMatchObject([{model_report_revision:0,model_report_json:null}]);
+      await db.execute("UPDATE runtime_descriptors SET model_report_revision=2");
+      await expect(migrateGatewayStore(db)).rejects.toThrow("invalid stored model report/revision pair");
+      expect((await db.execute("SELECT model_report_revision FROM runtime_descriptors")).rows[0]?.model_report_revision).toBe(2);
+    } finally { db.close(); rmSync(directory, {recursive:true,force:true}); }
+  });
+
+  it("adds model report columns to v7 atomically, preserving rows and reopening", async () => {
+    const db = createClient({ url: ":memory:" });
+    try {
+      await migrateGatewayStore(db);
+      expect(await columnNames(db, "runtime_descriptors")).toEqual(expect.arrayContaining(["model_report_revision", "model_report_json"]));
+      await db.execute("ALTER TABLE runtime_descriptors DROP COLUMN model_report_revision");
+      await db.execute("ALTER TABLE runtime_descriptors DROP COLUMN model_report_json");
+      await db.execute("UPDATE gateway_schema_migrations SET version=7,name='v0.1.6_transport_host'");
+      await db.execute("INSERT INTO runtime_descriptors(runtime_id,agent_id,harness,mode,status,updated_at) VALUES('retain','a','test','headless','online',1)");
+      await db.execute("CREATE TRIGGER reject_model_marker BEFORE UPDATE ON gateway_schema_migrations BEGIN SELECT RAISE(ABORT,'model marker failure'); END");
+      await expect(migrateGatewayStore(db)).rejects.toThrow("model marker failure");
+      expect(await columnNames(db, "runtime_descriptors")).not.toContain("model_report_revision");
+      expect((await db.execute("SELECT version FROM gateway_schema_migrations")).rows[0]?.version).toBe(7);
+      await db.execute("DROP TRIGGER reject_model_marker");
+      await migrateGatewayStore(db);
+      await migrateGatewayStore(db);
+      expect((await db.execute("SELECT runtime_id,model_report_revision,model_report_json FROM runtime_descriptors")).rows).toMatchObject([{runtime_id:"retain", model_report_revision:0, model_report_json:null}]);
+    } finally { db.close(); }
+  });
+
   it("creates one complete named baseline and reopens idempotently", async () => {
     const db = createClient({ url: ":memory:" });
 
@@ -118,6 +177,8 @@ describe("Gateway v0.1.0 store baseline", () => {
     await migrateGatewayStore(db);
     await db.batch([
       "ALTER TABLE hook_pipeline_evaluations DROP COLUMN result_json",
+      "ALTER TABLE runtime_descriptors DROP COLUMN model_report_revision",
+      "ALTER TABLE runtime_descriptors DROP COLUMN model_report_json",
       "ALTER TABLE hook_handler_executions DROP COLUMN result_json",
       "ALTER TABLE rest_bearer_token DROP COLUMN actor_session_id",
       "ALTER TABLE rest_bearer_token DROP COLUMN actor_agent_id",
@@ -142,6 +203,8 @@ describe("Gateway v0.1.0 store baseline", () => {
     const db = createClient({ url: ":memory:" });
     await migrateGatewayStore(db);
     await db.batch([
+      "ALTER TABLE runtime_descriptors DROP COLUMN model_report_revision",
+      "ALTER TABLE runtime_descriptors DROP COLUMN model_report_json",
       "ALTER TABLE rest_bearer_token DROP COLUMN actor_session_id",
       "ALTER TABLE rest_bearer_token DROP COLUMN actor_agent_id",
       "ALTER TABLE rest_bearer_token DROP COLUMN actor_runtime_id",
@@ -170,6 +233,8 @@ describe("Gateway v0.1.0 store baseline", () => {
     await migrateGatewayStore(db);
     await db.batch([
       "DROP TABLE transport_outbox",
+      "ALTER TABLE runtime_descriptors DROP COLUMN model_report_revision",
+      "ALTER TABLE runtime_descriptors DROP COLUMN model_report_json",
       "DROP TABLE transport_ingress",
       `UPDATE gateway_schema_migrations
        SET version = 6, name = 'v0.1.6_principals_and_transport_bindings'`,

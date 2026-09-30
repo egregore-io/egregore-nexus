@@ -1,10 +1,10 @@
-//! Hermes headed gateway bridge.
+//! Headed gateway bridge.
 //!
 //! Headed Hermes is not driven by tmux keystrokes. Nexus launches `hermes gateway run` with an
-//! runtime profile under the machine Hermes root that contains the Nexus gateway platform plugin,
+//! runtime profile under the machine root that contains the Nexus gateway platform plugin,
 //! then talks to that plugin over a launch-local socket. Delivery is one-at-a-time and acked only after the plugin
 //! surfaces the message into the gateway turn; streaming comes back as `agent_update` frames.
-//! The generated profile also gives Hermes a model-facing Nexus identity hint, so a fresh launch
+//! The generated profile also supplies a model-facing Nexus identity hint, so a fresh launch
 //! knows its assigned bus name/session before it has seen thread traffic.
 
 use std::fs;
@@ -69,6 +69,19 @@ pub fn write_hermes_gateway_profile(profile: &HermesGatewayProfile) -> Result<()
         .map_err(|e| NexusError::Store(format!("write Hermes adapter.py: {e}")))?;
     fs::write(plugin_dir.join("bridge_client.py"), PLUGIN_BRIDGE_CLIENT)
         .map_err(|e| NexusError::Store(format!("write Hermes bridge_client.py: {e}")))?;
+    let hook = profile.home.join("hooks/nexus-model");
+    fs::create_dir_all(&hook)
+        .map_err(|e| NexusError::Store(format!("create native model hook: {e}")))?;
+    fs::write(
+        hook.join("HOOK.yaml"),
+        "name: nexus-model\nevents: [agent:start, agent:end, 'session:compress']\n",
+    )
+    .map_err(|e| NexusError::Store(format!("write native model manifest: {e}")))?;
+    fs::write(
+        hook.join("handler.py"),
+        nexus_agent::adapter::hermes::native::MODEL_HOOK_SOURCE,
+    )
+    .map_err(|e| NexusError::Store(format!("write native model hook: {e}")))?;
     Ok(())
 }
 
@@ -156,6 +169,113 @@ struct BridgeState {
     processing_started_id: Option<String>,
     delivered_id: Option<String>,
     completion_guard: Option<(String, OwnedMutexGuard<()>)>,
+    model: Option<ModelCapture>,
+    adapter_owner: Option<uuid::Uuid>,
+}
+
+struct ModelCapture {
+    reporting: nexus_agent::adapter::NativeModelReporting,
+    root: Option<String>,
+    sequence: u64,
+    observed: bool,
+}
+impl Drop for ModelCapture {
+    fn drop(&mut self) {
+        self.reporting.sink().revoke();
+    }
+}
+
+impl ModelCapture {
+    fn admit(&mut self, frame: &Value) -> Result<bool, ()> {
+        if !self
+            .reporting
+            .sink()
+            .accepts_profile(self.reporting.profile().identity())
+        {
+            return Err(());
+        }
+        let context = &frame["context"];
+        if context["platform"] != "nexus"
+            || context["user_id"] != "nexus"
+            || context["chat_id"] != "nexus"
+            || context["chat_type"] != "dm"
+            || context["thread_id"] != ""
+            || !matches!(
+                frame["event"].as_str(),
+                Some("agent:start" | "agent:end" | "source_closed")
+            )
+        {
+            return Ok(false);
+        }
+        let Some(sequence) = frame["sequence"]
+            .as_u64()
+            .filter(|n| *n > self.sequence && *n <= 9_007_199_254_740_991)
+        else {
+            return Ok(false);
+        };
+        let Some(root) = context["session_id"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty() && s.len() <= 1024)
+        else {
+            return Ok(false);
+        };
+        if self.root.as_deref().is_some_and(|old| old != root) {
+            return Err(());
+        }
+        if frame["event"] == "source_closed" {
+            return if self.root.as_deref() == Some(root) {
+                Err(())
+            } else {
+                Ok(false)
+            };
+        }
+        if self.root.is_none() {
+            if frame["event"] != "agent:start" {
+                return Ok(false);
+            }
+            if !self.reporting.sink().bind_native_root(root) {
+                return Err(());
+            }
+            self.root = Some(root.into());
+        }
+        self.sequence = sequence;
+        if frame["row"].is_null() {
+            // The hook selected this root, but could not read its metadata. Replace previous
+            // evidence with unknown rather than leaving an old configured value current.
+            let update = nexus_contracts::model_report::NativeModelUpdate {
+                native_session_id: root.into(),
+                field: nexus_contracts::model_report::ModelEvidenceField::Configured,
+                value: nexus_contracts::model_report::ModelEvidenceValue::Unknown(
+                    nexus_contracts::ModelUnknownReason::AwaitingNativeMetadata,
+                ),
+            };
+            if !self.reporting.sink().observe(update) {
+                return Err(());
+            }
+            self.observed = false;
+            return Ok(true);
+        }
+        // A native compression may end the captured row before the end hook runs.
+        if frame["row"]["id"] == root && !frame["row"]["ended_at"].is_null() {
+            return Err(());
+        }
+        let Some(update) = nexus_agent::adapter::hermes::native::configured_model(
+            &frame["row"],
+            root,
+            nexus_common::now(),
+        ) else {
+            return Ok(false);
+        };
+        let observed = matches!(
+            &update.value,
+            nexus_contracts::model_report::ModelEvidenceValue::Observed(_)
+        );
+        if !self.reporting.sink().observe(update) {
+            return Err(());
+        }
+        self.observed = observed;
+        Ok(true)
+    }
 }
 
 /// Persistent local-socket bridge used by the Hermes gateway plugin.
@@ -168,6 +288,34 @@ pub struct HermesGatewayBridge {
 }
 
 impl HermesGatewayBridge {
+    /// Capture model reporting separately from input and visible stream frames.
+    pub fn start_observed(
+        session: SessionId,
+        socket_path: PathBuf,
+        token: String,
+        events: Arc<dyn EventSink>,
+        bell: Bell,
+        reporting: nexus_agent::adapter::NativeModelReporting,
+    ) -> Result<Arc<Self>, NexusError> {
+        let model = ModelCapture {
+            reporting,
+            root: None,
+            sequence: 0,
+            observed: false,
+        };
+        if model.reporting.profile().backend().as_str() != "hermes.gateway"
+            || !model
+                .reporting
+                .sink()
+                .accepts_profile(model.reporting.profile().identity())
+        {
+            return Err(NexusError::Adapter(
+                "invalid captured gateway model owner".into(),
+            ));
+        }
+        Self::start_inner(session, socket_path, token, events, bell, Some(model))
+    }
+
     /// Start the local bridge. Unix uses a filesystem socket; Windows uses an ephemeral loopback
     /// TCP listener. One plugin connection is active at a time; a new subscribe
     /// frame supersedes the previous connection.
@@ -178,8 +326,25 @@ impl HermesGatewayBridge {
         events: Arc<dyn EventSink>,
         bell: Bell,
     ) -> Result<Arc<Self>, NexusError> {
+        Self::start_inner(session, socket_path, token, events, bell, None)
+    }
+
+    fn start_inner(
+        session: SessionId,
+        socket_path: PathBuf,
+        token: String,
+        events: Arc<dyn EventSink>,
+        bell: Bell,
+        model: Option<ModelCapture>,
+    ) -> Result<Arc<Self>, NexusError> {
         let (listener, endpoint) = bind_bridge_listener(&socket_path)?;
-        let state = Arc::new((Mutex::new(BridgeState::default()), Condvar::new()));
+        let state = Arc::new((
+            Mutex::new(BridgeState {
+                model,
+                ..Default::default()
+            }),
+            Condvar::new(),
+        ));
         let handle = tokio::runtime::Handle::try_current().ok();
         let bridge = Arc::new(Self {
             state: state.clone(),
@@ -211,6 +376,34 @@ impl HermesGatewayBridge {
     /// Connection endpoint passed to the generated Hermes plugin.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// Synchronous captured-owner exclusion; absence of a row is not live model evidence.
+    pub(crate) fn with_current_model_binding<T>(
+        &self,
+        reporting: &nexus_agent::adapter::NativeModelReporting,
+        callback: impl FnOnce(Option<&str>) -> T,
+    ) -> Option<T> {
+        let guard = self.state.0.lock().unwrap();
+        let model = guard.model.as_ref()?;
+        if !model.reporting.same_owner(reporting)
+            || !model
+                .reporting
+                .sink()
+                .accepts_profile(model.reporting.profile().identity())
+        {
+            return None;
+        }
+        Some(callback(if model.observed {
+            model.root.as_deref()
+        } else {
+            None
+        }))
+    }
+
+    /// Close captured model admission without changing existing input/display completion policy.
+    pub(crate) fn revoke_model(&self) {
+        self.state.0.lock().unwrap().model.take();
     }
 
     /// Send a rendered Nexus turn to the connected Hermes plugin and wait until it reports the turn
@@ -265,6 +458,12 @@ impl HermesGatewayBridge {
     /// than terminal input bytes, but deliberately independent from provider/model completion.
     pub fn turn_completion_evidence(&self) -> TurnCompletionEvidence {
         TurnCompletionEvidence::ContextAccepted
+    }
+}
+
+impl Drop for HermesGatewayBridge {
+    fn drop(&mut self) {
+        self.revoke_model();
     }
 }
 
@@ -351,6 +550,8 @@ fn handle_client(
 ) {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
+    let connection = uuid::Uuid::new_v4();
+    let mut subscribed = false;
     loop {
         line.clear();
         let Ok(n) = reader.read_line(&mut line) else {
@@ -369,9 +570,29 @@ fn handle_client(
             Some("subscribe") => {
                 if let Ok(writer) = reader.get_ref().try_clone() {
                     let (lock, cv) = &*state;
-                    lock.lock().unwrap().adapter = Some(writer);
+                    let mut guard = lock.lock().unwrap();
+                    if guard.adapter_owner.is_some_and(|owner| owner != connection) {
+                        guard.model.take();
+                    }
+                    guard.adapter = Some(writer);
+                    guard.adapter_owner = Some(connection);
+                    subscribed = true;
                     cv.notify_all();
                 }
+            }
+            Some("model_source") => {
+                let accepted = {
+                    let mut guard = state.0.lock().unwrap();
+                    match guard.model.as_mut().map(|model| model.admit(&frame)) {
+                        Some(Ok(accepted)) => accepted,
+                        Some(Err(())) => {
+                            guard.model.take();
+                            false
+                        }
+                        None => false,
+                    }
+                };
+                let _ = writeln!(reader.get_mut(), "{}", json!({"accepted":accepted}));
             }
             Some("processing_started") => {
                 if let Some(id) = frame.get("id").and_then(Value::as_str) {
@@ -426,6 +647,12 @@ fn handle_client(
                 }
             }
             _ => {}
+        }
+    }
+    if subscribed {
+        let mut guard = state.0.lock().unwrap();
+        if guard.adapter_owner == Some(connection) {
+            guard.model.take();
         }
     }
 }

@@ -72,6 +72,8 @@ pub struct TranscriptRecord {
     pub prompt_id: Option<String>,
     /// Claude model message id for an assistant transcript record, including thinking-only rows.
     pub assistant_message_id: Option<String>,
+    /// Strict root response metadata, independent of display text or hook aliases.
+    pub response_model: Option<crate::native::model_reporting::ClaudeResponseModel>,
     /// User prompt recovered from Claude's `UserPromptSubmit` native hook.
     pub user_prompt: Option<UserPrompt>,
     /// Assistant text fragments recovered from transcript message content.
@@ -235,6 +237,7 @@ pub fn parse_transcript_value(value: &Value) -> Option<TranscriptRecord> {
         transcript_path,
         prompt_id,
         assistant_message_id,
+        response_model: crate::native::model_reporting::parse_response_model(value),
         user_prompt,
         assistant_text,
         tool_updates,

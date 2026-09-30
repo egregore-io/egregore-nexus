@@ -6,6 +6,324 @@
 //! without a real model and without network. They pass by default (`cargo test -p nexus-agent`);
 //! real harness spawns are covered separately and skipped when those binaries are absent.
 
+#[tokio::test]
+async fn model_metadata_cancelled_load_reply_cannot_borrow_the_later_new_root() {
+    use nexus_contracts::model_report::ModelEvidenceValue;
+    let dir = std::env::temp_dir().join(nexus_common::new_binding_id());
+    std::fs::create_dir_all(&dir).unwrap();
+    let (engine, sink) = model_metadata_engine(true);
+    let mut command = fake_command();
+    command.env.extend([
+        (
+            "FAKE_ACP_RAW_LOAD".into(),
+            json!({"models":{"currentModelId":"old-load"}}).to_string(),
+        ),
+        (
+            "FAKE_ACP_RAW_NEW".into(),
+            json!({"sessionId":"new-root","models":{"currentModelId":"new-model"}}).to_string(),
+        ),
+        (
+            "FAKE_ACP_MODEL_RESPONSE_GATE".into(),
+            dir.join("reply").display().to_string(),
+        ),
+        (
+            "FAKE_ACP_MODEL_RESPONSE_WITNESS".into(),
+            "old-reply-processed".into(),
+        ),
+    ]);
+    engine.spawn_and_initialize(&command).await.unwrap();
+    let ctx = LaunchCtx::default();
+    let mut pending = Box::pin(engine.load_session("old-root", None, &ctx));
+    let entered = dir.join("reply.entered");
+    tokio::select! {
+        result = &mut pending => panic!("load must remain parked: {result:?}"),
+        _ = wait_fixture_marker(&entered) => {}
+    }
+    drop(pending);
+    std::fs::write(dir.join("reply.release"), b"release").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while engine.take_updates().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("typed witness follows the abandoned raw reply before NEW is submitted");
+    assert!(
+        sink.values.lock().unwrap().is_empty(),
+        "abandoned request has no model authority"
+    );
+    assert!(sink.root.lock().unwrap().is_none());
+    engine.new_session(None, &ctx).await.unwrap();
+    let values = sink.values.lock().unwrap().clone();
+    engine.kill().await;
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(
+        values.len(),
+        1,
+        "late cancelled load precedes new reply on the real raw dispatch"
+    );
+    assert_eq!(values[0].native_session_id, "new-root");
+    assert!(
+        matches!(&values[0].value, ModelEvidenceValue::Observed(value) if value.model_id == "new-model")
+    );
+}
+#[tokio::test]
+async fn model_metadata_failed_load_has_no_evidence_and_fallback_new_uses_its_actual_root() {
+    let (engine, sink) = model_metadata_engine(true);
+    let mut command = fake_command();
+    command.env.extend([
+        ("FAKE_ACP_FAIL_LOAD".into(), "1".into()),
+        (
+            "FAKE_ACP_RAW_NEW".into(),
+            json!({"sessionId":"fallback-root","models":{"currentModelId":"fallback-model"}})
+                .to_string(),
+        ),
+    ]);
+    engine.spawn_and_initialize(&command).await.unwrap();
+    let error = engine
+        .load_session("stale-root", None, &LaunchCtx::default())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Resource not found"));
+    assert!(sink.values.lock().unwrap().is_empty());
+    assert!(sink.root.lock().unwrap().is_none());
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    let values = sink.values.lock().unwrap().clone();
+    engine.kill().await;
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0].native_session_id, "fallback-root");
+}
+#[tokio::test]
+async fn model_metadata_foreign_load_reply_is_not_authority_for_the_requested_root() {
+    let (engine, sink) = model_metadata_engine(true);
+    let mut command = fake_command();
+    command.env.push((
+        "FAKE_ACP_RAW_LOAD".into(),
+        json!({"sessionId":"foreign","models":{"currentModelId":"wrong"}}).to_string(),
+    ));
+    engine.spawn_and_initialize(&command).await.unwrap();
+    // SDK ignores this optional/unknown reply field, but metadata must not borrow its owner.
+    engine
+        .load_session("captured-root", None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    let values = sink.values.lock().unwrap().clone();
+    let root = sink.root.lock().unwrap().clone();
+    engine.kill().await;
+    assert!(values.is_empty());
+    assert!(root.is_none());
+}
+
+struct ModelMetadataSink {
+    identity: nexus_contracts::model_report::ModelProfileIdentity,
+    root: std::sync::Mutex<Option<String>>,
+    values: std::sync::Mutex<Vec<nexus_contracts::model_report::NativeModelUpdate>>,
+    closed: std::sync::atomic::AtomicBool,
+}
+impl nexus_contracts::model_report::ModelObservationSink for ModelMetadataSink {
+    fn accepts_profile(
+        &self,
+        profile: &nexus_contracts::model_report::ModelProfileIdentity,
+    ) -> bool {
+        self.identity.matches(profile)
+    }
+    fn bind_native_root(&self, root: &str) -> bool {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        let mut current = self.root.lock().unwrap();
+        if let Some(current) = current.as_ref() {
+            current == root
+        } else {
+            *current = Some(root.into());
+            true
+        }
+    }
+    fn observe(&self, update: nexus_contracts::model_report::NativeModelUpdate) -> bool {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst)
+            || self.root.lock().unwrap().as_deref() != Some(&update.native_session_id)
+        {
+            return false;
+        }
+        self.values.lock().unwrap().push(update);
+        true
+    }
+    fn revoke(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+fn model_metadata_engine(legacy: bool) -> (AcpEngine, Arc<ModelMetadataSink>) {
+    use nexus_agent::adapter::{AcpModelMetadataDialect, AdapterModelReportingProfile};
+    use nexus_contracts::{ModelEvidenceCapability, ModelObservationSource, ModelReportBackend};
+    let source = ModelObservationSource::new("fixture-config").unwrap();
+    let profile = AdapterModelReportingProfile::new(
+        ModelReportBackend::new("fixture-backend").unwrap(),
+        ModelEvidenceCapability::Supported,
+        ModelEvidenceCapability::Unsupported,
+        ModelEvidenceCapability::Unsupported,
+        if legacy {
+            AcpModelMetadataDialect::ConfigOptionsAndLegacyModels {
+                config_options_source: source,
+                legacy_models_source: ModelObservationSource::new("fixture-legacy").unwrap(),
+            }
+        } else {
+            AcpModelMetadataDialect::ConfigOptions { source }
+        },
+    )
+    .unwrap();
+    let sink = Arc::new(ModelMetadataSink {
+        identity: profile.identity().clone(),
+        root: Default::default(),
+        values: Default::default(),
+        closed: Default::default(),
+    });
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let mut registry = nexus_agent::AdapterRegistry::new();
+    let key = HarnessId::new("metadata-test").unwrap();
+    let slot = captured.clone();
+    registry.register_observed(
+        &key,
+        Arc::new(move |ctx| {
+            *slot.lock().unwrap() = ctx.model_reporting;
+            Arc::new(nexus_agent::MockAdapter::new())
+        }),
+        profile,
+    );
+    registry
+        .select(&key)
+        .unwrap()
+        .instantiate_observed(LaunchCtx::default(), sink.clone())
+        .unwrap();
+    let reporting = captured.lock().unwrap().take();
+    (AcpEngine::new().with_reporting(reporting), sink)
+}
+#[tokio::test]
+async fn model_metadata_actual_raw_new_and_load_dispatch_preserve_native_fixtures() {
+    use nexus_contracts::model_report::{ModelEvidenceField, ModelEvidenceValue};
+    let native: serde_json::Value = serde_json::from_str(include_str!(
+        "../../nexus/tests/fixtures/model_reporting/native.json"
+    ))
+    .unwrap();
+    for harness in ["codex", "claude", "opencode", "hermes"] {
+        for event in native["rows"][format!("{harness}.acp")]["events"]
+            .as_array()
+            .unwrap()
+        {
+            let method = event["kind"].as_str().unwrap();
+            if !matches!(method, "session/new" | "session/load") {
+                continue;
+            }
+            let (engine, sink) = model_metadata_engine(harness == "hermes");
+            let mut command = fake_command();
+            command.env.push((
+                if method == "session/new" {
+                    "FAKE_ACP_RAW_NEW"
+                } else {
+                    "FAKE_ACP_RAW_LOAD"
+                }
+                .into(),
+                event["payload"].to_string(),
+            ));
+            engine.spawn_and_initialize(&command).await.unwrap();
+            if method == "session/new" {
+                engine
+                    .new_session(None, &LaunchCtx::default())
+                    .await
+                    .unwrap();
+            } else {
+                engine
+                    .load_session("fixture-root", None, &LaunchCtx::default())
+                    .await
+                    .unwrap();
+            }
+            let values = sink.values.lock().unwrap().clone();
+            engine.kill().await;
+            assert_eq!(
+                values.len(),
+                1,
+                "{harness}/{method}: raw reply observed exactly once before completion"
+            );
+            assert_eq!(values[0].native_session_id, "fixture-root");
+            assert_eq!(values[0].field, ModelEvidenceField::Configured);
+            let expected = match (harness, method) {
+                ("codex" | "claude", _) => "gpt-astra",
+                ("opencode", "session/new") => "fixture-provider/gpt-astra",
+                ("opencode", _) => "fixture-provider/opaque-resumed-model",
+                ("hermes", _) => "fixture-provider:gpt-astra",
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(&values[0].value, ModelEvidenceValue::Observed(value) if value.provider_id.is_none() && value.model_id == expected)
+            );
+            assert!(
+                sink.closed.load(std::sync::atomic::Ordering::SeqCst),
+                "owned connection kill revokes reporting"
+            );
+        }
+    }
+}
+#[tokio::test]
+async fn model_metadata_raw_replacements_reject_foreign_and_malformed_without_changing_prompt_delivery(
+) {
+    use nexus_contracts::model_report::ModelEvidenceValue;
+    use nexus_contracts::{ModelInvalidReason, ModelUnknownReason};
+    let option = |model: &str| json!({"id":"model","name":"Model","category":"model","type":"select","currentValue":model,"options":[]});
+    let update = |root: &str, options: serde_json::Value| json!({"sessionId":root,"update":{"sessionUpdate":"config_option_update","configOptions":options}});
+    let (engine, sink) = model_metadata_engine(false);
+    let mut command = fake_command();
+    command.env.push((
+        "FAKE_ACP_RAW_NEW".into(),
+        json!({"sessionId":"fixture-root","configOptions":[option("first")]}).to_string(),
+    ));
+    command.env.push((
+        "FAKE_ACP_RAW_MODEL_UPDATES".into(),
+        json!([
+            update("foreign", json!([option("foreign")])),
+            update("fixture-root", json!([])),
+            update(
+                "fixture-root",
+                json!([option("partial"), {"id":"broken","category":7}])
+            ),
+            update("fixture-root", json!([option("last")]))
+        ])
+        .to_string(),
+    ));
+    engine.spawn_and_initialize(&command).await.unwrap();
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .unwrap();
+    let streamed = engine
+        .inject_completion_observed("metadata still delivers".into())
+        .await
+        .unwrap();
+    let values = sink.values.lock().unwrap().clone();
+    engine.kill().await;
+    assert!(
+        !streamed.is_empty(),
+        "normal typed display path remains in service"
+    );
+    assert_eq!(
+        values.len(),
+        4,
+        "initial plus three owned full replacements, no typed duplicate"
+    );
+    assert_eq!(
+        values[1].value,
+        ModelEvidenceValue::Unknown(ModelUnknownReason::NotInCurrentConfiguration)
+    );
+    assert_eq!(
+        values[2].value,
+        ModelEvidenceValue::Invalid(ModelInvalidReason::MalformedNativeMetadata)
+    );
+    assert!(
+        matches!(&values[3].value, ModelEvidenceValue::Observed(value) if value.model_id == "last")
+    );
+}
+
 use std::sync::Arc;
 
 use nexus_agent::adapter::engine::{AcpEngine, HarnessCommand, LaunchCtx};

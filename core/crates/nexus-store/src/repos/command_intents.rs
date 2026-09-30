@@ -92,7 +92,7 @@ pub struct CommandIntents<'a> {
     store: &'a Store,
 }
 
-/// Settlement of a prompt admission attempt. `Rejected` requires evidence that no native
+/// Settlement of a prompt or steer admission attempt. `Rejected` requires evidence that no native
 /// delivery occurred; transport loss and response/receipt timeouts are always `Uncertain`.
 pub enum PromptCommandOutcome<'a> {
     Completed(&'a str),
@@ -114,7 +114,7 @@ impl<'a> CommandIntents<'a> {
                 "UPDATE command_intents SET started_at = ?4, revision = revision + 1 \
              WHERE command_id = ?1 AND claimed_at = ?2 AND attempts = ?3 \
                AND status = 'claimed' AND started_at IS NULL AND lease_until > ?4 \
-               AND kind = 'harness.prompt' AND lease_until = ?5",
+               AND kind IN ('harness.prompt', 'harness.steer') AND lease_until = ?5",
                 params![
                     claim.command_id.as_str(),
                     claim.claimed_at,
@@ -140,7 +140,7 @@ impl<'a> CommandIntents<'a> {
              lease_until = NULL, revision = revision + 1 \
              WHERE command_id = ?1 AND claimed_at = ?2 AND attempts = ?3 \
                AND status = 'claimed' AND started_at IS NOT NULL \
-               AND kind = 'harness.prompt' AND lease_until = ?4 AND lease_until > ?5",
+               AND kind IN ('harness.prompt', 'harness.steer') AND lease_until = ?4 AND lease_until > ?5",
             params![claim.command_id.as_str(), claim.claimed_at, claim.attempts, claim.lease_until, now],
         ).await.map_err(store_err)?;
         // Deliberately do not ring ingress here. Native boundary readiness, not this release,
@@ -169,7 +169,7 @@ impl<'a> CommandIntents<'a> {
              completed_at = ?7, lease_until = NULL, revision = revision + 1 \
              WHERE command_id = ?1 AND claimed_at = ?2 AND attempts = ?3 \
                AND status = 'claimed' AND started_at IS NOT NULL \
-               AND kind = 'harness.prompt' AND lease_until = ?8 AND lease_until > ?7",
+               AND kind IN ('harness.prompt', 'harness.steer') AND lease_until = ?8 AND lease_until > ?7",
                 params![
                     claim.command_id.as_str(),
                     claim.claimed_at,
@@ -1129,7 +1129,7 @@ impl<'a> CommandIntents<'a> {
         Ok(())
     }
 
-    /// Record the durable transition for a non-prompt claim. Prompts must use
+    /// Record the durable transition for other claims. Prompts and steers must use
     /// [`Self::mark_prompt_started_for_claim`] with the complete captured attempt.
     pub async fn mark_started_for_claim(
         &self,
@@ -1143,7 +1143,7 @@ impl<'a> CommandIntents<'a> {
             .execute(
                 "UPDATE command_intents SET started_at = ?3, revision = revision + 1 WHERE command_id = ?1 \
                  AND status = 'claimed' AND claimed_at = ?2 AND started_at IS NULL \
-                 AND kind != 'harness.prompt'",
+                 AND kind NOT IN ('harness.prompt', 'harness.steer')",
                 params![command_id, claimed_at, started_at],
             )
             .await
@@ -1154,7 +1154,7 @@ impl<'a> CommandIntents<'a> {
     /// Return one current, unfinished claim to the durable pending queue when daemon shutdown
     /// wins before the command crosses its external acceptance boundary.
     ///
-    /// Armed prompts are excluded; their typed nonacceptance path requires the full claim.
+    /// Armed prompts and steers are excluded; typed nonacceptance requires the full claim.
     /// For these legacy claims the timestamp is the ownership token: a stale worker cannot release a row that a
     /// newer daemon has already reclaimed. Keep `attempts` unchanged so the durable row records
     /// that this daemon owned the claim even though it never reached the external provider.
@@ -1569,20 +1569,20 @@ enum ClaimFilter<'a> {
     ExceptKindSet(&'a str),
 }
 
-// For every prompt delivery, `started_at` is a conservative may-have-attempted fence,
+// For every prompt or steer delivery, `started_at` is a conservative may-have-attempted fence,
 // NOT proof of native acceptance. Persist it before invoking admission. A lost response or
 // expired lease cannot prove zero effect, so no claim path may replay an armed row. Other
 // commands retain their existing reclaim behavior. This lives in the identity store and thus
 // survives replacement of the daemon's boot-scoped transport database.
-const PROMPT_RECLAIM_SAFE: &str = "NOT (kind = 'harness.prompt' \
+const PROMPT_RECLAIM_SAFE: &str = "NOT (kind IN ('harness.prompt', 'harness.steer') \
     AND started_at IS NOT NULL)";
 
-const GENERIC_SETTLEMENT_SAFE: &str = "NOT (kind = 'harness.prompt' \
+const GENERIC_SETTLEMENT_SAFE: &str = "NOT (kind IN ('harness.prompt', 'harness.steer') \
     AND (started_at IS NOT NULL OR COALESCE(json_extract(CASE WHEN json_valid(request_json) THEN request_json ELSE '{}' END, '$.delivery') = 'auto', 0)))";
 
 // Unknown delivery remains an unresolved obligation. Removing its receipt would allow a
 // reconnect with the same id to create a new send. Known outcomes retain normal retention.
-const PROMPT_TERMINAL_REAP_SAFE: &str = "NOT (kind = 'harness.prompt' \
+const PROMPT_TERMINAL_REAP_SAFE: &str = "NOT (kind IN ('harness.prompt', 'harness.steer') \
     AND COALESCE(json_extract(CASE WHEN json_valid(error_json) THEN error_json ELSE '{}' END, '$.code') = -32011, 0))";
 
 fn prompt_uncertain_error_json() -> String {

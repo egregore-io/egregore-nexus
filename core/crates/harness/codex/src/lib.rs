@@ -150,8 +150,9 @@ impl Harness for CodexHarness {
 /// Install the real codex adapter factory into a registry (composition-root
 /// replacement for the former `AdapterRegistry::with_builtins()` codex arm).
 pub fn register(registry: &mut nexus_agent::AdapterRegistry) {
-    registry.register(
+    registry.register_observed(
         &nexus_contracts::HarnessId::new("codex").expect("builtin harness id is valid"),
         Arc::new(|ctx| Arc::new(CodexAdapter::new(ctx)) as Arc<dyn nexus_agent::Adapter>),
+        CodexAdapter::model_reporting_profile(),
     );
 }

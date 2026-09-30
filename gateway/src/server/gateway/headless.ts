@@ -7,6 +7,7 @@ import { dispatchNetworkMcp } from "../../routes/api/mcp";
 import { dispatchApiV1 } from "../../routes/api/v1/$";
 import { observeScoped } from "../../routes/api/agui.observe";
 import { attachAguiWsUpgrade } from "../agui/ws.mjs";
+import { createRuntimeSnapshotSource, type RuntimeSnapshotSource } from "../agui/runtimeSnapshots";
 import { closeSharedDaemonPushConnector } from "../agui/daemonPushRelay.mjs";
 import {
   createGatewayDeveloperEventSource,
@@ -77,6 +78,7 @@ export interface HeadlessGatewayLifecycle {
 export interface HeadlessGatewayWsOptions {
   fetchHandler: (request: Request) => Promise<Response>;
   developerEvents?: GatewayDeveloperEventSource;
+  runtimeSnapshots?: RuntimeSnapshotSource;
 }
 
 const DEFAULT_LIFECYCLE: HeadlessGatewayLifecycle = {
@@ -220,13 +222,17 @@ export async function attachHeadlessGatewayWs(
 ) {
   const ownsDeveloperEvents = !options.developerEvents;
   const developerEvents = options.developerEvents ?? createGatewayDeveloperEventSource();
+  const ownsRuntimeSnapshots = !options.runtimeSnapshots;
+  const runtimeSnapshots = options.runtimeSnapshots ?? createRuntimeSnapshotSource({fetchHandler:options.fetchHandler});
   const wss = await attachAguiWsUpgrade(server, {
     fetchHandler: options.fetchHandler,
     developerEvents,
+    runtimeSnapshots,
   });
   if (ownsDeveloperEvents) {
     server.once("close", () => developerEvents.close());
   }
+  if (ownsRuntimeSnapshots) server.once("close", () => runtimeSnapshots.close());
   return wss;
 }
 

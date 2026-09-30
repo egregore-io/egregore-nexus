@@ -403,6 +403,7 @@ mod agents {
             started_at: 10,
             stopped_at: None,
             last_heartbeat: Some(11),
+            model_report: None,
         }
     }
 

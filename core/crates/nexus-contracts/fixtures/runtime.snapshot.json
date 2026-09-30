@@ -1,0 +1,6 @@
+[
+  {"t":"runtime.subscribe","subscriptionId":"connection1/sub1","agentId":"a_current"},
+  {"t":"runtime.unsubscribe","subscriptionId":"connection1/sub1"},
+  {"t":"runtime.snapshot","subscriptionId":"connection1/sub2","agentId":"a_current","sequence":1,"runtimes":[]},
+  {"t":"runtime.unavailable","subscriptionId":"connection1/sub2","agentId":"a_current","sequence":2,"reason":"unavailable"}
+]

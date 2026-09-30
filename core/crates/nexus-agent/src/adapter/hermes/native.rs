@@ -1,4 +1,4 @@
-//! Native Hermes session row translation.
+//! Native session row translation.
 //!
 //! Headed Hermes persists structured conversation rows in `~/.hermes/state.db`. This module owns the
 //! pure row-to-`agent.update` translation used by the daemon-side forwarder; it deliberately does no
@@ -10,7 +10,82 @@ use nexus_transcript::{ToolCallObservation, ToolCallPhase};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-/// One active row from Hermes' native `messages` table.
+/// Installed into the isolated profile's native gateway hook registry.
+pub const MODEL_HOOK_SOURCE: &str = include_str!("model_hook.py");
+
+/// Native session rows describe configured metadata, not a provider response.
+pub fn model_profile() -> super::super::NativeModelReportingProfile {
+    use nexus_contracts::{ModelEvidenceCapability as Capability, ModelReportBackend};
+    super::super::NativeModelReportingProfile::new(
+        ModelReportBackend::new("hermes.gateway").unwrap(),
+        Capability::Supported,
+        Capability::Unverified,
+        Capability::Unverified,
+    )
+    .unwrap()
+}
+
+/// Read only an exact root's configured model from its native persisted row.
+pub fn configured_model(
+    row: &Value,
+    root: &str,
+    observed_at: i64,
+) -> Option<nexus_contracts::model_report::NativeModelUpdate> {
+    use nexus_contracts::model_report::{
+        ModelEvidenceField, ModelEvidenceValue, NativeModelUpdate,
+    };
+    use nexus_contracts::{
+        ModelInvalidReason, ModelObservation, ModelObservationSource, ModelUnknownReason,
+    };
+    if root.trim().is_empty()
+        || row.get("id").and_then(Value::as_str) != Some(root)
+        || row.get("parent_session_id") != Some(&Value::Null)
+    {
+        return None;
+    }
+    // Native lineage metadata is not interchangeable with a shared cwd or display cursor.
+    let config = match row.get("model_config") {
+        None | Some(Value::Null) => json!({}),
+        Some(Value::String(raw)) => serde_json::from_str::<Value>(raw).ok()?,
+        _ => return None,
+    };
+    let config = config.as_object()?;
+    if ["_delegate_from", "_branched_from"]
+        .iter()
+        .any(|key| config.get(*key).is_some_and(|value| !value.is_null()))
+    {
+        return None;
+    }
+    let invalid = || ModelEvidenceValue::Invalid(ModelInvalidReason::MalformedNativeMetadata);
+    let value = match row.get("model") {
+        None => ModelEvidenceValue::Unknown(ModelUnknownReason::AwaitingNativeMetadata),
+        Some(Value::String(model)) => {
+            let observation = ModelObservation {
+                model_id: model.clone(),
+                provider_id: None,
+                source: ModelObservationSource::new("hermes.gateway.session").unwrap(),
+                observed_at,
+                native_session_id: Some(root.into()),
+                native_turn_id: None,
+                native_message_id: None,
+                native_reported_at: None,
+            };
+            if observation.validate().is_ok() {
+                ModelEvidenceValue::Observed(observation)
+            } else {
+                invalid()
+            }
+        }
+        Some(_) => invalid(),
+    };
+    Some(NativeModelUpdate {
+        native_session_id: root.into(),
+        field: ModelEvidenceField::Configured,
+        value,
+    })
+}
+
+/// One active row from the native `messages` table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HermesMessageRow {
     /// Monotonic SQLite row id in `messages`.

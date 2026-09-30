@@ -358,7 +358,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
       `INSERT INTO identities VALUES
         ('a_target','current-target','old-owner-name','agent','agent',
          '{"ownerAgentId":"a_owner"}',1)`,
-      `INSERT INTO runtime_descriptors VALUES
+      `INSERT INTO runtime_descriptors (runtime_id,agent_id,session_id,harness,mode,backend,cwd,native_resume_key,status,updated_at) VALUES
         ('r_target','a_target','s_target','codex','headless',NULL,NULL,NULL,'online',2)`,
     ], "write");
     let idSeq = 0;
@@ -408,7 +408,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
       `INSERT INTO identities VALUES
         ('a_target','current-target','old-owner-name','agent','agent',
          '{"ownerAgentId":"a_owner"}',1)`,
-      `INSERT INTO runtime_descriptors VALUES
+      `INSERT INTO runtime_descriptors (runtime_id,agent_id,session_id,harness,mode,backend,cwd,native_resume_key,status,updated_at) VALUES
         ('r_target','a_target','s_target','codex','headless',NULL,NULL,NULL,'offline',2)`,
     ], "write");
     const submit = vi.fn(async () => ({ warmed: true }));
@@ -443,7 +443,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
       `INSERT INTO identities VALUES
         ('a_target','current-target','old-owner-name','agent','agent',
          '{"ownerAgentId":"a_owner"}',1)`,
-      `INSERT INTO runtime_descriptors VALUES
+      `INSERT INTO runtime_descriptors (runtime_id,agent_id,session_id,harness,mode,backend,cwd,native_resume_key,status,updated_at) VALUES
         ('r_target','a_target','s_target','codex','headless',NULL,NULL,NULL,'online',2)`,
     ], "write");
     let idSeq = 0;
@@ -515,7 +515,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
           1,
         ],
       },
-      `INSERT INTO runtime_descriptors VALUES
+      `INSERT INTO runtime_descriptors (runtime_id,agent_id,session_id,harness,mode,backend,cwd,native_resume_key,status,updated_at) VALUES
         ('r_target','a_target','s_target','codex','headless',NULL,NULL,NULL,'online',2)`,
     ], "write");
     let idSeq = 0;
@@ -565,7 +565,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
          '{"ownerAgentId":"a_owner"}',1),
         ('a_runtime_alias','runtime-alias','alias-owner','agent','agent',
          '{"ownerAgentId":"a_intruder"}',1)`,
-      `INSERT INTO runtime_descriptors VALUES
+      `INSERT INTO runtime_descriptors (runtime_id,agent_id,session_id,harness,mode,backend,cwd,native_resume_key,status,updated_at) VALUES
         ('r_exact','a_exact_target','s_collision','codex','headless',NULL,NULL,NULL,'online',2),
         ('s_collision','a_runtime_alias','s_alias','claude','headless',NULL,NULL,NULL,'online',99)`,
     ], "write");

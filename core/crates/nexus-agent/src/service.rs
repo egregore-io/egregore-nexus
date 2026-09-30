@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use nexus_common::{render_injected_turn_for, RuntimeProcessIds};
+use nexus_contracts::model_report::ModelObservationSink;
 use nexus_contracts::{
     AgentTurnExecutionPort, AgentUpdateKind, ContractError, EventSink, IdentityPort, InjectError,
     InjectResult, NexusBatch, Presence, RemoveRequest, RemoveResponse, SessionId, SpawnRequest,
@@ -20,7 +21,48 @@ use crate::active_turns::ActiveTurnTracker;
 use crate::adapter::engine::LaunchCtx;
 use crate::adapter::{Adapter, StreamEvent};
 use crate::error::AgentError;
-use crate::registry::AdapterRegistry;
+use crate::registry::{AdapterRegistry, PreparedAdapterFactory};
+
+/// Captured successful adapter open. Native ownership is checked separately from durable liveness.
+pub struct OpenedSession {
+    session: SessionId,
+    native_root: Option<String>,
+    process_ids: Option<RuntimeProcessIds>,
+    binding: Arc<()>,
+}
+
+impl std::fmt::Debug for OpenedSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OpenedSession { .. }")
+    }
+}
+
+impl OpenedSession {
+    pub fn native_root(&self) -> Option<&str> {
+        self.native_root.as_deref()
+    }
+    pub fn process_ids(&self) -> Option<RuntimeProcessIds> {
+        self.process_ids
+    }
+}
+
+/// Armed before the returned open future can be polled or dropped. This closes only reporting;
+/// it does not roll back a bound adapter, kill a native process, or settle durable model writes.
+struct PendingObservation(Option<Arc<dyn ModelObservationSink>>);
+
+impl PendingObservation {
+    fn revoke(&mut self) {
+        if let Some(sink) = self.0.take() {
+            sink.revoke();
+        }
+    }
+}
+
+impl Drop for PendingObservation {
+    fn drop(&mut self) {
+        self.revoke();
+    }
+}
 
 /// One registered agent session: its live adapter, the bound name + project (the agent's own
 /// identity, used as the `from`/caller for OUTBOUND sends), and the errored flag.
@@ -35,6 +77,16 @@ struct SessionEntry {
     /// True once `open_session` failed — the session is retained (errored), not dropped (spec §11).
     /// An errored session refuses injection ([`Agent::adapter_for`]) so held messages stay pending.
     errored: bool,
+    reporting: Option<Arc<dyn ModelObservationSink>>,
+    binding: Arc<()>,
+}
+
+impl SessionEntry {
+    fn close_observer(&self) {
+        if let Some(sink) = &self.reporting {
+            sink.revoke();
+        }
+    }
 }
 
 /// The agent-transport service. Implements [`AgentTurnExecutionPort`].
@@ -48,6 +100,51 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// Capture a factory/profile pair without invoking constructors or selecting it again later.
+    pub fn prepare_adapter(
+        &self,
+        kind: &nexus_contracts::HarnessId,
+    ) -> Result<PreparedAdapterFactory, ContractError> {
+        self.registry.select(kind).map_err(to_contract)
+    }
+
+    /// Run a synchronous action only while this exact successful binding is current. The callback
+    /// must not reenter Agent or await; callers must audit their sessions-to-owner lock order.
+    /// This certifies adapter binding, not observer openness or durable runtime liveness.
+    pub fn with_current_binding<R>(
+        &self,
+        receipt: &OpenedSession,
+        apply: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let sessions = self.sessions.lock().unwrap();
+        let entry = sessions.get(&receipt.session)?;
+        (!entry.errored && Arc::ptr_eq(&entry.binding, &receipt.binding)).then(apply)
+    }
+
+    /// Consume a captured factory and observer. Cancellation, including before first poll and
+    /// during the final event wait, revokes the supplied observer. Success retains it on the
+    /// exact SessionEntry. Already-performed native/delivery effects are not rolled back.
+    /// Concurrent pending opens still follow the existing last-bind-wins adapter policy.
+    pub fn open_session_for_observed<'a>(
+        &'a self,
+        session: SessionId,
+        name: &'a str,
+        project: &'a str,
+        prepared: PreparedAdapterFactory,
+        cwd: Option<String>,
+        env: Vec<(String, String)>,
+        resume_key: Option<&'a str>,
+        sink: Arc<dyn ModelObservationSink>,
+    ) -> impl std::future::Future<Output = Result<OpenedSession, ContractError>> + 'a {
+        let pending = PendingObservation(Some(sink));
+        async move {
+            self.open_prepared_session(
+                session, name, project, prepared, cwd, env, resume_key, pending,
+            )
+            .await
+        }
+    }
+
     /// Build the agent service over the adapter registry, the identity port (name↔session binding)
     /// and the event sink (relayed `agent.update`/`agent.status`). The outbound `BusPort` is absent
     /// until set with [`Agent::set_bus`] (the daemon wires it; unit tests leave it off).
@@ -76,15 +173,36 @@ impl Agent {
         adapter: Arc<dyn Adapter>,
         errored: bool,
     ) {
-        self.sessions.lock().unwrap().insert(
+        self.bind_session_entry(session, name.into(), project.into(), adapter, errored, None);
+    }
+
+    fn bind_session_entry(
+        &self,
+        session: SessionId,
+        name: String,
+        project: String,
+        adapter: Arc<dyn Adapter>,
+        errored: bool,
+        reporting: Option<Arc<dyn ModelObservationSink>>,
+    ) -> Arc<()> {
+        let mut sessions = self.sessions.lock().unwrap();
+        // Close the captured OLD sink before publishing its replacement under the same exclusion.
+        if let Some(old) = sessions.get(&session) {
+            old.close_observer();
+        }
+        let binding = Arc::new(());
+        sessions.insert(
             session,
             SessionEntry {
                 adapter,
-                name: name.into(),
-                project: project.into(),
+                name,
+                project,
                 errored,
+                reporting,
+                binding: binding.clone(),
             },
         );
+        binding
     }
 
     /// Open + bind an adapter under a **caller-supplied** session id + project (used by the daemon's
@@ -105,6 +223,32 @@ impl Agent {
         env: Vec<(String, String)>,
         resume_key: Option<&str>,
     ) -> Result<Option<RuntimeProcessIds>, ContractError> {
+        let prepared = self.prepare_adapter(&kind)?;
+        self.open_prepared_session(
+            session,
+            name,
+            project,
+            prepared,
+            cwd,
+            env,
+            resume_key,
+            PendingObservation(None),
+        )
+        .await
+        .map(|opened| opened.process_ids)
+    }
+
+    async fn open_prepared_session(
+        &self,
+        session: SessionId,
+        name: &str,
+        project: &str,
+        prepared: PreparedAdapterFactory,
+        cwd: Option<String>,
+        env: Vec<(String, String)>,
+        resume_key: Option<&str>,
+        mut pending: PendingObservation,
+    ) -> Result<OpenedSession, ContractError> {
         let bus_client_key = env_value(&env, "NEXUS_CLIENT_KEY");
         let bus_agent = env_value(&env, "NEXUS_AGENT");
         let ctx = LaunchCtx {
@@ -117,7 +261,12 @@ impl Agent {
             // Default `false`; the OpenCode adapter flips this on in its constructor.
             ..Default::default()
         };
-        let adapter = self.registry.get(&kind, ctx).map_err(to_contract)?;
+        let adapter = match &pending.0 {
+            Some(sink) => prepared
+                .instantiate_observed(ctx, sink.clone())
+                .map_err(to_contract)?,
+            None => prepared.instantiate(ctx),
+        };
         // Resume the harness's existing ACP session (`session/load`) when a resume key is given —
         // the not-fresh path. If resume fails (bad key / harness lacks loadSession), fall back to a
         // fresh `session/new` so the caller is never blocked.
@@ -141,27 +290,38 @@ impl Agent {
             Ok(()) => {
                 // Capture + persist the harness's real ACP session id so this agent can be resumed
                 // after a restart (the resume key for `session/load`).
-                if let Some(acp) = adapter.acp_session_id().await {
-                    let _ = self.identity.set_resume_key(&session, &acp).await;
+                let native_root = adapter.acp_session_id().await;
+                if let Some(acp) = &native_root {
+                    let _ = self.identity.set_resume_key(&session, acp).await;
                 }
                 let process_ledger = adapter.runtime_process_ids();
-                self.bind_session(
+                let binding = self.bind_session_entry(
                     session.clone(),
                     name.to_string(),
                     project.to_string(),
                     adapter,
                     false,
+                    pending.0.clone(),
                 );
                 self.events
                     .emit(WsEvent::AgentSpawned {
-                        session_id: session,
+                        session_id: session.clone(),
                         name: Some(name.to_string()),
                         agent_id: None,
                     })
                     .await;
-                Ok(process_ledger)
+                // Remain armed through the final await. An abandoned caller cannot leave its
+                // observer accepting even though the already-bound delivery entry is retained.
+                pending.0 = None;
+                Ok(OpenedSession {
+                    session,
+                    native_root,
+                    process_ids: process_ledger,
+                    binding,
+                })
             }
             Err(e) => {
+                pending.revoke();
                 self.bind_session(
                     session.clone(),
                     name.to_string(),
@@ -198,7 +358,13 @@ impl Agent {
     /// session row. This is the app-level removal seam used by `admin.remove`; it avoids routing a
     /// known daemon session back through the generic turn-exec `remove` stub.
     pub async fn detach_session(&self, session: &SessionId, kill: bool) -> bool {
-        let removed = self.sessions.lock().unwrap().remove(session);
+        let removed = {
+            let mut sessions = self.sessions.lock().unwrap();
+            if let Some(entry) = sessions.get(session) {
+                entry.close_observer();
+            }
+            sessions.remove(session)
+        };
         let Some(entry) = removed else {
             return false;
         };
@@ -679,6 +845,7 @@ impl AgentTurnExecutionPort for Agent {
             // Prefer the resolved session id; else fall back to the name binding.
             if let Some(c) = &caller {
                 if let Some(entry) = sessions.remove(&c.session) {
+                    entry.close_observer();
                     if req.kill {
                         kill_adapter = Some(entry.adapter);
                     }
@@ -692,6 +859,7 @@ impl AgentTurnExecutionPort for Agent {
                     .map(|(sid, _)| sid.clone())
                 {
                     if let Some(entry) = sessions.remove(&sid) {
+                        entry.close_observer();
                         if req.kill {
                             kill_adapter = Some(entry.adapter);
                         }

@@ -72,7 +72,9 @@ async fn state_with_adapters(configs: &[(HarnessId, HarnessCommand)]) -> AppStat
     for (harness, command) in configs {
         register_actual_adapter(&mut registry, harness, command.clone());
     }
-    AppState::wire_with_registry(store, &Config::default(), registry)
+    let state = AppState::wire_with_registry(store, &Config::default(), registry);
+    state.wait_for_runtime_identity_ready().await.unwrap();
+    state
 }
 
 fn operator_request() -> RegisterRequest {

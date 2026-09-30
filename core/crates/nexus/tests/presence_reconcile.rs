@@ -26,6 +26,7 @@ async fn reconcile_marks_stale_sessions_and_runtimes_offline() {
     let mut config = Config::default();
     config.heartbeat_ttl_ms = 30_000;
     let state = AppState::wire(store.clone(), &config);
+    state.wait_for_runtime_identity_ready().await.unwrap();
 
     seed_agent_runtime(
         &store,
@@ -188,6 +189,7 @@ async fn boot_registry_reconcile_offlines_transport_owned_rows_without_handles()
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
     let state = AppState::wire(store.clone(), &Config::default());
+    state.wait_for_runtime_identity_ready().await.unwrap();
 
     seed_agent_runtime(
         &store,
@@ -260,6 +262,7 @@ async fn mark_session_offline_stops_runtime_and_aborts_open_turn() {
     let mut config = Config::default();
     config.heartbeat_ttl_ms = 30_000;
     let state = AppState::wire(store.clone(), &config);
+    state.wait_for_runtime_identity_ready().await.unwrap();
 
     seed_agent_runtime(
         &store,
@@ -307,6 +310,7 @@ async fn heartbeat_keeper_dead_probe_path_uses_complete_offline_transition() {
     let mut config = Config::default();
     config.heartbeat_ttl_ms = 30_000;
     let state = AppState::wire(store.clone(), &config);
+    state.wait_for_runtime_identity_ready().await.unwrap();
 
     seed_agent_runtime(
         &store,
@@ -339,6 +343,7 @@ async fn heartbeat_dead_probe_terminalizes_owned_injecting_delivery() {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
     let state = AppState::wire(store.clone(), &Config::default());
+    state.wait_for_runtime_identity_ready().await.unwrap();
     let session = SessionId("s_dead_injecting".to_string());
     let message = MessageId("m_dead_injecting".to_string());
 
@@ -412,6 +417,7 @@ async fn heartbeat_keeper_restamps_live_acp_runtime_projection() {
     let mut config = Config::default();
     config.heartbeat_ttl_ms = 20;
     let state = AppState::wire_with_turn_exec(store.clone(), &config, Arc::new(AcpNoProbeExec));
+    state.wait_for_runtime_identity_ready().await.unwrap();
     let session = SessionId("s_acp_projection".to_string());
 
     state
@@ -449,6 +455,7 @@ async fn stopped_offline_stable_agent_remains_revivable_by_thread_wake_path() {
     let mut config = Config::default();
     config.heartbeat_ttl_ms = 30_000;
     let state = AppState::wire(store.clone(), &config);
+    state.wait_for_runtime_identity_ready().await.unwrap();
 
     seed_agent_runtime(
         &store,
@@ -527,6 +534,7 @@ async fn reconcile_final_flushes_stale_claude_transcript_before_stopping_runtime
     let mut config = Config::default();
     config.heartbeat_ttl_ms = 30_000;
     let state = AppState::wire(store.clone(), &config);
+    state.wait_for_runtime_identity_ready().await.unwrap();
 
     seed_agent_runtime(
         &store,
@@ -575,6 +583,7 @@ async fn reconcile_final_flushes_stale_codex_rollout_before_stopping_runtime() {
     let mut config = Config::default();
     config.heartbeat_ttl_ms = 30_000;
     let state = AppState::wire(store.clone(), &config);
+    state.wait_for_runtime_identity_ready().await.unwrap();
 
     let session_id = SessionId("s_stale_codex".to_string());
     seed_agent_runtime_with_harness(
@@ -703,6 +712,7 @@ async fn boot_presume_dead_marks_online_agents_offline_regardless_of_heartbeat()
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
     let state = AppState::wire(store.clone(), &Config::default());
+    state.wait_for_runtime_identity_ready().await.unwrap();
 
     // PTY-backed agent with a FRESH heartbeat.
     seed_agent_runtime(

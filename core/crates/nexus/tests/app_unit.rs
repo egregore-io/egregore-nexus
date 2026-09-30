@@ -1098,6 +1098,7 @@ async fn admin_remove_kill_targets_the_resolved_pty_session_only() {
 
     let store = mem_store().await;
     let state = AppState::wire_pty(store.clone(), &Config::default());
+    state.wait_for_runtime_identity_ready().await.unwrap();
     let supervisor = state
         .pty_supervisor()
         .expect("wire_pty must install a PTY supervisor")

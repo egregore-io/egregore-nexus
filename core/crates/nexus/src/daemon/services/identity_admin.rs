@@ -115,6 +115,7 @@ impl IdentityAdminService {
             started_at: row.started_at,
             stopped_at: row.stopped_at,
             last_heartbeat: row.last_heartbeat,
+            model_report: row.model_report,
         }
     }
 

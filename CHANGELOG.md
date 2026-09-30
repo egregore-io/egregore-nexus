@@ -1,5 +1,60 @@
 # Changelog
 
+## [0.1.6-beta.3] - Unreleased
+
+### Changed
+
+- Verify all eight headed/headless model-reporting paths through fresh native-fixture captures,
+  the Rust publisher and canonical Gateway snapshots. The composed gate rejects missing artifacts
+  and delayed older model/status frames; it does not stand in for live-provider or UI acceptance.
+- Report headed Hermes configured-model metadata from exact native session rows selected by
+  launch-local framework hooks, through the canonical runtime projection. Captured source/bridge
+  ownership rejects replay and replacement; missing rows become unknown, while disconnect or
+  native root loss closes reporting. Fresh/cold setup retains model ownership through required
+  liveness writes; existing input/completion behavior remains separate. No response model,
+  provider name, usage or quota is inferred.
+- Report headed OpenCode turn-selected model/provider metadata from the native plugin through
+  captured runtime ownership and the canonical projection. Fresh setup registers before native
+  launch; later failure can retain partial runtime state. Cold resume validates the ready-file
+  owner/root and propagates required liveness errors; hot reuse and best-effort lifecycle telemetry
+  retain their existing policies. No response model, usage or quota is inferred.
+- Report headed Claude response-model evidence through the canonical runtime projection, with
+  captured native ownership, source continuity and bounded message replay protection. Delayed
+  SessionStart source readiness gates model-enabled input with explicit timeout/cancellation
+  failure; legacy input remains unchanged. No configured model, usage or quota is inferred.
+- Report headed Codex configured-model evidence from its captured app-server setup response,
+  with exact native-owner validation and model-claim closure on canceled launch or disconnect.
+  Fresh launch and cold resume use the canonical daemon projection; response models and native
+  usage/context collectors are not inferred from this evidence.
+- Report configured models from Claude, Codex, OpenCode and Hermes headless ACP metadata through
+  captured runtime ownership and canonical Gateway projections. Missing or invalid native metadata
+  stays unavailable; this does not infer response models, usage, or headed-harness support.
+- Add authenticated, complete runtime snapshot subscriptions on the existing Gateway WebSocket,
+  with reconnect hydration, ordered unavailable states and durable model-report revisions.
+  This subscription change does not enable native collectors or establish Lens live integration.
+- Preserve validated native model/usage/context/allowance reports in canonical Gateway runtime
+  reads, guarded by durable report revision and exact agent binding. Missing evidence remains
+  unavailable; this foundation does not yet enable native collectors or live brief updates.
+- Synchronize the Rust workspace and npm distribution packages at `0.1.6-beta.3`
+  for the session-delivery correctness release candidate. Publication and live
+  acceptance remain separate release steps.
+
+### Fixed
+
+- Reject obsolete full runtime projections carrying older model-report revisions, preventing
+  delayed online snapshots from reviving stopped status while retaining newer model evidence.
+  Equal-revision same-owner status updates and legacy report-absent frames remain compatible.
+- Build Linux x64/arm64 npm binaries on the glibc 2.35 baseline and reject newer
+  ELF import requirements before upload, preventing runner upgrades from silently
+  breaking Ubuntu 22.04 and equivalent Linux/WSL installations.
+- Fence attempted steers against restart/lease replay and late settlement, including
+  redirected rows. Preserve strict no-active-turn rejection and ACP's completion window.
+- Wait for Codex's matching native input record before presenting a steer as accepted;
+  a terminal without that receipt releases the waiter as unconfirmed, never as delivered
+  or permission to resend. Native history admission is not provider-consumption proof.
+- Launch Windows Gateway and Webconsole `.cmd` shims without hand-built command
+  quoting, including npm installations under paths containing spaces.
+
 ## [0.1.6-beta.2] - Unreleased
 
 ### Changed

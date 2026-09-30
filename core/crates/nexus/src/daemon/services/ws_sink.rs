@@ -258,7 +258,7 @@ impl WsSink {
                     "disabledAt": agent.disabled_at,
                     "createdAt": agent.created_at,
                 });
-                let runtime_payload = serde_json::json!({
+                let mut runtime_payload = serde_json::json!({
                     "runtimeId": runtime.runtime_id,
                     "sessionId": session_id.0,
                     "agentId": runtime.agent_id,
@@ -277,6 +277,11 @@ impl WsSink {
                         .and_then(|row| row.native_resume_key.as_deref()),
                     "name": canonical_name,
                 });
+                // The report and its durable revision come from the same exact-owner runtime
+                // read above. Omit legacy absence; never expose the private observer token.
+                if let Some(report) = runtime.model_report {
+                    runtime_payload["modelReport"] = serde_json::json!(report);
+                }
                 vec![
                     lifecycle_effect(
                         "identity",

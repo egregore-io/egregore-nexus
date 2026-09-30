@@ -15,8 +15,342 @@ use nexus_harness_codex::{BridgeLaunchOptions, CodexAppServerClient, CodexBridge
 
 const FAKE_BIN: &str = env!("CARGO_BIN_EXE_fake_codex_app_server");
 
+struct ModelSink {
+    profile: nexus_contracts::model_report::ModelProfileIdentity,
+    root: std::sync::Mutex<Option<String>>,
+    updates: std::sync::Mutex<Vec<nexus_contracts::model_report::NativeModelUpdate>>,
+    closed: std::sync::atomic::AtomicBool,
+}
+impl nexus_contracts::model_report::ModelObservationSink for ModelSink {
+    fn accepts_profile(
+        &self,
+        identity: &nexus_contracts::model_report::ModelProfileIdentity,
+    ) -> bool {
+        self.profile.matches(identity) && !self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn bind_native_root(&self, root: &str) -> bool {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        let mut captured = self.root.lock().unwrap();
+        match captured.as_deref() {
+            Some(old) => old == root,
+            None => {
+                *captured = Some(root.into());
+                true
+            }
+        }
+    }
+    fn observe(&self, update: nexus_contracts::model_report::NativeModelUpdate) -> bool {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst)
+            || self.root.lock().unwrap().as_deref() != Some(&update.native_session_id)
+        {
+            return false;
+        }
+        self.updates.lock().unwrap().push(update);
+        true
+    }
+    fn revoke(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn captured_model() -> (Arc<ModelSink>, nexus_agent::adapter::NativeModelReporting) {
+    let profile = nexus_harness_codex::app_server::model_reporting::profile();
+    let sink = Arc::new(ModelSink {
+        profile: profile.identity().clone(),
+        root: Default::default(),
+        updates: Default::default(),
+        closed: Default::default(),
+    });
+    (sink.clone(), profile.capture(sink).unwrap())
+}
+fn model_payload(resume: bool) -> serde_json::Value {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../nexus/tests/fixtures/model_reporting/native.json"
+    ))
+    .unwrap();
+    fixture["rows"]["codex.headed"]["events"][if resume { 1 } else { 0 }]["payload"].clone()
+}
+
+async fn check_native_model_binding(resume: bool) {
+    use nexus_contracts::model_report::{ModelEvidenceField, ModelEvidenceValue};
+    let dir = tempdir(if resume { "mr" } else { "ms" });
+    let payload = model_payload(resume);
+    let root = payload["thread"]["id"].as_str().unwrap().to_owned();
+    if resume {
+        write_rollout(&dir, &root);
+    }
+    let (sink, reporting) = captured_model();
+    let bridge = CodexBridge::new();
+    let session = SessionId("model-session".into());
+    bridge
+        .launch_with_options(
+            session.clone(),
+            SupervisorOpts {
+                codex_exe: FAKE_BIN.into(),
+                session_dir: dir.clone(),
+                codex_home: Some(dir.join("codex-home")),
+                model: None,
+                bus_mcp: None,
+                cwd: None,
+                env: vec![(
+                    if resume {
+                        "FAKE_CODEX_RESUME_RESPONSE"
+                    } else {
+                        "FAKE_CODEX_START_RESPONSE"
+                    }
+                    .into(),
+                    payload.to_string(),
+                )],
+            },
+            Arc::new(RecSink::default()),
+            BridgeLaunchOptions {
+                model_reporting: Some(reporting.clone()),
+                known_thread_id: resume.then(|| root.clone()),
+                create_thread_if_missing: !resume,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let updates = sink.updates.lock().unwrap().clone();
+    let current =
+        bridge
+            .transport()
+            .with_current_model_binding(&session, &reporting, str::to_owned);
+    let (_, foreign) = captured_model();
+    let foreign_callback =
+        bridge
+            .transport()
+            .with_current_model_binding(&session, &foreign, |_| true);
+    bridge.kill(&session);
+    let after_kill = bridge
+        .transport()
+        .with_current_model_binding(&session, &reporting, |_| true);
+    let closed = sink.closed.load(std::sync::atomic::Ordering::SeqCst);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        updates.len(),
+        1,
+        "actual client response must reach captured model observer"
+    );
+    assert_eq!(updates[0].field, ModelEvidenceField::Configured);
+    assert_eq!(updates[0].native_session_id, root);
+    assert!(
+        matches!(&updates[0].value,ModelEvidenceValue::Observed(value) if value.model_id=="gpt-astra" && value.provider_id.as_deref()==Some("fixture"))
+    );
+    assert_eq!(current, Some(root));
+    assert_eq!(foreign_callback, None);
+    assert_eq!(after_kill, None);
+    assert!(closed, "native kill closes captured model admission");
+}
+#[tokio::test]
+async fn native_model_start_uses_actual_client_and_exact_published_owner() {
+    check_native_model_binding(false).await;
+}
+#[tokio::test]
+async fn native_model_resume_uses_actual_client_and_exact_published_owner() {
+    check_native_model_binding(true).await;
+}
+
+#[tokio::test]
+async fn native_model_cancelled_setup_closes_before_any_late_response() {
+    let dir = tempdir("mc");
+    let payload = model_payload(true);
+    let root = payload["thread"]["id"].as_str().unwrap().to_owned();
+    write_rollout(&dir, &root);
+    let entered = dir.join("entered");
+    let release = dir.join("release");
+    let (sink, reporting) = captured_model();
+    let bridge = CodexBridge::new();
+    let worker = bridge.clone();
+    let session = SessionId("model-cancel".into());
+    let worker_session = session.clone();
+    let opts = SupervisorOpts {
+        codex_exe: FAKE_BIN.into(),
+        session_dir: dir.clone(),
+        codex_home: Some(dir.join("codex-home")),
+        model: None,
+        bus_mcp: None,
+        cwd: None,
+        env: vec![
+            ("FAKE_CODEX_RESUME_RESPONSE".into(), payload.to_string()),
+            ("FAKE_CODEX_RESUME_GATE_THREAD".into(), root.clone()),
+            (
+                "FAKE_CODEX_RESUME_ENTERED".into(),
+                entered.to_string_lossy().into(),
+            ),
+            (
+                "FAKE_CODEX_RESUME_RELEASE".into(),
+                release.to_string_lossy().into(),
+            ),
+        ],
+    };
+    let task = tokio::spawn(async move {
+        worker
+            .launch_with_options(
+                worker_session,
+                opts,
+                Arc::new(RecSink::default()),
+                BridgeLaunchOptions {
+                    model_reporting: Some(reporting),
+                    known_thread_id: Some(root),
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !entered.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let closed_before_kill = sink.closed.load(std::sync::atomic::Ordering::SeqCst);
+    std::fs::write(&release, b"release").unwrap();
+    bridge.kill(&session);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        closed_before_kill,
+        "abandoned setup must close OLD observer before late native reply"
+    );
+    assert!(sink.updates.lock().unwrap().is_empty());
+}
+
 #[derive(Default)]
 struct RecSink(tokio::sync::Mutex<Vec<WsEvent>>);
+
+#[tokio::test]
+async fn native_model_old_setup_reply_cannot_borrow_new_same_process_binding() {
+    let dir = tempdir("mn");
+    let old_payload = model_payload(true);
+    let new_payload = model_payload(false);
+    let old_root = old_payload["thread"]["id"].as_str().unwrap().to_owned();
+    let new_root = new_payload["thread"]["id"].as_str().unwrap().to_owned();
+    write_rollout(&dir, &old_root);
+    let rollout = dir.join("codex-home/sessions/2026/06/rollout-test.jsonl");
+    std::fs::rename(&rollout, rollout.with_file_name("rollout-old.jsonl")).unwrap();
+    write_rollout(&dir, &new_root);
+    let entered = dir.join("entered");
+    let release = dir.join("release");
+    let replied = dir.join("replied");
+    let responses = serde_json::json!({old_root.clone():old_payload,new_root.clone():new_payload});
+    let opts = SupervisorOpts {
+        codex_exe: FAKE_BIN.into(),
+        session_dir: dir.clone(),
+        codex_home: Some(dir.join("codex-home")),
+        model: None,
+        bus_mcp: None,
+        cwd: None,
+        env: vec![
+            ("FAKE_CODEX_RESUME_RESPONSES".into(), responses.to_string()),
+            ("FAKE_CODEX_RESUME_GATE_THREAD".into(), old_root.clone()),
+            (
+                "FAKE_CODEX_RESUME_ENTERED".into(),
+                entered.to_string_lossy().into(),
+            ),
+            (
+                "FAKE_CODEX_RESUME_RELEASE".into(),
+                release.to_string_lossy().into(),
+            ),
+            (
+                "FAKE_CODEX_RESUME_REPLIED".into(),
+                replied.to_string_lossy().into(),
+            ),
+        ],
+    };
+    let session = SessionId("model-new-wins".into());
+    let bridge = CodexBridge::new();
+    let (old_sink, old_reporting) = captured_model();
+    let worker = bridge.clone();
+    let worker_session = session.clone();
+    let old_options = opts.clone();
+    let captured = old_reporting.clone();
+    let old = tokio::spawn(async move {
+        worker
+            .launch_with_options(
+                worker_session,
+                old_options,
+                Arc::new(RecSink::default()),
+                BridgeLaunchOptions {
+                    model_reporting: Some(captured),
+                    known_thread_id: Some(old_root),
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !entered.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let original_pid = bridge.process_ledger(&session).unwrap().os_pid;
+    let (new_sink, new_reporting) = captured_model();
+    let new = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        bridge.launch_with_options(
+            session.clone(),
+            opts,
+            Arc::new(RecSink::default()),
+            BridgeLaunchOptions {
+                model_reporting: Some(new_reporting.clone()),
+                known_thread_id: Some(new_root.clone()),
+                ..Default::default()
+            },
+        ),
+    )
+    .await;
+    let new_before_old_release = matches!(&new, Ok(Ok(_)));
+    let replacement_pid = bridge.process_ledger(&session).map(|ids| ids.os_pid);
+    std::fs::write(&release, b"release").unwrap();
+    let old_reply_attempted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !replied.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    let old = tokio::time::timeout(std::time::Duration::from_secs(5), old).await;
+    let old_callback =
+        bridge
+            .transport()
+            .with_current_model_binding(&session, &old_reporting, |_| true);
+    let new_callback =
+        bridge
+            .transport()
+            .with_current_model_binding(&session, &new_reporting, str::to_owned);
+    let old_closed = old_sink.closed.load(std::sync::atomic::Ordering::SeqCst);
+    let new_open = !new_sink.closed.load(std::sync::atomic::Ordering::SeqCst);
+    bridge.kill(&session);
+    let _ = std::fs::remove_dir_all(dir);
+    assert!(
+        new_before_old_release,
+        "NEW binding must complete while OLD native response is parked"
+    );
+    assert_eq!(
+        replacement_pid,
+        Some(original_pid),
+        "binding replacement reuses the same native process"
+    );
+    assert!(
+        old_reply_attempted,
+        "server attempted OLD response only after NEW completed"
+    );
+    assert!(matches!(old, Ok(Ok(Err(_)))));
+    assert!(old_closed);
+    assert!(new_open);
+    assert!(old_sink.updates.lock().unwrap().is_empty());
+    assert_eq!(new_sink.updates.lock().unwrap().len(), 1);
+    assert_eq!(old_callback, None);
+    assert_eq!(new_callback, Some(new_root));
+}
 
 #[async_trait]
 impl EventSink for RecSink {

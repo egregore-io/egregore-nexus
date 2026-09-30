@@ -1,6 +1,7 @@
 import type { Client, InStatement } from "@libsql/client";
 
 import { GATEWAY_CANONICAL_TABLES } from "./schema";
+import { readStoredModelReport } from "../projection/modelReport";
 
 const GATEWAY_V1_SCHEMA_VERSION = 1;
 const GATEWAY_V1_SCHEMA_NAME = "v0.1.0_baseline";
@@ -14,8 +15,15 @@ const GATEWAY_V5_SCHEMA_VERSION = 5;
 const GATEWAY_V5_SCHEMA_NAME = "v0.1.5_bearer_authority";
 const GATEWAY_V6_SCHEMA_VERSION = 6;
 const GATEWAY_V6_SCHEMA_NAME = "v0.1.6_principals_and_transport_bindings";
-export const CURRENT_GATEWAY_SCHEMA_VERSION = 7;
-export const CURRENT_GATEWAY_SCHEMA_NAME = "v0.1.6_transport_host";
+const GATEWAY_V7_SCHEMA_VERSION = 7;
+const GATEWAY_V7_SCHEMA_NAME = "v0.1.6_transport_host";
+export const CURRENT_GATEWAY_SCHEMA_VERSION = 8;
+export const CURRENT_GATEWAY_SCHEMA_NAME = "v0.1.6_runtime_model_reports";
+
+const MODEL_REPORT_COLUMNS = [
+  "ALTER TABLE runtime_descriptors ADD COLUMN model_report_revision INTEGER NOT NULL DEFAULT 0",
+  "ALTER TABLE runtime_descriptors ADD COLUMN model_report_json TEXT",
+];
 
 const INITIAL_SCHEMA: InStatement[] = [
   `CREATE TABLE IF NOT EXISTS projection_events (
@@ -413,6 +421,7 @@ export async function migrateGatewayStore(db: Client): Promise<void> {
         ...V016_IDENTITY_COLUMNS,
         ...V016_PRINCIPAL_TRANSPORT_SCHEMA,
         ...V016_TRANSPORT_HOST_SCHEMA,
+        ...MODEL_REPORT_COLUMNS,
         {
           sql: `INSERT INTO gateway_schema_migrations (version, name, applied_at)
                 VALUES (?, ?, ?)`,
@@ -430,6 +439,7 @@ export async function migrateGatewayStore(db: Client): Promise<void> {
   }
 
   await validateRequiredObjects(db);
+  await validateModelReportColumns(db);
 }
 
 async function upgradeOrValidateBaseline(db: Client): Promise<void> {
@@ -444,6 +454,9 @@ async function upgradeOrValidateBaseline(db: Client): Promise<void> {
   const name = String(marker.name);
   if (version === CURRENT_GATEWAY_SCHEMA_VERSION && name === CURRENT_GATEWAY_SCHEMA_NAME) {
     return;
+  }
+  if (version === GATEWAY_V7_SCHEMA_VERSION && name === GATEWAY_V7_SCHEMA_NAME) {
+    return upgradeModelReports(db);
   }
   if (version === GATEWAY_V6_SCHEMA_VERSION && name === GATEWAY_V6_SCHEMA_NAME) {
     await validateV6Objects(db);
@@ -591,8 +604,39 @@ async function upgradeTransportHost(db: Client): Promise<void> {
     migrationMarkerUpdate(
       GATEWAY_V6_SCHEMA_VERSION,
       GATEWAY_V6_SCHEMA_NAME,
+      GATEWAY_V7_SCHEMA_VERSION,
+      GATEWAY_V7_SCHEMA_NAME,
     ),
   ], "write");
+  await upgradeModelReports(db);
+}
+
+async function upgradeModelReports(db: Client): Promise<void> {
+  await validateRequiredObjects(db);
+  // Keep the existing batch transaction convention, including anonymous-memory compatibility.
+  // The temporary CHECK makes post-marker validation part of that SAME transaction: ignored
+  // marker writes cannot commit columns under the old version. All existing rows start 0/NULL.
+  await db.batch([
+    ...MODEL_REPORT_COLUMNS,
+    migrationMarkerUpdate(GATEWAY_V7_SCHEMA_VERSION, GATEWAY_V7_SCHEMA_NAME),
+    "CREATE TEMP TABLE model_report_migration_guard (valid INTEGER NOT NULL CHECK(valid = 1))",
+    { sql: `INSERT INTO model_report_migration_guard VALUES (
+        (SELECT COUNT(*) = 1 FROM gateway_schema_migrations WHERE version = ? AND name = ?)
+        AND NOT EXISTS (SELECT 1 FROM runtime_descriptors WHERE model_report_revision != 0 OR model_report_json IS NOT NULL))`,
+      args: [CURRENT_GATEWAY_SCHEMA_VERSION, CURRENT_GATEWAY_SCHEMA_NAME] },
+    "DROP TABLE model_report_migration_guard",
+  ], "write");
+}
+
+async function validateModelReportColumns(db: Pick<Client, "execute">): Promise<void> {
+  const info = await db.execute("PRAGMA table_info(runtime_descriptors)");
+  for (const [name, type] of [["model_report_revision", "INTEGER"], ["model_report_json", "TEXT"]]) {
+    if (!info.rows.some((row) => row.name === name && row.type === type)) {
+      throw new Error(`invalid runtime model schema column ${name}`);
+    }
+  }
+  const rows = await db.execute("SELECT model_report_revision, model_report_json FROM runtime_descriptors");
+  for (const row of rows.rows) readStoredModelReport(row.model_report_revision, row.model_report_json);
 }
 
 async function columnExists(
@@ -647,7 +691,7 @@ async function validateV6Objects(db: Client): Promise<void> {
   }
 }
 
-async function validateRequiredObjects(db: Client): Promise<void> {
+async function validateRequiredObjects(db: Pick<Client, "execute">): Promise<void> {
   for (const table of GATEWAY_CANONICAL_TABLES) {
     if (!(await objectExists(db, "table", table))) {
       throw new Error(`incomplete v0.1.0 Gateway schema: missing table ${table}`);
@@ -679,7 +723,7 @@ async function tableExists(db: Client, table: string): Promise<boolean> {
   return objectExists(db, "table", table);
 }
 
-async function objectExists(db: Client, kind: string, name: string): Promise<boolean> {
+async function objectExists(db: Pick<Client, "execute">, kind: string, name: string): Promise<boolean> {
   const result = await db.execute({
     sql: "SELECT 1 FROM sqlite_master WHERE type = ? AND name = ? LIMIT 1",
     args: [kind, name],

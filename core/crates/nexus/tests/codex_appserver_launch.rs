@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use nexus::daemon::gateway_stream_socket::{GatewayStreamFrame, GatewayStreamPublisher};
 use nexus::daemon::pty_supervisor::PtySupervisor;
 use nexus::daemon::AppState;
 use nexus_common::Config;
@@ -16,11 +17,39 @@ use nexus_contracts::ports::EventSink;
 use nexus_contracts::{AgentUpdateKind, HarnessId, SpawnRequest};
 use nexus_harness_codex::storage::CodexRuntimeStateRepo;
 use nexus_harness_codex::{CodexAppServerClient, CodexBridge, SupervisorOpts};
-use nexus_store::repos::IdentitySessions;
+use nexus_store::repos::{AgentRuntimes, IdentitySessions, Sessions};
 use nexus_store::{DaemonStore, Store};
 use portable_pty::PtySize;
 
+mod model_projection_artifacts {
+    include!("support/model_projection_artifacts.rs");
+}
+
 const FAKE_BIN: &str = env!("CARGO_BIN_EXE_nexus_fake_codex_app_server");
+
+async fn configured_frame(
+    rx: &mut tokio::sync::broadcast::Receiver<GatewayStreamFrame>,
+    session: &SessionId,
+    after: u64,
+) -> Result<serde_json::Value, tokio::time::error::Elapsed> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let GatewayStreamFrame::Projection { event } = rx.recv().await.unwrap() {
+                let payload = event.payload;
+                if payload["runtimeId"] == session.0
+                    && payload["modelReport"]["observerActive"] == true
+                    && payload["modelReport"]["configured"]["observation"]["modelId"] == "gpt-astra"
+                    && payload["modelReport"]["reportRevision"]
+                        .as_u64()
+                        .is_some_and(|revision| revision > after)
+                {
+                    return payload;
+                }
+            }
+        }
+    })
+    .await
+}
 
 #[derive(Default)]
 struct RecSink(tokio::sync::Mutex<Vec<WsEvent>>);
@@ -139,7 +168,15 @@ async fn fresh_headed_codex_launch_persists_discovered_thread_in_resurrection_ca
     std::fs::create_dir_all(&fake_bin_dir).expect("create fake bin dir");
     std::fs::create_dir_all(&work).expect("create work dir");
     std::fs::create_dir_all(&home).expect("create home dir");
-    write_fake_codex_command(&fake_bin_dir);
+    let fake_command = write_fake_codex_command(&fake_bin_dir);
+    // Replay captured setup metadata through the actual native client, not requested argv.
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/model_reporting/native.json")).unwrap();
+    let native = fixture["rows"]["codex.headed"]["events"][0]["payload"].clone();
+    let native_root = native["thread"]["id"].as_str().unwrap();
+    let script = std::fs::read_to_string(&fake_command).unwrap();
+    std::fs::write(&fake_command, script.replacen("#!/bin/sh\n", &format!(
+        "#!/bin/sh\nexport FAKE_CODEX_START_RESPONSE='{}'\nexport FAKE_CODEX_RESUME_RESPONSE='{}'\n", native, native), 1)).unwrap();
 
     let path = format!(
         "{}:{}",
@@ -185,7 +222,17 @@ async fn fresh_headed_codex_launch_persists_discovered_thread_in_resurrection_ca
         .await
         .expect("split store");
     let store = Arc::new(daemon.compatibility_store());
-    let state = AppState::wire_pty(store.clone(), &Config::default());
+    let publisher = GatewayStreamPublisher::new(128);
+    let mut frames = publisher.subscribe();
+    let state = Arc::new(AppState::wire_pty_with_gateway_stream(
+        store.clone(),
+        &Config::default(),
+        Some(publisher),
+    ));
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
 
     let spawned = state
         .launch_agent_with_program(
@@ -216,15 +263,202 @@ async fn fresh_headed_codex_launch_persists_discovered_thread_in_resurrection_ca
         .expect("resurrection descriptor");
     assert_eq!(
         descriptor.native_resume_key.as_deref(),
-        Some("fake-thread"),
+        Some(native_root),
         "the first daemon restart must not be the event that makes a headed Codex native thread durable"
     );
 
+    let fresh = configured_frame(&mut frames, &spawned.session_id, 0).await;
     state.teardown_owned_transports_for_shutdown().await;
+    let stopped = AgentRuntimes::new(&store)
+        .find_by_runtime_id(&spawned.session_id.0)
+        .await
+        .unwrap()
+        .unwrap();
+    // The fake viewer does not create a native rollout. Supply the exact captured root in the
+    // actual selected home so the ordinary cold-resume path can validate native correlation.
+    let native_state = CodexRuntimeStateRepo::new(&store)
+        .find_by_runtime_id(&spawned.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let rollout = native_state.codex_home.unwrap().join("sessions/2026/06");
+    std::fs::create_dir_all(&rollout).unwrap();
+    std::fs::write(
+        rollout.join("rollout-model.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"session_meta","payload":{"id":native_root}})
+        ),
+    )
+    .unwrap();
+    let resumed = state
+        .ensure_codex_appserver_live("headed-codex", "default")
+        .await;
+    let resumed_frame = if resumed.is_ok() {
+        configured_frame(
+            &mut frames,
+            &spawned.session_id,
+            fresh
+                .as_ref()
+                .ok()
+                .and_then(|value| value["modelReport"]["reportRevision"].as_u64())
+                .unwrap_or(0),
+        )
+        .await
+        .ok()
+    } else {
+        None
+    };
+    state.teardown_owned_transports_for_shutdown().await;
+    let stopped_frame = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let after = resumed_frame
+            .as_ref()
+            .and_then(|frame| frame["modelReport"]["reportRevision"].as_u64())
+            .unwrap_or(0);
+        loop {
+            if let GatewayStreamFrame::Projection { event } = frames.recv().await.unwrap() {
+                let payload = event.payload;
+                if payload["runtimeId"] == spawned.session_id.0
+                    && payload["active"] == false
+                    && payload["presence"] == "offline"
+                    && payload["modelReport"]["observerActive"] == false
+                    && payload["modelReport"]["reportRevision"]
+                        .as_u64()
+                        .is_some_and(|r| r > after)
+                {
+                    break payload;
+                }
+            }
+        }
+    })
+    .await
+    .ok();
+    // Park the actual required initial turn AFTER native setup returned. Canceling this outer
+    // launch must close its committed model claim even though the native binding still exists.
+    let entered = root.join("turn-entered");
+    let release = root.join("turn-release");
+    let mut cancel_native = native.clone();
+    cancel_native["thread"]["id"] = serde_json::json!("cancel-native-root");
+    let script = std::fs::read_to_string(&fake_command).unwrap();
+    std::fs::write(&fake_command, script.replacen("if [", &format!(
+        "export FAKE_CODEX_START_RESPONSE='{}'\nexport FAKE_CODEX_TURN_ENTERED='{}'\nexport FAKE_CODEX_TURN_RELEASE='{}'\nif [",
+        cancel_native, entered.display(), release.display()), 1)).unwrap();
+    let worker = state.clone();
+    let cancel_work = work.to_string_lossy().into_owned();
+    let launch = tokio::spawn(async move {
+        worker
+            .launch_agent_with_program(
+                SpawnRequest {
+                    kind: HarnessId::new("codex").unwrap(),
+                    name: Some("cancel-model".into()),
+                    identity_policy: None,
+                    cwd: Some(cancel_work),
+                    project: Some("default".into()),
+                    role: None,
+                    initial_prompt: Some("boot".into()),
+                    resume: None,
+                    harness_args: vec![],
+                    headless: false,
+                    backend: Some("pty".into()),
+                },
+                "default",
+                "codex",
+                None,
+            )
+            .await
+    });
+    let turn_entered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !entered.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok();
+    let cancel_row = Sessions::new(&store)
+        .find_by_name("default", "cancel-model")
+        .await
+        .unwrap();
+    let before_cancel = if let Some(row) = &cancel_row {
+        AgentRuntimes::new(&store)
+            .find_by_runtime_id(&row.session_id.0)
+            .await
+            .unwrap()
+    } else {
+        None
+    };
+    launch.abort();
+    let caller_cancelled = launch.await.is_err_and(|error| error.is_cancelled());
+    let claim_closed = if let (Some(row), Some(before)) = (&cancel_row, &before_cancel) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let current = AgentRuntimes::new(&store)
+                    .find_by_runtime_id(&row.session_id.0)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if current.model_observer_token.is_none()
+                    && current.model_report_revision > before.model_report_revision
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok()
+    } else {
+        false
+    };
+    std::fs::write(&release, b"release").unwrap();
+    state.teardown_owned_transports_for_shutdown().await;
+    state
+        .drain_model_reporting_for_shutdown(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
     drop(state);
     drop(store);
     drop(daemon);
     let _ = std::fs::remove_dir_all(root);
+    let fresh = fresh.expect("actual headed launch publishes captured configured model");
+    assert!(
+        turn_entered,
+        "actual initial-turn submission must witness returned native setup"
+    );
+    assert!(
+        before_cancel.is_some_and(|runtime| runtime.model_observer_token.is_some()),
+        "outer launch had a committed captured claim"
+    );
+    assert!(caller_cancelled);
+    assert!(
+        claim_closed,
+        "canceled caller closes its claim before explicit native teardown"
+    );
+    assert_eq!(fresh["modelReport"]["backend"], "codex.appserver");
+    assert_eq!(
+        fresh["modelReport"]["configured"]["observation"]["nativeSessionId"],
+        native_root
+    );
+    assert_eq!(
+        fresh["modelReport"]["configured"]["observation"]["providerId"],
+        "fixture"
+    );
+    assert!(!stopped.active);
+    assert!(stopped.stopped_at.is_some());
+    assert_eq!(resumed.unwrap(), spawned.session_id);
+    let resumed = resumed_frame.expect("cold resume publishes a newer captured observer");
+    assert_eq!(resumed["agentId"], fresh["agentId"]);
+    assert_eq!(resumed["runtimeId"], fresh["runtimeId"]);
+    assert_eq!(
+        resumed["modelReport"]["configured"]["observation"]["nativeSessionId"],
+        native_root
+    );
+    model_projection_artifacts::export(
+        "codex",
+        "headed",
+        &fresh,
+        &resumed,
+        &stopped_frame.expect("actual offline projection after resumed native owner"),
+    );
 }
 
 #[cfg(unix)]
@@ -315,6 +549,7 @@ async fn codex_restart_adopts_live_app_server_without_spawning_a_duplicate() {
             &[],
             None,
             "pty",
+            None,
         )
         .await
         .expect("initial headed Codex launch");
@@ -350,6 +585,7 @@ async fn codex_restart_adopts_live_app_server_without_spawning_a_duplicate() {
             vec![owner_home],
             None,
             "pty",
+            None,
         )
         .await
         .expect("restart should adopt the live app-server");

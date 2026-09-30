@@ -97,6 +97,10 @@ async fn fixture(
         &Config::default(),
         Some(publisher.clone()),
     );
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
     let sid = register(
         &state,
         path,
@@ -127,22 +131,44 @@ fn projections(
     result
 }
 
-fn assert_bound(events: &[GatewayProjectionEvent], sid: &SessionId, aid: &str) {
-    let identity = events
-        .iter()
-        .find(|e| e.kind == GatewayProjectionKind::IdentityUpserted)
-        .expect("resume must publish committed identity even without a presence transition");
-    assert_eq!(identity.payload["agentId"], aid);
-    let runtime = events
-        .iter()
-        .find(|e| e.kind == GatewayProjectionKind::RuntimeUpserted)
+fn assert_bound<'a>(
+    events: &'a [GatewayProjectionEvent],
+    sid: &SessionId,
+    aid: &str,
+) -> &'a GatewayProjectionEvent {
+    assert!(
+        events.windows(2).all(|pair| pair[0].seq < pair[1].seq),
+        "repair projections must retain strictly increasing sequence order"
+    );
+    let mut saw_identity = false;
+    let mut latest_runtime = None;
+    for event in events {
+        match event.kind {
+            GatewayProjectionKind::IdentityUpserted => {
+                assert_eq!(event.payload["agentId"], aid);
+                saw_identity = true;
+            }
+            GatewayProjectionKind::RuntimeUpserted => {
+                assert_eq!(event.payload["agentId"], aid);
+                assert_eq!(event.payload["sessionId"], sid.0);
+                assert_eq!(event.payload["runtimeId"], sid.0);
+                latest_runtime = Some(event);
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_identity,
+        "resume must publish committed identity even without a presence transition"
+    );
+    // Selection can publish an active/offline snapshot before presence materialization.
+    // The caller's final publication must expose the completed canonical repair.
+    let runtime = latest_runtime
         .expect("resume must upsert the canonical runtime, not only a presence patch");
-    assert_eq!(runtime.payload["agentId"], aid);
-    assert_eq!(runtime.payload["sessionId"], sid.0);
-    assert_eq!(runtime.payload["runtimeId"], sid.0);
     assert_eq!(runtime.payload["presence"], "online");
     assert_eq!(runtime.payload["active"], true);
     assert!(runtime.payload["stoppedAt"].is_null());
+    runtime
 }
 
 async fn check_repairs(path: Path) {
@@ -184,7 +210,25 @@ async fn check_repairs(path: Path) {
         let mut rx = publisher.subscribe();
         let mut lifecycle = state.ws.subscribe();
         assert_eq!(register(&state, path, &sid, &aid).await.unwrap(), sid);
-        assert_bound(&projections(&mut rx), &sid, &aid);
+        let events = projections(&mut rx);
+        let latest = assert_bound(&events, &sid, &aid);
+        let runtime = AgentRuntimes::new(&store)
+            .find_by_runtime_id(&sid.0)
+            .await
+            .unwrap()
+            .expect("successful repair must retain the canonical runtime");
+        assert_eq!(latest.payload["agentId"], runtime.agent_id);
+        assert_eq!(latest.payload["sessionId"], runtime.runtime_id);
+        assert_eq!(latest.payload["runtimeId"], runtime.runtime_id);
+        assert_eq!(latest.payload["active"], runtime.active);
+        assert_eq!(
+            latest.payload["presence"],
+            serde_json::json!(runtime.presence)
+        );
+        assert_eq!(
+            latest.payload["stoppedAt"],
+            serde_json::json!(runtime.stopped_at)
+        );
         while let Ok(event) = lifecycle.try_recv() {
             assert_ne!(event.method, "agent.spawned", "resume is not a new spawn");
             assert_ne!(

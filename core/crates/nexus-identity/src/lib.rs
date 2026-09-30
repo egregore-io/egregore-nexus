@@ -19,5 +19,8 @@ pub mod registry;
 pub mod service;
 pub mod tier;
 
-pub use service::Identity;
+pub use service::{
+    Identity, IdentityOfflineOperation, NonAgentResumeOperation, PreparedIdentityOffline,
+    RuntimeActivation, RuntimeActivationError, RuntimeActivationRequest,
+};
 pub use tier::tier_guard;

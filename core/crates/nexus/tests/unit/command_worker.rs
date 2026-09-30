@@ -55,6 +55,7 @@ struct ExactDispatchSpy {
     calls: Mutex<Vec<(String, SessionId)>>,
     probes: AtomicUsize,
     prompt_error: Option<ContractError>,
+    steer_error: Option<ContractError>,
 }
 
 #[async_trait::async_trait]
@@ -90,6 +91,9 @@ impl AgentTurnExecutionPort for ExactDispatchSpy {
             .lock()
             .unwrap()
             .push(("steer".into(), recipient.clone()));
+        if let Some(error) = &self.steer_error {
+            return Err(error.clone());
+        }
         Ok(
             serde_json::from_value(serde_json::json!({"accepted":true,"delivery":"steered"}))
                 .unwrap(),
@@ -490,6 +494,22 @@ impl AgentTurnExecutionPort for PromptDispatchBarrier {
 
     async fn compact(&self, recipient: &SessionId) -> PortResult<()> {
         self.prompt(recipient, "/compact".into()).await
+    }
+
+    async fn steer_observed(
+        &self,
+        recipient: &SessionId,
+        text: String,
+        _: Arc<dyn nexus_contracts::EventSink>,
+        _: nexus_contracts::WsEvent,
+    ) -> PortResult<nexus_contracts::SteerResponse> {
+        self.prompt(recipient, text).await?;
+        Ok(nexus_contracts::SteerResponse {
+            session_id: None,
+            accepted: true,
+            delivery: nexus_contracts::SteerDelivery::Steered,
+            turn_id: Some("recorded-native-input".into()),
+        })
     }
 }
 
@@ -1156,64 +1176,134 @@ async fn worker_settles_expired_armed_auto_as_unknown_without_native_redelivery(
 
 #[tokio::test]
 async fn graceful_shutdown_drains_the_active_prompt_and_defers_pre_fence_backlog() {
-    let exec = Arc::new(PromptDispatchBarrier::default());
-    let state = test_state_with_turn_exec(exec.clone()).await;
-    let operator = state
-        .identity
-        .register(human_register("Alex Morgan", "ck_shutdown_operator"))
+    for kind in [
+        command_kinds::harness::PROMPT,
+        command_kinds::harness::STEER,
+    ] {
+        let exec = Arc::new(PromptDispatchBarrier::default());
+        let state = test_state_with_turn_exec(exec.clone()).await;
+        let operator = state
+            .identity
+            .register(human_register("Alex Morgan", "ck_shutdown_operator"))
+            .await
+            .unwrap();
+        state
+            .identity
+            .register(human_register("Target Human", "ck_shutdown_target"))
+            .await
+            .unwrap();
+        let repo = CommandIntents::new(&state.store);
+        let mut first = prompt_intent(
+            "cmd_shutdown_active",
+            &operator,
+            "Alex Morgan",
+            "ck_shutdown_operator",
+            "reach the accepted boundary",
+            1,
+        );
+        first.kind = kind.into();
+        repo.insert_pending(first).await.unwrap();
+        let mut second = prompt_intent(
+            "cmd_shutdown_pre_fence",
+            &operator,
+            "Alex Morgan",
+            "ck_shutdown_operator",
+            "also accepted before shutdown",
+            2,
+        );
+        second.kind = kind.into();
+        repo.insert_pending(second).await.unwrap();
+
+        let worker = spawn(state.clone());
+        tokio::time::timeout(Duration::from_secs(1), exec.entered.notified())
+            .await
+            .expect("the active prompt must enter the transport boundary");
+
+        begin_shutdown(&state).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !worker.is_finished(),
+            "shutdown must wait for the active dispatch boundary"
+        );
+        exec.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("the command worker should stop after the active prompt settles")
+            .expect("the command worker must not panic during shutdown");
+
+        let active = repo.get("cmd_shutdown_active").await.unwrap().unwrap();
+        assert_eq!(active.status, "done");
+        let pre_fence = repo.get("cmd_shutdown_pre_fence").await.unwrap().unwrap();
+        assert_eq!(pre_fence.status, "pending");
+        assert_eq!(pre_fence.claimed_at, None);
+        assert_eq!(pre_fence.started_at, None);
+        assert_eq!(exec.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn shutdown_preserves_pending_and_preflight_steers_without_reclaim_spin() {
+    for block_preflight in [false, true] {
+        let exec = Arc::new(SteerDispatchSpy::default());
+        let state = test_state_with_turn_exec(exec.clone()).await;
+        let caller = state
+            .identity
+            .register(human_register("Alex Morgan", "ck_shutdown_steer"))
+            .await
+            .unwrap();
+        state
+            .identity
+            .register(human_register("Target Human", "ck_shutdown_target"))
+            .await
+            .unwrap();
+        let repo = CommandIntents::new(&state.store);
+        repo.insert_pending(steer_intent(
+            "shutdown-steer",
+            &caller,
+            "Alex Morgan",
+            "ck_shutdown_steer",
+            1,
+        ))
         .await
         .unwrap();
-    state
-        .identity
-        .register(human_register("Target Human", "ck_shutdown_target"))
-        .await
-        .unwrap();
-    let repo = CommandIntents::new(&state.store);
-    repo.insert_pending(prompt_intent(
-        "cmd_shutdown_active",
-        &operator,
-        "Alex Morgan",
-        "ck_shutdown_operator",
-        "reach the accepted boundary",
-        1,
-    ))
-    .await
-    .unwrap();
-    repo.insert_pending(prompt_intent(
-        "cmd_shutdown_pre_fence",
-        &operator,
-        "Alex Morgan",
-        "ck_shutdown_operator",
-        "also accepted before shutdown",
-        2,
-    ))
-    .await
-    .unwrap();
-
-    let worker = spawn(state.clone());
-    tokio::time::timeout(Duration::from_secs(1), exec.entered.notified())
-        .await
-        .expect("the active prompt must enter the transport boundary");
-
-    begin_shutdown(&state).await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(
-        !worker.is_finished(),
-        "shutdown must wait for the active dispatch boundary"
-    );
-    exec.release.notify_one();
-    tokio::time::timeout(Duration::from_secs(1), worker)
-        .await
-        .expect("the command worker should stop after the active prompt settles")
-        .expect("the command worker must not panic during shutdown");
-
-    let active = repo.get("cmd_shutdown_active").await.unwrap().unwrap();
-    assert_eq!(active.status, "done");
-    let pre_fence = repo.get("cmd_shutdown_pre_fence").await.unwrap().unwrap();
-    assert_eq!(pre_fence.status, "pending");
-    assert_eq!(pre_fence.claimed_at, None);
-    assert_eq!(pre_fence.started_at, None);
-    assert_eq!(exec.calls.load(Ordering::SeqCst), 1);
+        let worker = if block_preflight {
+            let preflight = state.store.lock_presence_transition().await;
+            let worker = spawn(state.clone());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while repo
+                    .get("shutdown-steer")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .started_at
+                    .is_none()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("real steer worker must arm before its blocked caller preflight");
+            begin_shutdown(&state).await;
+            drop(preflight);
+            worker
+        } else {
+            begin_shutdown(&state).await;
+            spawn(state.clone())
+        };
+        let mut worker = worker;
+        let result = tokio::time::timeout(Duration::from_secs(1), &mut worker).await;
+        if result.is_err() {
+            worker.abort();
+        }
+        result
+            .expect("shutdown must not claim/defer-spin or wait for pending STEER backlog")
+            .unwrap();
+        let row = repo.get("shutdown-steer").await.unwrap().unwrap();
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.started_at, None);
+        assert_eq!(row.attempts, if block_preflight { 1 } else { 0 });
+        assert_eq!(exec.calls.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test]
@@ -1542,7 +1632,11 @@ async fn expired_prompt_preflight_cannot_mint_a_shutdown_retry_witness() {
 
 #[tokio::test]
 async fn prompt_timeout_closes_real_preflight_before_prompt_or_slash_compact_entry() {
-    for lane in [WorkerLane::HarnessPrompt, WorkerLane::Any] {
+    for lane in [
+        WorkerLane::HarnessPrompt,
+        WorkerLane::HarnessSteer,
+        WorkerLane::Any,
+    ] {
         for text in ["hello", "/compact"] {
             let exec = Arc::new(ExactDispatchSpy::default());
             let state = test_state_with_turn_exec(exec.clone()).await;
@@ -1574,16 +1668,18 @@ async fn prompt_timeout_closes_real_preflight_before_prompt_or_slash_compact_ent
                 .await
                 .unwrap();
             let repo = CommandIntents::new(&state.store);
-            repo.insert_pending(prompt_intent(
+            let mut intent = prompt_intent(
                 "blocked",
                 &caller,
                 "Alex Morgan",
                 "ck_gate_operator",
                 text,
                 1,
-            ))
-            .await
-            .unwrap();
+            );
+            if matches!(lane, WorkerLane::HarnessSteer) {
+                intent.kind = command_kinds::harness::STEER.into();
+            }
+            repo.insert_pending(intent).await.unwrap();
             // Caller authentication awaits this real presence gate. Claims and terminal
             // settlement use a different gate and remain able to make progress.
             let preflight = state.store.lock_presence_transition().await;
@@ -1617,59 +1713,167 @@ async fn prompt_timeout_closes_real_preflight_before_prompt_or_slash_compact_ent
 
 #[tokio::test]
 async fn prompt_entered_timeout_retains_uncertainty_after_late_completion() {
-    let exec = Arc::new(PromptDispatchBarrier::default());
-    let state = test_state_with_turn_exec(exec.clone()).await;
-    let boot_refs = Arc::strong_count(&state.agent);
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while Arc::strong_count(&state.agent) >= boot_refs {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    let caller = state
-        .identity
-        .register(human_register("Alex Morgan", "ck_late_operator"))
+    for lane in [WorkerLane::HarnessPrompt, WorkerLane::HarnessSteer] {
+        let exec = Arc::new(PromptDispatchBarrier::default());
+        let state = test_state_with_turn_exec(exec.clone()).await;
+        let boot_refs = Arc::strong_count(&state.agent);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&state.agent) >= boot_refs {
+                tokio::task::yield_now().await;
+            }
+        })
         .await
         .unwrap();
-    state
+        let caller = state
+            .identity
+            .register(human_register("Alex Morgan", "ck_late_operator"))
+            .await
+            .unwrap();
+        state
+            .identity
+            .register(human_register("Target Human", "ck_late_target"))
+            .await
+            .unwrap();
+        let repo = CommandIntents::new(&state.store);
+        let mut intent = prompt_intent(
+            "late",
+            &caller,
+            "Alex Morgan",
+            "ck_late_operator",
+            "hello",
+            1,
+        );
+        if matches!(lane, WorkerLane::HarnessSteer) {
+            intent.kind = command_kinds::harness::STEER.into();
+        }
+        repo.insert_pending(intent).await.unwrap();
+        let baseline_refs = Arc::strong_count(&state.agent);
+        let worker_state = state.clone();
+        let worker = tokio::spawn(async move { process_next_for_lane(&worker_state, lane).await });
+        exec.entered.notified().await;
+        tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("entered delivery must settle at its report bound")
+            .unwrap()
+            .unwrap();
+        let terminal = repo.get("late").await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(terminal.error_json.as_deref().unwrap()).unwrap()["code"],
+            codes::DELIVERY_UNCERTAIN
+        );
+        exec.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&state.agent) != baseline_refs {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(exec.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(repo.get("late").await.unwrap().unwrap(), terminal);
+    }
+}
+
+#[tokio::test]
+async fn steer_known_nonacceptance_is_strict_and_other_native_errors_are_uncertain() {
+    for (native_code, expected_code) in [
+        (codes::ACTIVE_TURN_REQUIRED, codes::ACTIVE_TURN_REQUIRED),
+        (codes::INVALID_PARAMS, codes::DELIVERY_UNCERTAIN),
+        (-32004, codes::DELIVERY_UNCERTAIN),
+    ] {
+        let exec = Arc::new(ExactDispatchSpy {
+            steer_error: Some(ContractError {
+                code: native_code,
+                message: "native result".into(),
+            }),
+            ..Default::default()
+        });
+        let state = test_state_with_turn_exec(exec.clone()).await;
+        let caller = state
+            .identity
+            .register(human_register("Alex Morgan", "ck_steer_error"))
+            .await
+            .unwrap();
+        state
+            .identity
+            .register(human_register("Target Human", "ck_steer_target"))
+            .await
+            .unwrap();
+        let repo = CommandIntents::new(&state.store);
+        repo.insert_pending(steer_intent(
+            "strict",
+            &caller,
+            "Alex Morgan",
+            "ck_steer_error",
+            1,
+        ))
+        .await
+        .unwrap();
+        process_next_for_lane(&state, WorkerLane::HarnessSteer)
+            .await
+            .unwrap();
+        let row = repo.get("strict").await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(row.error_json.as_deref().unwrap()).unwrap()["code"],
+            expected_code
+        );
+        assert_eq!(exec.calls.lock().unwrap().len(), 1, "no retry or fallback");
+        assert_eq!(row.attempts, 1);
+    }
+}
+
+#[tokio::test]
+async fn recorded_steer_receipt_settles_exact_row_then_second_send_progresses() {
+    let exec = Arc::new(PromptDispatchBarrier::default());
+    let state = test_state_with_turn_exec(exec.clone()).await;
+    let caller = state
         .identity
-        .register(human_register("Target Human", "ck_late_target"))
+        .register(human_register("Alex Morgan", "ck_steer_receipt"))
+        .await
+        .unwrap();
+    let target = state
+        .identity
+        .register(human_register("Target Human", "ck_steer_target"))
         .await
         .unwrap();
     let repo = CommandIntents::new(&state.store);
-    repo.insert_pending(prompt_intent(
-        "late",
-        &caller,
-        "Alex Morgan",
-        "ck_late_operator",
-        "hello",
-        1,
-    ))
-    .await
-    .unwrap();
-    let baseline_refs = Arc::strong_count(&state.agent);
-    let worker_state = state.clone();
-    let worker = tokio::spawn(async move {
-        process_next_for_lane(&worker_state, WorkerLane::HarnessPrompt).await
-    });
-    exec.entered.notified().await;
-    worker.await.unwrap().unwrap();
-    let terminal = repo.get("late").await.unwrap().unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(terminal.error_json.as_deref().unwrap()).unwrap()["code"],
-        codes::DELIVERY_UNCERTAIN
-    );
-    exec.release.notify_one();
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while Arc::strong_count(&state.agent) != baseline_refs {
-            tokio::task::yield_now().await;
+    for (id, created) in [("first", 1), ("second", 2)] {
+        repo.insert_pending(steer_intent(
+            id,
+            &caller,
+            "Alex Morgan",
+            "ck_steer_receipt",
+            created,
+        ))
+        .await
+        .unwrap();
+    }
+    for (index, id) in ["first", "second"].into_iter().enumerate() {
+        let owned = state.clone();
+        let worker =
+            tokio::spawn(
+                async move { process_next_for_lane(&owned, WorkerLane::HarnessSteer).await },
+            );
+        exec.entered.notified().await;
+        assert_eq!(repo.get(id).await.unwrap().unwrap().status, "claimed");
+        if index == 0 {
+            assert_eq!(repo.get("second").await.unwrap().unwrap().attempts, 0);
         }
-    })
-    .await
-    .unwrap();
-    assert_eq!(exec.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(repo.get("late").await.unwrap().unwrap(), terminal);
+        exec.release.notify_one();
+        worker.await.unwrap().unwrap();
+        let row = repo.get(id).await.unwrap().unwrap();
+        assert_eq!(row.status, "done");
+        assert_eq!(row.attempts, 1);
+        let result: Value = serde_json::from_str(row.result_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "sessionId": target.session_id, "accepted": true, "delivery": "steered",
+                "turnId": "recorded-native-input"
+            })
+        );
+    }
+    assert_eq!(exec.calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -2266,6 +2470,7 @@ async fn maintenance_reaps_terminal_command_intents_by_retention() {
         }),
     )
     .await;
+    state.wait_for_runtime_identity_ready().await.unwrap();
     let repo = CommandIntents::new(&state.store);
     let ts = now();
     let alex = state
@@ -2325,6 +2530,67 @@ async fn maintenance_reaps_terminal_command_intents_by_retention() {
         repo.get("cmd_pending").await.unwrap().unwrap().status,
         "pending"
     );
+}
+
+#[tokio::test]
+async fn managed_retention_maintenance_rejects_shutdown_after_prior_table_effects() {
+    let state = test_state_with_config(
+        Config {
+            command_intent_retention_ms: 10_000,
+            ..Config::default()
+        },
+        Arc::new(FirstPromptHangs {
+            calls: AtomicUsize::new(0),
+        }),
+    )
+    .await;
+    state.wait_for_runtime_identity_ready().await.unwrap();
+    let alex = state
+        .identity
+        .register(human_register("Retention Operator", "retention_operator"))
+        .await
+        .unwrap();
+    let repo = CommandIntents::new(&state.store);
+    repo.insert_pending(prompt_intent(
+        "retention_prior_done",
+        &alex,
+        "Retention Operator",
+        "retention_operator",
+        "done",
+        now() - 30_000,
+    ))
+    .await
+    .unwrap();
+    repo.mark_done("retention_prior_done", "{}", now() - 20_000)
+        .await
+        .unwrap();
+    state.store.identity_conn().execute("INSERT INTO agent_runtimes(runtime_id,agent_id,harness,active,started_at,stopped_at) VALUES('retention_managed','retention_agent','other',0,1,2)", ()).await.unwrap();
+    state
+        .drain_model_reporting_for_shutdown(Duration::from_secs(2))
+        .await
+        .unwrap();
+    let error = maybe_reap_operational_tables(&state, &mut RetentionPolicyState::default())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not admitting runtime retention"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("earlier operational cleanup"),
+        "{error}"
+    );
+    assert!(
+        repo.get("retention_prior_done").await.unwrap().is_none(),
+        "earlier table work remains committed"
+    );
+    assert!(nexus_store::repos::AgentRuntimes::new(&state.store)
+        .find_by_runtime_id("retention_managed")
+        .await
+        .unwrap()
+        .is_some());
 }
 
 /// A validated [`nexus_contracts::HarnessId`] from a literal (panics on invalid — test-only).

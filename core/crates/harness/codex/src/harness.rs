@@ -43,6 +43,24 @@ pub struct CodexAdapter {
 }
 
 impl CodexAdapter {
+    /// Configured model evidence from the adapter's ACP metadata surface. This does not
+    /// advertise per-turn/response model selection or token/context/account telemetry.
+    pub fn model_reporting_profile() -> nexus_agent::adapter::AdapterModelReportingProfile {
+        use nexus_agent::adapter::{AcpModelMetadataDialect, AdapterModelReportingProfile};
+        use nexus_contracts::{
+            ModelEvidenceCapability, ModelObservationSource, ModelReportBackend,
+        };
+        let source = ModelObservationSource::new("codex.acp.config_options").unwrap();
+        AdapterModelReportingProfile::new(
+            ModelReportBackend::new("codex.acp").unwrap(),
+            ModelEvidenceCapability::Supported,
+            ModelEvidenceCapability::Unverified,
+            ModelEvidenceCapability::Unverified,
+            AcpModelMetadataDialect::ConfigOptions { source },
+        )
+        .expect("builtin ACP reporting profile is valid")
+    }
+
     /// Construct a Codex adapter that will spawn the **real** Codex ACP bridge for the given
     /// working directory. The exact invocation is [`codex_command`] (overridable via env).
     pub fn new(ctx: LaunchCtx) -> Self {
@@ -54,13 +72,7 @@ impl CodexAdapter {
         }
         let mut command = codex_command(ctx.cwd.clone());
         command.env = ctx.env.clone();
-        Self {
-            command,
-            engine: AcpEngine::for_harness(
-                HarnessId::new("codex").expect("builtin harness id is valid"),
-            ),
-            ctx,
-        }
+        Self::with_command_and_context(command, ctx)
     }
 
     /// Construct a Codex adapter over an explicit [`HarnessCommand`] (the hermetic tests point
@@ -70,11 +82,19 @@ impl CodexAdapter {
             cwd: command.cwd.clone(),
             ..Default::default()
         };
+        Self::with_command_and_context(command, ctx)
+    }
+
+    /// Construct over an explicit command with an already-captured launch context.
+    /// The command is used verbatim; launch bootstrap/config preparation stays in `new`.
+    /// Reporting is seeded before initialize through the same assembly as normal launches.
+    pub fn with_command_and_context(command: HarnessCommand, ctx: LaunchCtx) -> Self {
         Self {
             command,
             engine: AcpEngine::for_harness(
                 HarnessId::new("codex").expect("builtin harness id is valid"),
-            ),
+            )
+            .with_reporting(ctx.model_reporting.clone()),
             ctx,
         }
     }

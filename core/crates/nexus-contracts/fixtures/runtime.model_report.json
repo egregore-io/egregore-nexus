@@ -1,0 +1,35 @@
+{
+  "runtimeId": "s_wire_fixture",
+  "agentId": "a_wire_fixture",
+  "harness": "codex",
+  "presence": "online",
+  "active": true,
+  "startedAt": 10,
+  "modelReport": {
+    "backend": "codexAppServer",
+    "observerActive": true,
+    "reportRevision": 1,
+    "configured": {
+      "capability": "supported",
+      "status": "observed",
+      "observation": {
+        "modelId": "gpt-astra",
+        "source": "codex.config",
+        "observedAt": 10
+      }
+    },
+    "turnSelected": {
+      "capability": "unverified",
+      "status": "unknown"
+    },
+    "responseReported": {
+      "capability": "supported",
+      "status": "observed",
+      "observation": {
+        "modelId": "independent-response-model",
+        "source": "codex.thread",
+        "observedAt": 11
+      }
+    }
+  }
+}

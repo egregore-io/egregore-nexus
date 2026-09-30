@@ -1,11 +1,18 @@
 // --- Hand-authored wire unions (appended by gen-ts.sh / the ts_gen test) ---
 //
 // typeshare 1.13 cannot emit internally-tagged (`#[serde(tag = ...)]`) algebraic enums or infer
-// untagged-enum unions, so the three serde unions below are authored to match the frozen Rust wire
+// untagged-enum unions, so the serde unions below are authored to match the frozen Rust wire
 // shape exactly (the same JSON the crate's round-trip tests + golden fixtures assert). The Rust
 // types reference these via `#[typeshare(serialized_as = "...")]`. Keep in lockstep with
 // `src/send.rs` (SendTarget), `src/notify.rs` (NotifyTarget), `src/daemon_ipc.rs`
-// (DaemonIpcCall), `src/events.rs` (WsEvent), and `src/rpc.rs` (RequestId).
+// (DaemonIpcCall), `src/events.rs` (WsEvent), `src/rpc.rs` (RequestId), and
+// `src/model_report.rs` (ModelEvidenceSlot).
+
+/** Independent model evidence; Rust serde/validate enforce capability and payload consistency. */
+export type ModelEvidenceSlotWire =
+  | { status: "observed"; capability: ModelEvidenceCapability.Supported; observation: ModelObservation }
+  | { status: "unknown"; capability: ModelEvidenceCapability; reason?: ModelUnknownReason }
+  | { status: "invalid"; capability: ModelEvidenceCapability; reason: ModelInvalidReason };
 
 // String-backed id newtypes (src/ids.rs). They are `#[serde(transparent)]` and defined via a
 // macro, so typeshare's parser does not see the definitions (it only sees the usages); we emit the

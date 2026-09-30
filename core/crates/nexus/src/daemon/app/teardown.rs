@@ -241,6 +241,7 @@ impl AppState {
         agent_id: Option<&AgentId>,
         name: &str,
     ) -> Result<nexus_contracts::RemoveResponse, nexus_contracts::ContractError> {
+        let transition = Arc::new(self.store.lock_presence_transition().await);
         let project = &caller.project;
         let row = self
             .resolve_session_for_agent_request(project, agent_id, name)
@@ -257,12 +258,17 @@ impl AppState {
         if let Some(mut r) = row {
             self.stamp_selected_session_agent_id(&mut r, agent_id)
                 .await?;
+            self.validate_purge_selection(&r).await?;
             let target_agent_id = self.agent_id_for_selected_session(&r).await?;
             self.teardown_harness_row(&r).await;
             self.release_native_session_bindings(&r.session_id).await?;
-            if let Some(target_agent_id) = target_agent_id {
+            // The only expected Session change from release is the native key being cleared.
+            // Compare the retained selection; do not adopt a replacement returned by a reread.
+            r.harness_session_id = None;
+            self.validate_purge_selection(&r).await?;
+            if let Some(target_agent_id) = &target_agent_id {
                 NativeThreadBindings::new(&self.store)
-                    .delete_for_agent(&target_agent_id)
+                    .delete_for_agent(target_agent_id)
                     .await
                     .map_err(|e| e.to_contract_error())?;
             }
@@ -275,11 +281,22 @@ impl AppState {
                 )
                 .await;
             }
-            // Erase every trace from the daemon store (session row + in_flight + thread_members + msgs).
-            nexus_store::repos::Sessions::new(&self.store)
-                .purge_selected(&r)
+            let outcome = self
+                .presence
+                .purge_selected(r.clone(), target_agent_id, transition)
                 .await
-                .map_err(|e| e.to_contract_error())?;
+                .map_err(|error| error.into_nexus_error().to_contract_error())?;
+            if matches!(
+                outcome,
+                crate::daemon::services::presence::PresencePurgeOutcome::Managed(
+                    nexus_store::repos::sessions::SelectedIdentityPurge::SelectionChanged
+                )
+            ) {
+                return Err(NexusError::Invalid(
+                    "purge selection changed; earlier native release effects may remain".into(),
+                )
+                .to_contract_error());
+            }
             return Ok(nexus_contracts::RemoveResponse {
                 name: r.name,
                 status: "deleted".into(),
@@ -289,6 +306,19 @@ impl AppState {
             name: Some(name.to_string()),
             status: "deleted".into(),
         })
+    }
+
+    async fn validate_purge_selection(&self, selected: &SessionRow) -> Result<(), ContractError> {
+        let current = Sessions::new(&self.store)
+            .find_by_session_id(&selected.session_id)
+            .await
+            .map_err(|error| error.to_contract_error())?;
+        if current.as_ref() != Some(selected) {
+            return Err(NexusError::Invalid(
+                "purge selection changed during required stamp/native release; earlier effects may remain".into()
+            ).to_contract_error());
+        }
+        Ok(())
     }
 
     /// Kill the named agent's live harness (tmux/PTY) via the [`PtySupervisor`], best-effort. Resolves

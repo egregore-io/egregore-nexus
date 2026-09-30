@@ -36,13 +36,15 @@ mod adoption;
 mod delivery_recovery;
 mod launch_lifecycle;
 mod launch_orchestration;
+mod observed_adapter;
+mod observed_native;
 mod presence_lifecycle;
 mod revive;
 mod routing_recovery;
 mod runtime_registration;
 mod teardown;
 
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::broadcast;
 
 use nexus_common::{now, Config, NexusError, RuntimeProcessIds};
 use nexus_contracts::ids::{AgentId, SessionId};
@@ -71,6 +73,7 @@ use nexus_store::repos::{
 use nexus_store::types::{AgentRuntimeRow, SessionRow};
 use nexus_store::Store;
 
+use crate::daemon::boot_readiness::{run_boot, BootReadiness, InitialPresenceOutcome};
 use crate::daemon::claude_native_forwarder::{
     claude_native_paths_for_runtime, spawn_claude_native_forwarder_with_tool_events,
     GatewayClaudeToolObservationSink, DEFAULT_CLAUDE_NATIVE_FORWARDER_POLL_MS,
@@ -83,6 +86,7 @@ use crate::daemon::hermes_native_forwarder::{
     spawn_hermes_native_forwarder_with_tool_events, GatewayHermesToolObservationSink,
     HermesRuntimeStateRepo, HermesToolObservationSink, DEFAULT_HERMES_NATIVE_FORWARDER_POLL_MS,
 };
+use crate::daemon::model_reporting::ModelReporting;
 use crate::daemon::opencode_native_forwarder::{
     spawn_opencode_native_forwarder_with_tool_events, GatewayOpenCodeToolObservationSink,
     OpenCodeRuntimeStateRepo, OpenCodeToolObservationSink,
@@ -253,8 +257,9 @@ pub struct AppState {
     /// Closes the boot race between command ingress and reconstruction of the volatile runtime
     /// directory. Command workers must not reject a valid surviving bridge credential while its
     /// persistent identity capsule is still being materialized.
-    runtime_identity_ready: Arc<AtomicBool>,
-    runtime_identity_ready_notify: Arc<Notify>,
+    boot_readiness: BootReadiness,
+    /// One coordinator per wiring. Construction is synchronous and does not enable observers.
+    model_reporting: Arc<ModelReporting>,
     /// One-way fence for graceful daemon shutdown. Once raised, command lanes finish only the
     /// dispatch boundary they already own and refuse every later claim; newly accepted rows remain
     /// pending for the next daemon instead of becoming ambiguous during transport teardown.
@@ -289,6 +294,37 @@ impl AppState {
         admin: Arc<dyn AdminPort>,
         project: String,
     ) -> Self {
+        let model_reporting = Arc::new(ModelReporting::new(store.clone(), Arc::new(ws.clone())));
+        Self::new_with_model_reporting(
+            store,
+            ws,
+            identity,
+            agent,
+            realtime,
+            bus,
+            search,
+            notify,
+            admin,
+            project,
+            model_reporting,
+        )
+    }
+
+    /// Assemble around one captured coordinator; callers retain the same ownership authority.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_with_model_reporting(
+        store: Arc<Store>,
+        ws: WsSink,
+        identity: Arc<dyn IdentityPort>,
+        agent: Arc<dyn AgentTurnExecutionPort>,
+        realtime: Arc<dyn DispatchPort>,
+        bus: Arc<dyn BusPort>,
+        search: Arc<dyn SearchPort>,
+        notify: Arc<dyn NotifyPort>,
+        admin: Arc<dyn AdminPort>,
+        project: String,
+        model_reporting: Arc<ModelReporting>,
+    ) -> Self {
         let sources = SourceService::new(store.clone(), bus.clone());
         let identity_admin =
             IdentityAdminService::new(store.clone(), Arc::new(ws.clone()), admin.clone());
@@ -299,6 +335,7 @@ impl AppState {
             transport_registry.clone(),
         );
         AppState {
+            model_reporting,
             store,
             ws,
             identity,
@@ -326,8 +363,7 @@ impl AppState {
             loop_wiring: None,
             pending_respawn_backoff: Arc::new(Mutex::new(HashMap::new())),
             runtime_revive_gate: RuntimeReviveGate::default(),
-            runtime_identity_ready: Arc::new(AtomicBool::new(true)),
-            runtime_identity_ready_notify: Arc::new(Notify::new()),
+            boot_readiness: BootReadiness::unmanaged(),
             command_worker_shutting_down: Arc::new(AtomicBool::new(false)),
             agent_concrete: None,
             pty: None,
@@ -370,13 +406,13 @@ impl AppState {
 
     /// First-poll entry is atomic with shutdown and the attempt deadline. No fence is retained
     /// across a Pending adapter poll; unrelated ingress and provider I/O remain independent.
-    pub(crate) async fn prompt_entry_before_shutdown<F>(
+    pub(crate) async fn prompt_entry_before_shutdown<F, T>(
         &self,
         attempt: Option<&crate::daemon::command_worker::PromptAttempt>,
         future: F,
-    ) -> Result<(), ContractError>
+    ) -> Result<T, ContractError>
     where
-        F: std::future::Future<Output = Result<(), ContractError>>,
+        F: std::future::Future<Output = Result<T, ContractError>>,
     {
         let guard = self.store.write_lock().lock_owned().await;
         if self.command_worker_is_shutting_down() {
@@ -455,6 +491,17 @@ impl AppState {
         config: &Config,
         registry: nexus_agent::AdapterRegistry,
     ) -> Self {
+        Self::wire_with_registry_and_gateway_stream(store, config, registry, None)
+    }
+
+    /// The registry wiring with an optional canonical Gateway publisher. All services share the
+    /// same WsSink and model coordinator; no second projection or observer pipeline is created.
+    pub fn wire_with_registry_and_gateway_stream(
+        store: Arc<Store>,
+        config: &Config,
+        registry: nexus_agent::AdapterRegistry,
+        gateway_stream: Option<crate::daemon::gateway_stream_socket::GatewayStreamPublisher>,
+    ) -> Self {
         use nexus_agent::Agent;
         use nexus_identity::Identity;
 
@@ -462,11 +509,20 @@ impl AppState {
         // dozens of `session/update` chunks in a few ms — observed codex bursts of 30+ in 3ms) plus
         // many agents streaming at once, so a momentarily-behind observer doesn't trip
         // `RecvError::Lagged` (which silently SKIPS missed events → "dropped" stream).
-        let ws = WsSink::new(16_384, Some(store.clone()));
+        let mut ws = WsSink::new(16_384, Some(store.clone()));
+        if let Some(gateway_stream) = gateway_stream {
+            ws = ws.with_gateway_stream(gateway_stream);
+        }
         let events: Arc<dyn EventSink> = Arc::new(ws.clone());
 
         // identity (built here so it can be shared with the concrete `Agent` service)
-        let identity_svc = Arc::new(Identity::new(store.clone(), events.clone(), config));
+        let model_reporting = Arc::new(ModelReporting::new(store.clone(), events.clone()));
+        let identity_svc = Arc::new(Identity::new_with_runtime_activation(
+            store.clone(),
+            events.clone(),
+            config,
+            model_reporting.clone(),
+        ));
         let identity: Arc<dyn IdentityPort> = identity_svc.clone();
 
         // agent (ACP) — the concrete service IS the turn executor on this path.
@@ -475,7 +531,16 @@ impl AppState {
 
         // Assemble the shared body around the ACP agent as the turn-exec, keeping `agent_concrete`
         // so the launch orchestration can open/bind ACP sessions.
-        let state = Self::wire_shared(store, config, ws, events, identity, agent, Some(agent_svc));
+        let state = Self::wire_shared(
+            store,
+            config,
+            ws,
+            events,
+            identity,
+            agent,
+            Some(agent_svc),
+            model_reporting,
+        );
         state.spawn_boot_respawn();
         state
     }
@@ -499,12 +564,27 @@ impl AppState {
         let ws = WsSink::new(16_384, Some(store.clone()));
         let events: Arc<dyn EventSink> = Arc::new(ws.clone());
 
-        let identity_svc = Arc::new(Identity::new(store.clone(), events.clone(), config));
+        let model_reporting = Arc::new(ModelReporting::new(store.clone(), events.clone()));
+        let identity_svc = Arc::new(Identity::new_with_runtime_activation(
+            store.clone(),
+            events.clone(),
+            config,
+            model_reporting.clone(),
+        ));
         let identity: Arc<dyn IdentityPort> = identity_svc.clone();
 
         // No ACP `Agent` service — the supplied `turn_exec` IS the executor and `agent_concrete` is
         // None (launch falls back to the bare port; PTY launch lives in PtySupervisor).
-        let state = Self::wire_shared(store, config, ws, events, identity, turn_exec, None);
+        let state = Self::wire_shared(
+            store,
+            config,
+            ws,
+            events,
+            identity,
+            turn_exec,
+            None,
+            model_reporting,
+        );
         state.spawn_boot_respawn();
         state
     }
@@ -544,7 +624,13 @@ impl AppState {
         }
         let gateway_stream_publisher = ws.gateway_stream_publisher();
         let events: Arc<dyn EventSink> = Arc::new(ws.clone());
-        let identity_svc = Arc::new(Identity::new(store.clone(), events.clone(), config));
+        let model_reporting = Arc::new(ModelReporting::new(store.clone(), events.clone()));
+        let identity_svc = Arc::new(Identity::new_with_runtime_activation(
+            store.clone(),
+            events.clone(),
+            config,
+            model_reporting.clone(),
+        ));
         let identity: Arc<dyn IdentityPort> = identity_svc.clone();
 
         // (2) Build the ACP Agent with the SAME events sink so headless agent replies stream to the
@@ -584,6 +670,7 @@ impl AppState {
             identity,
             turn_exec,
             Some(agent_svc),
+            model_reporting,
         );
 
         // (6) Mount the supervisor so launch_agent can spawn headed harnesses.
@@ -597,6 +684,7 @@ impl AppState {
     /// `LoopWiring`, all keyed on the supplied `turn_exec` as the turn executor. `agent_concrete` is
     /// `Some` only on the ACP path (it backs launch's `open_session_for`). This is the single seam
     /// the PTY-native path swaps `turn_exec` at — every other wire is identical.
+    #[allow(clippy::too_many_arguments)]
     fn wire_shared(
         store: Arc<Store>,
         config: &Config,
@@ -605,6 +693,7 @@ impl AppState {
         identity: Arc<dyn IdentityPort>,
         agent: Arc<dyn AgentTurnExecutionPort>,
         agent_concrete: Option<Arc<nexus_agent::Agent>>,
+        model_reporting: Arc<ModelReporting>,
     ) -> Self {
         use nexus_bus::Bus;
         use nexus_dispatch::{DispatchService, ServiceDeps};
@@ -664,34 +753,7 @@ impl AppState {
             events.clone(),
         ));
 
-        // Loop wiring: the concrete handles that make a launched/registered agent wakeable. Shares
-        // the same `bell`/`registry` as `realtime` above (so a ring reaches the loop's bell) and the
-        // `turn_exec` as the turn executor (so a wake injects the drained batch as one turn — over
-        // ACP `session/prompt` on the agent path, or written into the recipient's PTY on the
-        // PtyTransport path).
-        let transport_registry = TransportRegistry::new();
-        let presence_writer =
-            PresenceWriter::new(store.clone(), events.clone(), transport_registry.clone());
-        let loop_wiring = LoopWiring {
-            store: store.clone(),
-            bell,
-            registry,
-            events: events.clone(),
-            turn_exec: agent.clone(),
-            gateway_stream: ws.gateway_stream_publisher(),
-            drain_limit: config.drain_limit,
-            preview_chars: config.msg_preview_chars,
-            spawned: Arc::new(Mutex::new(HashMap::new())),
-            shutting_down: Arc::new(AtomicBool::new(false)),
-            native_forwarders: Arc::new(Mutex::new(HashMap::new())),
-            raw_stream_writers: Arc::new(Mutex::new(HashSet::new())),
-            presence: presence_writer.clone(),
-        };
-
-        // Keep launched agents present in `members` (they're driven over ACP and don't self-heartbeat).
-        loop_wiring.spawn_heartbeat_keeper(config.heartbeat_ttl_ms);
-
-        let mut state = AppState::new(
+        let mut state = AppState::new_with_model_reporting(
             store,
             ws,
             identity,
@@ -702,8 +764,37 @@ impl AppState {
             notify,
             admin,
             String::new(),
+            model_reporting,
         );
-        state.runtime_identity_ready.store(false, Ordering::Release);
+        state.boot_readiness = BootReadiness::pending();
+        state.presence = state
+            .presence
+            .with_model_reporting(state.model_reporting.clone());
+
+        // Loop wiring: the concrete handles that make a launched/registered agent wakeable. Shares
+        // the same `bell`/`registry` as `realtime` above (so a ring reaches the loop's bell) and the
+        // `turn_exec` as the turn executor (so a wake injects the drained batch as one turn — over
+        // ACP `session/prompt` on the agent path, or written into the recipient's PTY on the
+        // PtyTransport path).
+        let loop_wiring = LoopWiring {
+            store: state.store.clone(),
+            bell,
+            registry,
+            events: events.clone(),
+            turn_exec: state.agent.clone(),
+            gateway_stream: state.ws.gateway_stream_publisher(),
+            drain_limit: config.drain_limit,
+            preview_chars: config.msg_preview_chars,
+            spawned: Arc::new(Mutex::new(HashMap::new())),
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            native_forwarders: Arc::new(Mutex::new(HashMap::new())),
+            raw_stream_writers: Arc::new(Mutex::new(HashSet::new())),
+            presence: state.presence.clone(),
+        };
+
+        // Keep launched agents present in `members` (they're driven over ACP and don't self-heartbeat).
+        loop_wiring.spawn_heartbeat_keeper(config.heartbeat_ttl_ms);
+
         state.hmac_secret = config.hmac_secret.clone();
         state.heartbeat_ttl_ms = config.heartbeat_ttl_ms;
         state.command_intent_retention_ms = config.command_intent_retention_ms;
@@ -722,7 +813,6 @@ impl AppState {
                 ),
             });
         state.loop_wiring = Some(loop_wiring);
-        state.presence = presence_writer;
         state.agent_concrete = agent_concrete;
         state.spawn_presence_reconciler();
         state

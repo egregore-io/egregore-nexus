@@ -17,6 +17,46 @@ fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
+/// This is a wire-shape example only, not captured native decoder evidence.
+#[test]
+fn runtime_model_report_fixture_roundtrips() {
+    let original = load("runtime.model_report.json");
+    let runtime: nexus_contracts::AgentRuntimeSummary =
+        serde_json::from_value(original.clone()).unwrap();
+    assert_eq!(serde_json::to_value(runtime).unwrap(), original);
+    assert_eq!(
+        original["modelReport"]["configured"]["observation"]["modelId"],
+        "gpt-astra"
+    );
+    assert!(original["modelReport"]["configured"]["observation"]
+        .get("providerId")
+        .is_none());
+    assert_ne!(
+        original["modelReport"]["configured"]["observation"]["modelId"],
+        original["modelReport"]["responseReported"]["observation"]["modelId"]
+    );
+}
+
+/// Synthetic wire values, not a native capture or enabled collector.
+#[test]
+fn runtime_telemetry_fixture_roundtrips() {
+    let original = load("runtime.telemetry.json");
+    let runtime: nexus_contracts::AgentRuntimeSummary =
+        serde_json::from_value(original.clone()).unwrap();
+    assert_eq!(serde_json::to_value(runtime).unwrap(), original);
+    assert_eq!(
+        original["modelReport"]["telemetry"]["usage"]["observation"]["scope"],
+        "sessionCumulative"
+    );
+    assert_eq!(
+        original["modelReport"]["telemetry"]["quota"]["observation"]["windows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
 fn load(name: &str) -> serde_json::Value {
     let path = fixtures_dir().join(name);
     let bytes = std::fs::read_to_string(&path)

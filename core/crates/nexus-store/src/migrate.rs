@@ -24,9 +24,10 @@ const CALLER_VALIDATION_SCHEMA_NAME: &str = "v0.1.5_caller_validation";
 pub(crate) const IDENTITY_SCHEMA_NAME: &str = "v0.1.0_identity";
 pub(crate) const IDENTITY_PROVIDER_SCHEMA_NAME: &str = "v0.1.6_identity_provider";
 pub(crate) const IDENTITY_CALLER_PRINCIPAL_SCHEMA_NAME: &str = "v0.1.6_identity_caller_principal";
+pub(crate) const IDENTITY_MODEL_REPORT_SCHEMA_NAME: &str = "v0.1.6_identity_model_report";
 pub(crate) const TRANSPORT_SCHEMA_NAME: &str = "v0.1.0_transport";
 
-/// Reachable test seam for proving that the identity-provider migration is atomic.
+/// Reachable test seam for proving identity-provider and model-report upgrades are atomic.
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationFault {
@@ -261,6 +262,12 @@ impl Store {
                 self.upgrade_identity_caller_validation().await?;
                 self.validate_caller_authority_schema().await?;
             }
+            Some(marker) if marker == IDENTITY_MODEL_REPORT_SCHEMA_NAME => {
+                self.validate_identity_schema().await?;
+                self.validate_identity_provider_schema().await?;
+                self.validate_caller_authority_schema().await?;
+                self.validate_model_report_schema().await?;
+            }
             Some(marker) if marker == TRANSPORT_SCHEMA_NAME => {}
             Some(marker) => return Err(unsupported_schema(&marker)),
             None if self.has_schema_migrations_table().await? => {
@@ -280,7 +287,93 @@ impl Store {
             }
         }
 
+        if self.object_exists("table", "agent_runtimes").await? {
+            self.upgrade_model_report(MigrationFault::None).await?;
+        }
         self.ensure_ephemeral_stream_schema().await
+    }
+
+    async fn validate_model_report_schema(&self) -> Result<(), NexusError> {
+        validate_model_report_schema_rows(
+            self.conn
+                .query("PRAGMA table_info(agent_runtimes)", ())
+                .await
+                .map_err(store_err)?,
+            self.conn
+                .query("PRAGMA table_info(retired_model_runtime_ids)", ())
+                .await
+                .map_err(store_err)?,
+        )
+        .await
+    }
+
+    /// Add model authority without rewriting any published baseline SQL. Compatibility stores
+    /// keep their existing ledger; split identity stores receive the new named marker atomically.
+    async fn upgrade_model_report(&self, fault: MigrationFault) -> Result<(), NexusError> {
+        let identity = self
+            .schema_marker()
+            .await?
+            .is_some_and(|name| name == IDENTITY_CALLER_PRINCIPAL_SCHEMA_NAME);
+        let mut present = 0;
+        for column in [
+            "model_observer_token",
+            "model_observer_sequence",
+            "model_report_revision",
+            "model_report_json",
+        ] {
+            present += usize::from(self.column_exists("agent_runtimes", column).await?);
+        }
+        if present != 0 && present != 4 {
+            return Err(NexusError::Store(
+                "incomplete model report authority schema".into(),
+            ));
+        }
+        if present == 4 && !identity {
+            return self.validate_model_report_schema().await;
+        }
+        let tx = self
+            .begin_write_txn("v016_identity_model_report_migration")
+            .await?;
+        let result = async {
+            if present == 0 {
+                for (index, sql) in [
+                    "ALTER TABLE agent_runtimes ADD COLUMN model_observer_token TEXT",
+                    "ALTER TABLE agent_runtimes ADD COLUMN model_observer_sequence INTEGER NOT NULL DEFAULT 0",
+                    "ALTER TABLE agent_runtimes ADD COLUMN model_report_revision INTEGER NOT NULL DEFAULT 0",
+                    "ALTER TABLE agent_runtimes ADD COLUMN model_report_json TEXT",
+                ].into_iter().enumerate() {
+                    tx.execute(sql, ()).await?;
+                    if index == 0 && fault == MigrationFault::AfterFirstStatement {
+                        return Err(NexusError::Store(
+                            "injected identity migration fault after first statement".into()
+                        ));
+                    }
+                }
+            }
+            tx.execute(
+                "CREATE TABLE IF NOT EXISTS retired_model_runtime_ids \
+                 (runtime_id TEXT PRIMARY KEY NOT NULL)",
+                (),
+            ).await?;
+            // CREATE IF NOT EXISTS does not establish the shape of a preexisting table.
+            // Validate through this pinned transaction before accepting the new marker.
+            validate_model_report_schema_rows(
+                tx.query("PRAGMA table_info(agent_runtimes)", ()).await?,
+                tx.query("PRAGMA table_info(retired_model_runtime_ids)", ()).await?,
+            ).await?;
+            if identity {
+                tx.execute("DELETE FROM schema_migrations", ()).await?;
+                tx.execute(
+                    "INSERT INTO schema_migrations(version, name, applied_at) VALUES (?1, ?2, ?3)",
+                    libsql::params![BASELINE_SCHEMA_VERSION, IDENTITY_MODEL_REPORT_SCHEMA_NAME, now()],
+                ).await?;
+            }
+            Ok(())
+        }.await;
+        match result {
+            Ok(()) => tx.commit().await,
+            Err(error) => rollback_error(tx, error).await,
+        }
     }
 
     pub(crate) async fn mark_schema_variant(&self, name: &str) -> Result<(), NexusError> {
@@ -897,19 +990,61 @@ pub async fn migrate_identity_with_fault(
             store.validate_caller_authority_schema().await
         }
         Some(marker) if marker == IDENTITY_CALLER_PRINCIPAL_SCHEMA_NAME => {
-            if fault != MigrationFault::None {
-                return Err(NexusError::Invalid(
-                    "identity migration fault requires a legacy identity schema".into(),
-                ));
-            }
             store.validate_identity_schema().await?;
             store.validate_identity_provider_schema().await?;
             store.upgrade_identity_caller_validation().await?;
-            store.validate_caller_authority_schema().await
+            store.validate_caller_authority_schema().await?;
+            store.upgrade_model_report(fault).await
+        }
+        Some(marker) if marker == IDENTITY_MODEL_REPORT_SCHEMA_NAME => {
+            store.validate_model_report_schema().await
         }
         Some(marker) => Err(unsupported_schema(&marker)),
         None => Err(unsupported_schema("missing identity schema marker")),
     }
+}
+
+/// One validator for ordinary reopen and transactional upgrade; consumes both schema cursors
+/// before the caller can commit or perform further migration writes.
+async fn validate_model_report_schema_rows(
+    mut runtime_columns: libsql::Rows,
+    mut retired_columns: libsql::Rows,
+) -> Result<(), NexusError> {
+    let mut names = Vec::new();
+    while let Some(row) = runtime_columns.next().await.map_err(store_err)? {
+        names.push(row.get::<String>(1).map_err(store_err)?);
+    }
+    for column in [
+        "model_observer_token",
+        "model_observer_sequence",
+        "model_report_revision",
+        "model_report_json",
+    ] {
+        if !names.iter().any(|name| name == column) {
+            return Err(NexusError::Store(format!(
+                "incomplete {IDENTITY_MODEL_REPORT_SCHEMA_NAME} schema: \
+                 missing agent_runtimes.{column}"
+            )));
+        }
+    }
+    let row = retired_columns
+        .next()
+        .await
+        .map_err(store_err)?
+        .ok_or_else(|| {
+            NexusError::Store("missing retired model runtime identity authority".into())
+        })?;
+    if row.get::<String>(1).map_err(store_err)? != "runtime_id"
+        || row.get::<String>(2).map_err(store_err)? != "TEXT"
+        || row.get::<i64>(3).map_err(store_err)? != 1
+        || row.get::<i64>(5).map_err(store_err)? != 1
+        || retired_columns.next().await.map_err(store_err)?.is_some()
+    {
+        return Err(NexusError::Store(
+            "invalid retired model runtime identity authority".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn rollback_error(tx: crate::state::WriteTxn, error: NexusError) -> Result<(), NexusError> {

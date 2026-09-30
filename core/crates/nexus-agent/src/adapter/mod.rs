@@ -9,8 +9,9 @@ use async_trait::async_trait;
 
 use nexus_common::{NexusError, RuntimeProcessIds};
 use nexus_contracts::{
-    ContractError, HarnessId, InjectError, OperatorAction, ProviderError, ProviderLimit,
-    ProviderLimitReason, ResetHint, SessionId, SteerCapability,
+    ContractError, HarnessId, InjectError, ModelEvidenceCapability, ModelObservationSource,
+    ModelReportBackend, OperatorAction, ProviderError, ProviderLimit, ProviderLimitReason,
+    ResetHint, SessionId, SteerCapability,
 };
 
 pub mod acp;
@@ -18,6 +19,8 @@ pub mod bootstrap;
 pub mod engine;
 pub mod hermes;
 pub mod mock;
+mod model_metadata;
+mod native_reporting;
 pub mod opencode;
 pub mod provider_limit;
 pub mod skill;
@@ -26,8 +29,209 @@ pub mod spawn_spec;
 pub use engine::{AcpEngine, HarnessCommand};
 pub use hermes::HermesAdapter;
 pub use mock::MockAdapter;
+pub use native_reporting::{NativeModelReporting, NativeModelReportingProfile};
 pub use opencode::OpenCodeAdapter;
 pub use spawn_spec::SpawnSpecAdapter;
+
+/// Native ACP metadata paths and their independently supplied, validated provenance identifiers.
+/// This describes decoding support only; it neither enables a collector nor selects a model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcpModelMetadataDialect {
+    ConfigOptions {
+        source: ModelObservationSource,
+    },
+    ConfigOptionsAndLegacyModels {
+        config_options_source: ModelObservationSource,
+        legacy_models_source: ModelObservationSource,
+    },
+}
+
+/// Immutable model-reporting support captured with an adapter factory before construction.
+/// The backend and each native path's source are opaque adapter-owned identifiers, not a shared
+/// harness catalog. A profile is not evidence that a collector is enabled or a launch is current.
+#[derive(Debug, Clone)]
+pub struct AdapterModelReportingProfile {
+    backend: ModelReportBackend,
+    configured: ModelEvidenceCapability,
+    turn_selected: ModelEvidenceCapability,
+    response_reported: ModelEvidenceCapability,
+    dialect: AcpModelMetadataDialect,
+    telemetry: Option<AdapterTelemetryReportingProfile>,
+    identity: nexus_contracts::model_report::ModelProfileIdentity,
+}
+
+impl PartialEq for AdapterModelReportingProfile {
+    fn eq(&self, other: &Self) -> bool {
+        self.backend == other.backend
+            && self.configured == other.configured
+            && self.turn_selected == other.turn_selected
+            && self.response_reported == other.response_reported
+            && self.dialect == other.dialect
+            && self.telemetry == other.telemetry
+    }
+}
+impl Eq for AdapterModelReportingProfile {}
+
+/// Constructed only by the consumed prepared factory from its captured profile and observer.
+#[derive(Clone)]
+pub struct AdapterModelReporting {
+    profile: AdapterModelReportingProfile,
+    sink: std::sync::Arc<dyn nexus_contracts::model_report::ModelObservationSink>,
+}
+impl std::fmt::Debug for AdapterModelReporting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AdapterModelReporting { .. }")
+    }
+}
+impl AdapterModelReporting {
+    pub(crate) fn captured(
+        profile: AdapterModelReportingProfile,
+        sink: std::sync::Arc<dyn nexus_contracts::model_report::ModelObservationSink>,
+    ) -> Self {
+        Self { profile, sink }
+    }
+    pub fn profile(&self) -> &AdapterModelReportingProfile {
+        &self.profile
+    }
+    pub fn sink(&self) -> &dyn nexus_contracts::model_report::ModelObservationSink {
+        self.sink.as_ref()
+    }
+}
+
+/// Immutable category support and exact adapter-owned source. This does not enable a collector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterTelemetryCapability {
+    capability: ModelEvidenceCapability,
+    source: Option<ModelObservationSource>,
+}
+
+impl AdapterTelemetryCapability {
+    pub fn new(
+        capability: ModelEvidenceCapability,
+        source: Option<ModelObservationSource>,
+    ) -> Result<Self, NexusError> {
+        if (capability == ModelEvidenceCapability::Supported) != source.is_some() {
+            return Err(NexusError::Adapter("supported telemetry requires its exact adapter source; unavailable telemetry cannot advertise one".into()));
+        }
+        if let Some(source) = &source {
+            source.validate().map_err(|error| {
+                NexusError::Adapter(format!("invalid telemetry source: {error}"))
+            })?;
+        }
+        Ok(Self { capability, source })
+    }
+    pub fn capability(&self) -> ModelEvidenceCapability {
+        self.capability
+    }
+    pub fn source(&self) -> Option<&ModelObservationSource> {
+        self.source.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterTelemetryReportingProfile {
+    usage: AdapterTelemetryCapability,
+    context: AdapterTelemetryCapability,
+    quota: AdapterTelemetryCapability,
+}
+
+impl AdapterTelemetryReportingProfile {
+    pub fn new(
+        usage: AdapterTelemetryCapability,
+        context: AdapterTelemetryCapability,
+        quota: AdapterTelemetryCapability,
+    ) -> Self {
+        Self {
+            usage,
+            context,
+            quota,
+        }
+    }
+    pub fn usage(&self) -> &AdapterTelemetryCapability {
+        &self.usage
+    }
+    pub fn context(&self) -> &AdapterTelemetryCapability {
+        &self.context
+    }
+    pub fn quota(&self) -> &AdapterTelemetryCapability {
+        &self.quota
+    }
+}
+
+impl AdapterModelReportingProfile {
+    /// Validate a profile. The corrupt-storage tombstone backend `unknown` cannot describe a
+    /// registered adapter; unfamiliar valid backend/source identifiers are preserved exactly.
+    pub fn new(
+        backend: ModelReportBackend,
+        configured: ModelEvidenceCapability,
+        turn_selected: ModelEvidenceCapability,
+        response_reported: ModelEvidenceCapability,
+        dialect: AcpModelMetadataDialect,
+    ) -> Result<Self, NexusError> {
+        let invalid =
+            |error| NexusError::Adapter(format!("invalid model reporting profile: {error}"));
+        backend.validate().map_err(invalid)?;
+        if backend.is_unknown() {
+            return Err(NexusError::Adapter(
+                "model reporting profile cannot use reserved backend unknown".into(),
+            ));
+        }
+        match &dialect {
+            AcpModelMetadataDialect::ConfigOptions { source } => {
+                source.validate().map_err(invalid)?;
+            }
+            AcpModelMetadataDialect::ConfigOptionsAndLegacyModels {
+                config_options_source,
+                legacy_models_source,
+            } => {
+                config_options_source.validate().map_err(invalid)?;
+                legacy_models_source.validate().map_err(invalid)?;
+            }
+        }
+        Ok(Self {
+            backend,
+            configured,
+            turn_selected,
+            response_reported,
+            dialect,
+            telemetry: None,
+            identity: Default::default(),
+        })
+    }
+
+    /// Consume the profile before factory selection; existing constructors remain telemetry-absent.
+    pub fn with_telemetry(mut self, telemetry: AdapterTelemetryReportingProfile) -> Self {
+        self.telemetry = Some(telemetry);
+        self.identity = Default::default();
+        self
+    }
+    pub fn identity(&self) -> &nexus_contracts::model_report::ModelProfileIdentity {
+        &self.identity
+    }
+    pub fn telemetry(&self) -> Option<&AdapterTelemetryReportingProfile> {
+        self.telemetry.as_ref()
+    }
+
+    pub fn backend(&self) -> &ModelReportBackend {
+        &self.backend
+    }
+
+    pub fn configured(&self) -> ModelEvidenceCapability {
+        self.configured
+    }
+
+    pub fn turn_selected(&self) -> ModelEvidenceCapability {
+        self.turn_selected
+    }
+
+    pub fn response_reported(&self) -> ModelEvidenceCapability {
+        self.response_reported
+    }
+
+    pub fn dialect(&self) -> &AcpModelMetadataDialect {
+        &self.dialect
+    }
+}
 
 /// Adapter-owned structured provider-limit metadata before the daemon has attached the Nexus
 /// session id. The agent service wraps this into [`InjectError::ProviderLimit`] at the observed

@@ -1,0 +1,50 @@
+{
+  "runtimeId": "s_telemetry_fixture",
+  "agentId": "a_telemetry_fixture",
+  "harness": "codex",
+  "presence": "online",
+  "active": true,
+  "startedAt": 10,
+  "modelReport": {
+    "backend": "fixture/native",
+    "observerActive": true,
+    "reportRevision": 1,
+    "configured": {"capability": "supported", "status": "unknown"},
+    "turnSelected": {"capability": "unverified", "status": "unknown"},
+    "responseReported": {"capability": "unsupported", "status": "unknown"},
+    "telemetry": {
+      "usage": {
+        "status": "observed", "capability": "supported",
+        "observation": {
+          "metadata": {"nativeSessionId": "native/root", "source": "fixture/usage", "observedAt": 30},
+          "scope": "sessionCumulative", "counterId": "native/session-tokens", "resetId": "usage/epoch1",
+          "inputTokens": 100, "outputTokens": 20, "cacheReadTokens": 70, "reasoningTokens": 12,
+          "totalTokens": 120
+        }
+      },
+      "context": {
+        "status": "observed", "capability": "supported",
+        "observation": {
+          "metadata": {"nativeSessionId": "native/root", "source": "fixture/context", "observedAt": 31},
+          "model": {"modelId": "opaque/native-model", "providerId": "opaque/provider"},
+          "effectiveCapacityTokens": {"value": 1000, "provenance": "native"},
+          "usedTokens": {"value": 250, "provenance": "estimated", "basis": "native/context-estimator"},
+          "remainingPercent": {"value": 75.0, "provenance": "native"},
+          "outputReserveTokens": {"value": 100, "provenance": "native"},
+          "compactionCount": 1, "resetId": "context/epoch2"
+        }
+      },
+      "quota": {
+        "status": "observed", "capability": "supported",
+        "observation": {
+          "metadata": {"nativeSessionId": "native/root", "source": "fixture/quota", "observedAt": 32, "nativeReportedAt": 29},
+          "providerId": "opaque/provider", "accountId": "non-secret/account",
+          "windows": [
+            {"windowId": "five-hour", "units": "percent", "usedPercent": 10.5, "resetsAt": 18000000, "windowSeconds": 18000},
+            {"windowId": "week", "units": "requests", "remaining": 42.0, "limit": 100.0}
+          ]
+        }
+      }
+    }
+  }
+}

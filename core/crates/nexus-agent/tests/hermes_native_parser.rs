@@ -5,6 +5,87 @@ use nexus_contracts::AgentUpdateKind;
 use nexus_transcript::ToolCallPhase;
 use serde_json::json;
 
+#[test]
+fn native_session_model_is_configured_only_and_preserves_exact_native_identity() {
+    use nexus_agent::adapter::hermes::native::{configured_model, model_profile};
+    use nexus_contracts::model_report::{ModelEvidenceField, ModelEvidenceValue};
+    let native: serde_json::Value = serde_json::from_str(include_str!(
+        "../../nexus/tests/fixtures/model_reporting/native.json"
+    ))
+    .unwrap();
+    let row = &native["rows"]["hermes.headed"]["events"][0]["payload"];
+    let update = configured_model(row, "fixture-root", 17).expect("captured native row");
+    assert_eq!(update.native_session_id, "fixture-root");
+    assert_eq!(update.field, ModelEvidenceField::Configured);
+    let ModelEvidenceValue::Observed(observation) = update.value else {
+        panic!("native row supplies configured evidence");
+    };
+    assert_eq!(observation.model_id, row["model"].as_str().unwrap());
+    assert_eq!(
+        observation.native_session_id.as_deref(),
+        Some("fixture-root")
+    );
+    assert_eq!(observation.source.as_str(), "hermes.gateway.session");
+    assert_eq!(observation.observed_at, 17);
+    assert!(observation.provider_id.is_none());
+    assert!(observation.native_turn_id.is_none());
+    assert!(observation.native_message_id.is_none());
+    assert!(observation.native_reported_at.is_none());
+    let profile = model_profile();
+    assert!(profile.telemetry().is_none());
+}
+
+#[test]
+fn native_session_model_rejects_foreign_child_and_ambiguous_lineage() {
+    use nexus_agent::adapter::hermes::native::configured_model;
+    let base = json!({"id":"root", "model":"opaque/model", "parent_session_id":null,
+        "model_config":"{}"});
+    for changed in [
+        json!({"id":"foreign"}),
+        json!({"parent_session_id":"root"}),
+        json!({"parent_session_id":""}),
+        json!({"model_config":"{\"_delegate_from\":\"root\"}"}),
+        json!({"model_config":"{\"_branched_from\":\"root\"}"}),
+        json!({"model_config":"not-json"}),
+        json!({"model_config":"[]"}),
+    ] {
+        let mut row = base.clone();
+        row.as_object_mut()
+            .unwrap()
+            .extend(changed.as_object().unwrap().clone());
+        assert!(configured_model(&row, "root", 1).is_none(), "{row}");
+    }
+    assert!(configured_model(&base, "", 1).is_none());
+}
+
+#[test]
+fn native_session_model_does_not_guess_from_config_and_keeps_invalid_distinct() {
+    use nexus_agent::adapter::hermes::native::configured_model;
+    use nexus_contracts::model_report::ModelEvidenceValue;
+    let base = json!({"id":"root", "parent_session_id":null,
+        "model_config":"{\"model\":\"desired-only\",\"provider\":\"not-authority\"}"});
+    assert!(matches!(
+        configured_model(&base, "root", 1).unwrap().value,
+        ModelEvidenceValue::Unknown(_)
+    ));
+    for model in [json!(null), json!(false), json!(""), json!("  ")] {
+        let mut row = base.clone();
+        row["model"] = model;
+        assert!(matches!(
+            configured_model(&row, "root", 1).unwrap().value,
+            ModelEvidenceValue::Invalid(_)
+        ));
+    }
+    let mut row = base;
+    row["model"] = json!("provider/native/opaque");
+    assert!(matches!(
+        configured_model(&row, "root", 9_007_199_254_740_992)
+            .unwrap()
+            .value,
+        ModelEvidenceValue::Invalid(_)
+    ));
+}
+
 fn row(
     id: i64,
     role: &str,

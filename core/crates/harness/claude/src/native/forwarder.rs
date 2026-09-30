@@ -25,6 +25,7 @@ use crate::native::codec::{
     user_input_event, ClaudeNativeEvent,
 };
 use crate::native::message_delta::parse_message_display_value;
+use crate::native::model_reporting::ClaudeTranscriptRead;
 use crate::native::transcript::{
     parse_hook_record, parse_transcript_value, AssistantText, ClaudeHookRecord, ClaudeToolUpdate,
     TranscriptRecord,
@@ -62,6 +63,20 @@ pub trait ClaudeToolObservationSink: Send + Sync {
 #[async_trait::async_trait]
 pub trait ClaudeHookObservationSink: Send + Sync {
     fn observe_hooks(&self, records: &[ClaudeHookRecord], file_len: Option<u64>, complete: bool);
+    /// A captured reporting floor may precede a display cursor that intentionally skips history.
+    fn model_byte_floor(&self, _path: &Path) -> Option<u64> {
+        None
+    }
+    /// Typed native response facts and absolute source offsets. This is not display-derived
+    /// model evidence; the binding-owned consumer must validate its captured root and source.
+    fn observe_models(
+        &self,
+        _path: &Path,
+        _records: &[(crate::native::model_reporting::ClaudeResponseModel, u64)],
+        _source: Option<&ClaudeTranscriptRead>,
+        _complete: bool,
+    ) {
+    }
     async fn accept_input(&self, _record: &ClaudeHookRecord) -> bool {
         false
     }
@@ -165,8 +180,46 @@ pub async fn forward_once_with_observations(
         producer_ids.admit_streamed(&session.0, &id).await?;
     }
 
-    let (transcript_values, transcript_cursor) =
-        read_new_json_values(&transcript_path, transcript_start_cursor)?;
+    let transcript_read = match read_json_records(&transcript_path, transcript_start_cursor) {
+        Ok(read) => read,
+        Err(error) => {
+            if let Some(hooks) = &hooks {
+                hooks.observe_models(&transcript_path, &[], None, false);
+            }
+            return Err(error);
+        }
+    };
+    if let Some(hooks) = &hooks {
+        let models: Vec<_> = if let Some((source, floor)) = transcript_read
+            .source
+            .as_ref()
+            .zip(hooks.model_byte_floor(&transcript_path))
+        {
+            source.response_models_after(floor)
+        } else {
+            transcript_read
+                .values
+                .iter()
+                .filter_map(|(value, offset)| {
+                    parse_transcript_value(value)?
+                        .response_model
+                        .map(|model| (model, *offset))
+                })
+                .collect()
+        };
+        hooks.observe_models(
+            &transcript_path,
+            &models,
+            transcript_read.source.as_ref(),
+            transcript_read.complete,
+        );
+    }
+    let transcript_cursor = transcript_read.cursor;
+    let transcript_values: Vec<_> = transcript_read
+        .values
+        .into_iter()
+        .map(|(value, _)| value)
+        .collect();
     emit_transcript_records(
         &session,
         events.as_ref(),
@@ -579,17 +632,19 @@ struct JsonRecords {
     cursor: i64,
     file_len: Option<u64>,
     complete: bool,
+    source: Option<ClaudeTranscriptRead>,
 }
 
 fn read_json_records(path: &Path, cursor: i64) -> Result<JsonRecords, NexusError> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    let source = match ClaudeTranscriptRead::open(path) {
+        Ok(source) => source,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(JsonRecords {
                 values: Vec::new(),
                 cursor: cursor.max(0),
                 file_len: None,
                 complete: false,
+                source: None,
             });
         }
         Err(e) => {
@@ -599,6 +654,7 @@ fn read_json_records(path: &Path, cursor: i64) -> Result<JsonRecords, NexusError
             )));
         }
     };
+    let bytes = source.bytes();
     let start = usize::try_from(cursor.max(0))
         .ok()
         .map(|idx| idx.min(bytes.len()))
@@ -624,6 +680,7 @@ fn read_json_records(path: &Path, cursor: i64) -> Result<JsonRecords, NexusError
         cursor: start as i64 + consumed as i64,
         file_len: Some(bytes.len() as u64),
         complete,
+        source: Some(source),
     })
 }
 

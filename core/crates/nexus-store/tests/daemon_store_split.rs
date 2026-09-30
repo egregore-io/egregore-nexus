@@ -125,10 +125,7 @@ async fn legacy_identity_marker_ladder_reopens_and_is_canonicalized() {
             row.get::<String>(1).expect("identity marker name"),
         ));
     }
-    assert_eq!(
-        markers,
-        vec![(1, "v0.1.6_identity_caller_principal".into())]
-    );
+    assert_eq!(markers, vec![(1, "v0.1.6_identity_model_report".into())]);
 
     drop(rows);
     drop(reopened);

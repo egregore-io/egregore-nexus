@@ -191,7 +191,19 @@ where
                 let _ = out_tx.send(response_frame(&id, json!({})));
             }
             "thread/start" => {
-                let thread_id = "fake-thread".to_string();
+                let start_result = std::env::var("FAKE_CODEX_START_RESPONSE")
+                    .ok()
+                    .map(|raw| {
+                        serde_json::from_str::<Value>(&raw)
+                            .expect("FAKE_CODEX_START_RESPONSE: invalid JSON")
+                    })
+                    .unwrap_or_else(
+                        || json!({"thread":{"id":"fake-thread","sessionId":"fake-thread"}}),
+                    );
+                let thread_id = start_result["thread"]["id"]
+                    .as_str()
+                    .unwrap_or("fake-thread")
+                    .to_string();
                 // Register this connection as a subscriber for this thread,
                 // but only if this connection has not already subscribed to it.
                 if subscribed_threads.insert(thread_id.clone()) {
@@ -203,10 +215,7 @@ where
                 // Match real codex: ThreadStartResponse nests the id at
                 // `thread.id`, NOT a flat `threadId`. (A flat-shape fake is what
                 // let the bridge ship a bug that only real codex exposed.)
-                let _ = out_tx.send(response_frame(
-                    &id,
-                    json!({"thread": {"id": thread_id, "sessionId": thread_id}}),
-                ));
+                let _ = out_tx.send(response_frame(&id, start_result));
             }
             "thread/resume" => {
                 // Register this connection as a subscriber for the given thread,
@@ -223,13 +232,20 @@ where
                         tx: out_tx.clone(),
                     });
                 }
-                let resume_result = std::env::var("FAKE_CODEX_RESUME_RESPONSE")
-                    .ok()
-                    .map(|raw| {
-                        serde_json::from_str::<Value>(&raw)
-                            .expect("FAKE_CODEX_RESUME_RESPONSE: invalid JSON")
-                    })
-                    .unwrap_or_else(|| json!({}));
+                let resume_result = if let Ok(raw) = std::env::var("FAKE_CODEX_RESUME_RESPONSES") {
+                    serde_json::from_str::<Value>(&raw)?
+                        .get(&thread_id)
+                        .expect("explicit resume response missing requested fixture root")
+                        .clone()
+                } else {
+                    std::env::var("FAKE_CODEX_RESUME_RESPONSE")
+                        .ok()
+                        .map(|raw| {
+                            serde_json::from_str::<Value>(&raw)
+                                .expect("FAKE_CODEX_RESUME_RESPONSE: invalid JSON")
+                        })
+                        .unwrap_or_else(|| json!({}))
+                };
                 if let Ok(script) = std::env::var("FAKE_CODEX_RESUME_SCRIPT") {
                     for note in serde_json::from_str::<Vec<Value>>(&script)? {
                         let _ = out_tx.send(note.to_string());
@@ -254,8 +270,26 @@ where
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
                 let _ = out_tx.send(response_frame(&id, resume_result));
+                if std::env::var("FAKE_CODEX_RESUME_GATE_THREAD")
+                    .ok()
+                    .as_deref()
+                    == Some(&thread_id)
+                {
+                    if let Ok(replied) = std::env::var("FAKE_CODEX_RESUME_REPLIED") {
+                        std::fs::write(replied, b"reply-attempted")?;
+                    }
+                }
             }
             "turn/start" => {
+                if let (Ok(entered), Ok(release)) = (
+                    std::env::var("FAKE_CODEX_TURN_ENTERED"),
+                    std::env::var("FAKE_CODEX_TURN_RELEASE"),
+                ) {
+                    std::fs::write(entered, b"entered")?;
+                    while !std::path::Path::new(&release).exists() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                }
                 // Get the threadId from the request params.
                 let thread_id = req
                     .get("params")
@@ -348,6 +382,52 @@ where
                             expected_turn_id
                         };
                         let _ = out_tx.send(response_frame(&id, json!({"turnId": turn_id})));
+                        if let Ok(gate) = std::env::var("FAKE_CODEX_STEER_CONSUME_GATE") {
+                            let thread_id = req["params"]["threadId"].as_str().unwrap();
+                            let subscribers = registry.lock().await;
+                            let targets: Vec<_> = subscribers
+                                .iter()
+                                .filter(|sub| sub.thread_id == thread_id)
+                                .map(|sub| sub.tx.clone())
+                                .collect();
+                            drop(subscribers);
+                            // Native acknowledgement precedes input consumption. An unrelated
+                            // active-turn notification must not claim delivery of the new input.
+                            let busy = notification_frame(
+                                "item/agentMessage/delta",
+                                &json!({
+                                    "threadId": thread_id, "turnId": turn_id,
+                                    "itemId": "busy-output", "delta": "still working before input"
+                                }),
+                            );
+                            for tx in &targets {
+                                let _ = tx.send(busy.clone());
+                            }
+                            while !std::path::Path::new(&gate).exists() {
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                            let receipt = if std::fs::read(&gate).unwrap() == b"abort" {
+                                notification_frame(
+                                    "turn/completed",
+                                    &json!({
+                                        "threadId": thread_id,
+                                        "turn": {"id": turn_id, "status": "interrupted"}
+                                    }),
+                                )
+                            } else {
+                                notification_frame(
+                                    "item/completed",
+                                    &json!({
+                                        "threadId": thread_id, "turnId": turn_id,
+                                        "item": {"id": format!("steer-input-{steer_calls}"),
+                                            "type": "userMessage", "content": req["params"]["input"]}
+                                    }),
+                                )
+                            };
+                            for tx in &targets {
+                                let _ = tx.send(receipt.clone());
+                            }
+                        }
                     }
                 }
             }

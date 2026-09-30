@@ -3,6 +3,7 @@ pub mod bridge;
 pub mod client;
 pub mod forwarder;
 pub mod jsonrpc;
+pub mod model_reporting;
 pub mod protocol;
 mod provider_limit;
 pub mod supervisor;

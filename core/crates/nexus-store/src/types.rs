@@ -168,6 +168,14 @@ pub struct AgentRuntimeRow {
     pub last_heartbeat: Option<i64>,
     pub os_pid: Option<i64>,
     pub os_pgid: Option<i64>,
+    /// Private captured observer authority; never include this token in public projections.
+    pub model_observer_token: Option<String>,
+    /// Nonnegative ordering within one owner, reset on replacement/invalidation.
+    pub model_observer_sequence: i64,
+    /// Validated durable authority independent from optional/untrusted report JSON.
+    pub model_report_revision: i64,
+    /// Canonical validated report, omitted (with a diagnostic) if only its JSON is untrusted.
+    pub model_report: Option<nexus_contracts::model_report::RuntimeModelReport>,
 }
 
 impl AgentRuntimeRow {

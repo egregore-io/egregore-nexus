@@ -10,95 +10,101 @@ impl AppState {
         // must never adopt messages accepted after startup as if they were pre-boot backlog.
         let boot_pending_cutoff = now();
         let st = self.clone();
+        let reporting = self.model_reporting.clone();
+        let guard = self
+            .boot_readiness
+            .guard(move || reporting.close_admission());
         tokio::spawn(async move {
-            let identity_restore = st.restore_runtime_identity_sessions_once().await;
-            st.runtime_identity_ready.store(true, Ordering::Release);
-            st.runtime_identity_ready_notify.notify_waiters();
-            if let Err(error) = identity_restore {
-                tracing::error!(
-                    target: "nexus::revive",
-                    error = %error,
-                    "failed to rebuild runtime identity sessions during daemon boot"
-                );
-                return;
+            let initial_presence = async {
+                if let Err(error) = st.restore_minimal_thread_routing_once().await {
+                    tracing::error!(
+                        target: "nexus::boot",
+                        error = %error,
+                        "failed to restore minimal thread routing; thread delivery remains unavailable"
+                    );
+                }
+                if let Err(error) = st.restore_unsettled_delivery_obligations_once().await {
+                    tracing::error!(
+                        target: "nexus::delivery",
+                        error = %error,
+                        "failed to rebuild unsettled delivery state during daemon boot"
+                    );
+                    return Err(error);
+                }
+                // An `injecting` row crossed (or may have crossed) the external harness boundary in a
+                // previous daemon process. Its outcome is unknowable after restart, so fail closed:
+                // terminal DLQ evidence, never an automatic duplicate prompt.
+                match Inbox::new(&st.store).recover_stale_injecting().await {
+                    Ok(recovered) if recovered.count > 0 => tracing::warn!(
+                        target: "nexus::delivery",
+                        count = recovered.count,
+                        "settled stale delivery attempts as delivery_outcome_unknown"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::error!(
+                        target: "nexus::delivery",
+                        %error,
+                        "failed to recover stale delivery attempts; refusing to infer delivery"
+                    ),
+                }
+                if let Err(error) = st.reconcile_claude_resume_ids_once().await {
+                    tracing::warn!(
+                        target: "nexus::revive",
+                        error = %error,
+                        "failed to backfill Claude resume ids during daemon boot"
+                    );
+                }
+                st.adopt_active_pty_runtimes().await;
+                // Presume-dead AFTER adoption: adoption re-registers the transports that
+                // actually survived; every other session still claiming liveness is a
+                // pre-restart fossil (including CLI/MCP peers, which the transport-scoped
+                // reconcile used to skip — the phantom-online class). Runs after adoption so
+                // it cannot stop the runtime rows adoption uses as its worklist.
+                let presume_dead = st.reconcile_boot_presume_dead_once().await;
+                if let Err(error) = &presume_dead {
+                    tracing::warn!(
+                        target: "nexus::presence",
+                        error = %error,
+                        "failed boot presume-dead presence reconcile"
+                    );
+                }
+                let stale = st.reconcile_stale_presence_once().await;
+                if let Err(error) = &stale {
+                    tracing::warn!(
+                        target: "nexus::presence",
+                        error = %error,
+                        "failed to reconcile stale presence during daemon boot"
+                    );
+                }
+                Ok(InitialPresenceOutcome {
+                    presume_dead: presume_dead.map_err(|error| error.to_string()),
+                    stale: stale.map_err(|error| error.to_string()),
+                })
+            };
+            if let Err(error) = run_boot(
+                guard,
+                st.model_reporting.initialize(),
+                async {
+                    st.restore_runtime_identity_sessions_once()
+                        .await
+                        .map(|_| ())
+                },
+                initial_presence,
+                st.respawn_pending_agents_before(boot_pending_cutoff),
+            )
+            .await
+            {
+                tracing::error!(target: "nexus::boot", %error, "daemon boot recovery failed");
             }
-            if let Err(error) = st.restore_minimal_thread_routing_once().await {
-                tracing::error!(
-                    target: "nexus::boot",
-                    error = %error,
-                    "failed to restore minimal thread routing; thread delivery remains unavailable"
-                );
-            }
-            if let Err(error) = st.restore_unsettled_delivery_obligations_once().await {
-                tracing::error!(
-                    target: "nexus::delivery",
-                    error = %error,
-                    "failed to rebuild unsettled delivery state during daemon boot"
-                );
-                return;
-            }
-            // An `injecting` row crossed (or may have crossed) the external harness boundary in a
-            // previous daemon process. Its outcome is unknowable after restart, so fail closed:
-            // terminal DLQ evidence, never an automatic duplicate prompt.
-            match Inbox::new(&st.store).recover_stale_injecting().await {
-                Ok(recovered) if recovered.count > 0 => tracing::warn!(
-                    target: "nexus::delivery",
-                    count = recovered.count,
-                    "settled stale delivery attempts as delivery_outcome_unknown"
-                ),
-                Ok(_) => {}
-                Err(error) => tracing::error!(
-                    target: "nexus::delivery",
-                    %error,
-                    "failed to recover stale delivery attempts; refusing to infer delivery"
-                ),
-            }
-            if let Err(error) = st.reconcile_claude_resume_ids_once().await {
-                tracing::warn!(
-                    target: "nexus::revive",
-                    error = %error,
-                    "failed to backfill Claude resume ids during daemon boot"
-                );
-            }
-            st.adopt_active_pty_runtimes().await;
-            // Presume-dead AFTER adoption: adoption re-registers the transports that
-            // actually survived; every other session still claiming liveness is a
-            // pre-restart fossil (including CLI/MCP peers, which the transport-scoped
-            // reconcile used to skip — the phantom-online class). Runs after adoption so
-            // it cannot stop the runtime rows adoption uses as its worklist.
-            if let Err(error) = st.reconcile_boot_presume_dead_once().await {
-                tracing::warn!(
-                    target: "nexus::presence",
-                    error = %error,
-                    "failed boot presume-dead presence reconcile"
-                );
-            }
-            if let Err(error) = st.reconcile_stale_presence_once().await {
-                tracing::warn!(
-                    target: "nexus::presence",
-                    error = %error,
-                    "failed to reconcile stale presence during daemon boot"
-                );
-            }
-            st.respawn_pending_agents_before(boot_pending_cutoff).await;
         });
     }
 
-    /// Wait until the boot-scoped runtime directory has been rebuilt from persistent identity.
-    /// Production ingress calls this once before starting command and IPC workers; the loop also
-    /// handles a waiter arriving concurrently with the readiness notification.
+    /// Wait for model-owner invalidation and successful persistent identity directory restoration.
+    /// Production calls this before command/IPC ingress, not before adoption or backlog recovery.
+    /// Errors and interrupted boot outcomes remain terminal for current and later waiters.
     #[doc(hidden)]
-    pub async fn wait_for_runtime_identity_ready(&self) {
-        loop {
-            if self.runtime_identity_ready.load(Ordering::Acquire) {
-                return;
-            }
-            let notified = self.runtime_identity_ready_notify.notified();
-            if self.runtime_identity_ready.load(Ordering::Acquire) {
-                return;
-            }
-            notified.await;
-        }
+    pub async fn wait_for_runtime_identity_ready(&self) -> Result<(), NexusError> {
+        self.boot_readiness.wait_ingress().await
     }
 
     /// Run one automatic Claude resume-id harvest pass.
@@ -176,19 +182,8 @@ impl AppState {
         let ts = now();
         self.archive_stale_claude_runtimes(ts).await;
         self.archive_stale_codex_runtimes(ts).await;
-        let stale = Sessions::new(&self.store)
-            .stale_online_rows(ts, self.heartbeat_ttl_ms)
-            .await?;
-        for row in stale {
-            self.presence
-                .mark_transport_offline(&row.session_id)
-                .await?;
-        }
-        // Session rows are only one side of runtime convergence. Preserve the runtime sweep for
-        // already-offline sessions and orphan runtime rows that cannot produce a session status
-        // transition of their own.
-        AgentRuntimes::new(&self.store)
-            .stop_stale(ts, self.heartbeat_ttl_ms)
+        self.presence
+            .reconcile_stale_presence(ts, self.heartbeat_ttl_ms)
             .await?;
         if !self.store.has_split_authority() {
             crate::daemon::agent_session_materializer::abort_open_turns_for_offline_sessions(
@@ -209,15 +204,16 @@ impl AppState {
     /// drain must clear that stale hold before it spawns/rings the loop. Paused sessions remain held:
     /// we stand up the loop for future resume, but keep the registry at `Paused` and do not issue an
     /// explicit ring.
-    pub(crate) fn make_live_agent_wakeable(
+    pub(crate) async fn make_live_agent_wakeable(
         &self,
         session: &SessionId,
         project: &str,
         paused: bool,
     ) {
         let Some(w) = &self.loop_wiring else { return };
+        let transition = w.store.lock_presence_transition().await;
         w.registry.set(session, session_wake_state(paused));
-        w.spawn_loop(session, project);
+        w.spawn_loop_under_transition(session, project, &transition);
         if !paused {
             w.ring(session);
         }
@@ -373,9 +369,13 @@ impl AppState {
         let st = self.clone();
         let interval_ms = (self.heartbeat_ttl_ms.max(2) / 2) as u64;
         tokio::spawn(async move {
+            if let Err(error) = st.boot_readiness.wait_initial_presence().await {
+                tracing::error!(target: "nexus::presence", %error,
+                    "boot did not reach initial presence reconciliation; periodic reconcile not started");
+                return;
+            }
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
-            // Boot reconcile happens after PTY adoption in `spawn_boot_respawn`; skip the immediate
-            // interval tick so this periodic task does not race adoption on daemon startup.
+            // Start the cadence only after adoption and both best-effort initial attempts settle.
             tick.tick().await;
             loop {
                 tick.tick().await;

@@ -57,6 +57,9 @@ use nexus_common::process_ids::runtime_process_ids_for_pid;
 use nexus_common::{NexusError, RuntimeProcessIds};
 use nexus_contracts::{HarnessId, TurnObservation, TurnObservationStamp, TurnState};
 
+use super::model_metadata::{
+    MetadataConnectionGuard, ModelMetadataCollector, OpenRequest, PendingMetadataRequest,
+};
 use super::provider_limit::classify_acp_prompt_error;
 use super::{AdapterInjectError, AdapterOperatorAction};
 
@@ -787,6 +790,8 @@ pub struct LaunchCtx {
     /// compatibility). claude/codex leave this `false` and keep getting the bus over ACP. Default
     /// `false` (inject) for backward-compatible behavior.
     pub suppress_acp_mcp: bool,
+    /// Captured prepared-factory reporting; absent for legacy/unobserved launches.
+    pub model_reporting: Option<super::AdapterModelReporting>,
 }
 
 /// Per-turn streaming state, shared between the SDK notification handler and [`AcpEngine::inject`].
@@ -1121,6 +1126,7 @@ impl PromptEvidence {
 
 /// A live, initialized ACP connection plus the harness's assigned session id.
 struct LiveConn {
+    model_connection_owner: String,
     /// Cloneable SDK connection handle. Outgoing requests/notifications route through the SDK's
     /// own actors, so this is used directly by every method.
     connection: ConnectionTo<Agent>,
@@ -1132,6 +1138,8 @@ struct LiveConn {
 
 /// The real ACP engine. One per launched harness; cheaply shareable (`Arc<dyn Adapter>` wraps it).
 pub struct AcpEngine {
+    reporting: Option<super::AdapterModelReporting>,
+    model_metadata: Arc<Mutex<ModelMetadataCollector>>,
     evidence: Arc<Mutex<PromptEvidence>>,
     /// The live connection, populated by [`AcpEngine::spawn_and_initialize`]. Behind an async
     /// mutex so the `&self` adapter methods can mutate the recorded session id.
@@ -1182,6 +1190,8 @@ impl AcpEngine {
     /// A fresh, unconnected engine.
     pub fn new() -> Self {
         Self {
+            reporting: None,
+            model_metadata: Arc::new(Mutex::new(ModelMetadataCollector::new(None))),
             evidence: Arc::new(Mutex::new(PromptEvidence::new())),
             conn: AsyncMutex::new(None),
             turn_lock: AsyncMutex::new(()),
@@ -1195,6 +1205,18 @@ impl AcpEngine {
             harness: None,
             session_open_timeout: SESSION_OPEN_TIMEOUT,
         }
+    }
+
+    /// Seed immutable reporting before connection initialization. Only the supplied profile's
+    /// verified dialect is decoded; this does not register support for any built-in harness.
+    pub fn with_reporting(mut self, reporting: Option<super::AdapterModelReporting>) -> Self {
+        self.model_metadata = Arc::new(Mutex::new(ModelMetadataCollector::new(reporting.clone())));
+        self.reporting = reporting;
+        self
+    }
+
+    pub fn reporting(&self) -> Option<&super::AdapterModelReporting> {
+        self.reporting.as_ref()
     }
 
     /// A fresh engine that can classify structured ACP prompt failures for `harness`.
@@ -1333,6 +1355,7 @@ impl AcpEngine {
     /// Nexus is a child subreaper and explicitly collects descendants orphaned by a wrapper exit;
     /// the returned future resolves only after bounded group shutdown completes or is reported.
     pub async fn kill(&self) {
+        self.model_metadata.lock().unwrap().close_current();
         {
             let mut evidence = self.evidence.lock().unwrap();
             let connection = evidence.connection.clone();
@@ -1465,13 +1488,15 @@ impl AcpEngine {
             evidence.state = TurnState::Unknown;
             evidence.connection.clone()
         };
+        self.model_metadata.lock().unwrap().begin(&connection_owner);
         tokio::spawn(run_connection(
             stdin,
             stdout,
             child_arc,
             Arc::clone(&self.updates),
             Arc::clone(&self.evidence),
-            connection_owner,
+            connection_owner.clone(),
+            self.model_metadata.clone(),
             is_queue_backed_harness(self.harness.as_ref()),
             init_tx,
             ready_tx,
@@ -1512,6 +1537,7 @@ impl AcpEngine {
             .map_err(|_| NexusError::Adapter("ACP connection handle was not published".into()))?;
 
         *self.conn.lock().await = Some(LiveConn {
+            model_connection_owner: connection_owner,
             connection,
             session_id: None,
             _shutdown_tx: shutdown_tx,
@@ -1531,12 +1557,21 @@ impl AcpEngine {
             let live = guard
                 .as_mut()
                 .ok_or_else(|| NexusError::Adapter("acp engine not connected".into()))?;
-            match tokio::time::timeout(
-                self.session_open_timeout,
-                live.connection.send_request(req).block_task(),
-            )
-            .await
-            {
+            let (sent, _metadata_pending) = {
+                // send_request queues synchronously. Raw response dispatch shares this mutex,
+                // so even an immediate reply cannot beat its exact request/root registration.
+                let mut metadata = self.model_metadata.lock().unwrap();
+                let sent = live.connection.send_request(req);
+                let id = sent.id();
+                metadata.register(&live.model_connection_owner, id.clone(), OpenRequest::New);
+                let pending = PendingMetadataRequest::new(
+                    self.model_metadata.clone(),
+                    live.model_connection_owner.clone(),
+                    id,
+                );
+                (sent, pending)
+            };
+            match tokio::time::timeout(self.session_open_timeout, sent.block_task()).await {
                 Ok(Ok(resp)) => {
                     live.session_id = Some(resp.session_id);
                     self.evidence.lock().unwrap().reset_binding();
@@ -1570,12 +1605,23 @@ impl AcpEngine {
             let live = guard
                 .as_mut()
                 .ok_or_else(|| NexusError::Adapter("acp engine not connected".into()))?;
-            match tokio::time::timeout(
-                self.session_open_timeout,
-                live.connection.send_request(request).block_task(),
-            )
-            .await
-            {
+            let (sent, _metadata_pending) = {
+                let mut metadata = self.model_metadata.lock().unwrap();
+                let sent = live.connection.send_request(request);
+                let id = sent.id();
+                metadata.register(
+                    &live.model_connection_owner,
+                    id.clone(),
+                    OpenRequest::Load(resume_key.into()),
+                );
+                let pending = PendingMetadataRequest::new(
+                    self.model_metadata.clone(),
+                    live.model_connection_owner.clone(),
+                    id,
+                );
+                (sent, pending)
+            };
+            match tokio::time::timeout(self.session_open_timeout, sent.block_task()).await {
                 Ok(Ok(_)) => {
                     let mut evidence = self.evidence.lock().unwrap();
                     if live.session_id.as_ref() == Some(&session_id) {
@@ -2138,6 +2184,7 @@ async fn run_connection(
     updates: Arc<TurnActivity>,
     evidence: Arc<Mutex<PromptEvidence>>,
     connection_owner: String,
+    model_metadata: Arc<Mutex<ModelMetadataCollector>>,
     queue_backed: bool,
     init_tx: oneshot::Sender<Result<(), NexusError>>,
     ready_tx: oneshot::Sender<ConnectionTo<Agent>>,
@@ -2145,6 +2192,8 @@ async fn run_connection(
     closed_tx: oneshot::Sender<()>,
     kill_signal_rx: oneshot::Receiver<oneshot::Sender<()>>,
 ) {
+    let _metadata_connection =
+        MetadataConnectionGuard(model_metadata.clone(), connection_owner.clone());
     let transport = agent_client_protocol::ByteStreams::new(stdin.compat_write(), stdout.compat());
 
     let mut init_tx = Some(init_tx);
@@ -2158,7 +2207,9 @@ async fn run_connection(
             {
                 let evidence = evidence.clone();
                 let connection_owner = connection_owner.clone();
+                let model_metadata = model_metadata.clone();
                 async move |dispatch: Dispatch, _cx: ConnectionTo<Agent>| {
+                    model_metadata.lock().unwrap().dispatch(&connection_owner, &dispatch);
                     let mut facts = evidence.lock().unwrap();
                     if facts.connection == connection_owner {
                         if let Dispatch::Response(result, router) = &dispatch {
@@ -2282,6 +2333,7 @@ async fn run_connection(
         Some(ref mut c) => {
             tokio::select! {
                 result = connect => {
+                    model_metadata.lock().unwrap().close(&connection_owner);
                     evidence.lock().unwrap().disconnected(&connection_owner);
                     if let Err(e) = result {
                         debug!(error = %e, "ACP connection closed with error");
@@ -2289,10 +2341,12 @@ async fn run_connection(
                     terminate_child_process_tree(c, PROCESS_TREE_TERM_GRACE, "connection closed").await;
                 }
                 status = c.wait() => {
+                    model_metadata.lock().unwrap().close(&connection_owner);
                     evidence.lock().unwrap().disconnected(&connection_owner);
                     debug!(?status, "harness process exited; ending ACP connection");
                 }
                 completion = kill_signal_rx => {
+                    model_metadata.lock().unwrap().close(&connection_owner);
                     evidence.lock().unwrap().disconnected(&connection_owner);
                     // engine.kill() was called. Terminate the whole process group so wrapper
                     // descendants cannot re-parent to init and survive the direct child.

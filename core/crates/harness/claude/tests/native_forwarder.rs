@@ -19,6 +19,307 @@ use serde_json::json;
 #[derive(Default)]
 struct CaptureHooks(Mutex<Vec<nexus_harness_claude::native::transcript::ClaudeHookRecord>>);
 
+struct CaptureModelFloor {
+    floor: u64,
+    inner: CaptureModels,
+}
+#[async_trait]
+impl nexus_harness_claude::native::forwarder::ClaudeHookObservationSink for CaptureModelFloor {
+    fn observe_hooks(
+        &self,
+        _: &[nexus_harness_claude::native::transcript::ClaudeHookRecord],
+        _: Option<u64>,
+        _: bool,
+    ) {
+    }
+    fn model_byte_floor(&self, _: &std::path::Path) -> Option<u64> {
+        Some(self.floor)
+    }
+    fn observe_models(
+        &self,
+        path: &std::path::Path,
+        records: &[(
+            nexus_harness_claude::native::model_reporting::ClaudeResponseModel,
+            u64,
+        )],
+        source: Option<&nexus_harness_claude::native::model_reporting::ClaudeTranscriptRead>,
+        complete: bool,
+    ) {
+        self.inner.0.lock().unwrap().push((
+            path.to_owned(),
+            records.to_vec(),
+            source.map(|s| s.len()),
+            complete,
+        ));
+    }
+}
+
+#[tokio::test]
+async fn native_model_admission_floor_survives_display_discovery_at_later_eof() {
+    use nexus_harness_claude::native::forwarder::forward_once_with_observations;
+    use nexus_harness_claude::native::model_reporting::ClaudeTranscriptCheckpoint;
+    let (store, session, paths, sink) = setup("model-floor-before-display").await;
+    let path = paths.bridge_dir.join("real-native.jsonl");
+    let row = json!({"type":"assistant","isSidechain":false,"sessionId":"native","message":{"type":"message","role":"assistant","id":"history","model":"old","content":[]}});
+    let old = row.to_string();
+    std::fs::write(&path, &old).unwrap();
+    let floor = ClaudeTranscriptCheckpoint::capture(&path).unwrap();
+    let capture = Arc::new(CaptureModelFloor {
+        floor: floor.byte_floor(),
+        inner: CaptureModels::default(),
+    });
+    let mut fresh = row;
+    fresh["message"]["id"] = json!("first-after-attach");
+    fresh["message"]["model"] = json!("new-response");
+    std::fs::write(&path, format!("{old}\n{fresh}")).unwrap();
+    std::fs::write(
+        &paths.hook_log_path,
+        json!({"event":"SessionStart","session_id":"native","transcript_path":path}).to_string(),
+    )
+    .unwrap();
+    let stats = forward_once_with_observations(
+        store,
+        session,
+        paths,
+        Arc::new(sink),
+        None,
+        Some(capture.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        stats.text_events, 0,
+        "display keeps its intentional history skip"
+    );
+    let calls = capture.inner.0.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].1.len(),
+        1,
+        "display discovery EOF cannot consume the first newly admitted model response"
+    );
+    assert_eq!(calls[0].1[0].0.native_message_id, "first-after-attach");
+    assert_eq!(calls[0].1[0].0.model, Ok(Some("new-response".into())));
+}
+
+#[test]
+fn native_model_admission_captures_source_before_first_response_and_excludes_partial_history() {
+    use nexus_harness_claude::native::model_reporting::{
+        capture_response_source, ClaudeTranscriptRead,
+    };
+    let dir = temp_dir("response-admission");
+    let hook = dir.join("hooks.jsonl");
+    let transcript = dir.join("native.jsonl");
+    let start = json!({"event":"SessionStart","session_id":"native","transcript_path":transcript});
+    assert!(capture_response_source(&hook, 0, None, None)
+        .unwrap()
+        .is_none());
+    std::fs::write(&hook, "{\"event\":\"SessionStart\"").unwrap();
+    assert!(
+        capture_response_source(&hook, 0, None, None)
+            .unwrap()
+            .is_none(),
+        "partial native hook is pending, not a completed invalid source"
+    );
+    std::fs::write(&hook, "{ invalid }").unwrap();
+    assert!(
+        capture_response_source(&hook, 0, None, None).is_err(),
+        "malformed completed input is not readiness"
+    );
+    std::fs::write(&hook, start.to_string()).unwrap();
+    let proof = capture_response_source(&hook, 0, None, None)
+        .unwrap()
+        .expect("positive new SessionStart resolves source before first prompt");
+    assert_eq!(proof.root(), "native");
+    let checkpoint = proof.into_checkpoint();
+    assert_eq!(
+        checkpoint.byte_floor(),
+        0,
+        "missing at admission is explicit, not later EOF"
+    );
+    let row = json!({"type":"assistant","sessionId":"native","isSidechain":false,"message":{"type":"message","role":"assistant","id":"first","model":"actual","content":[]}}).to_string();
+    std::fs::write(&transcript, &row).unwrap();
+    let first = ClaudeTranscriptRead::open(&transcript).unwrap();
+    assert!(first.continues(&checkpoint));
+    assert_eq!(first.response_models_after(0).len(), 1);
+    // A partially written OLD object at admission cannot acquire a new observed timestamp.
+    std::fs::write(&transcript, &row.as_bytes()[..10]).unwrap();
+    let partial = capture_response_source(&hook, 0, Some("native"), None)
+        .unwrap()
+        .unwrap()
+        .into_checkpoint();
+    let mut next: serde_json::Value = serde_json::from_str(&row).unwrap();
+    next["message"]["id"] = json!("second");
+    std::fs::write(&transcript, format!("{row}\n{next}")).unwrap();
+    let complete = ClaudeTranscriptRead::open(&transcript).unwrap();
+    assert!(complete.continues(&partial));
+    let facts = complete.response_models_after(partial.byte_floor());
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].0.native_message_id, "second");
+    assert!(
+        capture_response_source(&hook, start.to_string().len() as u64, None, None)
+            .unwrap()
+            .is_none(),
+        "historical SessionStart cannot lend a fresh owner its root"
+    );
+    assert!(capture_response_source(&hook, 0, Some("foreign"), None).is_err());
+    drop((checkpoint, first, partial, complete));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn native_model_source_requires_retained_file_and_unchanged_prefix() {
+    use nexus_harness_claude::native::model_reporting::ClaudeTranscriptRead;
+    let dir = temp_dir("model-source-continuity");
+    let path = dir.join("transcript.jsonl");
+    std::fs::write(&path, b"old record\n").unwrap();
+    let initial = ClaudeTranscriptRead::open(&path).unwrap();
+    let floor = initial.checkpoint();
+    assert_eq!(floor.byte_floor(), 11);
+    std::fs::write(&path, b"old record\nnew record\n").unwrap();
+    let appended = ClaudeTranscriptRead::open(&path).unwrap();
+    assert!(appended.continues(&floor));
+    let next = appended.checkpoint();
+    std::fs::write(&path, b"short").unwrap();
+    assert!(
+        !ClaudeTranscriptRead::open(&path).unwrap().continues(&next),
+        "observed truncation loses source authority"
+    );
+    std::fs::write(&path, b"NEW record\nnew record\n").unwrap();
+    assert!(
+        !ClaudeTranscriptRead::open(&path).unwrap().continues(&next),
+        "regrown changed prefix is not an append"
+    );
+    std::fs::rename(&path, dir.join("rotated.jsonl")).unwrap();
+    std::fs::write(&path, b"old record\nnew record\n").unwrap();
+    assert!(
+        !ClaudeTranscriptRead::open(&path).unwrap().continues(&next),
+        "same bytes at replacement path do not inherit retained file identity"
+    );
+    std::fs::remove_file(&path).unwrap();
+    assert!(ClaudeTranscriptRead::open(&path).is_err());
+    drop((initial, appended, floor, next));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[derive(Default)]
+struct CaptureModels(
+    Mutex<
+        Vec<(
+            std::path::PathBuf,
+            Vec<(
+                nexus_harness_claude::native::model_reporting::ClaudeResponseModel,
+                u64,
+            )>,
+            Option<u64>,
+            bool,
+        )>,
+    >,
+);
+
+#[async_trait]
+impl nexus_harness_claude::native::forwarder::ClaudeHookObservationSink for CaptureModels {
+    fn observe_hooks(
+        &self,
+        _: &[nexus_harness_claude::native::transcript::ClaudeHookRecord],
+        _: Option<u64>,
+        _: bool,
+    ) {
+    }
+    fn observe_models(
+        &self,
+        path: &std::path::Path,
+        records: &[(
+            nexus_harness_claude::native::model_reporting::ClaudeResponseModel,
+            u64,
+        )],
+        source: Option<&nexus_harness_claude::native::model_reporting::ClaudeTranscriptRead>,
+        complete: bool,
+    ) {
+        self.0.lock().unwrap().push((
+            path.to_owned(),
+            records.to_vec(),
+            source.map(|s| s.len()),
+            complete,
+        ));
+    }
+}
+
+#[tokio::test]
+async fn native_response_models_use_actual_transcript_records_and_offsets_without_text() {
+    use nexus_harness_claude::native::forwarder::forward_once_with_observations;
+    use nexus_harness_claude::native::transcript::parse_transcript_value;
+    let (store, session, paths, sink) = setup("response-model-offsets").await;
+    let models = Arc::new(CaptureModels::default());
+    let record = json!({"type":"assistant", "isSidechain":false, "sessionId":"native-root", "message":{"type":"message", "role":"assistant", "id":"msg-thinking", "model":"claude-response-exact", "content":[{"type":"thinking", "thinking":"private"}]}});
+    let parsed = parse_transcript_value(&record).unwrap();
+    assert!(parsed.assistant_text.is_empty());
+    assert_eq!(
+        parsed.response_model.as_ref().unwrap().native_message_id,
+        "msg-thinking"
+    );
+    let first = record.to_string();
+    let mut child = record.clone();
+    child["isSidechain"] = json!(true);
+    child["message"]["id"] = json!("child-msg");
+    let bytes = format!("{first}\n{}\n{{\"type\":", child);
+    let path = paths.bridge_dir.join("transcript.jsonl");
+    std::fs::write(&path, &bytes).unwrap();
+    forward_once_with_observations(
+        store.clone(),
+        session.clone(),
+        paths.clone(),
+        Arc::new(sink.clone()),
+        None,
+        Some(models.clone()),
+    )
+    .await
+    .unwrap();
+    {
+        let calls = models.0.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, path);
+        assert_eq!(calls[0].1.len(), 1, "child metadata is not parent evidence");
+        assert_eq!(calls[0].1[0].1, first.len() as u64);
+        assert_eq!(
+            calls[0].1[0].0.model,
+            Ok(Some("claude-response-exact".into()))
+        );
+        assert_eq!(calls[0].2, Some(bytes.len() as u64));
+        assert!(!calls[0].3, "partial native record must remain explicit");
+    }
+    forward_once_with_observations(
+        store.clone(),
+        session.clone(),
+        paths.clone(),
+        Arc::new(sink.clone()),
+        None,
+        Some(models.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        models.0.lock().unwrap()[1].1.is_empty(),
+        "persisted cursor does not replay model records"
+    );
+    std::fs::remove_file(&path).unwrap();
+    forward_once_with_observations(
+        store,
+        session,
+        paths,
+        Arc::new(sink),
+        None,
+        Some(models.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        models.0.lock().unwrap().last().unwrap().2,
+        None,
+        "source loss reaches the binding observer"
+    );
+}
+
 #[async_trait]
 impl nexus_harness_claude::native::forwarder::ClaudeHookObservationSink for CaptureHooks {
     fn observe_hooks(

@@ -52,6 +52,8 @@ pub type ThreadDiscovered = Arc<
 /// Optional behavior for [`CodexBridge::launch_with_options`].
 #[derive(Clone, Default)]
 pub struct BridgeLaunchOptions {
+    /// Captured native model observer supplied before this binding attempt. None is legacy.
+    pub model_reporting: Option<nexus_agent::adapter::NativeModelReporting>,
     /// Existing Codex thread id to resume immediately. When present, the bridge resolves the
     /// existing Codex home that already owns the matching rollout and starts the app-server with
     /// that `CODEX_HOME`, then binds that thread without waiting for a new rollout.
@@ -154,8 +156,9 @@ impl BindingAttempt {
         handle: Arc<()>,
         thread: Option<String>,
         lifecycle: Arc<Lifecycle>,
+        model_reporting: Option<nexus_agent::adapter::NativeModelReporting>,
     ) -> Self {
-        let owner = transport.begin_binding(&session, thread);
+        let owner = transport.begin_binding_with_reporting(&session, thread, model_reporting);
         Self(Arc::new(AttemptInner {
             transport,
             session,
@@ -331,6 +334,7 @@ impl CodexBridge {
         options: BridgeLaunchOptions,
     ) -> Result<PathBuf, CodexRpcError> {
         let BridgeLaunchOptions {
+            model_reporting,
             known_thread_id,
             resume_codex_homes,
             on_thread_discovered,
@@ -428,6 +432,7 @@ impl CodexBridge {
                         identity.clone(),
                         desired_thread_id.clone(),
                         self.lifecycle(&session),
+                        model_reporting.clone(),
                     )
                 };
                 let lifecycle_guard = attempt.enter().await?;
@@ -510,6 +515,7 @@ impl CodexBridge {
                 Arc::new(()),
                 known_thread_id.clone(),
                 self.lifecycle(&session),
+                model_reporting,
             )
         };
         let lifecycle_guard = attempt.enter().await?;

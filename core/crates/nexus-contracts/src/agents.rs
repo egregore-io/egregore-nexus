@@ -10,6 +10,7 @@ use typeshare::typeshare;
 use crate::enums::{AgentAccessRole, Presence};
 use crate::harness::HarnessId;
 use crate::ids::{AgentId, CredentialId, SessionId};
+use crate::model_report::RuntimeModelReport;
 
 /// `nexus agents create <name>` — create a durable agent identity.
 #[typeshare]
@@ -285,6 +286,9 @@ pub struct AgentRuntimeSummary {
     #[typeshare(serialized_as = "Option<number>")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_heartbeat: Option<i64>,
+    /// Independent native model evidence, absent until a model observer publishes a report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_report: Option<RuntimeModelReport>,
 }
 
 /// List runtimes for one durable agent.

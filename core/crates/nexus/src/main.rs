@@ -10,6 +10,7 @@
 //! and is routed through [`nexus::cli::run`].
 //! Identity is resolved server-side; canonical bus writes still happen through daemon services.
 
+use std::future::Future;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +19,7 @@ use clap::Parser;
 
 use nexus::cli::{self, Cli};
 use nexus::daemon::AppState;
-use nexus_common::{init_tracing, new_session_id, now, Config};
+use nexus_common::{init_tracing, new_session_id, now, Config, NexusError};
 use nexus_store::repos::DaemonState;
 
 #[tokio::main]
@@ -130,7 +131,7 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
         AppState::wire_pty_with_gateway_stream(store.clone(), &config, Some(gateway_stream));
 
     // --- Store-backed ingress: producers submit command rows; the daemon executes them. ---
-    state.wait_for_runtime_identity_ready().await;
+    state.wait_for_runtime_identity_ready().await?;
     tracing::info!("nexus daemon runtime identity directory restored");
     let mut command_worker = nexus::daemon::command_worker::spawn(state.clone());
     tracing::info!("nexus daemon command worker running");
@@ -171,20 +172,66 @@ async fn run_daemon() -> Result<(), Box<dyn std::error::Error>> {
     }
     tracing::info!("nexus daemon tearing down recorded transports for shutdown");
     let transports = state.teardown_owned_transports_for_shutdown().await;
-    tracing::info!(transports, "nexus daemon transport teardown complete");
-    tracing::info!("nexus daemon draining command lanes for shutdown");
-    let reaped = nexus::daemon::lifecycle::reap_claimed_command_intents(&store).await?;
     tracing::info!(
-        reaped,
-        "nexus daemon reaped in-flight command intents for shutdown"
+        transports,
+        "nexus daemon transport teardown attempts complete"
     );
-    drop(gateway_stream_socket);
-    // A failed final checkpoint must not turn a completed graceful shutdown into an error
-    // exit — deploy tooling gates on this process's exit code (#29).
-    if let Err(error) = nexus::daemon::lifecycle::checkpoint_wal(&store).await {
+    // Managed offline still needs model admission during transport teardown. This separate
+    // model-only budget bounds the waiter, not owned work or total daemon shutdown time.
+    let model_result = state
+        .drain_model_reporting_for_shutdown(Duration::from_secs(5))
+        .await;
+    finalize_shutdown(
+        model_result,
+        nexus::daemon::lifecycle::reap_claimed_command_intents(&store),
+        || drop(gateway_stream_socket),
+        nexus::daemon::lifecycle::checkpoint_wal(&store),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Finish normal Result-error paths without skipping later cleanup. Cancellation or panic of
+/// this helper is not a cleanup guarantee. Model tasks outlive a canceled waiter only while the
+/// runtime remains alive.
+async fn finalize_shutdown<R, D, C>(
+    model_result: Result<(), NexusError>,
+    reap: R,
+    release_stream: D,
+    checkpoint: C,
+) -> Result<u64, NexusError>
+where
+    R: Future<Output = Result<u64, NexusError>>,
+    D: FnOnce(),
+    C: Future<Output = Result<(), NexusError>>,
+{
+    match &model_result {
+        Ok(()) => tracing::info!("nexus daemon model reporting drained for shutdown"),
+        Err(error) => {
+            tracing::warn!(%error, "nexus daemon model reporting drain failed during shutdown")
+        }
+    }
+    tracing::info!("nexus daemon draining command lanes for shutdown");
+    let reap_result = reap.await;
+    if let Ok(reaped) = &reap_result {
+        tracing::info!(
+            reaped,
+            "nexus daemon reaped in-flight command intents for shutdown"
+        );
+    }
+    release_stream();
+    // A failed final checkpoint remains warning-only (#29), including when an earlier phase
+    // failed. Retain model/reaper causes until every normal-result cleanup has been attempted.
+    if let Err(error) = checkpoint.await {
         tracing::warn!(%error, "final WAL checkpoint failed during shutdown");
     }
-    Ok(())
+    match (model_result, reap_result) {
+        (Ok(()), result) => result,
+        (Err(model), Ok(_)) => Err(model),
+        (Err(model), Err(reap)) => Err(NexusError::Internal(format!(
+            "model reporting drain failed: {model}; command-intent reaping failed: {reap}"
+        ))),
+    }
 }
 
 /// Resolve when the process receives a shutdown signal: Ctrl-C (SIGINT) or, on Unix, SIGTERM (what

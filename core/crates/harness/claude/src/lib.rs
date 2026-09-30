@@ -172,8 +172,9 @@ impl Harness for ClaudeHarness {
 
 /// Install the real Claude adapter factory into a registry.
 pub fn register(registry: &mut nexus_agent::AdapterRegistry) {
-    registry.register(
+    registry.register_observed(
         &nexus_contracts::HarnessId::new("claude").expect("builtin harness id is valid"),
         Arc::new(|ctx| Arc::new(ClaudeAdapter::new(ctx)) as Arc<dyn nexus_agent::Adapter>),
+        ClaudeAdapter::model_reporting_profile(),
     );
 }

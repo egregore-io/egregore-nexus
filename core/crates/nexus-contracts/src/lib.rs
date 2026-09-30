@@ -44,6 +44,7 @@
 //! - [`enums`] — shared closed enums (`Kind`, `Scope`, `Tier`, `Presence`, `DeliveryState`).
 //! - [`harness`] — `HarnessId`, the validated open-set harness identifier.
 //! - [`agents`] — durable agent identities, runtime credentials, and runtime summaries.
+//! - [`model_report`] — independent observation-only runtime model evidence.
 //! - [`project`] — `Project` + register-project request/response.
 //! - [`message`] — `Message` + `Provenance` (in-band tag attrs + stored crypto stamp).
 //! - [`register`] — register handshake, `Whoami`, status/heartbeat (presence), members directory.
@@ -76,15 +77,18 @@ pub mod hooks;
 pub mod ids;
 pub mod message;
 pub mod metadata;
+pub mod model_report;
 pub mod notify;
 pub mod ports;
 pub mod project;
 pub mod prompt;
 pub mod register;
 pub mod rpc;
+pub mod runtime_snapshot;
 pub mod search;
 pub mod send;
 pub mod source;
+pub mod telemetry;
 pub mod threads;
 pub mod topics;
 
@@ -139,6 +143,12 @@ pub use metadata::{
     MessageMetadataMergeRequest, MetadataEntityKind, MetadataGetRequest, MetadataResponse,
     MetadataSetRequest,
 };
+pub use model_report::{
+    ModelEvidenceCapability, ModelEvidenceField, ModelEvidenceSlot, ModelEvidenceValue,
+    ModelInvalidReason, ModelObservation, ModelObservationSink, ModelObservationSource,
+    ModelReportBackend, ModelReportValidationError, ModelUnknownReason, NativeModelUpdate,
+    RuntimeModelReport, MAX_MODEL_REPORT_REVISION,
+};
 pub use notify::{
     NotifyCommandRequest, NotifyRequest, NotifyResponse, NotifySendRequest, NotifyTarget,
     RouteRule, NOTIFY_SIGNATURE_HEADER, NOTIFY_TIMESTAMP_HEADER,
@@ -163,6 +173,11 @@ pub use register::{
     StatusResponse, StatusState, Whoami,
 };
 pub use rpc::{codes, Notification, Request, RequestId, Response, RpcError, JSONRPC_VERSION};
+pub use runtime_snapshot::{
+    RuntimeSnapshotFrame, RuntimeSnapshotTag, RuntimeSubscribeFrame, RuntimeSubscribeTag,
+    RuntimeUnavailableFrame, RuntimeUnavailableReason, RuntimeUnavailableTag,
+    RuntimeUnsubscribeFrame, RuntimeUnsubscribeTag,
+};
 pub use search::{
     HistoryEntry, HistoryRequest, HistoryResponse, SearchHit, SearchMode, SearchRequest,
     SearchResponse,

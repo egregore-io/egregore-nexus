@@ -125,7 +125,7 @@ describe("canonical Gateway REST reads", () => {
       `INSERT INTO identities VALUES
         ('a_codex','codex','alex','lead','admin',
          '{"project":"default","ownerProject":"default"}',1)`,
-      `INSERT INTO runtime_descriptors VALUES
+      `INSERT INTO runtime_descriptors (runtime_id,agent_id,session_id,harness,mode,backend,cwd,native_resume_key,status,updated_at) VALUES
         ('r_old','a_codex','s_old','codex','headless',NULL,NULL,NULL,'stopped',2),
         ('r_live','a_codex','s_live','codex','headless',NULL,NULL,NULL,'busy',3)`,
     ], "write");
@@ -149,7 +149,7 @@ describe("canonical Gateway REST reads", () => {
       `INSERT INTO identities VALUES
         ('a_real','current-name',NULL,'agent','agent','{}',1),
         ('a_other','stale-name',NULL,'agent','agent','{}',1)`,
-      `INSERT INTO runtime_descriptors VALUES
+      `INSERT INTO runtime_descriptors (runtime_id,agent_id,session_id,harness,mode,backend,cwd,native_resume_key,status,updated_at) VALUES
         ('r_real','a_real','s_real','codex','headless',NULL,NULL,NULL,'online',2),
         ('r_other','a_other','s_other','claude','headless',NULL,NULL,NULL,'online',2)`,
     ], "write");
@@ -171,7 +171,7 @@ describe("canonical Gateway REST reads", () => {
       `INSERT INTO identities VALUES
         ('a_real','current-name',NULL,'agent','agent','{}',1),
         ('a_other','stale-name',NULL,'agent','agent','{}',1)`,
-      `INSERT INTO runtime_descriptors VALUES
+      `INSERT INTO runtime_descriptors (runtime_id,agent_id,session_id,harness,mode,backend,cwd,native_resume_key,status,updated_at) VALUES
         ('r_real','a_real','s_real','codex','headless',NULL,NULL,NULL,'online',2),
         ('r_other','a_other','s_other','claude','headless',NULL,NULL,NULL,'online',2)`,
     ], "write");
@@ -193,7 +193,7 @@ describe("canonical Gateway REST reads", () => {
       `INSERT INTO identities VALUES
         ('a_session_owner','session-owner',NULL,'agent','agent','{}',1),
         ('a_runtime_alias','runtime-alias',NULL,'agent','agent','{}',1)`,
-      `INSERT INTO runtime_descriptors VALUES
+      `INSERT INTO runtime_descriptors (runtime_id,agent_id,session_id,harness,mode,backend,cwd,native_resume_key,status,updated_at) VALUES
         ('r_session_owner','a_session_owner','s_collision','codex','headless',NULL,NULL,NULL,'online',2),
         ('s_collision','a_runtime_alias','s_alias','claude','headless',NULL,NULL,NULL,'online',99)`,
     ], "write");
@@ -227,7 +227,7 @@ describe("canonical Gateway REST reads", () => {
       `INSERT INTO identities VALUES
         ('a_collision','id-owner',NULL,'agent','agent','{"marker":"id"}',1),
         ('a_alias_owner','a_collision',NULL,'agent','agent','{"marker":"alias"}',2)`,
-      `INSERT INTO runtime_descriptors VALUES
+      `INSERT INTO runtime_descriptors (runtime_id,agent_id,session_id,harness,mode,backend,cwd,native_resume_key,status,updated_at) VALUES
         ('r_id','a_collision','s_id','codex','headless',NULL,NULL,NULL,'online',2),
         ('r_alias','a_alias_owner','s_alias','claude','headless',NULL,NULL,NULL,'online',2)`,
     ], "write");
@@ -333,7 +333,7 @@ describe("canonical Gateway REST reads", () => {
          '{"project":"default","kind":"agent","currentWork":"shipping"}',1),
         ('a_blake','blake',NULL,'agent','agent',
          '{"project":"other","kind":"agent"}',1)`,
-      `INSERT INTO runtime_descriptors VALUES
+      `INSERT INTO runtime_descriptors (runtime_id,agent_id,session_id,harness,mode,backend,cwd,native_resume_key,status,updated_at) VALUES
         ('r_old','a_ada','s_old','codex','headless','acp','/old',NULL,'stopped',2),
         ('r_live','a_ada','s_live','codex','headed','tmux','/work',NULL,'busy',3),
         ('r_blake','a_blake','s_blake','claude','headless','acp','/work',NULL,'online',4)`,

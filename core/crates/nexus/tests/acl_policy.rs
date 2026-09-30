@@ -13,7 +13,12 @@ use nexus_store::Store;
 async fn test_state() -> AppState {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
-    AppState::wire(store, &Config::default())
+    let state = AppState::wire(store, &Config::default());
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
+    state
 }
 
 fn register_agent(name: &str, client_key: &str) -> RegisterRequest {

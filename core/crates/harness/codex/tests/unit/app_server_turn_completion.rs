@@ -1,4 +1,83 @@
 use super::*;
+use std::future::Future;
+
+#[path = "app_server_model_reporting.rs"]
+mod model_reporting_tests;
+
+impl CodexTurnTracker {
+    pub(crate) fn new_owner(&self, thread: Option<String>) -> Self {
+        self.new_owner_with_reporting(thread, None)
+    }
+}
+
+#[tokio::test]
+async fn closed_turn_without_input_receipt_releases_waiter_without_claiming_delivery() {
+    for close_before_wait in [false, true] {
+        let tracker = CodexTurnTracker::default();
+        tracker.observe_active_turn("thread", "old");
+        if close_before_wait {
+            tracker.complete("thread", "old");
+        }
+        let mut receipt = std::pin::pin!(tracker.wait_for_accepted_user_input_echo(
+            "thread",
+            "old",
+            "not recorded",
+            Duration::from_secs(600),
+        ));
+        if !close_before_wait {
+            std::future::poll_fn(|cx| {
+                assert!(receipt.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            tracker.complete("thread", "old");
+        }
+        tracker.observe_active_turn("thread", "new");
+        let result = tokio::time::timeout(Duration::from_millis(100), receipt)
+            .await
+            .expect("a terminal turn cannot consume new input; do not retain the waiter for600s");
+        assert!(result.is_err(), "closing a turn is not an input receipt");
+        assert_eq!(tracker.active_turn_id("thread").as_deref(), Some("new"));
+    }
+}
+
+#[tokio::test]
+async fn input_receipt_before_terminal_remains_successful() {
+    let tracker = CodexTurnTracker::default();
+    tracker.observe_accepted_user_input_echo("thread", "turn", "recorded");
+    tracker.complete("thread", "turn");
+    assert!(
+        tracker
+            .wait_for_accepted_user_input_echo(
+                "thread",
+                "turn",
+                "recorded",
+                Duration::from_millis(100),
+            )
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn early_reader_terminal_does_not_discard_a_still_unprojected_input_receipt() {
+    let tracker = CodexTurnTracker::default();
+    let mut receipt = Box::pin(tracker.wait_for_accepted_user_input_echo(
+        "thread",
+        "turn",
+        "recorded",
+        Duration::from_secs(1),
+    ));
+    assert!(futures::poll!(&mut receipt).is_pending());
+    tracker.ingest_native(&note("thread", "turn", "turn/completed"));
+    assert!(
+        futures::poll!(&mut receipt).is_pending(),
+        "reader activity is not projected receipt ordering"
+    );
+    tracker.observe_accepted_user_input_echo("thread", "turn", "recorded");
+    tracker.settle_completion("thread", "turn");
+    receipt.await.unwrap();
+}
 
 impl CodexTurnTracker {
     pub(crate) fn live_completion_waiter_count(&self, thread_id: &str, turn_id: &str) -> usize {

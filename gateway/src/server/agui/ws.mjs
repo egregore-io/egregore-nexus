@@ -49,6 +49,7 @@ export function handleWs(socket, request, deps = {}) {
   const commands = new CommandFrames(socket, request, deps, sessionInput, sessionLane);
   const commandQueue = new SessionCommandQueue(socket, request, deps, sessionLane);
   const subscriptions = new DeveloperEventSubscriptions(socket, request, deps);
+  const runtimeSubscriptions = new RuntimeSnapshotSubscriptions(socket, request, deps.runtimeSnapshots);
   const abort = new AbortController();
   let finished = false;
   let resolveClosed;
@@ -62,6 +63,7 @@ export function handleWs(socket, request, deps = {}) {
     sessionLane.fail("agent-session socket closed before lane binding completed");
     abort.abort();
     subscriptions.close();
+    runtimeSubscriptions.close();
     commandQueue.close();
     resolveClosed?.();
   };
@@ -87,6 +89,7 @@ export function handleWs(socket, request, deps = {}) {
       steerInput,
       interruptInput,
       subscriptions,
+      runtimeSubscriptions,
       commands,
       commandQueue,
       sessionLane,
@@ -134,6 +137,71 @@ function hasObserveTarget(request) {
   if (SESSION_EVENTS_PATH.test(url.pathname)) return true;
   const params = url.searchParams;
   return ["session", "agentId", "thread", "dm", "topic"].some((key) => params.get(key));
+}
+
+// Canonical runtime snapshots share this authenticated Gateway socket, not the ephemeral fleet
+// or native status feed. IDs cannot be reused within a socket, including after unsubscribe.
+// Bound both active readers and lifetime IDs; reconnect resets this transport-local namespace.
+function validRuntimeSubscriptionId(value, limit = 128) {
+  return typeof value === "string" && value.length > 0
+    && !/^\p{White_Space}*$/u.test(value) && !/[\uD800-\uDFFF\p{Cc}]/u.test(value)
+    && Buffer.byteLength(value,"utf8") <= limit;
+}
+
+class RuntimeSnapshotSubscriptions {
+  #socket; #request; #source;
+  #active = new Map(); #used = new Set(); #closed = false;
+  constructor(socket, request, source) {
+    this.#socket = socket; this.#request = request; this.#source = source;
+  }
+  subscribe(frame) {
+    if (this.#closed) return;
+    const {subscriptionId, agentId} = frame;
+    if (!validRuntimeSubscriptionId(subscriptionId) || !validRuntimeSubscriptionId(agentId,1024)
+      || Object.keys(frame).some(key => !["t","subscriptionId","agentId"].includes(key))) {
+      sendJson(this.#socket,{t:"input.err",error:"invalid runtime subscription"});return;
+    }
+    if (this.#used.has(subscriptionId)) {
+      sendJson(this.#socket,{t:"input.err",error:"runtime subscription ID already used on this socket"});return;
+    }
+    if (this.#active.size >= 16 || this.#used.size >= 128) {
+      sendJson(this.#socket,{t:"input.err",error:"runtime subscription limit reached; reconnect with fresh IDs"});return;
+    }
+    this.#used.add(subscriptionId);
+    const entry = {close:undefined};
+    this.#active.set(subscriptionId,entry);
+    const send = value => {
+      if (this.#closed || this.#active.get(subscriptionId) !== entry) return false;
+      const payload = JSON.stringify(value);
+      if ((this.#socket.bufferedAmount ?? 0) + Buffer.byteLength(payload,"utf8") > MAX_BUFFERED_AMOUNT) {
+        this.close();this.#socket.close(1013,"runtime.backpressure");return false;
+      }
+      this.#socket.send(payload);return true;
+    };
+    try {
+      if (!this.#source) throw new Error("canonical source unavailable");
+      const reader = this.#source.subscribe(this.#request,subscriptionId,agentId,send);
+      entry.close = () => reader.close();
+      if (this.#closed || this.#active.get(subscriptionId) !== entry) reader.close();
+    } catch {
+      send({t:"runtime.unavailable",subscriptionId,agentId,sequence:1,reason:"unavailable"});
+      this.#active.delete(subscriptionId);
+    }
+  }
+  unsubscribe(frame) {
+    if (!validRuntimeSubscriptionId(frame.subscriptionId) || Object.keys(frame).some(key => !["t","subscriptionId"].includes(key))) {
+      sendJson(this.#socket,{t:"input.err",error:"invalid runtime unsubscribe"});return;
+    }
+    const entry = this.#active.get(frame.subscriptionId);
+    this.#active.delete(frame.subscriptionId);
+    entry?.close?.();
+  }
+  close() {
+    if (this.#closed) return;
+    this.#closed = true;
+    for (const entry of this.#active.values()) entry.close?.();
+    this.#active.clear();this.#used.clear();
+  }
 }
 
 export async function attachAguiWsUpgrade(server, options = {}) {
@@ -324,6 +392,7 @@ async function handleClientFrame(
     steerInput,
     interruptInput,
     subscriptions,
+    runtimeSubscriptions,
     commands,
     commandQueue,
     sessionLane,
@@ -339,6 +408,12 @@ async function handleClientFrame(
   if (frame?.t === "ping") {
     sendJson(socket, { t: "pong" });
     return;
+  }
+  if (frame?.t === "runtime.subscribe") {
+    runtimeSubscriptions.subscribe(frame);return;
+  }
+  if (frame?.t === "runtime.unsubscribe") {
+    runtimeSubscriptions.unsubscribe(frame);return;
   }
   if (frame?.t === "subscribe") {
     subscriptions.subscribe(frame);

@@ -115,6 +115,7 @@ pub struct PtySupervisor {
     /// OpenCode native-plugin bridges keyed by Nexus session id. Kept alive for the lifetime of the
     /// tmux viewer; dropping a bridge shuts down its loopback endpoint.
     opencode_plugins: Arc<Mutex<HashMap<SessionId, Arc<OpenCodePluginBridge>>>>,
+    native_gateways: Arc<Mutex<HashMap<SessionId, Arc<HermesGatewayBridge>>>>,
     runtime_store: Option<Arc<Store>>,
     /// Optional daemon-to-gateway publisher used for Codex app-server tool-call observations.
     gateway_stream: Option<GatewayStreamPublisher>,
@@ -416,6 +417,9 @@ impl HarnessInput for ClaudeNativeHarness {
     }
 
     async fn send_turn(&self, text: &str) -> Result<(), String> {
+        self.completion
+            .wait_for_model_source(CLAUDE_RAW_PROMPT_READY_TIMEOUT)
+            .await?;
         if !self.completion.is_current() {
             return Err("native binding was replaced".into());
         }
@@ -434,6 +438,9 @@ impl HarnessInput for ClaudeNativeHarness {
         text: &str,
         observer: Arc<dyn TurnAcceptanceObserver>,
     ) -> Result<(), String> {
+        self.completion
+            .wait_for_model_source(CLAUDE_RAW_PROMPT_READY_TIMEOUT)
+            .await?;
         if !self.completion.is_current() {
             return Err("native binding was replaced".into());
         }
@@ -574,6 +581,7 @@ impl Default for PtySupervisor {
             tmux_backend: TmuxBackendDriver,
             codex_bridge: CodexBridge::new(),
             opencode_plugins: Arc::new(Mutex::new(HashMap::new())),
+            native_gateways: Arc::new(Mutex::new(HashMap::new())),
             runtime_store: None,
             gateway_stream: None,
             pty_backends: Arc::new(Mutex::new(HashMap::new())),
@@ -621,6 +629,18 @@ pub fn tmux_session_name(session: &SessionId) -> String {
 }
 
 impl PtySupervisor {
+    pub(crate) fn with_current_gateway_model<T>(
+        &self,
+        session: &SessionId,
+        reporting: &nexus_agent::adapter::NativeModelReporting,
+        callback: impl FnOnce(Option<&str>) -> T,
+    ) -> Option<T> {
+        let gateways = self.native_gateways.lock().unwrap();
+        gateways
+            .get(session)?
+            .with_current_model_binding(reporting, callback)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -660,6 +680,7 @@ impl PtySupervisor {
             )) as Arc<dyn CodexToolObservationSink>
         });
         BridgeLaunchOptions {
+            model_reporting: None,
             known_thread_id,
             resume_codex_homes,
             on_thread_discovered,
@@ -755,6 +776,41 @@ impl PtySupervisor {
         events: Option<Arc<dyn EventSink>>,
         bell: Option<Bell>,
     ) -> Result<(), PtyError> {
+        self.launch_headed_pty_observed(
+            session,
+            kind,
+            agent_id,
+            name,
+            project,
+            client_key,
+            nexus_exe,
+            cwd,
+            size,
+            harness_args,
+            events,
+            bell,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn launch_headed_pty_observed(
+        &self,
+        session: &SessionId,
+        kind: &HarnessId,
+        agent_id: &str,
+        name: Option<&str>,
+        project: &str,
+        client_key: &str,
+        nexus_exe: &str,
+        cwd: &str,
+        size: PtySize,
+        harness_args: &[String],
+        events: Option<Arc<dyn EventSink>>,
+        bell: Option<Bell>,
+        model_reporting: Option<nexus_agent::adapter::NativeModelReporting>,
+    ) -> Result<(), PtyError> {
         let harness = require_headed_harness(kind)?;
         let launch_label = name.unwrap_or(agent_id);
         let program = harness.program();
@@ -820,14 +876,24 @@ impl PtySupervisor {
                 "HERMES_HOME".to_string(),
                 profile.home.to_string_lossy().into_owned(),
             ));
-            let bridge = HermesGatewayBridge::start(
-                session.clone(),
-                profile.bridge_socket.clone(),
-                profile.bridge_token.clone(),
-                events,
-                bell,
-            )
-            .map_err(|e| PtyError::Spawn(format!("start Hermes gateway bridge: {e}")))?;
+            let bridge = match model_reporting {
+                Some(reporting) => HermesGatewayBridge::start_observed(
+                    session.clone(),
+                    profile.bridge_socket.clone(),
+                    profile.bridge_token.clone(),
+                    events,
+                    bell,
+                    reporting,
+                ),
+                None => HermesGatewayBridge::start(
+                    session.clone(),
+                    profile.bridge_socket.clone(),
+                    profile.bridge_token.clone(),
+                    events,
+                    bell,
+                ),
+            }
+            .map_err(|e| PtyError::Spawn(format!("start native gateway bridge: {e}")))?;
             env.push((
                 "NEXUS_HERMES_BRIDGE_SOCKET".to_string(),
                 bridge.endpoint().to_string(),
@@ -862,6 +928,11 @@ impl PtySupervisor {
         }
         self.bind_tmux_backend(session, harness.clone())?;
         if let Some((bridge, _)) = hermes_bridge {
+            let mut gateways = self.native_gateways.lock().unwrap();
+            if let Some(old) = gateways.remove(session) {
+                old.revoke_model();
+            }
+            gateways.insert(session.clone(), bridge.clone());
             self.transport.bind(
                 session.clone(),
                 Arc::new(HermesGatewayHarness {
@@ -909,6 +980,41 @@ impl PtySupervisor {
         harness_args: &[String],
         events: Option<Arc<dyn EventSink>>,
         bell: Option<Bell>,
+    ) -> Result<(), PtyError> {
+        self.launch_headed_raw_pty_observed(
+            session,
+            kind,
+            agent_id,
+            name,
+            project,
+            client_key,
+            nexus_exe,
+            cwd,
+            size,
+            harness_args,
+            events,
+            bell,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn launch_headed_raw_pty_observed(
+        &self,
+        session: &SessionId,
+        kind: &HarnessId,
+        agent_id: &str,
+        name: Option<&str>,
+        project: &str,
+        client_key: &str,
+        nexus_exe: &str,
+        cwd: &str,
+        size: PtySize,
+        harness_args: &[String],
+        events: Option<Arc<dyn EventSink>>,
+        bell: Option<Bell>,
+        model_reporting: Option<nexus_agent::adapter::NativeModelReporting>,
     ) -> Result<(), PtyError> {
         let harness = require_headed_harness(kind)?;
         let launch_label = name.unwrap_or(agent_id);
@@ -975,14 +1081,24 @@ impl PtySupervisor {
                 "HERMES_HOME".to_string(),
                 profile.home.to_string_lossy().into_owned(),
             ));
-            let bridge = HermesGatewayBridge::start(
-                session.clone(),
-                profile.bridge_socket.clone(),
-                profile.bridge_token.clone(),
-                events,
-                bell,
-            )
-            .map_err(|e| PtyError::Spawn(format!("start Hermes gateway bridge: {e}")))?;
+            let bridge = match model_reporting {
+                Some(reporting) => HermesGatewayBridge::start_observed(
+                    session.clone(),
+                    profile.bridge_socket.clone(),
+                    profile.bridge_token.clone(),
+                    events,
+                    bell,
+                    reporting,
+                ),
+                None => HermesGatewayBridge::start(
+                    session.clone(),
+                    profile.bridge_socket.clone(),
+                    profile.bridge_token.clone(),
+                    events,
+                    bell,
+                ),
+            }
+            .map_err(|e| PtyError::Spawn(format!("start native gateway bridge: {e}")))?;
             env.push((
                 "NEXUS_HERMES_BRIDGE_SOCKET".to_string(),
                 bridge.endpoint().to_string(),
@@ -1043,6 +1159,11 @@ impl PtySupervisor {
         // Turn input for hermes goes through the gateway bridge, never the PTY; the raw PTY
         // still serves attach/viewer output like any other harness.
         if let Some((bridge, _)) = hermes_bridge {
+            let mut gateways = self.native_gateways.lock().unwrap();
+            if let Some(old) = gateways.remove(session) {
+                old.revoke_model();
+            }
+            gateways.insert(session.clone(), bridge.clone());
             self.transport.bind(
                 session.clone(),
                 Arc::new(HermesRawPtyHarness {
@@ -1355,6 +1476,18 @@ impl PtySupervisor {
         self.opencode_plugins.lock().unwrap().contains_key(id)
     }
 
+    pub(crate) fn with_current_plugin_model<T>(
+        &self,
+        session: &SessionId,
+        reporting: &nexus_agent::adapter::NativeModelReporting,
+        callback: impl FnOnce(&str) -> T,
+    ) -> Option<T> {
+        let bridges = self.opencode_plugins.lock().unwrap();
+        bridges
+            .get(session)?
+            .with_current_model_binding(reporting, callback)
+    }
+
     /// Adopt an already-running daemon-owned tmux harness after a daemon restart.
     ///
     /// Launches use deterministic tmux socket/session names derived from the Nexus session id. When
@@ -1415,6 +1548,9 @@ impl PtySupervisor {
     /// keep running headless). For codex app-server sessions, the forwarder is aborted and the
     /// subprocess is sent SIGTERM via `CodexAppServer::shutdown`.
     pub fn kill(&self, id: &SessionId) -> bool {
+        if let Some(bridge) = self.native_gateways.lock().unwrap().remove(id) {
+            bridge.revoke_model();
+        }
         if let Some(owner) = self.claude_completions.lock().unwrap().remove(id) {
             owner.invalidate();
         }
@@ -1434,6 +1570,9 @@ impl PtySupervisor {
     /// Called on graceful daemon shutdown so harness processes never outlive the daemon.
     /// Returns the count killed.
     pub fn kill_all(&self) -> usize {
+        for (_, bridge) in self.native_gateways.lock().unwrap().drain() {
+            bridge.revoke_model();
+        }
         for (_, owner) in self.claude_completions.lock().unwrap().drain() {
             owner.invalidate();
         }
@@ -1506,6 +1645,7 @@ impl PtySupervisor {
         harness_args: &[String],
         on_thread_discovered: Option<ThreadDiscovered>,
         viewer_backend: &str,
+        model_reporting: Option<nexus_agent::adapter::NativeModelReporting>,
     ) -> Result<(), PtyError> {
         self.start_codex_appserver_session(
             session,
@@ -1526,6 +1666,7 @@ impl PtySupervisor {
             on_thread_discovered,
             false,
             viewer_backend,
+            model_reporting,
         )
         .await
     }
@@ -1553,6 +1694,7 @@ impl PtySupervisor {
         resume_codex_homes: Vec<PathBuf>,
         on_thread_discovered: Option<ThreadDiscovered>,
         viewer_backend: &str,
+        model_reporting: Option<nexus_agent::adapter::NativeModelReporting>,
     ) -> Result<(), PtyError> {
         if !self.codex_bridge.has(session) {
             self.kill(session);
@@ -1576,6 +1718,7 @@ impl PtySupervisor {
             on_thread_discovered,
             false,
             viewer_backend,
+            model_reporting,
         )
         .await
     }
@@ -1601,6 +1744,7 @@ impl PtySupervisor {
         on_thread_discovered: Option<ThreadDiscovered>,
         force_fresh_app_server: bool,
         viewer_backend: &str,
+        model_reporting: Option<nexus_agent::adapter::NativeModelReporting>,
     ) -> Result<(), PtyError> {
         let launch_label = name.unwrap_or(agent_id);
         // The daemon has already reserved and registered this runtime. Install the model-facing
@@ -1637,20 +1781,17 @@ impl PtySupervisor {
             env: codex_appserver_env(session, agent_id, name, project, client_key, nexus_exe),
         };
 
+        let mut bridge_options = self.codex_bridge_options(
+            launch_label,
+            known_thread_id.clone(),
+            resume_codex_homes,
+            on_thread_discovered,
+            force_fresh_app_server,
+        );
+        bridge_options.model_reporting = model_reporting;
         let sock_path = self
             .codex_bridge
-            .launch_with_options(
-                session.clone(),
-                opts,
-                events,
-                self.codex_bridge_options(
-                    launch_label,
-                    known_thread_id.clone(),
-                    resume_codex_homes,
-                    on_thread_discovered,
-                    force_fresh_app_server,
-                ),
-            )
+            .launch_with_options(session.clone(), opts, events, bridge_options)
             .await
             .map_err(|e| PtyError::Spawn(format!("codex app-server launch failed: {e}")))?;
         let tui_thread_id = self
@@ -1905,6 +2046,7 @@ impl PtySupervisor {
         harness_args: &[String],
         resume_isolated_store: bool,
         viewer_backend: &str,
+        reporting: Option<nexus_agent::adapter::NativeModelReporting>,
     ) -> Result<(), PtyError> {
         let backend_kind = opencode_viewer_backend_kind(viewer_backend)?;
         let opencode_bin = resolve_opencode_executable(
@@ -1912,13 +2054,27 @@ impl PtySupervisor {
             std::env::var("PATH").ok().as_deref(),
         )
         .map_err(PtyError::Spawn)?;
+        let observed = reporting.is_some();
         let bridge = Arc::new(
-            OpenCodePluginBridge::start(
-                session.clone(),
-                events,
-                OpenCodePluginBridgeOptions::default(),
-            )
-            .await
+            match reporting {
+                Some(reporting) => {
+                    OpenCodePluginBridge::start_observed(
+                        session.clone(),
+                        events,
+                        OpenCodePluginBridgeOptions::default(),
+                        reporting,
+                    )
+                    .await
+                }
+                None => {
+                    OpenCodePluginBridge::start(
+                        session.clone(),
+                        events,
+                        OpenCodePluginBridgeOptions::default(),
+                    )
+                    .await
+                }
+            }
             .map_err(|e| PtyError::Spawn(format!("opencode plugin bridge failed: {e}")))?,
         );
         let files = write_opencode_plugin_files(&PathBuf::from(state_dir), session)
@@ -1929,6 +2085,10 @@ impl PtySupervisor {
         let mut args = vec![files.serve_path.to_string_lossy().into_owned()];
         args.extend(harness_args.iter().cloned());
         let mut env = nexus_runtime_env(session, agent_id, name, project, client_key, "opencode");
+        env.push((
+            "NEXUS_NATIVE_READY_OWNER".into(),
+            bridge.endpoint().ready_owner().into(),
+        ));
         env.push((
             "NEXUS_OPENCODE_BRIDGE_URL".to_string(),
             bridge.endpoint().base_url().to_string(),
@@ -2005,6 +2165,29 @@ impl PtySupervisor {
             ViewerRuntime::Tmux(harness)
         };
         let opencode_ready = read_opencode_plugin_ready(&files.ready_path)?;
+        if observed {
+            let expected =
+                crate::daemon::services::runtime_helpers::opencode_resume_session_id(harness_args);
+            let accepted = opencode_ready.ready_owner.as_deref()
+                == Some(bridge.endpoint().ready_owner())
+                && opencode_ready.session_id.as_deref().is_some_and(|root| {
+                    expected.is_none_or(|expected| expected == root) && bridge.bind_model_root(root)
+                });
+            if !accepted {
+                bridge.shutdown();
+                match &runtime {
+                    ViewerRuntime::Raw(pty) => {
+                        let _ = pty.kill();
+                    }
+                    ViewerRuntime::Tmux(harness) => {
+                        let _ = harness.kill();
+                    }
+                }
+                return Err(PtyError::Spawn(
+                    "native ready root does not match captured reporting owner".into(),
+                ));
+            }
+        }
         self.persist_opencode_plugin_state(
             session,
             &files.data_dir.join("opencode.db"),
@@ -2045,6 +2228,10 @@ impl PtySupervisor {
                 harness as Arc<dyn HarnessInput>
             }
         };
+        let mut bridges = self.opencode_plugins.lock().unwrap();
+        if let Some(old) = bridges.remove(session) {
+            old.shutdown();
+        }
         self.transport.bind(
             session.clone(),
             Arc::new(OpenCodeHeadedHarness::new(
@@ -2052,10 +2239,7 @@ impl PtySupervisor {
                 runtime_input,
             )),
         );
-        self.opencode_plugins
-            .lock()
-            .unwrap()
-            .insert(session.clone(), bridge);
+        bridges.insert(session.clone(), bridge);
         Ok(())
     }
 
@@ -2339,7 +2523,7 @@ fn hermes_gateway_profile(
             .join(format!("nexus-{}-{safe_name}", session.0)),
         source_home,
         bridge_socket: base.join("bridge.sock"),
-        bridge_token: format!("nexus-hermes-{}", session.0),
+        bridge_token: uuid::Uuid::new_v4().to_string(),
         nexus_name: name.to_string(),
         session_id: session.clone(),
     })
@@ -2471,6 +2655,7 @@ fn kill_tmux_session_if_exists(session_name: &str) {
 struct OpenCodePluginReady {
     session_id: Option<String>,
     pid: Option<u32>,
+    ready_owner: Option<String>,
 }
 
 fn read_opencode_plugin_ready(ready_path: &Path) -> Result<OpenCodePluginReady, PtyError> {
@@ -2487,7 +2672,15 @@ fn read_opencode_plugin_ready(ready_path: &Path) -> Result<OpenCodePluginReady, 
         .get("pid")
         .and_then(|v| v.as_u64())
         .and_then(|pid| u32::try_from(pid).ok());
-    Ok(OpenCodePluginReady { session_id, pid })
+    let ready_owner = ready
+        .get("readyOwner")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    Ok(OpenCodePluginReady {
+        session_id,
+        pid,
+        ready_owner,
+    })
 }
 
 fn opencode_plugin_ready_is_complete(ready_path: &Path) -> bool {

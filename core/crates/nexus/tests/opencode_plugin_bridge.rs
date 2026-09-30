@@ -38,6 +38,247 @@ impl CaptureSink {
     }
 }
 
+struct NativeCapture {
+    profile: nexus_contracts::model_report::ModelProfileIdentity,
+    closed: std::sync::atomic::AtomicBool,
+    root: Mutex<Option<String>>,
+    updates: Mutex<Vec<nexus_contracts::model_report::NativeModelUpdate>>,
+}
+impl nexus_contracts::model_report::ModelObservationSink for NativeCapture {
+    fn accepts_profile(
+        &self,
+        profile: &nexus_contracts::model_report::ModelProfileIdentity,
+    ) -> bool {
+        !self.closed.load(std::sync::atomic::Ordering::SeqCst) && self.profile.matches(profile)
+    }
+    fn bind_native_root(&self, root: &str) -> bool {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        let mut current = self.root.lock().unwrap();
+        if current.as_deref().is_some_and(|old| old != root) {
+            return false;
+        }
+        *current = Some(root.into());
+        true
+    }
+    fn observe(&self, update: nexus_contracts::model_report::NativeModelUpdate) -> bool {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst)
+            || self.root.lock().unwrap().as_deref() != Some(&update.native_session_id)
+        {
+            return false;
+        }
+        self.updates.lock().unwrap().push(update);
+        true
+    }
+    fn revoke(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+fn native_capture() -> (
+    Arc<NativeCapture>,
+    nexus_agent::adapter::NativeModelReporting,
+) {
+    let profile = nexus_agent::adapter::opencode::native::model_profile();
+    let sink = Arc::new(NativeCapture {
+        profile: profile.identity().clone(),
+        closed: false.into(),
+        root: Mutex::new(None),
+        updates: Mutex::new(vec![]),
+    });
+    let reporting = profile.capture(sink.clone()).unwrap();
+    (sink, reporting)
+}
+
+#[tokio::test]
+async fn model_bridge_requires_captured_root_and_bounds_owner_lifetime() {
+    use nexus_contracts::model_report::ModelEvidenceValue;
+    let (sink, reporting) = native_capture();
+    let bridge = OpenCodePluginBridge::start_observed(
+        SessionId("s_model".into()),
+        Arc::new(CaptureSink::default()),
+        Default::default(),
+        reporting.clone(),
+    )
+    .await
+    .unwrap();
+    let info = json!({"sessionID":"ses_exact","id":"msg_one","role":"assistant","modelID":"native-selected","providerID":"opaque"});
+    bridge
+        .http_json(
+            "POST",
+            "/model",
+            Some(info.clone()),
+            bridge.endpoint().token(),
+        )
+        .await;
+    assert!(
+        sink.updates.lock().unwrap().is_empty(),
+        "events cannot supply the root"
+    );
+    assert!(bridge.bind_model_root("ses_exact"));
+    assert!(!bridge.bind_model_root("ses_replacement"));
+    assert_eq!(
+        bridge.with_current_model_binding(&reporting, |root| root.to_owned()),
+        Some("ses_exact".into())
+    );
+    let (_, foreign) = native_capture();
+    assert_eq!(
+        bridge.with_current_model_binding(&foreign, |_| panic!("foreign callback")),
+        None::<()>
+    );
+    let (status, _) = bridge
+        .http_json("POST", "/model", Some(info.clone()), "wrong-token")
+        .await;
+    assert_eq!(status, 401);
+    let mut child = info.clone();
+    child["sessionID"] = json!("ses_child");
+    bridge
+        .http_json("POST", "/model", Some(child), bridge.endpoint().token())
+        .await;
+    assert!(sink.updates.lock().unwrap().is_empty());
+    for _ in 0..2 {
+        assert_eq!(
+            bridge
+                .http_json(
+                    "POST",
+                    "/model",
+                    Some(info.clone()),
+                    bridge.endpoint().token()
+                )
+                .await
+                .0,
+            204
+        );
+    }
+    let mut repeated_without_model = info.clone();
+    repeated_without_model
+        .as_object_mut()
+        .unwrap()
+        .remove("modelID");
+    bridge
+        .http_json(
+            "POST",
+            "/model",
+            Some(repeated_without_model),
+            bridge.endpoint().token(),
+        )
+        .await;
+    let updates = sink.updates.lock().unwrap().clone();
+    assert_eq!(
+        updates.len(),
+        1,
+        "repeated cumulative message is not new evidence"
+    );
+    assert!(
+        matches!(&updates[0].value, ModelEvidenceValue::Observed(value) if value.model_id == "native-selected")
+    );
+    bridge.shutdown();
+    assert!(sink.closed.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        bridge.with_current_model_binding(&reporting, |_| true),
+        None
+    );
+    let (_new_sink, new) = native_capture();
+    assert!(new.sink().accepts_profile(new.profile().identity()));
+}
+
+#[tokio::test]
+async fn model_bridge_replay_exhaustion_and_drop_close_only_captured_reporting() {
+    let (sink, reporting) = native_capture();
+    let bridge = OpenCodePluginBridge::start_observed(
+        SessionId("s_exhaust".into()),
+        Arc::new(CaptureSink::default()),
+        Default::default(),
+        reporting,
+    )
+    .await
+    .unwrap();
+    assert!(bridge.bind_model_root("ses_exact"));
+    let input = bridge.input();
+    bridge.http_json("POST", "/model", Some(json!({"sessionID":"ses_exact","id":"m".repeat(262145),"role":"assistant","modelID":"native"})), bridge.endpoint().token()).await;
+    assert!(sink.closed.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(sink.updates.lock().unwrap().is_empty());
+    assert!(
+        input.is_alive(),
+        "model exhaustion does not change delivery policy"
+    );
+    let (other, reporting) = native_capture();
+    let other_bridge = OpenCodePluginBridge::start_observed(
+        SessionId("s_drop".into()),
+        Arc::new(CaptureSink::default()),
+        Default::default(),
+        reporting,
+    )
+    .await
+    .unwrap();
+    let retained_input = other_bridge.input();
+    drop(other_bridge);
+    assert!(other.closed.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!retained_input.is_alive());
+}
+
+#[tokio::test]
+async fn model_generated_plugin_forwards_original_metadata_to_actual_bridge() {
+    // Node is required for this integration gate: never silently turn it into a passing skip.
+    let tmp = tempfile::tempdir().unwrap();
+    let files =
+        write_opencode_plugin_files(tmp.path(), &SessionId("s_generated_model".into())).unwrap();
+    let (sink, reporting) = native_capture();
+    let bridge = OpenCodePluginBridge::start_observed(
+        SessionId("s_generated_model".into()),
+        Arc::new(CaptureSink::default()),
+        Default::default(),
+        reporting,
+    )
+    .await
+    .unwrap();
+    assert!(bridge.bind_model_root("ses_exact"));
+    let script = r#"
+import { pathToFileURL } from 'node:url';
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (url, init) => {
+  if (String(url).endsWith('/turn/next')) return new Promise(() => {});
+  if (String(url).startsWith('http://native.invalid/')) return new Response(JSON.stringify({id:'ses_exact'}), {status:200});
+  return realFetch(url, init);
+};
+const { nexus } = await import(pathToFileURL(process.argv[1]).href);
+const hooks = await nexus();
+await hooks.event({event:{type:'session.created',properties:{info:{id:'ses_foreign'}}}});
+await hooks.event({event:{type:'message.updated',properties:{info:{sessionID:'ses_foreign',id:'m_child',role:'assistant',modelID:'child'}}}});
+await hooks.event({event:{type:'message.updated',properties:{info:{sessionID:'ses_exact',id:'m_real',role:'assistant',modelID:'selected-opaque',providerID:'native-provider',time:{created:123}}}}});
+process.exit(0);
+"#;
+    let output = tokio::process::Command::new("node")
+        .args(["--input-type=module", "--eval", script])
+        .arg(&files.plugin_path)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("NEXUS_OPENCODE_BRIDGE_URL", bridge.endpoint().base_url())
+        .env("NEXUS_OPENCODE_BRIDGE_TOKEN", bridge.endpoint().token())
+        .env("NEXUS_OPENCODE_SERVER_URL", "http://native.invalid")
+        .env("OPENCODE_SERVER_PASSWORD", "fixture")
+        .env("NEXUS_NAME", "fixture")
+        .env("NEXUS_OPENCODE_PROMPT_MODEL", "must-not-report/request")
+        .kill_on_drop(true)
+        .output()
+        .await
+        .expect("required Node fixture runtime");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let updates = sink.updates.lock().unwrap();
+    assert_eq!(updates.len(), 1);
+    let nexus_contracts::model_report::ModelEvidenceValue::Observed(value) = &updates[0].value
+    else {
+        panic!("observed")
+    };
+    assert_eq!(value.model_id, "selected-opaque");
+    assert_eq!(value.provider_id.as_deref(), Some("native-provider"));
+    assert_eq!(value.native_message_id.as_deref(), Some("m_real"));
+}
+
 #[tokio::test]
 async fn send_turn_waits_until_plugin_reports_completion() {
     let sink = Arc::new(CaptureSink::default());

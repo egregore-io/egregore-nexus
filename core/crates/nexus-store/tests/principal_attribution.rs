@@ -230,10 +230,7 @@ async fn split_identity_provider_store_upgrades_the_same_command_authority() {
     store.migrate().await.expect("upgrade split identity store");
 
     assert!(column_exists(&store, "command_intents", "caller_principal_id").await);
-    assert_eq!(
-        schema_marker(&store).await,
-        "v0.1.6_identity_caller_principal"
-    );
+    assert_eq!(schema_marker(&store).await, "v0.1.6_identity_model_report");
 }
 
 async fn column_exists(store: &Store, table: &str, column: &str) -> bool {

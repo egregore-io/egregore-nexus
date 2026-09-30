@@ -106,6 +106,20 @@ fn os_pid_alive(pid: u32) -> bool {
 }
 
 impl CodexAppServerTransport {
+    /// Execute without awaiting only when this exact captured reporting owner is still bound.
+    pub fn with_current_model_binding<T>(
+        &self,
+        session: &SessionId,
+        reporting: &nexus_agent::adapter::NativeModelReporting,
+        f: impl FnOnce(&str) -> T,
+    ) -> Option<T> {
+        let sessions = self.sessions.lock().unwrap();
+        let binding = sessions.get(session)?.binding.as_ref()?;
+        binding
+            .tracker
+            .with_model_binding(&binding.thread_id, reporting, f)
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -132,12 +146,23 @@ impl CodexAppServerTransport {
         session: &SessionId,
         thread: Option<String>,
     ) -> CodexTurnTracker {
+        self.begin_binding_with_reporting(session, thread, None)
+    }
+
+    pub(super) fn begin_binding_with_reporting(
+        &self,
+        session: &SessionId,
+        thread: Option<String>,
+        reporting: Option<nexus_agent::adapter::NativeModelReporting>,
+    ) -> CodexTurnTracker {
         let mut sessions = self.sessions.lock().unwrap();
         let slot = sessions.entry(session.clone()).or_default();
         if let Some(previous) = slot.candidate.take() {
             previous.revoke_owner();
         }
-        let owner = self.turn_tracker.new_owner(thread);
+        let owner = self
+            .turn_tracker
+            .new_owner_with_reporting(thread, reporting);
         slot.candidate = Some(owner.clone());
         owner
     }
@@ -508,8 +533,16 @@ impl CodexAppServerTransport {
             tracker,
             ..
         } = self.client_for(recipient)?;
-        let queued_event = tracker.queue_accepted_event(&thread_id, events, accepted_event);
+        let queued_event =
+            tracker.queue_accepted_event_on_native_user_input(&thread_id, events, accepted_event);
         let accepted_echo = tracker.queue_accepted_user_input_echo(&thread_id, text.clone());
+        let mut acceptance_cleanup = PromptAcceptanceCleanup {
+            tracker: tracker.clone(),
+            accepted_event: queued_event.clone(),
+            accepted_echo: accepted_echo.clone(),
+            text: text.clone(),
+            turn_id: None,
+        };
 
         let decision = self
             .steer_active(&client, &tracker, &thread_id, &text)
@@ -520,10 +553,8 @@ impl CodexAppServerTransport {
                 error
             })?;
 
-        tracker
-            .emit_accepted_event(&queued_event, decision.turn_id.as_deref())
-            .await;
         if let Some(turn_id) = decision.turn_id.as_deref() {
+            acceptance_cleanup.turn_id = Some(turn_id.to_owned());
             tracker.record_accepted_user_input_echo_for_queued(&accepted_echo, turn_id);
             tracker
                 .wait_for_accepted_user_input_echo(
@@ -535,9 +566,7 @@ impl CodexAppServerTransport {
                 .await
                 .map_err(|error| ContractError {
                     code: -32004,
-                    message: format!(
-                        "timed out waiting for codex native steer context receipt: {error}"
-                    ),
+                    message: format!("codex native steer context receipt unavailable: {error}"),
                 })?;
         }
         Ok(SteerResponse {

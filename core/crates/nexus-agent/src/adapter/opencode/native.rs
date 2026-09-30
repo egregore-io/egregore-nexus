@@ -1,8 +1,8 @@
-//! Native OpenCode session event translation.
+//! Native session event translation.
 //!
 //! Headed OpenCode writes structured records to its `opencode.db` `event` table. This module owns
 //! the pure row-to-`agent.update` translation used by the daemon-side forwarder; it deliberately
-//! does no process management and never reads terminal output. OpenCode `message.part.updated`
+//! does no process management and never reads terminal output. Native `message.part.updated`
 //! records carry cumulative text per part, so the translator keeps a small per-part cursor and emits
 //! only the newly appended suffix.
 
@@ -13,6 +13,87 @@ use nexus_contracts::AgentUpdateKind;
 use nexus_transcript::{ToolCallObservation, ToolCallPhase};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+/// The native assistant constructor records selection, not provider response resolution.
+pub fn model_profile() -> super::super::NativeModelReportingProfile {
+    use nexus_contracts::{ModelEvidenceCapability as Capability, ModelReportBackend};
+    super::super::NativeModelReportingProfile::new(
+        ModelReportBackend::new("opencode.plugin").unwrap(),
+        Capability::Unverified,
+        Capability::Supported,
+        Capability::Unverified,
+    )
+    .unwrap()
+}
+
+/// Decode original assistant metadata under a separately captured native root.
+pub fn selected_model(
+    info: &Value,
+    root: &str,
+    observed_at: i64,
+) -> Option<nexus_contracts::model_report::NativeModelUpdate> {
+    use nexus_contracts::model_report::{
+        ModelEvidenceField, ModelEvidenceValue, NativeModelUpdate,
+    };
+    use nexus_contracts::{
+        ModelInvalidReason, ModelObservation, ModelObservationSource, ModelUnknownReason,
+    };
+    if root.trim().is_empty()
+        || info.get("sessionID").and_then(Value::as_str) != Some(root)
+        || info.get("role").and_then(Value::as_str) != Some("assistant")
+    {
+        return None;
+    }
+    let message = info
+        .get("id")?
+        .as_str()
+        .filter(|id| !id.trim().is_empty())?;
+    let invalid = || ModelEvidenceValue::Invalid(ModelInvalidReason::MalformedNativeMetadata);
+    let decode = || {
+        let Some(model) = info.get("modelID") else {
+            return ModelEvidenceValue::Unknown(ModelUnknownReason::AwaitingNativeMetadata);
+        };
+        let Some(model) = model.as_str() else {
+            return invalid();
+        };
+        let provider = match info.get("providerID") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) => Some(value.clone()),
+            Some(_) => return invalid(),
+        };
+        let native_reported_at = match info.get("time") {
+            None => None,
+            Some(Value::Object(time)) => match time.get("created") {
+                None => None,
+                Some(value) => match value.as_i64() {
+                    Some(value) => Some(value),
+                    None => return invalid(),
+                },
+            },
+            Some(_) => return invalid(),
+        };
+        let observation = ModelObservation {
+            model_id: model.into(),
+            provider_id: provider,
+            source: ModelObservationSource::new("opencode.plugin.assistant").unwrap(),
+            observed_at,
+            native_session_id: Some(root.into()),
+            native_turn_id: None,
+            native_message_id: Some(message.into()),
+            native_reported_at,
+        };
+        if observation.validate().is_ok() {
+            ModelEvidenceValue::Observed(observation)
+        } else {
+            invalid()
+        }
+    };
+    Some(NativeModelUpdate {
+        native_session_id: root.into(),
+        field: ModelEvidenceField::TurnSelected,
+        value: decode(),
+    })
+}
 
 /// One row from OpenCode's native `event` table.
 #[derive(Debug, Clone, PartialEq)]

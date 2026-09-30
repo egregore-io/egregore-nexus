@@ -4,8 +4,8 @@
 
 The gateway exposes the bus over a REST API under `/api/v1/*`. This is the front door for
 humans and external HTTP clients. Under the hood each endpoint is a thin translator: reads and
-writes cross the daemon's boot-scoped local IPC endpoint. The daemon owns command persistence,
-canonical tables, policy, and read projections; the gateway never opens the durable store.
+writes cross the daemon's boot-scoped local IPC endpoint. The daemon owns transport/runtime
+authority; canonical product reads use the Gateway's own projected store, not the daemon database.
 
 CLI/MCP `dm`, `post`, `reply`, `publish`, and generic `send` use the same Message Post
 command-intent path.
@@ -34,6 +34,47 @@ mode defaults to `--discovery=none` so local smoke tests cannot overwrite the sh
 Discovery writers remove their own record on clean exit, and discovery consumers should verify the
 recorded PID plus `/api/v1/health` before using the URL. The package split does not change the
 gateway URL contract used by Lens or other local clients.
+
+## Canonical runtime WebSocket snapshots
+
+Use the existing `/api/agui/ws` socket without an observe target. Send:
+
+```json
+{"t":"runtime.subscribe","subscriptionId":"connection1/brief1","agentId":"a_exact"}
+```
+
+The first successful response is a complete canonical snapshot, including stopped history:
+
+```json
+{"t":"runtime.snapshot","subscriptionId":"connection1/brief1","agentId":"a_exact","sequence":1,"runtimes":[]}
+```
+
+Rows have the same runtime fields as `/api/v1/agents/:agentId/runtimes?includeStopped=true`,
+including optional validated `modelReport`. An empty list is authoritative absence, not a read
+failure. Native reporting capabilities/collectors are still being integrated; no observation means
+unavailable, not zero usage or an inferred quota/context value.
+
+Every read uses the socket's credentials through that authenticated REST route. Post-commit Gateway
+change signals trigger serialized rereads; a signal during an awaited read invalidates that read.
+Read/authentication failure sends `runtime.unavailable` with the same IDs, the next `sequence`, and
+one bounded `reason`: `unauthorized`, `notFound`, `unavailable`, or `invalidSnapshot`. A stalled
+read becomes unavailable after five seconds; a replacement read is not started until the original
+settles. No internal error detail or raw obsolete projection payload is sent.
+
+Sequence starts at one and advances for snapshots and unavailable frames within one subscription;
+it is **not** a durable replay cursor. No `afterSeq` is accepted. On reconnect use a fresh
+subscription ID and wait for a fresh complete snapshot. Key delivery by socket generation and
+subscription ID, then exact agent/runtime and durable `modelReport.reportRevision`. Invalidate
+live availability on disconnect/unavailable/replacement; stopped or inactive-observer evidence
+is historical. Never sum repeated cumulative snapshots or derive remaining context from lifetime
+token totals.
+
+Send `{"t":"runtime.unsubscribe","subscriptionId":"connection1/brief1"}` to stop a reader.
+Subscription IDs are nonblank, control-free, at most 128 UTF-8 bytes, and cannot be reused on the
+same socket (even after unsubscribe). Reuse is rejected without replacing the existing reader.
+There are at most 16 active and 128 lifetime subscriptions per socket. Invalid controls receive
+the existing `input.err` frame. Backpressure closes the socket with code 1013; reconnect rehydrates
+instead of pretending a dropped snapshot was delivered. There is no second fleet/telemetry bus.
 
 ## Auth
 

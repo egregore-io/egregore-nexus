@@ -11,7 +11,7 @@ describe("public canonical Gateway reads", () => {
     await db.batch([
       "INSERT INTO identities VALUES ('a_ada','ada',NULL,'agent','agent','{}',1)",
       "INSERT INTO identities VALUES ('a_operator','operator',NULL,'human','admin','{\"project\":\"default\",\"kind\":\"human\"}',1)",
-      "INSERT INTO runtime_descriptors VALUES ('r_ada','a_ada','s_ada','codex','headless','acp','/work',NULL,'online',2)",
+      "INSERT INTO runtime_descriptors (runtime_id,agent_id,session_id,harness,mode,backend,cwd,native_resume_key,status,updated_at) VALUES ('r_ada','a_ada','s_ada','codex','headless','acp','/work',NULL,'online',2)",
       "INSERT INTO threads VALUES ('t_design','design',NULL,1,1)",
       "INSERT INTO thread_members VALUES ('t_design','a_ada',1,NULL)",
       "INSERT INTO topics VALUES ('builds',1,1)",
@@ -152,7 +152,7 @@ describe("public canonical Gateway reads", () => {
     await migrateGatewayStore(db);
     await db.batch([
       "INSERT INTO identities VALUES ('a_cross','cross',NULL,'agent','agent','{\"project\":\"ops\"}',1)",
-      "INSERT INTO runtime_descriptors VALUES ('r_cross','a_cross','s_cross','codex','headless','acp','/work',NULL,'online',2)",
+      "INSERT INTO runtime_descriptors (runtime_id,agent_id,session_id,harness,mode,backend,cwd,native_resume_key,status,updated_at) VALUES ('r_cross','a_cross','s_cross','codex','headless','acp','/work',NULL,'online',2)",
     ], "write");
     const deps = { db: vi.fn(), canonicalDb: () => db };
     const caller = { name: "operator", project: "default", sessionId: "s_operator" };

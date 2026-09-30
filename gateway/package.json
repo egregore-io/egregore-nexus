@@ -1,6 +1,6 @@
 {
   "name": "@egregore/nexus-gateway",
-  "version": "0.1.6-beta.2",
+  "version": "0.1.6-beta.3",
   "private": false,
   "bin": {
     "nexus": "scripts/nexus.mjs",
@@ -62,7 +62,7 @@
   "dependencies": {
     "@ag-ui/client": "^0.0.57",
     "@ag-ui/encoder": "^0.0.57",
-    "@egregore/nexus-cli": "0.1.6-beta.2",
+    "@egregore/nexus-cli": "0.1.6-beta.3",
     "@libsql/client": "^0.17.4",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@tanstack/react-router": "^1.170.16",

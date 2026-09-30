@@ -142,9 +142,16 @@ impl CodexAppServerClient {
         let result = self
             .request_setup(method::THREAD_START, thread_start_params(cwd))
             .await?;
-        thread_id_from_result(&result).ok_or_else(|| {
+        let thread = thread_id_from_result(&result).ok_or_else(|| {
             CodexRpcError::Decode(format!("thread/start response missing thread.id: {result}"))
-        })
+        })?;
+        if self
+            .origin_tracker()
+            .is_some_and(|origin| !origin.observe_setup_model(&thread, &result))
+        {
+            return Err(CodexRpcError::Closed);
+        }
+        Ok(thread)
     }
 
     /// Resume an existing thread.
@@ -164,8 +171,16 @@ impl CodexAppServerClient {
         thread_id: &str,
         cwd: Option<&str>,
     ) -> Result<Value, CodexRpcError> {
-        self.request_setup(method::THREAD_RESUME, thread_resume_params(thread_id, cwd))
-            .await
+        let result = self
+            .request_setup(method::THREAD_RESUME, thread_resume_params(thread_id, cwd))
+            .await?;
+        if self
+            .origin_tracker()
+            .is_some_and(|origin| !origin.observe_setup_model(thread_id, &result))
+        {
+            return Err(CodexRpcError::Closed);
+        }
+        Ok(result)
     }
 
     /// Submit a user turn to an existing thread.

@@ -26,6 +26,13 @@ use nexus_contracts::register::{
     RegisterResponse, RenameRequest, RenameResponse, StatusRequest, StatusResponse, StatusState,
     Whoami,
 };
+use nexus_store::repos::agent_runtimes::{
+    RuntimeActivationCommitState, RuntimeActivationFailure, SelectedRuntimeActivation,
+    SelectedRuntimeResidueCleanup,
+};
+use nexus_store::repos::sessions::{
+    CapturedStagedSession, SelectedStagedSessionCleanup, SelectedStagedSessionStamp,
+};
 use nexus_store::repos::{
     AgentCredentials, AgentRef, AgentRuntimes, Agents, DeveloperEvents, IdentitySessions, NewAgent,
     NewAgentRuntime, NewDeveloperEvent, Sessions, AGENT_LIFECYCLE_TOPIC,
@@ -36,7 +43,257 @@ use nexus_store::Store;
 use crate::binding::{caller_from_row, is_live, kind_str, tier_str, whoami_from_row};
 use crate::error::to_port;
 use crate::presence::{is_stale, presence_for_state, presence_from_str};
-use crate::registry::{resolve_register, RegisterOutcome};
+use crate::registry::{
+    resolve_register, resolve_register_captured, CapturedRegisterOutcome, RegisterOutcome,
+};
+
+/// Inert internal activation request. Constructor and registration wiring are deliberately separate.
+#[derive(Debug)]
+pub enum RuntimeActivationRequest {
+    CreateActive(NewAgentRuntime),
+    ActivateExisting {
+        runtime_id: SessionId,
+        agent_id: AgentId,
+    },
+}
+
+/// Preserve store-produced disposition, including partial effects, through owned settlement.
+#[derive(Debug)]
+pub enum RuntimeActivationError {
+    /// Rejected before submitting the selected activation write, including selector read errors.
+    RejectedBeforeStore { cause: NexusError },
+    /// Actual store failure; an additional settlement error cannot erase its original cause.
+    Store {
+        failure: RuntimeActivationFailure,
+        settlement_error: Option<NexusError>,
+    },
+    /// Actual successful store receipt retained across a later settlement/publication failure.
+    AfterStore {
+        receipt: SelectedRuntimeActivation,
+        cause: NexusError,
+    },
+    /// No store result survived dispatch. This does not imply rollback or safe cleanup.
+    OutcomeUnavailable { cause: NexusError },
+}
+
+/// A managed caller must supply its already-held SAME-Store presence guard. The Arc retains
+/// ownership through cancellation; its type does not verify which Store acquired that guard.
+#[async_trait]
+pub trait RuntimeActivation: Send + Sync {
+    /// Remove only the runtime selected by a validated non-agent resume. The operation and
+    /// retained guard must belong to the same Store as the coordinator.
+    async fn cleanup_non_agent_residue(
+        &self,
+        operation: NonAgentResumeOperation,
+        transition: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<SelectedRuntimeResidueCleanup, NexusError>;
+
+    /// Admit Identity's inert offline operation before any compatibility reads or writes.
+    /// The operation, coordinator, and guard must originate from the SAME Store; this is an
+    /// internal caller invariant, not a property certified by these types.
+    async fn set_identity_offline(
+        &self,
+        operation: IdentityOfflineOperation,
+        transition: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<(), NexusError>;
+
+    /// Inert selected cleanup. Same-store receipt/guard provenance and the prior monotonic
+    /// registration disposition are caller obligations, not verified by this interface.
+    async fn cleanup_unbound_registration(
+        &self,
+        staged: CapturedStagedSession,
+        transition: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<SelectedStagedSessionCleanup, NexusError>;
+
+    async fn activate_runtime(
+        &self,
+        request: RuntimeActivationRequest,
+        transition: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<SelectedRuntimeActivation, RuntimeActivationError>;
+}
+
+/// Private-origin proof from Identity's kind-checked resumed Session, not an authentication API.
+/// Same-Store managed exclusion remains a caller invariant; a proof read does not make the
+/// subsequent runtime transaction and resume stamp atomic against direct repository writers.
+pub struct NonAgentResumeOperation {
+    store: Arc<Store>,
+    session_id: SessionId,
+    kind: (Locality, Kind),
+    client_key: Option<String>,
+    stale_agent_id: Option<String>,
+}
+
+impl NonAgentResumeOperation {
+    fn new(store: Arc<Store>, row: &SessionRow) -> Result<Self, NexusError> {
+        let kind = row.entity_kind()?;
+        if kind.1 == Kind::Agent {
+            return Err(NexusError::Invalid(
+                "agent Session cannot authorize residue cleanup".into(),
+            ));
+        }
+        Ok(Self {
+            store,
+            session_id: row.session_id.clone(),
+            kind,
+            client_key: row.client_key.clone(),
+            stale_agent_id: row.agent_id.clone(),
+        })
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub fn stale_agent_id(&self) -> Option<&str> {
+        self.stale_agent_id.as_deref()
+    }
+
+    pub async fn matches_current_session(&self) -> Result<bool, NexusError> {
+        let Some(current) = Sessions::new(&self.store)
+            .find_by_session_id(&self.session_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        Ok(current.session_id == self.session_id
+            && current.entity_kind()? == self.kind
+            && current.client_key == self.client_key
+            && current.agent_id == self.stale_agent_id)
+    }
+}
+
+/// Identity-owned offline preparation. Construction is private and performs no I/O, allowing
+/// the managed owner to close admission before the BEFORE read and strict presence append.
+pub struct IdentityOfflineOperation {
+    store: Arc<Store>,
+    events: Arc<dyn EventSink>,
+    session: SessionId,
+}
+
+impl IdentityOfflineOperation {
+    fn new(store: Arc<Store>, events: Arc<dyn EventSink>, session: SessionId) -> Self {
+        Self {
+            store,
+            events,
+            session,
+        }
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session
+    }
+
+    pub async fn prepare(self) -> Result<PreparedIdentityOffline, NexusError> {
+        let sessions = Sessions::new(&self.store);
+        let before = sessions.find_by_session_id(&self.session).await?;
+        sessions
+            .set_presence(&self.session, Presence::Offline)
+            .await?;
+        let paused = before
+            .filter(|row| row.is_agent() && row.presence.as_deref() != Some("offline"))
+            .map(|row| row.paused);
+        Ok(PreparedIdentityOffline {
+            events: self.events,
+            session: self.session,
+            paused,
+        })
+    }
+}
+
+/// Consumed Identity status state: eligibility and pause are captured from BEFORE, not reread
+/// after stopping. Unlike Presence, this operation does not abort open turns.
+pub struct PreparedIdentityOffline {
+    events: Arc<dyn EventSink>,
+    session: SessionId,
+    paused: Option<bool>,
+}
+
+impl PreparedIdentityOffline {
+    pub async fn finish(self) {
+        if let Some(paused) = self.paused {
+            self.events
+                .emit(WsEvent::AgentStatus {
+                    session_id: self.session,
+                    presence: Presence::Offline,
+                    paused,
+                })
+                .await;
+        }
+    }
+}
+
+/// Register-local knowledge, never cleanup authority by itself. In particular, a later
+/// no-effect result cannot erase an earlier effect, uncertain write, or lost selection.
+#[derive(Default)]
+pub(crate) struct RegistrationDisposition {
+    pub(crate) preserve_required: bool,
+    pub(crate) cleanup_authority_lost: bool,
+    context: Option<String>,
+}
+
+impl RegistrationDisposition {
+    fn preserve(&mut self, context: impl Into<String>) {
+        self.preserve_required = true;
+        self.context.get_or_insert_with(|| context.into());
+    }
+
+    fn selection_changed(&mut self) {
+        self.cleanup_authority_lost = true;
+        self.context
+            .get_or_insert_with(|| "registration selection changed; cleanup authority lost".into());
+    }
+
+    pub(crate) fn record(
+        &mut self,
+        result: &Result<SelectedRuntimeActivation, RuntimeActivationError>,
+    ) {
+        match result {
+            Ok(receipt) | Err(RuntimeActivationError::AfterStore { receipt, .. }) => {
+                match receipt {
+                    SelectedRuntimeActivation::Applied(_) => {
+                        self.preserve("runtime activation applied")
+                    }
+                    SelectedRuntimeActivation::SelectionChanged => self.selection_changed(),
+                }
+            }
+            Err(RuntimeActivationError::Store { failure, .. }) => match failure.commit_state() {
+                RuntimeActivationCommitState::NotCommitted => {}
+                state => self.preserve(format!("runtime activation store outcome {state:?}")),
+            },
+            Err(RuntimeActivationError::OutcomeUnavailable { .. }) => {
+                self.preserve("runtime activation outcome unavailable")
+            }
+            Err(RuntimeActivationError::RejectedBeforeStore { .. }) => {}
+        }
+    }
+
+    fn cleanup_vetoed(&self) -> bool {
+        self.preserve_required || self.cleanup_authority_lost
+    }
+}
+
+impl RuntimeActivationError {
+    fn into_nexus_error(self) -> NexusError {
+        match self {
+            Self::RejectedBeforeStore { cause }
+            | Self::AfterStore { cause, .. }
+            | Self::OutcomeUnavailable { cause } => cause,
+            Self::Store {
+                failure,
+                settlement_error,
+            } => {
+                let mut context = format!(
+                    "{failure}; activation store outcome {:?}",
+                    failure.commit_state()
+                );
+                if let Some(error) = settlement_error {
+                    context.push_str(&format!("; activation settlement failed: {error}"));
+                }
+                NexusError::Store(context)
+            }
+        }
+    }
+}
 
 /// The `<nexus>` startup directive returned on every register (backend §6): untagged content is
 /// the agent's human, anything inside `<nexus …>` is bus traffic, and delivered batches carry
@@ -72,6 +329,7 @@ pub struct Identity {
     store: Arc<Store>,
     events: Arc<dyn EventSink>,
     heartbeat_ttl_ms: i64,
+    runtime_activation: Option<Arc<dyn RuntimeActivation>>,
 }
 
 struct PreparedAgentRegistration {
@@ -87,6 +345,80 @@ impl Identity {
             store,
             events,
             heartbeat_ttl_ms: config.heartbeat_ttl_ms,
+            runtime_activation: None,
+        }
+    }
+
+    /// Opt into managed activation and Identity offline settlement. The caller must supply a
+    /// coordinator over this SAME Store;
+    /// construction does not certify provenance and does not wire other lifecycle writers.
+    pub fn new_with_runtime_activation(
+        store: Arc<Store>,
+        events: Arc<dyn EventSink>,
+        config: &Config,
+        runtime_activation: Arc<dyn RuntimeActivation>,
+    ) -> Self {
+        Self {
+            runtime_activation: Some(runtime_activation),
+            ..Self::new(store, events, config)
+        }
+    }
+
+    async fn activate_registration_runtime(
+        &self,
+        request: RuntimeActivationRequest,
+        transition: &Arc<tokio::sync::OwnedMutexGuard<()>>,
+        disposition: &mut RegistrationDisposition,
+    ) -> Result<(), NexusError> {
+        let result = self
+            .runtime_activation
+            .as_ref()
+            .expect("managed registration")
+            .activate_runtime(request, transition.clone())
+            .await;
+        // Record before returning to the binding helper's next fallible presence/Session write.
+        disposition.record(&result);
+        match result {
+            Ok(SelectedRuntimeActivation::Applied(_)) => Ok(()),
+            Ok(SelectedRuntimeActivation::SelectionChanged) => Err(NexusError::Invalid(
+                "runtime activation selection changed".into(),
+            )),
+            Err(error) => Err(error.into_nexus_error()),
+        }
+    }
+
+    async fn stamp_registration_agent(
+        &self,
+        session: &SessionId,
+        agent: &str,
+        captured: &mut Option<CapturedStagedSession>,
+        disposition: &mut RegistrationDisposition,
+    ) -> Result<(), NexusError> {
+        let Some(selected) = captured.as_ref() else {
+            return Sessions::new(&self.store)
+                .set_agent_id(session, agent)
+                .await;
+        };
+        match Sessions::new(&self.store)
+            .set_agent_id_selected(selected, agent)
+            .await
+        {
+            Ok(SelectedStagedSessionStamp::Updated(receipt)) => {
+                *captured = Some(receipt);
+                Ok(())
+            }
+            Ok(SelectedStagedSessionStamp::SelectionChanged) => {
+                disposition.selection_changed();
+                Err(NexusError::Invalid(
+                    "registration Session selection changed".into(),
+                ))
+            }
+            Err(error) => {
+                // This API does not prove the commit phase on Err. Keep the original receipt,
+                // but never turn a normalized reread into authority after this uncertainty.
+                disposition.preserve("registration Session stamp failed; outcome uncertain");
+                Err(error)
+            }
         }
     }
 
@@ -180,6 +512,8 @@ impl Identity {
         req: &RegisterRequest,
         credential_verified: bool,
         resuming: bool,
+        transition: &Arc<tokio::sync::OwnedMutexGuard<()>>,
+        disposition: &mut RegistrationDisposition,
     ) -> Result<(AgentId, Option<String>), NexusError> {
         let agents = Agents::new(&self.store);
         let row_name = row.require_name("agent runtime binding")?;
@@ -216,6 +550,10 @@ impl Identity {
                 }
                 existing_by_name.agent_id
             } else {
+                if self.runtime_activation.is_some() {
+                    disposition
+                        .preserve("durable agent creation attempted; coupled identity retained");
+                }
                 agents
                     .create(NewAgent {
                         agent_id: requested.0.clone(),
@@ -233,6 +571,9 @@ impl Identity {
             match matching_agents.len() {
                 0 => {
                     let generated = format!("a_{}", row.session_id.0);
+                    if self.runtime_activation.is_some() {
+                        disposition.preserve("durable agent creation attempted; coupled identity retained");
+                    }
                     agents
                         .create(NewAgent {
                             agent_id: generated,
@@ -275,7 +616,19 @@ impl Identity {
                 )));
             }
             if !resuming {
-                runtimes.set_active(&row.session_id.0, true).await?;
+                if self.runtime_activation.is_some() {
+                    self.activate_registration_runtime(
+                        RuntimeActivationRequest::ActivateExisting {
+                            runtime_id: row.session_id.clone(),
+                            agent_id: AgentId(agent_id.clone()),
+                        },
+                        transition,
+                        disposition,
+                    )
+                    .await?;
+                } else {
+                    runtimes.set_active(&row.session_id.0, true).await?;
+                }
                 runtimes
                     .set_presence(
                         &row.session_id.0,
@@ -288,21 +641,29 @@ impl Identity {
                     .await?;
             }
         } else {
-            runtimes
-                .create(NewAgentRuntime {
-                    runtime_id: row.session_id.0.clone(),
-                    agent_id: agent_id.clone(),
-                    harness: row.agent.clone().unwrap_or_else(|| "unknown".into()),
-                    cwd: row.cwd.clone(),
-                    transport: row.transport.clone(),
-                    presence: Some(if resuming {
-                        "offline".into()
-                    } else {
-                        row.presence.clone().unwrap_or_else(|| "online".into())
-                    }),
-                    active: !resuming,
-                })
+            let runtime = NewAgentRuntime {
+                runtime_id: row.session_id.0.clone(),
+                agent_id: agent_id.clone(),
+                harness: row.agent.clone().unwrap_or_else(|| "unknown".into()),
+                cwd: row.cwd.clone(),
+                transport: row.transport.clone(),
+                presence: Some(if resuming {
+                    "offline".into()
+                } else {
+                    row.presence.clone().unwrap_or_else(|| "online".into())
+                }),
+                active: !resuming,
+            };
+            if !resuming && self.runtime_activation.is_some() {
+                self.activate_registration_runtime(
+                    RuntimeActivationRequest::CreateActive(runtime),
+                    transition,
+                    disposition,
+                )
                 .await?;
+            } else {
+                runtimes.create(runtime).await?;
+            }
         }
 
         Ok((AgentId(agent_id), credential_id))
@@ -1017,6 +1378,7 @@ fn scopes_allow_runtime_register(scopes_json: &str) -> bool {
 #[async_trait]
 impl IdentityPort for Identity {
     async fn register(&self, mut req: RegisterRequest) -> PortResult<RegisterResponse> {
+        let mut disposition = RegistrationDisposition::default();
         let result: Result<RegisterResponse, NexusError> = async {
             let requested_kind = kind_str(req.locality, req.kind);
             let requested_nature = req.kind.unwrap_or(Kind::Agent);
@@ -1025,7 +1387,7 @@ impl IdentityPort for Identity {
                     "only agent registrations may bind an agent_id".into(),
                 ));
             }
-            let _transition = self.store.lock_presence_transition().await;
+            let transition = Arc::new(self.store.lock_presence_transition().await);
             let prepared_agent = self.preflight_requested_agent(&req).await?;
             if let Some(canonical_name) = prepared_agent
                 .as_ref()
@@ -1037,7 +1399,19 @@ impl IdentityPort for Identity {
                 req.name = Some(canonical_name);
             }
             let credential_verified = prepared_agent.is_some();
-            let outcome = resolve_register(&self.store, &req).await?;
+            let mut captured = None;
+            let outcome = if self.runtime_activation.is_some() {
+                match resolve_register_captured(&self.store, &req).await? {
+                    CapturedRegisterOutcome::Resumed(row) => RegisterOutcome::Resumed(row),
+                    CapturedRegisterOutcome::Created(receipt) => {
+                        let row = receipt.row().clone();
+                        captured = Some(receipt);
+                        RegisterOutcome::Created(row)
+                    }
+                }
+            } else {
+                resolve_register(&self.store, &req).await?
+            };
             let staged_session_id = match &outcome {
                 RegisterOutcome::Created(row) => Some(row.session_id.clone()),
                 RegisterOutcome::Resumed(_) => None,
@@ -1062,9 +1436,19 @@ impl IdentityPort for Identity {
                         // Older builds could persist an agent binding/runtime on a human browser
                         // session. Kind is the authority: remove only that disposable runtime;
                         // the durable agent and all of its real runtimes remain intact.
-                        AgentRuntimes::new(&self.store)
-                            .remove_non_agent_residue(&row.session_id.0)
-                            .await?;
+                        if let Some(activation) = self.runtime_activation.as_ref() {
+                            let operation = NonAgentResumeOperation::new(self.store.clone(), &row)?;
+                            match activation.cleanup_non_agent_residue(operation, transition.clone()).await? {
+                                SelectedRuntimeResidueCleanup::Removed | SelectedRuntimeResidueCleanup::AlreadyAbsent => {}
+                                SelectedRuntimeResidueCleanup::BindingChanged => return Err(NexusError::Invalid(
+                                    "non-agent resume selection changed; runtime and Session repair not completed".into(),
+                                )),
+                            }
+                        } else {
+                            AgentRuntimes::new(&self.store)
+                                .remove_non_agent_residue(&row.session_id.0)
+                                .await?;
+                        }
                     }
                     let publish = row.presence.as_deref() != Some("online");
                     self.rebind_resume(&row, &req).await?;
@@ -1076,8 +1460,9 @@ impl IdentityPort for Identity {
                     // fail and leave the newly active runtime detached from its session.
                     if row.is_agent() {
                         if let Some(prepared) = prepared_agent.as_ref() {
-                            Sessions::new(&self.store)
-                                .set_agent_id(&row.session_id, &prepared.agent.agent_id)
+                            self.stamp_registration_agent(
+                                &row.session_id, &prepared.agent.agent_id, &mut captured, &mut disposition,
+                            )
                                 .await?;
                         }
                     }
@@ -1090,13 +1475,14 @@ impl IdentityPort for Identity {
                 .ok_or_else(|| NexusError::NotFound(session_id.0.clone()))?;
             let (agent_id, bound_credential_id) = if row.is_agent() {
                 let (agent_id, credential_id) = self
-                    .bind_agent_runtime(&row, &req, credential_verified, !publish_spawn)
+                    .bind_agent_runtime(&row, &req, credential_verified, !publish_spawn, &transition, &mut disposition)
                     .await?;
                 // Stamp the durable identity on an agent session itself. Human principals are
                 // durable session identities, but never become agent identities or runtimes.
                 if row.agent_id.as_deref() != Some(agent_id.0.as_str()) {
-                    Sessions::new(&self.store)
-                        .set_agent_id(&row.session_id, &agent_id.0)
+                    self.stamp_registration_agent(
+                        &row.session_id, &agent_id.0, &mut captured, &mut disposition,
+                    )
                         .await?;
                 }
                 (Some(agent_id), credential_id)
@@ -1108,9 +1494,17 @@ impl IdentityPort for Identity {
                 // live. Human resumes refresh only their session, never an agent runtime.
                 Sessions::new(&self.store).touch_heartbeat(&session_id).await?;
                 Sessions::new(&self.store).set_presence(&session_id, Presence::Online).await?;
-                if agent_id.is_some() {
+                if let Some(agent_id) = agent_id.as_ref() {
                     let runtimes = AgentRuntimes::new(&self.store);
-                    runtimes.set_active(&session_id.0, true).await?;
+                    if self.runtime_activation.is_some() {
+                        self.activate_registration_runtime(
+                            RuntimeActivationRequest::ActivateExisting {
+                                runtime_id: session_id.clone(), agent_id: agent_id.clone(),
+                            }, &transition, &mut disposition,
+                        ).await?;
+                    } else {
+                        runtimes.set_active(&session_id.0, true).await?;
+                    }
                     runtimes.set_presence(&session_id.0, Presence::Online).await?;
                 }
             }
@@ -1191,6 +1585,24 @@ impl IdentityPort for Identity {
                     let Some(session_id) = staged_session_id else {
                         return Err(error);
                     };
+                    if let Some(activation) = self.runtime_activation.as_ref() {
+                        if disposition.cleanup_vetoed() {
+                            return Err(error);
+                        }
+                        // Only a fresh insertion supplies this receipt. Absence validation and
+                        // reservation-lane ownership belong to the delegate, not a caller reread.
+                        let staged = captured.expect("managed fresh insertion receipt");
+                        return match activation.cleanup_unbound_registration(staged, transition.clone()).await {
+                            Ok(SelectedStagedSessionCleanup::Removed | SelectedStagedSessionCleanup::AlreadyAbsent) => Err(error),
+                            Ok(SelectedStagedSessionCleanup::SelectionChanged) => {
+                                disposition.selection_changed();
+                                Err(error)
+                            }
+                            Err(cleanup) => Err(NexusError::Internal(format!(
+                                "{error}; registration retained; selected cleanup failed or uncertain: {cleanup}"
+                            ))),
+                        };
+                    }
                     if let Err(cleanup) = AgentRuntimes::new(&self.store)
                         .remove_staged_registration(
                             &session_id.0,
@@ -1215,7 +1627,14 @@ impl IdentityPort for Identity {
             }
         }
         .await;
-        to_port(result)
+        to_port(result).map_err(|mut error| {
+            if let Some(context) = disposition.context {
+                error
+                    .message
+                    .push_str(&format!("; registration retained/partial: {context}"));
+            }
+            error
+        })
     }
 
     async fn whoami(&self, caller: &Caller) -> PortResult<Whoami> {
@@ -1888,27 +2307,21 @@ impl IdentityPort for Identity {
     }
 
     async fn set_offline(&self, session: &SessionId) -> PortResult<()> {
-        // Identity-only callers keep this lightweight fallback. Daemon paths that also own
-        // loop/runtime state use `AppState::mark_session_offline` so roster, runtime, and turn
-        // state converge together.
+        // Both paths retain Identity's BEFORE-status semantics, independently of Presence's
+        // turn cleanup. Managed admission owns this same guard through caller cancellation.
         let result: Result<(), NexusError> = async {
-            let _transition = self.store.lock_presence_transition().await;
-            let sessions = Sessions::new(&self.store);
-            let before = sessions.find_by_session_id(session).await?;
-            sessions.set_presence(session, Presence::Offline).await?;
-            AgentRuntimes::new(&self.store).stop(&session.0).await?;
-            if before
-                .as_ref()
-                .is_some_and(|row| row.is_agent() && row.presence.as_deref() != Some("offline"))
-            {
-                self.events
-                    .emit(WsEvent::AgentStatus {
-                        session_id: session.clone(),
-                        presence: Presence::Offline,
-                        paused: before.as_ref().is_some_and(|row| row.paused),
-                    })
-                    .await;
+            let transition = Arc::new(self.store.lock_presence_transition().await);
+            let operation = IdentityOfflineOperation::new(
+                self.store.clone(),
+                self.events.clone(),
+                session.clone(),
+            );
+            if let Some(activation) = &self.runtime_activation {
+                return activation.set_identity_offline(operation, transition).await;
             }
+            let prepared = operation.prepare().await?;
+            AgentRuntimes::new(&self.store).stop(&session.0).await?;
+            prepared.finish().await;
             Ok(())
         }
         .await;

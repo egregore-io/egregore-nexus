@@ -43,6 +43,8 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 toml = { workspace = true }
 async-trait = { workspace = true }
+agent-client-protocol = { workspace = true }
+tokio-util = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 figment = { workspace = true }
@@ -74,3 +76,8 @@ path = "../../crates/harness/codex/src/bin/fake_codex_app_server.rs"
 tokio = { workspace = true }
 tempfile = "3"
 portable-pty = "0.9.0"
+
+[[bin]]
+# Same hermetic ACP peer used by the adapter crates; never a provider invocation.
+name = "nexus_model_fixture_acp"
+path = "../nexus-agent/src/bin/fake_acp_agent.rs"

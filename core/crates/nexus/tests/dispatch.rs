@@ -531,6 +531,7 @@ async fn send_commits_before_a_cold_target_finishes_reviving() {
         Arc::new(move |_cwd| Arc::new(slow.clone()) as Arc<dyn nexus_agent::Adapter>),
     );
     let state = AppState::wire_with_registry(store, &nexus_common::Config::default(), registry);
+    state.wait_for_runtime_identity_ready().await.unwrap();
     state
         .identity
         .register(RegisterRequest {
@@ -639,6 +640,10 @@ async fn registration_does_not_start_a_drain_loop_before_the_harness_is_live() {
     let exec = Arc::new(DefinitelyOfflineTurnExec::default());
     let state =
         AppState::wire_with_turn_exec(store, &nexus_common::Config::default(), exec.clone());
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
     state
         .identity
         .register(RegisterRequest {
@@ -1601,6 +1606,10 @@ async fn admin_spawn_uses_daemon_launch_path_and_registers_member() {
         &nexus_common::Config::default(),
         agent.clone(),
     );
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
 
     let resp = dispatch(
         &state,
@@ -2242,6 +2251,10 @@ async fn ensure_in_workspace_moves_a_cross_workspace_agent() {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
     let state = AppState::wire(store, &Config::default());
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
 
     // Seed an agent registered in project "team".
     state

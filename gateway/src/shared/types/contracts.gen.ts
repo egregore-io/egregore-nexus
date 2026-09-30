@@ -9,6 +9,27 @@ export type DaemonIpcCall = DaemonIpcCallWire;
 export type HarnessId = string;
 
 /**
+ * One independent evidence slot. Only observed evidence carries an observation. The status-tagged
+ * wire union is mirrored in gen/postamble.ts because typeshare cannot emit internal tags.
+ */
+export type ModelEvidenceSlot = ModelEvidenceSlotWire;
+
+/**
+ * Opaque decoder provenance, not a model identifier or a claim that a collector is enabled.
+ * Nonblank, no control characters, at most 128 UTF-8 bytes; preserved exactly.
+ * Collectors decide which evidence field a verified native envelope can establish; in particular
+ * a reroute event does not by itself establish the model that generated a response.
+ */
+export type ModelObservationSource = string;
+
+/**
+ * Opaque actual-runtime backend identifier, supplied by its collector rather than a shared
+ * catalog. Nonblank, no control characters, at most 128 UTF-8 bytes; preserved exactly.
+ * The exact reserved identifier `unknown` is only valid on a corrupt-storage tombstone report.
+ */
+export type ModelReportBackend = string;
+
+/**
  * One-shot notification target. `Auto` resolves an unqualified CLI value at daemon ingress;
  * explicit variants remove ambiguity without exposing the derived recipient fan-out.
  */
@@ -36,6 +57,21 @@ export type RequestId = RequestIdWire;
  */
 export type SendTarget = SendTargetWire;
 
+/** An exact nonnegative JavaScript-safe native token/count value. Zero is an observation. */
+export type TelemetryCounter = number;
+
+/** Opaque non-secret native reporting identity, at most 1024 UTF-8 bytes; preserved exactly. */
+export type TelemetryId = string;
+
+/**
+ * Native finite nonnegative quantity, bounded by MAX_SAFE_INTEGER. Fractional native units and
+ * over-limit used percentages are preserved, not clamped or converted to inferred costs.
+ */
+export type TelemetryQuantity = number;
+
+/** Signed Unix milliseconds, including negative timestamps, within JavaScript's exact range. */
+export type TelemetryTimestamp = number;
+
 /**
  * The canonical event stream. `#[serde(tag = "type")]` puts the dotted name in a `type` field.
  *
@@ -45,6 +81,55 @@ export type SendTarget = SendTargetWire;
  * unchanged and the inline round-trip tests assert the internally-tagged JSON.
  */
 export type WsEvent = WsEventWire;
+
+export interface TelemetryMetadata {
+	nativeSessionId: TelemetryId;
+	source: ModelObservationSource;
+	observedAt: TelemetryTimestamp;
+	nativeReportedAt?: TelemetryTimestamp;
+}
+
+export interface QuotaWindow {
+	windowId: TelemetryId;
+	units: TelemetryId;
+	used?: TelemetryQuantity;
+	remaining?: TelemetryQuantity;
+	limit?: TelemetryQuantity;
+	usedPercent?: TelemetryQuantity;
+	remainingPercent?: TelemetryQuantity;
+	resetsAt?: TelemetryTimestamp;
+	windowSeconds?: TelemetryCounter;
+}
+
+/**
+ * Account/provider scoped native allowance, merely observed through a runtime. Missing account
+ * identity is not authority to combine snapshots across runtimes. No model or price is inferred.
+ */
+export interface AccountQuotaObservation {
+	metadata: TelemetryMetadata;
+	providerId: TelemetryId;
+	accountId?: TelemetryId;
+	windows: QuotaWindow[];
+}
+
+export enum TelemetryAvailability {
+	Observed = "observed",
+	Unknown = "unknown",
+	Invalid = "invalid",
+}
+
+/** Whether this backend's decoder has verified support for this evidence field. */
+export enum ModelEvidenceCapability {
+	Supported = "supported",
+	Unsupported = "unsupported",
+	Unverified = "unverified",
+}
+
+export interface AccountQuotaSlot {
+	status: TelemetryAvailability;
+	capability: ModelEvidenceCapability;
+	observation?: AccountQuotaObservation;
+}
 
 /**
  * Public send acknowledgement. Routing and recipient counts stay internal; callers receive only
@@ -219,6 +304,108 @@ export enum Presence {
 	Offline = "offline",
 }
 
+export enum TokenUsageScope {
+	Turn = "turn",
+	SessionCumulative = "sessionCumulative",
+}
+
+export interface TelemetryModelIdentity {
+	modelId: TelemetryId;
+	providerId?: TelemetryId;
+}
+
+/**
+ * Snapshot, never an increment. Counter/reset/scope identity determines whether two observations
+ * refer to the same native counter; overlapping breakdowns must not be summed into a total.
+ */
+export interface TokenUsageObservation {
+	metadata: TelemetryMetadata;
+	scope: TokenUsageScope;
+	counterId: TelemetryId;
+	resetId?: TelemetryId;
+	nativeTurnId?: TelemetryId;
+	model?: TelemetryModelIdentity;
+	inputTokens?: TelemetryCounter;
+	outputTokens?: TelemetryCounter;
+	cacheReadTokens?: TelemetryCounter;
+	cacheWriteTokens?: TelemetryCounter;
+	reasoningTokens?: TelemetryCounter;
+	totalTokens?: TelemetryCounter;
+}
+
+export interface TokenUsageSlot {
+	status: TelemetryAvailability;
+	capability: ModelEvidenceCapability;
+	observation?: TokenUsageObservation;
+}
+
+export enum TelemetryProvenance {
+	Native = "native",
+	Derived = "derived",
+	Estimated = "estimated",
+}
+
+export interface ContextTokenValue {
+	value: TelemetryCounter;
+	provenance: TelemetryProvenance;
+	basis?: TelemetryId;
+}
+
+export interface ContextPercentageValue {
+	value: TelemetryQuantity;
+	provenance: TelemetryProvenance;
+	basis?: TelemetryId;
+}
+
+/**
+ * Current effective context only, never lifetime token usage or a guessed model maximum.
+ * Each value has its own provenance because native capacity and estimated occupancy can coexist.
+ */
+export interface ContextObservation {
+	metadata: TelemetryMetadata;
+	model?: TelemetryModelIdentity;
+	effectiveCapacityTokens?: ContextTokenValue;
+	usedTokens?: ContextTokenValue;
+	remainingTokens?: ContextTokenValue;
+	usedPercent?: ContextPercentageValue;
+	remainingPercent?: ContextPercentageValue;
+	outputReserveTokens?: ContextTokenValue;
+	compactionCount?: TelemetryCounter;
+	resetId?: TelemetryId;
+}
+
+export interface ContextSlot {
+	status: TelemetryAvailability;
+	capability: ModelEvidenceCapability;
+	observation?: ContextObservation;
+}
+
+export interface RuntimeTelemetryReport {
+	usage: TokenUsageSlot;
+	context: ContextSlot;
+	quota: AccountQuotaSlot;
+}
+
+/**
+ * Public persisted snapshot. The store assigns the positive revision before publication; private
+ * uncommitted snapshots must not use this wire type with revision zero. Slots never imply one
+ * another, and observer activity is independent from the last recorded evidence.
+ * The unknown backend is reserved for an inactive corrupt-storage tombstone, not native evidence.
+ */
+export interface RuntimeModelReport {
+	backend: ModelReportBackend;
+	observerActive: boolean;
+	reportRevision: number;
+	configured: ModelEvidenceSlot;
+	turnSelected: ModelEvidenceSlot;
+	responseReported: ModelEvidenceSlot;
+	/**
+	 * Optional native telemetry shares this snapshot's exact ownership and durable revision.
+	 * Keep its payload out of line: reports are embedded in rows held by nested async operations.
+	 */
+	telemetry?: RuntimeTelemetryReport;
+}
+
 /** Runtime summary for the current process/session representing a durable agent. */
 export interface AgentRuntimeSummary {
 	/** The disposable runtime id. In the first pass this is the Nexus `SessionId`. */
@@ -232,6 +419,8 @@ export interface AgentRuntimeSummary {
 	startedAt: number;
 	stoppedAt?: number;
 	lastHeartbeat?: number;
+	/** Independent native model evidence, absent until a model observer publishes a report. */
+	modelReport?: RuntimeModelReport;
 }
 
 /** One durable agent identity with its current runtime snapshot when available. */
@@ -1237,6 +1426,22 @@ export interface MetadataSetRequest {
 	metadata: any;
 }
 
+/**
+ * Native evidence with opaque, nonblank identifiers. Provider is supplied explicitly, never
+ * inferred by splitting a model id. Timestamps are signed JavaScript-safe Unix milliseconds;
+ * native time is optional. Negative values are preserved, never clamped or rounded.
+ */
+export interface ModelObservation {
+	modelId: string;
+	providerId?: string;
+	source: ModelObservationSource;
+	observedAt: number;
+	nativeSessionId?: string;
+	nativeTurnId?: string;
+	nativeMessageId?: string;
+	nativeReportedAt?: number;
+}
+
 /** `nexus admin monitor` — stream the web console event feed for oversight. */
 export interface MonitorRequest {
 	follow: boolean;
@@ -1548,6 +1753,59 @@ export interface RouteRule {
 	topic?: string;
 	/** Recipient: an agent name or a thread name. */
 	to: string;
+}
+
+export enum RuntimeSnapshotTag {
+	Snapshot = "runtime.snapshot",
+}
+
+export interface RuntimeSnapshotFrame {
+	t: RuntimeSnapshotTag;
+	subscriptionId: string;
+	agentId: AgentId;
+	/** Positive safe integer, starting at one for a new subscription. Not an afterSeq cursor. */
+	sequence: number;
+	/** Complete agent-scoped canonical list, including stopped history. Empty means absence. */
+	runtimes: AgentRuntimeSummary[];
+}
+
+export enum RuntimeSubscribeTag {
+	Subscribe = "runtime.subscribe",
+}
+
+export interface RuntimeSubscribeFrame {
+	t: RuntimeSubscribeTag;
+	subscriptionId: string;
+	agentId: AgentId;
+}
+
+export enum RuntimeUnavailableTag {
+	Unavailable = "runtime.unavailable",
+}
+
+export enum RuntimeUnavailableReason {
+	Unauthorized = "unauthorized",
+	NotFound = "notFound",
+	Unavailable = "unavailable",
+	InvalidSnapshot = "invalidSnapshot",
+}
+
+export interface RuntimeUnavailableFrame {
+	t: RuntimeUnavailableTag;
+	subscriptionId: string;
+	agentId: AgentId;
+	sequence: number;
+	/** Bounded public category; no internal database/authentication detail is exposed. */
+	reason: RuntimeUnavailableReason;
+}
+
+export enum RuntimeUnsubscribeTag {
+	Unsubscribe = "runtime.unsubscribe",
+}
+
+export interface RuntimeUnsubscribeFrame {
+	t: RuntimeUnsubscribeTag;
+	subscriptionId: string;
 }
 
 /** One search hit. */
@@ -1973,15 +2231,36 @@ export type HookEvaluationResponse =
 	| { event: "before_send", result: HookBeforeSendResult }
 	| { event: "after_receipt", result: HookAfterReceiptResult };
 
+export enum ModelInvalidReason {
+	/** Persisted report JSON could not be trusted; no native decoder evidence is inferred. */
+	CorruptStoredMetadata = "corruptStoredMetadata",
+	MalformedNativeMetadata = "malformedNativeMetadata",
+	AmbiguousModelSelection = "ambiguousModelSelection",
+	ConflictingNativeMetadata = "conflictingNativeMetadata",
+}
+
+export enum ModelUnknownReason {
+	AwaitingNativeMetadata = "awaitingNativeMetadata",
+	NotInCurrentConfiguration = "notInCurrentConfiguration",
+	ObserverReplaced = "observerReplaced",
+}
+
 
 // --- Hand-authored wire unions (appended by gen-ts.sh / the ts_gen test) ---
 //
 // typeshare 1.13 cannot emit internally-tagged (`#[serde(tag = ...)]`) algebraic enums or infer
-// untagged-enum unions, so the three serde unions below are authored to match the frozen Rust wire
+// untagged-enum unions, so the serde unions below are authored to match the frozen Rust wire
 // shape exactly (the same JSON the crate's round-trip tests + golden fixtures assert). The Rust
 // types reference these via `#[typeshare(serialized_as = "...")]`. Keep in lockstep with
 // `src/send.rs` (SendTarget), `src/notify.rs` (NotifyTarget), `src/daemon_ipc.rs`
-// (DaemonIpcCall), `src/events.rs` (WsEvent), and `src/rpc.rs` (RequestId).
+// (DaemonIpcCall), `src/events.rs` (WsEvent), `src/rpc.rs` (RequestId), and
+// `src/model_report.rs` (ModelEvidenceSlot).
+
+/** Independent model evidence; Rust serde/validate enforce capability and payload consistency. */
+export type ModelEvidenceSlotWire =
+  | { status: "observed"; capability: ModelEvidenceCapability.Supported; observation: ModelObservation }
+  | { status: "unknown"; capability: ModelEvidenceCapability; reason?: ModelUnknownReason }
+  | { status: "invalid"; capability: ModelEvidenceCapability; reason: ModelInvalidReason };
 
 // String-backed id newtypes (src/ids.rs). They are `#[serde(transparent)]` and defined via a
 // macro, so typeshare's parser does not see the definitions (it only sees the usages); we emit the

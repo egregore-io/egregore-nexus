@@ -1,0 +1,172 @@
+{
+  "description": "Raw JSON is parsed independently by Rust serde and Gateway validation; do not normalize Unicode first.",
+  "reports": [
+    {
+      "name": "positive safe max revision",
+      "raw": "{\"backend\":\"codexAppServer\",\"observerActive\":true,\"reportRevision\":9007199254740991,\"configured\":{\"capability\":\"supported\",\"status\":\"observed\",\"observation\":{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":1}},\"turnSelected\":{\"capability\":\"unverified\",\"status\":\"unknown\"},\"responseReported\":{\"capability\":\"supported\",\"status\":\"unknown\",\"reason\":\"awaitingNativeMetadata\"}}",
+      "valid": true
+    },
+    {
+      "name": "zero revision",
+      "raw": "{\"backend\":\"codexAppServer\",\"observerActive\":true,\"reportRevision\":0,\"configured\":{\"capability\":\"supported\",\"status\":\"observed\",\"observation\":{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":1}},\"turnSelected\":{\"capability\":\"unverified\",\"status\":\"unknown\"},\"responseReported\":{\"capability\":\"supported\",\"status\":\"unknown\",\"reason\":\"awaitingNativeMetadata\"}}",
+      "valid": false
+    },
+    {
+      "name": "unsafe revision",
+      "raw": "{\"backend\":\"codexAppServer\",\"observerActive\":true,\"reportRevision\":9007199254740992,\"configured\":{\"capability\":\"supported\",\"status\":\"observed\",\"observation\":{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":1}},\"turnSelected\":{\"capability\":\"unverified\",\"status\":\"unknown\"},\"responseReported\":{\"capability\":\"supported\",\"status\":\"unknown\",\"reason\":\"awaitingNativeMetadata\"}}",
+      "valid": false
+    },
+    {
+      "name": "fractional revision",
+      "raw": "{\"backend\":\"codexAppServer\",\"observerActive\":true,\"reportRevision\":1.5,\"configured\":{\"capability\":\"supported\",\"status\":\"observed\",\"observation\":{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":1}},\"turnSelected\":{\"capability\":\"unverified\",\"status\":\"unknown\"},\"responseReported\":{\"capability\":\"supported\",\"status\":\"unknown\",\"reason\":\"awaitingNativeMetadata\"}}",
+      "valid": false
+    },
+    {
+      "name": "unsupported observation",
+      "raw": "{\"backend\":\"codexAppServer\",\"observerActive\":true,\"reportRevision\":1,\"configured\":{\"capability\":\"unsupported\",\"status\":\"observed\",\"observation\":{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":1}},\"turnSelected\":{\"capability\":\"unverified\",\"status\":\"unknown\"},\"responseReported\":{\"capability\":\"supported\",\"status\":\"unknown\",\"reason\":\"awaitingNativeMetadata\"}}",
+      "valid": false
+    },
+    {
+      "name": "unknown observation payload",
+      "raw": "{\"backend\":\"codexAppServer\",\"observerActive\":true,\"reportRevision\":1,\"configured\":{\"capability\":\"supported\",\"status\":\"unknown\",\"observation\":{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":1}},\"turnSelected\":{\"capability\":\"unverified\",\"status\":\"unknown\"},\"responseReported\":{\"capability\":\"supported\",\"status\":\"unknown\",\"reason\":\"awaitingNativeMetadata\"}}",
+      "valid": false
+    },
+    {
+      "name": "slot extra",
+      "raw": "{\"backend\":\"codexAppServer\",\"observerActive\":true,\"reportRevision\":1,\"configured\":{\"capability\":\"supported\",\"status\":\"observed\",\"observation\":{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":1},\"extra\":true},\"turnSelected\":{\"capability\":\"unverified\",\"status\":\"unknown\"},\"responseReported\":{\"capability\":\"supported\",\"status\":\"unknown\",\"reason\":\"awaitingNativeMetadata\"}}",
+      "valid": false
+    },
+    {
+      "name": "unknown backend requires tombstone",
+      "raw": "{\"backend\":\"unknown\",\"observerActive\":true,\"reportRevision\":1,\"configured\":{\"capability\":\"supported\",\"status\":\"observed\",\"observation\":{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":1}},\"turnSelected\":{\"capability\":\"unverified\",\"status\":\"unknown\"},\"responseReported\":{\"capability\":\"supported\",\"status\":\"unknown\",\"reason\":\"awaitingNativeMetadata\"}}",
+      "valid": false
+    },
+    {
+      "name": "valid unknown tombstone",
+      "raw": "{\"backend\":\"unknown\",\"observerActive\":false,\"reportRevision\":1,\"configured\":{\"status\":\"invalid\",\"capability\":\"unverified\",\"reason\":\"corruptStoredMetadata\"},\"turnSelected\":{\"status\":\"invalid\",\"capability\":\"unverified\",\"reason\":\"corruptStoredMetadata\"},\"responseReported\":{\"status\":\"invalid\",\"capability\":\"unverified\",\"reason\":\"corruptStoredMetadata\"}}",
+      "valid": true
+    },
+    {
+      "name": "active unknown tombstone",
+      "raw": "{\"backend\":\"unknown\",\"observerActive\":true,\"reportRevision\":1,\"configured\":{\"status\":\"invalid\",\"capability\":\"unverified\",\"reason\":\"corruptStoredMetadata\"},\"turnSelected\":{\"status\":\"invalid\",\"capability\":\"unverified\",\"reason\":\"corruptStoredMetadata\"},\"responseReported\":{\"status\":\"invalid\",\"capability\":\"unverified\",\"reason\":\"corruptStoredMetadata\"}}",
+      "valid": false
+    }
+  ],
+  "observations": [
+    {
+      "name": "observedAt -9007199254740992",
+      "raw": "{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":-9007199254740992}",
+      "valid": false
+    },
+    {
+      "name": "observedAt -9007199254740991",
+      "raw": "{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":-9007199254740991}",
+      "valid": true
+    },
+    {
+      "name": "observedAt 9007199254740991",
+      "raw": "{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":9007199254740991}",
+      "valid": true
+    },
+    {
+      "name": "observedAt 9007199254740992",
+      "raw": "{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":9007199254740992}",
+      "valid": false
+    },
+    {
+      "name": "nativeReportedAt -9007199254740992",
+      "raw": "{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":1,\"nativeReportedAt\":-9007199254740992}",
+      "valid": false
+    },
+    {
+      "name": "nativeReportedAt -9007199254740991",
+      "raw": "{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":1,\"nativeReportedAt\":-9007199254740991}",
+      "valid": true
+    },
+    {
+      "name": "nativeReportedAt 9007199254740991",
+      "raw": "{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":1,\"nativeReportedAt\":9007199254740991}",
+      "valid": true
+    },
+    {
+      "name": "nativeReportedAt 9007199254740992",
+      "raw": "{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":1,\"nativeReportedAt\":9007199254740992}",
+      "valid": false
+    },
+    {
+      "name": "NEL blank",
+      "raw": "{\"modelId\":\"\",\"source\":\"native/source\",\"observedAt\":1}",
+      "valid": false
+    },
+    {
+      "name": "FEFF opaque",
+      "raw": "{\"modelId\":\"﻿\",\"source\":\"native/source\",\"observedAt\":1}",
+      "valid": true
+    },
+    {
+      "name": "supplementary scalar",
+      "raw": "{\"modelId\":\"😀\",\"source\":\"native/source\",\"observedAt\":1}",
+      "valid": true
+    },
+    {
+      "name": "NEL control source",
+      "raw": "{\"modelId\":\"native-model\",\"source\":\"nativesource\",\"observedAt\":1}",
+      "valid": false
+    },
+    {
+      "name": "FEFF source",
+      "raw": "{\"modelId\":\"native-model\",\"source\":\"﻿\",\"observedAt\":1}",
+      "valid": true
+    },
+    {
+      "name": "UTF8 limit",
+      "raw": "{\"modelId\":\"native-model\",\"source\":\"éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\",\"observedAt\":1}",
+      "valid": true
+    },
+    {
+      "name": "UTF8 overflow",
+      "raw": "{\"modelId\":\"native-model\",\"source\":\"ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé\",\"observedAt\":1}",
+      "valid": false
+    },
+    {
+      "name": "modelId lone \\ud800",
+      "raw": "{\"source\":\"native/source\",\"observedAt\":1,\"modelId\":\"\\ud800\"}",
+      "valid": false
+    },
+    {
+      "name": "modelId lone \\udfff",
+      "raw": "{\"source\":\"native/source\",\"observedAt\":1,\"modelId\":\"\\udfff\"}",
+      "valid": false
+    },
+    {
+      "name": "source lone \\ud800",
+      "raw": "{\"modelId\":\"native-model\",\"observedAt\":1,\"source\":\"\\ud800\"}",
+      "valid": false
+    },
+    {
+      "name": "source lone \\udfff",
+      "raw": "{\"modelId\":\"native-model\",\"observedAt\":1,\"source\":\"\\udfff\"}",
+      "valid": false
+    },
+    {
+      "name": "nativeSessionId lone \\ud800",
+      "raw": "{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":1,\"nativeSessionId\":\"\\ud800\"}",
+      "valid": false
+    },
+    {
+      "name": "nativeSessionId lone \\udfff",
+      "raw": "{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":1,\"nativeSessionId\":\"\\udfff\"}",
+      "valid": false
+    },
+    {
+      "name": "ignored extras",
+      "raw": "{\"modelId\":\"native-model\",\"source\":\"native/source\",\"observedAt\":1,\"extra\":\"ignored\"}",
+      "valid": true,
+      "canonical": {
+        "modelId": "native-model",
+        "source": "native/source",
+        "observedAt": 1
+      }
+    }
+  ]
+}

@@ -53,7 +53,9 @@ async fn state_with_counting_fail_adapter(adapter: CountingFailOpenAdapter) -> A
         &hid("claude"),
         Arc::new(move |_cwd| Arc::new(adapter.clone()) as Arc<dyn Adapter>),
     );
-    AppState::wire_with_registry(store, &Config::default(), registry)
+    let state = AppState::wire_with_registry(store, &Config::default(), registry);
+    state.wait_for_runtime_identity_ready().await.unwrap();
+    state
 }
 
 async fn state_with_mock(mock: MockAdapter) -> AppState {
@@ -65,7 +67,9 @@ async fn state_with_mock(mock: MockAdapter) -> AppState {
         &hid("claude"),
         Arc::new(move |_cwd| Arc::new(mock.clone()) as Arc<dyn Adapter>),
     );
-    AppState::wire_with_registry(store, &Config::default(), registry)
+    let state = AppState::wire_with_registry(store, &Config::default(), registry);
+    state.wait_for_runtime_identity_ready().await.unwrap();
+    state
 }
 
 fn operator_request() -> RegisterRequest {

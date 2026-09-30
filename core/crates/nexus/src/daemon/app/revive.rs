@@ -3,6 +3,16 @@
 use super::*;
 
 impl AppState {
+    /// Close model admission and await this state's tracked model settlement after transport
+    /// teardown. The budget bounds only this waiter: cancellation/timeout does not abort owned
+    /// work, certify rollback, or guarantee settlement after the runtime/process exits.
+    pub async fn drain_model_reporting_for_shutdown(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<(), NexusError> {
+        self.model_reporting.shutdown(budget).await
+    }
+
     /// UNIFIED REVIVE — edge wrapper that resolves `name-or-id` once, then dispatches by row.
     ///
     /// - `transport = "acp"` → [`AppState::ensure_live`] (re-open/resume ACP session).
@@ -286,10 +296,18 @@ impl AppState {
                 None => bound_thread_id.is_some(),
             };
             if bound_to_requested_thread {
-                self.make_live_agent_wakeable(&session, &project, row.paused);
+                self.make_live_agent_wakeable(&session, &project, row.paused)
+                    .await;
                 return Ok(session);
             }
         }
+        let reporting_agent = self.capture_model_reporting_agent(&row).await?;
+        let mut model_observation = self.reserve_native_observation(
+            &reporting_agent,
+            &session,
+            nexus_harness_codex::app_server::model_reporting::profile(),
+        )?;
+        model_observation.commit(self).await?;
         let events = self
             .loop_wiring
             .as_ref()
@@ -362,7 +380,7 @@ impl AppState {
         supervisor
             .respawn_codex_appserver(
                 &session,
-                row.agent_id.as_deref().unwrap_or(&name),
+                &reporting_agent,
                 &name,
                 &project,
                 &client_key,
@@ -377,6 +395,7 @@ impl AppState {
                 resume_codex_homes,
                 Some(self.codex_thread_persistence_callback()),
                 viewer_backend,
+                Some(model_observation.reporting()),
             )
             .await
             .map_err(|e| nexus_contracts::ContractError {
@@ -394,7 +413,9 @@ impl AppState {
         }
 
         self.finish_codex_appserver_resume(&name, &session, &project, row.paused)
-            .await
+            .await?;
+        model_observation.activate_codex(self, &transport).await?;
+        Ok(session)
     }
 
     /// Restamp a revived Codex app-server row as live and publish best-effort resume telemetry.
@@ -412,8 +433,9 @@ impl AppState {
         // The drainer intentionally ignores agent-owned pending rows while the durable session is
         // offline. Materialize liveness before spawning/ringing the loop; doing this afterward is
         // a race where the first (and only) wake drains zero rows and mail waits for another post.
-        let _ = self.presence.materialize_online(session).await;
-        self.make_live_agent_wakeable(session, project, paused);
+        self.presence.materialize_online_for_resume(session).await?;
+        self.make_live_agent_wakeable(session, project, paused)
+            .await;
         self.append_agent_lifecycle_best_effort(name, session, "resume", "codex app-server resume")
             .await;
         Ok(session.clone())
@@ -456,10 +478,19 @@ impl AppState {
         // waiter reuses the bridge/viewer pair installed by the owner.
         let _revive = self.runtime_revive_gate.acquire(&session).await;
         if supervisor.has_opencode_plugin(&session) && supervisor.transport().is_bound(&session) {
-            self.attach_opencode_plugin_session_machinery(&session, &project)
+            // Existing hot reuse keeps its best-effort refresh policy and its current model owner.
+            let _ = self
+                .attach_opencode_plugin_session_machinery(&session, &project)
                 .await;
             return Ok(session);
         }
+        let reporting_agent = self.capture_model_reporting_agent(&row).await?;
+        let mut model_observation = self.reserve_native_observation(
+            &reporting_agent,
+            &session,
+            nexus_agent::adapter::opencode::native::model_profile(),
+        )?;
+        model_observation.commit(self).await?;
         let events = self
             .loop_wiring
             .as_ref()
@@ -528,6 +559,7 @@ impl AppState {
                 &resume_args,
                 !resume_args.is_empty(),
                 viewer_backend,
+                Some(model_observation.reporting()),
             )
             .await
             .map_err(|e| nexus_contracts::ContractError {
@@ -543,7 +575,8 @@ impl AppState {
         }
 
         self.attach_opencode_plugin_session_machinery(&session, &project)
-            .await;
+            .await?;
+        model_observation.activate_plugin(self, &supervisor).await?;
         Ok(session)
     }
 
@@ -681,13 +714,25 @@ impl AppState {
             .ok()
             .and_then(|p| p.to_str().map(String::from))
             .unwrap_or_else(|| "nexus".to_string());
-        let size = portable_pty::PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
+        let mut gateway_observation =
+            if headed_runtime_kind(&kind) == HeadedRuntimeKind::HermesGateway {
+                Some(
+                    self.prepare_gateway_resume(
+                        &row,
+                        nexus_agent::adapter::hermes::native::model_profile(),
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+        // The native gateway restores its launch-local session-key store, not a CLI --session
+        // argument. The captured observer rejects any different root selected by that framework.
+        let revive_tail = if gateway_observation.is_some() {
+            Vec::new()
+        } else {
+            self.headed_revive_tail_for_row(&row, &kind).await?
         };
-        let revive_tail = self.headed_revive_tail_for_row(&row, &kind).await?;
         let viewer_backend = match kind.as_str() {
             "hermes" => HermesRuntimeStateRepo::new(&self.store)
                 .find_by_runtime_id(&session)
@@ -714,43 +759,22 @@ impl AppState {
             supervisor.arm_claude_startup_wait(&session);
         }
         supervisor.kill(&session);
-        let events = self.loop_wiring.as_ref().map(|w| w.events());
-        let bell = self.loop_wiring.as_ref().map(|w| w.bell());
-        let respawn = if viewer_backend == "pty" {
-            supervisor
-                .launch_headed_raw_pty(
-                    &session,
-                    &kind,
-                    row.agent_id.as_deref().unwrap_or(&name),
-                    Some(&name),
-                    &project,
-                    &client_key,
-                    &nexus_exe,
-                    &cwd,
-                    size,
-                    &revive_tail,
-                    events,
-                    bell,
-                )
-                .await
-        } else {
-            supervisor
-                .launch_headed_pty(
-                    &session,
-                    &kind,
-                    row.agent_id.as_deref().unwrap_or(&name),
-                    Some(&name),
-                    &project,
-                    &client_key,
-                    &nexus_exe,
-                    &cwd,
-                    size,
-                    &revive_tail,
-                    events,
-                    bell,
-                )
-                .await
-        };
+        let respawn = self
+            .respawn_stored_terminal(
+                &supervisor,
+                &row,
+                &name,
+                &client_key,
+                &kind,
+                &viewer_backend,
+                &nexus_exe,
+                &cwd,
+                &revive_tail,
+                gateway_observation
+                    .as_ref()
+                    .map(|observation| observation.reporting()),
+            )
+            .await;
         if let Err(error) = respawn {
             supervisor.clear_claude_startup_wait(&session);
             return Err(nexus_contracts::ContractError {
@@ -767,14 +791,26 @@ impl AppState {
                 })?;
         }
 
-        self.attach_pty_session_machinery(
-            &supervisor,
-            &session,
-            &project,
-            row.agent.as_deref(),
-            row.paused,
-        )
-        .await;
+        if let Some(observation) = gateway_observation.as_mut() {
+            self.attach_pty_session_machinery_checked(
+                &supervisor,
+                &session,
+                &project,
+                row.agent.as_deref(),
+                row.paused,
+            )
+            .await?;
+            observation.finish_gateway(self, &supervisor).await?;
+        } else {
+            self.attach_pty_session_machinery(
+                &supervisor,
+                &session,
+                &project,
+                row.agent.as_deref(),
+                row.paused,
+            )
+            .await;
+        }
         Ok(session)
     }
 
@@ -787,7 +823,7 @@ impl AppState {
         let harness = harness_registry_by_id(kind);
         if let nexus_harness_core::ResumeStyle::Flag(prefix) = harness.resume_style() {
             // The native session-id store for flag-resume harnesses is currently the
-            // ClaudeNative runtime repo; a future flag-style harness must route its own
+            // legacy native runtime repo; a future flag-style harness must route its own
             // durable key through the registry (P3).
             let state = nexus_harness_claude::storage::ClaudeRuntimeStateRepo::new(&self.store)
                 .find_by_runtime_id(&row.session_id)
@@ -829,21 +865,14 @@ impl AppState {
             })
     }
 
-    /// Re-establish the stream observer, drain loop, and durable liveness rows for a headed PTY
-    /// session after either deterministic tmux adoption or same-session respawn.
-    ///
-    /// Adoption after a daemon restart can race with stale-presence reconciliation: the tmux
-    /// process is still real, but the durable `agent_runtimes` row may already be inactive/offline.
-    /// Restamping both compatibility `sessions` and stable `agent_runtimes` before ringing the loop
-    /// keeps stable-agent `in_flight` rows visible to the drain.
-    pub(crate) async fn attach_pty_session_machinery(
+    pub(super) async fn attach_pty_session_machinery_checked(
         &self,
         supervisor: &Arc<PtySupervisor>,
         session: &SessionId,
         project: &str,
         harness: Option<&str>,
         paused: bool,
-    ) {
+    ) -> Result<(), nexus_contracts::ContractError> {
         // Pending agent-owned rows are intentionally invisible while the durable runtime is
         // offline. Restamp liveness BEFORE spawning/ringing the event loop; `spawn_loop` rings on
         // attach, and spending that wake against an offline row drains nothing and strands the
@@ -855,27 +884,19 @@ impl AppState {
                 error = ?error,
                 "failed to restamp headed PTY runtime live before wake; refusing to ring"
             );
-            return;
+            return Err(error);
         }
 
         // Spawn a fresh PtyReplyReader for the newly-bound tmux harness: the old one exited when the
         // previous daemon lost its PTY channel. On revive/adoption we hook `pipe_output()` on the
         // bound TmuxHarness and start a reader task. The drain loop ring pushes any queued mail.
         //
-        // NOTE: headed codex sessions use the app-server path (transport = "codex-appserver") and are
+        // NOTE: app-server sessions (transport = "codex-appserver") are
         // routed to `ensure_codex_appserver_live`, never here. Guard the reply-reader call anyway so
         // any legacy codex row (transport = "pty" from before this dispatch flip) does NOT accidentally
         // get the scrape reader re-attached on revive.
         if let Some(w) = &self.loop_wiring {
-            w.registry.set(
-                session,
-                if paused {
-                    nexus_dispatch::AgentState::Paused
-                } else {
-                    nexus_dispatch::AgentState::Idle
-                },
-            );
-            self.spawn_raw_stream_writer_for_terminal(session);
+            self.spawn_raw_stream_writer_for_terminal(session).await;
             match headed_runtime_from_agent_token(harness) {
                 HeadedRuntimeKind::ClaudeNative => {
                     self.spawn_claude_native_forwarder_if_needed(session).await;
@@ -906,7 +927,17 @@ impl AppState {
                     );
                 }
             }
-            w.spawn_loop(session, project);
+            // Publish wake state and the loop together, after native setup/I/O has finished.
+            let transition = w.store.lock_presence_transition().await;
+            w.registry.set(
+                session,
+                if paused {
+                    nexus_dispatch::AgentState::Paused
+                } else {
+                    nexus_dispatch::AgentState::Idle
+                },
+            );
+            w.spawn_loop_under_transition(session, project, &transition);
             w.ring(session);
         }
         if let Err(error) = self
@@ -920,18 +951,19 @@ impl AppState {
                 "failed to append headed PTY resume lifecycle event after adoption"
             );
         }
+        Ok(())
     }
 
     pub(crate) async fn attach_opencode_plugin_session_machinery(
         &self,
         session: &SessionId,
         project: &str,
-    ) {
-        self.spawn_raw_stream_writer_for_terminal(session);
+    ) -> Result<(), nexus_contracts::ContractError> {
+        self.spawn_raw_stream_writer_for_terminal(session).await;
         self.spawn_opencode_native_forwarder_if_needed(session)
             .await;
         if let Some(w) = &self.loop_wiring {
-            w.spawn_loop(session, project);
+            w.spawn_loop(session, project).await;
             w.ring(session);
         }
         if let Err(error) = self.mark_rebound_agent_live(session).await {
@@ -941,7 +973,9 @@ impl AppState {
                 error = ?error,
                 "failed to restamp OpenCode plugin runtime live after revive"
             );
-        } else if let Err(error) = self
+            return Err(error);
+        }
+        if let Err(error) = self
             .append_agent_lifecycle_for_session(session, "resume")
             .await
         {
@@ -949,8 +983,9 @@ impl AppState {
                 target: "nexus::revive",
                 session = %session,
                 error = ?error,
-                "failed to append OpenCode plugin resume lifecycle event after revive"
+                "failed to append native plugin resume lifecycle event after revive"
             );
         }
+        Ok(())
     }
 }

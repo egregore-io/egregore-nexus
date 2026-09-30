@@ -1102,6 +1102,10 @@ async fn claude_resume_does_not_treat_provider_session_as_nexus_identity() {
         .unwrap();
 
     let state = AppState::wire_pty(store.clone(), &Config::default());
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
     let mut request = claude_resume_request("felix");
     request.cwd = Some(cwd.to_string_lossy().into_owned());
     let response = state
@@ -1169,6 +1173,10 @@ async fn claude_resume_replaces_same_identity_acp_owner_with_headed_runtime() {
         .unwrap();
 
     let state = AppState::wire_pty(store.clone(), &Config::default());
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
     let mut request = claude_resume_request("hugo");
     request.cwd = Some(cwd.to_string_lossy().into_owned());
     let response = state
@@ -1195,6 +1203,10 @@ async fn daemon_launch_without_cwd_uses_stable_agent_id_fallback_workspace() {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
     let state = AppState::wire_pty(store.clone(), &Config::default());
+    state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
     let name = "claude-daemon-fallback-cwd";
     let request = SpawnRequest {
         kind: hid("claude"),

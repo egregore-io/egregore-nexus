@@ -22,12 +22,12 @@ jobs:
         include:
           - target: linux-x64-gnu
             support: release baseline
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             rust_target: x86_64-unknown-linux-gnu
             executable: nexus
           - target: linux-arm64-gnu
             support: release baseline
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             rust_target: aarch64-unknown-linux-gnu
             executable: nexus
           - target: darwin-x64
@@ -54,6 +54,11 @@ jobs:
       - name: Verify distribution version
         shell: bash
         run: node scripts/nexus-version check
+      - name: Verify Linux ABI guard contracts
+        if: startsWith(matrix.target, 'linux-')
+        run: |
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.35"
+          node --test scripts/nexus-linux-abi.test.mjs
       - name: Verify native packager failure contracts
         if: matrix.target == 'linux-x64-gnu'
         shell: bash
@@ -115,6 +120,9 @@ jobs:
           node packages/nexus-cli/bin/nexus.mjs --version
           node packages/nexus-cli/bin/nexus.mjs daemon install --help
           node scripts/nexus-cli-command-surface-smoke.mjs packages/nexus-cli/bin/nexus.mjs
+      - name: Verify packaged Linux glibc baseline
+        if: startsWith(matrix.target, 'linux-')
+        run: node scripts/nexus-linux-abi.mjs packages/nexus-cli/native/${{ matrix.target }}/nexus
       - uses: actions/upload-artifact@v4
         with:
           name: nexus-native-${{ matrix.target }}

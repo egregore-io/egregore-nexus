@@ -973,22 +973,24 @@ async fn route_request_inner(
             prompt_target_row_by_session(state, &session).await?;
             let caller_kind = authenticated_caller_kind(state, c).await?;
             let mut response = state
-                .agent
-                .steer_observed(
-                    &session,
-                    r.text.clone(),
-                    std::sync::Arc::new(state.ws.clone()),
-                    WsEvent::AgentUpdate {
-                        session_id: session.clone(),
-                        kind: AgentUpdateKind::UserInput,
-                        data: json!({
-                            "text": r.text,
-                            "clientMessageId": r.client_message_id,
-                            "source": "steer",
-                            "name": c.name,
-                            "kind": caller_kind,
-                        }),
-                    },
+                .prompt_entry_before_shutdown(
+                    attempt,
+                    state.agent.steer_observed(
+                        &session,
+                        r.text.clone(),
+                        std::sync::Arc::new(state.ws.clone()),
+                        WsEvent::AgentUpdate {
+                            session_id: session.clone(),
+                            kind: AgentUpdateKind::UserInput,
+                            data: json!({
+                                "text": r.text,
+                                "clientMessageId": r.client_message_id,
+                                "source": "steer",
+                                "name": c.name,
+                                "kind": caller_kind,
+                            }),
+                        },
+                    ),
                 )
                 .await
                 .map_err(|e| contract_to_rpc(&e))?;

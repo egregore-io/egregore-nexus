@@ -128,7 +128,9 @@ pub struct LoopWiring {
     pub(crate) native_forwarders: Arc<Mutex<HashMap<(String, SessionId), NativeForwarderSlot>>>,
     /// Headed PTY/tmux sessions whose raw terminal output is already being copied to stream_raw.
     pub(crate) raw_stream_writers: Arc<Mutex<HashSet<SessionId>>>,
-    /// Connection-owned liveness registry + materialized presence writer.
+    /// Connection-owned liveness registry + materialized presence writer. Construction must use
+    /// the same Store as `store` above (AppState::wire_shared supplies both from state.store), so
+    /// attachment guards serialize with this writer's tracked offline transitions.
     pub(crate) presence: PresenceWriter,
 }
 
@@ -172,7 +174,20 @@ impl LoopWiring {
     /// launch→dm→wake path). `project` must be the session's own project: the drainer filters
     /// in-flight rows by it (`pending_for(... project ...)`), so an empty/wrong project drains
     /// nothing and the agent never wakes.
-    pub(crate) fn spawn_loop(&self, session: &SessionId, project: &str) {
+    pub(crate) async fn spawn_loop(&self, session: &SessionId, project: &str) {
+        let transition = self.store.lock_presence_transition().await;
+        self.spawn_loop_under_transition(session, project, &transition);
+    }
+
+    /// Synchronous publication for callers already holding this wiring's Store presence guard.
+    /// The borrowed guard proves lock ownership, not Store identity: callers must acquire it from
+    /// `self.store` (or the same AppState store used to construct this wiring), before map locks.
+    pub(crate) fn spawn_loop_under_transition(
+        &self,
+        session: &SessionId,
+        project: &str,
+        _transition: &tokio::sync::OwnedMutexGuard<()>,
+    ) {
         let mut spawned = self.spawned.lock().expect("spawned set poisoned");
         if self.shutting_down.load(Ordering::Acquire) {
             tracing::debug!(
@@ -240,11 +255,12 @@ impl LoopWiring {
         self.abort_loop(session);
     }
 
-    pub(crate) fn spawn_raw_stream_writer(
+    pub(crate) async fn spawn_raw_stream_writer(
         &self,
         session: &SessionId,
         output: broadcast::Receiver<Vec<u8>>,
     ) {
+        let _transition = self.store.lock_presence_transition().await;
         {
             let mut spawned = self
                 .raw_stream_writers
@@ -262,7 +278,8 @@ impl LoopWiring {
 
     /// Claim a structured native forwarder slot. Forwarders read append-only native stores, so
     /// multiple tasks for one session would duplicate `/agent` stream rows.
-    pub(crate) fn claim_native_forwarder(&self, harness: &str, session: &SessionId) -> bool {
+    pub(crate) async fn claim_native_forwarder(&self, harness: &str, session: &SessionId) -> bool {
+        let _transition = self.store.lock_presence_transition().await;
         let mut spawned = self
             .native_forwarders
             .lock()
@@ -291,11 +308,16 @@ impl LoopWiring {
 
     /// Called under the captured binding's owner gate. A fresh owner supersedes an older
     /// reservation as well as an attached task; the map remains the sole forwarder registry.
+    /// The caller must capture the owner BEFORE awaiting this wiring's Store presence guard, then
+    /// revalidate that captured owner under the native gate. The borrowed guard does not prove
+    /// Store identity; construction/callers must honor the same-Store contract above. Release the
+    /// presence guard after this synchronous claim, before forwarder setup or I/O.
     pub(crate) fn claim_native_forwarder_for_owner(
         &self,
         harness: &str,
         session: &SessionId,
         owner: uuid::Uuid,
+        _transition: &tokio::sync::OwnedMutexGuard<()>,
     ) -> bool {
         let mut slots = self
             .native_forwarders

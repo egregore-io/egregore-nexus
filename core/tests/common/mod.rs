@@ -61,6 +61,7 @@ impl TestDaemon {
         );
 
         let state = AppState::wire_with_registry(store, &Config::default(), registry);
+        state.wait_for_runtime_identity_ready().await.unwrap();
 
         TestDaemon { state, mock }
     }

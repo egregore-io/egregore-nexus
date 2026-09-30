@@ -14,13 +14,14 @@
 #   scripts/check architecture                  # daemon/Gateway/WebUI ownership boundary
 #   scripts/check boundaries                    # harness isolation boundary (shrink-only)
 #   scripts/check gateway      # gateway only
+#   scripts/check model-reporting              # eight native/adapter modes -> Gateway snapshots
 #   scripts/check hooks-practical             # live Gateway message-hook boundary
 #   scripts/check gateway useAgentSession       # focused vitest filter
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/check [all|rust|rust-workspace|acceptance|core-test-layout|cargo-targets|release-identity|architecture|boundaries|load|hooks-practical|gateway] [extra args]
+Usage: scripts/check [all|rust|rust-workspace|acceptance|core-test-layout|cargo-targets|release-identity|architecture|boundaries|load|hooks-practical|gateway|model-reporting] [extra args]
 EOF
 }
 
@@ -86,6 +87,32 @@ gateway_gate() {
   fi
 }
 
+model_reporting_gate() (
+  # Empty unique artifacts, explicit run association, no access to an operator Nexus home.
+  local original_home="$HOME"
+  local run_home
+  run_home="$(mktemp -d "${TMPDIR:-/tmp}/nexus-model-reporting.XXXXXX")"
+  trap 'rm -rf -- "$run_home"' EXIT
+  export CARGO_HOME="${CARGO_HOME:-$original_home/.cargo}"
+  export RUSTUP_HOME="${RUSTUP_HOME:-$original_home/.rustup}"
+  export HOME="$run_home/home" NEXUS_HOME="$run_home/nexus" XDG_CONFIG_HOME="$run_home/config"
+  export NEXUS_MODEL_PROJECTION_FIXTURE_DIR="$run_home/artifacts"
+  export NEXUS_MODEL_PROJECTION_RUN_ID="${run_home##*/}"
+  mkdir -p "$HOME" "$NEXUS_MODEL_PROJECTION_FIXTURE_DIR"
+  (cd core && cargo test -p egregore-nexus --test acp_adapter_model_reporting)
+  (cd core && cargo test -p egregore-nexus --test codex_appserver_launch fresh_headed_codex_launch_persists_discovered_thread_in_resurrection_capsule)
+  (cd core && cargo test -p egregore-nexus --lib headed_model_projection_)
+  for mode in headless headed; do
+    for harness in claude codex opencode hermes; do
+      test -s "$NEXUS_MODEL_PROJECTION_FIXTURE_DIR/$harness.$mode.json" || {
+        echo "Missing nonempty Rust projection artifact: $harness.$mode" >&2; exit 1;
+      }
+    done
+  done
+  node -e 'const fs=require("node:fs"),crypto=require("node:crypto"),path=require("node:path"); const dir=process.env.NEXUS_MODEL_PROJECTION_FIXTURE_DIR; for(const name of fs.readdirSync(dir).sort()) console.log(crypto.createHash("sha256").update(fs.readFileSync(path.join(dir,name))).digest("hex"),name);'
+  (cd gateway && node node_modules/vitest/vitest.mjs run --config vitest.model-integration.config.ts)
+)
+
 case "$MODE" in
   rust)           rust_gate "$@" ;;
   rust-workspace) rust_workspace_compile_gate ;;
@@ -95,6 +122,7 @@ case "$MODE" in
   release-identity) release_identity_gate ;;
   architecture)    architecture_ownership_gate ;;
   boundaries)      boundary_gate ;;
+  model-reporting) model_reporting_gate ;;
   # Load-regression gate: full incident-replay run in the isolated docker env (phases 1-6,
   # ~10-15 min). NOT part of `all` — run before every deploy: scripts/check load
   load) python3 scripts/test-nexus-load-gate && exec python3 -u scripts/nexus-load-gate run --skip-docker-build "$@" ;;

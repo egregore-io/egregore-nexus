@@ -9,4 +9,5 @@ pub mod codec;
 pub mod forwarder;
 pub mod hooks;
 pub mod message_delta;
+pub mod model_reporting;
 pub mod transcript;

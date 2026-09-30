@@ -8,7 +8,7 @@ use nexus_store::{migrate_identity_with_fault, MigrationFault, Store};
 const BASELINE_SCHEMA: &str = include_str!("../../../migrations/0001_init.sql");
 const IDENTITY_SCHEMA: &str = include_str!("../../../migrations/identity/0001_identity.sql");
 const LEGACY_MARKER: &str = "v0.1.0_identity";
-const CURRENT_IDENTITY_MARKER: &str = "v0.1.6_identity_caller_principal";
+const CURRENT_IDENTITY_MARKER: &str = "v0.1.6_identity_model_report";
 const LEGACY_NATIVE_THREAD_BINDINGS_SCHEMA: &str = r#"
 CREATE TABLE native_thread_bindings (
   harness          TEXT NOT NULL,

@@ -2087,13 +2087,49 @@ mod agent_credentials {
 }
 
 mod sessions {
+    use std::future::Future;
+
     use libsql::params;
     use nexus_contracts::enums::{Kind, Presence, Scope};
     use nexus_contracts::ids::{MessageId, ProjectId, SessionId};
     use nexus_contracts::message::{Message, Provenance};
     use nexus_store::repos::sessions::*;
-    use nexus_store::repos::{AgentCredentials, Agents, Messages, NewAgent, NewAgentCredential};
-    use nexus_store::Store;
+    use nexus_store::repos::{
+        AgentCredentials, Agents, DeveloperEvents, Messages, NewAgent, NewAgentCredential,
+        AGENT_LIFECYCLE_TOPIC,
+    };
+    use nexus_store::{DaemonStore, Store};
+
+    struct SplitStore(std::path::PathBuf);
+
+    impl SplitStore {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            Self(std::env::temp_dir().join(format!(
+                "nexus-session-stale-{}-{nonce}.db",
+                std::process::id()
+            )))
+        }
+
+        async fn open(&self) -> DaemonStore {
+            DaemonStore::open(self.0.to_str().unwrap()).await.unwrap()
+        }
+    }
+
+    impl Drop for SplitStore {
+        fn drop(&mut self) {
+            for path in [
+                self.0.clone(),
+                self.0.with_extension("db-wal"),
+                self.0.with_extension("db-shm"),
+            ] {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
 
     async fn migrated() -> Store {
         let s = Store::open(":memory:").await.unwrap();
@@ -2115,6 +2151,913 @@ mod sessions {
             project: "p_demo".into(),
             transport: None,
         }
+    }
+
+    async fn stale_session(
+        store: &Store,
+        name: &str,
+        agent_id: Option<&str>,
+        presence: Option<&str>,
+        created_at: i64,
+        last_heartbeat: Option<i64>,
+    ) -> SessionId {
+        let session = SessionId(format!("s_{name}"));
+        let mut new = new_session(name, &format!("ck-{name}"));
+        new.session_id = session.clone();
+        Sessions::new(store)
+            .create_staged_registration(new)
+            .await
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sessions SET agent_id=?2,presence=?3,created_at=?4,last_heartbeat=?5, \
+                 role='kept-role',current_work='kept-work',metadata_json='{\"kept\":true}' \
+                 WHERE session_id=?1",
+                params![
+                    session.0.clone(),
+                    agent_id,
+                    presence,
+                    created_at,
+                    last_heartbeat
+                ],
+            )
+            .await
+            .unwrap();
+        session
+    }
+
+    async fn lifecycle_rows(store: &Store) -> Vec<nexus_store::repos::DeveloperEventRow> {
+        DeveloperEvents::new(store)
+            .since(AGENT_LIFECYCLE_TOPIC, 0)
+            .await
+            .unwrap()
+    }
+
+    async fn resume_presence_policy(
+        store: &Store,
+        session: &SessionId,
+        best_effort: bool,
+    ) -> Result<(), nexus_common::NexusError> {
+        let repo = Sessions::new(store);
+        if best_effort {
+            repo.set_presence_with_best_effort_lifecycle(session, Presence::Online)
+                .await
+        } else {
+            repo.set_presence(session, Presence::Online).await
+        }
+    }
+
+    async fn resume_presence_append_failure(best_effort: bool) {
+        let store = migrated().await;
+        let session =
+            stale_session(&store, "resume-policy", None, Some("offline"), 10, Some(20)).await;
+        store.conn.execute_batch("CREATE TRIGGER fail_resume_lifecycle BEFORE INSERT ON developer_events BEGIN SELECT RAISE(ABORT,'resume lifecycle append failure'); END;").await.unwrap();
+        let epoch = store.events().session_lifecycle_changed().epoch();
+        let result = resume_presence_policy(&store, &session, best_effort).await;
+        if best_effort {
+            result.expect("only the lifecycle append error is best-effort");
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("resume lifecycle append failure"), "{error}");
+        }
+        assert_eq!(
+            Sessions::new(&store)
+                .find_by_session_id(&session)
+                .await
+                .unwrap()
+                .unwrap()
+                .presence
+                .as_deref(),
+            Some("online")
+        );
+        assert!(lifecycle_rows(&store).await.is_empty());
+        assert_eq!(
+            store.events().session_lifecycle_changed().epoch(),
+            epoch + u64::from(best_effort)
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_presence_strict_append_failure_retains_error_and_signal_order() {
+        resume_presence_append_failure(false).await;
+    }
+
+    #[tokio::test]
+    async fn resume_presence_best_effort_append_failure_signals_durable_update() {
+        resume_presence_append_failure(true).await;
+    }
+
+    #[tokio::test]
+    async fn resume_presence_required_lookup_failure_is_not_swallowed() {
+        for best_effort in [false, true] {
+            let store = migrated().await;
+            let session =
+                stale_session(&store, "resume-lookup", None, Some("offline"), 10, Some(20)).await;
+            store
+                .conn
+                .execute_batch("UPDATE sessions SET kind='invalid-resume-kind'")
+                .await
+                .unwrap();
+            let before = staged_raw(&store, &session).await;
+            let epoch = store.events().session_lifecycle_changed().epoch();
+            let error = resume_presence_policy(&store, &session, best_effort)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("invalid-resume-kind"), "{error}");
+            assert_eq!(staged_raw(&store, &session).await, before);
+            assert!(lifecycle_rows(&store).await.is_empty());
+            assert_eq!(store.events().session_lifecycle_changed().epoch(), epoch);
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_presence_required_update_failure_is_not_swallowed() {
+        for best_effort in [false, true] {
+            let store = migrated().await;
+            let session =
+                stale_session(&store, "resume-update", None, Some("offline"), 10, Some(20)).await;
+            store.conn.execute_batch("CREATE TRIGGER fail_resume_update BEFORE UPDATE OF presence ON sessions BEGIN SELECT RAISE(ABORT,'required resume presence update'); END;").await.unwrap();
+            let before = staged_raw(&store, &session).await;
+            let epoch = store.events().session_lifecycle_changed().epoch();
+            let error = resume_presence_policy(&store, &session, best_effort)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("required resume presence update"), "{error}");
+            assert_eq!(staged_raw(&store, &session).await, before);
+            assert!(lifecycle_rows(&store).await.is_empty());
+            assert_eq!(store.events().session_lifecycle_changed().epoch(), epoch);
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_presence_normal_append_preserves_event_and_signal() {
+        for best_effort in [false, true] {
+            let store = migrated().await;
+            let session =
+                stale_session(&store, "resume-normal", None, Some("offline"), 10, Some(20)).await;
+            let epoch = store.events().session_lifecycle_changed().epoch();
+            resume_presence_policy(&store, &session, best_effort)
+                .await
+                .unwrap();
+            let rows = lifecycle_rows(&store).await;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].lifecycle.as_deref(), Some("started"));
+            assert_eq!(rows[0].session_id.as_deref(), Some(session.0.as_str()));
+            assert_eq!(
+                store.events().session_lifecycle_changed().epoch(),
+                epoch + 1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_presence_no_transition_does_not_attempt_append() {
+        for best_effort in [false, true] {
+            let store = migrated().await;
+            let session = stale_session(
+                &store,
+                "resume-unchanged",
+                None,
+                Some("online"),
+                10,
+                Some(20),
+            )
+            .await;
+            store.conn.execute_batch("CREATE TRIGGER fail_unneeded_append BEFORE INSERT ON developer_events BEGIN SELECT RAISE(ABORT,'unexpected lifecycle append'); END;").await.unwrap();
+            let before = staged_raw(&store, &session).await;
+            let epoch = store.events().session_lifecycle_changed().epoch();
+            resume_presence_policy(&store, &session, best_effort)
+                .await
+                .unwrap();
+            assert_eq!(staged_raw(&store, &session).await, before);
+            assert!(lifecycle_rows(&store).await.is_empty());
+            assert_eq!(
+                store.events().session_lifecycle_changed().epoch(),
+                epoch + 1
+            );
+        }
+    }
+
+    async fn staged_raw(store: &Store, id: &SessionId) -> Option<Vec<libsql::Value>> {
+        let mut rows = store
+            .conn
+            .query(
+                "SELECT * FROM sessions WHERE session_id=?1",
+                params![id.0.clone()],
+            )
+            .await
+            .unwrap();
+        rows.next()
+            .await
+            .unwrap()
+            .map(|row| (0..20).map(|i| row.get_value(i).unwrap()).collect())
+    }
+
+    #[tokio::test]
+    async fn captured_staged_manifest_covers_every_persisted_column() {
+        let store = migrated().await;
+        let source = include_str!("../src/repos/sessions.rs");
+        let (_, manifest) = source
+            .split_once("const CAPTURED_SESSION_COLUMNS: [&str; 20] = [")
+            .expect("private capture manifest declaration");
+        let (manifest, _) = manifest
+            .split_once("];\n")
+            .expect("fixed manifest terminator");
+        let mut expected: Vec<_> = manifest
+            .split('"')
+            .enumerate()
+            .filter_map(|(i, s)| (i % 2 == 1).then_some(s.to_owned()))
+            .collect();
+        let mut actual = Vec::new();
+        let mut rows = store
+            .conn
+            .query("PRAGMA table_info(sessions)", ())
+            .await
+            .unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            actual.push(row.get::<String>(1).unwrap());
+        }
+        expected.sort();
+        actual.sort();
+        assert_eq!(expected.len(), 20);
+        assert_eq!(
+            actual, expected,
+            "persisted columns must not escape receipt authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_staged_roundtrip_advances_only_confirmed_authority() {
+        let store = migrated().await;
+        let repo = Sessions::new(&store);
+        let epoch = store.events().session_lifecycle_changed().epoch();
+        let unrelated = repo
+            .create_staged_registration_captured(new_session("unrelated", "unrelated-key"), None)
+            .await
+            .unwrap();
+        let unrelated_before = staged_raw(&store, &unrelated.row().session_id).await;
+        let original = repo
+            .create_staged_registration_captured(
+                new_session("captured", "captured-key"),
+                Some("{\"original\":true}".into()),
+            )
+            .await
+            .unwrap();
+        let id = original.row().session_id.clone();
+        assert_eq!(
+            Some(original.row().clone()),
+            repo.find_by_session_id(&id).await.unwrap()
+        );
+        assert!(lifecycle_rows(&store).await.is_empty());
+        assert_eq!(epoch, store.events().session_lifecycle_changed().epoch());
+        let before = staged_raw(&store, &id).await.unwrap();
+        let advanced = match repo
+            .set_agent_id_selected(&original, "a_selected")
+            .await
+            .unwrap()
+        {
+            SelectedStagedSessionStamp::Updated(receipt) => receipt,
+            _ => panic!("exact selection must stamp"),
+        };
+        let mut expected = before;
+        expected[1] = libsql::Value::Text("a_selected".into());
+        assert_eq!(staged_raw(&store, &id).await.unwrap(), expected);
+        assert_eq!(advanced.row().agent_id.as_deref(), Some("a_selected"));
+        let same_value = match repo
+            .set_agent_id_selected(&advanced, "a_selected")
+            .await
+            .unwrap()
+        {
+            SelectedStagedSessionStamp::Updated(receipt) => receipt,
+            _ => panic!("same binding remains an exact selection"),
+        };
+        assert_eq!(same_value.row(), advanced.row());
+        assert_eq!(staged_raw(&store, &id).await.unwrap(), expected);
+        assert!(matches!(
+            repo.set_agent_id_selected(&original, "a_wrong")
+                .await
+                .unwrap(),
+            SelectedStagedSessionStamp::SelectionChanged
+        ));
+        assert!(matches!(
+            repo.remove_staged_registration_selected(&original)
+                .await
+                .unwrap(),
+            SelectedStagedSessionCleanup::SelectionChanged
+        ));
+        assert_eq!(staged_raw(&store, &id).await.unwrap(), expected);
+        assert_eq!(epoch, store.events().session_lifecycle_changed().epoch());
+        assert!(matches!(
+            repo.remove_staged_registration_selected(&advanced)
+                .await
+                .unwrap(),
+            SelectedStagedSessionCleanup::Removed
+        ));
+        assert_eq!(
+            store.events().session_lifecycle_changed().epoch(),
+            epoch + 1
+        );
+        assert!(matches!(
+            repo.remove_staged_registration_selected(&same_value)
+                .await
+                .unwrap(),
+            SelectedStagedSessionCleanup::AlreadyAbsent
+        ));
+        assert!(matches!(
+            repo.set_agent_id_selected(&advanced, "a_absent")
+                .await
+                .unwrap(),
+            SelectedStagedSessionStamp::SelectionChanged
+        ));
+        assert_eq!(
+            store.events().session_lifecycle_changed().epoch(),
+            epoch + 1
+        );
+        assert!(lifecycle_rows(&store).await.is_empty());
+        assert_eq!(
+            staged_raw(&store, &unrelated.row().session_id).await,
+            unrelated_before
+        );
+        store
+            .begin_write_txn("following_receipt_writer")
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn captured_staged_rejects_every_changed_column_without_effects() {
+        // Include exact NULL-vs-empty distinctions and identity/native/client/metadata fields.
+        for mutation in [
+            "agent_id='a_other'",
+            "name='replacement'",
+            "agent='codex'",
+            "kind='human'",
+            "kind='invalid-kind'",
+            "role=''",
+            "tier='other'",
+            "harness_session_id='h_other'",
+            "client_key='other-key'",
+            "cwd=''",
+            "project='elsewhere'",
+            "current_work=''",
+            "presence=NULL",
+            "paused=NULL",
+            "paused_by=''",
+            "callback_url=''",
+            "last_heartbeat=0",
+            "created_at=NULL",
+            "transport=''",
+            "metadata_json=''",
+            "session_id='s_replacement'",
+        ] {
+            let store = migrated().await;
+            let repo = Sessions::new(&store);
+            let original = repo
+                .create_staged_registration_captured(new_session("original", "original-key"), None)
+                .await
+                .unwrap();
+            let unrelated = repo
+                .create_staged_registration_captured(
+                    new_session("unrelated", "unrelated-key"),
+                    None,
+                )
+                .await
+                .unwrap();
+            let other_before = staged_raw(&store, &unrelated.row().session_id).await;
+            store
+                .conn
+                .execute(
+                    &format!("UPDATE sessions SET {mutation} WHERE session_id='s_original'"),
+                    (),
+                )
+                .await
+                .unwrap();
+            let id = if mutation.starts_with("session_id=") {
+                SessionId("s_replacement".into())
+            } else {
+                original.row().session_id.clone()
+            };
+            let before = staged_raw(&store, &id).await;
+            let epoch = store.events().session_lifecycle_changed().epoch();
+            assert!(
+                matches!(
+                    repo.set_agent_id_selected(&original, "a_wrong")
+                        .await
+                        .unwrap(),
+                    SelectedStagedSessionStamp::SelectionChanged
+                ),
+                "{mutation}"
+            );
+            let cleanup = repo
+                .remove_staged_registration_selected(&original)
+                .await
+                .unwrap();
+            assert!(
+                if mutation.starts_with("session_id=") {
+                    matches!(cleanup, SelectedStagedSessionCleanup::AlreadyAbsent)
+                } else {
+                    matches!(cleanup, SelectedStagedSessionCleanup::SelectionChanged)
+                },
+                "{mutation}"
+            );
+            assert_eq!(staged_raw(&store, &id).await, before, "{mutation}");
+            assert_eq!(
+                staged_raw(&store, &unrelated.row().session_id).await,
+                other_before
+            );
+            assert!(lifecycle_rows(&store).await.is_empty());
+            assert_eq!(epoch, store.events().session_lifecycle_changed().epoch());
+            store
+                .begin_write_txn("after_changed_selection")
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn captured_staged_raw_equivalence_is_not_projection_equivalence() {
+        for (initial, replacement) in [
+            ("kind='agent'", "kind='local.agent'"),
+            ("paused=NULL", "paused=0"),
+            ("paused=1", "paused=2"),
+            ("paused=0.5", "paused=0"),
+            ("created_at=NULL", "created_at=0"),
+            ("created_at='not-an-integer'", "created_at=0"),
+            ("agent=X'0102'", "agent='Blob([1, 2])'"),
+        ] {
+            let store = migrated().await;
+            store.conn.execute_batch(&format!("CREATE TRIGGER capture_initial AFTER INSERT ON sessions BEGIN UPDATE sessions SET {initial} WHERE session_id=NEW.session_id; END;")).await.unwrap();
+            let repo = Sessions::new(&store);
+            let receipt = repo
+                .create_staged_registration_captured(new_session("raw", "raw-key"), None)
+                .await
+                .unwrap();
+            let id = &receipt.row().session_id;
+            let original_raw = staged_raw(&store, id).await;
+            store
+                .conn
+                .execute(
+                    &format!("UPDATE sessions SET {replacement} WHERE session_id=?1"),
+                    params![id.0.clone()],
+                )
+                .await
+                .unwrap();
+            let replacement_raw = staged_raw(&store, id).await;
+            assert_ne!(original_raw, replacement_raw);
+            assert_eq!(
+                Some(receipt.row().clone()),
+                repo.find_by_session_id(id).await.unwrap(),
+                "fixture must normalize equivalently: {initial}"
+            );
+            let epoch = store.events().session_lifecycle_changed().epoch();
+            assert!(
+                matches!(
+                    repo.set_agent_id_selected(&receipt, "a_wrong")
+                        .await
+                        .unwrap(),
+                    SelectedStagedSessionStamp::SelectionChanged
+                ),
+                "{initial}"
+            );
+            assert!(
+                matches!(
+                    repo.remove_staged_registration_selected(&receipt)
+                        .await
+                        .unwrap(),
+                    SelectedStagedSessionCleanup::SelectionChanged
+                ),
+                "{initial}"
+            );
+            assert_eq!(staged_raw(&store, id).await, replacement_raw);
+            assert!(lifecycle_rows(&store).await.is_empty());
+            assert_eq!(epoch, store.events().session_lifecycle_changed().epoch());
+            // Restoring the same raw image is intentionally allowed: this is not ABA protection.
+            store
+                .conn
+                .execute(
+                    &format!("UPDATE sessions SET {initial} WHERE session_id=?1"),
+                    params![id.0.clone()],
+                )
+                .await
+                .unwrap();
+            assert_eq!(staged_raw(&store, id).await, original_raw);
+            let advanced = match repo.set_agent_id_selected(&receipt, "a_raw").await.unwrap() {
+                SelectedStagedSessionStamp::Updated(receipt) => receipt,
+                _ => panic!("actual persisted noncanonical image must remain usable"),
+            };
+            let mut expected = original_raw.unwrap();
+            expected[1] = libsql::Value::Text("a_raw".into());
+            assert_eq!(staged_raw(&store, id).await.unwrap(), expected);
+            assert!(matches!(
+                repo.remove_staged_registration_selected(&advanced)
+                    .await
+                    .unwrap(),
+                SelectedStagedSessionCleanup::Removed
+            ));
+            store
+                .begin_write_txn("after_raw_receipt")
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn assert_captured_staged_rejected_write(action: &str) {
+        let store = migrated().await;
+        let repo = Sessions::new(&store);
+        let receipt = repo
+            .create_staged_registration_captured(new_session("guarded", "guarded-key"), None)
+            .await
+            .unwrap();
+        let before = staged_raw(&store, &receipt.row().session_id).await;
+        let trigger = match action {
+                "ignore-update" => "CREATE TRIGGER reject_write BEFORE UPDATE ON sessions BEGIN SELECT RAISE(IGNORE); END;",
+                "ignore-delete" => "CREATE TRIGGER reject_write BEFORE DELETE ON sessions BEGIN SELECT RAISE(IGNORE); END;",
+                _ => "CREATE TRIGGER reject_write AFTER UPDATE OF agent_id ON sessions BEGIN UPDATE sessions SET client_key='trigger-key',metadata_json='changed' WHERE session_id=NEW.session_id; END;",
+            };
+        store.conn.execute_batch(trigger).await.unwrap();
+        let epoch = store.events().session_lifecycle_changed().epoch();
+        if action == "ignore-delete" {
+            assert!(
+                repo.remove_staged_registration_selected(&receipt)
+                    .await
+                    .is_err(),
+                "ignored delete cannot report Removed"
+            );
+        } else {
+            assert!(
+                repo.set_agent_id_selected(&receipt, "a_new").await.is_err(),
+                "{action} cannot advance receipt"
+            );
+        }
+        assert_eq!(staged_raw(&store, &receipt.row().session_id).await, before);
+        assert_eq!(epoch, store.events().session_lifecycle_changed().epoch());
+        assert!(lifecycle_rows(&store).await.is_empty());
+        store
+            .conn
+            .execute_batch("DROP TRIGGER reject_write;")
+            .await
+            .unwrap();
+        // The original receipt is still valid after this confirmed precommit rollback.
+        let advanced = match repo.set_agent_id_selected(&receipt, "a_new").await.unwrap() {
+            SelectedStagedSessionStamp::Updated(receipt) => receipt,
+            _ => panic!("rollback must preserve original authority"),
+        };
+        assert!(matches!(
+            repo.remove_staged_registration_selected(&advanced)
+                .await
+                .unwrap(),
+            SelectedStagedSessionCleanup::Removed
+        ));
+        store
+            .begin_write_txn("after_rejected_write")
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn captured_staged_ignored_update_does_not_advance() {
+        assert_captured_staged_rejected_write("ignore-update").await;
+    }
+
+    #[tokio::test]
+    async fn captured_staged_ignored_delete_does_not_signal_removal() {
+        assert_captured_staged_rejected_write("ignore-delete").await;
+    }
+
+    #[tokio::test]
+    async fn captured_staged_trigger_changes_roll_back_without_advanced_authority() {
+        assert_captured_staged_rejected_write("alter-update").await;
+    }
+
+    #[tokio::test]
+    async fn captured_staged_insert_and_projection_failures_return_no_receipt() {
+        for trigger in [
+            "CREATE TRIGGER reject_insert BEFORE INSERT ON sessions BEGIN SELECT RAISE(IGNORE); END;",
+            "CREATE TRIGGER reject_insert AFTER INSERT ON sessions BEGIN UPDATE sessions SET kind='invalid-kind' WHERE session_id=NEW.session_id; END;",
+        ] {
+            let store = migrated().await;
+            store.conn.execute_batch(trigger).await.unwrap();
+            let epoch = store.events().session_lifecycle_changed().epoch();
+            assert!(Sessions::new(&store).create_staged_registration_captured(new_session("invalid", "invalid-key"), None).await.is_err());
+            assert!(staged_raw(&store, &SessionId("s_invalid".into())).await.is_none(), "precommit decode failure must roll back insertion");
+            assert_eq!(epoch, store.events().session_lifecycle_changed().epoch());
+            assert!(lifecycle_rows(&store).await.is_empty());
+            store.begin_write_txn("after_insert_failure").await.unwrap().commit().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn captured_staged_creation_waits_for_actual_transport_write_gate() {
+        use std::task::Poll;
+        let store = migrated().await;
+        let repo = Sessions::new(&store);
+        let held = store.begin_write_txn("park_capture").await.unwrap();
+        let mut capture = Box::pin(
+            repo.create_staged_registration_captured(new_session("parked", "parked-key"), None),
+        );
+        std::future::poll_fn(|cx| {
+            assert!(
+                capture.as_mut().poll(cx).is_pending(),
+                "capture must acquire gate before insertion"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert!(staged_raw(&store, &SessionId("s_parked".into()))
+            .await
+            .is_none());
+        held.commit().await.unwrap();
+        let receipt = capture.await.unwrap();
+        assert_eq!(receipt.row().session_id.0, "s_parked");
+        assert!(matches!(
+            repo.remove_staged_registration_selected(&receipt)
+                .await
+                .unwrap(),
+            SelectedStagedSessionCleanup::Removed
+        ));
+    }
+
+    #[tokio::test]
+    async fn captured_staged_selected_operations_revalidate_parked_replacement() {
+        use std::task::Poll;
+        for stamp in [true, false] {
+            let store = migrated().await;
+            let repo = Sessions::new(&store);
+            let receipt = repo
+                .create_staged_registration_captured(new_session("parked", "parked-key"), None)
+                .await
+                .unwrap();
+            let held = store
+                .begin_write_txn("replace_parked_selection")
+                .await
+                .unwrap();
+            let operation = async {
+                if stamp {
+                    assert!(matches!(
+                        repo.set_agent_id_selected(&receipt, "a_wrong")
+                            .await
+                            .unwrap(),
+                        SelectedStagedSessionStamp::SelectionChanged
+                    ));
+                } else {
+                    assert!(matches!(
+                        repo.remove_staged_registration_selected(&receipt)
+                            .await
+                            .unwrap(),
+                        SelectedStagedSessionCleanup::SelectionChanged
+                    ));
+                }
+            };
+            let mut operation = Box::pin(operation);
+            let mut follower = Box::pin(store.begin_write_txn("following_parked_selection"));
+            std::future::poll_fn(|cx| {
+                assert!(
+                    operation.as_mut().poll(cx).is_pending(),
+                    "selection must wait for gate"
+                );
+                assert!(follower.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            held.execute("DELETE FROM sessions WHERE session_id='s_parked'", ())
+                .await
+                .unwrap();
+            held.execute("INSERT INTO sessions (session_id, name, kind, client_key, agent_id, metadata_json) VALUES ('s_parked','replacement','agent','replacement-key','a_replacement','replacement')", ()).await.unwrap();
+            held.commit().await.unwrap();
+            let before = staged_raw(&store, &receipt.row().session_id).await;
+            let epoch = store.events().session_lifecycle_changed().epoch();
+            // Tokio's FIFO gate keeps this follower behind the selected operation.
+            std::future::poll_fn(|cx| {
+                assert!(follower.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            operation.await;
+            follower.await.unwrap().commit().await.unwrap();
+            assert_eq!(staged_raw(&store, &receipt.row().session_id).await, before);
+            assert_eq!(epoch, store.events().session_lifecycle_changed().epoch());
+            assert!(lifecycle_rows(&store).await.is_empty());
+        }
+    }
+
+    async fn assert_captured_staged_commit_failure(operation: &str) {
+        let store = migrated().await;
+        let repo = Sessions::new(&store);
+        let original = repo
+            .create_staged_registration_captured(new_session("commit", "commit-key"), None)
+            .await
+            .unwrap();
+        store.conn.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE receipt_parent (id INTEGER PRIMARY KEY); CREATE TABLE receipt_child (id INTEGER REFERENCES receipt_parent(id) DEFERRABLE INITIALLY DEFERRED);").await.unwrap();
+        // Prove the failure is deferred: the violating statement succeeds inside a txn.
+        let probe = store
+            .begin_write_txn("deferred_constraint_probe")
+            .await
+            .unwrap();
+        assert_eq!(
+            probe
+                .execute("INSERT INTO receipt_child VALUES (1)", ())
+                .await
+                .unwrap(),
+            1
+        );
+        let error = probe
+            .commit()
+            .await
+            .expect_err("actual deferred constraint must fail at commit");
+        assert!(error.to_string().to_lowercase().contains("foreign key"));
+        store
+            .begin_write_txn("after_commit_probe")
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+        store.conn.execute_batch(&format!("CREATE TRIGGER fail_commit AFTER {operation} ON sessions BEGIN INSERT INTO receipt_child VALUES (1); END;")).await.unwrap();
+        let epoch = store.events().session_lifecycle_changed().epoch();
+        let error = match operation {
+            "INSERT" => repo
+                .create_staged_registration_captured(
+                    new_session("new-commit", "new-commit-key"),
+                    None,
+                )
+                .await
+                .err(),
+            "UPDATE" => repo
+                .set_agent_id_selected(&original, "a_unconfirmed")
+                .await
+                .err(),
+            _ => repo
+                .remove_staged_registration_selected(&original)
+                .await
+                .err(),
+        }
+        .expect("commit failure cannot yield successful outcome or advanced authority");
+        assert!(error.to_string().to_lowercase().contains("foreign key"));
+        assert_eq!(epoch, store.events().session_lifecycle_changed().epoch());
+        assert!(lifecycle_rows(&store).await.is_empty());
+        // This fixture rolls back on failed COMMIT drop. Do not generalize that to every
+        // commit error: callers receive uncertainty, not permission for ID-only cleanup.
+        store
+            .begin_write_txn("writer_after_failed_receipt_commit")
+            .await
+            .unwrap()
+            .commit()
+            .await
+            .unwrap();
+        assert_eq!(
+            Some(original.row().clone()),
+            repo.find_by_session_id(&original.row().session_id)
+                .await
+                .unwrap()
+        );
+        assert!(staged_raw(&store, &SessionId("s_new-commit".into()))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn captured_staged_insert_commit_failure_returns_no_receipt() {
+        assert_captured_staged_commit_failure("INSERT").await;
+    }
+
+    #[tokio::test]
+    async fn captured_staged_stamp_commit_failure_returns_no_advanced_receipt() {
+        assert_captured_staged_commit_failure("UPDATE").await;
+    }
+
+    #[tokio::test]
+    async fn captured_staged_cleanup_commit_failure_does_not_signal_success() {
+        assert_captured_staged_commit_failure("DELETE").await;
+    }
+
+    async fn assert_stale_offline_no_effect(
+        store: &Store,
+        session: &SessionId,
+        expected_agent_id: Option<&str>,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) {
+        let repo = Sessions::new(store);
+        let before = repo.find_by_session_id(session).await.unwrap().unwrap();
+        let events_before = lifecycle_rows(store).await;
+        let lifecycle_epoch = store.events().session_lifecycle_changed().epoch();
+        assert!(!repo
+            .set_offline_if_stale_selected(session, expected_agent_id, now_ms, ttl_ms)
+            .await
+            .unwrap());
+        assert_eq!(
+            repo.find_by_session_id(session).await.unwrap().unwrap(),
+            before
+        );
+        assert_eq!(lifecycle_rows(store).await, events_before);
+        assert_eq!(
+            store.events().session_lifecycle_changed().epoch(),
+            lifecycle_epoch
+        );
+    }
+
+    async fn assert_parked_stale_change_is_preserved(change: &str) {
+        use std::task::Poll;
+
+        let path = SplitStore::new();
+        let daemon = path.open().await;
+        let store = daemon.compatibility_store();
+        let initial_agent = match change {
+            "none-to-bound" => None,
+            _ => Some("agent-a"),
+        };
+        let session = stale_session(
+            &store,
+            &format!("parked-{change}"),
+            initial_agent,
+            Some("online"),
+            10,
+            Some(20),
+        )
+        .await;
+        let gate = store
+            .begin_write_txn("test_session_stale_selection_gate")
+            .await
+            .unwrap();
+        let repo = Sessions::new(&store);
+        let mut mark = std::pin::pin!(repo.set_offline_if_stale_selected(
+            &session,
+            initial_agent,
+            1_000,
+            100,
+        ));
+        let mut follower = std::pin::pin!(store.begin_write_txn("test_session_stale_fifo_witness"));
+        std::future::poll_fn(|cx| {
+            assert!(mark.as_mut().poll(cx).is_pending());
+            assert!(follower.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        match change {
+            "heartbeat" => gate
+                .execute(
+                    "UPDATE sessions SET last_heartbeat=999 WHERE session_id=?1",
+                    params![session.0.clone()],
+                )
+                .await
+                .unwrap(),
+            "none-to-bound" => gate
+                .execute(
+                    "UPDATE sessions SET agent_id='agent-b' WHERE session_id=?1",
+                    params![session.0.clone()],
+                )
+                .await
+                .unwrap(),
+            "agent-a-to-b" => gate
+                .execute(
+                    "UPDATE sessions SET agent_id='agent-b' WHERE session_id=?1",
+                    params![session.0.clone()],
+                )
+                .await
+                .unwrap(),
+            _ => panic!("unknown parked change"),
+        };
+        gate.commit().await.unwrap();
+        let before = repo.find_by_session_id(&session).await.unwrap().unwrap();
+        let lifecycle_epoch = store.events().session_lifecycle_changed().epoch();
+        std::future::poll_fn(|cx| {
+            assert!(
+                follower.as_mut().poll(cx).is_pending(),
+                "stale selection did not precede the FIFO witness"
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert!(!mark.await.unwrap(), "{change}");
+        follower.await.unwrap().commit().await.unwrap();
+
+        assert_eq!(
+            repo.find_by_session_id(&session).await.unwrap().unwrap(),
+            before,
+            "{change}"
+        );
+        assert!(lifecycle_rows(&store).await.is_empty(), "{change}");
+        assert_eq!(
+            store.events().session_lifecycle_changed().epoch(),
+            lifecycle_epoch,
+            "{change}"
+        );
     }
 
     fn msg(id: &str, from: &str) -> Message {
@@ -2190,6 +3133,276 @@ mod sessions {
         assert!(row.paused);
         assert_eq!(row.paused_by.as_deref(), Some("self"));
         assert!(row.last_heartbeat.is_some());
+    }
+
+    #[tokio::test]
+    async fn selected_stale_offline_requires_exact_agent_binding() {
+        let path = SplitStore::new();
+        let daemon = path.open().await;
+        let store = daemon.compatibility_store();
+        let session = stale_session(
+            &store,
+            "exact-agent",
+            Some("agent-a"),
+            Some("online"),
+            10,
+            Some(20),
+        )
+        .await;
+        let repo = Sessions::new(&store);
+        let before = repo.find_by_session_id(&session).await.unwrap().unwrap();
+        let lifecycle_epoch = store.events().session_lifecycle_changed().epoch();
+
+        assert!(!repo
+            .set_offline_if_stale_selected(&session, Some("agent-b"), 1_000, 100)
+            .await
+            .unwrap());
+
+        assert_eq!(
+            repo.find_by_session_id(&session).await.unwrap().unwrap(),
+            before
+        );
+        assert!(lifecycle_rows(&store).await.is_empty());
+        assert_eq!(
+            store.events().session_lifecycle_changed().epoch(),
+            lifecycle_epoch
+        );
+
+        let null_session =
+            stale_session(&store, "exact-null", None, Some("online"), 10, Some(20)).await;
+        assert_stale_offline_no_effect(&store, &session, None, 1_000, 100).await;
+        assert_stale_offline_no_effect(&store, &null_session, Some("agent-a"), 1_000, 100).await;
+    }
+
+    #[tokio::test]
+    async fn selected_stale_offline_uses_strict_staleness_and_offline_coalescing() {
+        let path = SplitStore::new();
+        let daemon = path.open().await;
+        let store = daemon.compatibility_store();
+        let threshold = stale_session(
+            &store,
+            "threshold",
+            Some("agent"),
+            Some("online"),
+            900,
+            None,
+        )
+        .await;
+        let fresh_heartbeat = stale_session(
+            &store,
+            "fresh-heartbeat",
+            Some("agent"),
+            Some("busy"),
+            10,
+            Some(950),
+        )
+        .await;
+        let null_presence =
+            stale_session(&store, "null-presence", Some("agent"), None, 10, Some(20)).await;
+        let offline = stale_session(
+            &store,
+            "already-offline",
+            Some("agent"),
+            Some("offline"),
+            10,
+            Some(20),
+        )
+        .await;
+
+        for session in [&threshold, &fresh_heartbeat, &null_presence, &offline] {
+            assert_stale_offline_no_effect(&store, session, Some("agent"), 1_000, 100).await;
+        }
+
+        let events_before = lifecycle_rows(&store).await;
+        let lifecycle_epoch = store.events().session_lifecycle_changed().epoch();
+        assert!(!Sessions::new(&store)
+            .set_offline_if_stale_selected(
+                &SessionId("s_missing".into()),
+                Some("agent"),
+                1_000,
+                100,
+            )
+            .await
+            .unwrap());
+        assert_eq!(lifecycle_rows(&store).await, events_before);
+        assert_eq!(
+            store.events().session_lifecycle_changed().epoch(),
+            lifecycle_epoch
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_stale_offline_changes_online_and_busy_rows_with_captured_attribution() {
+        let path = SplitStore::new();
+        let daemon = path.open().await;
+        let store = daemon.compatibility_store();
+        let online = stale_session(
+            &store,
+            "stale-online",
+            Some("agent-a"),
+            Some("online"),
+            10,
+            Some(20),
+        )
+        .await;
+        let busy_null_agent =
+            stale_session(&store, "stale-busy", None, Some("busy"), 10, None).await;
+        let repo = Sessions::new(&store);
+        let mut expected_online = repo.find_by_session_id(&online).await.unwrap().unwrap();
+        expected_online.presence = Some("offline".into());
+        let mut expected_busy = repo
+            .find_by_session_id(&busy_null_agent)
+            .await
+            .unwrap()
+            .unwrap();
+        expected_busy.presence = Some("offline".into());
+
+        let first_epoch = store.events().session_lifecycle_changed().epoch();
+        let first_started_at = nexus_common::now();
+        assert!(repo
+            .set_offline_if_stale_selected(&online, Some("agent-a"), 1_000, 100)
+            .await
+            .unwrap());
+        let first_finished_at = nexus_common::now();
+        assert_eq!(
+            store.events().session_lifecycle_changed().epoch(),
+            first_epoch + 1
+        );
+        let first = lifecycle_rows(&store).await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].agent_name.as_deref(), Some("stale-online"));
+        assert_eq!(first[0].session_id.as_deref(), Some(online.0.as_str()));
+        assert_eq!(first[0].lifecycle.as_deref(), Some("offline"));
+        assert!((first_started_at..=first_finished_at).contains(&first[0].created_at));
+
+        let second_epoch = store.events().session_lifecycle_changed().epoch();
+        let second_started_at = nexus_common::now();
+        assert!(repo
+            .set_offline_if_stale_selected(&busy_null_agent, None, 1_000, 100)
+            .await
+            .unwrap());
+        let second_finished_at = nexus_common::now();
+        assert_eq!(
+            store.events().session_lifecycle_changed().epoch(),
+            second_epoch + 1
+        );
+        let rows = lifecycle_rows(&store).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].agent_name.as_deref(), Some("stale-busy"));
+        assert_eq!(
+            rows[1].session_id.as_deref(),
+            Some(busy_null_agent.0.as_str())
+        );
+        assert_eq!(rows[1].lifecycle.as_deref(), Some("offline"));
+        assert!((second_started_at..=second_finished_at).contains(&rows[1].created_at));
+        assert_eq!(
+            repo.find_by_session_id(&online).await.unwrap().unwrap(),
+            expected_online
+        );
+        assert_eq!(
+            repo.find_by_session_id(&busy_null_agent)
+                .await
+                .unwrap()
+                .unwrap(),
+            expected_busy
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_stale_offline_revalidates_after_waiting_for_transport_transaction() {
+        assert_parked_stale_change_is_preserved("heartbeat").await;
+        assert_parked_stale_change_is_preserved("none-to-bound").await;
+        assert_parked_stale_change_is_preserved("agent-a-to-b").await;
+    }
+
+    #[tokio::test]
+    async fn selected_stale_offline_rolls_back_precommit_update_errors() {
+        let path = SplitStore::new();
+        let daemon = path.open().await;
+        let store = daemon.compatibility_store();
+        let session = stale_session(
+            &store,
+            "invalid-update",
+            Some("agent"),
+            Some("online"),
+            10,
+            Some(20),
+        )
+        .await;
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER invalidupdate BEFORE UPDATE OF presence ON sessions \
+                 WHEN NEW.session_id='s_invalid-update' AND NEW.presence='offline' \
+                 BEGIN SELECT RAISE(ABORT, 'invalid update'); END;",
+            )
+            .await
+            .unwrap();
+        let repo = Sessions::new(&store);
+        let before = repo.find_by_session_id(&session).await.unwrap().unwrap();
+        let lifecycle_epoch = store.events().session_lifecycle_changed().epoch();
+
+        assert!(repo
+            .set_offline_if_stale_selected(&session, Some("agent"), 1_000, 100)
+            .await
+            .is_err());
+
+        assert_eq!(
+            repo.find_by_session_id(&session).await.unwrap().unwrap(),
+            before
+        );
+        assert!(lifecycle_rows(&store).await.is_empty());
+        assert_eq!(
+            store.events().session_lifecycle_changed().epoch(),
+            lifecycle_epoch
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_stale_offline_reports_postcommit_lifecycle_failure_after_durable_change() {
+        let path = SplitStore::new();
+        let daemon = path.open().await;
+        let store = daemon.compatibility_store();
+        let session = stale_session(
+            &store,
+            "lifecycle-failure",
+            Some("agent"),
+            Some("online"),
+            10,
+            Some(20),
+        )
+        .await;
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_offline_lifecycle BEFORE INSERT ON developer_events \
+                 WHEN NEW.lifecycle='offline' \
+                 BEGIN SELECT RAISE(ABORT, 'lifecycle insert failed'); END;",
+            )
+            .await
+            .unwrap();
+        let repo = Sessions::new(&store);
+        let lifecycle_epoch = store.events().session_lifecycle_changed().epoch();
+
+        assert!(repo
+            .set_offline_if_stale_selected(&session, Some("agent"), 1_000, 100)
+            .await
+            .is_err());
+
+        assert_eq!(
+            repo.find_by_session_id(&session)
+                .await
+                .unwrap()
+                .unwrap()
+                .presence
+                .as_deref(),
+            Some("offline")
+        );
+        assert!(lifecycle_rows(&store).await.is_empty());
+        assert_eq!(
+            store.events().session_lifecycle_changed().epoch(),
+            lifecycle_epoch
+        );
     }
 
     #[tokio::test]

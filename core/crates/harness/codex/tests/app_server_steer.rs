@@ -94,12 +94,176 @@ fn accepted_event(session: &SessionId, text: &str) -> WsEvent {
 }
 
 #[tokio::test]
+async fn busy_steer_publishes_only_native_recorded_input_and_later_send_progresses() {
+    for abort_first in [false, true] {
+        let dir = tempdir("steer-consumption");
+        let gate = dir.join("consume");
+        let (dir, server, transport, session) = setup_with_env(
+            "steer-consumption",
+            dir,
+            vec![(
+                "FAKE_CODEX_STEER_CONSUME_GATE".into(),
+                gate.to_string_lossy().into_owned(),
+            )],
+        )
+        .await;
+        let client = Arc::new(
+            CodexAppServerClient::connect(server.socket(), "observer")
+                .await
+                .unwrap(),
+        );
+        client.thread_resume("fake-thread").await.unwrap();
+        let sink = Arc::new(RecSink::default());
+        let forwarder = spawn_codex_forwarder(
+            session.clone(),
+            client,
+            sink.clone(),
+            Arc::new(AutoApprove),
+            transport.turn_tracker().clone(),
+        );
+        transport
+            .turn_tracker()
+            .observe_active_turn("fake-thread", "t1");
+        let first = {
+            let transport = transport.clone();
+            let session = session.clone();
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                transport
+                    .steer_observed(
+                        &session,
+                        "first input".into(),
+                        sink,
+                        accepted_event(&session, "first input"),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if sink.0.lock().await.iter().any(|event| {
+                    serde_json::to_string(event)
+                        .unwrap()
+                        .contains("still working before input")
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("acknowledged steer emitted unrelated native output while consumption is gated");
+        assert!(
+            !first.is_finished(),
+            "RPC queue admission is not native consumption"
+        );
+        assert!(
+            !sink.0.lock().await.iter().any(|event| matches!(
+                event,
+                WsEvent::AgentUpdate {
+                    kind: AgentUpdateKind::UserInput,
+                    ..
+                }
+            )),
+            "neither RPC acknowledgement nor unrelated native output may report input delivered"
+        );
+        std::fs::write(
+            &gate,
+            if abort_first {
+                b"abort".as_slice()
+            } else {
+                b"consume".as_slice()
+            },
+        )
+        .unwrap();
+        let first_result = tokio::time::timeout(Duration::from_secs(3), first)
+            .await
+            .expect("a native terminal cannot pin the receipt for 600s")
+            .unwrap();
+        if abort_first {
+            assert!(
+                first_result.is_err(),
+                "aborted input without a receipt cannot be reported delivered"
+            );
+            transport
+                .turn_tracker()
+                .observe_active_turn("fake-thread", "t2");
+            std::fs::write(&gate, b"consume").unwrap();
+        } else {
+            assert!(first_result.unwrap().accepted);
+        }
+        let second_result = tokio::time::timeout(
+            Duration::from_secs(3),
+            transport.steer_observed(
+                &session,
+                "second input".into(),
+                sink.clone(),
+                accepted_event(&session, "second input"),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(second_result.accepted);
+        let inputs: Vec<_> = sink
+            .0
+            .lock()
+            .await
+            .iter()
+            .filter_map(|event| match event {
+                WsEvent::AgentUpdate {
+                    kind: AgentUpdateKind::UserInput,
+                    data,
+                    ..
+                } => Some(data["text"].clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            inputs,
+            if abort_first {
+                vec![json!("second input")]
+            } else {
+                vec![json!("first input"), json!("second input")]
+            }
+        );
+        forwarder.abort();
+        server.shutdown().await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[tokio::test]
 async fn tracked_active_turn_uses_native_turn_steer() {
-    let (dir, server, transport, session) = setup("steer_active", None).await;
+    let dir = tempdir("steer_active");
+    let gate = dir.join("record-input");
+    std::fs::write(&gate, b"ready").unwrap();
+    let (dir, server, transport, session) = setup_with_env(
+        "steer_active",
+        dir,
+        vec![(
+            "FAKE_CODEX_STEER_CONSUME_GATE".into(),
+            gate.to_string_lossy().into_owned(),
+        )],
+    )
+    .await;
     transport
         .turn_tracker()
         .observe_active_turn("fake-thread", "t1");
     let sink = Arc::new(RecSink::default());
+    let client = Arc::new(
+        CodexAppServerClient::connect(server.socket(), "observer")
+            .await
+            .unwrap(),
+    );
+    client.thread_resume("fake-thread").await.unwrap();
+    let forwarder = spawn_codex_forwarder(
+        session.clone(),
+        client,
+        sink.clone(),
+        Arc::new(AutoApprove),
+        transport.turn_tracker().clone(),
+    );
 
     let steering = {
         let transport = transport.clone();
@@ -117,21 +281,6 @@ async fn tracked_active_turn_uses_native_turn_steer() {
         })
     };
 
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while sink.0.lock().await.is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("native steer acceptance is emitted");
-    assert!(
-        !steering.is_finished(),
-        "turn/steer acceptance alone must not settle Nexus delivery"
-    );
-
-    transport
-        .turn_tracker()
-        .observe_accepted_user_input_echo("fake-thread", "t1", "focus tests");
     let response = tokio::time::timeout(Duration::from_secs(1), steering)
         .await
         .expect("native input echo settles the steer")
@@ -140,7 +289,22 @@ async fn tracked_active_turn_uses_native_turn_steer() {
 
     assert_eq!(response.delivery, SteerDelivery::Steered);
     assert_eq!(response.turn_id.as_deref(), Some("t1"));
-    assert_eq!(sink.0.lock().await.len(), 1);
+    assert_eq!(
+        sink.0
+            .lock()
+            .await
+            .iter()
+            .filter(|event| matches!(
+                event,
+                WsEvent::AgentUpdate {
+                    kind: AgentUpdateKind::UserInput,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    forwarder.abort();
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(dir);
 }

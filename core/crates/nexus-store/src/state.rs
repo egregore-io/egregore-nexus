@@ -149,6 +149,28 @@ impl WriteTxn {
         self.guard.take();
         Ok(())
     }
+
+    /// Confirm only a successful explicit rollback while still owning the writer guard.
+    /// Already-autocommit state cannot prove how the transaction ended. On rollback failure,
+    /// leave ownership with `Drop`, exactly as the legacy rollback API does.
+    pub(crate) async fn rollback_confirmed(
+        mut self,
+        original: &NexusError,
+    ) -> Result<bool, NexusError> {
+        let confirmed = if self.conn.is_autocommit() {
+            false
+        } else {
+            if let Err(err) = self.conn.execute("ROLLBACK", ()).await {
+                return Err(NexusError::Store(format!(
+                    "{original}; rollback failed: {err}"
+                )));
+            }
+            true
+        };
+        self.active = false;
+        self.guard.take();
+        Ok(confirmed)
+    }
 }
 
 impl Drop for WriteTxn {

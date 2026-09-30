@@ -28,7 +28,9 @@ use nexus_store::{DaemonStore, Store};
 async fn state() -> AppState {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
-    AppState::wire(store, &Config::default())
+    let state = AppState::wire(store, &Config::default());
+    state.wait_for_runtime_identity_ready().await.unwrap();
+    state
 }
 
 async fn split_state_with_gateway_stream() -> (
@@ -44,11 +46,9 @@ async fn split_state_with_gateway_stream() -> (
     let store = Arc::new(daemon.compatibility_store());
     let publisher = GatewayStreamPublisher::new(128);
     let receiver = publisher.subscribe();
-    (
-        directory,
-        AppState::wire_pty_with_gateway_stream(store, &Config::default(), Some(publisher)),
-        receiver,
-    )
+    let state = AppState::wire_pty_with_gateway_stream(store, &Config::default(), Some(publisher));
+    state.wait_for_runtime_identity_ready().await.unwrap();
+    (directory, state, receiver)
 }
 
 async fn state_with_gateway_stream() -> (
@@ -59,10 +59,9 @@ async fn state_with_gateway_stream() -> (
     store.migrate().await.unwrap();
     let publisher = GatewayStreamPublisher::new(128);
     let receiver = publisher.subscribe();
-    (
-        AppState::wire_pty_with_gateway_stream(store, &Config::default(), Some(publisher)),
-        receiver,
-    )
+    let state = AppState::wire_pty_with_gateway_stream(store, &Config::default(), Some(publisher));
+    state.wait_for_runtime_identity_ready().await.unwrap();
+    (state, receiver)
 }
 
 async fn next_identity_projection(

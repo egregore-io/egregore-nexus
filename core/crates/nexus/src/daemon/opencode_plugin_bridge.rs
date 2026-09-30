@@ -1,16 +1,16 @@
 //! Loopback bridge for headed OpenCode's native plugin.
 //!
-//! Headed OpenCode is not driven by tmux keystrokes. The daemon binds this bridge as the
+//! The headed runtime is not driven by tmux keystrokes. The daemon binds this bridge as the
 //! [`HarnessInput`](nexus_pty::HarnessInput) for the OpenCode session, while an in-process
 //! `@opencode-ai/plugin` polls the loopback endpoint for pending turns, submits them through
 //! OpenCode's native `prompt_async`, and reports completion on `session.idle`. Because
 //! [`send_turn`](OpenCodePluginInput::send_turn) only returns after that completion callback, the
 //! existing realtime drain loop keeps its crash-safe "ack after turn finished" semantics. The plugin
-//! sends explicit OpenCode prompt agent/model metadata on each turn so resumed sessions do not fall
+//! sends explicit prompt agent/model metadata on each turn so resumed sessions do not fall
 //! back to a stale model from their prior history. It also treats OpenCode's generic idle status as
 //! a completion/poll-resume signal so a stale native `busy` flag cannot leave Nexus turns queued.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,6 +23,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use nexus_agent::adapter::NativeModelReporting;
 use nexus_contracts::events::{AgentUpdateKind, WsEvent};
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::EventSink;
@@ -57,6 +58,7 @@ impl Default for OpenCodePluginBridgeOptions {
 pub struct OpenCodePluginEndpoint {
     base_url: String,
     token: String,
+    ready_owner: String,
 }
 
 /// Runtime files generated for a headed OpenCode launch.
@@ -86,6 +88,11 @@ impl OpenCodePluginEndpoint {
     pub fn token(&self) -> &str {
         &self.token
     }
+
+    /// Opaque per-launch ready-file association. This is not an authentication/observer token.
+    pub(crate) fn ready_owner(&self) -> &str {
+        &self.ready_owner
+    }
 }
 
 /// Live bridge handle. Dropping it shuts down the loopback server and marks the bound input dead.
@@ -97,17 +104,90 @@ pub struct OpenCodePluginBridge {
 }
 
 impl OpenCodePluginBridge {
+    /// Capture a provisional model owner before polling native setup. The ready handshake, not an
+    /// incoming message, subsequently binds its root. Root activation remains the caller's job.
+    pub async fn start_observed(
+        session_id: SessionId,
+        events: Arc<dyn EventSink>,
+        options: OpenCodePluginBridgeOptions,
+        reporting: NativeModelReporting,
+    ) -> Result<Self, OpenCodePluginBridgeError> {
+        let reporter = ModelReporter {
+            reporting,
+            root: None,
+            seen: HashSet::new(),
+            seen_bytes: 0,
+        };
+        if reporter.reporting.profile().backend().as_str() != "opencode.plugin"
+            || !reporter
+                .reporting
+                .sink()
+                .accepts_profile(reporter.reporting.profile().identity())
+        {
+            return Err(OpenCodePluginBridgeError::Model(
+                "captured model profile is unavailable".into(),
+            ));
+        }
+        Self::start_inner(session_id, events, options, Some(reporter)).await
+    }
+
+    /// Bind only the exact root read from this launch's ready handshake; never a model event.
+    pub fn bind_model_root(&self, root: &str) -> bool {
+        let mut reporter = self.state.model.lock().unwrap();
+        let Some(model) = reporter.as_mut() else {
+            return false;
+        };
+        if !self.state.alive.load(Ordering::SeqCst)
+            || root.trim().is_empty()
+            || model.root.as_deref().is_some_and(|old| old != root)
+            || !model.reporting.sink().bind_native_root(root)
+        {
+            return false;
+        }
+        model.root = Some(root.into());
+        true
+    }
+
+    /// Exclude reporting shutdown while a synchronous activation callback checks captured ownership.
+    /// The supervisor additionally excludes replacement of this bridge in its runtime registry.
+    pub fn with_current_model_binding<T>(
+        &self,
+        reporting: &NativeModelReporting,
+        callback: impl FnOnce(&str) -> T,
+    ) -> Option<T> {
+        let guard = self.state.model.lock().unwrap();
+        let model = guard.as_ref()?;
+        if !self.state.alive.load(Ordering::SeqCst)
+            || !model.reporting.same_owner(reporting)
+            || !reporting
+                .sink()
+                .accepts_profile(reporting.profile().identity())
+        {
+            return None;
+        }
+        Some(callback(model.root.as_deref()?))
+    }
     /// Start a token-authenticated loopback bridge for one headed OpenCode Nexus session.
     pub async fn start(
         session_id: SessionId,
         events: Arc<dyn EventSink>,
         options: OpenCodePluginBridgeOptions,
     ) -> Result<Self, OpenCodePluginBridgeError> {
+        Self::start_inner(session_id, events, options, None).await
+    }
+
+    async fn start_inner(
+        session_id: SessionId,
+        events: Arc<dyn EventSink>,
+        options: OpenCodePluginBridgeOptions,
+        model: Option<ModelReporter>,
+    ) -> Result<Self, OpenCodePluginBridgeError> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let addr = listener.local_addr()?;
         let endpoint = OpenCodePluginEndpoint {
             base_url: format!("http://{addr}"),
             token: Uuid::new_v4().to_string(),
+            ready_owner: Uuid::new_v4().to_string(),
         };
         let state = Arc::new(BridgeState {
             session_id,
@@ -119,12 +199,14 @@ impl OpenCodePluginBridge {
             next_id: AtomicU64::new(1),
             notify: Notify::new(),
             alive: AtomicBool::new(true),
+            model: Mutex::new(model),
         });
         let app = Router::new()
             .route("/turn/next", get(next_turn))
             .route("/turn/:id/complete", post(complete_turn))
             .route("/turn/:id/error", post(error_turn))
             .route("/event", post(plugin_event))
+            .route("/model", post(plugin_model))
             .with_state(state.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
@@ -160,7 +242,11 @@ impl OpenCodePluginBridge {
 
     /// Stop the loopback server. Best-effort; also wakes any long-polling plugin request.
     pub fn shutdown(&self) {
-        self.state.alive.store(false, Ordering::SeqCst);
+        {
+            let mut model = self.state.model.lock().unwrap();
+            self.state.alive.store(false, Ordering::SeqCst);
+            model.take(); // Revoke before releasing native reporting exclusion.
+        }
         self.state.notify.notify_waiters();
         if let Some(tx) = self.shutdown.lock().unwrap().take() {
             let _ = tx.send(());
@@ -170,11 +256,7 @@ impl OpenCodePluginBridge {
 
 impl Drop for OpenCodePluginBridge {
     fn drop(&mut self) {
-        self.state.alive.store(false, Ordering::SeqCst);
-        self.state.notify.notify_waiters();
-        if let Some(tx) = self.shutdown.lock().unwrap().take() {
-            let _ = tx.send(());
-        }
+        self.shutdown();
     }
 }
 
@@ -260,6 +342,72 @@ struct BridgeState {
     next_id: AtomicU64,
     notify: Notify,
     alive: AtomicBool,
+    model: Mutex<Option<ModelReporter>>,
+}
+
+struct ModelReporter {
+    reporting: NativeModelReporting,
+    root: Option<String>,
+    seen: HashSet<String>,
+    seen_bytes: usize,
+}
+impl Drop for ModelReporter {
+    fn drop(&mut self) {
+        self.reporting.sink().revoke();
+    }
+}
+
+impl ModelReporter {
+    fn observe(&mut self, info: &Value) -> bool {
+        use nexus_contracts::model_report::ModelEvidenceValue;
+        if !self
+            .reporting
+            .sink()
+            .accepts_profile(self.reporting.profile().identity())
+        {
+            return false;
+        }
+        let Some(root) = self.root.as_deref() else {
+            return true;
+        };
+        // Once this message's selection is accepted, later partial snapshots of that same
+        // message must not clear it or refresh it as new evidence.
+        if info.get("sessionID").and_then(Value::as_str) == Some(root)
+            && info
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| self.seen.contains(id))
+        {
+            return true;
+        }
+        let Some(update) =
+            nexus_agent::adapter::opencode::native::selected_model(info, root, nexus_common::now())
+        else {
+            return true;
+        };
+        let message = match &update.value {
+            ModelEvidenceValue::Observed(value) => value.native_message_id.clone(),
+            _ => None,
+        };
+        if let Some(message) = message.as_ref() {
+            if self.seen.contains(message) {
+                return true;
+            }
+            if self.seen.len() >= 4096
+                || message.len() > 262144usize.saturating_sub(self.seen_bytes)
+            {
+                return false;
+            }
+        }
+        if !self.reporting.sink().observe(update) {
+            return false;
+        }
+        if let Some(message) = message {
+            self.seen_bytes += message.len();
+            self.seen.insert(message);
+        }
+        true
+    }
 }
 
 struct QueuedTurn {
@@ -294,6 +442,25 @@ struct PluginEvent {
 pub enum OpenCodePluginBridgeError {
     #[error("opencode plugin bridge io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("native model reporting: {0}")]
+    Model(String),
+}
+
+async fn plugin_model(
+    State(state): State<Arc<BridgeState>>,
+    headers: HeaderMap,
+    Json(info): Json<Value>,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let mut model = state.model.lock().unwrap();
+    if state.alive.load(Ordering::SeqCst)
+        && model.as_mut().is_some_and(|model| !model.observe(&info))
+    {
+        model.take();
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn next_turn(State(state): State<Arc<BridgeState>>, headers: HeaderMap) -> Response {
@@ -756,6 +923,12 @@ export const nexus = async () => {
           break;
         case "message.updated": {
           const info = event.properties?.info ?? {};
+          // Forward original native metadata, never requested prompt configuration. The bridge's
+          // immutable ready-handshake root owns attribution independently of mutable display state.
+          if (info.role === "assistant") {
+            try { await bridge("/model", { method: "POST", body: JSON.stringify(info) }); }
+            catch (error) { log(`model metadata unavailable: ${error}`); }
+          }
           if (info.id && info.role) roles.set(info.id, info.role);
           break;
         }
@@ -1058,7 +1231,7 @@ async function main() {
   }
   if (readyPath) {
     const readyTempPath = `${readyPath}.tmp-${process.pid}`;
-    writeFileSync(readyTempPath, JSON.stringify({ sessionId: id, url, pid: serve.pid }) + "\n");
+    writeFileSync(readyTempPath, JSON.stringify({ sessionId: id, url, pid: serve.pid, readyOwner: process.env.NEXUS_NATIVE_READY_OWNER }) + "\n");
     renameSync(readyTempPath, readyPath);
   }
 }

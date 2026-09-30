@@ -76,6 +76,11 @@
 //!   tests use this to prove shutdown reaches the whole ACP process tree, not just this wrapper.
 //! - `FAKE_ACP_CHILD_IGNORE_TERM=1` — make that child ignore `SIGTERM`. This exercises the
 //!   process-group escalation path after the wrapper itself has already exited.
+//! - `FAKE_ACP_RAW_NEW` / `FAKE_ACP_RAW_LOAD` — exact JSON success bodies for metadata tests,
+//!   bypassing tolerant typed serialization. `FAKE_ACP_MODEL_RESPONSE_GATE` parks their replies;
+//!   `FAKE_ACP_MODEL_RESPONSE_WITNESS` emits a typed notification after the raw response.
+//! - `FAKE_ACP_RAW_MODEL_UPDATES` — JSON array of exact session/update parameters emitted before
+//!   the existing prompt response. Does not change the existing prompt/steer output contract.
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, ContentBlock, ContentChunk,
@@ -84,7 +89,9 @@ use agent_client_protocol::schema::v1::{
     RequestPermissionRequest, SessionId, SessionNotification, SessionUpdate, StopReason,
     TextContent, ToolCall, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, Usage,
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo, Dispatch, Result};
+use agent_client_protocol::{
+    Agent, Client, ConnectionTo, Dispatch, Handled, Result, UntypedMessage,
+};
 
 const FAKE_SESSION_ID: &str = "fake-session-1";
 
@@ -276,6 +283,43 @@ async fn main() -> Result<()> {
     Agent
         .builder()
         .name("fake-acp-agent")
+        .on_receive_dispatch(
+            async move |dispatch: Dispatch, cx: ConnectionTo<Client>| {
+                if let Dispatch::Request(request, responder) = dispatch {
+                    let variable = match request.method.as_str() {
+                        "session/new" => Some("FAKE_ACP_RAW_NEW"),
+                        "session/load" => Some("FAKE_ACP_RAW_LOAD"),
+                        _ => None,
+                    };
+                    if let Some(raw) = variable.and_then(|key| std::env::var(key).ok()) {
+                        // Raw native fixture bodies must not pass through the SDK's tolerant
+                        // typed serializer before the client receives them.
+                        let payload = serde_json::from_str(&raw)
+                            .map_err(agent_client_protocol::util::internal_error)?;
+                        fixture_gate("FAKE_ACP_MODEL_RESPONSE_GATE").await;
+                        responder.respond(payload)?;
+                        if let Ok(witness) = std::env::var("FAKE_ACP_MODEL_RESPONSE_WITNESS") {
+                            // Serialized after the raw reply: consuming this ordinary typed
+                            // notification witnesses that the earlier raw dispatch was processed.
+                            cx.send_notification(message_chunk(
+                                SessionId::new("fixture-witness"),
+                                &witness,
+                            ))?;
+                        }
+                        return Ok(Handled::Yes);
+                    }
+                    return Ok(Handled::No {
+                        message: Dispatch::Request(request, responder),
+                        retry: false,
+                    });
+                }
+                Ok(Handled::No {
+                    message: dispatch,
+                    retry: false,
+                })
+            },
+            agent_client_protocol::on_receive_dispatch!(),
+        )
         .on_receive_request(
             async move |initialize: InitializeRequest, responder, _cx| {
                 if std::env::var("FAKE_ACP_FAIL_INIT").is_ok() {
@@ -339,6 +383,13 @@ async fn main() -> Result<()> {
                 let session_id = req.session_id.clone();
                 let body = prompt_text(&req);
                 fixture_gate("FAKE_ACP_PROMPT_GATE").await;
+                if let Ok(raw) = std::env::var("FAKE_ACP_RAW_MODEL_UPDATES") {
+                    let updates: Vec<serde_json::Value> = serde_json::from_str(&raw)
+                        .map_err(agent_client_protocol::util::internal_error)?;
+                    for update in updates {
+                        cx.send_notification(UntypedMessage::new("session/update", update)?)?;
+                    }
+                }
                 if std::env::var("FAKE_ACP_ECHO_USER").is_ok() {
                     let _ = cx.send_notification(user_message_chunk(session_id.clone(), &body));
                 }

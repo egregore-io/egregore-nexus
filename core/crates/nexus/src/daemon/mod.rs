@@ -6,6 +6,7 @@
 
 pub mod agent_session_materializer;
 pub mod app;
+mod boot_readiness;
 pub mod claude_native_forwarder;
 pub mod claude_resume_harvest;
 pub mod command_worker;
@@ -17,6 +18,7 @@ pub mod harness_launch;
 pub mod hermes_gateway;
 pub mod hermes_native_forwarder;
 pub mod lifecycle;
+mod model_reporting;
 pub mod native_forwarder;
 pub mod opencode_native_forwarder;
 pub mod opencode_plugin_bridge;

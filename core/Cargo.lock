@@ -664,8 +664,9 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
 name = "egregore-nexus"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
+ "agent-client-protocol",
  "async-trait",
  "axum",
  "clap",
@@ -700,6 +701,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "toml",
  "tracing",
  "uuid",
@@ -708,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "egregore-nexus-common"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "figment",
  "nexus-contracts",
@@ -723,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "egregore-nexus-notify"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "async-trait",
  "egregore-nexus-common",
@@ -1382,7 +1384,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-acceptance"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "agent-client-protocol",
  "egregore-nexus",
@@ -1403,7 +1405,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-acp-stream"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "agent-client-protocol",
  "nexus-contracts",
@@ -1413,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-admin"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "async-trait",
  "egregore-nexus-common",
@@ -1425,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-agent"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -1447,7 +1449,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-bus"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "async-trait",
  "egregore-nexus-common",
@@ -1464,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-contracts"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "async-trait",
  "serde",
@@ -1475,7 +1477,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-dispatch"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "async-trait",
  "egregore-nexus-common",
@@ -1488,7 +1490,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-harness-claude"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -1500,14 +1502,17 @@ dependencies = [
  "nexus-harness-core",
  "nexus-store",
  "nexus-transcript",
+ "same-file",
  "serde_json",
+ "sha2",
+ "time",
  "tokio",
  "tokio-util",
 ]
 
 [[package]]
 name = "nexus-harness-codex"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -1532,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-harness-core"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "nexus-contracts",
  "thiserror",
@@ -1540,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-identity"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "async-trait",
  "egregore-nexus-common",
@@ -1555,7 +1560,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-pty"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "async-trait",
  "nexus-contracts",
@@ -1570,7 +1575,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-search"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "async-trait",
  "egregore-nexus-common",
@@ -1584,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-store"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "egregore-nexus-common",
  "libsql",
@@ -1597,7 +1602,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-transcript"
-version = "0.1.6-beta.2"
+version = "0.1.6-beta.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -2003,6 +2008,15 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
+name = "same-file"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
+dependencies = [
+ "winapi-util",
+]
 
 [[package]]
 name = "schemars"
@@ -2876,6 +2890,15 @@ name = "winapi-i686-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
+name = "winapi-util"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+dependencies = [
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "winapi-x86_64-pc-windows-gnu"

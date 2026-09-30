@@ -238,6 +238,30 @@ describe("headless gateway", () => {
     }
   });
 
+  it("hydrates canonical_runtime subscriptions through the real headless socket and REST dispatcher", async () => {
+    const deps=dispatchers();
+    const reads:Request[]=[];
+    deps.apiV1=vi.fn(async (request:Request)=> {
+      reads.push(request);
+      return Response.json({agentId:"a_current",runtimes:[]});
+    });
+    const server=await createHeadlessGatewayServer(deps);
+    await new Promise<void>(resolve=>server.listen(0,"127.0.0.1",resolve));
+    const {port}=server.address() as AddressInfo;
+    const socket=new WebSocket(`ws://127.0.0.1:${port}/api/agui/ws`);
+    try {
+      await new Promise<void>((resolve,reject)=>{socket.once("open",resolve);socket.once("error",reject);});
+      const next=new Promise<any>((resolve,reject)=>{socket.once("message",data=>resolve(JSON.parse(String(data))));socket.once("error",reject);});
+      socket.send(JSON.stringify({t:"runtime.subscribe",subscriptionId:"live1",agentId:"a_current"}));
+      expect(await next).toEqual({t:"runtime.snapshot",subscriptionId:"live1",agentId:"a_current",sequence:1,runtimes:[]});
+      expect(reads).toHaveLength(1);
+      expect(new URL(reads[0]!.url).pathname).toBe("/api/v1/agents/a_current/runtimes");
+    } finally {
+      socket.close();
+      await new Promise<void>((resolve,reject)=>server.close(error=>error?reject(error):resolve()));
+    }
+  });
+
   it("binds browser cookie CSRF at upgrade before routing a WebSocket mutation", async () => {
     const deps = dispatchers();
     deps.aguiObserve = canonicalSessionObserve;

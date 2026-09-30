@@ -27,6 +27,10 @@ async fn already_live_headless_agent_wake_does_not_wait_for_an_unrelated_write_l
     };
     let state = AppState::wire_with_registry(store.clone(), &config, registry);
     state
+        .wait_for_runtime_identity_ready()
+        .await
+        .expect("runtime identity ready");
+    state
         .launch_agent(
             SpawnRequest {
                 kind: hid("claude"),

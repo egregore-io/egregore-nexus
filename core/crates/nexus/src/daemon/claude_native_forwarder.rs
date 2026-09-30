@@ -6,7 +6,7 @@
 //! forwards newly appended hook JSONL into the shared [`EventSink`]. That keeps `/agent/<name>`
 //! observe streams live without scraping the full-screen Claude TUI.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -23,6 +23,10 @@ use nexus_harness_claude::native::forwarder::{
     ClaudeToolObservationSink,
 };
 use nexus_harness_claude::native::hooks::{hook_log_path, message_delta_log_path};
+use nexus_harness_claude::native::model_reporting::{
+    CapturedClaudeResponseSource, ClaudeResponseModel, ClaudeTranscriptCheckpoint,
+    ClaudeTranscriptRead,
+};
 use nexus_harness_claude::native::transcript::ClaudeHookRecord;
 use nexus_harness_claude::storage::ClaudeRuntimeStateRepo;
 use nexus_pty::TurnAcceptanceObserver;
@@ -47,6 +51,7 @@ pub struct ClaudeTurnCompletion {
     notify: tokio::sync::Notify,
     submission_generation: AtomicU64,
     submission_notify: tokio::sync::Notify,
+    model_source_notify: tokio::sync::Notify,
     next_accepted_input_id: AtomicU64,
     accepted_inputs: Mutex<VecDeque<PendingAcceptedInput>>,
 }
@@ -59,6 +64,59 @@ struct ClaudeActivity {
     unknown: bool,
     ambiguous: bool,
     open: Option<ClaudeHookRecord>,
+    model_reporting_attached: bool,
+    model_reporting: Option<ClaudeModelReporter>,
+    model_source_state: ModelSourceState,
+}
+
+enum ModelSourceState {
+    Legacy,
+    Pending,
+    Ready,
+    Unavailable(String),
+}
+
+pub(crate) enum ClaudeModelSource {
+    Ready(CapturedClaudeResponseSource),
+    Pending {
+        hook_path: PathBuf,
+        after_offset: u64,
+        root: Option<String>,
+        stored: Option<(String, PathBuf)>,
+    },
+}
+
+pub(crate) struct ClaudeModelSourceGuard<'a> {
+    owner: &'a ClaudeTurnCompletion,
+    armed: bool,
+}
+impl ClaudeModelSourceGuard<'_> {
+    pub(crate) fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for ClaudeModelSourceGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.owner
+                .fail_pending_model_source("native response source wait/setup was canceled");
+        }
+    }
+}
+
+struct ClaudeModelReporter {
+    reporting: nexus_agent::adapter::NativeModelReporting,
+    source: Option<ClaudeTranscriptCheckpoint>,
+    pending: Option<ClaudeModelSource>,
+    offset: u64,
+    messages: HashSet<String>,
+    message_bytes: usize,
+}
+
+impl Drop for ClaudeModelReporter {
+    fn drop(&mut self) {
+        self.reporting.sink().revoke();
+    }
 }
 
 impl Default for ClaudeTurnCompletion {
@@ -139,11 +197,15 @@ impl ClaudeTurnCompletion {
                 unknown: true,
                 ambiguous: false,
                 open: None,
+                model_reporting_attached: false,
+                model_reporting: None,
+                model_source_state: ModelSourceState::Legacy,
             }),
             generation: AtomicU64::new(0),
             notify: tokio::sync::Notify::new(),
             submission_generation: AtomicU64::new(0),
             submission_notify: tokio::sync::Notify::new(),
+            model_source_notify: tokio::sync::Notify::new(),
             next_accepted_input_id: AtomicU64::new(0),
             accepted_inputs: Mutex::new(VecDeque::new()),
         }
@@ -151,6 +213,236 @@ impl ClaudeTurnCompletion {
 
     pub fn is_current(&self) -> bool {
         self.activity.lock().unwrap().valid_owner
+    }
+
+    pub(crate) fn begin_model_source(&self) -> ClaudeModelSourceGuard<'_> {
+        let mut state = self.activity.lock().unwrap();
+        if matches!(state.model_source_state, ModelSourceState::Legacy) {
+            state.model_source_state = ModelSourceState::Pending;
+        }
+        ClaudeModelSourceGuard {
+            owner: self,
+            armed: true,
+        }
+    }
+
+    fn fail_pending_model_source(&self, cause: &str) {
+        let mut state = self.activity.lock().unwrap();
+        if matches!(state.model_source_state, ModelSourceState::Pending) {
+            state.model_reporting.take();
+            state.model_source_state = ModelSourceState::Unavailable(cause.into());
+        }
+        drop(state);
+        self.model_source_notify.notify_waiters();
+    }
+
+    /// Initial source readiness only, not prompt delivery or model evidence. Legacy owners do
+    /// not wait. Cancellation/timeout revokes the captured pending claim, never a replacement.
+    pub(crate) async fn wait_for_model_source(&self, budget: Duration) -> Result<(), String> {
+        let guard = ClaudeModelSourceGuard {
+            owner: self,
+            armed: true,
+        };
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let changed = self.model_source_notify.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self.activity.lock().unwrap();
+                if !state.valid_owner {
+                    return Err("native binding was replaced".into());
+                }
+                match &state.model_source_state {
+                    ModelSourceState::Legacy | ModelSourceState::Ready => {
+                        guard.disarm();
+                        return Ok(());
+                    }
+                    ModelSourceState::Unavailable(cause) => return Err(cause.clone()),
+                    ModelSourceState::Pending => {
+                        if state.model_reporting.as_ref().is_some_and(|reporter| {
+                            !reporter
+                                .reporting
+                                .sink()
+                                .accepts_profile(reporter.reporting.profile().identity())
+                        }) {
+                            return Err("captured native model claim is unavailable".into());
+                        }
+                    }
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                self.fail_pending_model_source("native response source readiness timed out");
+                return Err("native response source readiness timed out".into());
+            }
+            // Coordinator close has no native notification subscription. Bound that detection
+            // by the existing forwarder cadence, without resampling source authority here.
+            tokio::select! {
+                _ = &mut changed => {},
+                _ = tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_millis(DEFAULT_CLAUDE_NATIVE_FORWARDER_POLL_MS))) => {},
+            }
+        }
+    }
+
+    pub(crate) fn attach_model_reporting(
+        &self,
+        reporting: nexus_agent::adapter::NativeModelReporting,
+        source: ClaudeModelSource,
+    ) -> bool {
+        let mut state = self.activity.lock().unwrap();
+        if !state.valid_owner
+            || state.model_reporting_attached
+            || matches!(state.model_source_state, ModelSourceState::Unavailable(_))
+            || !reporting
+                .sink()
+                .accepts_profile(reporting.profile().identity())
+        {
+            return false;
+        }
+        state.model_reporting_attached = true;
+        state.model_source_state = ModelSourceState::Pending;
+        state.model_reporting = Some(ClaudeModelReporter {
+            reporting,
+            offset: 0,
+            source: None,
+            pending: Some(source),
+            messages: HashSet::new(),
+            message_bytes: 0,
+        });
+        self.resolve_model_source(&mut state);
+        !matches!(state.model_source_state, ModelSourceState::Unavailable(_))
+    }
+
+    pub(crate) fn capture_model_source(
+        &self,
+        paths: &ClaudeNativeBridgePaths,
+        stored_source: Option<(&str, &std::path::Path)>,
+    ) -> std::io::Result<ClaudeModelSource> {
+        let state = self.activity.lock().unwrap();
+        if !state.valid_owner {
+            return Err(std::io::Error::other("captured native owner was replaced"));
+        }
+        let (root, offset) = (state.native_session.clone(), state.offset);
+        drop(state);
+        let selected = nexus_harness_claude::native::model_reporting::capture_response_source(
+            &paths.hook_log_path,
+            offset,
+            root.as_deref(),
+            stored_source,
+        )?;
+        Ok(match selected {
+            Some(source) => ClaudeModelSource::Ready(source),
+            None => ClaudeModelSource::Pending {
+                hook_path: paths.hook_log_path.clone(),
+                after_offset: offset,
+                root,
+                stored: stored_source.map(|(root, path)| (root.into(), path.to_owned())),
+            },
+        })
+    }
+
+    /// Keep sidecar schema knowledge with the native source owner, outside shared app assembly.
+    pub(crate) async fn capture_stored_model_source(
+        &self,
+        store: &Store,
+        runtime: &SessionId,
+        paths: &ClaudeNativeBridgePaths,
+    ) -> Result<ClaudeModelSource, NexusError> {
+        let native = ClaudeRuntimeStateRepo::new(store)
+            .find_by_runtime_id(runtime)
+            .await?;
+        let stored = native.as_ref().and_then(|state| {
+            state
+                .claude_session_id
+                .as_deref()
+                .zip(state.transcript_path.as_deref())
+        });
+        self.capture_model_source(paths, stored).map_err(|error| {
+            NexusError::Internal(format!("capture native response source: {error}"))
+        })
+    }
+
+    pub(crate) fn close_model_reporting(&self) {
+        let mut state = self.activity.lock().unwrap();
+        state.model_reporting.take();
+        if matches!(state.model_source_state, ModelSourceState::Pending) {
+            state.model_source_state = ModelSourceState::Unavailable(
+                "native response source was closed before readiness".into(),
+            );
+        }
+        drop(state);
+        self.model_source_notify.notify_waiters();
+    }
+
+    // Called only under captured activity exclusion. Never resolves another completion owner.
+    fn resolve_model_source(&self, state: &mut ClaudeActivity) {
+        let Some(reporter) = state.model_reporting.as_mut() else {
+            return;
+        };
+        let Some(pending) = reporter.pending.take() else {
+            return;
+        };
+        let selected = if !reporter
+            .reporting
+            .sink()
+            .accepts_profile(reporter.reporting.profile().identity())
+        {
+            Err(std::io::Error::other(
+                "captured native model claim is unavailable",
+            ))
+        } else {
+            match pending {
+                ClaudeModelSource::Ready(source) => Ok(Some(source)),
+                ClaudeModelSource::Pending {
+                    ref hook_path,
+                    after_offset,
+                    ref root,
+                    ref stored,
+                } => {
+                    let result =
+                        nexus_harness_claude::native::model_reporting::capture_response_source(
+                            hook_path,
+                            after_offset,
+                            root.as_deref(),
+                            stored
+                                .as_ref()
+                                .map(|(root, path)| (root.as_str(), path.as_path())),
+                        );
+                    if matches!(result, Ok(None)) {
+                        reporter.pending = Some(pending);
+                    }
+                    result
+                }
+            }
+        };
+        match selected {
+            Ok(None) => return,
+            Ok(Some(source))
+                if state
+                    .native_session
+                    .as_deref()
+                    .is_none_or(|root| root == source.root())
+                    && reporter.reporting.sink().bind_native_root(source.root()) =>
+            {
+                if state.native_session.is_none() {
+                    state.native_session = Some(source.root().into());
+                    state.revision += 1;
+                }
+                let source = source.into_checkpoint();
+                reporter.offset = source.byte_floor();
+                reporter.source = Some(source);
+                state.model_source_state = ModelSourceState::Ready;
+            }
+            result => {
+                let cause = result.err().map_or_else(
+                    || "captured native source owner mismatch".into(),
+                    |e| e.to_string(),
+                );
+                state.model_reporting.take();
+                state.model_source_state = ModelSourceState::Unavailable(cause);
+            }
+        }
+        self.model_source_notify.notify_waiters();
     }
 
     /// One atomic, binding-owned snapshot. Ambiguous/truncated facts remain unknown even when
@@ -197,9 +489,13 @@ impl ClaudeTurnCompletion {
             state.valid_owner = false;
             state.revision += 1;
         }
+        // Revoke under the same activity exclusion as native model dispatch. No late current
+        // owner lookup, async wait, or change to the native input/terminal policy.
+        state.model_reporting.take();
         drop(state);
         self.notify.notify_waiters();
         self.submission_notify.notify_waiters();
+        self.model_source_notify.notify_waiters();
     }
     pub(crate) fn attach_resume_identity(&self, native_session: Option<String>) {
         let mut state = self.activity.lock().unwrap();
@@ -375,11 +671,105 @@ impl ClaudeTurnCompletion {
 
 #[async_trait]
 impl ClaudeHookObservationSink for ClaudeTurnCompletion {
+    fn model_byte_floor(&self, path: &std::path::Path) -> Option<u64> {
+        let state = self.activity.lock().unwrap();
+        if !state.valid_owner {
+            return None;
+        }
+        state
+            .model_reporting
+            .as_ref()
+            .filter(|reporter| {
+                reporter
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| source.matches_path(path))
+            })
+            .map(|reporter| reporter.offset)
+    }
+    fn observe_models(
+        &self,
+        path: &std::path::Path,
+        records: &[(ClaudeResponseModel, u64)],
+        source: Option<&ClaudeTranscriptRead>,
+        _complete: bool,
+    ) {
+        use nexus_contracts::model_report::ModelEvidenceValue;
+        let mut state = self.activity.lock().unwrap();
+        if !state.valid_owner {
+            return;
+        }
+        let root = state.native_session.clone();
+        let Some(reporter) = state.model_reporting.as_mut() else {
+            return;
+        };
+        let Some(checkpoint) = reporter.source.as_ref() else {
+            return;
+        };
+        // Explicitly absent at admission may await the first file. Once any source has been
+        // observed, disappearance is loss, not permission to restart at a later EOF.
+        if source.is_none() && checkpoint.is_missing() && checkpoint.matches_path(path) {
+            return;
+        }
+        let Some(source) = source.filter(|source| source.continues(checkpoint)) else {
+            state.model_reporting.take();
+            return;
+        };
+        let mut revoke = false;
+        for (record, offset) in records {
+            if *offset <= reporter.offset {
+                continue;
+            }
+            if *offset > source.len() {
+                revoke = true;
+                break;
+            }
+            reporter.offset = *offset;
+            if root.as_deref() != Some(&record.native_session_id)
+                || reporter.messages.contains(&record.native_message_id)
+            {
+                continue;
+            }
+            // Bound replay state for this exact source lifetime. Exhaustion is loss of
+            // reporting, never eviction that could relabel an OLD replay as a NEW response.
+            if reporter.messages.len() >= 4096
+                || record.native_message_id.len()
+                    > 262_144usize.saturating_sub(reporter.message_bytes)
+            {
+                revoke = true;
+                break;
+            }
+            if !reporter
+                .reporting
+                .sink()
+                .bind_native_root(&record.native_session_id)
+            {
+                revoke = true;
+                break;
+            }
+            let update = record.update(nexus_common::now());
+            let observed = matches!(update.value, ModelEvidenceValue::Observed(_));
+            if !reporter.reporting.sink().observe(update) {
+                revoke = true;
+                break;
+            }
+            if observed {
+                reporter.message_bytes += record.native_message_id.len();
+                reporter.messages.insert(record.native_message_id.clone());
+            }
+        }
+        reporter.source = Some(source.checkpoint());
+        if revoke {
+            state.model_reporting.take();
+        }
+    }
+
     fn observe_hooks(&self, records: &[ClaudeHookRecord], file_len: Option<u64>, complete: bool) {
         let mut state = self.activity.lock().unwrap();
         if !state.valid_owner {
             return;
         }
+        self.resolve_model_source(&mut state);
         if file_len.is_none_or(|len| len < state.offset) {
             state.revision +=
                 u64::from(!state.unknown || (!state.ambiguous && state.open.is_some()));
@@ -521,7 +911,18 @@ pub fn spawn_claude_native_forwarder_with_tool_events(
     tool_events: Option<Arc<dyn ClaudeToolObservationSink>>,
     completion: Option<Arc<ClaudeTurnCompletion>>,
 ) -> tokio::task::JoinHandle<()> {
+    struct ModelLifetime(Option<Arc<ClaudeTurnCompletion>>);
+    impl Drop for ModelLifetime {
+        fn drop(&mut self) {
+            if let Some(owner) = &self.0 {
+                owner.close_model_reporting();
+            }
+        }
+    }
+    // Construct outside the future: cancellation before its first poll must close admission too.
+    let model_lifetime = ModelLifetime(completion.clone());
     tokio::spawn(async move {
+        let _model_lifetime = model_lifetime;
         let delay = Duration::from_millis(poll_ms.max(1));
         loop {
             if completion.as_ref().is_some_and(|c| !c.is_current()) {
@@ -559,6 +960,9 @@ pub fn spawn_claude_native_forwarder_with_tool_events(
                     }
                 }
                 Err(error) => {
+                    if let Some(owner) = &completion {
+                        owner.close_model_reporting();
+                    }
                     tracing::warn!(
                         target: "nexus::claude_native_forwarder",
                         session = %session,

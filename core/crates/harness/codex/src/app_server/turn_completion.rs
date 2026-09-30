@@ -49,6 +49,10 @@ struct Inner {
     waiters: HashMap<TurnKey, Vec<oneshot::Sender<CodexTurnCompletion>>>,
     completed: HashMap<TurnKey, CodexTurnCompletion>,
     completed_order: VecDeque<TurnKey>,
+    // Projected terminals, after all earlier native input records have been processed. Raw
+    // reader terminals are too early: an input receipt can still be behind a blocked sink.
+    input_closed_turns: HashSet<TurnKey>,
+    input_closed_order: VecDeque<TurnKey>,
     receipt_waiters: HashMap<TurnKey, Vec<oneshot::Sender<CodexTurnCompletion>>>,
     receipts: HashMap<TurnKey, CodexTurnCompletion>,
     receipt_order: VecDeque<TurnKey>,
@@ -85,12 +89,19 @@ struct OwnerLease {
     observation_id: String,
     registry: Weak<Mutex<Registry>>,
     revoked: CancellationToken,
+    model_reporting: Option<nexus_agent::adapter::NativeModelReporting>,
 }
 
 impl Drop for OwnerLease {
     fn drop(&mut self) {
         if let Some(registry) = self.registry.upgrade() {
-            registry.lock().unwrap().owners.remove(&self.id);
+            let mut registry = registry.lock().unwrap();
+            if let Some(reporting) = &self.model_reporting {
+                reporting.sink().revoke();
+            }
+            registry.owners.remove(&self.id);
+        } else if let Some(reporting) = &self.model_reporting {
+            reporting.sink().revoke();
         }
     }
 }
@@ -193,6 +204,10 @@ enum CodexTurnCompletion {
 /// Error returned when a headed Codex turn does not report successful completion.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodexTurnWaitError {
+    InputReceiptUnavailable {
+        thread_id: String,
+        turn_id: String,
+    },
     Timeout {
         thread_id: String,
         turn_id: String,
@@ -219,6 +234,9 @@ impl std::fmt::Display for CodexTurnWaitError {
             f,
             "{}",
             match self {
+                Self::InputReceiptUnavailable { thread_id, turn_id } => format!(
+                    "codex input receipt unavailable for {thread_id}/{turn_id}; delivery is unconfirmed"
+                ),
                 Self::Timeout {
                     thread_id,
                     turn_id,
@@ -252,7 +270,11 @@ impl CodexTurnTracker {
         TrackerGuard { registry, owner }
     }
 
-    pub(super) fn new_owner(&self, thread: Option<String>) -> Self {
+    pub(super) fn new_owner_with_reporting(
+        &self,
+        thread: Option<String>,
+        model_reporting: Option<nexus_agent::adapter::NativeModelReporting>,
+    ) -> Self {
         let mut registry = self.inner.lock().unwrap();
         registry.next_owner += 1;
         let id = registry.next_owner;
@@ -270,6 +292,7 @@ impl CodexTurnTracker {
                 observation_id: nexus_common::new_binding_id(),
                 registry: Arc::downgrade(&self.inner),
                 revoked: CancellationToken::new(),
+                model_reporting,
             })),
         }
     }
@@ -291,6 +314,15 @@ impl CodexTurnTracker {
                 if expected.as_deref().is_none_or(|id| id == thread) => {}
             _ => return false,
         }
+        if let Some(reporting) = self
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.model_reporting.as_ref())
+        {
+            if !reporting.sink().bind_native_root(thread) {
+                return false;
+            }
+        }
         inner.active_turn_ids.retain(|id, _| id == thread);
         inner.idle_threads.retain(|id| id == thread);
         inner.native_terminals.retain(|(id, _)| id == thread);
@@ -308,7 +340,64 @@ impl CodexTurnTracker {
                 inner.fact_revision += 1;
             }
             owner.revoked.cancel();
+            if let Some(reporting) = &owner.model_reporting {
+                reporting.sink().revoke();
+            }
         }
+    }
+
+    /// Check the captured model/native pair while native revocation remains excluded.
+    pub(super) fn with_model_binding<T>(
+        &self,
+        thread: &str,
+        reporting: &nexus_agent::adapter::NativeModelReporting,
+        f: impl FnOnce(&str) -> T,
+    ) -> Option<T> {
+        let owner = self.owner.as_ref()?;
+        if !owner.model_reporting.as_ref()?.same_owner(reporting) {
+            return None;
+        }
+        let inner = self.lock(thread);
+        if inner.disconnected
+            || !matches!(&inner.phase, OwnerPhase::Published(current) if current == thread)
+        {
+            return None;
+        }
+        if !reporting
+            .sink()
+            .accepts_profile(reporting.profile().identity())
+        {
+            return None;
+        }
+        Some(f(thread))
+    }
+
+    /// A setup response belongs only to the provisional connection that submitted it.
+    pub(super) fn observe_setup_model(&self, thread: &str, result: &Value) -> bool {
+        let Some(reporting) = self
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.model_reporting.as_ref())
+        else {
+            return true;
+        };
+        let inner = self.lock(thread);
+        if inner.disconnected
+            || !matches!(&inner.phase, OwnerPhase::Provisional(expected) if expected.as_deref().is_none_or(|id| id == thread))
+        {
+            return false;
+        }
+        let Some(value) = super::model_reporting::decode_configured(result, thread) else {
+            return false;
+        };
+        reporting.sink().bind_native_root(thread)
+            && reporting
+                .sink()
+                .observe(nexus_contracts::model_report::NativeModelUpdate {
+                    native_session_id: thread.into(),
+                    field: nexus_contracts::model_report::ModelEvidenceField::Configured,
+                    value,
+                })
     }
 
     pub(super) fn is_revoked(&self) -> bool {
@@ -388,6 +477,13 @@ impl CodexTurnTracker {
         if !inner.disconnected {
             inner.disconnected = true;
             inner.fact_revision += 1;
+        }
+        if let Some(reporting) = self
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.model_reporting.as_ref())
+        {
+            reporting.sink().revoke();
         }
     }
 
@@ -1030,6 +1126,15 @@ impl CodexTurnTracker {
                 inner.accepted_input_receipt_order.retain(|row| row != &key);
                 return Ok(());
             }
+            if inner
+                .input_closed_turns
+                .contains(&(thread_id.to_owned(), turn_id.to_owned()))
+            {
+                return Err(CodexTurnWaitError::InputReceiptUnavailable {
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                });
+            }
             let (tx, rx) = oneshot::channel();
             let id = inner.next_accepted_input_receipt_waiter_id;
             inner.next_accepted_input_receipt_waiter_id =
@@ -1049,7 +1154,11 @@ impl CodexTurnTracker {
         let mut registration = registration;
 
         match tokio::time::timeout(timeout, &mut registration.rx).await {
-            Ok(Ok(())) | Ok(Err(_)) => Ok(()),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(CodexTurnWaitError::InputReceiptUnavailable {
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+            }),
             Err(_elapsed) => Err(CodexTurnWaitError::Timeout {
                 thread_id: thread_id.to_string(),
                 turn_id: turn_id.to_string(),
@@ -1196,6 +1305,19 @@ impl CodexTurnTracker {
         let key = (thread_id.to_string(), turn_id.to_string());
         let waiters = {
             let mut inner = self.lock(thread_id);
+            if inner.input_closed_turns.insert(key.clone()) {
+                inner.input_closed_order.push_back(key.clone());
+                while inner.input_closed_order.len() > RECENT_COMPLETIONS_LIMIT {
+                    if let Some(old) = inner.input_closed_order.pop_front() {
+                        inner.input_closed_turns.remove(&old);
+                    }
+                }
+            }
+            // Dropping only this turn's unresolved receipt senders wakes them as unavailable,
+            // never as accepted. Exact receipts already processed remain successful.
+            inner
+                .accepted_input_receipt_waiters
+                .retain(|(thread, turn, _), _| thread != thread_id || turn != turn_id);
             if let Some(waiters) = inner.waiters.remove(&key) {
                 waiters
             } else {

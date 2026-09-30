@@ -39,7 +39,7 @@ impl SpawnSpecAdapter {
         command.env.extend(ctx.env.iter().cloned());
         Self {
             command,
-            engine: AcpEngine::for_harness(id),
+            engine: AcpEngine::for_harness(id).with_reporting(ctx.model_reporting.clone()),
             ctx,
         }
     }

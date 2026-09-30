@@ -4,6 +4,7 @@
 
 use nexus_common::{new_session_id, NexusError};
 use nexus_contracts::register::RegisterRequest;
+use nexus_store::repos::sessions::CapturedStagedSession;
 use nexus_store::repos::{AgentRuntimes, Agents, NativeThreadBindings, NewSession, Sessions};
 use nexus_store::types::SessionRow;
 use nexus_store::Store;
@@ -18,26 +19,85 @@ pub(crate) enum RegisterOutcome {
     Created(SessionRow),
 }
 
-/// Resolve register-once over the store (backend §5.1):
-///
-/// 1. Known `harness_session_id` (global) → **resume** that session. (The service layer
-///    rebinds `client_key`/runtime state and marks it online.)
-/// 2. Else, known `client_key` (global) → **resume** that session.
-/// 3. Else, if the `name` is held by a *different live* session → **reject**
-///    ([`NexusError::DuplicateName`]). If the holding session is *offline*, adopting its name
-///    (a rebind that overwrites `client_key`/harness/presence on the service layer) requires
-///    **authenticating as that identity**: the caller must present `agent_id` +
-///    `runtime_credential`, which the service verifies in preflight ([`preflight_requested_agent`])
-///    *before* any write. A credential-less adoption attempt (`agent_id` absent) is rejected here
-///    with [`NexusError::DuplicateName`] — closing an identity-takeover hole where any caller
-///    could silently seize an offline identity's name with no authentication.
-/// 4. Else → **create** a new session row, binding `name ↔ harness_session_id`.
-///
-/// [`preflight_requested_agent`]: crate::service — verified upfront in the register flow.
+/// Inert alternate registration result. Only insertion produces staged-row authority.
+/// A resumed projection grants neither creation nor cleanup authority.
+#[allow(dead_code)] // No service caller is enabled by this prerequisite.
+pub(crate) enum CapturedRegisterOutcome {
+    Resumed(SessionRow),
+    Created(CapturedStagedSession),
+}
+
+enum RegisterSelection {
+    Resumed(SessionRow),
+    Fresh(NewSession, Option<String>),
+}
+
+/// Preserve the legacy insertion, late projection read, and ID-only cleanup fallback.
 pub(crate) async fn resolve_register(
     store: &Store,
     req: &RegisterRequest,
 ) -> Result<RegisterOutcome, NexusError> {
+    let (new, metadata_json) = match select_register(store, req).await? {
+        RegisterSelection::Resumed(row) => return Ok(RegisterOutcome::Resumed(row)),
+        RegisterSelection::Fresh(new, metadata_json) => (new, metadata_json),
+    };
+    let repo = Sessions::new(store);
+    let id = repo
+        .create_staged_registration_with_metadata(new, metadata_json)
+        .await?;
+    match repo.find_by_session_id(&id).await {
+        Ok(Some(created)) => Ok(RegisterOutcome::Created(created)),
+        Ok(None) => {
+            repo.remove_staged_registration(&id).await?;
+            Err(NexusError::Internal(format!(
+                "created session {id:?} not found"
+            )))
+        }
+        Err(error) => {
+            if let Err(cleanup) = repo.remove_staged_registration(&id).await {
+                return Err(NexusError::Store(format!(
+                    "{error}; staged session cleanup failed: {cleanup}"
+                )));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Carry the store's insertion-produced receipt without a late reread or legacy fallback.
+/// The fresh projection is `receipt.row()`. Use the receipt only with its issuing store;
+/// it is not an identical-image delete/reinsert incarnation guarantee. Capture/commit errors
+/// propagate without granting cleanup authority. No service caller is enabled here.
+#[allow(dead_code)]
+pub(crate) async fn resolve_register_captured(
+    store: &Store,
+    req: &RegisterRequest,
+) -> Result<CapturedRegisterOutcome, NexusError> {
+    match select_register(store, req).await? {
+        RegisterSelection::Resumed(row) => Ok(CapturedRegisterOutcome::Resumed(row)),
+        RegisterSelection::Fresh(new, metadata_json) => Sessions::new(store)
+            .create_staged_registration_captured(new, metadata_json)
+            .await
+            .map(CapturedRegisterOutcome::Created),
+    }
+}
+
+/// Select register-once policy without insertion, preserving this precedence:
+///
+/// 1. Native binding owner, runtime ownership, and matching client-key validation.
+/// 2. Unique matching legacy harness-session/name, with matching client key.
+/// 3. Global client-key resume, independent of project metadata.
+/// 4. Unique compatibility name, rejecting live owners and guarding offline adoption.
+/// 5. Durable alias guard in the agent-kind lane only (human/app namespaces are separate).
+/// 6. Fresh ID and session input, carrying `req.access` metadata.
+///
+/// This is not credential verification. Offline adoption requires `agent_id` here and relies
+/// on the existing service preflight to verify its runtime credential before any write.
+/// Generate a fresh ID only after all resume and rejection decisions.
+async fn select_register(
+    store: &Store,
+    req: &RegisterRequest,
+) -> Result<RegisterSelection, NexusError> {
     let repo = Sessions::new(store);
     let req_name = req.name.as_deref().ok_or_else(|| {
         NexusError::Invalid("register name is required before whoami staging is active".into())
@@ -105,12 +165,12 @@ pub(crate) async fn resolve_register(
                         }
                     }
                     require_matching_client_key(&row, req)?;
-                    return Ok(RegisterOutcome::Resumed(row));
+                    return Ok(RegisterSelection::Resumed(row));
                 }
             }
             if let Some(row) = repo.find_by_agent_id(&binding.agent_id).await? {
                 require_matching_client_key(&row, req)?;
-                return Ok(RegisterOutcome::Resumed(row));
+                return Ok(RegisterSelection::Resumed(row));
             }
             return Err(NexusError::NotFound(format!(
                 "native {harness} session {} owner runtime for {}:{}",
@@ -140,13 +200,13 @@ pub(crate) async fn resolve_register(
             )));
         }
         require_matching_client_key(&existing, req)?;
-        return Ok(RegisterOutcome::Resumed(existing));
+        return Ok(RegisterSelection::Resumed(existing));
     }
 
     // (2) Resume on a globally known client_key. Project is descriptive metadata and cannot fork
     // one credential into a second identity.
     if let Some(existing) = repo.find_by_client_key_any_project(&req.client_key).await? {
-        return Ok(RegisterOutcome::Resumed(existing));
+        return Ok(RegisterSelection::Resumed(existing));
     }
 
     // (3) Resolve the compatibility name globally and uniquely before any write. A project label
@@ -168,7 +228,7 @@ pub(crate) async fn resolve_register(
                 req_name, by_name.project
             )));
         }
-        return Ok(RegisterOutcome::Resumed(by_name));
+        return Ok(RegisterSelection::Resumed(by_name));
     }
 
     // Durable agent aliases are exclusive within the agent registration lane. Human/app sessions
@@ -223,26 +283,7 @@ pub(crate) async fn resolve_register(
         .access
         .as_ref()
         .map(|access| serde_json::json!({"access": access}).to_string());
-    let id = repo
-        .create_staged_registration_with_metadata(new, metadata_json)
-        .await?;
-    match repo.find_by_session_id(&id).await {
-        Ok(Some(created)) => Ok(RegisterOutcome::Created(created)),
-        Ok(None) => {
-            repo.remove_staged_registration(&id).await?;
-            Err(NexusError::Internal(format!(
-                "created session {id:?} not found"
-            )))
-        }
-        Err(error) => {
-            if let Err(cleanup) = repo.remove_staged_registration(&id).await {
-                return Err(NexusError::Store(format!(
-                    "{error}; staged session cleanup failed: {cleanup}"
-                )));
-            }
-            Err(error)
-        }
-    }
+    Ok(RegisterSelection::Fresh(new, metadata_json))
 }
 
 fn require_matching_client_key(row: &SessionRow, req: &RegisterRequest) -> Result<(), NexusError> {
