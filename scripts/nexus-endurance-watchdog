@@ -1,0 +1,1424 @@
+#!/usr/bin/env python3
+"""Event-driven watchdog for the three-hour, shared-thread harness endurance gate."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import random
+import re
+import shlex
+import signal
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+ANSI_ESCAPE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+PROVIDER_RETRY_MAX_ATTEMPTS = 3
+PROVIDER_RETRY_BACKOFF_SECONDS = {1: 5.0, 2: 15.0}
+DELIVERY_SCAN_INTERVAL_SECONDS = 15.0
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def progressive_checkpoint_deadlines(duration_seconds: int) -> list[int]:
+    """Return the release cadence, ramping from a 5m early check to 30m."""
+    deadlines: list[int] = []
+    elapsed = 0
+    checkpoint = 0
+    while elapsed < duration_seconds:
+        if checkpoint == 0:
+            interval = 5 * 60
+        elif checkpoint < 4:
+            interval = 10 * 60
+        elif checkpoint == 4:
+            interval = 15 * 60
+        elif checkpoint < 10:
+            interval = 20 * 60
+        else:
+            interval = 30 * 60
+        elapsed = min(duration_seconds, elapsed + interval)
+        deadlines.append(elapsed)
+        checkpoint += 1
+    return deadlines
+
+
+def bounded_wait_seconds(
+    *, now: float, deadlines: list[float], maximum: float = 60.0
+) -> float:
+    """Bound one event-driven wait by the next scheduled controller deadline."""
+    remaining = [maximum, *(deadline - now for deadline in deadlines)]
+    return max(0.001, min(remaining))
+
+
+def parse_thinker_assignments(values: list[str]) -> dict[str, str]:
+    assignments: dict[str, str] = {}
+    for value in values:
+        name, separator, thinker = value.partition("=")
+        if not separator or not name.strip() or not thinker.strip():
+            raise ValueError(f"invalid thinker assignment: {value!r}")
+        if name in assignments:
+            raise ValueError(f"duplicate thinker assignment for {name}")
+        assignments[name] = thinker
+    return assignments
+
+
+def parse_participant_agent_ids(values: list[str]) -> dict[str, str]:
+    agent_ids: dict[str, str] = {}
+    for value in values:
+        name, separator, agent_id = value.partition("=")
+        if not separator or not name.strip() or not agent_id.strip():
+            raise ValueError(f"invalid participant agent ID: {value!r}")
+        if name in agent_ids:
+            raise ValueError(f"duplicate participant agent ID for {name}")
+        agent_ids[name] = agent_id
+    return agent_ids
+
+
+def validate_participant_agent_ids(
+    participants: set[str], participant_agent_ids: dict[str, str]
+) -> None:
+    if set(participant_agent_ids) != participants:
+        missing = sorted(participants - set(participant_agent_ids))
+        unknown = sorted(set(participant_agent_ids) - participants)
+        raise ValueError(
+            "participant agent IDs must exactly match participants; "
+            f"missing={missing}, unknown={unknown}"
+        )
+    if len(set(participant_agent_ids.values())) != len(participant_agent_ids):
+        raise ValueError("participant agent IDs must be unique")
+
+
+def operator_intervention(
+    rng: random.Random,
+    sequence: int,
+    assignments: dict[str, str],
+) -> dict[str, Any]:
+    if len(assignments) < 2:
+        raise ValueError("operator interventions require at least two assigned participants")
+    targets = rng.sample(list(assignments), 2)
+    first, second = targets
+    first_thinker = assignments[first]
+    second_thinker = assignments[second]
+    attacks = [
+        "this shit is turning into a cowardly seminar",
+        "stop posting bloodless brainlet summaries",
+        "your thread has the pulse of a dead clanker",
+        "quit hiding behind fraudulent academic throat-clearing",
+        "wake the fuck up and defend the claim instead of polishing it",
+    ]
+    attack = rng.choice(attacks)
+    body = (
+        f"OPERATOR_HEAT_{sequence:04d}: {first}, you {first_thinker} fraud, and "
+        f"{second}, you {second_thinker} brainlet: {attack}. Each of you owes this "
+        "4chan-style forum one terse rebuttal now. Attack the other named argument, "
+        "use plain profane language, name exactly one peer, confirm the m_ receipt, then stop."
+    )
+    return {
+        "sequence": sequence,
+        "targets": targets,
+        "assignments": {
+            first: first_thinker,
+            second: second_thinker,
+        },
+        "body": body,
+    }
+
+
+def adaptive_operator_delay(
+    rng: random.Random,
+    *,
+    minimum: int,
+    maximum: int,
+    messages_since_last: int,
+    previous_messages: int,
+    participant_count: int,
+) -> tuple[int, str]:
+    if minimum <= 0 or maximum < minimum:
+        raise ValueError("operator interval must satisfy 0 < minimum <= maximum")
+    declining = messages_since_last < participant_count
+    if previous_messages > 0:
+        declining = declining or messages_since_last < previous_messages * 0.7
+    if declining:
+        return minimum, "traffic_decline"
+    return rng.randint(minimum, maximum), "scheduled"
+
+
+def next_operator_deadline(
+    *,
+    scheduled_at: float,
+    participant_last_activity_at: float,
+    last_operator_at: float | None,
+    minimum: int,
+) -> float:
+    desired = min(scheduled_at, participant_last_activity_at + minimum)
+    if last_operator_at is None:
+        return desired
+    return max(desired, last_operator_at + minimum)
+
+
+@dataclass
+class WatchState:
+    thread: str
+    started_at: float
+    last_activity_at: float = field(init=False)
+    last_snapshot_at: float = field(init=False)
+    message_count: int = 0
+    quiet_nudges: int = 0
+    authors: set[str] = field(default_factory=set)
+    author_message_counts: dict[str, int] = field(default_factory=dict)
+    author_last_activity_at: dict[str, float] = field(default_factory=dict)
+    batches: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.last_activity_at = self.started_at
+        self.last_snapshot_at = self.started_at
+
+    def observe(self, batch: dict[str, Any], now: float) -> list[dict[str, Any]]:
+        self.batches.append(batch)
+        messages = [
+            row
+            for row in batch.get("threads", [])
+            if row.get("thread") == self.thread
+        ]
+        if messages:
+            self.last_activity_at = now
+            self.message_count += len(messages)
+            self.quiet_nudges = 0
+            self.authors.update(
+                str(row["from"])
+                for row in messages
+                if row.get("from")
+            )
+            for row in messages:
+                author = row.get("from")
+                if author:
+                    name = str(author)
+                    self.author_message_counts[name] = (
+                        self.author_message_counts.get(name, 0) + 1
+                    )
+                    self.author_last_activity_at[name] = now
+        return messages
+
+    def participant_message_count(self, participants: set[str]) -> int:
+        return sum(self.author_message_counts.get(name, 0) for name in participants)
+
+    def participant_last_activity_at(self, participants: set[str]) -> float:
+        return max(
+            (self.author_last_activity_at.get(name, self.started_at) for name in participants),
+            default=self.started_at,
+        )
+
+    def quiet_due(self, now: float, silence_seconds: float) -> bool:
+        return now - self.last_activity_at >= silence_seconds
+
+    def snapshot_due(self, now: float, snapshot_seconds: float) -> bool:
+        return now - self.last_snapshot_at >= snapshot_seconds
+
+    def mark_snapshot(self, now: float) -> None:
+        self.last_snapshot_at = now
+
+
+class DockerNexus:
+    def __init__(
+        self,
+        *,
+        container: str,
+        binary: str,
+        name: str,
+        client_key: str,
+        project: str,
+        nexus_home: str,
+        docker_user: str | None = None,
+    ) -> None:
+        self.container = container
+        self.binary = binary
+        self.docker_user = docker_user
+        self.identity_env = [
+            "-e",
+            f"NEXUS_NAME={name}",
+            "-e",
+            f"NEXUS_CLIENT_KEY={client_key}",
+            "-e",
+            f"NEXUS_PROJECT={project}",
+            "-e",
+            "NEXUS_AGENT=other",
+            "-e",
+            "NEXUS_KIND=human",
+            "-e",
+            f"NEXUS_HOME={nexus_home}",
+            "-e",
+            "NEXUS_NO_AUTOSTART=1",
+            "-e",
+            "TOKIO_WORKER_THREADS=2",
+        ]
+        self.operator_env = [
+            "-e",
+            f"NEXUS_PROJECT={project}",
+            "-e",
+            f"NEXUS_HOME={nexus_home}",
+            "-e",
+            "NEXUS_NO_AUTOSTART=1",
+            "-e",
+            "TOKIO_WORKER_THREADS=2",
+        ]
+
+    def docker_exec_prefix(self) -> list[str]:
+        command = ["docker", "exec"]
+        if self.docker_user:
+            command.extend(["--user", self.docker_user])
+        return command
+
+    def run(
+        self,
+        *args: str,
+        timeout: float = 30,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        command = [
+            *self.docker_exec_prefix(),
+            *self.identity_env,
+            self.container,
+            self.binary,
+            *args,
+        ]
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+        if check and result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(f"{' '.join(args)} failed rc={result.returncode}: {detail}")
+        return result
+
+    def run_operator(
+        self,
+        *args: str,
+        timeout: float = 30,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run an admin diagnostic as the env-less local machine operator."""
+        command = [
+            *self.docker_exec_prefix(),
+            *self.operator_env,
+            self.container,
+            self.binary,
+            *args,
+        ]
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+        if check and result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(f"operator {' '.join(args)} failed rc={result.returncode}: {detail}")
+        return result
+
+    def exec_operator_command(
+        self,
+        *args: str,
+        timeout: float = 10,
+    ) -> subprocess.CompletedProcess[str]:
+        command = [
+            *self.docker_exec_prefix(),
+            *self.operator_env,
+            self.container,
+            *args,
+        ]
+        return subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+
+    def listen_once(self, timeout_ms: int) -> dict[str, Any]:
+        result = self.run(
+            "listen",
+            "--json",
+            "--once",
+            "--timeout-ms",
+            str(timeout_ms),
+            timeout=(timeout_ms / 1000) + 30,
+        )
+        if not result.stdout.strip():
+            return {"counts": {"total": 0}, "dms": [], "threads": []}
+        return json.loads(result.stdout)
+
+
+@dataclass(frozen=True)
+class ScheduledProviderRetry:
+    completed_attempt: int
+    due_at: float
+    source: str | None
+
+
+class ProviderRetryController:
+    """Explicitly requeue advisory provider failures for the endurance fixture only.
+
+    Nexus itself keeps the release invariant that no message is silently replayed after crossing
+    the external harness boundary. This controller is the explicit operator: it consumes typed DLQ
+    evidence, waits between attempts, records every decision, and stops after three total attempts.
+    """
+
+    def __init__(self, evidence_path: Path) -> None:
+        self.evidence_path = evidence_path
+        self.scheduled: dict[str, ScheduledProviderRetry] = {}
+
+    @staticmethod
+    def _details(row: dict[str, Any]) -> dict[str, Any]:
+        details = row.get("errorDetails")
+        if isinstance(details, str):
+            try:
+                details = json.loads(details)
+            except ValueError:
+                return {}
+        return details if isinstance(details, dict) else {}
+
+    @classmethod
+    def _retryable_attempt(cls, row: dict[str, Any]) -> tuple[int, str | None] | None:
+        if row.get("errorCode") != "provider_error":
+            return None
+        details = cls._details(row)
+        if details.get("retryable") is not True:
+            return None
+        try:
+            attempt = int(row.get("attemptCount") or 0)
+        except (TypeError, ValueError):
+            return None
+        if attempt < 1:
+            return None
+        source = details.get("source")
+        return attempt, str(source) if source else None
+
+    def due(self, now: float) -> bool:
+        return any(retry.due_at <= now for retry in self.scheduled.values())
+
+    def next_deadline(self, fallback: float) -> float:
+        return min(
+            (retry.due_at for retry in self.scheduled.values()),
+            default=fallback,
+        )
+
+    def _record(self, record: dict[str, Any]) -> None:
+        self.evidence_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.evidence_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def review(self, dlq: dict[str, Any], nexus: DockerNexus, *, now: float) -> str | None:
+        rows = [row for row in dlq.get("rows", []) if isinstance(row, dict)]
+        current_ids = {
+            str(row["inFlightId"])
+            for row in rows
+            if row.get("inFlightId")
+        }
+        for in_flight_id in set(self.scheduled) - current_ids:
+            del self.scheduled[in_flight_id]
+
+        retryable: list[tuple[dict[str, Any], int, str | None]] = []
+        exhausted: list[int] = []
+        terminal_count = 0
+        for row in rows:
+            classification = self._retryable_attempt(row)
+            if classification is None:
+                terminal_count += 1
+                continue
+            attempt, source = classification
+            if attempt >= PROVIDER_RETRY_MAX_ATTEMPTS:
+                terminal_count += 1
+                exhausted.append(attempt)
+                continue
+            retryable.append((row, attempt, source))
+
+        if terminal_count:
+            if terminal_count == len(rows) and exhausted:
+                highest = max(exhausted)
+                return (
+                    f"delivery failure: {terminal_count} dead-lettered row(s); "
+                    f"explicit provider retry exhausted at attempt {highest}"
+                )
+            return f"delivery failure: {terminal_count} dead-lettered row(s)"
+
+        for row, attempt, source in retryable:
+            in_flight_id = str(row["inFlightId"])
+            scheduled = self.scheduled.get(in_flight_id)
+            if scheduled is None or scheduled.completed_attempt != attempt:
+                scheduled = ScheduledProviderRetry(
+                    completed_attempt=attempt,
+                    due_at=now + PROVIDER_RETRY_BACKOFF_SECONDS[attempt],
+                    source=source,
+                )
+                self.scheduled[in_flight_id] = scheduled
+            if now < scheduled.due_at:
+                continue
+
+            result = nexus.run_operator(
+                "admin",
+                "dlq",
+                "requeue",
+                in_flight_id,
+                "--json",
+                timeout=10,
+            )
+            response = json.loads(result.stdout)
+            requeued_ids = response.get("inFlightIds") or []
+            if int(response.get("count") or 0) != 1 or in_flight_id not in requeued_ids:
+                raise RuntimeError(
+                    f"explicit provider requeue did not move {in_flight_id}: {response!r}"
+                )
+            self._record(
+                {
+                    "requeuedAt": utc_now(),
+                    "inFlightId": in_flight_id,
+                    "messageId": row.get("messageId"),
+                    "recipientAgentId": row.get("recipientAgentId"),
+                    "completedAttempt": attempt,
+                    "nextAttempt": attempt + 1,
+                    "errorCode": row.get("errorCode"),
+                    "source": source,
+                }
+            )
+            del self.scheduled[in_flight_id]
+        return None
+
+
+def notify(nexus: DockerNexus, target: str, message: str) -> None:
+    """Dogfood the canonical one-shot primitive; no source registration or fanout knob."""
+    digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    nexus.run(
+        "notify",
+        "--target",
+        target,
+        "--source",
+        "nexus-endurance-watchdog",
+        "--idempotency-key",
+        f"watchdog:{digest}",
+        message,
+        timeout=30,
+    )
+
+
+def mirror_notification(command: Path | None, message: str) -> None:
+    """Best-effort operator mirror while the host runtime predates `nexus notify`."""
+    if command is None:
+        return
+    subprocess.run(
+        [str(command), message],
+        check=False,
+        timeout=15,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def emit_notification(
+    nexus: DockerNexus,
+    target: str,
+    message: str,
+    external_command: Path | None,
+) -> None:
+    notify(nexus, target, message)
+    mirror_notification(external_command, message)
+
+
+def post_operator_intervention(
+    nexus: DockerNexus,
+    thread: str,
+    intervention: dict[str, Any],
+    evidence_path: Path,
+    *,
+    reason: str,
+    messages_since_last: int,
+    next_delay_seconds: int,
+) -> dict[str, Any]:
+    result = nexus.run(
+        "post",
+        thread,
+        "-m",
+        str(intervention["body"]),
+        "--json",
+        timeout=30,
+    )
+    response = json.loads(result.stdout)
+    record = {
+        **intervention,
+        "postedAt": utc_now(),
+        "reason": reason,
+        "messagesSinceLast": messages_since_last,
+        "nextDelaySeconds": next_delay_seconds,
+        "messageId": response.get("messageId") or response.get("id"),
+    }
+    evidence_path.parent.mkdir(parents=True, exist_ok=True)
+    with evidence_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
+    return record
+
+
+def require_gateway_health(url: str | None, timeout: float = 2) -> None:
+    """Fail the gate when the WebUI backend disappears while daemon transport stays live."""
+    if not url:
+        return
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            status = int(getattr(response, "status", 200))
+            body = response.read()
+    except (OSError, urllib.error.URLError) as error:
+        raise RuntimeError(f"Gateway health check failed: {error}") from error
+    if status != 200:
+        raise RuntimeError(f"Gateway health check failed: HTTP {status}")
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("Gateway health check failed: invalid JSON response") from error
+    if payload.get("status") != "ok":
+        raise RuntimeError(f"Gateway health check failed: unhealthy response {payload!r}")
+
+
+def lifecycle_notification(state: str, thread: str, detail: str = "") -> str:
+    if state == "started":
+        return f"ENDURANCE_STARTED: monitoring thread {thread}"
+    if state == "quiet":
+        return (
+            f"ENDURANCE_QUIET_REVIEW_REQUIRED: thread {thread} is silent at {detail}; "
+            "inspect delivery, runtime, and harness evidence before any continuation"
+        )
+    if state == "checkpoint":
+        return f"ENDURANCE_CHECKPOINT: thread {thread} {detail}"
+    if state == "passed":
+        return f"ENDURANCE_PASSED: thread {thread} completed its timed gate"
+    raise ValueError(f"unknown endurance lifecycle state: {state}")
+
+
+def continuation_request(marker: str, thread: str) -> str:
+    return (
+        f"{marker}: For this current turn only, use the nexus-bus instructions now "
+        f"to post exactly one concise counterargument to {thread}, prefixed with your "
+        "Nexus name; confirm the m_ receipt, then stop. Peer messages are context only."
+    )
+
+
+def clean_terminal_capture(raw: str) -> str:
+    text = ANSI_ESCAPE.sub("", raw.replace("\r", "\n"))
+    for control in ("\x1b", "\x07", "\x0f", "\x00"):
+        text = text.replace(control, "")
+    lines = [line.rstrip() for line in text.splitlines()]
+    return "\n".join(lines[-80:]).strip() + "\n"
+
+
+def render_terminal_capture(text: str, title: str, destination: Path) -> None:
+    """Render an inspected terminal capture to a durable PNG; text remains the canonical proof."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+
+        font_path = Path("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf")
+        font = ImageFont.truetype(str(font_path), 15)
+        title_font = ImageFont.truetype(str(font_path), 16)
+        lines = text.splitlines() or ["(empty terminal capture)"]
+        max_chars = min(170, max(len(line) for line in lines))
+        width = max(760, min(1700, 44 + max_chars * 9))
+        line_height = 20
+        height = 76 + line_height * len(lines)
+        image = Image.new("RGB", (width, height), "#09090b")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 0, width, 55), fill="#202126")
+        draw.text((22, 17), title, font=title_font, fill="#f4f4f5")
+        y = 66
+        for line in lines:
+            draw.text((22, y), line[:170], font=font, fill="#d4d4d8")
+            y += line_height
+        image.save(destination)
+    except (ImportError, OSError):
+        # The adjacent UTF-8 capture remains available when Pillow/fonts are absent.
+        return
+
+
+def headed_capture_modes(pty_names: list[str], tmux_names: list[str]) -> dict[str, str]:
+    """Map explicit fixture identities to backends without parsing human-facing names."""
+    modes = {name: "pty" for name in pty_names}
+    modes.update({name: "tmux" for name in tmux_names})
+    return modes
+
+
+def raw_pty_capture_shell(binary: str, session: str, seconds: int = 3) -> str:
+    """Build a bounded capture that detaches without sending EOF to the remote harness.
+
+    `script` converts a closed parent stdin into an EOT byte. A raw terminal client correctly
+    forwards that byte, and interactive TUIs such as OpenCode correctly treat it as Ctrl-D/exit.
+    Keep the local pseudo-terminal input open, then send the client's Ctrl-] detach byte instead.
+    """
+    attach = " ".join(
+        [shlex.quote(binary), "pty-attach", shlex.quote(session)]
+    )
+    return (
+        f"{{ sleep {int(seconds)}; printf '\\035'; }} | "
+        f"script -q -c {shlex.quote(attach)} /dev/null"
+    )
+
+
+def hermes_state_db_path(session: str, name: str) -> str:
+    safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", name)
+    return f"/tmp/nexus-hermes-gateway-{session}-{safe_name}/home/state.db"
+
+
+def capture_webui_screen(
+    *,
+    webui_url: str,
+    webui_png: Path,
+    webui_log: Path,
+    profile: Path,
+    browser: Path = ROOT / "scripts" / "nexus-webui-screenshot.mjs",
+    timeout: float = 30,
+) -> None:
+    command = [
+        str(browser),
+        "--browser-executable=/home/tester/.local/bin/chromium",
+        f"--url={webui_url}",
+        f"--user-data-dir={profile}",
+        f"--screenshot={webui_png}",
+    ]
+    process = subprocess.Popen(
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        os.killpg(process.pid, signal.SIGKILL)
+        stdout, stderr = process.communicate()
+        webui_log.write_text(
+            f"url={webui_url}\nreturncode=timeout\n\n"
+            f"stdout:\n{stdout}\n\nstderr:\n{stderr}\n",
+            encoding="utf-8",
+        )
+        raise error
+
+    webui_log.write_text(
+        f"url={webui_url}\nreturncode={process.returncode}\n\n"
+        f"stdout:\n{stdout}\n\nstderr:\n{stderr}\n",
+        encoding="utf-8",
+    )
+    if process.returncode != 0:
+        raise RuntimeError(f"WebUI screenshot exited rc={process.returncode}")
+    if not webui_png.exists():
+        raise RuntimeError("WebUI screenshot exited successfully without producing an image")
+
+
+def capture_optional_webui_screen(
+    *,
+    webui_url: str,
+    webui_png: Path,
+    webui_log: Path,
+    profile: Path,
+    browser: Path = ROOT / "scripts" / "nexus-webui-screenshot.mjs",
+    timeout: float = 30,
+) -> list[str]:
+    """Capture observer evidence without confusing browser failure with transport failure."""
+    try:
+        capture_webui_screen(
+            webui_url=webui_url,
+            webui_png=webui_png,
+            webui_log=webui_log,
+            profile=profile,
+            browser=browser,
+            timeout=timeout,
+        )
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        with webui_log.open("a", encoding="utf-8") as handle:
+            handle.write(f"\nobserverCaptureError={error}\n")
+    captured = [str(webui_log)]
+    if webui_png.exists():
+        captured.append(str(webui_png))
+    return captured
+
+
+def participant_sessions(
+    members: dict[str, Any],
+    participants: list[str],
+    participant_agent_ids: dict[str, str] | None = None,
+) -> dict[str, str]:
+    rows = members.get("members", [])
+    by_name = {
+        str(row["name"]): str(row["sessionId"])
+        for row in rows
+        if row.get("name") and row.get("sessionId")
+    }
+    by_agent_id = {
+        str(row["agentId"]): str(row["sessionId"])
+        for row in rows
+        if row.get("agentId") and row.get("sessionId")
+    }
+    sessions: dict[str, str] = {}
+    for name in participants:
+        if participant_agent_ids and name in participant_agent_ids:
+            session = by_agent_id.get(participant_agent_ids[name])
+        else:
+            session = by_name.get(name)
+        if session:
+            sessions[name] = session
+    return sessions
+
+
+def capture_headed_screens(
+    *,
+    output: Path,
+    sequence: int,
+    nexus: DockerNexus,
+    participants: list[str],
+    headed_modes: dict[str, str],
+    hermes_names: set[str],
+    participant_agent_ids: dict[str, str] | None = None,
+    webui_url: str | None = None,
+) -> list[str]:
+    screen_dir = output / "screens"
+    screen_dir.mkdir(parents=True, exist_ok=True)
+    members = json.loads(
+        nexus.run(
+            "members",
+            "--json",
+            "--include-offline",
+            "--include-dead",
+            timeout=10,
+        ).stdout
+    )
+    sessions = participant_sessions(members, participants, participant_agent_ids)
+    captured: list[str] = []
+    for name in participants:
+        session = sessions.get(name)
+        mode = headed_modes.get(name)
+        if not session or mode is None:
+            continue
+        try:
+            if mode == "tmux":
+                result = nexus.exec_operator_command(
+                    "tmux",
+                    "-S",
+                    f"/tmp/nexus-tmux-nexus-{session}.sock",
+                    "capture-pane",
+                    "-p",
+                    "-e",
+                    "-S",
+                    "-200",
+                    "-t",
+                    f"nexus-{session}",
+                )
+            else:
+                result = nexus.exec_operator_command(
+                    "bash",
+                    "-c",
+                    raw_pty_capture_shell(nexus.binary, session),
+                    timeout=6,
+                )
+            raw = result.stdout + result.stderr
+        except subprocess.TimeoutExpired as error:
+            raw = f"terminal capture timed out: {error}\n"
+        if name in hermes_names:
+            state = nexus.exec_operator_command(
+                "sqlite3",
+                "-readonly",
+                "-header",
+                "-column",
+                hermes_state_db_path(session, name),
+                """SELECT id, role, printf('%.3f', timestamp) AS timestamp,
+substr(replace(content, char(10), ' '), 1, 700) AS content, finish_reason
+FROM (SELECT * FROM messages WHERE active = 1 ORDER BY id DESC LIMIT 12)
+ORDER BY id;""",
+                timeout=6,
+            )
+            raw += "\n\n[Hermes durable gateway turn state]\n"
+            raw += state.stdout + state.stderr
+        text = clean_terminal_capture(raw)
+        stem = f"checkpoint-{sequence:04d}-{name}"
+        text_path = screen_dir / f"{stem}.txt"
+        png_path = screen_dir / f"{stem}.png"
+        text_path.write_text(text, encoding="utf-8")
+        render_terminal_capture(
+            text,
+            f"{name} · checkpoint {sequence} · {utc_now()}",
+            png_path,
+        )
+        captured.append(str(text_path))
+        if png_path.exists():
+            captured.append(str(png_path))
+    if webui_url:
+        webui_png = screen_dir / f"checkpoint-{sequence:04d}-webui.png"
+        webui_log = screen_dir / f"checkpoint-{sequence:04d}-webui.log"
+        profile = output / f"chromium-profile-{sequence:04d}"
+        captured.extend(
+            capture_optional_webui_screen(
+                webui_url=webui_url,
+                webui_png=webui_png,
+                webui_log=webui_log,
+                profile=profile,
+            )
+        )
+    return captured
+
+
+def classify_quiet_diagnostics(
+    dlq: dict[str, Any],
+    members: dict[str, Any],
+    participants: list[str],
+    participant_agent_ids: dict[str, str] | None = None,
+) -> str | None:
+    """Distinguish delivery/runtime failure from an otherwise healthy quiet thread."""
+    dead_letters = int(dlq.get("total") or len(dlq.get("rows", [])))
+    if dead_letters:
+        return f"delivery failure: {dead_letters} dead-lettered row(s)"
+
+    member_rows = [
+        row
+        for row in members.get("members", [])
+        if isinstance(row, dict)
+    ]
+    by_name = {str(row.get("name")): row for row in member_rows if row.get("name")}
+    by_agent_id = {
+        str(row.get("agentId")): row for row in member_rows if row.get("agentId")
+    }
+    expected_rows = {
+        name: (
+            by_agent_id.get(participant_agent_ids[name])
+            if participant_agent_ids and name in participant_agent_ids
+            else by_name.get(name)
+        )
+        for name in participants
+    }
+    missing = sorted(name for name, row in expected_rows.items() if row is None)
+    if missing:
+        return f"runtime failure: missing participant(s): {', '.join(missing)}"
+    offline = sorted(
+        name
+        for name, row in expected_rows.items()
+        if str(row.get("presence") or "offline").lower()
+        in {"offline", "dead", "errored"}
+    )
+    if offline:
+        return f"runtime failure: offline participant(s): {', '.join(offline)}"
+    return None
+
+
+def diagnose_quiet(
+    nexus: DockerNexus,
+    participants: list[str],
+    participant_agent_ids: dict[str, str] | None = None,
+    provider_retries: ProviderRetryController | None = None,
+    now: float | None = None,
+) -> str | None:
+    dlq_result = nexus.run_operator("admin", "dlq", "list", "--json", timeout=10)
+    dlq = json.loads(dlq_result.stdout)
+    if provider_retries is not None:
+        failure = provider_retries.review(
+            dlq,
+            nexus,
+            now=time.monotonic() if now is None else now,
+        )
+        if failure:
+            return failure
+        dlq = {"rows": [], "total": 0}
+    members_result = nexus.run(
+        "members",
+        "--json",
+        "--include-offline",
+        "--include-dead",
+        timeout=10,
+    )
+    return classify_quiet_diagnostics(
+        dlq,
+        json.loads(members_result.stdout),
+        participants,
+        participant_agent_ids,
+    )
+
+
+def diagnose_delivery(
+    nexus: DockerNexus,
+    provider_retries: ProviderRetryController | None = None,
+    now: float | None = None,
+) -> str | None:
+    dlq_result = nexus.run_operator("admin", "dlq", "list", "--json", timeout=10)
+    dlq = json.loads(dlq_result.stdout)
+    if provider_retries is not None:
+        return provider_retries.review(
+            dlq,
+            nexus,
+            now=time.monotonic() if now is None else now,
+        )
+    return classify_quiet_diagnostics(
+        dlq,
+        {"members": []},
+        [],
+    )
+
+
+def snapshot(
+    *,
+    output: Path,
+    sequence: int,
+    state: WatchState,
+    nexus: DockerNexus,
+    status: str,
+    detail: str = "",
+    screenshots: list[str] | None = None,
+) -> Path:
+    output.mkdir(parents=True, exist_ok=True)
+    diagnostics: dict[str, Any] = {}
+    for label, args in {
+        "daemon_status": ("daemon", "status"),
+        "members": ("members", "--json", "--include-offline", "--include-dead"),
+    }.items():
+        try:
+            result = nexus.run(*args, timeout=10, check=False)
+        except subprocess.TimeoutExpired as error:
+            diagnostics[label] = {
+                "returncode": None,
+                "stdout": str(error.stdout or ""),
+                "stderr": str(error.stderr or ""),
+                "timedOut": True,
+            }
+        else:
+            diagnostics[label] = {
+                "returncode": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "timedOut": False,
+            }
+    try:
+        dlq_result = nexus.run_operator(
+            "admin", "dlq", "list", "--json", timeout=10, check=False
+        )
+    except subprocess.TimeoutExpired as error:
+        diagnostics["dead_letters"] = {
+            "returncode": None,
+            "stdout": str(error.stdout or ""),
+            "stderr": str(error.stderr or ""),
+            "timedOut": True,
+        }
+    else:
+        diagnostics["dead_letters"] = {
+            "returncode": dlq_result.returncode,
+            "stdout": dlq_result.stdout,
+            "stderr": dlq_result.stderr,
+            "timedOut": False,
+        }
+    stats = subprocess.run(
+        ["docker", "stats", "--no-stream", nexus.container],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    diagnostics["docker_stats"] = {
+        "returncode": stats.returncode,
+        "stdout": stats.stdout,
+        "stderr": stats.stderr,
+    }
+    process_memory = subprocess.run(
+        [
+            "docker",
+            "top",
+            nexus.container,
+            "-eo",
+            "pid,ppid,rss,vsz,etime,comm,args",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    diagnostics["process_memory"] = {
+        "returncode": process_memory.returncode,
+        "stdout": process_memory.stdout,
+        "stderr": process_memory.stderr,
+    }
+    payload = {
+        "capturedAt": utc_now(),
+        "status": status,
+        "detail": detail,
+        "thread": state.thread,
+        "messageCount": state.message_count,
+        "authors": sorted(state.authors),
+        "quietNudges": state.quiet_nudges,
+        "screenshots": screenshots or [],
+        "lastActivityMonotonic": state.last_activity_at,
+        "batches": state.batches,
+        "diagnostics": diagnostics,
+    }
+    path = output / f"snapshot-{sequence:04d}.json"
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--container", required=True)
+    parser.add_argument("--docker-user")
+    parser.add_argument("--thread", required=True)
+    parser.add_argument("--controller", required=True)
+    parser.add_argument("--client-key", required=True)
+    parser.add_argument("--project", default="matrix")
+    parser.add_argument("--nexus-bin", default="/opt/nexus")
+    parser.add_argument("--nexus-home", required=True)
+    parser.add_argument("--duration-seconds", type=int, default=5 * 60 * 60)
+    parser.add_argument("--max-quiet-nudges", type=int, default=3)
+    parser.add_argument("--participant", action="append", default=[])
+    parser.add_argument("--participant-agent-id", action="append", default=[])
+    parser.add_argument("--headed-pty", action="append", default=[])
+    parser.add_argument("--headed-tmux", action="append", default=[])
+    parser.add_argument("--hermes-headed", action="append", default=[])
+    parser.add_argument("--thinker-assignment", action="append", default=[])
+    parser.add_argument("--operator-seed", default="nexus-endurance")
+    parser.add_argument("--operator-min-seconds", type=int, default=4 * 60)
+    parser.add_argument("--operator-max-seconds", type=int, default=10 * 60)
+    parser.add_argument("--webui-url")
+    parser.add_argument("--gateway-health-url")
+    parser.add_argument(
+        "--notify-target",
+        help="explicit Nexus agent id/name/group/thread target; defaults to the controller",
+    )
+    parser.add_argument(
+        "--external-notify-command",
+        type=Path,
+        help="optional best-effort operator mirror; never substitutes for canonical nexus notify",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=ROOT / "output" / "endurance-watchdog",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    started = time.monotonic()
+    deadline = started + args.duration_seconds
+    state = WatchState(thread=args.thread, started_at=started)
+    nexus = DockerNexus(
+        container=args.container,
+        binary=args.nexus_bin,
+        name=args.controller,
+        client_key=args.client_key,
+        project=args.project,
+        nexus_home=args.nexus_home,
+        docker_user=args.docker_user,
+    )
+    sequence = 0
+    checkpoint_offsets = progressive_checkpoint_deadlines(args.duration_seconds)
+    checkpoint_index = 0
+    checkpoint_message_count = 0
+    notify_target = args.notify_target or args.controller
+    headed_modes = headed_capture_modes(args.headed_pty, args.headed_tmux)
+    hermes_names = set(args.hermes_headed)
+    participant_names = set(args.participant)
+    participant_agent_ids = parse_participant_agent_ids(args.participant_agent_id)
+    if participant_agent_ids:
+        validate_participant_agent_ids(participant_names, participant_agent_ids)
+    assignments = parse_thinker_assignments(args.thinker_assignment)
+    if assignments and set(assignments) != participant_names:
+        missing = sorted(participant_names - set(assignments))
+        unknown = sorted(set(assignments) - participant_names)
+        raise ValueError(
+            f"thinker assignments must exactly match participants; missing={missing}, unknown={unknown}"
+        )
+    if args.operator_min_seconds <= 0 or args.operator_max_seconds < args.operator_min_seconds:
+        raise ValueError("operator interval must satisfy 0 < minimum <= maximum")
+    operator_rng = random.Random(args.operator_seed)
+    operator_sequence = 0
+    operator_message_count = 0
+    previous_operator_messages = 0
+    last_operator_at: float | None = None
+    next_operator_at = started + operator_rng.randint(
+        args.operator_min_seconds, args.operator_max_seconds
+    )
+    operator_evidence = args.output / "operator-interventions.jsonl"
+    provider_retries = ProviderRetryController(args.output / "provider-requeues.jsonl")
+    next_delivery_scan_at = started
+
+    try:
+        require_gateway_health(args.gateway_health_url)
+        emit_notification(
+            nexus,
+            notify_target,
+            lifecycle_notification("started", args.thread),
+            args.external_notify_command,
+        )
+        snapshot(
+            output=args.output,
+            sequence=sequence,
+            state=state,
+            nexus=nexus,
+            status="running",
+        )
+        while time.monotonic() < deadline:
+            loop_now = time.monotonic()
+            next_checkpoint = started + checkpoint_offsets[checkpoint_index]
+            participant_last_activity_at = state.participant_last_activity_at(
+                participant_names
+            )
+            next_operator_due = (
+                next_operator_deadline(
+                    scheduled_at=next_operator_at,
+                    participant_last_activity_at=participant_last_activity_at,
+                    last_operator_at=last_operator_at,
+                    minimum=args.operator_min_seconds,
+                )
+                if assignments
+                else deadline
+            )
+            remaining_ms = max(
+                1,
+                int(
+                    bounded_wait_seconds(
+                        now=loop_now,
+                        deadlines=[
+                            next_checkpoint,
+                            next_operator_due,
+                            deadline,
+                            next_delivery_scan_at,
+                            provider_retries.next_deadline(deadline),
+                        ],
+                    )
+                    * 1000
+                ),
+            )
+            batch = nexus.listen_once(remaining_ms)
+            require_gateway_health(args.gateway_health_url)
+            now = time.monotonic()
+            state.observe(batch, now)
+            if now >= next_delivery_scan_at or provider_retries.due(now):
+                failure = diagnose_delivery(nexus, provider_retries, now)
+                if failure:
+                    raise RuntimeError(failure)
+                next_delivery_scan_at = now + DELIVERY_SCAN_INTERVAL_SECONDS
+
+            if assignments and now >= next_operator_due:
+                failure = diagnose_quiet(
+                    nexus,
+                    args.participant,
+                    participant_agent_ids,
+                    provider_retries,
+                    now,
+                )
+                if failure:
+                    raise RuntimeError(failure)
+                current_participant_messages = state.participant_message_count(
+                    participant_names
+                )
+                messages_since_last = current_participant_messages - operator_message_count
+                delay, pressure_reason = adaptive_operator_delay(
+                    operator_rng,
+                    minimum=args.operator_min_seconds,
+                    maximum=args.operator_max_seconds,
+                    messages_since_last=messages_since_last,
+                    previous_messages=previous_operator_messages,
+                    participant_count=len(participant_names),
+                )
+                reason = (
+                    "silence"
+                    if now >= participant_last_activity_at + args.operator_min_seconds
+                    else pressure_reason
+                )
+                operator_sequence += 1
+                intervention = operator_intervention(
+                    operator_rng,
+                    operator_sequence,
+                    assignments,
+                )
+                post_operator_intervention(
+                    nexus,
+                    args.thread,
+                    intervention,
+                    operator_evidence,
+                    reason=reason,
+                    messages_since_last=messages_since_last,
+                    next_delay_seconds=delay,
+                )
+                previous_operator_messages = messages_since_last
+                operator_message_count = current_participant_messages
+                last_operator_at = time.monotonic()
+                next_operator_at = last_operator_at + delay
+
+            while (
+                checkpoint_index < len(checkpoint_offsets)
+                and now >= started + checkpoint_offsets[checkpoint_index]
+            ):
+                failure = diagnose_quiet(
+                    nexus,
+                    args.participant,
+                    participant_agent_ids,
+                    provider_retries,
+                    now,
+                )
+                if failure:
+                    raise RuntimeError(failure)
+                sequence += 1
+                checkpoint_number = checkpoint_index + 1
+                screenshots = capture_headed_screens(
+                    output=args.output,
+                    sequence=sequence,
+                    nexus=nexus,
+                    participants=args.participant,
+                    headed_modes=headed_modes,
+                    hermes_names=hermes_names,
+                    participant_agent_ids=participant_agent_ids,
+                    webui_url=args.webui_url,
+                )
+                failure = diagnose_quiet(
+                    nexus,
+                    args.participant,
+                    participant_agent_ids,
+                    provider_retries,
+                    now,
+                )
+                if failure:
+                    raise RuntimeError(failure)
+                minutes = checkpoint_offsets[checkpoint_index] // 60
+                participant_message_count = state.participant_message_count(
+                    participant_names
+                )
+                if participant_message_count == checkpoint_message_count:
+                    state.quiet_nudges += 1
+                    marker = f"checkpoint {checkpoint_number}/{len(checkpoint_offsets)} at {minutes}m"
+                    snapshot(
+                        output=args.output,
+                        sequence=sequence,
+                        state=state,
+                        nexus=nexus,
+                        status="manual_review_required",
+                        detail=marker,
+                        screenshots=screenshots,
+                    )
+                    emit_notification(
+                        nexus,
+                        notify_target,
+                        lifecycle_notification("quiet", args.thread, marker),
+                        args.external_notify_command,
+                    )
+                    if state.quiet_nudges >= args.max_quiet_nudges:
+                        raise RuntimeError(
+                            "thread remained collectively silent across "
+                            f"{state.quiet_nudges} manually reviewable checkpoints"
+                        )
+                else:
+                    detail = (
+                        f"{checkpoint_number}/{len(checkpoint_offsets)} at {minutes}m; "
+                        f"messages={state.message_count}; participant_messages={participant_message_count}; "
+                        f"authors={len(state.authors)}; "
+                        f"screenshots={len(screenshots)}"
+                    )
+                    snapshot(
+                        output=args.output,
+                        sequence=sequence,
+                        state=state,
+                        nexus=nexus,
+                        status="running",
+                        detail=detail,
+                        screenshots=screenshots,
+                    )
+                    emit_notification(
+                        nexus,
+                        notify_target,
+                        lifecycle_notification("checkpoint", args.thread, detail),
+                        args.external_notify_command,
+                    )
+                checkpoint_message_count = participant_message_count
+                state.mark_snapshot(now)
+                checkpoint_index += 1
+                if checkpoint_index >= len(checkpoint_offsets):
+                    break
+
+        missing_authors = sorted(set(args.participant) - state.authors)
+        if missing_authors:
+            raise RuntimeError(
+                "participation failure: no thread post from " + ", ".join(missing_authors)
+            )
+
+        failure = diagnose_quiet(nexus, args.participant, participant_agent_ids)
+        if failure:
+            raise RuntimeError(failure)
+        require_gateway_health(args.gateway_health_url)
+
+        sequence += 1
+        screenshots = capture_headed_screens(
+            output=args.output,
+            sequence=sequence,
+            nexus=nexus,
+            participants=args.participant,
+            headed_modes=headed_modes,
+            hermes_names=hermes_names,
+            participant_agent_ids=participant_agent_ids,
+            webui_url=args.webui_url,
+        )
+        failure = diagnose_quiet(nexus, args.participant, participant_agent_ids)
+        if failure:
+            raise RuntimeError(failure)
+        path = snapshot(
+            output=args.output,
+            sequence=sequence,
+            state=state,
+            nexus=nexus,
+            status="passed",
+            screenshots=screenshots,
+        )
+        emit_notification(
+            nexus,
+            notify_target,
+            lifecycle_notification("passed", args.thread),
+            args.external_notify_command,
+        )
+        print(f"PASS endurance watchdog: {path}")
+        return 0
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        try:
+            emit_notification(
+                nexus,
+                notify_target,
+                f"ENDURANCE_FAILURE: {error}",
+                args.external_notify_command,
+            )
+        except Exception:
+            pass
+        sequence += 1
+        screenshots = capture_headed_screens(
+            output=args.output,
+            sequence=sequence,
+            nexus=nexus,
+            participants=args.participant,
+            headed_modes=headed_modes,
+            hermes_names=hermes_names,
+            participant_agent_ids=participant_agent_ids,
+            webui_url=None,
+        )
+        path = snapshot(
+            output=args.output,
+            sequence=sequence,
+            state=state,
+            nexus=nexus,
+            status="failed",
+            detail=str(error),
+            screenshots=screenshots,
+        )
+        print(f"FAIL endurance watchdog: {error}; evidence={path}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

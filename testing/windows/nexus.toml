@@ -1,0 +1,88 @@
+schema = 1
+name = "nexus"
+network = "internet"
+timeout_seconds = 18000
+
+[env]
+CI = "1"
+NEXUS_HOME = "C:\\w\\data\\${RUN_ID}\\nexus"
+
+[[sources]]
+name = "egregore-nexus"
+path = "../.."
+destination = "egregore-nexus"
+mode = "git-workspace"
+excludes = [
+  ".nexus/**",
+  ".opencode/**",
+  ".playwright-mcp/**",
+  ".worktrees/**",
+  "gateway/.dist-run-*/**",
+  "output/**",
+]
+
+[[steps]]
+name = "rust-format"
+workdir = "C:\\w\\src\\egregore-nexus\\core"
+timeout_seconds = 900
+command = '''
+& cargo.exe fmt --all -- --check
+'''
+
+[[steps]]
+name = "rust-compile"
+workdir = "C:\\w\\src\\egregore-nexus\\core"
+timeout_seconds = 7200
+command = '''
+& cargo.exe test --workspace --no-run
+'''
+
+[[steps]]
+name = "rust-tests"
+workdir = "C:\\w\\src\\egregore-nexus\\core"
+timeout_seconds = 7200
+command = '''
+& cargo.exe test --workspace
+'''
+
+[[steps]]
+name = "rust-release"
+workdir = "C:\\w\\src\\egregore-nexus\\core"
+timeout_seconds = 7200
+command = '''
+& cargo.exe build --release -p egregore-nexus
+'''
+
+[[steps]]
+name = "gateway-install"
+workdir = "C:\\w\\src\\egregore-nexus"
+timeout_seconds = 3600
+command = '''
+& pnpm.cmd --dir gateway install --frozen-lockfile
+'''
+
+[[steps]]
+name = "gateway-gates"
+workdir = "C:\\w\\src\\egregore-nexus"
+timeout_seconds = 5400
+command = '''
+& pnpm.cmd --dir gateway typecheck
+& pnpm.cmd --dir gateway test
+& pnpm.cmd --dir gateway build:gateway-package
+& pnpm.cmd --dir gateway build
+'''
+
+[[artifacts]]
+name = "nexus-exe"
+path = "C:\\w\\src\\egregore-nexus\\core\\target\\release\\nexus.exe"
+required = true
+
+[[artifacts]]
+name = "gateway-headless"
+path = "C:\\w\\src\\egregore-nexus\\gateway\\dist-gateway"
+required = true
+
+[[artifacts]]
+name = "gateway-web"
+path = "C:\\w\\src\\egregore-nexus\\gateway\\dist"
+required = true

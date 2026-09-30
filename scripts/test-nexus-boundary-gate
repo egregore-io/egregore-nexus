@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Fixture self-test for scripts/nexus-boundary-gate. Proves the gate rejects
+# new harness bleed, enforces shrink-only ceilings, and accepts the exempt
+# locations (crates/harness/*, tests/ directories, workspace root, core/tests).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GATE="$ROOT/scripts/nexus-boundary-gate"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+new_fixture() {
+  local name="$1"
+  local fixture="$TMP/$name"
+  mkdir -p \
+    "$fixture/scripts" \
+    "$fixture/core/crates/nexus-common/src" \
+    "$fixture/core/crates/harness/claude/src"
+  : >"$fixture/scripts/nexus-boundary-gate.allow"
+  printf '%s\n' "$fixture"
+}
+
+expect_rejected() {
+  local name="$1"
+  local fixture="$2"
+  local expected="$3"
+  local output
+  if output="$($GATE "$fixture" 2>&1)"; then
+    echo "FAIL $name: violating fixture passed" >&2
+    printf '%s\n' "$output" >&2
+    exit 1
+  fi
+  if [[ "$output" != *"$expected"* ]]; then
+    echo "FAIL $name: diagnostic did not contain '$expected'" >&2
+    printf '%s\n' "$output" >&2
+    exit 1
+  fi
+}
+
+expect_allowed() {
+  local name="$1"
+  local fixture="$2"
+  local output
+  if ! output="$($GATE "$fixture" 2>&1)"; then
+    echo "FAIL $name: clean fixture was rejected" >&2
+    printf '%s\n' "$output" >&2
+    exit 1
+  fi
+}
+
+# --help must succeed without side effects.
+"$GATE" --help >/dev/null
+
+# Clean tree passes.
+fixture="$(new_fixture clean)"
+echo 'pub fn transport() {}' >"$fixture/core/crates/nexus-common/src/lib.rs"
+expect_allowed clean "$fixture"
+
+# New harness name in a core production source is rejected.
+fixture="$(new_fixture name-bleed)"
+echo '// talk to claude here' >"$fixture/core/crates/nexus-common/src/lib.rs"
+expect_rejected name-bleed "$fixture" 'core/crates/nexus-common/src/lib.rs'
+
+# New concrete harness dependency in a manifest is rejected.
+fixture="$(new_fixture dep-bleed)"
+mkdir -p "$fixture/core/crates/nexus-store"
+echo 'nexus-harness-claude = { workspace = true }' \
+  >"$fixture/core/crates/nexus-store/Cargo.toml"
+expect_rejected dep-bleed "$fixture" 'core/crates/nexus-store/Cargo.toml'
+
+# Path reach into crates/harness/ from a manifest is rejected.
+fixture="$(new_fixture path-reach)"
+mkdir -p "$fixture/core/crates/nexus-store"
+echo 'helper = { path = "../../crates/harness/codex" }' \
+  >"$fixture/core/crates/nexus-store/Cargo.toml"
+expect_rejected path-reach "$fixture" 'core/crates/nexus-store/Cargo.toml'
+
+# A grandfathered file at its ceiling passes.
+fixture="$(new_fixture at-ceiling)"
+printf '// claude\n// codex\n' >"$fixture/core/crates/nexus-common/src/lib.rs"
+echo 'name core/crates/nexus-common/src/lib.rs|2' \
+  >"$fixture/scripts/nexus-boundary-gate.allow"
+expect_allowed at-ceiling "$fixture"
+
+# A grandfathered file above its ceiling is rejected (ceilings only shrink).
+fixture="$(new_fixture above-ceiling)"
+printf '// claude\n// codex\n// opencode\n' \
+  >"$fixture/core/crates/nexus-common/src/lib.rs"
+echo 'name core/crates/nexus-common/src/lib.rs|2' \
+  >"$fixture/scripts/nexus-boundary-gate.allow"
+expect_rejected above-ceiling "$fixture" 'may only decrease'
+
+# Dropping below the ceiling passes and prompts a ratchet note.
+fixture="$(new_fixture below-ceiling)"
+printf '// claude\n' >"$fixture/core/crates/nexus-common/src/lib.rs"
+echo 'name core/crates/nexus-common/src/lib.rs|3' \
+  >"$fixture/scripts/nexus-boundary-gate.allow"
+expect_allowed below-ceiling "$fixture"
+if [[ "$($GATE "$fixture")" != *'ratchet the ceiling down'* ]]; then
+  echo 'FAIL below-ceiling: expected a ratchet-down note' >&2
+  exit 1
+fi
+
+# Exempt locations may name harnesses freely: the harness tree itself, test
+# directories, the workspace root manifest, and the integration test crate.
+fixture="$(new_fixture exemptions)"
+echo 'pub struct ClaudeHarness; // claude codex opencode hermes' \
+  >"$fixture/core/crates/harness/claude/src/lib.rs"
+mkdir -p "$fixture/core/crates/nexus-common/tests"
+echo '// claude fixture' >"$fixture/core/crates/nexus-common/tests/claude.rs"
+echo 'members = ["crates/harness/claude", "crates/harness/codex"]' \
+  >"$fixture/core/Cargo.toml"
+mkdir -p "$fixture/core/tests"
+echo 'nexus-harness-codex = { path = "../crates/harness/codex" }' \
+  >"$fixture/core/tests/Cargo.toml"
+expect_allowed exemptions "$fixture"
+
+# The real repository must be green against its own allowlist.
+expect_allowed repository "$ROOT"
+
+echo "PASS boundary fixture gate"

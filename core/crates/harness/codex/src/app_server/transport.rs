@@ -569,7 +569,7 @@ fn active_turn_steer_race(error: &CodexRpcError) -> Option<ActiveTurnSteerRace> 
 
 /// Shared test helpers for in-process fake WebSocket-over-Unix-socket codex server.
 /// Exported as `pub(crate)` so `routing_turn_exec` tests can reuse without duplication.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod test_support {
     use futures::SinkExt;
     use futures::StreamExt;
@@ -673,7 +673,7 @@ pub(crate) mod test_support {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::test_support::spawn_fake_server;
     use super::*;

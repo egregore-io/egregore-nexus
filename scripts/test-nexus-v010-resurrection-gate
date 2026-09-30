@@ -1,0 +1,1221 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import dataclasses
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+PATH = Path(__file__).resolve().parent / "nexus-v010-resurrection-gate"
+gate = None
+if PATH.exists():
+    loader = importlib.machinery.SourceFileLoader("nexus_v010_resurrection_gate", str(PATH))
+    spec = importlib.util.spec_from_loader("nexus_v010_resurrection_gate", loader)
+    gate = importlib.util.module_from_spec(spec)
+    sys.modules["nexus_v010_resurrection_gate"] = gate
+    loader.exec_module(gate)
+
+
+FIXTURE_NAMES = [
+    "Ada",
+    "Simone",
+    "Hannah",
+    "Marcus",
+    "Iris",
+    "Soren",
+    "Maya",
+    "Lucian",
+    "Noor",
+    "Friedrich",
+    "Albert",
+    "Hypatia",
+]
+
+
+def fixture_manifest():
+    participants = []
+    harnesses = (
+        "claude",
+        "claude",
+        "claude",
+        "codex",
+        "codex",
+        "codex",
+        "opencode",
+        "opencode",
+        "opencode",
+        "hermes",
+        "hermes",
+        "hermes",
+    )
+    expected_transport = {
+        ("claude", "headless"): "acp",
+        ("claude", "pty"): "pty",
+        ("claude", "tmux"): "pty",
+        ("codex", "headless"): "acp",
+        ("codex", "pty"): "codex-appserver",
+        ("codex", "tmux"): "codex-appserver",
+        ("opencode", "headless"): "acp",
+        ("opencode", "pty"): "opencode-plugin",
+        ("opencode", "tmux"): "opencode-plugin",
+        ("hermes", "headless"): "acp",
+        ("hermes", "pty"): "pty",
+        ("hermes", "tmux"): "pty",
+    }
+    for index, name in enumerate(FIXTURE_NAMES):
+        harness = harnesses[index]
+        variant = ("headless", "pty", "tmux")[index % 3]
+        participants.append(
+            gate.Participant(
+                name=name,
+                agent_id=f"a_{index}",
+                runtime_id=f"s_{index}",
+                harness=harness,
+                variant=variant,
+                transport=expected_transport[(harness, variant)],
+                cwd=f"/tmp/{name}",
+                native_resume_digest=f"sha256:native-{index}",
+                provider_digest=(
+                    f"sha256:provider-{index}" if harness == "claude" else None
+                ),
+            )
+        )
+    return gate.Manifest(
+        candidate="test", thread="endurance-test", participants=participants
+    )
+
+
+def observed_from_manifest(manifest):
+    members = {}
+    runtimes = {}
+    for participant in manifest.participants:
+        members[participant.name] = {
+            "name": participant.name,
+            "agentId": participant.agent_id,
+            "sessionId": participant.runtime_id,
+        }
+        runtimes[participant.name] = dataclasses.asdict(participant)
+    return gate.ObservedState(
+        members=members,
+        thread_members=manifest.names,
+        runtimes=runtimes,
+    )
+
+
+class ManifestContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.assertIsNotNone(gate, "resurrection gate module must exist")
+
+    def test_candidate_71_shape_fails_before_wake(self) -> None:
+        expected = fixture_manifest()
+        observed = gate.ObservedState(
+            members={
+                "endurance-controller71": {
+                    "name": "endurance-controller71",
+                    "agentId": "a_controller",
+                }
+            },
+            thread_members=[],
+            runtimes={},
+        )
+
+        failures = gate.compare_restored_state(expected, observed)
+
+        self.assertIn(
+            "missing Nexus identities: " + ", ".join(expected.names), failures
+        )
+        self.assertIn("thread members expected=12 observed=0", failures)
+
+    def test_manifest_requires_twelve_unique_agent_ids(self) -> None:
+        manifest = fixture_manifest()
+        manifest.participants[1].agent_id = manifest.participants[0].agent_id
+
+        with self.assertRaisesRegex(ValueError, "12 unique Nexus agent IDs"):
+            gate.validate_manifest(manifest)
+
+    def test_restored_state_accepts_exact_twelve_variant_manifest(self) -> None:
+        manifest = fixture_manifest()
+
+        failures = gate.compare_restored_state(
+            manifest, observed_from_manifest(manifest)
+        )
+
+        self.assertEqual(failures, [])
+
+    def test_claude_provider_id_is_correlation_not_nexus_identity(self) -> None:
+        before = fixture_manifest().participants[0]
+        after = dataclasses.replace(before, provider_digest="sha256:new")
+
+        result = gate.compare_participant(before, after)
+
+        self.assertEqual(result.failures, [])
+        self.assertEqual(result.caveats, ["Claude provider correlation changed: Ada"])
+
+    def test_claude_resume_rotation_is_one_provider_caveat(self) -> None:
+        before = fixture_manifest().participants[0]
+        after = dataclasses.replace(
+            before,
+            native_resume_digest="sha256:new",
+            provider_digest="sha256:new",
+        )
+
+        result = gate.compare_participant(before, after)
+
+        self.assertEqual(result.failures, [])
+        self.assertEqual(result.caveats, ["Claude provider correlation changed: Ada"])
+
+    def test_nexus_agent_id_change_is_a_failure(self) -> None:
+        before = fixture_manifest().participants[0]
+        after = dataclasses.replace(before, agent_id="a_replacement")
+
+        result = gate.compare_participant(before, after)
+
+        self.assertIn("Nexus agent identity changed: Ada", result.failures)
+
+    def test_mixed_claude_provider_ids_in_one_bridge_fail(self) -> None:
+        participant = fixture_manifest().participants[0]
+        observed = observed_from_manifest(fixture_manifest())
+        observed.runtimes[participant.name]["provider_digests"] = [
+            "sha256:one",
+            "sha256:two",
+        ]
+
+        failures = gate.compare_restored_state(fixture_manifest(), observed)
+
+        self.assertIn("mixed Claude provider correlations: Ada", failures)
+
+
+class OperationalBoundaryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        for name in (
+            "DockerNexus",
+            "LifecycleSnapshot",
+            "compare_lifecycle",
+            "restart_daemon",
+            "secret_digest",
+            "write_json_atomic",
+        ):
+            self.assertTrue(hasattr(gate, name), f"missing operational API: {name}")
+
+    def test_docker_client_uses_controller_identity_and_embedded_daemon_ipc(self) -> None:
+        runner = gate.DockerNexus(
+            container="validator",
+            binary="/opt/nexus",
+            nexus_home="/tmp/nexus-home",
+            codex_home="/tmp/codex-home",
+            project="endurance",
+            controller="controller",
+            client_key="ck_controller",
+            docker_user="1000:1000",
+        )
+        completed = subprocess.CompletedProcess([], 0, stdout="{}\n", stderr="")
+
+        with mock.patch.object(subprocess, "run", return_value=completed) as run:
+            result = runner.run("members", "--json")
+
+        self.assertEqual(result, completed)
+        command = run.call_args.args[0]
+        self.assertEqual(command[:4], ["docker", "exec", "--user", "1000:1000"])
+        self.assertIn("NEXUS_KIND=human", command)
+        self.assertIn("NEXUS_NAME=controller", command)
+        self.assertIn("NEXUS_CLIENT_KEY=ck_controller", command)
+        self.assertIn("NEXUS_HOME=/tmp/nexus-home", command)
+        self.assertIn("CODEX_HOME=/tmp/codex-home", command)
+        self.assertNotIn("NEXUS_DB_URL", " ".join(command))
+        self.assertEqual(command[-3:], ["/opt/nexus", "members", "--json"])
+
+    def test_restart_uses_public_daemon_command_and_not_docker_restart(self) -> None:
+        runner = mock.Mock(spec=gate.DockerNexus)
+        runner.run.return_value = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout="nexus daemon restarted supervisor=self log=/tmp/daemon.log\n",
+            stderr="",
+        )
+
+        result = gate.restart_daemon(runner)
+
+        runner.run.assert_called_once_with(
+            "daemon", "restart", operator=True, timeout=120
+        )
+        self.assertEqual(result["status"], "restarted")
+        self.assertIn("nexus daemon restarted", result["output"])
+
+    def test_daemon_status_probe_is_killed_inside_the_container_before_host_timeout(self) -> None:
+        runner = gate.DockerNexus(
+            container="validator",
+            binary="/opt/nexus",
+            nexus_home="/tmp/nexus-home",
+            project="endurance",
+            controller="controller",
+            client_key="ck_controller",
+            docker_user="1000:1000",
+        )
+        completed = subprocess.CompletedProcess([], 0, stdout="daemon: running\n", stderr="")
+
+        with mock.patch.object(subprocess, "run", return_value=completed) as run:
+            result = runner.probe_daemon_status(timeout=10)
+
+        self.assertEqual(result, completed)
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[-7:],
+            [
+                "/usr/bin/timeout",
+                "--signal=KILL",
+                "--kill-after=1s",
+                "8s",
+                "/opt/nexus",
+                "daemon",
+                "status",
+            ],
+        )
+        self.assertEqual(run.call_args.kwargs["timeout"], 10)
+
+    def test_gateway_pid_must_remain_live_across_normal_daemon_restart(self) -> None:
+        before = gate.LifecycleSnapshot(
+            daemon_boot_id="boot-a", gateway_pid=100, gateway_url="http://127.0.0.1:4101"
+        )
+        after = gate.LifecycleSnapshot(
+            daemon_boot_id="boot-b", gateway_pid=100, gateway_url="http://127.0.0.1:4101"
+        )
+
+        self.assertEqual(gate.compare_lifecycle(before, after), [])
+
+    def test_unchanged_daemon_boot_id_fails_lifecycle_comparison(self) -> None:
+        before = gate.LifecycleSnapshot("boot-a", 100, "http://127.0.0.1:4101")
+        after = gate.LifecycleSnapshot("boot-a", 100, "http://127.0.0.1:4101")
+
+        self.assertIn(
+            "daemon boot ID did not change",
+            gate.compare_lifecycle(before, after),
+        )
+
+    def test_provider_value_is_digested_before_evidence(self) -> None:
+        raw = "provider-secret-value"
+
+        digest = gate.secret_digest(raw)
+
+        self.assertTrue(digest.startswith("sha256:"))
+        self.assertNotIn(raw, digest)
+        self.assertEqual(digest, gate.secret_digest(raw))
+
+    def test_atomic_json_write_replaces_sibling_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "evidence.json"
+            with mock.patch.object(os, "replace", wraps=os.replace) as replace:
+                gate.write_json_atomic(path, {"status": "pass"})
+
+            self.assertEqual(json.loads(path.read_text()), {"status": "pass"})
+            replace.assert_called_once()
+            source, destination = replace.call_args.args
+            self.assertEqual(Path(destination), path)
+            self.assertEqual(Path(source).parent, path.parent)
+            self.assertFalse(Path(source).exists())
+
+    def test_identity_sql_is_read_only(self) -> None:
+        runner = gate.DockerNexus(
+            container="validator",
+            binary="/opt/nexus",
+            nexus_home="/tmp/nexus-home",
+            project="endurance",
+            controller="controller",
+            client_key="ck_controller",
+        )
+        completed = subprocess.CompletedProcess(
+            [], 0, stdout='[{"message_id":"m1"}]\n', stderr=""
+        )
+
+        with mock.patch.object(subprocess, "run", return_value=completed) as run:
+            rows = runner.read_identity_sql("SELECT message_id FROM delivery_obligations")
+
+        self.assertEqual(rows, [{"message_id": "m1"}])
+        command = run.call_args.args[0]
+        self.assertIn("PRAGMA query_only=ON;", command[-1])
+        self.assertNotIn("INSERT", command[-1].upper())
+
+
+def marker_replies(names: list[str], marker: str) -> list[dict[str, str]]:
+    return [{"from": name, "body": marker} for name in names]
+
+
+class QuietFake:
+    def __init__(self, manifest, *, restored=None, thread_replies=None, dm_replies=None):
+        self.manifest = manifest
+        self.restored = restored or observed_from_manifest(manifest)
+        self.thread_replies = thread_replies or marker_replies(
+            manifest.names, "QUIET_TEST"
+        )
+        self.dm_replies = dm_replies or marker_replies(manifest.names, "DM_TEST")
+        self.calls: list[str] = []
+        self.posted = False
+
+    def prepare_quiet(self, names: list[str]) -> None:
+        self.calls.append("prepare_quiet")
+
+    def wait_settled(self) -> None:
+        self.calls.append("wait_settled")
+
+    def capture_before(self, manifest) -> None:
+        self.calls.append("capture_before")
+
+    def capture_lifecycle_before(self):
+        self.calls.append("capture_lifecycle_before")
+        return gate.LifecycleSnapshot("boot-a", 100, "http://127.0.0.1:4101")
+
+    def restart_daemon(self) -> None:
+        self.calls.append("restart_daemon")
+
+    def wait_ready(self) -> None:
+        self.calls.append("wait_ready")
+
+    def reconnect_controller(self) -> None:
+        self.calls.append("reconnect_controller")
+
+    def capture_lifecycle_after(self):
+        self.calls.append("capture_lifecycle_after")
+        return gate.LifecycleSnapshot("boot-b", 100, "http://127.0.0.1:4101")
+
+    def capture_pre_wake(self):
+        self.calls.append("capture_pre_wake")
+        return self.restored
+
+    def post_quiet_marker(self, marker: str) -> str:
+        self.calls.append("post_quiet_marker")
+        self.posted = True
+        return "m_quiet"
+
+    def wait_thread_replies(self, marker: str, names: list[str]):
+        self.calls.append("wait_thread_replies")
+        return self.thread_replies
+
+    def send_dm_markers(self, names: list[str], marker_prefix: str):
+        self.calls.append("send_dm_markers")
+        return {name: f"{marker_prefix}_{name}" for name in names}
+
+    def wait_dm_replies(self, markers: dict[str, str]):
+        self.calls.append("wait_dm_replies")
+        return [
+            {"from": name, "body": marker}
+            for name, marker in markers.items()
+        ] if self.dm_replies == "generated" else self.dm_replies
+
+    def require_no_dlq(self) -> None:
+        self.calls.append("require_no_dlq")
+
+    def capture_evidence(self, phase: str) -> None:
+        self.calls.append("capture_evidence")
+
+
+class QuietPhaseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        for name in ("GateFailure", "context_reply_failures", "run_quiet_phase"):
+            self.assertTrue(hasattr(gate, name), f"missing quiet-phase API: {name}")
+
+    def test_quiet_phase_runs_in_restart_then_wake_order(self) -> None:
+        manifest = fixture_manifest()
+        fake = QuietFake(manifest, dm_replies="generated")
+
+        result = gate.run_quiet_phase(
+            fake,
+            manifest,
+            marker="QUIET_TEST",
+            dm_marker_prefix="DM_TEST",
+        )
+
+        self.assertEqual(result.message_id, "m_quiet")
+        self.assertEqual(
+            fake.calls,
+            [
+                "prepare_quiet",
+                "wait_settled",
+                "capture_before",
+                "capture_lifecycle_before",
+                "restart_daemon",
+                "wait_ready",
+                "reconnect_controller",
+                "capture_lifecycle_after",
+                "capture_pre_wake",
+                "post_quiet_marker",
+                "wait_thread_replies",
+                "send_dm_markers",
+                "wait_dm_replies",
+                "require_no_dlq",
+                "wait_settled",
+                "capture_evidence",
+            ],
+        )
+
+    def test_quiet_phase_fails_before_post_when_thread_members_are_missing(self) -> None:
+        manifest = fixture_manifest()
+        restored = observed_from_manifest(manifest)
+        restored.thread_members = []
+        fake = QuietFake(manifest, restored=restored)
+
+        with self.assertRaisesRegex(gate.GateFailure, "thread members expected=12 observed=0"):
+            gate.run_quiet_phase(
+                fake,
+                manifest,
+                marker="QUIET_TEST",
+                dm_marker_prefix="DM_TEST",
+            )
+
+        self.assertFalse(fake.posted)
+
+    def test_context_reply_requires_exact_marker_once_per_participant(self) -> None:
+        replies = marker_replies(FIXTURE_NAMES, "QUIET_TEST")
+        replies[-1]["body"] = "wrong marker"
+
+        failures = gate.context_reply_failures(
+            replies, FIXTURE_NAMES, "QUIET_TEST"
+        )
+
+        self.assertEqual(failures, ["missing context reply: Hypatia"])
+
+    def test_duplicate_context_reply_fails(self) -> None:
+        replies = marker_replies(FIXTURE_NAMES, "QUIET_TEST")
+        replies.append({"from": "Ada", "body": "QUIET_TEST"})
+
+        failures = gate.context_reply_failures(
+            replies, FIXTURE_NAMES, "QUIET_TEST"
+        )
+
+        self.assertEqual(failures, ["duplicate context reply: Ada"])
+
+    def test_mapped_context_reply_ignores_peer_marker_echoes(self) -> None:
+        markers = {"Ada": "MARKER_ADA", "Simone": "MARKER_SIMONE"}
+        replies = [
+            {"from": "Ada", "body": "MARKER_ADA"},
+            {"from": "Simone", "body": "MARKER_ADA"},
+        ]
+
+        failures = gate.context_reply_map_failures(replies, markers)
+
+        self.assertEqual(failures, ["missing context reply: Simone"])
+
+    def test_participant_markers_are_short_unique_and_run_scoped(self) -> None:
+        markers = gate.participant_marker_map(
+            FIXTURE_NAMES, "ACTIVE_REVIVE_108_78c9320dcaf0_1"
+        )
+        next_run = gate.participant_marker_map(
+            FIXTURE_NAMES, "ACTIVE_REVIVE_109_78c9320dcaf0_1"
+        )
+
+        self.assertEqual(len(set(markers.values())), len(FIXTURE_NAMES))
+        self.assertTrue(all(len(marker) <= 16 for marker in markers.values()))
+        self.assertTrue(all(marker.startswith("NX-") for marker in markers.values()))
+        self.assertNotEqual(markers, next_run)
+
+
+def obligation(message_id: str, agent_id: str, state: str) -> dict[str, str]:
+    return {
+        "message_id": message_id,
+        "recipient_agent_id": agent_id,
+        "state": state,
+    }
+
+
+class ActiveFake:
+    def __init__(self, manifest, obligation_sequences):
+        self.manifest = manifest
+        self.obligation_sequences = iter(obligation_sequences)
+        self.calls: list[str] = []
+        self.posted_markers: list[dict[str, str]] = []
+        self.active_message_id = ""
+
+    def wait_settled(self) -> None:
+        self.calls.append("wait_settled")
+
+    def post_active_markers(self, markers: dict[str, str]) -> str:
+        self.calls.append("post_active_markers")
+        self.posted_markers.append(markers)
+        self.active_message_id = f"m{len(self.posted_markers)}"
+        return self.active_message_id
+
+    def observe_unsettled(self, message_id: str):
+        self.calls.append("observe_unsettled")
+        return next(self.obligation_sequences)
+
+    def capture_lifecycle_before(self):
+        self.calls.append("capture_lifecycle_before")
+        return gate.LifecycleSnapshot("boot-a", 100, "http://127.0.0.1:4101")
+
+    def restart_daemon(self) -> None:
+        self.calls.append("restart_daemon")
+
+    def wait_ready(self) -> None:
+        self.calls.append("wait_ready")
+
+    def reconnect_controller(self) -> None:
+        self.calls.append("reconnect_controller")
+
+    def capture_lifecycle_after(self):
+        self.calls.append("capture_lifecycle_after")
+        return gate.LifecycleSnapshot("boot-b", 100, "http://127.0.0.1:4101")
+
+    def capture_pre_wake(self):
+        self.calls.append("capture_pre_wake")
+        return observed_from_manifest(self.manifest)
+
+    def wait_obligations_delivered(self, message_id: str, expected_agent_ids: set[str]):
+        self.calls.append("wait_obligations_delivered")
+        return [
+            obligation(message_id, agent_id, "delivered")
+            for agent_id in sorted(expected_agent_ids)
+        ]
+
+    def settle_active_restart_delivery(
+        self,
+        message_id: str,
+        markers: dict[str, str],
+        expected_agent_ids: set[str],
+    ):
+        self.calls.append("settle_active_restart_delivery")
+        return [
+            obligation(message_id, agent_id, "delivered")
+            for agent_id in sorted(expected_agent_ids)
+        ]
+
+    def wait_thread_marker_replies(self, markers: dict[str, str]):
+        self.calls.append("wait_thread_marker_replies")
+        return [
+            {"from": name, "body": marker}
+            for name, marker in markers.items()
+        ]
+
+    def prove_post_recovery_routes(self, manifest, marker_prefix: str):
+        self.calls.append("prove_post_recovery_routes")
+        names = set(manifest.names)
+        return gate.RouteProof(thread_authors=names, dm_authors=names)
+
+    def require_no_dlq(self) -> None:
+        self.calls.append("require_no_dlq")
+
+    def capture_evidence(self, phase: str) -> None:
+        self.calls.append("capture_evidence")
+
+
+class ActivePhaseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        for name in (
+            "RecipientLedger",
+            "RouteProof",
+            "route_proof_failures",
+            "run_active_phase",
+        ):
+            self.assertTrue(hasattr(gate, name), f"missing active-phase API: {name}")
+
+    def test_active_phase_restarts_only_after_durable_unsettled_obligation(self) -> None:
+        manifest = fixture_manifest()
+        first_agent = manifest.participants[0].agent_id
+        fake = ActiveFake(
+            manifest,
+            obligation_sequences=[[obligation("m1", first_agent, "accepted")]],
+        )
+
+        gate.run_active_phase(
+            fake,
+            manifest,
+            marker_prefix="ACTIVE_TEST",
+            max_attempts=3,
+        )
+
+        self.assertLess(
+            fake.calls.index("observe_unsettled"),
+            fake.calls.index("restart_daemon"),
+        )
+
+    def test_active_phase_does_not_require_a_global_quiet_boundary(self) -> None:
+        manifest = fixture_manifest()
+        first_agent = manifest.participants[0].agent_id
+        fake = ActiveFake(
+            manifest,
+            obligation_sequences=[[obligation("m1", first_agent, "accepted")]],
+        )
+
+        gate.run_active_phase(
+            fake,
+            manifest,
+            marker_prefix="ACTIVE_TEST",
+            max_attempts=3,
+        )
+
+        self.assertNotIn("wait_settled", fake.calls)
+
+    def test_active_phase_reconnects_human_controller_before_post_restart_reads(self) -> None:
+        manifest = fixture_manifest()
+        first_agent = manifest.participants[0].agent_id
+        fake = ActiveFake(
+            manifest,
+            obligation_sequences=[[obligation("m1", first_agent, "accepted")]],
+        )
+
+        gate.run_active_phase(
+            fake,
+            manifest,
+            marker_prefix="ACTIVE_TEST",
+            max_attempts=3,
+        )
+
+        self.assertLess(fake.calls.index("wait_ready"), fake.calls.index("reconnect_controller"))
+        self.assertLess(
+            fake.calls.index("reconnect_controller"), fake.calls.index("capture_pre_wake")
+        )
+
+    def test_active_phase_explicitly_settles_restart_ambiguity_before_waiting_for_replies(self) -> None:
+        manifest = fixture_manifest()
+        first_agent = manifest.participants[0].agent_id
+        fake = ActiveFake(
+            manifest,
+            obligation_sequences=[[obligation("m1", first_agent, "accepted")]],
+        )
+
+        gate.run_active_phase(
+            fake,
+            manifest,
+            marker_prefix="ACTIVE_TEST",
+            max_attempts=3,
+        )
+
+        self.assertLess(
+            fake.calls.index("restart_daemon"),
+            fake.calls.index("settle_active_restart_delivery"),
+        )
+        self.assertLess(
+            fake.calls.index("settle_active_restart_delivery"),
+            fake.calls.index("wait_thread_marker_replies"),
+        )
+        self.assertNotIn("wait_obligations_delivered", fake.calls)
+
+    def test_active_phase_retries_marker_when_delivery_settles_too_fast(self) -> None:
+        manifest = fixture_manifest()
+        first_agent = manifest.participants[0].agent_id
+        fake = ActiveFake(
+            manifest,
+            obligation_sequences=[
+                [],
+                [],
+                [obligation("m3", first_agent, "injecting")],
+            ],
+        )
+
+        gate.run_active_phase(
+            fake,
+            manifest,
+            marker_prefix="ACTIVE_TEST",
+            max_attempts=3,
+        )
+
+        self.assertEqual(len(fake.posted_markers), 3)
+
+    def test_active_phase_fails_without_a_durable_inflight_boundary(self) -> None:
+        fake = ActiveFake(fixture_manifest(), obligation_sequences=[[], [], []])
+
+        with self.assertRaisesRegex(gate.GateFailure, "no durable in-flight boundary"):
+            gate.run_active_phase(
+                fake,
+                fixture_manifest(),
+                marker_prefix="ACTIVE_TEST",
+                max_attempts=3,
+            )
+
+        self.assertNotIn("restart_daemon", fake.calls)
+
+    def test_recipient_ledger_requires_every_recipient_delivered(self) -> None:
+        ledger = gate.RecipientLedger(expected={"a1", "a2"})
+        ledger.observe_snapshot(
+            [
+                obligation("m1", "a1", "delivered"),
+                obligation("m1", "a2", "accepted"),
+            ]
+        )
+
+        self.assertEqual(
+            ledger.failures("m1"),
+            ["recipient obligation not delivered: a2 state=accepted"],
+        )
+
+    def test_recipient_ledger_rejects_duplicate_rows_for_one_recipient(self) -> None:
+        ledger = gate.RecipientLedger(expected={"a1"})
+        ledger.observe_snapshot(
+            [
+                obligation("m1", "a1", "delivered"),
+                obligation("m1", "a1", "delivered"),
+            ]
+        )
+
+        self.assertEqual(
+            ledger.failures("m1"), ["duplicate recipient obligation row: a1"]
+        )
+
+    def test_route_proof_requires_thread_and_dm_from_all_twelve(self) -> None:
+        names = FIXTURE_NAMES.copy()
+        proof = gate.RouteProof(
+            thread_authors=set(names[:-1]),
+            dm_authors=set(names),
+        )
+
+        self.assertEqual(
+            gate.route_proof_failures(proof, names),
+            ["missing post-recovery thread route: Hypatia"],
+        )
+
+    def test_dm_marker_pins_the_controller_instead_of_context_sensitive_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            operations = gate.LiveOperations(
+                nexus=mock.Mock(
+                    controller="controller",
+                    binary="/tmp/nexus-target/debug/nexus",
+                ),
+                candidate="test",
+                thread="endurance-test",
+                expected=[],
+                gateway_health_url="http://gateway/health",
+                gateway_base_url="http://gateway",
+                webui_url="http://webui",
+                output=Path(directory),
+            )
+            with mock.patch.object(
+                operations,
+                "_json_command",
+                return_value={},
+            ) as command:
+                markers = operations.send_dm_markers(["Hypatia"], "DM_TEST")
+
+        prompt = command.call_args.args[3]
+        marker = markers["Hypatia"]
+        self.assertIn("direct message to controller", prompt)
+        self.assertIn("do not use context-sensitive reply", prompt)
+        self.assertIn("do not post", prompt)
+        self.assertIn(
+            f"/tmp/nexus-target/debug/nexus dm controller -m '{marker}' --json",
+            prompt,
+        )
+
+    def test_post_recovery_route_uses_dm_pause_barrier_before_thread_probe(self) -> None:
+        manifest = fixture_manifest()
+        with tempfile.TemporaryDirectory() as directory:
+            operations = gate.LiveOperations(
+                nexus=mock.Mock(controller="controller"),
+                candidate="test",
+                thread="endurance-test",
+                expected=[],
+                gateway_health_url="http://gateway/health",
+                gateway_base_url="http://gateway",
+                webui_url="http://webui",
+                output=Path(directory),
+            )
+            calls: list[str] = []
+            dm_markers = {name: f"DM_{name}" for name in manifest.names}
+            thread_markers = {name: f"THREAD_{name}" for name in manifest.names}
+
+            def send_dm(names, marker_prefix, *, after_reply_instruction=None):
+                calls.append("send_dm")
+                self.assertEqual(names, manifest.names)
+                self.assertIn("pause peer debate", after_reply_instruction)
+                return dm_markers
+
+            def wait_dm(markers):
+                calls.append("wait_dm")
+                return [
+                    {"from": name, "body": marker}
+                    for name, marker in markers.items()
+                ]
+
+            def post_thread(_body):
+                calls.append("post_thread")
+                return "m_thread"
+
+            def wait_thread(markers):
+                calls.append("wait_thread")
+                self.assertEqual(markers, thread_markers)
+                return [
+                    {"from": name, "body": marker}
+                    for name, marker in markers.items()
+                ]
+
+            with mock.patch.object(
+                gate,
+                "participant_marker_map",
+                return_value=thread_markers,
+            ), mock.patch.object(
+                operations,
+                "send_dm_markers",
+                side_effect=send_dm,
+            ), mock.patch.object(
+                operations,
+                "wait_dm_replies",
+                side_effect=wait_dm,
+            ), mock.patch.object(
+                operations,
+                "_post_thread",
+                side_effect=post_thread,
+            ), mock.patch.object(
+                operations,
+                "wait_thread_marker_replies",
+                side_effect=wait_thread,
+            ):
+                proof = operations.prove_post_recovery_routes(
+                    manifest, "POST_RECOVERY"
+                )
+
+        self.assertEqual(calls, ["send_dm", "wait_dm", "post_thread", "wait_thread"])
+        self.assertEqual(proof.dm_authors, set(manifest.names))
+        self.assertEqual(proof.thread_authors, set(manifest.names))
+
+    def test_restart_settlement_explicitly_requeues_only_outcome_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            operations = gate.LiveOperations(
+                nexus=mock.Mock(controller="controller"),
+                candidate="test",
+                thread="endurance-test",
+                expected=[],
+                gateway_health_url="http://gateway/health",
+                gateway_base_url="http://gateway",
+                webui_url="http://webui",
+                output=Path(directory),
+            )
+            dlq = {
+                "rows": [
+                    {
+                        "inFlightId": "f_restart",
+                        "messageId": "m_restart",
+                        "recipientAgentId": "a_1",
+                        "errorReason": "delivery outcome unknown after restart",
+                    }
+                ],
+                "total": 1,
+            }
+            with mock.patch.object(
+                operations,
+                "_json_command",
+                side_effect=[dlq, {"count": 1, "inFlightIds": ["f_restart"]}],
+            ) as command, mock.patch.object(
+                operations, "_obligation_rows", return_value=[]
+            ):
+                delivered = operations.settle_active_restart_delivery(
+                    "m_restart", {"Ada": "ACTIVE_TEST_1"}, {"a_1"}
+                )
+
+        self.assertEqual(delivered, [obligation("m_restart", "a_1", "delivered")])
+        self.assertEqual(command.call_args_list[1].args[0:4], ("admin", "dlq", "requeue", "f_restart"))
+
+    def test_restart_settlement_requeues_a_causal_participant_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            operations = gate.LiveOperations(
+                nexus=mock.Mock(controller="controller"),
+                candidate="test",
+                thread="endurance-test",
+                expected=[gate.ExpectedParticipant("Ada", "claude", "pty")],
+                gateway_health_url="http://gateway/health",
+                gateway_base_url="http://gateway",
+                webui_url="http://webui",
+                output=Path(directory),
+            )
+            dlq = {
+                "rows": [
+                    {
+                        "inFlightId": "f_reply",
+                        "messageId": "m_reply",
+                        "sender": "Ada",
+                        "recipientAgentId": "a_1",
+                        "errorReason": "delivery outcome unknown after restart",
+                        "bodyPreview": "ACTIVE_TEST_1",
+                    }
+                ],
+                "total": 1,
+            }
+            history = [
+                {
+                    "messageId": "m_restart",
+                    "from": "controller",
+                    "body": "ACTIVE_TEST_1: active restart proof",
+                },
+                {
+                    "messageId": "m_reply",
+                    "from": "Ada",
+                    "body": "ACTIVE_TEST_1",
+                },
+            ]
+            with mock.patch.object(
+                operations,
+                "_json_command",
+                side_effect=[dlq, {"count": 1, "inFlightIds": ["f_reply"]}],
+            ) as command, mock.patch.object(
+                operations,
+                "_thread_history",
+                return_value=history,
+            ), mock.patch.object(
+                operations,
+                "_obligation_rows",
+                side_effect=lambda message_id=None: [],
+            ):
+                delivered = operations.settle_active_restart_delivery(
+                    "m_restart", {"Ada": "ACTIVE_TEST_1"}, {"a_1"}
+                )
+
+        self.assertEqual(delivered, [obligation("m_restart", "a_1", "delivered")])
+        self.assertEqual(
+            command.call_args_list[1].args[0:4],
+            ("admin", "dlq", "requeue", "f_reply"),
+        )
+
+    def test_restart_settlement_rejects_adapter_cancellation_as_contract_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            operations = gate.LiveOperations(
+                nexus=mock.Mock(controller="controller"),
+                candidate="test",
+                thread="endurance-test",
+                expected=[],
+                gateway_health_url="http://gateway/health",
+                gateway_base_url="http://gateway",
+                webui_url="http://webui",
+                output=Path(directory),
+            )
+            with mock.patch.object(
+                operations,
+                "_json_command",
+                return_value={
+                    "rows": [
+                        {
+                            "inFlightId": "f_restart",
+                            "messageId": "m_restart",
+                            "recipientAgentId": "a_1",
+                            "errorReason": "adapter request channel closed",
+                        }
+                    ],
+                    "total": 1,
+                },
+            ):
+                with self.assertRaisesRegex(
+                    gate.GateFailure, "non-ambiguous delivery failure"
+                ):
+                    operations.settle_active_restart_delivery(
+                        "m_restart", {"Ada": "ACTIVE_TEST_1"}, {"a_1"}
+                    )
+
+
+class ThreadHistoryWindowTests(unittest.TestCase):
+    def operations(self, directory: str):
+        return gate.LiveOperations(
+            nexus=mock.Mock(controller="controller"),
+            candidate="test",
+            thread="endurance-test",
+            expected=[],
+            gateway_health_url="http://gateway/health",
+            gateway_base_url="http://gateway",
+            webui_url="http://webui",
+            output=Path(directory),
+            reply_timeout=10.0,
+        )
+
+    def test_mapped_replies_survive_rolling_latest_history_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            operations = self.operations(directory)
+            pages = [
+                [{"messageId": "m_ada", "from": "Ada", "body": "MARKER_ADA"}],
+                [
+                    {
+                        "messageId": "m_simone",
+                        "from": "Simone",
+                        "body": "MARKER_SIMONE",
+                    }
+                ],
+                [
+                    {
+                        "messageId": "m_simone",
+                        "from": "Simone",
+                        "body": "MARKER_SIMONE",
+                    }
+                ],
+            ]
+            with mock.patch.object(
+                operations, "_thread_history", side_effect=pages
+            ), mock.patch.object(
+                operations, "require_no_dlq"
+            ), mock.patch.object(gate.time, "sleep"):
+                replies = operations.wait_thread_marker_replies(
+                    {"Ada": "MARKER_ADA", "Simone": "MARKER_SIMONE"}
+                )
+
+        self.assertEqual(
+            [row["messageId"] for row in replies], ["m_ada", "m_simone"]
+        )
+
+    def test_shared_marker_replies_survive_rolling_latest_history_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            operations = self.operations(directory)
+            pages = [
+                [{"messageId": "m_ada", "from": "Ada", "body": "MARKER"}],
+                [{"messageId": "m_simone", "from": "Simone", "body": "MARKER"}],
+                [{"messageId": "m_simone", "from": "Simone", "body": "MARKER"}],
+            ]
+            with mock.patch.object(
+                operations, "_thread_history", side_effect=pages
+            ), mock.patch.object(
+                operations, "require_no_dlq"
+            ), mock.patch.object(gate.time, "sleep"):
+                replies = operations.wait_thread_replies(
+                    "MARKER", ["Ada", "Simone"]
+                )
+
+        self.assertEqual(
+            [row["messageId"] for row in replies], ["m_ada", "m_simone"]
+        )
+
+
+class CliAndManifestTests(unittest.TestCase):
+    def setUp(self) -> None:
+        for name in (
+            "ExpectedParticipant",
+            "parse_participant",
+            "parse_args",
+            "build_manifest_from_payloads",
+            "LiveOperations",
+        ):
+            self.assertTrue(hasattr(gate, name), f"missing CLI API: {name}")
+
+    def test_participant_argument_carries_name_harness_and_variant(self) -> None:
+        parsed = gate.parse_participant("Ada-72:claude:headless")
+
+        self.assertEqual(
+            parsed,
+            gate.ExpectedParticipant(
+                name="Ada-72", harness="claude", variant="headless"
+            ),
+        )
+
+    def test_participant_argument_rejects_unknown_variant(self) -> None:
+        with self.assertRaisesRegex(ValueError, "variant must be headless, pty, or tmux"):
+            gate.parse_participant("Ada-72:claude:screen")
+
+    def test_full_fixture_requires_each_harness_variant_once(self) -> None:
+        expected = [
+            gate.ExpectedParticipant(
+                name=f"p-{index}", harness=harness, variant=variant
+            )
+            for index, (harness, variant) in enumerate(
+                (harness, variant)
+                for harness in sorted(gate.ALLOWED_HARNESSES)
+                for variant in sorted(gate.ALLOWED_VARIANTS)
+            )
+        ]
+        expected[-1] = dataclasses.replace(
+            expected[-1],
+            harness=expected[0].harness,
+            variant=expected[0].variant,
+        )
+
+        with self.assertRaisesRegex(gate.GateFailure, "exactly one of each"):
+            gate.validate_expected_matrix(expected)
+
+    def test_cli_requires_the_runtime_and_evidence_boundaries(self) -> None:
+        args = gate.parse_args(
+            [
+                "--container",
+                "validator",
+                "--thread",
+                "endurance-v010-final72",
+                "--candidate",
+                "72",
+                "--controller",
+                "endurance-controller72",
+                "--client-key",
+                "ck72",
+                "--project",
+                "endurance",
+                "--nexus-bin",
+                "/opt/nexus",
+                "--nexus-home",
+                "/tmp/nexus-home",
+                "--codex-home",
+                "/tmp/endurance-codex-home",
+                "--gateway-health-url",
+                "http://127.0.0.1:4551/api/v1/health",
+                "--gateway-base-url",
+                "http://127.0.0.1:4551",
+                "--webui-url",
+                "http://127.0.0.1:4552/c/endurance-v010-final72",
+                "--output",
+                "/tmp/evidence",
+                "--participant",
+                "Ada-72:claude:headless",
+            ]
+        )
+
+        self.assertEqual(args.candidate, "72")
+        self.assertEqual(args.codex_home, "/tmp/endurance-codex-home")
+        self.assertEqual(args.participant[0].variant, "headless")
+        self.assertEqual(args.output, Path("/tmp/evidence"))
+
+    def test_manifest_combines_public_runtime_and_private_resume_capsule(self) -> None:
+        specs = [gate.ExpectedParticipant("Ada-72", "claude", "headless")]
+        member_payload = {
+            "members": [
+                {
+                    "name": "Ada-72",
+                    "agentId": "a_ada",
+                    "sessionId": "s_ada",
+                }
+            ]
+        }
+        runtime_payloads = {
+            "Ada-72": {
+                "agentId": "a_ada",
+                "runtimes": [
+                    {
+                        "runtimeId": "s_ada",
+                        "agentId": "a_ada",
+                        "harness": "claude",
+                        "cwd": "/tmp/Ada-72",
+                        "transport": "acp",
+                        "active": True,
+                    }
+                ],
+            }
+        }
+        identity_rows = [
+            {
+                "runtime_id": "s_ada",
+                "agent_id": "a_ada",
+                "harness": "claude",
+                "mode": "headless",
+                "backend": "acp",
+                "cwd": "/tmp/Ada-72",
+                "native_resume_key": "claude-provider-id",
+            }
+        ]
+
+        manifest = gate.build_manifest_from_payloads(
+            candidate="72",
+            thread="endurance-v010-final72",
+            expected=specs,
+            member_payload=member_payload,
+            runtime_payloads=runtime_payloads,
+            identity_rows=identity_rows,
+            require_twelve=False,
+        )
+
+        participant = manifest.participants[0]
+        self.assertEqual(participant.agent_id, "a_ada")
+        self.assertEqual(participant.variant, "headless")
+        self.assertEqual(
+            participant.native_resume_digest,
+            gate.secret_digest("claude-provider-id"),
+        )
+        self.assertEqual(
+            participant.provider_digest,
+            gate.secret_digest("claude-provider-id"),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

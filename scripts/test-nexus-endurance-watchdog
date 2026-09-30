@@ -1,0 +1,815 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import inspect
+import json
+import os
+import random
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+import urllib.error
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+
+PATH = Path(__file__).resolve().parent / "nexus-endurance-watchdog"
+ENDURANCE_GATE_PATH = Path(__file__).resolve().parent / "nexus-v010-endurance-gate"
+LOADER = importlib.machinery.SourceFileLoader("nexus_endurance_watchdog", str(PATH))
+SPEC = importlib.util.spec_from_loader("nexus_endurance_watchdog", LOADER)
+watchdog = importlib.util.module_from_spec(SPEC)
+sys.modules["nexus_endurance_watchdog"] = watchdog
+LOADER.exec_module(watchdog)
+
+
+class WatchStateTests(unittest.TestCase):
+    def test_docker_client_runs_as_configured_container_user(self) -> None:
+        client = watchdog.DockerNexus(
+            container="gate",
+            binary="/opt/nexus",
+            name="controller",
+            client_key="ck_controller",
+            project="endurance",
+            nexus_home="/tmp/endurance-home",
+            docker_user="1000:1000",
+        )
+
+        self.assertEqual(
+            client.docker_exec_prefix(),
+            ["docker", "exec", "--user", "1000:1000"],
+        )
+
+    def test_docker_client_propagates_only_daemon_ipc_discovery(self) -> None:
+        client = watchdog.DockerNexus(
+            container="gate",
+            binary="/opt/nexus",
+            name="controller",
+            client_key="ck_controller",
+            project="endurance",
+            nexus_home="/tmp/endurance-home",
+        )
+
+        joined = " ".join(client.identity_env)
+        self.assertIn("NEXUS_HOME=/tmp/endurance-home", joined)
+        self.assertIn("NEXUS_KIND=human", joined)
+        self.assertIn("TOKIO_WORKER_THREADS=2", joined)
+        self.assertNotIn("NEXUS_DB_URL", joined)
+        self.assertNotIn("NEXUS_STREAM_DB_PATH", joined)
+        operator = " ".join(client.operator_env)
+        self.assertIn("NEXUS_PROJECT=endurance", operator)
+        self.assertIn("TOKIO_WORKER_THREADS=2", operator)
+        self.assertNotIn("NEXUS_NAME", operator)
+        self.assertNotIn("NEXUS_CLIENT_KEY", operator)
+
+    def test_only_target_thread_messages_count_as_activity(self) -> None:
+        state = watchdog.WatchState(thread="endurance", started_at=10.0)
+        batch = {
+            "dms": [{"id": "m_dm", "body": "not thread activity"}],
+            "threads": [
+                {"id": "m_other", "thread": "other", "body": "ignore"},
+                {
+                    "id": "m_target",
+                    "from": "endurance-agent",
+                    "thread": "endurance",
+                    "body": "count",
+                },
+            ],
+        }
+
+        observed = state.observe(batch, now=25.0)
+
+        self.assertEqual([row["id"] for row in observed], ["m_target"])
+        self.assertEqual(state.last_activity_at, 25.0)
+        self.assertEqual(state.message_count, 1)
+        self.assertEqual(state.authors, {"endurance-agent"})
+        self.assertEqual(state.participant_message_count({"endurance-agent"}), 1)
+        self.assertEqual(state.participant_message_count({"controller"}), 0)
+
+    def test_silence_and_snapshot_deadlines_are_independent(self) -> None:
+        state = watchdog.WatchState(thread="endurance", started_at=100.0)
+        self.assertFalse(state.quiet_due(now=219.9, silence_seconds=120.0))
+        self.assertTrue(state.quiet_due(now=220.0, silence_seconds=120.0))
+        self.assertFalse(state.snapshot_due(now=699.9, snapshot_seconds=600.0))
+        self.assertTrue(state.snapshot_due(now=700.0, snapshot_seconds=600.0))
+
+        state.mark_snapshot(now=700.0)
+        self.assertFalse(state.snapshot_due(now=1299.9, snapshot_seconds=600.0))
+        self.assertTrue(state.snapshot_due(now=1300.0, snapshot_seconds=600.0))
+
+    def test_operator_posts_do_not_mask_participant_silence(self) -> None:
+        state = watchdog.WatchState(thread="endurance", started_at=100.0)
+        state.observe(
+            {
+                "threads": [
+                    {"thread": "endurance", "from": "Ada-74", "body": "first"}
+                ]
+            },
+            now=200.0,
+        )
+        state.observe(
+            {
+                "threads": [
+                    {"thread": "endurance", "from": "controller", "body": "heat"}
+                ]
+            },
+            now=500.0,
+        )
+
+        self.assertEqual(state.last_activity_at, 500.0)
+        self.assertEqual(state.participant_last_activity_at({"Ada-74"}), 200.0)
+
+    def test_operator_deadline_enforces_minimum_after_previous_injection(self) -> None:
+        self.assertEqual(
+            watchdog.next_operator_deadline(
+                scheduled_at=900.0,
+                participant_last_activity_at=100.0,
+                last_operator_at=350.0,
+                minimum=240,
+            ),
+            590.0,
+        )
+        self.assertEqual(
+            watchdog.next_operator_deadline(
+                scheduled_at=900.0,
+                participant_last_activity_at=100.0,
+                last_operator_at=None,
+                minimum=240,
+            ),
+            340.0,
+        )
+
+    def test_operator_intervention_is_deterministic_profane_and_assignment_aware(self) -> None:
+        assignments = {
+            "Ada-73": "Nietzsche",
+            "Marcus-73": "Freud",
+            "Maya-73": "Jung",
+            "Hypatia-73": "Piaget",
+        }
+
+        first = watchdog.operator_intervention(random.Random("candidate-73"), 4, assignments)
+        second = watchdog.operator_intervention(random.Random("candidate-73"), 4, assignments)
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(first["targets"]), 2)
+        self.assertTrue(set(first["targets"]).issubset(assignments))
+        for target in first["targets"]:
+            self.assertIn(target, first["body"])
+            self.assertIn(assignments[target], first["body"])
+        self.assertRegex(first["body"], r"fuck|shit|brainlet|clanker|fraud")
+        self.assertIn("one terse rebuttal", first["body"])
+
+    def test_operator_delay_accelerates_when_traffic_declines(self) -> None:
+        calm = watchdog.adaptive_operator_delay(
+            random.Random(3),
+            minimum=240,
+            maximum=600,
+            messages_since_last=30,
+            previous_messages=24,
+            participant_count=12,
+        )
+        declining = watchdog.adaptive_operator_delay(
+            random.Random(3),
+            minimum=240,
+            maximum=600,
+            messages_since_last=8,
+            previous_messages=30,
+            participant_count=12,
+        )
+
+        self.assertGreaterEqual(calm[0], 240)
+        self.assertLessEqual(calm[0], 600)
+        self.assertEqual(calm[1], "scheduled")
+        self.assertEqual(declining, (240, "traffic_decline"))
+
+    def test_thinker_assignments_require_one_assignment_per_participant(self) -> None:
+        self.assertEqual(
+            watchdog.parse_thinker_assignments(
+                ["Ada-73=Nietzsche", "Marcus-73=Freud"]
+            ),
+            {"Ada-73": "Nietzsche", "Marcus-73": "Freud"},
+        )
+        with self.assertRaisesRegex(ValueError, "invalid thinker assignment"):
+            watchdog.parse_thinker_assignments(["broken"])
+
+    def test_participant_agent_ids_parse_explicit_stable_identity_map(self) -> None:
+        self.assertEqual(
+            watchdog.parse_participant_agent_ids(
+                ["Noor-opencode-tmux-110=a_noor", "Ada-claude-headless-110=a_ada"]
+            ),
+            {
+                "Noor-opencode-tmux-110": "a_noor",
+                "Ada-claude-headless-110": "a_ada",
+            },
+        )
+
+    def test_participant_agent_ids_must_exactly_match_participants(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            r"participant agent IDs must exactly match participants; missing=\['Noor'\], unknown=\['Other'\]",
+        ):
+            watchdog.validate_participant_agent_ids(
+                {"Ada", "Noor"},
+                {"Ada": "a_ada", "Other": "a_other"},
+            )
+
+    def test_participant_agent_ids_must_be_unique(self) -> None:
+        with self.assertRaisesRegex(ValueError, "participant agent IDs must be unique"):
+            watchdog.validate_participant_agent_ids(
+                {"Ada", "Noor"},
+                {"Ada": "a_shared", "Noor": "a_shared"},
+            )
+
+    def test_cli_accepts_repeatable_participant_agent_ids(self) -> None:
+        argv = [
+            "nexus-endurance-watchdog",
+            "--container",
+            "gate",
+            "--thread",
+            "endurance",
+            "--controller",
+            "controller",
+            "--client-key",
+            "ck_controller",
+            "--nexus-home",
+            "/tmp/nexus-home",
+            "--participant-agent-id",
+            "Noor=a_noor",
+            "--participant-agent-id",
+            "Ada=a_ada",
+        ]
+
+        with mock.patch.object(sys, "argv", argv):
+            args = watchdog.parse_args()
+
+        self.assertEqual(args.participant_agent_id, ["Noor=a_noor", "Ada=a_ada"])
+
+    def test_operator_post_is_recorded_as_jsonl_evidence(self) -> None:
+        nexus = mock.Mock(spec=watchdog.DockerNexus)
+        nexus.run.return_value = SimpleNamespace(
+            stdout='{"messageId":"m_operator"}\n'
+        )
+        intervention = {
+            "sequence": 1,
+            "targets": ["Ada-73", "Marcus-73"],
+            "body": "Ada-73 and Marcus-73: fight.",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "operator-interventions.jsonl"
+            record = watchdog.post_operator_intervention(
+                nexus,
+                "endurance",
+                intervention,
+                path,
+                reason="traffic_decline",
+                messages_since_last=4,
+                next_delay_seconds=240,
+            )
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(record, persisted)
+        self.assertEqual(record["messageId"], "m_operator")
+        self.assertEqual(record["reason"], "traffic_decline")
+        nexus.run.assert_called_once_with(
+            "post",
+            "endurance",
+            "-m",
+            intervention["body"],
+            "--json",
+            timeout=30,
+        )
+
+    def test_lifecycle_notifications_cover_start_intervention_and_completion(self) -> None:
+        self.assertEqual(
+            watchdog.lifecycle_notification("started", "endurance"),
+            "ENDURANCE_STARTED: monitoring thread endurance",
+        )
+        self.assertEqual(
+            watchdog.lifecycle_notification("quiet", "endurance", "marker-1"),
+            "ENDURANCE_QUIET_REVIEW_REQUIRED: thread endurance is silent at marker-1; inspect delivery, runtime, and harness evidence before any continuation",
+        )
+        self.assertEqual(
+            watchdog.lifecycle_notification("checkpoint", "endurance", "5/15 at 50m"),
+            "ENDURANCE_CHECKPOINT: thread endurance 5/15 at 50m",
+        )
+        self.assertEqual(
+            watchdog.lifecycle_notification("passed", "endurance"),
+            "ENDURANCE_PASSED: thread endurance completed its timed gate",
+        )
+
+    def test_watchdog_notification_uses_explicit_target_without_source_registration(self) -> None:
+        nexus = mock.Mock(spec=watchdog.DockerNexus)
+
+        watchdog.notify(nexus, "endurance-controller", "CHECKPOINT_READY")
+
+        args = nexus.run.call_args.args
+        self.assertEqual(args[:6], (
+            "notify",
+            "--target",
+            "endurance-controller",
+            "--source",
+            "nexus-endurance-watchdog",
+            "--idempotency-key",
+        ))
+        self.assertTrue(args[6].startswith("watchdog:"))
+        self.assertEqual(args[7], "CHECKPOINT_READY")
+        self.assertNotIn("source", args[:1])
+        self.assertEqual(nexus.run.call_args.kwargs, {"timeout": 30})
+
+    def test_lifecycle_notification_is_mirrored_once(self) -> None:
+        nexus = mock.Mock(spec=watchdog.DockerNexus)
+        mirror = Path("/tmp/nexus-notify-mirror")
+
+        with mock.patch.object(watchdog, "notify") as canonical, mock.patch.object(
+            watchdog, "mirror_notification"
+        ) as external:
+            watchdog.emit_notification(nexus, "controller", "CHECKPOINT", mirror)
+
+        canonical.assert_called_once_with(nexus, "controller", "CHECKPOINT")
+        external.assert_called_once_with(mirror, "CHECKPOINT")
+
+    def test_three_hour_release_checkpoint_schedule_is_progressive(self) -> None:
+        self.assertEqual(
+            watchdog.progressive_checkpoint_deadlines(3 * 60 * 60),
+            [
+                300,
+                900,
+                1500,
+                2100,
+                3000,
+                4200,
+                5400,
+                6600,
+                7800,
+                9000,
+                10800,
+            ],
+        )
+
+    def test_release_gate_defaults_to_three_hours(self) -> None:
+        self.assertIn(
+            "DURATION_SECONDS=${2:-10800}",
+            ENDURANCE_GATE_PATH.read_text(encoding="utf-8"),
+        )
+
+    def test_headed_capture_modes_do_not_depend_on_display_names(self) -> None:
+        self.assertEqual(
+            watchdog.headed_capture_modes(
+                ["Iris-candidate"],
+                ["Soren-candidate", "Hypatia-candidate"],
+            ),
+            {
+                "Iris-candidate": "pty",
+                "Soren-candidate": "tmux",
+                "Hypatia-candidate": "tmux",
+            },
+        )
+
+    def test_participant_sessions_follow_stable_agent_id_across_rename(self) -> None:
+        self.assertEqual(
+            watchdog.participant_sessions(
+                {
+                    "members": [
+                        {
+                            "name": "Noor-opencode-tmux-110-CLOSED",
+                            "agentId": "a_noor",
+                            "sessionId": "s_noor",
+                        }
+                    ]
+                },
+                ["Noor-opencode-tmux-110"],
+                {"Noor-opencode-tmux-110": "a_noor"},
+            ),
+            {"Noor-opencode-tmux-110": "s_noor"},
+        )
+
+    def test_raw_pty_capture_detaches_without_forwarding_eof(self) -> None:
+        command = watchdog.raw_pty_capture_shell("/opt/nexus", "s_123", 3)
+
+        self.assertIn("sleep 3", command)
+        self.assertIn("printf '\\035'", command)
+        self.assertIn("pty-attach s_123", command)
+        self.assertNotIn("/dev/null <", command)
+
+    def test_webui_capture_does_not_wait_for_virtual_time_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            browser = root / "browser"
+            arguments = root / "arguments.txt"
+            browser.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                f"printf '%s\\n' \"$@\" > {arguments}\n"
+                "for argument in \"$@\"; do\n"
+                "  case \"$argument\" in\n"
+                "    --screenshot=*) touch \"${argument#--screenshot=}\" ;;\n"
+                "  esac\n"
+                "done\n",
+                encoding="utf-8",
+            )
+            browser.chmod(0o755)
+            png = root / "webui.png"
+            log = root / "webui.log"
+
+            watchdog.capture_webui_screen(
+                webui_url="http://127.0.0.1:4552/c/endurance",
+                webui_png=png,
+                webui_log=log,
+                profile=root / "profile",
+                browser=browser,
+                timeout=2,
+            )
+
+            command = arguments.read_text(encoding="utf-8")
+            self.assertNotIn("--virtual-time-budget", command)
+            self.assertTrue(png.exists())
+            self.assertIn("returncode=0", log.read_text(encoding="utf-8"))
+
+    def test_gateway_health_check_rejects_a_missing_backend(self) -> None:
+        failure = urllib.error.URLError("connection refused")
+        with mock.patch.object(watchdog.urllib.request, "urlopen", side_effect=failure):
+            with self.assertRaisesRegex(RuntimeError, "Gateway health check failed"):
+                watchdog.require_gateway_health("http://127.0.0.1:4551/api/v1/health")
+
+    def test_watchdog_checks_gateway_health_while_listening(self) -> None:
+        source = inspect.getsource(watchdog.main)
+
+        self.assertGreaterEqual(source.count("require_gateway_health(args.gateway_health_url)"), 2)
+
+    def test_webui_capture_timeout_reaps_the_browser_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            browser = root / "browser"
+            child_pid_path = root / "child.pid"
+            browser.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                "sleep 60 &\n"
+                f"printf '%s' \"$!\" > {child_pid_path}\n"
+                "wait\n",
+                encoding="utf-8",
+            )
+            browser.chmod(0o755)
+
+            with self.assertRaises(subprocess.TimeoutExpired):
+                watchdog.capture_webui_screen(
+                    webui_url="http://127.0.0.1:4552/c/endurance",
+                    webui_png=root / "webui.png",
+                    webui_log=root / "webui.log",
+                    profile=root / "profile",
+                    browser=browser,
+                    timeout=0.2,
+                )
+
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+            for _ in range(50):
+                try:
+                    os.kill(child_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail(f"timed-out browser child {child_pid} was not reaped")
+
+    def test_optional_webui_capture_records_observer_failure_without_failing_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            browser = root / "browser"
+            browser.write_text("#!/usr/bin/env bash\nexit 17\n", encoding="utf-8")
+            browser.chmod(0o755)
+            png = root / "webui.png"
+            log = root / "webui.log"
+
+            captured = watchdog.capture_optional_webui_screen(
+                webui_url="http://127.0.0.1:4552/c/endurance",
+                webui_png=png,
+                webui_log=log,
+                profile=root / "profile",
+                browser=browser,
+                timeout=2,
+            )
+
+            self.assertEqual(captured, [str(log)])
+            evidence = log.read_text(encoding="utf-8")
+            self.assertIn("returncode=17", evidence)
+            self.assertIn("observerCaptureError=WebUI screenshot exited rc=17", evidence)
+            self.assertFalse(png.exists())
+
+    def test_failure_snapshot_does_not_repeat_failed_webui_capture(self) -> None:
+        source = inspect.getsource(watchdog.main)
+        failure_handler = source.split(
+            "except (OSError, ValueError, RuntimeError, subprocess.SubprocessError)",
+            maxsplit=1,
+        )[1]
+
+        self.assertIn("webui_url=None", failure_handler)
+
+    def test_final_pass_rechecks_runtime_liveness(self) -> None:
+        source = inspect.getsource(watchdog.main)
+
+        self.assertGreaterEqual(
+            source.count(
+                "failure = diagnose_quiet(nexus, args.participant, participant_agent_ids)"
+            ),
+            2,
+            "checkpoint validation must run again immediately before passed",
+        )
+
+    def test_hermes_state_path_uses_runtime_identity_not_name_shape(self) -> None:
+        self.assertEqual(
+            watchdog.hermes_state_db_path("s_123", "Albert candidate/1"),
+            "/tmp/nexus-hermes-gateway-s_123-Albert_candidate_1/home/state.db",
+        )
+
+    def test_continuation_is_one_bounded_current_request(self) -> None:
+        message = watchdog.continuation_request("marker-1", "endurance")
+
+        self.assertIn("marker-1", message)
+        self.assertIn("For this current turn only", message)
+        self.assertIn("exactly one", message)
+        self.assertIn("confirm the m_ receipt", message)
+        self.assertIn("then stop", message)
+        self.assertIn("endurance", message)
+        self.assertNotIn("future", message.lower())
+        self.assertNotIn("automatic", message.lower())
+
+    def test_silence_checkpoint_requires_manual_continuation(self) -> None:
+        source = inspect.getsource(watchdog.main)
+
+        self.assertNotIn("continuation_request(", source)
+        self.assertIn("manual_review_required", source)
+
+    def test_quiet_diagnostics_fail_on_dead_letters(self) -> None:
+        failure = watchdog.classify_quiet_diagnostics(
+            {"rows": [{"inFlightId": "if_1"}], "total": 1},
+            {"members": []},
+            [],
+        )
+
+        self.assertEqual(failure, "delivery failure: 1 dead-lettered row(s)")
+
+    def test_retryable_provider_error_is_explicitly_requeued_after_backoff(self) -> None:
+        class FakeNexus:
+            def __init__(self) -> None:
+                self.calls: list[tuple[tuple[str, ...], dict[str, object]]] = []
+
+            def run_operator(self, *args: str, **kwargs: object) -> SimpleNamespace:
+                self.calls.append((args, kwargs))
+                return SimpleNamespace(
+                    stdout=json.dumps(
+                        {"count": 1, "inFlightIds": ["if_provider_1"]}
+                    )
+                )
+
+        dlq = {
+            "rows": [
+                {
+                    "inFlightId": "if_provider_1",
+                    "attemptCount": 1,
+                    "errorCode": "provider_error",
+                    "errorDetails": {
+                        "retryable": True,
+                        "source": "claude.acp.prompt_error",
+                    },
+                }
+            ],
+            "total": 1,
+        }
+        nexus = FakeNexus()
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "provider-requeues.jsonl"
+            retries = watchdog.ProviderRetryController(evidence)
+
+            self.assertIsNone(retries.review(dlq, nexus, now=100.0))
+            self.assertEqual(retries.next_deadline(999.0), 105.0)
+            self.assertEqual(nexus.calls, [])
+
+            self.assertIsNone(retries.review(dlq, nexus, now=105.0))
+            self.assertEqual(
+                nexus.calls[0][0],
+                ("admin", "dlq", "requeue", "if_provider_1", "--json"),
+            )
+            self.assertEqual(nexus.calls[0][1], {"timeout": 10})
+            record = json.loads(evidence.read_text().strip())
+            self.assertEqual(record["inFlightId"], "if_provider_1")
+            self.assertEqual(record["completedAttempt"], 1)
+            self.assertEqual(record["nextAttempt"], 2)
+            self.assertEqual(record["source"], "claude.acp.prompt_error")
+
+    def test_retryable_provider_error_is_terminal_after_third_attempt(self) -> None:
+        retries = watchdog.ProviderRetryController(Path("/tmp/not-written.jsonl"))
+        failure = retries.review(
+            {
+                "rows": [
+                    {
+                        "inFlightId": "if_provider_3",
+                        "attemptCount": 3,
+                        "errorCode": "provider_error",
+                        "errorDetails": {"retryable": True},
+                    }
+                ],
+                "total": 1,
+            },
+            mock.Mock(),
+            now=100.0,
+        )
+
+        self.assertEqual(
+            failure,
+            "delivery failure: 1 dead-lettered row(s); explicit provider retry exhausted at attempt 3",
+        )
+
+    def test_nonretryable_provider_error_remains_terminal(self) -> None:
+        retries = watchdog.ProviderRetryController(Path("/tmp/not-written.jsonl"))
+        failure = retries.review(
+            {
+                "rows": [
+                    {
+                        "inFlightId": "if_provider_auth",
+                        "attemptCount": 1,
+                        "errorCode": "provider_error",
+                        "errorDetails": {"retryable": False},
+                    }
+                ],
+                "total": 1,
+            },
+            mock.Mock(),
+            now=100.0,
+        )
+
+        self.assertEqual(failure, "delivery failure: 1 dead-lettered row(s)")
+
+    def test_next_watch_wait_wakes_for_provider_retry_deadline(self) -> None:
+        self.assertEqual(
+            watchdog.bounded_wait_seconds(
+                now=100.0,
+                deadlines=[160.0, 105.0, 300.0],
+            ),
+            5.0,
+        )
+
+    def test_quiet_diagnostics_fail_on_offline_participant(self) -> None:
+        failure = watchdog.classify_quiet_diagnostics(
+            {"rows": [], "total": 0},
+            {
+                "members": [
+                    {"name": "claude", "presence": "online"},
+                    {"name": "hermes", "presence": "offline"},
+                ]
+            },
+            ["claude", "hermes"],
+        )
+
+        self.assertEqual(failure, "runtime failure: offline participant(s): hermes")
+
+    def test_quiet_diagnostics_accept_live_participants_without_dlq(self) -> None:
+        failure = watchdog.classify_quiet_diagnostics(
+            {"rows": [], "total": 0},
+            {
+                "members": [
+                    {"name": "claude", "presence": "online"},
+                    {"name": "hermes", "presence": "active"},
+                ]
+            },
+            ["claude", "hermes"],
+        )
+
+        self.assertIsNone(failure)
+
+    def test_quiet_diagnostics_follow_stable_agent_id_across_rename(self) -> None:
+        failure = watchdog.classify_quiet_diagnostics(
+            {"rows": [], "total": 0},
+            {
+                "members": [
+                    {
+                        "name": "Noor-opencode-tmux-110-CLOSED",
+                        "agentId": "a_noor",
+                        "presence": "online",
+                    }
+                ]
+            },
+            ["Noor-opencode-tmux-110"],
+            participant_agent_ids={"Noor-opencode-tmux-110": "a_noor"},
+        )
+
+        self.assertIsNone(failure)
+
+    def test_diagnose_quiet_reads_both_dlq_and_member_state(self) -> None:
+        class FakeNexus:
+            def run_operator(self, *args: str, **kwargs: object) -> SimpleNamespace:
+                return SimpleNamespace(stdout=json.dumps({"rows": [], "total": 0}))
+
+            def run(self, *args: str, **kwargs: object) -> SimpleNamespace:
+                return SimpleNamespace(
+                    stdout=json.dumps(
+                        {"members": [{"name": "claude", "presence": "offline"}]}
+                    )
+                )
+
+        self.assertEqual(
+            watchdog.diagnose_quiet(FakeNexus(), ["claude"]),
+            "runtime failure: offline participant(s): claude",
+        )
+
+    def test_diagnose_quiet_passes_stable_agent_identity_map(self) -> None:
+        class FakeNexus:
+            def run_operator(self, *args: str, **kwargs: object) -> SimpleNamespace:
+                return SimpleNamespace(stdout=json.dumps({"rows": [], "total": 0}))
+
+            def run(self, *args: str, **kwargs: object) -> SimpleNamespace:
+                return SimpleNamespace(
+                    stdout=json.dumps(
+                        {
+                            "members": [
+                                {
+                                    "name": "Noor-CLOSED",
+                                    "agentId": "a_noor",
+                                    "presence": "online",
+                                }
+                            ]
+                        }
+                    )
+                )
+
+        self.assertIsNone(
+            watchdog.diagnose_quiet(
+                FakeNexus(), ["Noor"], {"Noor": "a_noor"}
+            )
+        )
+
+    def test_main_threads_stable_identity_map_through_runtime_checks_and_screenshots(self) -> None:
+        source = inspect.getsource(watchdog.main)
+
+        self.assertIn(
+            "participant_agent_ids = parse_participant_agent_ids(args.participant_agent_id)",
+            source,
+        )
+        self.assertIn(
+            "validate_participant_agent_ids(participant_names, participant_agent_ids)",
+            source,
+        )
+        self.assertGreaterEqual(
+            source.count("failure = diagnose_quiet("),
+            5,
+        )
+        self.assertGreaterEqual(source.count("provider_retries,"), 3)
+        self.assertGreaterEqual(
+            source.count("participant_agent_ids=participant_agent_ids"),
+            3,
+        )
+
+    def test_diagnose_delivery_reads_dlq_without_requiring_members(self) -> None:
+        class FakeNexus:
+            def run_operator(self, *args: str, **kwargs: object) -> SimpleNamespace:
+                return SimpleNamespace(
+                    stdout=json.dumps({"rows": [{"inFlightId": "if_1"}], "total": 1})
+                )
+
+        self.assertEqual(
+            watchdog.diagnose_delivery(FakeNexus()),
+            "delivery failure: 1 dead-lettered row(s)",
+        )
+
+    def test_snapshot_records_slow_diagnostic_without_aborting_gate(self) -> None:
+        class FakeNexus:
+            container = "gate"
+
+            def run(self, *args: str, **kwargs: object) -> SimpleNamespace:
+                if args[:2] == ("daemon", "status"):
+                    raise subprocess.TimeoutExpired(["nexus", "daemon", "status"], 10)
+                return SimpleNamespace(returncode=0, stdout='{"members": []}', stderr="")
+
+            def run_operator(self, *args: str, **kwargs: object) -> SimpleNamespace:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout='{"rows": [], "total": 0}',
+                    stderr="",
+                )
+
+        stats = SimpleNamespace(returncode=0, stdout="stats", stderr="")
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            watchdog.subprocess, "run", return_value=stats
+        ):
+            path = watchdog.snapshot(
+                output=Path(directory),
+                sequence=0,
+                state=watchdog.WatchState(thread="endurance", started_at=1.0),
+                nexus=FakeNexus(),
+                status="running",
+            )
+
+            diagnostics = json.loads(path.read_text())["diagnostics"]
+
+        self.assertTrue(diagnostics["daemon_status"]["timedOut"])
+        self.assertIsNone(diagnostics["daemon_status"]["returncode"])
+        self.assertEqual(diagnostics["members"]["returncode"], 0)
+        self.assertIn("process_memory", diagnostics)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=1)

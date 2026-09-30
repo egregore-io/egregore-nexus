@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! approval-relay integration test.
 //!
 //! Verifies that `spawn_codex_forwarder` — when the fake server emits an

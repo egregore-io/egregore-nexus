@@ -24,6 +24,15 @@ fn windows_uses_native_harness_executable_names() {
     assert_eq!(native_npm_runner(platform), "npx.cmd");
 }
 
+#[cfg(windows)]
+#[test]
+fn a_windows_build_selects_the_windows_process_contract() {
+    assert_eq!(
+        NativeProcessPlatform::current(),
+        NativeProcessPlatform::Windows
+    );
+}
+
 #[test]
 fn unix_platforms_use_their_native_path_tokens() {
     let platform = NativeProcessPlatform::Unix;

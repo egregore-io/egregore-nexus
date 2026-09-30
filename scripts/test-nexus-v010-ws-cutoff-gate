@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Focused fixture contracts for the v0.1 WebSocket cutoff gate."""
+
+from __future__ import annotations
+
+import runpy
+import unittest
+from pathlib import Path
+
+
+SCRIPT = Path(__file__).with_name("nexus-v010-ws-cutoff-gate")
+MODULE = runpy.run_path(str(SCRIPT))
+
+
+class ReceiverListenerCommandTests(unittest.TestCase):
+    def test_fixture_namespace_is_unique_without_changing_candidate_label(self) -> None:
+        self.assertEqual(
+            MODULE["run_suffix"]("architecture", 123456),
+            "architecture-123456",
+        )
+
+    def test_listener_owns_and_acknowledges_the_fixture_recipient(self) -> None:
+        command = MODULE["receiver_listener_command"](
+            container="validator",
+            nexus="/opt/nexus",
+            receiver="ws-receivercandidate",
+            client_key="ws-receiver-key-candidate",
+            project="endurance",
+            nexus_home="/tmp/nexus-home",
+        )
+
+        self.assertEqual(command[:2], ["docker", "exec"])
+        self.assertIn("NEXUS_NAME=ws-receivercandidate", command)
+        self.assertIn("NEXUS_CLIENT_KEY=ws-receiver-key-candidate", command)
+        self.assertIn("NEXUS_PROJECT=endurance", command)
+        self.assertIn("NEXUS_AGENT=other", command)
+        self.assertIn("TOKIO_WORKER_THREADS=2", command)
+        self.assertEqual(
+            command[-7:],
+            ["listen", "--json", "--once", "--timeout-ms", "15000", "--max", "16"],
+        )
+
+    def test_live_gate_covers_ping_and_malformed_frame_isolation(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('label="websocket ping/pong"', source)
+        self.assertIn('await events.send_raw("{not-json")', source)
+        self.assertIn('label="socket remains live after malformed frame"', source)
+
+    def test_repeated_gate_runs_do_not_reuse_notification_idempotency_keys(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            'f"ws-cutoff-notify-{suffix}-{notification_marker}"',
+            source,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""Unit tests for the pure helpers in scripts/nexus-load-gate (no docker needed)."""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import inspect
+import sys
+import unittest
+from pathlib import Path
+
+_PATH = Path(__file__).resolve().parent / "nexus-load-gate"
+_loader = importlib.machinery.SourceFileLoader("nexus_load_gate", str(_PATH))
+_spec = importlib.util.spec_from_loader("nexus_load_gate", _loader)
+lg = importlib.util.module_from_spec(_spec)
+sys.modules["nexus_load_gate"] = lg  # dataclasses resolve annotations via sys.modules
+_loader.exec_module(lg)
+
+
+class LedgerTests(unittest.TestCase):
+    def test_exactly_once_is_clean(self):
+        led = lg.Ledger()
+        led.record_send("m1", "a1", "post", {"a2", "a3"}, t=0.0)
+        led.record_receipt("m1", "a2", "row1", t=0.1)
+        led.record_receipt("m1", "a3", "row1", t=0.2)
+        self.assertEqual(led.missing(), [])
+        self.assertEqual(led.duplicates(), [])
+
+    def test_missing_recipient_reported(self):
+        led = lg.Ledger()
+        led.record_send("m1", "a1", "post", {"a2", "a3"}, t=0.0)
+        led.record_receipt("m1", "a2", "row1", t=0.1)
+        self.assertEqual(led.missing(), [("m1", "a3")])
+
+    def test_duplicate_receipt_reported(self):
+        led = lg.Ledger()
+        led.record_send("m1", "a1", "dm", {"a2"}, t=0.0)
+        led.record_receipt("m1", "a2", "row1", t=0.1)
+        led.record_receipt("m1", "a2", "row1", t=0.2)
+        dupes = led.duplicates()
+        self.assertEqual(len(dupes), 1)
+        self.assertIn("received 2x", dupes[0])
+
+    def test_two_durable_rows_for_one_send_reported(self):
+        led = lg.Ledger()
+        led.record_send("m1", "a1", "post", {"a2", "a3"}, t=0.0)
+        led.record_receipt("m1", "a2", "rowA", t=0.1)
+        led.record_receipt("m1", "a3", "rowB", t=0.2)
+        dupes = led.duplicates()
+        self.assertEqual(len(dupes), 1)
+        self.assertIn("2 distinct durable rows", dupes[0])
+
+    def test_allowed_restart_dupes_are_exempt(self):
+        led = lg.Ledger()
+        led.record_send("m1", "a1", "dm", {"a2"}, t=0.0)
+        led.record_receipt("m1", "a2", "row1", t=0.1)
+        led.record_receipt("m1", "a2", "row1", t=0.2)
+        self.assertEqual(led.duplicates(allowed={"m1"}), [])
+        self.assertEqual(len(led.duplicates(allowed=set())), 1)
+
+
+class ScanLogsTests(unittest.TestCase):
+    def test_instant_fail_signatures(self):
+        for sig in lg.INSTANT_FAIL_SIGNATURES:
+            findings = lg.scan_logs(f"junk\nERROR blah {sig} blah\n", budgets={})
+            self.assertEqual(len(findings), 1, sig)
+            self.assertTrue(findings[0].over_budget, sig)
+            self.assertEqual(findings[0].count, 1)
+
+    def test_clean_log_is_clean(self):
+        self.assertEqual(lg.scan_logs("all good\nnothing to see\n"), [])
+
+    def test_budgeted_signature_within_budget(self):
+        text = "x unsupported statement y\n" * 3
+        findings = lg.scan_logs(text, budgets={"unsupported statement": 5})
+        self.assertEqual(len(findings), 1)
+        self.assertFalse(findings[0].over_budget)
+        self.assertEqual(findings[0].count, 3)
+
+    def test_budgeted_signature_over_budget(self):
+        text = "x unsupported statement y\n" * 6
+        findings = lg.scan_logs(text, budgets={"unsupported statement": 5})
+        self.assertTrue(findings[0].over_budget)
+
+
+class SummaryTests(unittest.TestCase):
+    def test_fail_wins_and_json_shape(self):
+        s = lg.Summary(profile={"agents": 2})
+        s.check("a", True)
+        s.check("b", False, evidence="boom")
+        self.assertFalse(s.ok)
+        d = s.to_dict()
+        self.assertEqual(d["status"], "fail")
+        self.assertEqual(d["failures"], ["b"])
+        self.assertEqual(d["checks"][1]["evidence"], "boom")
+
+    def test_empty_summary_is_not_a_pass(self):
+        self.assertFalse(lg.Summary().ok)
+
+    def test_all_pass(self):
+        s = lg.Summary()
+        s.check("a", True)
+        self.assertTrue(s.ok)
+        self.assertEqual(s.to_dict()["status"], "pass")
+
+
+class BodyCodecTests(unittest.TestCase):
+    def test_roundtrip(self):
+        body = lg.body_for("abc123")
+        self.assertEqual(lg.msg_id_from_body(body), "abc123")
+
+    def test_non_gate_traffic_is_none(self):
+        self.assertIsNone(lg.msg_id_from_body("hello world"))
+        self.assertIsNone(lg.msg_id_from_body("LG:noterminator"))
+
+
+class CpuParseTests(unittest.TestCase):
+    def test_mm_ss(self):
+        self.assertEqual(lg.parse_ps_cpu_seconds("02:30"), 150)
+
+    def test_hh_mm_ss(self):
+        self.assertEqual(lg.parse_ps_cpu_seconds("01:02:03"), 3723)
+
+    def test_days(self):
+        self.assertEqual(lg.parse_ps_cpu_seconds("1-00:00:10"), 86410)
+
+    def test_malformed(self):
+        self.assertIsNone(lg.parse_ps_cpu_seconds("junk"))
+
+
+class CensusTests(unittest.TestCase):
+    HEADER = "    PID ARGS\n"
+
+    def test_stack_processes_pass(self):
+        out = lg.census_violettions(
+            self.HEADER
+            + "  1 /tmp/nexus-target/debug/nexus daemon\n"
+            + "  3 socat TCP-LISTEN:4500\n"
+            + "  4 node scripts/gateway-serve.mjs\n"
+            + "  5 sleep infinity\n"
+        )
+        self.assertEqual(out, [])
+
+    def test_harness_process_fails(self):
+        out = lg.census_violettions(self.HEADER + "  9 claude --resume abc\n")
+        self.assertEqual(len(out), 1)
+        self.assertIn("forbidden", out[0])
+
+    def test_unknown_process_fails(self):
+        out = lg.census_violettions(self.HEADER + "  9 minerd --threads 8\n")
+        self.assertEqual(len(out), 1)
+        self.assertIn("unexpected", out[0])
+
+
+class ProvisioningTests(unittest.TestCase):
+    def test_endurance_default_stops_after_watchdog_without_resurrection(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        watchdog_wait = source.index('wait "$WATCHDOG_PID"')
+        restart_guard = source.index('if [ "$RUN_RESURRECTION" != 1 ]; then')
+        resurrection = source.index("nexus-v010-resurrection-gate")
+
+        self.assertIn(
+            "RUN_RESURRECTION=${NEXUS_ENDURANCE_RUN_RESURRECTION:-0}", source
+        )
+        self.assertLess(watchdog_wait, restart_guard)
+        self.assertLess(restart_guard, resurrection)
+        self.assertIn("exit 0", source[restart_guard:resurrection])
+        self.assertNotIn("--filter label=egregore-nexus-test=true", source)
+
+    def test_resurrection_runner_selects_an_isolated_fixture(self):
+        source = (_PATH.parent / "nexus-v010-resurrection-run").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("NEXUS_ENDURANCE_RUN_RESURRECTION=1", source)
+        self.assertIn("nexus-v010-resurrection", source)
+        self.assertIn("4561", source)
+        self.assertIn("4562", source)
+        self.assertIn("resurrection-v010-final", source)
+        self.assertIn("v010-resurrection-candidate", source)
+        self.assertIn("NEXUS_ENDURANCE_EXPECT_CPUS=2000000000", source)
+        self.assertIn("NEXUS_ENDURANCE_EXPECT_MEMORY_BYTES=8589934592", source)
+        self.assertIn(
+            "NEXUS_ENDURANCE_REQUIRE_HOST_CAPACITY=${NEXUS_RESURRECTION_REQUIRE_HOST_CAPACITY:-0}",
+            source,
+        )
+        self.assertIn('exec "$ROOT/scripts/nexus-v010-endurance-gate"', source)
+
+    def test_concurrent_fixture_has_a_fail_closed_host_capacity_gate(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("NEXUS_ENDURANCE_REQUIRE_HOST_CAPACITY", source)
+        self.assertIn("MemAvailable", source)
+        self.assertIn("/proc/pressure/memory", source)
+        self.assertIn("1099511627776", source)
+        self.assertIn("host-capacity.json", source)
+
+    def test_docker_image_leaves_isolated_home_writable_for_host_uid(self):
+        dockerfile = (
+            _PATH.parent.parent / "tools" / "docker" / "nexus-test.Dockerfile"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('install -d -m 0777 "$HOME"', dockerfile)
+
+    def test_claude_fixture_preserves_oauth_but_removes_host_api_overrides(self):
+        docker_env = (_PATH.parent / "nexus-docker-test-env").read_text(encoding="utf-8")
+
+        self.assertIn("ANTHROPIC_BASE_URL", docker_env)
+        self.assertIn("ANTHROPIC_API_KEY", docker_env)
+        self.assertIn("ANTHROPIC_AUTH_TOKEN", docker_env)
+        self.assertIn("del(.env.ANTHROPIC_BASE_URL", docker_env)
+
+    def test_claude_fixture_pins_exact_sonnet_five_model(self):
+        docker_env = (_PATH.parent / "nexus-docker-test-env").read_text(encoding="utf-8")
+
+        self.assertIn('CLAUDE_MODEL="${NEXUS_DOCKER_TEST_CLAUDE_MODEL:-claude-sonnet-5}"', docker_env)
+        self.assertIn('-e "ANTHROPIC_MODEL=$CLAUDE_MODEL"', docker_env)
+
+    def test_real_harness_path_includes_the_mounted_bun_opencode_binary(self):
+        docker_env = (_PATH.parent / "nexus-docker-test-env").read_text(encoding="utf-8")
+
+        self.assertIn('path_env="$path_env:$HOME/.bun/bin"', docker_env)
+
+    def test_docker_environment_hands_in_tree_gateway_to_daemon(self):
+        docker_env = (_PATH.parent / "nexus-docker-test-env").read_text(encoding="utf-8")
+
+        self.assertIn(
+            '-e "NEXUS_GATEWAY_BIN=/work/egregore-nexus/gateway/scripts/nexus-gateway.mjs"',
+            docker_env,
+        )
+        self.assertIn("container_uses_in_tree_gateway()", docker_env)
+        self.assertIn("$NEXUS_BIN gateway restart", docker_env)
+        self.assertIn("start_gateway", docker_env)
+
+    def test_docker_environment_clamps_compile_and_gate_resources(self):
+        docker_env = (_PATH.parent / "nexus-docker-test-env").read_text(encoding="utf-8")
+
+        self.assertIn("--init", docker_env)
+        self.assertIn('--user "$HOST_UID:$HOST_GID"', docker_env)
+        self.assertIn('--cpus "$CPUS"', docker_env)
+        self.assertIn('--memory "$MEMORY"', docker_env)
+        self.assertIn('--memory-swap "$MEMORY"', docker_env)
+        self.assertIn('--pids-limit "$PIDS_LIMIT"', docker_env)
+
+    def test_reused_container_repairs_harness_home_for_host_uid(self):
+        docker_env = (_PATH.parent / "nexus-docker-test-env").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'docker exec --user 0:0 "$NAME" install -d -o "$HOST_UID" -g "$HOST_GID" -m 0700 /tmp/harness-home',
+            docker_env,
+        )
+        self.assertLess(
+            docker_env.index("ensure_harness_home_owned"),
+            docker_env.index("prepare_host_harnesses"),
+        )
+
+    def test_docker_environment_reuses_the_only_container_without_an_image_probe(self):
+        docker_env = (_PATH.parent / "nexus-docker-test-env").read_text(encoding="utf-8")
+
+        self.assertIn("if ! container_exists; then\n    ensure_image\n  fi", docker_env)
+        self.assertNotIn("  ensure_image\n  if container_exists; then", docker_env)
+
+    def test_store_reset_reaps_the_container_and_removes_only_embedded_database(self):
+        source = inspect.getsource(lg.Env.reset_state)
+
+        self.assertIn('["docker", "restart", self.container]', source)
+        self.assertIn("/tmp/nexus-home/nexus.db", source)
+        self.assertIn("socat TCP-LISTEN:4100", source)
+        self.assertNotIn("sqld", source)
+        self.assertLess(source.index('"restart"'), source.index("rm -rf"))
+
+    def test_daemon_restart_bounces_gateway_and_waits_for_daemon_read_view(self):
+        restart = inspect.getsource(lg.Env.restart_daemon)
+        readiness = inspect.getsource(lg.Env.wait_healthy)
+
+        self.assertIn("gateway stop", restart)
+        self.assertIn("gateway start", restart)
+        self.assertLess(restart.index("gateway stop"), restart.index("gateway start"))
+        self.assertIn("members", readiness)
+        self.assertIn("--include-offline", readiness)
+
+    def test_restart_re_adoption_excludes_the_dead_target_control(self):
+        live = [lg.Actor(name="lg01", client_key="ck_lg01")]
+        ghost = lg.Actor(name="lgghost", client_key="ck_lgghost")
+        self.assertEqual(
+            [actor.name for actor in lg.registration_actors(live, ghost, include_ghost=False)],
+            ["lg01"],
+        )
+        self.assertEqual(
+            [actor.name for actor in lg.registration_actors(live, ghost, include_ghost=True)],
+            ["lg01", "lgghost"],
+        )
+
+
+class EnduranceFixtureTests(unittest.TestCase):
+    def test_controller_is_explicitly_human_and_never_enters_harness_revival(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("-e NEXUS_KIND=human", source)
+        self.assertIn(
+            'controller register --name "$CONTROLLER" --agent other --kind human',
+            source,
+        )
+
+    def test_shared_thread_fixture_names_expose_harness_and_variant(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "printf '%s-%s-%s-%s\\n' \"$proper_name\" \"$harness\" \"$variant\" \"$CANDIDATE\"",
+            source,
+        )
+
+    def test_shared_thread_fixture_builds_the_candidate_cli_before_launch(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        build = source.index("cargo build -p egregore-nexus --bin nexus")
+        launch = source.index("nexus gateway start --json")
+        self.assertLess(build, launch)
+
+    def test_candidate_binary_is_pinned_and_proved_at_the_exact_revision(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('FULL_CANDIDATE=$(git -C "$ROOT" rev-parse', source)
+        self.assertIn('-e "NEXUS_BUILD_REVISION=$FULL_CANDIDATE"', source)
+        self.assertIn('"$NEXUS_BIN" --version', source)
+        self.assertIn('grep -Fq "revision $FULL_CANDIDATE)"', source)
+
+    def test_shared_thread_fixture_starts_and_sustains_a_bounded_debate(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("The hostile 4chan-style forum is open", source)
+        self.assertIn("reply once to each new operator post", source)
+        self.assertIn("reply only when you are directly named or challenged", source)
+        self.assertIn("challenge exactly one named peer", source)
+        self.assertNotIn("post exactly once when that message explicitly asks", source)
+        self.assertNotIn("Do not answer peer posts until", source)
+
+    def test_resurrection_controls_outrank_debate_traffic(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "resurrection proof control message takes absolute priority",
+            source,
+        )
+
+    def test_shared_thread_fixture_assigns_balanced_randomized_thinkers(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("thinker-assignments.json", source)
+        self.assertIn("Nietzsche", source)
+        self.assertIn("Freud", source)
+        self.assertIn("Jung", source)
+        self.assertIn("Piaget", source)
+        self.assertIn("random.Random(seed).shuffle(thinkers)", source)
+        self.assertIn("--thinker-assignment", source)
+
+    def test_shared_thread_fixture_keys_watchdog_participants_by_stable_agent_id(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "agent_id=$(jq -er '.runtimes[] | select(.active == true) | .agentId'",
+            source,
+        )
+        self.assertIn(
+            'watchdog_args+=(--participant-agent-id "$name=$agent_id")',
+            source,
+        )
+
+    def test_shared_thread_fixture_is_profane_and_enables_adaptive_operator_pressure(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("4chan-style forum", source)
+        self.assertIn("fuck", source)
+        self.assertIn("shit", source)
+        self.assertIn("brainlet", source)
+        self.assertIn("--operator-min-seconds", source)
+        self.assertIn("--operator-max-seconds", source)
+        self.assertIn("--operator-seed", source)
+
+    def test_endurance_fixture_defaults_to_the_two_cpu_eight_gib_budget(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "EXPECTED_CPUS=${NEXUS_ENDURANCE_EXPECT_CPUS:-2000000000}", source
+        )
+        self.assertIn(
+            "EXPECTED_MEMORY_BYTES=${NEXUS_ENDURANCE_EXPECT_MEMORY_BYTES:-8589934592}",
+            source,
+        )
+        self.assertIn('[ "$cpus" = "$EXPECTED_CPUS" ]', source)
+        self.assertIn('[ "$memory" = "$EXPECTED_MEMORY_BYTES" ]', source)
+
+    def test_endurance_fixture_records_exact_harness_versions(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("harness-versions.txt", source)
+        for harness in ("claude", "codex", "opencode", "hermes"):
+            self.assertIn(f'capture_harness_version "{harness}"', source)
+
+    def test_endurance_fixture_preserves_container_path_when_capturing_harness_versions(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+        capture = source.split("capture_harness_version() {", 1)[1].split("\n}\n", 1)[0]
+
+        self.assertIn('bash -c', capture)
+        self.assertNotIn('bash -lc', capture)
+
+    def test_endurance_fixture_preflights_hermes_acp_dependencies(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('hermes acp --check', source)
+        self.assertLess(source.index('hermes acp --check'), source.index('launch_one()'))
+
+    def test_endurance_fixture_preserves_container_path_for_hermes_preflight(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            'docker exec "$CONTAINER" bash -c \'hermes acp --check\'', source
+        )
+        self.assertNotIn(
+            'docker exec "$CONTAINER" bash -lc \'hermes acp --check\'', source
+        )
+
+    def test_endurance_fixture_requires_logged_in_claude_oauth_before_launch(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("claude-auth-status.json", source)
+        self.assertIn(".loggedIn == true", source)
+        self.assertLess(source.index("claude-auth-status.json"), source.index("launch_one()"))
+
+    def test_endurance_fixture_requires_a_model_completed_readiness_dm(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("ENDURANCE_READY_", source)
+        self.assertIn("Use the Nexus bus exactly once to DM", source)
+        self.assertIn('controller history --with "$name" --limit 20 --json', source)
+        self.assertIn('.from == $name and .body == $marker', source)
+        self.assertIn('[ "$ready_count" -eq 12 ]', source)
+
+    def test_endurance_fixture_waits_for_all_model_turns_before_thread_traffic(self):
+        source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
+            encoding="utf-8"
+        )
+
+        launches_complete = source.index('done\n\nlog "Waiting for all 12 real harness variants')
+        readiness = source.index("Waiting for all 12 model-completion readiness DMs")
+        thread_create = source.index('log "Creating shared thread $THREAD"')
+        opening = source.index('controller post "$THREAD" -m "$opening"')
+
+        self.assertLess(launches_complete, readiness)
+        self.assertLess(readiness, thread_create)
+        self.assertLess(thread_create, opening)
+        self.assertIn("readiness.tsv", source)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=1)

@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/nexus-three-facet-package-smoke
+
+Packages and smoke-tests the complete @egregore/nexus install: CLI/daemon, Gateway, and WebUI.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+TMP=$(mktemp -d)
+GATEWAY_PORT=$((43000 + ($$ % 1000)))
+WEBUI_PORT=$((44000 + ($$ % 1000)))
+STACK_BIN="$TMP/stack-install/node_modules/.bin"
+WEBUI_PID=
+cleanup() {
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    for log in "$TMP/gateway-start.log" "$TMP/nexus-home/gateway.log" \
+      "$TMP/nexus-home/daemon.log" "$TMP/webui.log"; do
+      [ ! -f "$log" ] || { echo "--- $log ---" >&2; tail -n 120 "$log" >&2; }
+    done
+  fi
+  [ -z "$WEBUI_PID" ] || kill "$WEBUI_PID" 2>/dev/null || true
+  if [ -x "$TMP/cargo-home/bin/nexus" ]; then
+    NEXUS_HOME="$TMP/nexus-home" NEXUS_DB_PATH="$TMP/nexus-home/nexus.db" \
+      NEXUS_GATEWAY_BIN="$STACK_BIN/nexus-gateway" \
+      "$TMP/cargo-home/bin/nexus" gateway stop --force >/dev/null 2>&1 || true
+    NEXUS_HOME="$TMP/nexus-home" NEXUS_DB_PATH="$TMP/nexus-home/nexus.db" \
+      "$TMP/cargo-home/bin/nexus" daemon stop >/dev/null 2>&1 || true
+  fi
+  pkill -f -- "$TMP/stack-install/node_modules/@egregore/nexus-gateway/dist-gateway/headless.mjs" \
+    >/dev/null 2>&1 || true
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+wait_http() {
+  local url=$1
+  local log=$2
+  for _ in $(seq 1 120); do
+    if curl -fsS "$url" >/dev/null 2>&1; then return 0; fi
+    sleep 0.25
+  done
+  cat "$log" >&2
+  return 1
+}
+
+mkdir -p "$TMP/packs" "$TMP/cargo-home" "$TMP/stack-install" \
+  "$TMP/nexus-home" "$TMP/cli-assembly"
+
+(cd "$ROOT/core" && \
+  cargo package --workspace --exclude nexus-acceptance --no-verify --keep-going --allow-dirty && \
+  cargo install --path crates/nexus --bin nexus --root "$TMP/cargo-home" --locked --force)
+"$TMP/cargo-home/bin/nexus" --version | grep -q '0.1.0'
+"$TMP/cargo-home/bin/nexus" --version | grep -Eq 'revision [^)]+\)'
+test "$(wc -c <"$TMP/cargo-home/bin/nexus")" -lt 104857600
+NEXUS_HOME="$TMP/nexus-home" NEXUS_DB_PATH="$TMP/nexus-home/nexus.db" \
+  "$TMP/cargo-home/bin/nexus" daemon start >/dev/null
+
+set +e
+NEXUS_HOME="$TMP/nexus-home" NEXUS_DB_PATH="$TMP/nexus-home/nexus.db" \
+  NEXUS_GATEWAY_BIN="$TMP/not-installed/nexus-gateway" \
+  "$TMP/cargo-home/bin/nexus" --json gateway start >"$TMP/missing-gateway.json"
+MISSING_GATEWAY_STATUS=$?
+set -e
+test "$MISSING_GATEWAY_STATUS" -eq 3
+grep -q 'GATEWAY_NOT_INSTALLED' "$TMP/missing-gateway.json"
+grep -q '@egregore/nexus-gateway' "$TMP/missing-gateway.json"
+
+GATEWAY_TARBALL=$(cd "$ROOT/gateway" && \
+  npm pack --pack-destination "$TMP/packs" --silent | tail -n 1)
+cp -R "$ROOT/packages/nexus-cli/." "$TMP/cli-assembly/"
+"$ROOT/scripts/nexus-pack-native-npm" \
+  --binary "$TMP/cargo-home/bin/nexus" --output "$TMP/cli-assembly" >/dev/null
+CLI_TARBALL=$(cd "$TMP/cli-assembly" && \
+  npm pack --pack-destination "$TMP/packs" --silent | tail -n 1)
+NEXUS_TARBALL=$(cd "$ROOT/packages/nexus" && \
+  npm pack --pack-destination "$TMP/packs" --silent | tail -n 1)
+
+(cd "$TMP/stack-install" && npm init -y >/dev/null && \
+  npm install --ignore-scripts \
+    "$TMP/packs/$CLI_TARBALL" \
+    "$TMP/packs/$GATEWAY_TARBALL" "$TMP/packs/$NEXUS_TARBALL" >/dev/null)
+
+npm install --global --prefix "$TMP/global-install" --ignore-scripts --no-audit --no-fund \
+  "$TMP/packs/$CLI_TARBALL" \
+  "$TMP/packs/$GATEWAY_TARBALL" "$TMP/packs/$NEXUS_TARBALL" >/dev/null
+
+npm install --global --prefix "$TMP/path-guidance-install" \
+  --foreground-scripts --no-audit --no-fund \
+  "$TMP/packs/$CLI_TARBALL" >"$TMP/path-guidance.log"
+grep -Fq 'Nexus installed successfully, but its command directory is not on PATH' \
+  "$TMP/path-guidance.log"
+grep -Fq "$TMP/path-guidance-install/bin" "$TMP/path-guidance.log"
+
+test "$(find "$TMP/packs" -maxdepth 1 -name '*.tgz' -printf '.' | wc -c)" -eq 3
+"$STACK_BIN/nexus" daemon install --help >/dev/null
+node "$ROOT/scripts/nexus-cli-command-surface-smoke.mjs" "$STACK_BIN/nexus"
+"$TMP/global-install/bin/nexus" daemon install --help >/dev/null
+"$TMP/path-guidance-install/bin/nexus" daemon install --help >/dev/null
+"$STACK_BIN/nexus-gateway" --help | grep -q 'nexus-gateway'
+NEXUS_HOME="$TMP/nexus-home" NEXUS_GATEWAY_DB="file:$TMP/nexus-home/gateway.db" \
+  "$STACK_BIN/nexus-gateway" --migrate-only | grep -q 'schemaVersion'
+
+NEXUS_HOME="$TMP/nexus-home" NEXUS_DB_PATH="$TMP/nexus-home/nexus.db" \
+  NEXUS_GATEWAY_DB="file:$TMP/nexus-home/gateway.db" \
+  NEXUS_GATEWAY_BIND=127.0.0.1 NEXUS_GATEWAY_PORT="$GATEWAY_PORT" \
+  NEXUS_GATEWAY_BIN="$STACK_BIN/nexus-gateway" \
+  "$TMP/cargo-home/bin/nexus" gateway start >"$TMP/gateway-start.log"
+wait_http "http://127.0.0.1:$GATEWAY_PORT/api/v1/health" "$TMP/gateway-start.log"
+NEXUS_HOME="$TMP/nexus-home" NEXUS_DB_PATH="$TMP/nexus-home/nexus.db" \
+  NEXUS_GATEWAY_BIN="$STACK_BIN/nexus-gateway" \
+  "$TMP/cargo-home/bin/nexus" --json gateway status | grep -q '"state": "live"'
+NEXUS_HOME="$TMP/nexus-home" NEXUS_DB_PATH="$TMP/nexus-home/nexus.db" \
+  NEXUS_GATEWAY_BIN="$STACK_BIN/nexus-gateway" \
+  "$TMP/cargo-home/bin/nexus" gateway logs --lines 5 >/dev/null
+NEXUS_HOME="$TMP/nexus-home" NEXUS_DB_PATH="$TMP/nexus-home/nexus.db" \
+  NEXUS_GATEWAY_DB="file:$TMP/nexus-home/gateway.db" \
+  NEXUS_GATEWAY_BIND=127.0.0.1 NEXUS_GATEWAY_PORT="$GATEWAY_PORT" \
+  NEXUS_GATEWAY_BIN="$STACK_BIN/nexus-gateway" \
+  "$TMP/cargo-home/bin/nexus" gateway restart --force >/dev/null
+wait_http "http://127.0.0.1:$GATEWAY_PORT/api/v1/health" "$TMP/gateway-start.log"
+
+"$STACK_BIN/nexus-webui" --help | grep -q 'gateway-url'
+"$STACK_BIN/nexus-webui" \
+  --host 127.0.0.1 --port "$WEBUI_PORT" --gateway-url "http://127.0.0.1:$GATEWAY_PORT" \
+  >"$TMP/webui.log" 2>&1 &
+WEBUI_PID=$!
+wait_http "http://127.0.0.1:$WEBUI_PORT/health" "$TMP/webui.log"
+curl -fsS "http://127.0.0.1:$WEBUI_PORT/" | grep -q '<div id="root"></div>'
+curl -fsS "http://127.0.0.1:$WEBUI_PORT/api/v1/health" | grep -q 'ok'
+
+HOME="$TMP/empty-home" CARGO_HOME="$TMP/empty-cargo" \
+  "$STACK_BIN/nexus" --version | grep -Eq 'nexus 0\.1\.0 \(revision [^)]+\)'
+
+node -e '
+const fs = require("node:fs");
+const path = require("node:path");
+const root = process.argv[1];
+const gateway = JSON.parse(fs.readFileSync(path.join(root, "gateway", "package.json"), "utf8"));
+const webui = JSON.parse(fs.readFileSync(path.join(root, "gateway", "webconsole", "package.json"), "utf8"));
+const cli = JSON.parse(fs.readFileSync(path.join(root, "packages", "nexus-cli", "package.json"), "utf8"));
+const nexus = JSON.parse(fs.readFileSync(path.join(root, "packages", "nexus", "package.json"), "utf8"));
+if (gateway.name !== "@egregore/nexus-gateway" || gateway.private) process.exit(1);
+if (webui.name !== "@egregore/nexus-webui-workspace" || !webui.private) process.exit(1);
+if (cli.name !== "@egregore/nexus-cli" || cli.private) process.exit(1);
+if (nexus.name !== "@egregore/nexus" || nexus.private) process.exit(1);
+if ([gateway, webui, cli, nexus].some((pkg) => pkg.license !== "Apache-2.0" || pkg.version !== "0.1.1")) process.exit(1);
+if (gateway.dependencies?.["@egregore/nexus-cli"] !== "0.1.1") process.exit(1);
+if (gateway.bin?.nexus !== "scripts/nexus.mjs") process.exit(1);
+if (nexus.dependencies?.["@egregore/nexus-cli"] !== "0.1.1") process.exit(1);
+if (nexus.dependencies?.["@egregore/nexus-gateway"] !== "0.1.1") process.exit(1);
+' "$ROOT"
+
+NEXUS_HOME="$TMP/nexus-home" NEXUS_DB_PATH="$TMP/nexus-home/nexus.db" \
+  NEXUS_GATEWAY_BIN="$STACK_BIN/nexus-gateway" \
+  "$TMP/cargo-home/bin/nexus" gateway stop --force >/dev/null
+
+echo "three-facet package smoke: PASS"

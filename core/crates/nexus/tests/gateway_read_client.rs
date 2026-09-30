@@ -36,7 +36,10 @@ async fn message(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    if query.get("me").map(String::as_str) != Some("operator") {
+    if !query
+        .get("me")
+        .is_some_and(|caller| !caller.trim().is_empty())
+    {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "missing caller"})),

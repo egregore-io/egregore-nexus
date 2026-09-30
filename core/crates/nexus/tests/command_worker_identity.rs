@@ -849,6 +849,9 @@ async fn rename_keeps_mcp_and_cli_env_writes_live_and_canonically_attributed() {
         })
         .unwrap(),
     );
+    // Some clients fall back to the immutable agent id when their cached display name becomes
+    // stale. That label is metadata too; the registered client key remains the credential.
+    cli_env_send.caller_name = registered.agent_id.as_ref().unwrap().0.clone();
     cli_env_send.caller_agent_id = registered.agent_id.as_ref().map(|id| id.0.clone());
     CommandIntents::new(&state.store)
         .insert_pending(cli_env_send)
@@ -863,7 +866,7 @@ async fn rename_keeps_mcp_and_cli_env_writes_live_and_canonically_attributed() {
         .expect("send command row");
     assert_eq!(
         send_row.status, "done",
-        "stale launch-time name must not wedge a valid client key: {:?}",
+        "a noncanonical caller label must not wedge a valid client key: {:?}",
         send_row.error_json
     );
     let mut rows = state

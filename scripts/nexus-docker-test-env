@@ -1,0 +1,655 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO=$(cd "$SCRIPT_DIR/.." && pwd)
+IMAGE="${NEXUS_DOCKER_TEST_IMAGE:-egregore-nexus-test:local}"
+NAME="${NEXUS_DOCKER_TEST_NAME:-nexus-test}"
+HOST_PORT="${NEXUS_DOCKER_TEST_PORT:-4510}"
+CPUS="${NEXUS_DOCKER_TEST_CPUS:-2}"
+MEMORY="${NEXUS_DOCKER_TEST_MEMORY:-10g}"
+PIDS_LIMIT="${NEXUS_DOCKER_TEST_PIDS_LIMIT:-1024}"
+CLAUDE_MODEL="${NEXUS_DOCKER_TEST_CLAUDE_MODEL:-claude-sonnet-5}"
+HOST_UID=$(id -u)
+HOST_GID=$(id -g)
+CONTAINER_PORT="${NEXUS_DOCKER_TEST_CONTAINER_PORT:-4100}"
+GATEWAY_INTERNAL_PORT="${NEXUS_DOCKER_TEST_GATEWAY_INTERNAL_PORT:-4101}"
+NEXUS_BIN=/tmp/nexus-target/debug/nexus
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/nexus-docker-test-env <command> [args...]
+
+Commands:
+  build          Build the test-only Docker image.
+  up             Start an isolated Nexus daemon/gateway you can connect to.
+                 Host Claude/Codex/OpenCode/Hermes CLIs are available by default.
+  status         Show isolated daemon/gateway status.
+  shell          Open a shell in the isolated container.
+  nexus -- ARGS  Run the isolated Nexus CLI with ARGS.
+  smoke          Run a small isolated CLI/API write/read smoke.
+  locks          Assert Gateway owns its DB and has zero identity DB FDs/POSIX locks.
+  logs           Tail the isolated daemon log.
+  down           Stop and remove the isolated container.
+  clean          Remove stopped nexus-test containers.
+
+Environment:
+  NEXUS_DOCKER_TEST_NAME       Container name, default: nexus-test
+  NEXUS_DOCKER_TEST_PORT       Host gateway port, default: 4510
+  NEXUS_DOCKER_TEST_IMAGE      Image tag, default: egregore-nexus-test:local
+  NEXUS_DOCKER_TEST_CPUS       CPU quota for builds and gates, default: 2
+  NEXUS_DOCKER_TEST_MEMORY     Memory and memory+swap limit, default: 10g
+  NEXUS_DOCKER_TEST_PIDS_LIMIT Process limit, default: 1024
+  NEXUS_DOCKER_TEST_CLAUDE_MODEL Exact Claude model, default: claude-sonnet-5
+The container uses isolated /tmp Nexus state and never mounts ~/.nexus.
+Host harness auth/config is mounted read-only and copied into the container's
+isolated /tmp/harness-home so you can run commands like `nexus launch claude`
+without using the live Nexus DB/socket.
+USAGE
+}
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+dockerfile() {
+  printf '%s\n' "$REPO/tools/docker/nexus-test.Dockerfile"
+}
+
+container_exists() {
+  docker container inspect "$NAME" >/dev/null 2>&1
+}
+
+container_running() {
+  [ "$(docker container inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = "true" ]
+}
+
+container_real_harnesses() {
+  [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-real-harnesses" }}' "$NAME" 2>/dev/null || true)" = "true" ]
+}
+
+container_uses_tmpfs_stream_db() {
+  docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+    | grep -qx 'NEXUS_STREAM_DB_PATH=/dev/shm/nexus-stream.db'
+}
+
+container_uses_internal_gateway_port() {
+  docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+    | grep -qx "NEXUS_GATEWAY_PORT=$GATEWAY_INTERNAL_PORT"
+}
+
+container_uses_in_tree_gateway() {
+  docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+    | grep -qx 'NEXUS_GATEWAY_BIN=/work/egregore-nexus/gateway/scripts/nexus-gateway.mjs'
+}
+
+container_uses_split_stores() {
+  docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+    | grep -qx 'NEXUS_DB_PATH=/tmp/nexus-home/nexus.db' \
+    && docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+      | grep -qx 'NEXUS_GATEWAY_DB=file:/tmp/nexus-home/gateway.db' \
+    && ! docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+      | grep -q '^NEXUS_DB_URL='
+}
+
+container_uses_debug_stack() {
+  docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+    | grep -qx 'RUST_MIN_STACK=33554432'
+}
+
+container_uses_resource_limits() {
+  [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-test-cpus" }}' "$NAME" 2>/dev/null || true)" = "$CPUS" ] \
+    && [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-test-memory" }}' "$NAME" 2>/dev/null || true)" = "$MEMORY" ] \
+    && [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-test-pids-limit" }}' "$NAME" 2>/dev/null || true)" = "$PIDS_LIMIT" ]
+}
+
+container_uses_init_reaper() {
+  [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-test-init" }}' "$NAME" 2>/dev/null || true)" = "true" ]
+}
+
+container_uses_host_user() {
+  [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-test-user" }}' "$NAME" 2>/dev/null || true)" = "$HOST_UID:$HOST_GID" ]
+}
+
+container_mounts_host_bun() {
+  [ ! -d "$HOME/.bun" ] && return 0
+  docker container inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$NAME" 2>/dev/null \
+    | grep -qx "$HOME/.bun" \
+    && docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+      | grep -q "^PATH=.*$HOME/.bun/bin"
+}
+
+container_mounts_host_hermes() {
+  [ ! -d "$HOME/.hermes" ] && return 0
+  docker container inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$NAME" 2>/dev/null \
+    | grep -qx "$HOME/.hermes"
+}
+
+container_mounts_host_uv_python() {
+  [ ! -d "$HOME/.local/share/uv" ] && return 0
+  docker container inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$NAME" 2>/dev/null \
+    | grep -qx "$HOME/.local/share/uv"
+}
+
+build_image() {
+  docker build -f "$(dockerfile)" -t "$IMAGE" "$REPO/tools/docker"
+}
+
+ensure_image() {
+  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    build_image
+  fi
+}
+
+exec_bash() {
+  docker exec "$NAME" bash -c "$*"
+}
+
+exec_interactive() {
+  local tty_flags=()
+  if [ -t 0 ] && [ -t 1 ]; then
+    tty_flags=(-it)
+  else
+    tty_flags=(-i)
+  fi
+  docker exec "${tty_flags[@]}" -w /work/egregore-nexus "$NAME" "$@"
+}
+
+add_mount_if_dir() {
+  local args_name=$1
+  local src=$2
+  local dst=$3
+  local mode=${4:-ro}
+  if [ -d "$src" ]; then
+    eval "$args_name+=( -v \"\$src:\$dst:\$mode\" )"
+  fi
+}
+
+host_node_root() {
+  local claude_bin
+  claude_bin=$(command -v claude 2>/dev/null || true)
+  if [ -n "$claude_bin" ]; then
+    cd "$(dirname "$claude_bin")/.." && pwd
+  fi
+}
+
+ensure_harness_home_owned() {
+  # Older cached validator images created HOME as root. Repair the disposable directory on every
+  # reuse before the host-UID process copies OAuth state into it; this does not touch host auth.
+  docker exec --user 0:0 "$NAME" install -d -o "$HOST_UID" -g "$HOST_GID" -m 0700 /tmp/harness-home
+}
+
+prepare_host_harnesses() {
+  exec_bash 'set -euo pipefail
+    export NEXUS_STREAM_DB_PATH="${NEXUS_STREAM_DB_PATH:-/dev/shm/nexus-stream.db}"
+    rm -rf "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$HERMES_HOME" "$NEXUS_OPENCODE_HOME" \
+      "$HOME/.opencode" "$HOME/.config/opencode" "$HOME/.local/share/opencode"
+    mkdir -p "$HOME" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$HERMES_HOME" "$NEXUS_OPENCODE_HOME" "$XDG_RUNTIME_DIR" "$HOME/.config"
+
+    if [ -d /host-auth/.claude ]; then
+      for claude_file in .credentials.json settings.json settings.local.json CLAUDE.md; do
+        if [ -f "/host-auth/.claude/$claude_file" ]; then
+          cp -a "/host-auth/.claude/$claude_file" "$CLAUDE_CONFIG_DIR/$claude_file"
+        fi
+      done
+    fi
+    if [ -f /host-auth/.claude.json ]; then
+      cp -a /host-auth/.claude.json "$HOME/.claude.json"
+      cp -a /host-auth/.claude.json "$CLAUDE_CONFIG_DIR/.claude.json"
+    fi
+
+    # The validation container must use the copied first-party OAuth session,
+    # not host-local API/proxy overrides whose localhost is a different network
+    # namespace. Preserve the rest of the operator settings.
+    for settings in "$CLAUDE_CONFIG_DIR/settings.json" "$CLAUDE_CONFIG_DIR/settings.local.json"; do
+      if [ -f "$settings" ]; then
+        sanitized="${settings}.nexus-sanitized"
+        jq "
+          if (.env | type) == \"object\" then
+            del(.env.ANTHROPIC_BASE_URL,
+                .env.ANTHROPIC_API_KEY,
+                .env.ANTHROPIC_AUTH_TOKEN,
+                .env.CLAUDE_CODE_USE_BEDROCK,
+                .env.CLAUDE_CODE_USE_VERTEX,
+                .env.CLAUDE_CODE_USE_FOUNDRY)
+          else . end
+        " "$settings" > "$sanitized"
+        mv "$sanitized" "$settings"
+      fi
+    done
+
+    if [ -d /host-auth/.codex ]; then
+      mkdir -p "$CODEX_HOME"
+      for f in auth.json config.toml AGENTS.md version.json hooks.json models_cache.json; do
+        [ -e "/host-auth/.codex/$f" ] && cp -a "/host-auth/.codex/$f" "$CODEX_HOME"/ || true
+      done
+      for d in skills prompts agents; do
+        [ -d "/host-auth/.codex/$d" ] && cp -a "/host-auth/.codex/$d" "$CODEX_HOME"/ || true
+      done
+    fi
+
+    if [ -d /host-auth/opencode-config ]; then
+      mkdir -p "$HOME/.config/opencode"
+      [ -f /host-auth/opencode-config/opencode.jsonc ] \
+        && cp -a /host-auth/opencode-config/opencode.jsonc "$HOME/.config/opencode/opencode.jsonc"
+    fi
+    if [ -d /host-auth/opencode-share ]; then
+      mkdir -p "$HOME/.local/share/opencode"
+      for opencode_file in auth.json account.json; do
+        if [ -f "/host-auth/opencode-share/$opencode_file" ]; then
+          cp -a "/host-auth/opencode-share/$opencode_file" \
+            "$HOME/.local/share/opencode/$opencode_file"
+        fi
+      done
+    fi
+
+    if [ -d /host-auth/hermes ]; then
+      for hermes_file in auth.json config.yaml models.json provider_models_cache.json context_length_cache.yaml; do
+        if [ -f "/host-auth/hermes/$hermes_file" ]; then
+          cp -a "/host-auth/hermes/$hermes_file" "$HERMES_HOME/$hermes_file"
+        fi
+      done
+    fi'
+}
+
+container_env_summary() {
+  cat <<EOF
+container: $NAME
+gateway:   http://127.0.0.1:$HOST_PORT
+proxy:     0.0.0.0:$CONTAINER_PORT -> 127.0.0.1:$GATEWAY_INTERNAL_PORT (inside container)
+pid:       /tmp/nexus-home/daemon.pid (inside container)
+identity:  /tmp/nexus-home/nexus.db (daemon identity/continuity only)
+gateway:   /tmp/nexus-home/gateway.db (canonical product history)
+ownership: split daemon/Gateway embedded SQLite
+stream db: /dev/shm/nexus-stream.db (inside container)
+logs:      /tmp/nexus-home/daemon.log (inside container)
+real CLIs: $(container_real_harnesses && echo "mounted/copied" || echo "not mounted")
+
+Connect:
+  open http://127.0.0.1:$HOST_PORT
+  scripts/nexus-docker-test-env shell
+  scripts/nexus-docker-test-env nexus -- daemon status
+  scripts/nexus-docker-test-env locks
+  scripts/nexus-docker-test-env nexus -- launch claude --name docker-claude --detach
+  scripts/nexus-docker-test-env logs
+
+Stop:
+  scripts/nexus-docker-test-env down
+EOF
+}
+
+wait_for_daemon() {
+  for _ in $(seq 1 160); do
+    if docker exec "$NAME" bash -c \
+      "pid=\$(cat /tmp/nexus-home/daemon.pid 2>/dev/null || true); proxy=\$(cat /tmp/nexus-home/gateway-proxy.pid 2>/dev/null || true); test -n \"\$pid\" && kill -0 \"\$pid\" 2>/dev/null && test -n \"\$proxy\" && kill -0 \"\$proxy\" 2>/dev/null && curl -fsS \"http://127.0.0.1:$CONTAINER_PORT/api/v1/health\" >/dev/null" \
+      >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  docker exec "$NAME" bash -c 'cat /tmp/nexus-home/daemon.log 2>/dev/null || true' >&2 || true
+  die "isolated daemon/gateway did not become ready"
+}
+
+# Pidfile liveness still rejects zombies explicitly even though Docker's tiny init reaps orphaned
+# children. This keeps the lifecycle probe correct during the short interval before PID 1 collects
+# a crashed daemon, preventing a zombie from being reported as alive.
+PIDFILE_ALIVE='pidfile_alive() {
+    pid=$(cat "$1" 2>/dev/null || true)
+    [ -n "$pid" ] || return 1
+    state=$(ps -o stat= -p "$pid" 2>/dev/null || true)
+    case "$state" in ""|Z*) return 1 ;; *) return 0 ;; esac
+  }'
+
+start_gateway_proxy() {
+  exec_bash "set -euo pipefail
+    $PIDFILE_ALIVE
+    mkdir -p \"\$NEXUS_HOME\"
+    if pidfile_alive /tmp/nexus-home/gateway-proxy.pid; then
+      exit 0
+    fi
+    nohup socat TCP-LISTEN:$CONTAINER_PORT,fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:$GATEWAY_INTERNAL_PORT > /tmp/nexus-home/gateway-proxy.log 2>&1 &
+    echo \"\$!\" > /tmp/nexus-home/gateway-proxy.pid"
+}
+
+start_daemon() {
+  exec_bash "set -euo pipefail
+    $PIDFILE_ALIVE
+    export NEXUS_STREAM_DB_PATH=\"\${NEXUS_STREAM_DB_PATH:-/dev/shm/nexus-stream.db}\"
+    export NEXUS_DB_PATH=\"\${NEXUS_DB_PATH:-/tmp/nexus-home/nexus.db}\"
+    # Debug-build daemons overflow the default 2MB tokio worker stacks at boot (
+    # deep poll chains; release unaffected). Without this the daemon aborts within
+    # seconds of a cold container boot.
+    export RUST_MIN_STACK=33554432
+    mkdir -p \"\$NEXUS_HOME\" \"\$HOME\" \"\$CODEX_HOME\" \"\$CLAUDE_CONFIG_DIR\" \"\$HERMES_HOME\" \"\$NEXUS_OPENCODE_HOME\" \"\$XDG_RUNTIME_DIR\" /dev/shm
+    if pidfile_alive /tmp/nexus-home/daemon.pid; then
+      exit 0
+    fi
+    cd /work/egregore-nexus
+    nohup /tmp/nexus-target/debug/nexus daemon > /tmp/nexus-home/daemon.log 2>&1 &
+    echo \"\$!\" > /tmp/nexus-home/daemon.pid"
+}
+
+start_gateway() {
+  exec_bash "set -euo pipefail
+    $NEXUS_BIN gateway restart >/tmp/nexus-home/gateway-start.log"
+}
+
+cmd_build() {
+  build_image
+}
+
+cmd_up() {
+  [ $# -eq 0 ] || die "up does not take flags; host harness CLI access is the default"
+  local with_host_harnesses=1
+
+  # Reusing the sole validation container must not start a transient image-probe
+  # container alongside it. Only inspect/build the image when no container exists.
+  if ! container_exists; then
+    ensure_image
+  fi
+  if container_exists; then
+    if [ "$with_host_harnesses" = "1" ] && ! container_real_harnesses; then
+      echo "recreating $NAME with host harness mounts"
+      docker rm -f "$NAME" >/dev/null
+    elif [ "$with_host_harnesses" = "0" ] && container_real_harnesses; then
+      echo "recreating $NAME without host harness mounts"
+      docker rm -f "$NAME" >/dev/null
+    elif ! container_uses_tmpfs_stream_db; then
+      echo "recreating $NAME with tmpfs stream DB configuration"
+      docker rm -f "$NAME" >/dev/null
+    elif ! container_uses_internal_gateway_port; then
+      echo "recreating $NAME with proxied gateway port configuration"
+      docker rm -f "$NAME" >/dev/null
+    elif ! container_uses_in_tree_gateway; then
+      echo "recreating $NAME with the in-tree gateway package"
+      docker rm -f "$NAME" >/dev/null
+    elif ! container_uses_split_stores; then
+      echo "recreating $NAME with split daemon/Gateway store configuration"
+      docker rm -f "$NAME" >/dev/null
+    elif ! container_uses_debug_stack; then
+      echo "recreating $NAME with the debug daemon stack bound inherited by lifecycle children"
+      docker rm -f "$NAME" >/dev/null
+    elif ! container_uses_resource_limits; then
+      echo "recreating $NAME with CPU, memory, and process limits"
+      docker rm -f "$NAME" >/dev/null
+    elif ! container_uses_init_reaper; then
+      echo "recreating $NAME with Docker init child reaping"
+      docker rm -f "$NAME" >/dev/null
+    elif ! container_uses_host_user; then
+      echo "recreating $NAME as the host user for OAuth harness compatibility"
+      docker rm -f "$NAME" >/dev/null
+    elif [ "$with_host_harnesses" = "1" ] && ! container_mounts_host_bun; then
+      echo "recreating $NAME with host Bun mount"
+      docker rm -f "$NAME" >/dev/null
+    elif [ "$with_host_harnesses" = "1" ] && ! container_mounts_host_hermes; then
+      echo "recreating $NAME with host Hermes mount"
+      docker rm -f "$NAME" >/dev/null
+    elif [ "$with_host_harnesses" = "1" ] && ! container_mounts_host_uv_python; then
+      echo "recreating $NAME with host UV Python mount"
+      docker rm -f "$NAME" >/dev/null
+    fi
+  fi
+
+  if container_exists; then
+    if ! container_running; then
+      docker start "$NAME" >/dev/null
+    fi
+  else
+    local run_args=()
+    local real_label=false
+    local path_env="/tmp/nexus-target/debug:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    if [ "$with_host_harnesses" = "1" ]; then
+      real_label=true
+      local node_root
+      node_root=$(host_node_root || true)
+      [ -n "$node_root" ] && add_mount_if_dir run_args "$node_root" /host-node ro && path_env="/tmp/nexus-target/debug:/usr/local/cargo/bin:/host-node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      add_mount_if_dir run_args "$HOME/.cargo/bin" /host-cargo-bin ro && path_env="$path_env:/host-cargo-bin"
+      add_mount_if_dir run_args "$HOME/.local/bin" /host-local-bin ro && path_env="$path_env:/host-local-bin"
+      add_mount_if_dir run_args "$HOME/.bun" "$HOME/.bun" ro
+      path_env="$path_env:$HOME/.bun/bin"
+      add_mount_if_dir run_args "$HOME/.hermes" "$HOME/.hermes" ro
+      add_mount_if_dir run_args "$HOME/.local/share/uv" "$HOME/.local/share/uv" ro
+      add_mount_if_dir run_args "$HOME/.claude" /host-auth/.claude ro
+      [ -f "$HOME/.claude.json" ] && run_args+=( -v "$HOME/.claude.json:/host-auth/.claude.json:ro" )
+      add_mount_if_dir run_args "$HOME/.codex" /host-auth/.codex ro
+      add_mount_if_dir run_args "$HOME/.opencode" /host-auth/.opencode ro
+      add_mount_if_dir run_args "$HOME/.config/opencode" /host-auth/opencode-config ro
+      add_mount_if_dir run_args "$HOME/.local/share/opencode" /host-auth/opencode-share ro
+      add_mount_if_dir run_args "$HOME/.hermes" /host-auth/hermes ro
+    fi
+
+    docker run -d \
+      --init \
+      --user "$HOST_UID:$HOST_GID" \
+      --name "$NAME" \
+      --label egregore-nexus-test=true \
+      --label "egregore-nexus-real-harnesses=$real_label" \
+      --label "egregore-nexus-test-cpus=$CPUS" \
+      --label "egregore-nexus-test-memory=$MEMORY" \
+      --label "egregore-nexus-test-pids-limit=$PIDS_LIMIT" \
+      --label "egregore-nexus-test-init=true" \
+      --label "egregore-nexus-test-user=$HOST_UID:$HOST_GID" \
+      --cpus "$CPUS" \
+      --memory "$MEMORY" \
+      --memory-swap "$MEMORY" \
+      --pids-limit "$PIDS_LIMIT" \
+      -p "127.0.0.1:$HOST_PORT:$CONTAINER_PORT" \
+      -e "PATH=$path_env" \
+      -e "NEXUS_DB_PATH=/tmp/nexus-home/nexus.db" \
+      -e "NEXUS_GATEWAY_DB=file:/tmp/nexus-home/gateway.db" \
+      -e "NEXUS_STREAM_DB_PATH=/dev/shm/nexus-stream.db" \
+      -e "ANTHROPIC_MODEL=$CLAUDE_MODEL" \
+      -e "RUST_MIN_STACK=33554432" \
+      -e "NEXUS_GATEWAY_BIND=127.0.0.1" \
+      -e "NEXUS_GATEWAY_PORT=$GATEWAY_INTERNAL_PORT" \
+      -e "NEXUS_GATEWAY_BIN=/work/egregore-nexus/gateway/scripts/nexus-gateway.mjs" \
+      -v "$REPO:/work/egregore-nexus:rw" \
+      "${run_args[@]}" \
+      -w /work/egregore-nexus \
+      "$IMAGE" \
+      sleep infinity >/dev/null
+  fi
+
+  if [ "$with_host_harnesses" = "1" ]; then
+    ensure_harness_home_owned
+    prepare_host_harnesses
+  fi
+
+  exec_bash 'set -euo pipefail
+    export NEXUS_STREAM_DB_PATH="${NEXUS_STREAM_DB_PATH:-/dev/shm/nexus-stream.db}"
+    mkdir -p "$NEXUS_HOME" "$HOME" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$HERMES_HOME" "$NEXUS_OPENCODE_HOME" "$XDG_RUNTIME_DIR" /dev/shm
+    repo_owner="$(stat -c "%u:%g" /work/egregore-nexus)"
+    chown -R "$repo_owner" /work/egregore-nexus/gateway/node_modules /work/egregore-nexus/gateway/dist /work/egregore-nexus/.pnpm-store 2>/dev/null || true
+    cd /work/egregore-nexus/core
+    CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" cargo build -p egregore-nexus
+    cd /work/egregore-nexus/gateway
+    CI=true pnpm install --frozen-lockfile --config.confirmModulesPurge=false
+    CI=true pnpm build
+    chown -R "$repo_owner" /work/egregore-nexus/gateway/node_modules /work/egregore-nexus/gateway/dist /work/egregore-nexus/.pnpm-store 2>/dev/null || true'
+  start_gateway_proxy
+  start_daemon
+  start_gateway
+  wait_for_daemon
+  container_env_summary
+}
+
+cmd_status() {
+  container_running || die "container $NAME is not running"
+  exec_bash '/tmp/nexus-target/debug/nexus daemon status'
+  printf '\nSplit store ownership:\n'
+  exec_bash 'printf "identity=%s\ngateway=%s\n" "$NEXUS_DB_PATH" "$NEXUS_GATEWAY_DB"; test -z "${NEXUS_DB_URL:-}"'
+  printf '\nGateway health:\n'
+  exec_bash "curl -fsS http://127.0.0.1:$CONTAINER_PORT/api/v1/health && echo"
+  printf '\nHarness CLI visibility:\n'
+  exec_bash 'for bin in claude codex opencode hermes; do printf "%-8s " "$bin"; command -v "$bin" || true; done'
+}
+
+cmd_shell() {
+  container_running || die "container $NAME is not running"
+  exec_interactive bash
+}
+
+cmd_nexus() {
+  container_running || die "container $NAME is not running"
+  if [ "${1:-}" = "--" ]; then
+    shift
+  fi
+  exec_interactive "$NEXUS_BIN" "$@"
+}
+
+cmd_smoke() {
+  container_running || die "container $NAME is not running"
+  exec_bash "set -euo pipefail
+    test \"\$NEXUS_DB_PATH\" = /tmp/nexus-home/nexus.db
+    test \"\$NEXUS_GATEWAY_DB\" = file:/tmp/nexus-home/gateway.db
+    test -z \"\${NEXUS_DB_URL:-}\"
+    /tmp/nexus-target/debug/nexus daemon status >/tmp/nexus-home/smoke-status.txt
+    curl -fsS http://127.0.0.1:$CONTAINER_PORT/api/v1/health >/tmp/nexus-home/smoke-health.json
+    NEXUS_NAME=docker-operator NEXUS_AGENT=other NEXUS_PROJECT=docker NEXUS_CLIENT_KEY=ck_docker_operator \
+      /tmp/nexus-target/debug/nexus register --name docker-operator --agent other --project docker --client-key ck_docker_operator >/tmp/nexus-home/smoke-register.txt
+    NEXUS_NAME=docker-operator NEXUS_AGENT=other NEXUS_PROJECT=docker NEXUS_CLIENT_KEY=ck_docker_operator \
+      /tmp/nexus-target/debug/nexus whoami >/tmp/nexus-home/smoke-whoami.txt
+    NEXUS_NAME=docker-operator NEXUS_AGENT=other NEXUS_PROJECT=docker NEXUS_CLIENT_KEY=ck_docker_operator \
+      /tmp/nexus-target/debug/nexus members --include-offline >/tmp/nexus-home/smoke-members.txt
+    cat /tmp/nexus-home/smoke-health.json
+    echo
+    cat /tmp/nexus-home/smoke-whoami.txt
+    cat /tmp/nexus-home/smoke-members.txt"
+}
+
+cmd_locks() {
+  container_running || die "container $NAME is not running"
+  exec_bash 'python3 - <<'"'"'PY'"'"'
+import json
+import os
+import sys
+from pathlib import Path
+
+identity_path = Path(os.environ.get("NEXUS_DB_PATH", "/tmp/nexus-home/nexus.db"))
+gateway_url = os.environ.get("NEXUS_GATEWAY_DB", "file:/tmp/nexus-home/gateway.db")
+gateway_path = Path(gateway_url.removeprefix("file:"))
+if not identity_path.exists():
+    raise SystemExit(f"identity db file missing: {identity_path}")
+if not gateway_path.exists():
+    raise SystemExit(f"gateway db file missing: {gateway_path}")
+
+gateway_pids: list[int] = []
+for proc in Path("/proc").iterdir():
+    if not proc.name.isdigit():
+        continue
+    try:
+        cmdline = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+        executable = Path(os.readlink(proc / "exe")).name
+    except OSError:
+        continue
+    if executable in {"node", "bun"} and any(marker in cmdline for marker in (
+        "scripts/gateway-serve.mjs",
+        "src/server/gateway/headless.ts",
+        "gateway/scripts/nexus-gateway.mjs",
+        "dist-gateway/headless.mjs",
+    )):
+        gateway_pids.append(int(proc.name))
+
+if not gateway_pids:
+    raise SystemExit("gateway process not found")
+
+db_real = str(identity_path.resolve())
+gateway_real = str(gateway_path.resolve())
+fd_hits: list[str] = []
+canonical_hits: list[str] = []
+for pid in gateway_pids:
+    fd_dir = Path("/proc") / str(pid) / "fd"
+    try:
+        fds = list(fd_dir.iterdir())
+    except OSError:
+        continue
+    for fd in fds:
+        try:
+            target = os.readlink(fd)
+        except OSError:
+            continue
+        if target == db_real or target.startswith(f"{db_real} "):
+            fd_hits.append(f"{pid}:{fd.name}->{target}")
+        if target == gateway_real or target.startswith(f"{gateway_real} "):
+            canonical_hits.append(f"{pid}:{fd.name}->{target}")
+
+db_inode = str(identity_path.stat().st_ino)
+lock_hits: list[str] = []
+try:
+    lock_lines = Path("/proc/locks").read_text(encoding="utf-8").splitlines()
+except OSError:
+    lock_lines = []
+for line in lock_lines:
+    parts = line.split()
+    if len(parts) < 6:
+        continue
+    lock_kind = parts[1]
+    try:
+        pid = int(parts[4])
+    except ValueError:
+        continue
+    device_inode = parts[5]
+    if lock_kind == "POSIX" and pid in gateway_pids and device_inode.endswith(f":{db_inode}"):
+        lock_hits.append(line)
+
+print(f"identity_db_path={db_real}")
+print(f"gateway_db_path={gateway_real}")
+db_url = os.environ.get("NEXUS_DB_URL", "")
+print(f"db_url={db_url}")
+gateway_pid_list = ",".join(str(pid) for pid in gateway_pids)
+print(f"gateway_pids={gateway_pid_list}")
+print(f"gateway_db_fds={len(fd_hits)}")
+print(f"gateway_posix_db_locks={len(lock_hits)}")
+print(f"gateway_canonical_store_fds={len(canonical_hits)}")
+
+if db_url:
+    print("legacy direct-store URL is present in the embedded fixture", file=sys.stderr)
+if not canonical_hits:
+    print("packaged Gateway process has no canonical Gateway store handle", file=sys.stderr)
+if db_url or fd_hits or lock_hits or not canonical_hits:
+    if fd_hits:
+        print("gateway_db_fd_hits=" + json.dumps(fd_hits), file=sys.stderr)
+    if lock_hits:
+        print("gateway_posix_db_lock_hits=" + json.dumps(lock_hits), file=sys.stderr)
+    raise SystemExit(1)
+PY'
+}
+
+cmd_logs() {
+  container_running || die "container $NAME is not running"
+  docker exec -it "$NAME" bash -c 'tail -n 200 -f /tmp/nexus-home/daemon.log'
+}
+
+cmd_down() {
+  if container_exists; then
+    docker rm -f "$NAME" >/dev/null
+    echo "removed $NAME"
+  else
+    echo "container $NAME does not exist"
+  fi
+}
+
+cmd_clean() {
+  docker ps -a \
+    --filter label=egregore-nexus-test=true \
+    --filter status=exited \
+    --format '{{.Names}}' \
+    | xargs -r docker rm >/dev/null
+}
+
+case "${1:-}" in
+  build) shift; cmd_build "$@" ;;
+  up) shift; cmd_up "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  shell) shift; cmd_shell "$@" ;;
+  nexus) shift; cmd_nexus "$@" ;;
+  smoke) shift; cmd_smoke "$@" ;;
+  locks) shift; cmd_locks "$@" ;;
+  logs) shift; cmd_logs "$@" ;;
+  down) shift; cmd_down "$@" ;;
+  clean) shift; cmd_clean "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) usage >&2; die "unknown command: $1" ;;
+esac

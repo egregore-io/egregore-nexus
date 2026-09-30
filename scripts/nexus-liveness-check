@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""nexus-liveness-check — fleet liveness validator.
+
+For every session the store believes is online, verify it is ACTUALLY alive:
+  heartbeat age  — store claim (fresh < 90s)
+  tmux socket    — headed runtimes: does the deterministic socket + session exist?
+  process        — is any process still bound to the session's client key / MCP?
+
+Verdicts:
+  LIVE        heartbeat fresh AND substrate (socket/process) present
+  DEGRADED    heartbeat fresh but substrate missing (heartbeats from a ghost lane — dean/oscar class)
+  STALE       presence=online but heartbeat old (presence-decay, bug #5 class)
+  GHOST       substrate present but heartbeat old (process alive, bus-dead)
+
+Usage: scripts/nexus-liveness-check [--all] [--db PATH] [--now-ms N]
+Exit 1 if any non-LIVE among online rows.
+"""
+import argparse
+import os
+import sqlite3
+import subprocess
+import sys
+import time
+
+DEFAULT_DB = os.path.expanduser("~/.nexus/nexus.db")
+FRESH_MS = 90_000
+
+
+def tmux_alive(session_id: str):
+    sock = f"/tmp/nexus-tmux-nexus-{session_id}.sock"
+    if not os.path.exists(sock):
+        return None  # no socket — headless/plugin transport, not applicable
+    try:
+        r = subprocess.run(["tmux", "-S", sock, "has-session"],
+                           capture_output=True, timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def proc_bound(client_key: str, name: str):
+    if not client_key:
+        return None
+    try:
+        out = subprocess.run(["pgrep", "-af", client_key],
+                             capture_output=True, text=True, timeout=5).stdout
+        return bool([l for l in out.splitlines() if "pgrep" not in l])
+    except Exception:
+        return None
+
+
+def safe_path_component(value):
+    safe = "".join(
+        ch if ch.isalnum() or ch in "._-" else "_"
+        for ch in str(value or "")
+    )
+    return safe or "_"
+
+
+def opencode_acp_db_paths(cwd: str, project: str, name: str):
+    if not cwd:
+        return []
+    cwd_real = os.path.realpath(os.path.expanduser(cwd))
+    root = os.path.join(cwd_real, ".nexus", "opencode")
+    paths = []
+    if project and name:
+        paths.append(
+            os.path.join(
+                root,
+                "acp",
+                safe_path_component(project),
+                safe_path_component(name),
+                "opencode.db",
+            )
+        )
+    paths.append(os.path.join(root, "opencode.db"))
+    return paths
+
+
+def opencode_acp_proc_bound(cwd: str, project: str, harness_session_id: str, client_key: str, name: str):
+    candidates = []
+    cwd_real = os.path.realpath(os.path.expanduser(cwd)) if cwd else None
+    expected_dbs = opencode_acp_db_paths(cwd, project, name)
+    for pid in proc_ids():
+        cmd = proc_text(pid, "cmdline")
+        if not cmd:
+            continue
+        parts = cmd.split("\0")
+        if not any(part.endswith("opencode") or part == "opencode" for part in parts):
+            continue
+        if "acp" not in parts:
+            continue
+        env = proc_env(pid)
+        env_db = env.get("OPENCODE_DB")
+        env_config = env.get("OPENCODE_CONFIG_CONTENT", "")
+        if env_db and os.path.realpath(env_db) in expected_dbs:
+            candidates.append(pid)
+            continue
+        if client_key and client_key in env_config:
+            candidates.append(pid)
+            continue
+        if name and f'"{name}"' in env_config:
+            candidates.append(pid)
+            continue
+        if cwd_real and proc_cwd(pid) == cwd_real:
+            candidates.append(pid)
+    if candidates:
+        return True
+    if harness_session_id and any(os.path.exists(path) for path in expected_dbs):
+        # The native session exists, but no ACP process is bound to its launch-local DB/env.
+        return False
+    return None
+
+
+def proc_ids():
+    try:
+        return [pid for pid in os.listdir("/proc") if pid.isdigit()]
+    except Exception:
+        return []
+
+
+def proc_text(pid: str, name: str):
+    try:
+        with open(os.path.join("/proc", pid, name), "rb") as f:
+            return f.read().decode(errors="ignore")
+    except Exception:
+        return None
+
+
+def proc_env(pid: str):
+    raw = proc_text(pid, "environ")
+    if not raw:
+        return {}
+    env = {}
+    for item in raw.split("\0"):
+        if "=" in item:
+            key, value = item.split("=", 1)
+            env[key] = value
+    return env
+
+
+def proc_cwd(pid: str):
+    try:
+        return os.path.realpath(os.readlink(os.path.join("/proc", pid, "cwd")))
+    except Exception:
+        return None
+
+
+def table_columns(con, table):
+    return [row[1] for row in con.execute(f"PRAGMA table_info({table})")]
+
+
+def offline_exclusions(con):
+    rows = con.execute(
+        "SELECT name, agent FROM sessions WHERE presence = 'offline' ORDER BY name"
+    ).fetchall()
+    if not rows:
+        return
+    names = ", ".join(f"{name}/{agent or '-'}" for name, agent in rows[:12])
+    suffix = "..." if len(rows) > 12 else ""
+    print(
+        f"NOTE: excluding {len(rows)} offline session(s) from verdict; use --all to inspect: {names}{suffix}"
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--all", action="store_true", help="include offline sessions")
+    parser.add_argument("--db", default=DEFAULT_DB, help="nexus.db path")
+    parser.add_argument("--now-ms", type=int, default=None, help="test-only clock override")
+    args = parser.parse_args()
+
+    con = sqlite3.connect(f"file:{os.path.expanduser(args.db)}?mode=ro", uri=True)
+    cols = table_columns(con, "sessions")
+    wanted = [
+        "name",
+        "session_id",
+        "agent",
+        "transport",
+        "presence",
+        "last_heartbeat",
+        "client_key",
+        "cwd",
+        "project",
+        "harness_session_id",
+    ]
+    select_cols = [col for col in wanted if col in cols]
+    q = f"SELECT {', '.join(select_cols)} FROM sessions"
+    if not args.all:
+        offline_exclusions(con)
+        q += " WHERE presence != 'offline'"
+    now = args.now_ms if args.now_ms is not None else int(time.time() * 1000)
+    bad = 0
+    print(f"{'NAME':<12} {'HARNESS':<9} {'TRANSPORT':<16} {'HEARTBEAT':<12} {'TMUX':<6} {'PROC':<6} VERDICT")
+    for raw in con.execute(q + " ORDER BY name"):
+        row = dict(zip(select_cols, raw))
+        name = row.get("name")
+        sid = row.get("session_id")
+        harness = row.get("agent")
+        transport = row.get("transport")
+        presence = row.get("presence")
+        hb = row.get("last_heartbeat")
+        ck = row.get("client_key")
+        hb_fresh = hb is not None and (now - hb) < FRESH_MS
+        hb_txt = f"{(now-hb)/1000:.0f}s ago" if hb else "never"
+        tm = tmux_alive(sid)
+        pr = None
+        if (harness or "") == "opencode" and (transport or "") == "acp":
+            pr = opencode_acp_proc_bound(
+                row.get("cwd"),
+                row.get("project"),
+                row.get("harness_session_id"),
+                ck,
+                name,
+            )
+        if pr is None:
+            pr = proc_bound(ck, name)
+        tm_txt = {True: "ok", False: "DEAD", None: "n/a"}[tm]
+        pr_txt = {True: "ok", False: "GONE", None: "n/a"}[pr]
+
+        substrate = (tm if tm is not None else pr)
+        if presence == "offline" and substrate is not True:
+            verdict = "OFFLINE"
+        elif hb_fresh and substrate in (True, None):
+            verdict = "LIVE"
+        elif hb_fresh:
+            verdict, bad = "🟡 DEGRADED (ghost lane — dean/oscar class)", bad + 1
+        elif substrate is True:
+            verdict, bad = "🟠 GHOST (process alive, bus-dead)", bad + 1
+        else:
+            verdict, bad = "🔴 STALE (presence-decay, bug #5)", bad + 1
+        print(f"{name:<12} {harness or '-':<9} {transport or '-':<16} {hb_txt:<12} {tm_txt:<6} {pr_txt:<6} {verdict}")
+
+    print(f"\n{'⚠ ' + str(bad) + ' session(s) not cleanly LIVE' if bad else '✅ every online session verified live'}")
+    sys.exit(1 if bad else 0)
+
+
+if __name__ == "__main__":
+    main()

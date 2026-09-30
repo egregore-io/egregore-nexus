@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Reject duplicate Rust binary target names across the Cargo workspace."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+
+repo_root = Path(__file__).resolve().parent.parent
+core_root = repo_root / "core"
+
+result = subprocess.run(
+    ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+    cwd=core_root,
+    check=True,
+    capture_output=True,
+    text=True,
+)
+metadata = json.loads(result.stdout)
+
+owners: dict[str, list[tuple[str, str]]] = defaultdict(list)
+for package in metadata["packages"]:
+    for target in package["targets"]:
+        if "bin" in target["kind"]:
+            owners[target["name"]].append((package["name"], target["src_path"]))
+
+duplicates = {name: entries for name, entries in owners.items() if len(entries) > 1}
+if duplicates:
+    print("FAIL Cargo target-name gate: duplicate binary target names found.", file=sys.stderr)
+    for name, entries in sorted(duplicates.items()):
+        print(f"  {name}", file=sys.stderr)
+        for package, source in entries:
+            print(f"    {package}: {source}", file=sys.stderr)
+    print(
+        "Cargo places workspace binaries in one output directory; give every binary target a "
+        "workspace-unique name.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+print("PASS Cargo target-name gate: every workspace binary target name is unique.")

@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Require release entrypoint help to be successful and side-effect free."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import tempfile
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+ENTRYPOINTS = (
+    "scripts/check",
+    "scripts/nexus-architecture-ownership-gate",
+    "scripts/nexus-core-test-layout-gate",
+    "scripts/nexus-daemon-lifecycle-acceptance",
+    "scripts/nexus-docker-test-env",
+    "scripts/nexus-endurance-watchdog",
+    "scripts/nexus-gateway-architecture-integration",
+    "scripts/nexus-listener-soak-gate",
+    "scripts/nexus-liveness-check",
+    "scripts/nexus-load-gate",
+    "scripts/nexus-notify-smoke",
+    "scripts/nexus-pack-native-npm",
+    "scripts/nexus-three-facet-package-smoke",
+    "scripts/nexus-v01-release-validation",
+    "scripts/nexus-v010-endurance-gate",
+    "scripts/nexus-v010-release-identity-gate",
+    "scripts/nexus-v010-release-evidence",
+    "scripts/nexus-v010-resurrection-gate",
+    "scripts/nexus-v010-resurrection-run",
+    "scripts/nexus-v010-ws-cutoff-gate",
+    "scripts/nexus-webui-screenshot.mjs",
+)
+SIDE_EFFECT_COMMANDS = (
+    "cargo",
+    "chromium",
+    "curl",
+    "docker",
+    "nexus",
+    "npm",
+    "pkill",
+    "pnpm",
+    "tmux",
+)
+
+
+def install_sentinel_commands(bin_dir: Path, log: Path) -> None:
+    body = (
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$(basename \"$0\") $*\" >> {str(log)!r}\n"
+        "exit 99\n"
+    )
+    for command in SIDE_EFFECT_COMMANDS:
+        path = bin_dir / command
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+
+
+def main() -> int:
+    failures: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="nexus-help-contract-") as raw:
+        temporary = Path(raw)
+        bin_dir = temporary / "bin"
+        home = temporary / "home"
+        bin_dir.mkdir()
+        home.mkdir()
+        sentinel = temporary / "side-effects.log"
+        install_sentinel_commands(bin_dir, sentinel)
+        base_env = {
+            **os.environ,
+            "HOME": str(home),
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "NEXUS_HOME": str(home / ".nexus"),
+            "NEXUS_NOTIFY_STATE": str(home / "notify-state.json"),
+            "NEXUS_ENDURANCE_CONTAINER": "help-contract-do-not-touch",
+            "NEXUS_VALIDATION_CONTAINER": "help-contract-do-not-touch",
+        }
+
+        for relative in ENTRYPOINTS:
+            sentinel.unlink(missing_ok=True)
+            entrypoint = ROOT / relative
+            result = subprocess.run(
+                [str(entrypoint), "--help"],
+                cwd=ROOT,
+                env=base_env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+            output = (result.stdout + result.stderr).strip()
+            if result.returncode != 0:
+                failures.append(
+                    f"{relative}: --help exited {result.returncode}: {output[-240:]!r}"
+                )
+            if not output:
+                failures.append(f"{relative}: --help produced no usage text")
+            if sentinel.exists():
+                failures.append(
+                    f"{relative}: --help invoked side-effect command(s): "
+                    f"{sentinel.read_text(encoding='utf-8').strip()!r}"
+                )
+
+    if failures:
+        print("FAIL release entrypoint help contract")
+        for failure in failures:
+            print(f"- {failure}")
+        return 1
+    print(f"PASS release entrypoint help contract: {len(ENTRYPOINTS)} entrypoints")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

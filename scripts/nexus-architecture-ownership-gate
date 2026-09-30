@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# Enforce the Nexus daemon/Gateway/WebUI process and storage ownership boundary.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/nexus-architecture-ownership-gate [REPO_ROOT]
+
+Checks the daemon, Gateway, and WebUI process and storage ownership boundary.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+cd "$ROOT"
+
+if ! command -v rg >/dev/null 2>&1; then
+  echo "error: rg is required for the architecture ownership gate" >&2
+  exit 2
+fi
+
+violations=0
+
+scan() {
+  local label="$1"
+  local pattern="$2"
+  shift 2
+
+  local -a paths=()
+  local candidate
+  for candidate in "$@"; do
+    [[ -e "$candidate" ]] && paths+=("$candidate")
+  done
+  ((${#paths[@]})) || return 0
+
+  local matches status
+  set +e
+  matches="$(
+    rg --color never --line-number --ignore-case \
+      --glob '*.{ts,tsx,js,mjs,mts,cjs,rs,json}' \
+      --glob '!**/*.test.*' \
+      --glob '!**/*.spec.*' \
+      --glob '!**/test/**' \
+      --glob '!**/tests/**' \
+      --glob '!**/__tests__/**' \
+      --glob '!gateway/src/routes/api/**' \
+      --glob '!**/routeTree.gen.ts' \
+      --glob '!**/dist/**' \
+      --glob '!**/node_modules/**' \
+      -e "$pattern" \
+      "${paths[@]}" 2>&1
+  )"
+  status=$?
+  set -e
+
+  if [[ "$status" -eq 0 ]]; then
+    local emitted=0 source
+    while IFS= read -r match; do
+      [[ -n "$match" ]] || continue
+      source="${match#*:*:}"
+      if [[ "$source" =~ ^[[:space:]]*(//|/\*|\*|#) ]]; then
+        continue
+      fi
+      printf 'VIOLATION [%s] %s\n' "$label" "$match"
+      emitted=1
+    done <<<"$matches"
+    ((emitted)) && violations=1
+    return 0
+  fi
+  if [[ "$status" -ne 1 ]]; then
+    printf 'error: rg failed during %s scan\n%s\n' "$label" "$matches" >&2
+    exit "$status"
+  fi
+}
+
+webui_paths=(gateway/src/app gateway/src/modules gateway/src/routes)
+runtime_paths=(core/crates/nexus/src gateway/src/server gateway/scripts)
+gateway_server_paths=(gateway/src/server gateway/scripts)
+
+scan \
+  webui-daemon-dependency \
+  '(@server/daemon|@drizzle/client|@server/messagePost/commandIngress|daemon[/_-]ipc|command[/_-]ingress)' \
+  "${webui_paths[@]}"
+
+scan \
+  webui-daemon-configuration \
+  '(NEXUS_HOME|NEXUS_DAEMON_SOCKET|NEXUS_DAEMON_MANIFEST|NEXUS_MANIFEST_PATH|NEXUS_DB_PATH|NEXUS_DB_URL)' \
+  "${webui_paths[@]}"
+
+scan \
+  webui-thread-dm-agui-history \
+  '/api/agui/observe[^"'"'"'[:space:]]*[?&](thread|dm)=' \
+  "${webui_paths[@]}"
+
+scan \
+  webui-thread-dm-agui-routing \
+  '(function[[:space:]]+observeUrlForTarget|function[[:space:]]+observeUrl\([[:space:]]*thread)' \
+  "${webui_paths[@]}"
+
+scan \
+  forbidden-database-runtime \
+  '((spawn|exec|start|command::new|connect|client|transport|url).{0,100}\bsqld\b|\bsqld\b.{0,100}(spawn|exec|start|command::new|connect|client|transport|url)|(connect|client|transport|url).{0,100}\bhrana\b|\bhrana\b.{0,100}(connect|client|transport|url)|libsql://|NEXUS_(WEBCONSOLE|GATEWAY)_DB_TOKEN)' \
+  "${runtime_paths[@]}"
+
+scan \
+  raw-terminal-misdocumented-as-model-text \
+  '(lane[[:space:]]*=[[:space:]]*raw.{0,100}(model|semantic|response|text)|(model|semantic|response|text).{0,100}lane[[:space:]]*=[[:space:]]*raw)' \
+  "${webui_paths[@]}" gateway/src/server
+
+scan \
+  gateway-opens-daemon-database \
+  '(^|[^A-Za-z0-9_.-])nexus\.db([^A-Za-z0-9_.-]|$)' \
+  "${gateway_server_paths[@]}"
+
+if [[ "$violations" -ne 0 ]]; then
+  echo
+  echo "FAIL architecture ownership gate: process or storage boundary violations found."
+  exit 1
+fi
+
+echo "PASS architecture ownership gate: daemon, Gateway and WebUI ownership boundaries hold."

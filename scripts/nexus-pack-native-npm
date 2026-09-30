@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/nexus-pack-native-npm --binary PATH --output DIR [--target TARGET]
+
+Stage an already-built Nexus binary in an @egregore/nexus-cli package assembly.
+This command never compiles source.
+EOF
+}
+
+TARGET=linux-x64-gnu
+BINARY=
+OUTPUT=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --target) TARGET=${2:?missing value for --target}; shift 2 ;;
+    --binary) BINARY=${2:?missing value for --binary}; shift 2 ;;
+    --output) OUTPUT=${2:?missing value for --output}; shift 2 ;;
+    *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+case "$TARGET" in
+  linux-x64-gnu|linux-arm64-gnu|darwin-x64|darwin-arm64|win32-x64-msvc) ;;
+  *) echo "unsupported native npm target: $TARGET" >&2; exit 2 ;;
+esac
+if [ -z "$BINARY" ] || [ ! -x "$BINARY" ]; then
+  echo "--binary must name an executable Nexus binary" >&2
+  exit 2
+fi
+if [ -z "$OUTPUT" ]; then
+  echo "--output is required" >&2
+  exit 2
+fi
+
+VERSION_OUTPUT=$("$BINARY" --version 2>&1) || {
+  echo "native binary --version failed" >&2
+  exit 1
+}
+if ! printf '%s\n' "$VERSION_OUTPUT" \
+  | grep -Eq '^nexus 0\.1\.0 \(revision [A-Za-z0-9._+-]+\)$' \
+  || printf '%s\n' "$VERSION_OUTPUT" | grep -q 'revision unknown'; then
+  echo "native binary does not report Nexus 0.1.0 with a source revision: $VERSION_OUTPUT" >&2
+  exit 1
+fi
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+EXECUTABLE=nexus
+[ "$TARGET" != win32-x64-msvc ] || EXECUTABLE=nexus.exe
+cp "$BINARY" "$TMP/$EXECUTABLE"
+chmod 755 "$TMP/$EXECUTABLE"
+
+if [[ "$TARGET" == linux-* ]]; then
+  for tool in strip objcopy readelf; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      echo "Linux native npm packaging requires GNU binutils tool: $tool" >&2
+      exit 1
+    fi
+  done
+
+  strip --strip-all "$TMP/$EXECUTABLE"
+  objcopy --remove-section=.comment "$TMP/$EXECUTABLE"
+
+  SECTIONS=$(readelf -SW "$TMP/$EXECUTABLE")
+  if printf '%s\n' "$SECTIONS" | grep -Eq '\.(symtab|debug_[^ ]*|comment)([[:space:]]|$)'; then
+    echo "native npm binary retains symbol, debug, or comment sections after stripping" >&2
+    exit 1
+  fi
+fi
+
+if ! "$TMP/$EXECUTABLE" --version 2>&1 | grep -Fxq "$VERSION_OUTPUT"; then
+  echo "stripped native npm binary no longer reports the expected version" >&2
+  exit 1
+fi
+
+DESTINATION="$OUTPUT/native/$TARGET"
+mkdir -p "$DESTINATION"
+cp "$TMP/$EXECUTABLE" "$DESTINATION/$EXECUTABLE"
+chmod 755 "$DESTINATION/$EXECUTABLE"
+printf '%s/%s\n' "$(cd "$DESTINATION" && pwd)" "$EXECUTABLE"

@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Pure tests for the v0.1 release-validation evidence ledger."""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import sys
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+PATH = Path(__file__).resolve().parent / "nexus-v01-release-validation"
+LOADER = importlib.machinery.SourceFileLoader("nexus_v01_release_validation", str(PATH))
+SPEC = importlib.util.spec_from_loader("nexus_v01_release_validation", LOADER)
+rv = importlib.util.module_from_spec(SPEC)
+sys.modules["nexus_v01_release_validation"] = rv
+LOADER.exec_module(rv)
+
+
+class InventoryTests(unittest.TestCase):
+    def test_every_public_leaf_has_a_behavior_classification(self):
+        missing = rv.PUBLIC_LEAF_COMMANDS - set(rv.COMMAND_CLASSIFICATION)
+        extra = set(rv.COMMAND_CLASSIFICATION) - rv.PUBLIC_LEAF_COMMANDS
+        self.assertEqual(missing, set())
+        self.assertEqual(extra, set())
+
+    def test_nested_repair_and_credential_verbs_are_not_collapsed(self):
+        for command in {
+            "admin dlq list",
+            "admin dlq requeue",
+            "admin dlq purge",
+            "admin group assign",
+            "agents credentials create",
+            "agents credentials revoke",
+        }:
+            self.assertIn(command, rv.PUBLIC_LEAF_COMMANDS)
+
+    def test_dlq_zero_row_mutations_are_idempotent_successes(self):
+        source = PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            '"admin", "dlq", "requeue", "if_missing"], "Confirms an idempotent zero-row requeue without broad mutation.", allowed_exit={0}, limited=True',
+            source,
+        )
+        self.assertIn(
+            '"admin", "dlq", "purge", "if_missing", "--yes"], "Confirms an idempotent zero-row purge without broad mutation.", allowed_exit={0}, limited=True',
+            source,
+        )
+
+    def test_architecture_mode_is_the_canonical_gateway_gate(self):
+        args = rv.parse_args(["architecture", "--container", "candidate", "--unit-only"])
+        self.assertEqual(args.mode, "architecture")
+        self.assertEqual(args.container, "candidate")
+        self.assertTrue(args.unit_only)
+
+    def test_cli_gate_preflight_starts_and_verifies_the_complete_local_stack(self):
+        script = rv.daemon_ready_script()
+        self.assertIn("daemon start", script)
+        self.assertIn("daemon status", script)
+        self.assertIn("RESTART PENDING", script)
+        self.assertIn("daemon restart", script)
+        self.assertIn("NEXUS_GATEWAY_BIN", script)
+        self.assertIn("build:gateway-package", script)
+        self.assertIn("gateway start", script)
+        self.assertIn("Simulate a stale gateway discovery PID reused by the supervising shell", script)
+        self.assertIn('"pid": os.getppid()', script)
+        self.assertIn('"state": "live"', script)
+        self.assertIn("/host-cargo-bin:/host-local-bin", script)
+        self.assertIn("seq 1 60", script)
+        self.assertIn("grep -q '^daemon: running$'", script)
+
+
+class RedactionTests(unittest.TestCase):
+    def test_timeout_output_bytes_are_normalized_for_redaction(self):
+        self.assertEqual(rv.output_text(b"Bearer very-secret-token"), "Bearer very-secret-token")
+        self.assertEqual(rv.redact(rv.output_text(b"Bearer very-secret-token")), "Bearer [REDACTED]")
+
+    def test_redacts_source_and_runtime_secrets(self):
+        raw = (
+            '{"token":"abcdefghijklmnopqrstuvwx",'
+            '"secret":"secret-abcdefghijklmnopqrstuvwx",'
+            '"credential":"cred-abcdefghijklmnopqrstuvwx"}'
+        )
+        redacted = rv.redact(raw)
+        self.assertNotIn("abcdefghijklmnopqrstuvwx", redacted)
+        self.assertIn("[REDACTED]", redacted)
+
+    def test_preserves_message_and_agent_ids(self):
+        raw = "m_deadbeef a_deadbeef s_deadbeef"
+        self.assertEqual(rv.redact(raw), raw)
+
+
+class LedgerTests(unittest.TestCase):
+    def test_bounded_command_escalates_after_the_graceful_timeout(self):
+        runner = rv.Runner("candidate", Path("evidence"), "expected-sha")
+        completed = __import__("subprocess").CompletedProcess([], 124, "", "")
+        with mock.patch.object(rv.subprocess, "run", return_value=completed) as run:
+            result = runner.bounded_command(
+                label="behavior:daemon run",
+                facet="daemon run",
+                argv=["daemon", "run"],
+                expected="bounded foreground daemon",
+                seconds=2,
+            )
+
+        argv = run.call_args.args[0]
+        self.assertIn("--signal=TERM", argv)
+        self.assertIn("--kill-after=2s", argv)
+        self.assertEqual(result.status, "limited")
+
+    def test_runner_rejects_a_binary_from_a_different_source_revision(self):
+        runner = rv.Runner("candidate", Path("evidence"), "expected-sha")
+        result = rv.Result(
+            label="fixture:exact-binary",
+            command="nexus --version",
+            facet="fixture",
+            classification="release",
+            status="pass",
+            exit_code=0,
+            started_at="2026-07-16T00:00:00Z",
+            finished_at="2026-07-16T00:00:01Z",
+        )
+        with mock.patch.object(
+            runner,
+            "command",
+            return_value=(result, "nexus 0.1.0 (revision stale-sha)\n", ""),
+        ):
+            self.assertFalse(runner.require_exact_binary())
+
+        self.assertEqual(result.status, "fail")
+        self.assertEqual(
+            result.evidence["assertions"],
+            [{"pass": False, "detail": "binary revision matches expected-sha"}],
+        )
+
+    def test_missing_behavior_case_prevents_pass(self):
+        ledger = rv.Ledger(commit="abc", container="test")
+        ledger.record(
+            rv.Result(
+                label="help:whoami",
+                command="nexus whoami --help",
+                facet="whoami",
+                classification="release",
+                status="pass",
+                exit_code=0,
+                started_at="2026-07-12T00:00:00Z",
+                finished_at="2026-07-12T00:00:01Z",
+            )
+        )
+        self.assertFalse(ledger.complete)
+        self.assertIn("whoami", ledger.missing_behavior_facets)
+
+    def test_one_behavior_result_per_leaf_is_complete(self):
+        ledger = rv.Ledger(commit="abc", container="test")
+        for command in rv.PUBLIC_LEAF_COMMANDS:
+            ledger.record(
+                rv.Result(
+                    label=f"behavior:{command}",
+                    command=f"nexus {command}",
+                    facet=command,
+                    classification=rv.COMMAND_CLASSIFICATION[command],
+                    status="pass",
+                    exit_code=0,
+                    started_at="2026-07-12T00:00:00Z",
+                    finished_at="2026-07-12T00:00:01Z",
+                )
+            )
+        self.assertTrue(ledger.complete)
+        self.assertEqual(ledger.missing_behavior_facets, [])
+
+
+class CodexAcpGateTests(unittest.TestCase):
+    def test_codex_acp_mode_is_parseable(self):
+        args = rv.parse_args(["codex-acp", "--container", "candidate"])
+        self.assertEqual(args.mode, "codex-acp")
+        self.assertEqual(args.container, "candidate")
+
+    def test_codex_acp_ledger_requires_every_live_checkpoint(self):
+        ledger = rv.CodexAcpLedger(commit="abc", container="candidate")
+        for facet in rv.CODEX_ACP_FACETS - {"codex-acp-restart"}:
+            ledger.record(
+                rv.Result(
+                    label=f"behavior:{facet}",
+                    command=facet,
+                    facet=facet,
+                    classification="release",
+                    status="pass",
+                    exit_code=0,
+                    started_at="2026-07-12T00:00:00Z",
+                    finished_at="2026-07-12T00:00:01Z",
+                )
+            )
+
+        self.assertFalse(ledger.complete)
+        self.assertEqual(ledger.missing_behavior_facets, ["codex-acp-restart"])
+
+        ledger.record(
+            rv.Result(
+                label="behavior:codex-acp-restart",
+                command="codex-acp-restart",
+                facet="codex-acp-restart",
+                classification="release",
+                status="pass",
+                exit_code=0,
+                started_at="2026-07-12T00:00:00Z",
+                finished_at="2026-07-12T00:00:01Z",
+            )
+        )
+        self.assertTrue(ledger.complete)
+
+    def test_codex_probe_preserves_embedded_python_newline_escape(self):
+        script = rv.codex_probe_script(
+            name="probe",
+            marker="MARKER",
+            evidence_dir="/tmp/evidence",
+        )
+        self.assertIn('write_text(session_id + "\\n", encoding="utf-8")', script)
+        self.assertNotIn('write_text(session_id + "\n", encoding="utf-8")', script)
+
+    def test_codex_probe_subscribes_before_sending_the_prompt(self):
+        script = rv.codex_probe_script(
+            name="probe",
+            marker="MARKER",
+            evidence_dir="/tmp/evidence",
+        )
+        self.assertNotIn("--initial-prompt", script)
+        self.assertNotIn("/api/v1/members", script)
+        self.assertIn('/api/v1/agent-sessions/$session_id/events?view=agui', script)
+        self.assertIn('nexus dm "$name" --message', script)
+        self.assertLess(script.index("curl -NsS"), script.index('nexus dm "$name"'))
+
+    def test_codex_agui_summary_reconstructs_split_assistant_deltas(self):
+        events = [
+            {"type": "TEXT_MESSAGE_START", "messageId": "user", "role": "user"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "user", "delta": "Reply MARKER"},
+            {"type": "TEXT_MESSAGE_START", "messageId": "assistant", "role": "assistant"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "assistant", "delta": "MAR"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "assistant", "delta": "KER"},
+            {"type": "RUN_FINISHED"},
+        ]
+
+        self.assertEqual(
+            rv.summarize_codex_agui_events(events, "MARKER"),
+            {
+                "assistantMarkerCount": 1,
+                "runFinishedCount": 1,
+                "runErrorCount": 0,
+            },
+        )
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=1)

@@ -1,0 +1,95 @@
+name: main-regression
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  gateway-lifecycle-platform:
+    name: Gateway lifecycle (${{ matrix.os }})
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cross-platform config and process contract
+        run: cargo test --manifest-path core/Cargo.toml -p egregore-nexus gateway_lifecycle_contracts
+      - name: Cross-platform delivery-mode persistence
+        run: cargo test --manifest-path core/Cargo.toml -p egregore-nexus-common --test config
+
+  boundaries:
+    name: Harness boundary gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install boundary gate dependencies
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - name: Boundary gate self-test
+        run: scripts/test-nexus-boundary-gate
+      - name: Boundary gate
+        run: scripts/check boundaries
+
+  rust:
+    name: Rust regression gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk space
+        # The full-workspace Rust build (target/ + registry) overflows the stock
+        # ~14GB runner -> "No space left on device". Drop preinstalled SDKs we
+        # never use to reclaim ~25GB before building.
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            core/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('core/Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+      - name: nexus-store gate
+        run: scripts/check rust -p nexus-store
+      - name: nexus daemon gate
+        run: scripts/check rust -p egregore-nexus
+      - name: Rust workspace compile gate
+        run: scripts/check rust-workspace
+      - name: Restart-survival regression
+        run: cargo test --manifest-path core/Cargo.toml -p egregore-nexus --test store_client inbox_consume_reissues_after_daemon_boot_epoch_changes -- --exact
+      - name: Acceptance gate
+        run: scripts/check acceptance
+
+  gateway:
+    name: Gateway regression gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: gateway/pnpm-lock.yaml
+      - name: Install gateway deps
+        run: pnpm --dir gateway install --frozen-lockfile
+      - name: Gateway gate
+        run: scripts/check gateway
+      - name: Web reconnect regressions
+        run: pnpm --dir gateway test src/modules/pane/aguiPane.test.tsx src/modules/pane/useAgentSession.test.tsx

@@ -218,7 +218,7 @@ impl AgentTurnExecutionPort for RoutingTurnExec {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use nexus_contracts::batch::{BatchCounts, NexusBatch};

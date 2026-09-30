@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""Daemon lifecycle CLI acceptance checklist and safe dry-run probes.
+
+Default behavior is documentation-only. Use --check-readonly to run only the
+read-only lifecycle verbs against the current daemon. Control verbs
+(run/start/stop/restart/install/uninstall) are never executed by this script;
+their acceptance steps are printed as operator-window items.
+"""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@dataclass(frozen=True)
+class LifecycleAcceptance:
+    verb: str
+    command: str
+    safety: str
+    expected_exit_codes: str
+    output_shape: str
+    edge_cases: tuple[str, ...]
+    acceptance: tuple[str, ...]
+
+
+CHECKLIST: tuple[LifecycleAcceptance, ...] = (
+    LifecycleAcceptance(
+        verb="run",
+        command="nexus daemon run",
+        safety="dev foreground; operator-window only; not executed by this script",
+        expected_exit_codes="0 while running; nonzero on bind/store/config failure",
+        output_shape="foreground daemon log stream; Ctrl-C performs graceful shutdown path",
+        edge_cases=(
+            "already running: single-instance guard refuses a second daemon loudly",
+            "not running: foreground daemon owns the terminal until interrupted",
+            "stale pid: lock/pid recovery is handled by daemon boot guard before serving",
+        ),
+        acceptance=(
+            "Operator starts foreground daemon in a disposable target and sees gateway/store boot.",
+            "A second foreground run exits nonzero with an already-running message.",
+            "Ctrl-C performs transport teardown, intent reap, discovery tombstone, WAL checkpoint.",
+        ),
+    ),
+    LifecycleAcceptance(
+        verb="start",
+        command="nexus daemon start",
+        safety="operator-window only; not executed by this script",
+        expected_exit_codes="0 on started/already-running supervisor success; nonzero on tripwire or supervisor failure",
+        output_shape="nexus daemon started pid=<pid|unknown> supervisor=<kind> log=<path>",
+        edge_cases=(
+            "already running: must not spawn a second daemon; reports existing live pid/supervisor",
+            "not running: starts detached under native supervisor or self-daemon fallback",
+            "stale pid: steals dead pid/lock only after pid-alive check and logs recovery",
+        ),
+        acceptance=(
+            "Bare operator terminal starts daemon and prints pid, supervisor, and log path.",
+            "Agent ambient identity is refused with 'daemon supervision is operator-only'.",
+            "After a crash/stale pid, start recovers discovery/lock state before serving.",
+        ),
+    ),
+    LifecycleAcceptance(
+        verb="stop",
+        command="nexus daemon stop",
+        safety="operator-window only; not executed by this script",
+        expected_exit_codes="0 on accepted stop request; nonzero on tripwire or supervisor failure",
+        output_shape="nexus daemon stop requested supervisor=<kind>",
+        edge_cases=(
+            "already running: drains lanes, reaps expired in-flight rows, tears transports down",
+            "not running: native/self supervisor reports stopped or no live pid without data loss",
+            "stale pid: clears/tombstones dead discovery without killing unrelated processes",
+        ),
+        acceptance=(
+            "No new intents are claimed after draining starts.",
+            "Bounded in-flight rows become explicit errors, never silent drops.",
+            "Daemon-owned transports and gateway discovery are removed/tombstoned.",
+        ),
+    ),
+    LifecycleAcceptance(
+        verb="restart",
+        command="nexus daemon restart",
+        safety="operator-window only; not executed by this script",
+        expected_exit_codes="0 when stop+start both complete; nonzero on either half failing",
+        output_shape="nexus daemon restarted supervisor=<kind> log=<path>",
+        edge_cases=(
+            "already running: stop+start picks up the installed/current binary",
+            "not running: start half still brings the daemon up if supervisor allows it",
+            "stale pid: stop half must not kill unrelated pid; start half refreshes discovery",
+        ),
+        acceptance=(
+            "Used as the deploy primitive after backup/runbook preflight.",
+            "Post-restart status reports current==running and no wedged lanes.",
+            "Fleet recovery uses graceful-return; no agent issues daemon control itself.",
+        ),
+    ),
+    LifecycleAcceptance(
+        verb="status",
+        command="nexus daemon status",
+        safety="read-only; executed by --check-readonly",
+        expected_exit_codes="0 healthy, 1 degraded, 2 down",
+        output_shape=(
+            "daemon/supervisor/pid/binary/gateway/wedged_intents/lanes/transport_pairs; "
+            "binary line includes RESTART PENDING on mismatch"
+        ),
+        edge_cases=(
+            "already running: prints pid, uptime when known, gateway liveness, lanes and transports",
+            "not running: prints daemon: down and exits 2",
+            "stale pid: pid-alive check makes daemon down/degraded instead of trusting a file",
+        ),
+        acceptance=(
+            "Exit codes are scriptable: 0 healthy, 1 degraded, 2 down.",
+            "A newer installed binary yields RESTART PENDING and degraded exit 1.",
+            "Gateway discovery is pid-alive checked, not just file-presence checked.",
+        ),
+    ),
+    LifecycleAcceptance(
+        verb="logs",
+        command="nexus daemon logs",
+        safety="read-only; executed by --check-readonly as `nexus daemon logs -n 1`",
+        expected_exit_codes="0 when native or file log reader succeeds; nonzero on inaccessible log source",
+        output_shape="tail lines from native supervisor log reader or daemon.log fallback",
+        edge_cases=(
+            "already running: returns recent daemon log lines",
+            "not running: still reads historical daemon.log when present",
+            "stale pid: logs remain readable for diagnosis even when status is down/degraded",
+        ),
+        acceptance=(
+            "`-n N` limits output without requiring callers to know ~/.nexus/daemon.log.",
+            "`-f` follows through native log reader when available, file fallback otherwise.",
+        ),
+    ),
+    LifecycleAcceptance(
+        verb="doctor",
+        command="nexus daemon doctor",
+        safety="read-only; executed by --check-readonly",
+        expected_exit_codes="0 no findings, 1 degraded findings while running, 2 down",
+        output_shape="'daemon doctor: no issues found' or 'daemon doctor findings:' bullet list",
+        edge_cases=(
+            "already running: scans binary mismatch, gateway stale, wedged intents, PATH tools",
+            "not running: reports daemon down and exits 2",
+            "stale pid: reports stale gateway/discovery and suggested fixes without mutation",
+        ),
+        acceptance=(
+            "Doctor changes nothing and prints suggested operator fixes.",
+            "PATH checks include harness binaries that can block launches.",
+            "Stuck/expired lease findings are explicit rather than hidden in logs.",
+        ),
+    ),
+    LifecycleAcceptance(
+        verb="install",
+        command="nexus daemon install",
+        safety="operator-window only; not executed by this script",
+        expected_exit_codes="0 installed/idempotent success; nonzero on tripwire or platform-controller failure",
+        output_shape="nexus daemon service installed and started (<systemd|launchd|task-scheduler>)",
+        edge_cases=(
+            "already running: transfers the daemon to the native supervisor without overlap",
+            "not running: installs and starts the native daemon unit/service immediately",
+            "stale pid: installation is independent of pidfile state",
+        ),
+        acceptance=(
+            "Linux writes, enables, and starts one user systemd unit with NEXUS_HOME and WorkingDirectory.",
+            "No companion database service or store credential is installed on any platform.",
+            "macOS installs a RunAtLoad LaunchAgent with restart-on-failure.",
+            "Windows installs a limited-privilege per-user Scheduled Task with restart-on-failure.",
+            "Agent ambient identity is refused before platform mutation.",
+        ),
+    ),
+    LifecycleAcceptance(
+        verb="uninstall",
+        command="nexus daemon uninstall",
+        safety="operator-window only; not executed by this script",
+        expected_exit_codes="0 removed/idempotent success; nonzero on tripwire or platform-controller failure",
+        output_shape="nexus daemon service uninstalled (<systemd|launchd|task-scheduler>)",
+        edge_cases=(
+            "already running: stops the supervised daemon before removing its native registration",
+            "not running: disables and removes the native unit/service if present",
+            "stale pid: uninstallation is independent of pidfile state",
+        ),
+        acceptance=(
+            "Removes only the platform supervisor artifact, not the durable store.",
+            "Agent ambient identity is refused before platform mutation.",
+        ),
+    ),
+)
+
+READONLY_COMMANDS = (
+    ("help.commands", ["daemon", "--help"]),
+    ("status.shape", ["daemon", "status"]),
+    ("logs.exit", ["daemon", "logs", "-n", "1"]),
+    ("doctor.output", ["daemon", "doctor"]),
+)
+
+STATUS_REQUIRED_PREFIXES = (
+    "daemon:",
+    "supervisor:",
+    "pid:",
+    "binary:",
+    "gateway:",
+    "wedged_intents:",
+    "lanes:",
+    "transport_pairs:",
+)
+
+
+@dataclass
+class ProbeResult:
+    name: str
+    ok: bool
+    detail: str
+
+    @property
+    def line(self) -> str:
+        return f"{'PASS' if self.ok else 'FAIL'} {self.name}: {self.detail}"
+
+
+def run_command(
+    nexus_bin: str,
+    args: list[str],
+    timeout: float,
+) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            [nexus_bin, *args],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def print_checklist() -> None:
+    print("# Nexus daemon lifecycle CLI acceptance")
+    print()
+    print("Default safety rule: operator-control verbs are operator-window only and not executed by this script.")
+    print("Run `scripts/nexus-daemon-lifecycle-acceptance --check-readonly` to probe only read-only verbs.")
+    print()
+    for item in CHECKLIST:
+        print(f"## {item.command}")
+        print()
+        print(f"- Safety: {item.safety}.")
+        print(f"- Expected exit codes: {item.expected_exit_codes}.")
+        print(f"- Expected output shape: {item.output_shape}.")
+        print("- Edge cases:")
+        for edge in item.edge_cases:
+            print(f"  - {edge}.")
+        print("- Acceptance:")
+        for step in item.acceptance:
+            print(f"  - {step}")
+        print()
+
+
+def validate_help(result: subprocess.CompletedProcess[str] | None) -> ProbeResult:
+    if result is None:
+        return ProbeResult("help.commands", False, "command timed out or could not start")
+    if result.returncode != 0:
+        return ProbeResult("help.commands", False, f"exit={result.returncode}")
+    output = result.stdout + result.stderr
+    missing = [item.verb for item in CHECKLIST if item.verb not in output]
+    if missing:
+        return ProbeResult(
+            "help.commands",
+            False,
+            "missing lifecycle verbs in help: " + ", ".join(missing),
+        )
+    return ProbeResult("help.commands", True, "all lifecycle verbs listed")
+
+
+def validate_status(result: subprocess.CompletedProcess[str] | None) -> ProbeResult:
+    if result is None:
+        return ProbeResult("status.shape", False, "command timed out or could not start")
+    if result.returncode not in (0, 1, 2):
+        return ProbeResult("status.shape", False, f"unexpected exit={result.returncode}")
+    output = result.stdout + result.stderr
+    missing = [prefix for prefix in STATUS_REQUIRED_PREFIXES if prefix not in output]
+    if missing:
+        return ProbeResult(
+            "status.shape",
+            False,
+            "missing required status lines: " + ", ".join(missing),
+        )
+    daemon_line = line_for(output, "daemon:")
+    if result.returncode == 2 and daemon_line != "down":
+        return ProbeResult(
+            "status.shape",
+            False,
+            f"exit=2 must report daemon: down; saw {daemon_line or 'missing'}",
+        )
+    if result.returncode in (0, 1) and daemon_line not in {"running", "down"}:
+        return ProbeResult(
+            "status.shape",
+            False,
+            f"daemon line must be running or down; saw {daemon_line or 'missing'}",
+        )
+    return ProbeResult("status.shape", True, f"exit={result.returncode}; daemon={daemon_line}")
+
+
+def validate_logs(result: subprocess.CompletedProcess[str] | None) -> ProbeResult:
+    if result is None:
+        return ProbeResult("logs.exit", False, "command timed out or could not start")
+    if result.returncode != 0:
+        detail = first_line(result.stdout, result.stderr)
+        return ProbeResult("logs.exit", False, f"exit={result.returncode}; {detail}")
+    return ProbeResult("logs.exit", True, "logs command returned 0")
+
+
+def validate_doctor(result: subprocess.CompletedProcess[str] | None) -> ProbeResult:
+    if result is None:
+        return ProbeResult("doctor.output", False, "command timed out or could not start")
+    if result.returncode not in (0, 1, 2):
+        return ProbeResult("doctor.output", False, f"unexpected exit={result.returncode}")
+    output = result.stdout + result.stderr
+    stripped = output.strip()
+    if not (
+        stripped.startswith("daemon doctor: no issues found")
+        or stripped.startswith("daemon doctor findings:")
+    ):
+        return ProbeResult(
+            "doctor.output",
+            False,
+            f"unexpected first line: {first_line(result.stdout, result.stderr)}",
+        )
+    return ProbeResult("doctor.output", True, f"exit={result.returncode}")
+
+
+def line_for(output: str, prefix: str) -> str | None:
+    for raw in output.splitlines():
+        if raw.startswith(prefix):
+            return raw[len(prefix) :].strip()
+    return None
+
+
+def first_line(stdout: str, stderr: str) -> str:
+    for raw in f"{stdout}\n{stderr}".splitlines():
+        line = raw.strip()
+        if line:
+            return line
+    return "no output"
+
+
+def check_readonly(nexus_bin: str, timeout: float) -> int:
+    validators = {
+        "help.commands": validate_help,
+        "status.shape": validate_status,
+        "logs.exit": validate_logs,
+        "doctor.output": validate_doctor,
+    }
+    print("# Nexus daemon lifecycle read-only dry-run")
+    print()
+    print("Executed commands are limited to read-only lifecycle verbs:")
+    for name, args in READONLY_COMMANDS:
+        print(f"- {nexus_bin} {' '.join(args)}")
+    print()
+
+    results: list[ProbeResult] = []
+    for name, args in READONLY_COMMANDS:
+        result = run_command(nexus_bin, args, timeout)
+        results.append(validators[name](result))
+
+    for result in results:
+        print(result.line)
+
+    failures = [result for result in results if not result.ok]
+    if failures:
+        print(f"\nread-only acceptance: FAIL ({len(failures)} failing criterion/criteria)")
+        return 1
+    print("\nread-only acceptance: PASS")
+    return 0
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--nexus-bin", default="nexus", help="nexus executable to probe")
+    parser.add_argument("--command-timeout", type=float, default=12.0)
+    parser.add_argument(
+        "--print-only",
+        action="store_true",
+        help="print the checklist without probing the daemon",
+    )
+    parser.add_argument(
+        "--check-readonly",
+        action="store_true",
+        help="run only status/logs/doctor/help against the current daemon",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    if args.check_readonly:
+        return check_readonly(args.nexus_bin, args.command_timeout)
+    print_checklist()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
