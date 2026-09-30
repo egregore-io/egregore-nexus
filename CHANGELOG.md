@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.4] - 2026-07-19
+
+### Changed
+
+- Replaced closed harness identity enums with validated open identifiers and composition-root
+  registries, establishing the plug-in boundary used by future maintained harness integrations.
+- Preserved all existing Claude Code, Codex, OpenCode, and Hermes wire spellings and runtime
+  behavior while moving harness-specific dispatch behind the new adapter boundary.
+
 ## [0.1.0] - Unreleased
 
 ### Added
