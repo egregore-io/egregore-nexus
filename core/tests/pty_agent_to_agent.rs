@@ -20,6 +20,16 @@ use nexus_store::Store;
 use portable_pty::{CommandBuilder, PtySize};
 use tokio::sync::broadcast;
 
+#[cfg(unix)]
+fn passive_terminal_command() -> CommandBuilder {
+    CommandBuilder::new("cat")
+}
+
+#[cfg(windows)]
+fn passive_terminal_command() -> CommandBuilder {
+    CommandBuilder::new("cmd.exe")
+}
+
 /// One project for every agent so DM resolution + thread fan-out (both project-scoped) reach.
 const PROJECT: &str = "egregore";
 
@@ -69,8 +79,8 @@ impl PtyTestDaemon {
     }
 
     /// Register `name` as a wakeable bus member (its idle drain loop is stood up), capture its
-    /// session id, spawn a `cat` `PtySession`, and `bind` it under that session so a delivered turn
-    /// writes into this agent's PTY.
+    /// session id, spawn a passive native `PtySession`, and `bind` it under that session so a
+    /// delivered turn would write into this agent's PTY.
     async fn register_pty_agent(&self, name: &str) -> PtyAgent {
         // `register` writes the member row (kind=agent → drain loop via `ensure_agent_loop`) and
         // returns the bound session id. `client_key` keys resume; a per-name key is fine here.
@@ -96,7 +106,7 @@ impl PtyTestDaemon {
 
         let pty = Arc::new(
             PtySession::spawn(
-                CommandBuilder::new("cat"),
+                passive_terminal_command(),
                 PtySize {
                     rows: 24,
                     cols: 80,
@@ -106,7 +116,8 @@ impl PtyTestDaemon {
             )
             .unwrap(),
         );
-        // Bind the PTY under the agent's session: a delivery to this agent → write into this cat PTY.
+        // Bind the PTY under the agent's session: a delivery to this agent would write into this
+        // passive native terminal.
         self.transport.bind(resp.session_id.clone(), pty.clone());
         // Registration intentionally does not start an agent-owned drain loop until its transport
         // is live. This fixture binds after registration, so mirror the production supervisor's

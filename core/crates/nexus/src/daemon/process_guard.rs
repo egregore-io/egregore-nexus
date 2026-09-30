@@ -104,10 +104,7 @@ fn acquire_lock_file(lock_path: &Path) -> io::Result<File> {
                     if process_alive(pid) {
                         return Err(io::Error::new(
                             io::ErrorKind::AlreadyExists,
-                            format!(
-                                "nexus daemon already owns {} (pid {pid})",
-                                lock_path.display()
-                            ),
+                            format!("nexus daemon already running (pid {pid})"),
                         ));
                     }
                 }
@@ -137,7 +134,12 @@ fn remove_if_owned_pid(path: &Path, pid: u32) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    nexus_common::process_ids::runtime_process_ids_for_pid(pid).is_some()
+}
+
+#[cfg(not(any(unix, windows)))]
 fn process_alive(_pid: u32) -> bool {
     false
 }

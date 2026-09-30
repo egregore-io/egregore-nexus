@@ -191,16 +191,17 @@ impl Drop for WriteTxn {
 
 /// A handle to the recorded libSQL store. Wraps one durable [`libsql::Connection`]; the daemon is
 /// the sole durable writer (the gateway's Drizzle view is read-only). Repos query durable state
-/// through [`Store::conn`]. `migrate()` also prepares the volatile `mem` stream database: a named
-/// tmpfs file for daemon file stores, or anonymous memory for pure test stores.
+/// through [`Store::conn`]. `migrate()` also prepares the volatile `mem` stream database in
+/// anonymous memory. An explicit `NEXUS_STREAM_DB_PATH` opts nonstandard deployments into a named
+/// cross-process stream file.
 pub struct Store {
     /// The live libSQL connection. Public so repos (and the migration test) can issue queries.
     pub conn: StoreConnection,
     /// Optional file-backed identity/continuity authority. When absent (legacy/unit stores),
     /// identity and transport intentionally share `conn` for compatibility.
     identity_authority: Option<Arc<Store>>,
-    /// Named tmpfs SQLite file used for cross-process live stream lanes. `None` for pure
-    /// `:memory:` stores used by unit tests.
+    /// Explicitly configured SQLite file used for cross-process live stream lanes. `None` uses an
+    /// anonymous in-memory stream database, which is the production daemon default.
     stream_db_path: Option<String>,
     /// In-process store write topics for daemon-local wakeups.
     events: StoreEventBus,
@@ -295,11 +296,7 @@ impl Store {
             }
         }
 
-        let stream_db_path = match parsed {
-            StoreLocation::Memory => None,
-            StoreLocation::LocalPath(_) => Some(crate::migrate::resolve_stream_db_path()?),
-            StoreLocation::RemoteUrl(_) => unreachable!("remote URLs rejected above"),
-        };
+        let stream_db_path = crate::migrate::resolve_stream_db_path();
 
         Ok(Store {
             conn: StoreConnection::new(conn),

@@ -16,6 +16,7 @@ import {
   type StreamStoreDoorbell,
 } from "@server/agui/streamStoreRelay";
 import { createClient } from "@libsql/client";
+import { removeTempPath } from "../../test/removeTempPath";
 
 async function waitFor(predicate: () => boolean, timeoutMs = 300): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -505,7 +506,8 @@ describe("daemon push relay", () => {
       data: { text: "from store", streamEventId: 1 },
     });
     relay.close();
-    await rm(dir, { recursive: true, force: true });
+    db.close();
+    await removeTempPath(dir, { recursive: true });
   });
 
   it("falls back to the store path when a stale daemon push endpoint fails to open", async () => {
@@ -555,6 +557,7 @@ describe("daemon push relay", () => {
       data: { text: "from stale fallback", streamEventId: 1 },
     });
     relay.close();
-    await rm(dir, { recursive: true, force: true });
+    db.close();
+    await removeTempPath(dir, { recursive: true });
   });
 });

@@ -17,8 +17,6 @@ pub(crate) const IDENTITY_SCHEMA_NAME: &str = "v0.1.0_identity";
 pub(crate) const TRANSPORT_SCHEMA_NAME: &str = "v0.1.0_transport";
 
 const BASELINE_SCHEMA: &str = include_str!("../../../migrations/0001_init.sql");
-const STREAM_DB_FILE_NAME: &str = "nexus-stream.db";
-
 const EPHEMERAL_STREAM_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS mem.stream_events (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -397,37 +395,19 @@ async fn attached_database_exists_on(
     Ok(false)
 }
 
-/// Resolve the cross-process stream DB path for local daemon stores.
+/// Resolve an explicitly configured cross-process stream DB path.
 ///
-/// `NEXUS_STREAM_DB_PATH` is an explicit override for tests and nonstandard deployments. Without
-/// it, the stream file must live on a tmpfs-like filesystem so live output never writes to disk.
-pub fn resolve_stream_db_path() -> Result<String, NexusError> {
-    if let Ok(path) = std::env::var("NEXUS_STREAM_DB_PATH") {
-        let path = path.trim();
-        if !path.is_empty() {
-            return Ok(path.to_string());
-        }
-    }
-
-    let base = std::env::var("XDG_RUNTIME_DIR")
+/// The daemon's normal transport authority is anonymous memory. A named stream file remains an
+/// opt-in seam for tests and nonstandard deployments that deliberately provide one.
+pub fn resolve_stream_db_path() -> Option<String> {
+    std::env::var("NEXUS_STREAM_DB_PATH")
         .ok()
-        .filter(|path| !path.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/dev/shm"));
-    let path = base.join(STREAM_DB_FILE_NAME);
-    guard_tmpfs(&path)?;
-    Ok(path.to_string_lossy().into_owned())
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
 }
 
 fn prepare_stream_db_file(path: &str) -> Result<(), NexusError> {
     let path = Path::new(path);
-    if std::env::var("NEXUS_STREAM_DB_PATH")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .is_none()
-    {
-        guard_tmpfs(path)?;
-    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
             NexusError::Store(format!("create stream db dir {parent:?}: {error}"))
@@ -479,65 +459,6 @@ fn create_0600(path: &Path) -> Result<(), NexusError> {
         .open(path)
         .map_err(|error| NexusError::Store(format!("create stream db file {path:?}: {error}")))?;
     Ok(())
-}
-
-fn guard_tmpfs(path: &Path) -> Result<(), NexusError> {
-    #[cfg(unix)]
-    {
-        let mounts = std::fs::read_to_string("/proc/mounts").map_err(|error| {
-            NexusError::Store(format!("read /proc/mounts for stream tmpfs guard: {error}"))
-        })?;
-        let canonical_parent = path
-            .parent()
-            .unwrap_or_else(|| Path::new("/"))
-            .canonicalize()
-            .unwrap_or_else(|_| {
-                path.parent()
-                    .unwrap_or_else(|| Path::new("/"))
-                    .to_path_buf()
-            });
-        let mut best: Option<(usize, String)> = None;
-        for line in mounts.lines() {
-            let mut parts = line.split_whitespace();
-            let _source = parts.next();
-            let Some(mount_point) = parts.next() else {
-                continue;
-            };
-            let Some(fs_type) = parts.next() else {
-                continue;
-            };
-            let mount_path = PathBuf::from(mount_point.replace("\\040", " "));
-            if canonical_parent.starts_with(&mount_path) {
-                let len = mount_path.as_os_str().len();
-                if best
-                    .as_ref()
-                    .map(|(best_len, _)| len > *best_len)
-                    .unwrap_or(true)
-                {
-                    best = Some((len, fs_type.to_string()));
-                }
-            }
-        }
-        let Some((_len, fs_type)) = best else {
-            return Err(NexusError::Store(format!(
-                "cannot prove stream db path {path:?} is on tmpfs"
-            )));
-        };
-        if matches!(fs_type.as_str(), "tmpfs" | "ramfs" | "devtmpfs") {
-            return Ok(());
-        }
-        return Err(NexusError::Store(format!(
-            "stream db path {path:?} is on {fs_type}, not tmpfs; set NEXUS_STREAM_DB_PATH to override"
-        )));
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Err(NexusError::Store(
-            "named stream DB tmpfs guard is only implemented on Unix; set NEXUS_STREAM_DB_PATH to override".into(),
-        ))
-    }
 }
 
 fn sqlite_quote(value: &str) -> String {

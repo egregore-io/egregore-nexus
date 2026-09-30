@@ -38,8 +38,12 @@ for (const required of [
   "thread new",
   "source register",
   "agents list",
+  "update",
+  "gateway install",
   "gateway start",
   "gateway delivery-mode set",
+  "webconsole launch",
+  "webconsole status",
   "daemon install",
   "daemon status",
 ]) {

@@ -17,7 +17,7 @@
 //! requested thread rollout, starts `codex app-server` with that `CODEX_HOME`, and opens the TUI
 //! with `codex resume --remote ... <thread>`. It never copies rollout history into a fresh home.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -552,36 +552,41 @@ fn codex_home_with_thread(
     explicit_homes: &[PathBuf],
     thread_id: &str,
 ) -> Option<PathBuf> {
-    codex_resume_home_candidates(session_dir, explicit_homes)
-        .into_iter()
-        .find(|home| rollout_with_thread_id(&home.join("sessions"), thread_id).is_some())
-}
+    let mut seen = HashSet::new();
+    let mut matching_home = |home: PathBuf| {
+        if !seen.insert(home.clone()) {
+            return None;
+        }
+        rollout_with_thread_id(&home.join("sessions"), thread_id)
+            .is_some()
+            .then_some(home)
+    };
 
-fn codex_resume_home_candidates(session_dir: &Path, explicit_homes: &[PathBuf]) -> Vec<PathBuf> {
-    let mut homes = Vec::new();
     for home in explicit_homes {
-        push_unique_path(&mut homes, home.clone());
+        if let Some(home) = matching_home(home.clone()) {
+            return Some(home);
+        }
     }
     if let Some(home) = std::env::var_os("CODEX_HOME") {
-        push_unique_path(&mut homes, PathBuf::from(home));
+        if let Some(home) = matching_home(PathBuf::from(home)) {
+            return Some(home);
+        }
     }
     if let Some(home) = std::env::var_os("HOME") {
-        push_unique_path(&mut homes, PathBuf::from(home).join(".codex"));
+        if let Some(home) = matching_home(PathBuf::from(home).join(".codex")) {
+            return Some(home);
+        }
     }
     if let Some(codex_sessions_root) = session_dir.parent() {
         if let Ok(entries) = std::fs::read_dir(codex_sessions_root) {
             for entry in entries.flatten() {
-                push_unique_path(&mut homes, entry.path().join("codex-home"));
+                if let Some(home) = matching_home(entry.path().join("codex-home")) {
+                    return Some(home);
+                }
             }
         }
     }
-    homes
-}
-
-fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if !paths.iter().any(|existing| existing == &path) {
-        paths.push(path);
-    }
+    None
 }
 
 /// Read the newest Codex rollout under `CODEX_HOME/sessions` and return its thread id.

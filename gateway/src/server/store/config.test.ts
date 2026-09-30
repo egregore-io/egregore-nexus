@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { GatewayStoreConfigError, gatewayStoreConfig } from "./config";
@@ -5,7 +6,7 @@ import { GatewayStoreConfigError, gatewayStoreConfig } from "./config";
 describe("Gateway canonical store configuration", () => {
   it("defaults to a local Gateway-owned database", () => {
     expect(gatewayStoreConfig({}, "/home/test")).toEqual({
-      url: "file:/home/test/.nexus/gateway.db",
+      url: `file:${join("/home/test", ".nexus", "gateway.db")}`,
     });
   });
 
@@ -24,7 +25,7 @@ describe("Gateway canonical store configuration", () => {
   it("accepts the deprecated local alias only when the canonical variable is unset", () => {
     expect(
       gatewayStoreConfig({ NEXUS_WEBCONSOLE_DB: "file:~/.nexus/legacy.db" }, "/home/test"),
-    ).toEqual({ url: "file:/home/test/.nexus/legacy.db" });
+    ).toEqual({ url: `file:${join("/home/test", ".nexus", "legacy.db")}` });
   });
 
   it.each(["libsql://remote.invalid", "http://127.0.0.1:4141", "https://db.invalid"])(
@@ -45,6 +46,6 @@ describe("Gateway canonical store configuration", () => {
         },
         "/home/test",
       ),
-    ).toEqual({ url: "file:/home/test/.nexus/gateway.db" });
+    ).toEqual({ url: `file:${join("/home/test", ".nexus", "gateway.db")}` });
   });
 });

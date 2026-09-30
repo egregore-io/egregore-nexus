@@ -25,6 +25,10 @@
   the release gate.
 - Per-user `nexus daemon install` and `nexus daemon uninstall` lifecycle commands using systemd on
   Linux/WSL, launchd on macOS, and Task Scheduler on Windows.
+- Native per-user Gateway service installation plus on-demand `nexus webconsole` launch, health,
+  URL, log, restart, and stop commands.
+- Installation-aware `nexus update` with exclusive locking, exact npm/Cargo versions, service-state
+  preservation, post-install verification, and exact-version rollback.
 
 ### Changed
 
@@ -37,6 +41,8 @@
 - Normal agent delivery is push-on-ready; clients do not need to poll for inbound messages.
 - `@egregore/nexus-cli` carries all supported native binaries in one package, and
   `@egregore/nexus-gateway` installs and exposes the CLI without a separate platform package.
+- Complete npm installs coordinate daemon and Gateway service registration in dependency order;
+  missing facets are never downloaded implicitly.
 
 ### Fixed
 

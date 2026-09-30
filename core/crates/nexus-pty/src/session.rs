@@ -122,7 +122,7 @@ impl PtySession {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use portable_pty::{CommandBuilder, PtySize};

@@ -1,10 +1,10 @@
 import { createClient } from "@libsql/client";
 import { randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { removeTempPath } from "../../test/removeTempPath";
 import { migrateGatewayStore } from "../store/migrations";
 import { GatewayProjectionConsumer, type ProjectionTransport } from "./consumer";
 
@@ -43,7 +43,7 @@ describe("Gateway projection consumer", () => {
   }
   afterEach(async () => {
     for (const client of clients.splice(0)) client.close();
-    await Promise.all(paths.splice(0).map((dbPath) => rm(dbPath, { force: true })));
+    await Promise.all(paths.splice(0).map((dbPath) => removeTempPath(dbPath)));
   });
 
   it("ACKs only after transaction completion and ACKs duplicate replay", async () => {

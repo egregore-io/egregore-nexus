@@ -1013,13 +1013,18 @@ async fn gateway_stream_reports_ephemeral_gap_for_dropped_developer_event_cursor
 #[tokio::test]
 async fn gateway_stream_socket_writes_boot_scoped_manifest_next_to_gateway_json() {
     let home = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
     let runtime = tempfile::tempdir().unwrap();
     let home_s = home.path().display().to_string();
+    #[cfg(unix)]
     let runtime_s = runtime.path().display().to_string();
+    #[cfg(unix)]
     let _env = nexus::cli::ambient::TestEnvGuard::new(&[
         ("NEXUS_HOME", Some(home_s.as_str())),
         ("XDG_RUNTIME_DIR", Some(runtime_s.as_str())),
     ]);
+    #[cfg(windows)]
+    let _env = nexus::cli::ambient::TestEnvGuard::new(&[("NEXUS_HOME", Some(home_s.as_str()))]);
 
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
@@ -1033,7 +1038,13 @@ async fn gateway_stream_socket_writes_boot_scoped_manifest_next_to_gateway_json(
         assert_eq!(manifest.version, 1);
         assert_eq!(manifest.daemon_boot_id, "boot_manifest_test");
         assert_eq!(manifest.path, handle.endpoint().path);
+        #[cfg(unix)]
         assert!(manifest.path.starts_with(runtime.path()));
+        #[cfg(windows)]
+        assert!(manifest
+            .path
+            .to_string_lossy()
+            .starts_with(r"\\.\pipe\nexus-gateway-stream-"));
         assert!(!manifest.token.is_empty());
         assert_eq!(
             gateway_stream_endpoint_manifest_path(),

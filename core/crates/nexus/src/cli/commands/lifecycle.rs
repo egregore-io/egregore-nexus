@@ -751,7 +751,14 @@ mod builder_tests {
     fn codex_command_and_mcp_args() {
         let (prog, args) =
             build_harness_command(&Harness::Codex, "ada", "lens", "/usr/bin/nexus", None).unwrap();
-        assert_eq!(prog, "codex");
+        assert_eq!(
+            prog,
+            nexus_harness_core::native_harness_program(
+                Harness::Codex,
+                nexus_harness_core::NativeProcessPlatform::current(),
+            )
+            .unwrap()
+        );
         assert!(args.contains(&"-c".to_string()));
         assert!(args
             .iter()
@@ -767,7 +774,14 @@ mod builder_tests {
     fn claude_command_and_mcp_config() {
         let (prog, args) =
             build_harness_command(&Harness::Claude, "ada", "lens", "/usr/bin/nexus", None).unwrap();
-        assert_eq!(prog, "claude");
+        assert_eq!(
+            prog,
+            nexus_harness_core::native_harness_program(
+                Harness::Claude,
+                nexus_harness_core::NativeProcessPlatform::current(),
+            )
+            .unwrap()
+        );
         let idx = args
             .iter()
             .position(|a| a == "--mcp-config")

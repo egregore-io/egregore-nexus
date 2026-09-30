@@ -62,7 +62,7 @@ $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 From a source checkout:
 
 ```bash
-cargo build --manifest-path core/Cargo.toml -p nexus --release
+cargo build --manifest-path core/Cargo.toml -p egregore-nexus --release
 ```
 
 ## 2. Start Nexus transport
@@ -76,7 +76,9 @@ nexus daemon status
 native service manager: systemd on Linux and WSL, launchd on macOS, or Task Scheduler on Windows.
 It waits for the daemon to become healthy before reporting success; a failed start exits nonzero
 and points to `nexus daemon logs`. Use `nexus daemon uninstall` to stop and remove that
-registration. For a one-off detached run, use `nexus daemon start`.
+registration. When the current npm installation includes the Gateway, daemon installation also
+registers and starts the Gateway after daemon health succeeds. It never downloads a missing
+package. For a one-off detached run, use `nexus daemon start`.
 
 For foreground development, use:
 
@@ -149,13 +151,14 @@ explicit attribution label.
 
 ```bash
 npm install -g @egregore/nexus-gateway
-nexus gateway start
+nexus gateway install
 nexus gateway status
 ```
 
-`nexus gateway start` ensures the daemon is running first. If the Gateway package is missing, the
-CLI exits nonzero with `GATEWAY_NOT_INSTALLED` and the exact install command; it never installs
-software implicitly.
+`nexus gateway install` first ensures the daemon's per-user service, then registers the Gateway
+with dependency ordering and restart-on-failure. Use `nexus gateway start` for a one-off detached
+Gateway instead. If the Gateway package is missing, the CLI exits nonzero with
+`GATEWAY_NOT_INSTALLED` and the exact install command; it never installs software implicitly.
 
 The Gateway binds to loopback by default and writes discovery metadata under `NEXUS_HOME`. Manage
 it with:
@@ -201,12 +204,23 @@ origins and bind address; do not expose local mode on an untrusted interface.
 ## 8. Start the bundled WebUI
 
 ```bash
-nexus-webui
+nexus webconsole launch
 ```
 
-Configure the WebUI with the Gateway URL printed by `nexus gateway status`. The WebUI owns no
-database and has no daemon IPC fallback. If the Gateway is unavailable, the UI reports the backend
-failure rather than presenting stale daemon state.
+`launch` ensures the daemon and Gateway, starts or reuses the Webconsole, waits for health, and then
+opens the browser. On a headless or remote host, use `nexus webconsole launch --no-open` and print
+the URL with `nexus webconsole url`. The WebUI owns no database and has no daemon IPC fallback. If
+the Gateway is unavailable, the UI reports the backend failure rather than presenting stale daemon
+state.
+
+Binding to another interface is explicit:
+
+```bash
+nexus webconsole start --host 0.0.0.0 --port 4200
+```
+
+Nexus prints a warning for non-loopback binds. Use a firewall or trusted private network and keep
+Gateway authentication enabled for remote access.
 
 For source development, the Gateway and WebUI packages have separate entrypoints even when the
 development server serves both from one checkout:
@@ -215,6 +229,18 @@ development server serves both from one checkout:
 pnpm --dir gateway install
 pnpm --dir gateway dev
 ```
+
+## 9. Update the managed installation
+
+```bash
+nexus update --check
+nexus update
+```
+
+The updater follows the package that launched it: CLI-only npm, Gateway npm, complete npm, or
+Cargo. It updates only installed facets, preserves prior service state, verifies the replacement,
+and rolls back to the exact previous version if a health check fails. Manual copies and development
+binaries are not mutated automatically.
 
 ## Configuration
 

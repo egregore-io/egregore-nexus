@@ -1,23 +1,30 @@
 use std::sync::Arc;
 
+#[cfg(unix)]
 use nexus::daemon::pty_supervisor::tmux_session_name;
 use nexus::daemon::AppState;
 use nexus_common::Config;
-use nexus_contracts::{Harness, Kind, Message, MessageId, ProjectId, Provenance, Scope, SessionId};
+use nexus_contracts::{Harness, SessionId};
+#[cfg(unix)]
+use nexus_contracts::{Kind, Message, MessageId, ProjectId, Provenance, Scope};
 use nexus_harness_claude::storage::{ClaudeRuntimeLaunch, ClaudeRuntimeStateRepo};
+#[cfg(unix)]
 use nexus_pty::TmuxHarness;
-use nexus_store::repos::{
-    AgentRuntimes, Agents, Inbox, NewAgent, NewAgentRuntime, NewSession, Sessions,
-};
+#[cfg(unix)]
+use nexus_store::repos::Inbox;
+use nexus_store::repos::{AgentRuntimes, Agents, NewAgent, NewAgentRuntime, NewSession, Sessions};
 use nexus_store::Store;
 
 const PROJECT: &str = "default";
 const AGENT_NAME: &str = "warm-claude";
 const AGENT_ID: &str = "agent_warm_claude";
+#[cfg(unix)]
 const CODEX_AGENT_NAME: &str = "warm-codex";
+#[cfg(unix)]
 const CODEX_AGENT_ID: &str = "agent_warm_codex";
 const CLAUDE_NATIVE_SESSION: &str = "claude-native-warm-owner";
 
+#[cfg(unix)]
 #[tokio::test]
 async fn warm_adopts_existing_tmux_runtime_without_respawn() {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
@@ -59,6 +66,7 @@ async fn warm_adopts_existing_tmux_runtime_without_respawn() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn warm_adoption_restamps_runtime_active_before_stable_recipient_drain() {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
@@ -118,6 +126,7 @@ async fn warm_adoption_restamps_runtime_active_before_stable_recipient_drain() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn warm_codex_does_not_adopt_surviving_tmux_as_plain_pty() {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
@@ -282,6 +291,7 @@ async fn seed_active_pty_runtime(store: Arc<Store>, session: SessionId, cwd: Str
         .unwrap();
 }
 
+#[cfg(unix)]
 async fn seed_active_codex_appserver_runtime(store: Arc<Store>, session: SessionId, cwd: String) {
     Agents::new(&store)
         .create(NewAgent {
@@ -325,6 +335,7 @@ async fn seed_active_codex_appserver_runtime(store: Arc<Store>, session: Session
         .unwrap();
 }
 
+#[cfg(unix)]
 async fn seed_stable_agent_pending_row(store: Arc<Store>, message_id: MessageId) {
     nexus_store::repos::Messages::new(&store)
         .insert(&Message {

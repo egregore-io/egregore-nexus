@@ -1,8 +1,9 @@
 //! PTY launch wiring and public-v0.1 context-acceptance safety.
 //!
-//! `launch_agent_with_program("cat")` must auto-bind the daemon-owned PTY, but durable bus delivery
-//! must fail closed because raw PTY bytes cannot prove harness context acceptance. Direct operator
-//! prompts remain supported and are used to prove the PTY reply reader feeds `stream_events`.
+//! A passive native test process launched through `launch_agent_with_program` must auto-bind the
+//! daemon-owned PTY, but durable bus delivery must fail closed because raw PTY bytes cannot prove
+//! harness context acceptance. Direct operator prompts remain supported and prove the PTY reply
+//! reader feeds `stream_events`.
 
 use std::sync::Arc;
 
@@ -17,6 +18,16 @@ use nexus_store::Store;
 use tokio::sync::broadcast;
 
 const PROJECT: &str = "egregore";
+
+#[cfg(unix)]
+fn passive_pty_program() -> &'static str {
+    "cat"
+}
+
+#[cfg(windows)]
+fn passive_pty_program() -> &'static str {
+    "cmd.exe"
+}
 
 /// Boot a real in-test daemon on the PTY-native wiring (its turn-exec is the supervisor's
 /// `PtyTransport`; the supervisor is owned by `AppState`).
@@ -108,9 +119,9 @@ async fn wait_for_terminal_contract_error(
 async fn launch_autobinds_pty_but_durable_dm_fails_before_raw_write() {
     let state = start().await;
 
-    // Launch a `cat` "agent" through the PTY-native path. The program override stands in for the real
-    // claude binary; everything else (session mint, supervisor bind, register_and_wake, transport
-    // wiring) is the production path. NO manual `bind` anywhere.
+    // Launch a passive "agent" through the PTY-native path. The program override stands in for the
+    // real Claude binary; everything else (session mint, supervisor bind, register_and_wake,
+    // transport wiring) is the production path. NO manual `bind` anywhere.
     let launched = state
         .launch_agent_with_program(
             SpawnRequest {
@@ -127,7 +138,7 @@ async fn launch_autobinds_pty_but_durable_dm_fails_before_raw_write() {
                 backend: None,
             },
             PROJECT,
-            "cat",
+            passive_pty_program(),
             None,
         )
         .await
@@ -192,13 +203,13 @@ async fn launch_autobinds_pty_but_durable_dm_fails_before_raw_write() {
     wait_for_terminal_contract_error(&state, &ack.message_id, &launched.session_id).await;
 }
 
-/// After a headed `cat` launch + DM, the cat PTY echoes the injected text back as PTY bytes. The
-/// PtyReplyReader (wired into `launch_agent_with_program`) must pick those bytes up, run them
+/// After a headed passive-process launch + prompt, the PTY renders the injected text as PTY bytes.
+/// The PtyReplyReader (wired into `launch_agent_with_program`) must pick those bytes up, run them
 /// through `ScreenText`, and emit a `text` AgentUpdate that is persisted into `stream_events` by
 /// the `WsSink`. This test asserts that marker appears in `stream_events` — proof the reader is
-/// wired into the live launch path and feeds the store, WITHOUT reading any `~/.claude` file.
+/// wired into the live launch path and feeds the store, WITHOUT reading any provider state file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cat_pty_text_reaches_stream_events() {
+async fn passive_pty_text_reaches_stream_events() {
     // Use a unique marker so we can assert specifically on this test's text, not stale rows.
     let marker = format!("NEXUS_PTY_MARKER_{}", nexus_common::new_session_id().0);
 
@@ -206,7 +217,7 @@ async fn cat_pty_text_reaches_stream_events() {
     store.migrate().await.unwrap();
     let state = AppState::wire_pty(store.clone(), &Config::default());
 
-    // (1) Launch a cat agent on the PTY-native path (program="cat").
+    // (1) Launch a passive agent on the PTY-native path.
     let launched = state
         .launch_agent_with_program(
             SpawnRequest {
@@ -223,15 +234,16 @@ async fn cat_pty_text_reaches_stream_events() {
                 backend: None,
             },
             PROJECT,
-            "cat",
+            passive_pty_program(),
             None,
         )
         .await
         .expect("pty launch");
 
     // (2) Directly prompt ada with the marker text. Unlike durable bus delivery, an operator prompt
-    // is allowed to write to a raw PTY. cat echoes it back as PTY bytes → PtyReplyReader →
-    // ScreenText strips ANSI → Text AgentUpdate → WsSink persists to stream_events.
+    // is allowed to write to a raw PTY. The native process renders it as PTY bytes →
+    // PtyReplyReader → ScreenText strips ANSI → Text AgentUpdate → WsSink persists to
+    // stream_events.
     let _: nexus_contracts::PromptResponse = call(
         &state,
         Some(Caller {

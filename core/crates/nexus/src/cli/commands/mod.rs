@@ -23,6 +23,8 @@ pub mod send;
 pub mod source;
 pub mod terminal_client;
 pub mod threads;
+pub mod update;
+pub mod webconsole;
 
 /// clap value-parsers for the contract enums (kept out of `nexus-contracts`, which has no clap dep).
 pub mod parse {

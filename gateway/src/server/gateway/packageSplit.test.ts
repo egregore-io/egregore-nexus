@@ -28,7 +28,9 @@ describe("gateway/webconsole package split", () => {
     expect(publishedGateway.scripts.dev).toBe("pnpm --dir gateway start:api");
     expect(publishedGateway.scripts.build).toBe("npm run build:gateway-package");
     expect(publishedGateway.scripts["webconsole:dev"]).toBe("pnpm --dir webconsole dev");
-    expect(publishedGateway.scripts["webconsole:build"]).toBe("pnpm --dir webconsole build");
+    expect(publishedGateway.scripts["webconsole:build"]).toBe(
+      "node webconsole/build-webconsole.mjs",
+    );
   });
 
   it("keeps the gateway headless entrypoint independent of the webconsole package", () => {

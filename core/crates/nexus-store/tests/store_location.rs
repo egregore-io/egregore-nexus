@@ -89,6 +89,42 @@ async fn opens_file_url_with_local_store_path() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn local_store_defaults_to_anonymous_stream_storage() {
+    let _guard = env_guard().lock().unwrap();
+    let _stream_env = EnvRestore::capture("NEXUS_STREAM_DB_PATH");
+    std::env::remove_var("NEXUS_STREAM_DB_PATH");
+
+    let run = format!(
+        "nexus-store-anonymous-stream-{}-{}",
+        std::process::id(),
+        nexus_common::now()
+    );
+    let dir = std::env::temp_dir().join(run);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store_path = dir.join("nexus.db");
+
+    let store = Store::open(store_path.to_string_lossy().as_ref())
+        .await
+        .expect("open local store");
+    assert_eq!(store.stream_db_path(), None);
+    store.migrate().await.expect("migrate local store");
+
+    let mut rows = store
+        .conn
+        .query(
+            "SELECT name FROM mem.sqlite_master WHERE type = 'table' AND name = 'stream_events'",
+            (),
+        )
+        .await
+        .expect("query anonymous stream schema");
+    assert!(rows.next().await.expect("stream schema row").is_some());
+    assert!(!dir.join("nexus-stream.db").exists());
+
+    drop(store);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn env_guard() -> &'static std::sync::Mutex<()> {
     static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     GUARD.get_or_init(|| std::sync::Mutex::new(()))

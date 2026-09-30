@@ -18,14 +18,39 @@ def main() -> int:
         'network = "internet"',
         'path = "../.."',
         'name = "rust-tests"',
+        'name = "npm-cli-smoke"',
+        "node.exe packages/nexus-cli/bin/nexus.mjs daemon install --help",
+        "node.exe scripts/nexus-cli-command-surface-smoke.mjs",
         'name = "gateway-gates"',
+        "pnpm.cmd --dir gateway webconsole:build",
         'name = "nexus-exe"',
         'name = "gateway-headless"',
         'name = "gateway-web"',
+        'path = "C:\\\\w\\\\src\\\\egregore-nexus\\\\gateway\\\\webconsole\\\\dist"',
     )
     missing_fragments = [fragment for fragment in required_fragments if fragment not in recipe]
     if missing_fragments:
         failures.append(f"recipe is missing required contract fragments: {missing_fragments}")
+    optimization_fragments = (
+        'CARGO_BUILD_JOBS = "4"',
+        'RUST_TEST_THREADS = "4"',
+        'CARGO_TARGET_DIR = "C:\\\\w\\\\cache\\\\cargo-target"',
+        '--store-dir C:\\w\\cache\\pnpm-store',
+        '--prefer-offline',
+    )
+    missing_optimizations = [
+        fragment for fragment in optimization_fragments if fragment not in recipe
+    ]
+    if missing_optimizations:
+        failures.append(
+            f"recipe is missing bounded warm-cache settings: {missing_optimizations}"
+        )
+    if 'name = "rust-compile"' in recipe or "--workspace --no-run" in recipe:
+        failures.append("recipe still performs the redundant Rust no-run compile")
+    if recipe.count("cargo.exe test --workspace") != 1:
+        failures.append("recipe must compile and run the Rust workspace exactly once")
+    if "pnpm.cmd --dir gateway build\n" in recipe:
+        failures.append("recipe still performs the duplicate headless Gateway build")
 
     if failures:
         print("FAIL Windows validation recipe contract")

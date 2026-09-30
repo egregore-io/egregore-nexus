@@ -1,11 +1,13 @@
 import { createRequire } from "node:module";
 import type { AddressInfo } from "node:net";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createClient } from "@libsql/client";
 
 import { describe, expect, it, vi } from "vitest";
+
+import { removeTempPath } from "../../test/removeTempPath";
 
 vi.mock("../../routes/api/agui.observe", () => ({
   observeScoped: vi.fn(async () => json({ ok: true, route: "agent-session" })),
@@ -61,7 +63,7 @@ describe("headless gateway", () => {
         .toMatchObject({ count: 0 });
       db.close();
     } finally {
-      await rm(dir, { recursive: true, force: true });
+      await removeTempPath(dir, { recursive: true });
     }
   });
 

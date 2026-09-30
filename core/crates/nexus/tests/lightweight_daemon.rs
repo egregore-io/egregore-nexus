@@ -28,6 +28,17 @@ fn unique_store_path(label: &str) -> PathBuf {
     ))
 }
 
+fn passive_pty_program() -> &'static str {
+    #[cfg(windows)]
+    {
+        "cmd.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "cat"
+    }
+}
+
 #[derive(Clone)]
 struct ResumeKeyAdapter {
     inner: MockAdapter,
@@ -475,7 +486,7 @@ async fn daemon_owned_headed_launch_persists_its_exact_mode_and_backend() {
                 backend: Some("pty".into()),
             },
             "default",
-            "cat",
+            passive_pty_program(),
             None,
         )
         .await

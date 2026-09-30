@@ -37,6 +37,10 @@ wsl-target = "x86_64-unknown-linux-gnu"
 # section before npm assembly; Mach-O and PE/COFF do not carry that ELF section.
 strip = "symbols"
 
+[patch.crates-io]
+libsql = { path = "vendor/libsql" }
+portable-pty = { path = "vendor/portable-pty" }
+
 [workspace.dependencies]
 nexus-contracts = { path = "crates/nexus-contracts", version = "=0.1.0" }
 nexus-common = { package = "egregore-nexus-common", path = "crates/nexus-common", version = "=0.1.0" }

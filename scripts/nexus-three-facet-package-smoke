@@ -14,6 +14,12 @@ case "${1:-}" in
 esac
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+# This fixture owns a disposable daemon and Gateway. Never let an ambient agent session inherit
+# operator authority or route the smoke test into the caller's live Nexus runtime.
+unset NEXUS_AGENT NEXUS_AGENT_ID NEXUS_CLI NEXUS_CLIENT_KEY NEXUS_HOME \
+  NEXUS_KIND NEXUS_NAME NEXUS_PROJECT NEXUS_SESSION_ID NEXUS_TIER
+
 TMP=$(mktemp -d)
 GATEWAY_PORT=$((43000 + ($$ % 1000)))
 WEBUI_PORT=$((44000 + ($$ % 1000)))
@@ -102,8 +108,14 @@ grep -Fq "$TMP/path-guidance-install/bin" "$TMP/path-guidance.log"
 
 test "$(find "$TMP/packs" -maxdepth 1 -name '*.tgz' -printf '.' | wc -c)" -eq 3
 "$STACK_BIN/nexus" daemon install --help >/dev/null
+"$STACK_BIN/nexus" update --help >/dev/null
+"$STACK_BIN/nexus" gateway install --help >/dev/null
+"$STACK_BIN/nexus" webconsole launch --help >/dev/null
 node "$ROOT/scripts/nexus-cli-command-surface-smoke.mjs" "$STACK_BIN/nexus"
 "$TMP/global-install/bin/nexus" daemon install --help >/dev/null
+"$TMP/global-install/bin/nexus" update --help >/dev/null
+"$TMP/global-install/bin/nexus" gateway install --help >/dev/null
+"$TMP/global-install/bin/nexus" webconsole launch --help >/dev/null
 "$TMP/path-guidance-install/bin/nexus" daemon install --help >/dev/null
 "$STACK_BIN/nexus-gateway" --help | grep -q 'nexus-gateway'
 NEXUS_HOME="$TMP/nexus-home" NEXUS_GATEWAY_DB="file:$TMP/nexus-home/gateway.db" \
@@ -152,11 +164,11 @@ if (gateway.name !== "@egregore/nexus-gateway" || gateway.private) process.exit(
 if (webui.name !== "@egregore/nexus-webui-workspace" || !webui.private) process.exit(1);
 if (cli.name !== "@egregore/nexus-cli" || cli.private) process.exit(1);
 if (nexus.name !== "@egregore/nexus" || nexus.private) process.exit(1);
-if ([gateway, webui, cli, nexus].some((pkg) => pkg.license !== "Apache-2.0" || pkg.version !== "0.1.1")) process.exit(1);
-if (gateway.dependencies?.["@egregore/nexus-cli"] !== "0.1.1") process.exit(1);
+if ([gateway, webui, cli, nexus].some((pkg) => pkg.license !== "Apache-2.0" || pkg.version !== "0.1.2")) process.exit(1);
+if (gateway.dependencies?.["@egregore/nexus-cli"] !== "0.1.2") process.exit(1);
 if (gateway.bin?.nexus !== "scripts/nexus.mjs") process.exit(1);
-if (nexus.dependencies?.["@egregore/nexus-cli"] !== "0.1.1") process.exit(1);
-if (nexus.dependencies?.["@egregore/nexus-gateway"] !== "0.1.1") process.exit(1);
+if (nexus.dependencies?.["@egregore/nexus-cli"] !== "0.1.2") process.exit(1);
+if (nexus.dependencies?.["@egregore/nexus-gateway"] !== "0.1.2") process.exit(1);
 ' "$ROOT"
 
 NEXUS_HOME="$TMP/nexus-home" NEXUS_DB_PATH="$TMP/nexus-home/nexus.db" \

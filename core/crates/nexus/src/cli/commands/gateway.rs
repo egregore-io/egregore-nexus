@@ -15,9 +15,14 @@ use crate::gateway_lifecycle::{
     gateway_logs, gateway_status, restart_gateway, start_gateway, stop_gateway,
     GatewayLifecycleError, GatewayRuntimeStatus, GatewayStatusReport,
 };
+use crate::gateway_service::{
+    install_gateway_service, uninstall_gateway_service, GatewayServiceReport,
+};
 
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum GatewayCmd {
+    /// Install and start the Gateway under the native per-user supervisor.
+    Install,
     /// Start Nexus Core when needed, then start the installed gateway.
     Start,
     /// Stop only the gateway; Nexus Core remains running.
@@ -31,6 +36,8 @@ pub enum GatewayCmd {
     /// Inspect or change daemon-to-Gateway projection delivery policy.
     #[command(subcommand, name = "delivery-mode")]
     DeliveryMode(GatewayDeliveryModeCmd),
+    /// Stop and remove the Gateway's native per-user service.
+    Uninstall,
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
@@ -81,6 +88,10 @@ pub struct GatewayLogsArgs {
 
 pub async fn run(command: GatewayCmd, json: bool) -> ExitCode {
     match command {
+        GatewayCmd::Install => match install_gateway_service().await {
+            Ok(report) => render_service_report(&report, json),
+            Err(error) => render_error(&error, json),
+        },
         GatewayCmd::Start => match start_gateway().await {
             Ok(report) => render_report(&report, json, false),
             Err(error) => render_error(&error, json),
@@ -105,7 +116,28 @@ pub async fn run(command: GatewayCmd, json: bool) -> ExitCode {
             Ok(report) => render_delivery_mode(&report, json),
             Err(error) => render_error(&error, json),
         },
+        GatewayCmd::Uninstall => match uninstall_gateway_service() {
+            Ok(report) => render_service_report(&report, json),
+            Err(error) => render_error(&error, json),
+        },
     }
+}
+
+fn render_service_report(report: &GatewayServiceReport, json: bool) -> ExitCode {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(report).unwrap_or_else(|_| "{}".into())
+        );
+    } else if report.installed {
+        println!(
+            "Nexus Gateway service installed and healthy ({})",
+            report.supervisor
+        );
+    } else {
+        println!("Nexus Gateway service uninstalled ({})", report.supervisor);
+    }
+    ExitCode::SUCCESS
 }
 
 async fn run_delivery_mode(

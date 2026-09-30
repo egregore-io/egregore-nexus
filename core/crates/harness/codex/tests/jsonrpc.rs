@@ -15,7 +15,6 @@
 use nexus_harness_codex::JsonRpc;
 #[cfg(unix)]
 use nexus_harness_codex::{CodexRpcError, Notification};
-#[cfg(unix)]
 use std::path::PathBuf;
 #[cfg(unix)]
 use tokio::net::UnixListener;

@@ -12,7 +12,7 @@ name core/crates/nexus-agent/src/adapter/hermes/mod.rs|5
 name core/crates/nexus-agent/src/adapter/hermes/native.rs|16
 name core/crates/nexus-agent/src/adapter/hermes/skill.rs|33
 name core/crates/nexus-agent/src/adapter/mod.rs|6
-name core/crates/nexus-agent/src/adapter/opencode/harness.rs|76
+name core/crates/nexus-agent/src/adapter/opencode/harness.rs|75
 name core/crates/nexus-agent/src/adapter/opencode/mod.rs|4
 name core/crates/nexus-agent/src/adapter/opencode/native.rs|16
 name core/crates/nexus-agent/src/adapter/opencode/skill.rs|14
@@ -44,7 +44,6 @@ name core/crates/nexus/src/cli/commands/attach.rs|2
 name core/crates/nexus/src/cli/commands/lifecycle.rs|47
 name core/crates/nexus/src/cli/commands/mcp/mod.rs|23
 name core/crates/nexus/src/cli/commands/mod.rs|16
-name core/crates/nexus/src/cli/mod.rs|5
 name core/crates/nexus/src/cli/read_client.rs|45
 name core/crates/nexus/src/daemon/app/adoption.rs|51
 name core/crates/nexus/src/daemon/app/launch_orchestration.rs|39

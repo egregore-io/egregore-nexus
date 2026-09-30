@@ -75,7 +75,7 @@ describe("conversation store — persist + read back (the refresh path)", () => 
   });
 
   it("delegates configuration to the local canonical Gateway store", () => {
-    expect(conversationDbConfig({}).url).toMatch(/\/\.nexus\/gateway\.db$/);
+    expect(conversationDbConfig({}).url).toMatch(/[/\\]\.nexus[/\\]gateway\.db$/);
     expect(
       conversationDbConfig({
         NEXUS_GATEWAY_DB: "file:/tmp/gateway.db",

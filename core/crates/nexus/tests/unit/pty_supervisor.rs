@@ -27,6 +27,17 @@ struct SubmissionSignalTerminal {
     writer: Arc<SubmissionSignalWriter>,
 }
 
+fn echoing_pty_program() -> &'static str {
+    #[cfg(windows)]
+    {
+        "cmd.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "cat"
+    }
+}
+
 impl TerminalBackend for SubmissionSignalTerminal {
     fn attach(&self) -> nexus_pty::TerminalAttachment {
         nexus_pty::TerminalAttachment {
@@ -284,8 +295,12 @@ fn opencode_binary_preflight_reports_missing_path() {
 #[test]
 fn opencode_binary_preflight_resolves_path_and_override() {
     let tmp = tempfile::tempdir().unwrap();
-    let bin = tmp.path().join("opencode");
-    std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+    let bin = tmp.path().join(if cfg!(windows) {
+        "opencode.exe"
+    } else {
+        "opencode"
+    });
+    std::fs::write(&bin, "fixture").unwrap();
     let path_env = tmp.path().to_string_lossy();
 
     assert_eq!(
@@ -565,13 +580,13 @@ async fn persist_codex_tmux_state_updates_runtime_state() {
 
 #[tokio::test]
 async fn launch_spawns_binds_and_routes_inject_through_the_pty() {
-    // `cat` echoes its PTY input back out — a deterministic, offline harness stand-in.
+    // The platform's stdin pager echoes PTY input back out as an offline harness stand-in.
     let supervisor = PtySupervisor::new();
     let session = SessionId("s_cat_launch".into());
     let pty = supervisor
         .launch(
             &session,
-            "cat",
+            echoing_pty_program(),
             "ada",
             Some("ada"),
             "default",
@@ -644,7 +659,7 @@ async fn launch_stores_raw_runtime_behind_pty_backend_handle() {
     supervisor
         .launch(
             &session,
-            "cat",
+            echoing_pty_program(),
             "ada",
             Some("ada"),
             "default",
@@ -722,7 +737,7 @@ async fn raw_pty_bind_publishes_endpoint_manifest_and_kill_removes_it() {
     supervisor
         .launch(
             &session,
-            "cat",
+            echoing_pty_program(),
             "ada",
             Some("ada"),
             "default",
@@ -813,7 +828,7 @@ async fn launch_exposes_terminal_socket_for_raw_pty_runtime() {
     supervisor
         .launch(
             &session,
-            "cat",
+            echoing_pty_program(),
             "ada",
             Some("ada"),
             "default",
@@ -936,7 +951,7 @@ async fn kill_removes_terminal_socket_endpoint() {
     supervisor
         .launch(
             &session,
-            "cat",
+            echoing_pty_program(),
             "ada",
             Some("ada"),
             "default",
@@ -956,13 +971,17 @@ async fn kill_removes_terminal_socket_endpoint() {
     let endpoint = supervisor
         .terminal_endpoint(&session)
         .expect("raw PTY launch should expose terminal endpoint");
+    #[cfg(unix)]
     assert!(endpoint.path.exists());
+    #[cfg(windows)]
+    assert!(endpoint.path.to_string_lossy().starts_with(r"\\.\pipe\"));
     assert_eq!(supervisor.pty_backend_kind(&session), Some("raw"));
 
     assert!(supervisor.kill(&session));
 
     assert!(supervisor.terminal_endpoint(&session).is_none());
     assert_eq!(supervisor.pty_backend_kind(&session), None);
+    #[cfg(unix)]
     assert!(
         !endpoint.path.exists(),
         "terminal socket file should be removed when the runtime is killed"

@@ -210,17 +210,22 @@ not require the Gateway.
 ## Gateway lifecycle
 
 ```bash
+nexus gateway install
 nexus gateway start
 nexus gateway status
 nexus gateway logs -n 200
 nexus gateway logs --follow
 nexus gateway restart
 nexus gateway stop
+nexus gateway uninstall
 ```
 
-`start` and `restart` ensure the daemon is running first. A missing package returns
+`install` registers the Gateway with the current user's native service manager, first ensuring the
+daemon is installed and healthy. `start` and `restart` ensure the daemon is running first. A
+missing package returns
 `GATEWAY_NOT_INSTALLED` with `npm install -g @egregore/nexus-gateway`; the CLI never installs it
-implicitly.
+implicitly. Gateway lifecycle never stops the daemon except when `nexus daemon uninstall` is
+explicitly removing the complete supervised stack.
 
 Projection delivery policy:
 
@@ -232,6 +237,48 @@ nexus gateway delivery-mode set best-effort
 
 Buffered mode retains a bounded boot-epoch projection backlog until Gateway acknowledgement.
 Best-effort mode does not retain disconnected Gateway projections.
+
+## Webconsole lifecycle
+
+```bash
+nexus webconsole launch
+nexus webconsole launch --no-open
+nexus webconsole start --host 127.0.0.1 --port 4200
+nexus webconsole status
+nexus webconsole url
+nexus webconsole logs --follow
+nexus webconsole restart
+nexus webconsole stop
+```
+
+`launch` ensures daemon and Gateway health, starts or reuses one Webconsole process, waits for its
+health endpoint, and then opens the browser. `start` performs the same dependency and health work
+without opening a browser. The Webconsole is on demand and is not registered as a login service.
+
+The default bind is loopback. A non-loopback `--host` prints a warning because Webconsole delegates
+authentication and all data access to its configured Gateway. It never connects to daemon IPC or
+opens daemon state.
+
+Status exits `0` when live and healthy, `1` when degraded or stale, `2` when down, and `3` when the
+Webconsole package is not installed.
+
+## Installation-aware updates
+
+```bash
+nexus update --check
+nexus update
+nexus --json update --check
+```
+
+The updater acts only on the npm or Cargo installation that launched it. It acquires one exclusive
+lock, resolves an exact target version, snapshots daemon/Gateway/Webconsole runtime state, updates
+only installed facets, rewrites native service definitions, and restores only services that were
+running. A failed verification rolls back to the exact prior version and prints a recovery command.
+
+Manual copies and development binaries are intentionally unmanaged. Daemon-launched agent
+sessions cannot update the operator installation. `--check` exits `0` when current, `10` when an
+update is available, and nonzero on an error. Machine-readable output includes the install method,
+facets, service transitions, rollback result, and stable error code; it never includes credentials.
 
 ## Agents and administration
 

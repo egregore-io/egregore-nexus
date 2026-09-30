@@ -8,6 +8,7 @@ fn parse(args: &[&str]) -> Cli {
 
 #[test]
 fn gateway_lifecycle_verbs_parse() {
+    parse(&["gateway", "install"]);
     parse(&["gateway", "start"]);
     parse(&["gateway", "stop", "--force"]);
     parse(&["gateway", "restart", "--force"]);
@@ -16,6 +17,28 @@ fn gateway_lifecycle_verbs_parse() {
     parse(&["gateway", "delivery-mode", "show"]);
     parse(&["gateway", "delivery-mode", "set", "buffered"]);
     parse(&["gateway", "delivery-mode", "set", "best-effort"]);
+    parse(&["gateway", "uninstall"]);
+}
+
+#[test]
+fn lifecycle_affordances_parse() {
+    parse(&["webconsole", "launch", "--no-open"]);
+    parse(&[
+        "webconsole",
+        "start",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "4200",
+    ]);
+    parse(&["webconsole", "stop", "--force"]);
+    parse(&["webconsole", "restart"]);
+    parse(&["webconsole", "status"]);
+    parse(&["webconsole", "logs", "--follow", "--lines", "25"]);
+    parse(&["webconsole", "url"]);
+    parse(&["update"]);
+    parse(&["update", "--check"]);
+    parse(&["--json", "update", "--check"]);
 }
 
 #[test]

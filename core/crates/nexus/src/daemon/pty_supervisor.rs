@@ -631,9 +631,9 @@ impl PtySupervisor {
     /// Spawn `program` in a raw daemon-owned **PTY** with the nexus-bus MCP wired, bind it to the
     /// transport under the caller-supplied [`SessionId`], track the session, and return the PTY.
     ///
-    /// This is the deterministic, offline path: tests pass `"cat"` (it echoes its PTY input, which
-    /// the cat-based proofs assert on). Production claude/codex launches go through [`launch_headed_pty`]
-    /// instead — a raw PTY makes claude's TUI never COMPLETE an injected turn. The transcript tailer
+    /// This is the deterministic, offline raw path. Production Claude and Codex launches go through
+    /// [`launch_headed_pty`] instead — a raw PTY makes Claude's TUI never complete an injected turn.
+    /// The transcript tailer
     /// is NOT spawned here (the caller supplies the store/sink/bell it needs). On Windows, the
     /// terminal/transport traits are exposed through `ConPtyBackend` so this same raw path uses the
     /// platform ConPTY host instead of a Unix PTY.

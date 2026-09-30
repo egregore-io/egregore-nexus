@@ -32,6 +32,10 @@ use std::sync::Arc;
 
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(windows)]
+use tokio::net::TcpListener;
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
@@ -107,11 +111,14 @@ fn error_frame(id: &Value, message: &str, data: Option<Value>) -> String {
 /// When `turn/start { threadId }` is received, pushes the scripted
 /// notifications to ALL subscribers for that threadId (cross-connection
 /// broadcast), then sends the `{result:{}}` reply on THIS connection only.
-async fn handle_conn(
-    stream: tokio::net::UnixStream,
+async fn handle_conn<S>(
+    stream: S,
     script: Arc<Vec<Value>>,
     registry: Registry,
-) -> Result<(), BoxError> {
+) -> Result<(), BoxError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let ws = accept_async_with_config(stream, Some(ws_config())).await?;
     let (mut ws_sink, mut ws_stream) = ws.split();
 
@@ -314,19 +321,35 @@ pub(super) async fn run() {
         }
     }
 
-    // Parse socket path: find the last `unix://…` token in argv.
-    let sock_path: String = std::env::args()
-        .rev()
-        .find(|a| a.starts_with("unix://"))
-        .expect("Usage: fake_codex_app_server app-server --listen unix://<sock>")
-        .strip_prefix("unix://")
-        .unwrap()
-        .to_owned();
+    #[cfg(unix)]
+    let listener = {
+        let sock_path: String = std::env::args()
+            .rev()
+            .find(|arg| arg.starts_with("unix://"))
+            .expect("Usage: fake_codex_app_server app-server --listen unix://<sock>")
+            .strip_prefix("unix://")
+            .unwrap()
+            .to_owned();
+        let _ = std::fs::remove_file(&sock_path);
+        UnixListener::bind(&sock_path).expect("failed to bind UnixListener")
+    };
 
-    // Remove any stale socket file from a prior run.
-    let _ = std::fs::remove_file(&sock_path);
-
-    let listener = UnixListener::bind(&sock_path).expect("failed to bind UnixListener");
+    #[cfg(windows)]
+    let listener = {
+        let address = std::env::args()
+            .rev()
+            .find_map(|arg| arg.strip_prefix("ws://").map(str::to_owned))
+            .expect("Usage: fake_codex_app_server app-server --listen ws://<address>")
+            .parse::<std::net::SocketAddr>()
+            .expect("invalid loopback WebSocket listen address");
+        assert!(address.ip().is_loopback(), "fake server must bind loopback");
+        let listener = TcpListener::bind(address)
+            .await
+            .expect("failed to bind loopback TcpListener");
+        let address = listener.local_addr().expect("read loopback listen address");
+        eprintln!("Codex app-server listening on ws://{address}");
+        listener
+    };
 
     // Load the notification script once — shared across all connections.
     let script = Arc::new(load_script());

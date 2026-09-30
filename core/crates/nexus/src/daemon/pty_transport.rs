@@ -296,32 +296,32 @@ mod tests {
         AgentUpdateKind, Harness, InjectError, Kind, ProviderLimitReason, Scope,
     };
     use nexus_pty::bracketed_paste;
-    use portable_pty::{CommandBuilder, PtySize};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct CapturingHarness {
+        turns: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl HarnessInput for CapturingHarness {
+        async fn send_turn(&self, text: &str) -> Result<(), String> {
+            self.turns.lock().unwrap().push(text.to_string());
+            Ok(())
+        }
+    }
 
     #[test]
     fn is_bound_reflects_binding() {
-        use nexus_pty::PtySession;
         let transport = PtyTransport::default();
         let session = SessionId("s_bound".into());
         assert!(
             !transport.is_bound(&session),
             "unbound session is not bound"
         );
-        let pty = Arc::new(
-            PtySession::spawn(
-                CommandBuilder::new("cat"),
-                PtySize {
-                    rows: 24,
-                    cols: 80,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                },
-            )
-            .unwrap(),
-        );
-        transport.bind(session.clone(), pty as Arc<dyn nexus_pty::HarnessInput>);
+        let harness = Arc::new(CapturingHarness::default());
+        transport.bind(session.clone(), harness as Arc<dyn nexus_pty::HarnessInput>);
         assert!(transport.is_bound(&session), "bound session reports bound");
         assert!(
             !transport.is_bound(&SessionId("s_other".into())),
@@ -339,27 +339,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inject_turn_writes_the_rendered_batch_into_the_pty() {
-        use nexus_pty::PtySession;
+    async fn inject_turn_sends_the_rendered_batch_to_the_bound_harness() {
         let session = SessionId("s_pty".into());
-        let pty = Arc::new(
-            PtySession::spawn(
-                CommandBuilder::new("cat"),
-                PtySize {
-                    rows: 24,
-                    cols: 80,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                },
-            )
-            .unwrap(),
-        );
-        let mut out = pty.subscribe();
+        let harness = Arc::new(CapturingHarness::default());
 
         let transport = PtyTransport::default();
         transport.bind(
             session.clone(),
-            pty.clone() as Arc<dyn nexus_pty::HarnessInput>,
+            harness.clone() as Arc<dyn nexus_pty::HarnessInput>,
         );
 
         let batch = NexusBatch {
@@ -385,19 +372,7 @@ mod tests {
         };
         transport.inject_turn(&session, &batch).await.unwrap();
 
-        let injected = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            let mut buf = Vec::new();
-            while let Ok(c) = out.recv().await {
-                buf.extend_from_slice(&c);
-                let s = String::from_utf8_lossy(&buf);
-                if s.contains("</nexus-batch>") {
-                    return s.to_string();
-                }
-            }
-            String::new()
-        })
-        .await
-        .unwrap_or_default();
+        let injected = harness.turns.lock().unwrap()[0].clone();
         assert!(
             injected.contains("<nexus-batch"),
             "the rendered <nexus-batch> must reach the PTY: {injected}"
@@ -413,27 +388,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prompt_writes_raw_operator_text_into_the_pty_without_batch_envelope() {
-        use nexus_pty::PtySession;
+    async fn prompt_sends_raw_operator_text_without_a_batch_envelope() {
         let session = SessionId("s_pty".into());
-        let pty = Arc::new(
-            PtySession::spawn(
-                CommandBuilder::new("cat"),
-                PtySize {
-                    rows: 24,
-                    cols: 80,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                },
-            )
-            .unwrap(),
-        );
-        let mut out = pty.subscribe();
+        let harness = Arc::new(CapturingHarness::default());
 
         let transport = PtyTransport::default();
         transport.bind(
             session.clone(),
-            pty.clone() as Arc<dyn nexus_pty::HarnessInput>,
+            harness.clone() as Arc<dyn nexus_pty::HarnessInput>,
         );
 
         // The operator's verbatim text (the web `/agent` send). It must reach the harness AS-IS —
@@ -443,23 +405,10 @@ mod tests {
             .await
             .unwrap();
 
-        let (saw_text, saw_envelope) =
-            tokio::time::timeout(std::time::Duration::from_secs(3), async {
-                let mut buf = Vec::new();
-                while let Ok(c) = out.recv().await {
-                    buf.extend_from_slice(&c);
-                    let s = String::from_utf8_lossy(&buf);
-                    if s.contains("WEB2TUI-RAW-9931") {
-                        return (true, s.contains("nexus-batch"));
-                    }
-                }
-                (false, false)
-            })
-            .await
-            .unwrap_or((false, false));
-        assert!(saw_text, "the raw operator text must reach the PTY");
+        let sent = harness.turns.lock().unwrap();
+        assert_eq!(sent.as_slice(), ["WEB2TUI-RAW-9931"]);
         assert!(
-            !saw_envelope,
+            !sent[0].contains("nexus-batch"),
             "an operator prompt must NOT be wrapped in a <nexus-batch> envelope"
         );
     }
