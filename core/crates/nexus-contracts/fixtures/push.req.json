@@ -1,0 +1,12 @@
+{
+  "jsonrpc": "2.0",
+  "id": 10,
+  "method": "push",
+  "params": {
+    "source": "github-ci",
+    "topic": "ci.events",
+    "summary": "Build passed",
+    "body": "All checks green on main@abc1234",
+    "meta": { "sha": "abc1234", "branch": "main" }
+  }
+}

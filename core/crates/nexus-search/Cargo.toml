@@ -1,0 +1,22 @@
+[package]
+name = "nexus-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = ["crates-io"]
+description = "Nexus scoped search: per-agent FTS5 + native-vector + chronological history over the durable message log; every query injects the caller's scope (own DMs ∪ member threads ∪ subscribed topics — context hygiene §9). Implements SearchPort."
+
+[dependencies]
+nexus-contracts = { workspace = true }
+nexus-common = { workspace = true }
+nexus-store = { workspace = true }
+libsql = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

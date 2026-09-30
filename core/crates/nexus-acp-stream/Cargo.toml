@@ -1,0 +1,16 @@
+[package]
+name = "nexus-acp-stream"
+description = "ACP stream normalization for Egregore Nexus harness adapters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = ["crates-io"]
+
+[dependencies]
+agent-client-protocol = { workspace = true }
+nexus-contracts = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

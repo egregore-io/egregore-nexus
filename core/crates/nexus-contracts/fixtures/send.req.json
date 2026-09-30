@@ -1,0 +1,11 @@
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "send",
+  "params": {
+    "to": { "verb": "dm", "name": "dylan", "agentId": "a_dylan" },
+    "summary": null,
+    "body": "rebase before you start",
+    "mention": []
+  }
+}

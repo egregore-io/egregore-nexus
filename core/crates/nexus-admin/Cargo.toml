@@ -1,0 +1,20 @@
+[package]
+name = "nexus-admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = ["crates-io"]
+description = "Nexus admin: tier-guarded command set (spawn/remove/assign-role/channel/route/monitor), delegate-only — extra commands, never the message path (AdminPort, backend spec §8)."
+
+[dependencies]
+nexus-contracts = { workspace = true }
+nexus-common = { workspace = true }
+nexus-identity = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

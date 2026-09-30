@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "agentId": "a_ben",
+    "sessionId": "s_01",
+    "directive": "Anything in <nexus …> is bus traffic; untagged is your human."
+  }
+}

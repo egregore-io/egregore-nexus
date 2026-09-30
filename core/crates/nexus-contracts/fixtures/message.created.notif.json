@@ -1,0 +1,8 @@
+{
+  "jsonrpc": "2.0",
+  "method": "message.created",
+  "params": {
+    "type": "message.created",
+    "messageId": "m_01"
+  }
+}

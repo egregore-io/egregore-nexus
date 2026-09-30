@@ -1,0 +1,34 @@
+/target/
+node_modules/
+.env
+.worktrees/
+nexus-pipe-*.bin
+
+# Local runtime/tool state.
+.nexus/opencode/
+.opencode/
+.playwright-mcp/
+opencode.json*
+
+# Generated gateway router scratch files.
+gateway/.tanstack/tmp/
+
+# Local package/build output and validation evidence. These directories may
+# contain browser profiles, test databases, logs, screenshots, and copied auth
+# state; none belongs in source archives.
+.pnpm-store/
+output/
+gateway/.dist-run-*/
+gateway/dist-gateway/
+gateway/webconsole/dist/
+.nexus/load-gate/
+.claude/skills/impeccable/
+*.tgz
+
+# Accidental zero-byte files created by local scripts/import mishaps.
+/os
+/sqlite3
+/subprocess
+/sys
+/tempfile
+__pycache__/

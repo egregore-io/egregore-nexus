@@ -1,0 +1,101 @@
+export interface AguiWsHandle {
+  closed: Promise<void>;
+  close(code?: number, reason?: string): void;
+}
+
+export interface AguiWsSocket {
+  bufferedAmount?: number;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  on?(event: "message", handler: (data: string | Buffer) => void): unknown;
+  on?(event: "close" | "error", handler: () => void): unknown;
+}
+
+export interface AguiWsInput {
+  mode: "session" | "bus";
+  target: unknown;
+  text: string;
+  clientMessageId?: string;
+}
+
+export interface AguiWsSteerInput {
+  target: unknown;
+  text: string;
+  clientMessageId?: string;
+}
+
+export interface AguiWsDeveloperEventSource {
+  since(topic: string, afterSeq: number): Promise<unknown[]>;
+}
+
+export interface AguiWsDaemonToolCallEventSource {
+  subscribe(
+    topic: string,
+    afterSeq: number,
+    handlers: {
+      onEvent: (event: unknown) => void;
+      onGap?: (frame: unknown) => void;
+      onError?: (error: unknown) => void;
+    },
+  ): (() => void) | undefined;
+}
+
+export interface AguiWsObserveFrameObserver {
+  observeAguiFrame(payload: string): void;
+}
+
+export interface AguiWsDeps {
+  fetchHandler?: (request: Request) => Promise<Response>;
+  observe?: (request: Request) => Promise<Response>;
+  sessionInput?: (input: AguiWsInput, request: Request) => Promise<Response>;
+  busInput?: (input: AguiWsInput, request: Request) => Promise<Response>;
+  steerInput?: (input: AguiWsSteerInput, request: Request) => Promise<Response>;
+  /** Session name → harness kind (`claude`|`codex`|…) for the command catalog.
+   *  Defaults to a `/api/v1/members` lookup through `fetchHandler`. */
+  resolveHarness?: (target: string, request: Request) => Promise<string | undefined>;
+  developerEvents?: AguiWsDeveloperEventSource;
+  daemonToolCallEvents?: AguiWsDaemonToolCallEventSource | null;
+  /** Ephemeral `sys.fleet.status` push source (agent presence/activity/spawned/removed plus the
+   *  ordered `resync` reconciliation boundary on every subscribe/reconnect). Defaults to the
+   *  daemon push socket under the pseudo session id `fleet`. */
+  daemonFleetStatusEvents?: AguiWsDaemonToolCallEventSource | null;
+  developerEventPollMs?: number;
+  /** One gateway-wide poll cadence for the daemon-owned transition projection. */
+  commandQueueEventPollMs?: number;
+  commandQueueHub?: CommandQueueHub;
+}
+
+export interface CommandQueueHubHandlers {
+  onSnapshot(snapshot: unknown): void;
+  onTransition(transition: unknown): void;
+  onError(error: string): void;
+}
+
+export class CommandQueueHub {
+  constructor(deps: AguiWsDeps);
+  subscribe(
+    request: Request,
+    target: string,
+    handlers: CommandQueueHubHandlers,
+  ): () => void;
+}
+
+export function handleWs(
+  socket: AguiWsSocket,
+  request: Request,
+  deps?: AguiWsDeps,
+): AguiWsHandle;
+
+export function attachAguiWsUpgrade(
+  server: unknown,
+  options?: AguiWsDeps,
+): Promise<unknown>;
+
+export function toObserveRequest(request: Request): Request;
+
+export function pumpSseResponseToSocket(
+  response: Response,
+  socket: AguiWsSocket,
+  signal?: AbortSignal,
+  observer?: AguiWsObserveFrameObserver,
+): Promise<void>;

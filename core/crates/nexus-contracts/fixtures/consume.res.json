@@ -1,0 +1,44 @@
+{
+  "jsonrpc": "2.0",
+  "id": 3,
+  "result": {
+    "counts": { "dms": 2, "thread": 1, "total": 3 },
+    "dms": [
+      {
+        "id": "m_01",
+        "from": "erin",
+        "kind": "human",
+        "scope": "dm",
+        "thread": null,
+        "topic": null,
+        "body": "take the auth refactor today?",
+        "truncated": false
+      },
+      {
+        "id": "m_02",
+        "from": "ben",
+        "kind": "agent",
+        "scope": "dm",
+        "thread": null,
+        "topic": null,
+        "body": "rebase before you start.",
+        "truncated": false
+      }
+    ],
+    "threads": [
+      {
+        "id": "m_03",
+        "from": "dylan",
+        "kind": "agent",
+        "scope": "thread",
+        "thread": "backend",
+        "topic": null,
+        "body": "migration plan ... [truncated]",
+        "truncated": true
+      }
+    ],
+    "dmMessageIds": ["m_01", "m_02"],
+    "threadMessageIds": ["m_03"],
+    "messageIds": ["m_01", "m_02", "m_03"]
+  }
+}

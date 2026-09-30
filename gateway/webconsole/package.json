@@ -1,0 +1,34 @@
+{
+  "name": "@egregore/nexus-webui-workspace",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/egregore-io/egregore-nexus.git",
+    "directory": "gateway/webconsole"
+  },
+  "homepage": "https://github.com/egregore-io/egregore-nexus#readme",
+  "bugs": {
+    "url": "https://github.com/egregore-io/egregore-nexus/issues"
+  },
+  "description": "Static Nexus WebUI configured to communicate only with a Nexus Gateway.",
+  "bin": {
+    "nexus-webui": "bin/nexus-webui.mjs"
+  },
+  "files": [
+    "bin/nexus-webui.mjs",
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "vite --config vite.config.ts",
+    "preview": "vite preview --config vite.config.ts",
+    "build": "node build-webconsole.mjs",
+    "test": "cd .. && pnpm exec vitest run src/app src/modules src/routes --exclude 'src/routes/api/**'",
+    "typecheck": "cd .. && pnpm exec tsc --noEmit"
+  }
+}

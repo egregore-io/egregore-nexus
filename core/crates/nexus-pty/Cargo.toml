@@ -1,0 +1,23 @@
+[package]
+name = "nexus-pty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = ["crates-io"]
+description = "Portable PTY transport and terminal framing for Nexus agent harnesses."
+
+[dependencies]
+portable-pty = "0.9.0"
+tokio = { version = "1.48", features = ["rt", "sync", "macros", "io-util", "time"] }
+thiserror = "1"
+serde_json = "1"
+async-trait = "0.1"
+vt100 = "0.15"
+nexus-harness-claude = { workspace = true }
+nexus-harness-codex = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "time"] }

@@ -1,0 +1,8 @@
+{
+  "jsonrpc": "2.0",
+  "id": 32,
+  "method": "admin.dlq.requeue",
+  "params": {
+    "inFlightId": "if_dead"
+  }
+}

@@ -1,0 +1,299 @@
+/*
+ * Obsidian Void — design tokens and the `--lens-*` styling contract.
+ *
+ * Tailwind v4 is CSS-first: this file is the single styling entry. It imports
+ * Tailwind, declares the `--lens-*` semantic token contract on :root, then maps
+ * the relevant tokens into Tailwind's theme namespace via `@theme inline` so
+ * utilities (`bg-primary`, `text-read`, `text-faint`, `border-subtle`,
+ * `rounded-row`, `max-w-chat`, `text-online`, …) resolve to the same CSS
+ * variables. Components reference tokens only (never hard-coded hex) so a user
+ * stylesheet re-skins instantly by overriding `--lens-*`.
+ */
+@import "tailwindcss";
+@import "streamdown/styles.css";
+
+@source "../../../node_modules/streamdown/dist/*.js";
+/* The separately-built WebUI has gateway/webconsole as its Vite root. Tell
+ * Tailwind to scan the imported application graph outside that root as well. */
+@source "../../app/**/*.{ts,tsx}";
+@source "../../modules/**/*.{ts,tsx}";
+@source "../../routes/**/*.{ts,tsx}";
+@source "../../shared/**/*.{ts,tsx}";
+
+:root {
+  /* canvas */
+  --lens-bg-primary: #000000;
+  --lens-bg-secondary: #0a0a0a;
+  --lens-bg-tertiary: #121212;
+  --lens-bg-hover: #1c1c1c;
+  --lens-surface-raised: #161616;
+  --lens-surface-inset: #050505;
+  --lens-overlay: #111111;
+
+  /* text */
+  --lens-text-normal: #ffffff;
+  --lens-text-read: #eaeaea;
+  --lens-text-muted: #8f8f8f;
+  --lens-text-faint: #7c7c7c; /* ~5:1 on pure black — AA for small labels */
+
+  /* borders / fills — hairlines instead of shadows */
+  --lens-border-subtle: rgba(255, 255, 255, 0.06);
+  --lens-border-strong: #262626;
+  --lens-fill-active: rgba(255, 255, 255, 0.04);
+  --lens-fill-hover: rgba(255, 255, 255, 0.02);
+  --lens-focus-halo: rgba(255, 255, 255, 0.2);
+
+  /* state hues — desaturated, never neon */
+  --lens-online: #34d399;
+  --lens-busy: #f59e0b;
+  --lens-offline: #4b4b4b;
+  --lens-alert: #e0654f;
+  --lens-accent: #d6d6d6; /* monochrome "accent": near-white, used sparingly */
+
+  /* type */
+  --lens-font-ui: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --lens-font-mono:
+    "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+
+  /* radii */
+  --r-2: 4px;
+  --r-row: 6px;
+  --r-btn: 8px;
+  --r-bubble: 12px;
+  --r-pill: 50px;
+
+  /* layout */
+  --rail-w: 244px;
+  --ctx-w: 280px;
+  --top-h: 48px;
+  --chat-max: 56rem;
+
+  /* z-scale (semantic) */
+  --z-sticky: 100;
+  --z-dropdown: 200;
+  --z-modal: 400;
+  --z-toast: 600;
+  --z-tooltip: 800;
+
+  /* premium floating-overlay depth (menus/dialogs) */
+  --lens-shadow-elevated: 0 16px 48px rgba(0, 0, 0, 0.85);
+
+  /* backdrop dim — controlled by SettingsModal; AppShell re-applies from store on mount */
+  --lens-backdrop-dim: 0.66;
+
+  /* scrim — modal/overlay backdrop colour driven by the backdrop-dim preference */
+  --lens-scrim: rgb(0 0 0 / var(--lens-backdrop-dim, 0.66));
+
+  /* Streamdown/shadcn token aliases, kept pointed at the Nexus palette. */
+  --background: var(--lens-bg-primary);
+  --foreground: var(--lens-text-read);
+  --card: var(--lens-surface-inset);
+  --card-foreground: var(--lens-text-read);
+  --muted: var(--lens-bg-tertiary);
+  --muted-foreground: var(--lens-text-muted);
+  --border: var(--lens-border-subtle);
+  --sidebar: var(--lens-surface-inset);
+}
+
+/* Accent overrides — set via document.documentElement.dataset.accent */
+:root[data-accent="green"] {
+  --lens-accent: var(--lens-online);
+}
+:root[data-accent="amber"] {
+  --lens-accent: var(--lens-busy);
+}
+:root[data-accent="ember"] {
+  --lens-accent: var(--lens-alert);
+}
+/* mono = default (no override needed; --lens-accent is already near-white) */
+
+/*
+ * Bridge the semantic tokens into Tailwind's theme. `inline` keeps the variable
+ * references live, so changing a `--lens-*` value (a loaded user theme) instantly
+ * re-themes every utility that consumes it.
+ */
+@theme inline {
+  --color-bg-primary: var(--lens-bg-primary);
+  --color-bg-secondary: var(--lens-bg-secondary);
+  --color-bg-tertiary: var(--lens-bg-tertiary);
+  --color-bg-hover: var(--lens-bg-hover);
+  --color-bg-overlay: var(--lens-overlay);
+  --color-surface-raised: var(--lens-surface-raised);
+  --color-surface-inset: var(--lens-surface-inset);
+  --color-background: var(--lens-bg-primary);
+  --color-foreground: var(--lens-text-read);
+  --color-muted: var(--lens-bg-tertiary);
+  --color-muted-foreground: var(--lens-text-muted);
+  --color-border: var(--lens-border-subtle);
+  --color-sidebar: var(--lens-surface-inset);
+
+  --color-text-normal: var(--lens-text-normal);
+  --color-text-read: var(--lens-text-read);
+  --color-text-muted: var(--lens-text-muted);
+  --color-text-faint: var(--lens-text-faint);
+
+  --color-border-subtle: var(--lens-border-subtle);
+  --color-border-strong: var(--lens-border-strong);
+
+  --color-online: var(--lens-online);
+  --color-busy: var(--lens-busy);
+  --color-offline: var(--lens-offline);
+  --color-alert: var(--lens-alert);
+  --color-accent: var(--lens-accent);
+
+  --radius-2: var(--r-2);
+  --radius-row: var(--r-row);
+  --radius-btn: var(--r-btn);
+  --radius-bubble: var(--r-bubble);
+  --radius-pill: var(--r-pill);
+  --radius-md: var(--r-btn);
+  --radius-xl: var(--r-bubble);
+
+  --container-chat: var(--chat-max);
+
+  --font-ui: var(--lens-font-ui);
+  --font-mono: var(--lens-font-mono);
+}
+
+/* ── base / reset ───────────────────────────────── */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+body {
+  background: var(--lens-bg-primary);
+  color: var(--lens-text-read);
+  font-family: var(--lens-font-ui);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+:focus-visible {
+  outline: 2px solid var(--lens-focus-halo);
+  outline-offset: 2px;
+  border-radius: var(--r-2);
+}
+
+/* The blinking-dot / caret keyframe for live streaming turns. */
+@keyframes lens-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+/*
+ * Thin, recessive scrollbars for scroll regions (the ScrollArea primitive adds
+ * `.lens-scroll`). Track invisible; thumb a faint white-alpha bar that brightens
+ * on hover — in keeping with the clinical, low-noise void.
+ */
+.lens-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+}
+.lens-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.lens-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.lens-scroll::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.1);
+  border: 3px solid transparent;
+  background-clip: content-box;
+  border-radius: 9999px;
+}
+.lens-scroll:hover::-webkit-scrollbar-thumb {
+  background-color: rgba(255, 255, 255, 0.18);
+}
+
+/* Streamdown renders thread conversation text while keeping tokenized chrome. */
+.nexus-streamdown {
+  overflow-wrap: anywhere;
+}
+.nexus-streamdown-body {
+  color: var(--lens-text-read);
+  line-height: 1.55;
+}
+.nexus-streamdown-body :where(p) {
+  margin: 0;
+}
+.nexus-streamdown-body :where(h1, h2, h3, h4, h5, h6) {
+  margin: 0.85rem 0 0.35rem;
+  color: var(--lens-text-normal);
+  font-weight: 650;
+  line-height: 1.25;
+  letter-spacing: 0;
+}
+.nexus-streamdown-body :where(h1) {
+  font-size: 1.2rem;
+}
+.nexus-streamdown-body :where(h2) {
+  font-size: 1.08rem;
+}
+.nexus-streamdown-body :where(h3, h4, h5, h6) {
+  font-size: 0.98rem;
+}
+.nexus-streamdown-body :where(ul, ol) {
+  margin: 0.35rem 0 0.35rem 1.1rem;
+  padding: 0;
+}
+.nexus-streamdown-body :where(li) {
+  margin: 0.16rem 0;
+  padding-left: 0.1rem;
+}
+.nexus-streamdown-body :where(a) {
+  color: var(--lens-text-normal);
+  text-decoration: underline;
+  text-decoration-color: var(--lens-border-strong);
+  text-underline-offset: 3px;
+}
+.nexus-streamdown-body :where(code:not([data-block="true"])) {
+  border: 1px solid var(--lens-border-subtle);
+  border-radius: var(--r-2);
+  background: var(--lens-bg-tertiary);
+  color: var(--lens-text-normal);
+  font-family: var(--lens-font-mono);
+  font-size: 0.88em;
+}
+.nexus-streamdown-body :where([data-streamdown="code-block"]) {
+  margin: 0.7rem 0;
+  border-radius: var(--r-btn);
+  border-color: var(--lens-border-subtle);
+  background: var(--lens-surface-inset);
+}
+.nexus-streamdown-body :where([data-streamdown="code-block-body"]) {
+  border-color: var(--lens-border-subtle);
+  background: var(--lens-bg-primary);
+}
+.nexus-streamdown-body :where(blockquote) {
+  margin: 0.65rem 0;
+  border-left: 1px solid var(--lens-border-strong);
+  padding-left: 0.75rem;
+  color: var(--lens-text-muted);
+}
+.nexus-streamdown-body :where(table) {
+  width: 100%;
+  border-collapse: collapse;
+}
+.nexus-streamdown-body :where(th, td) {
+  border: 1px solid var(--lens-border-subtle);
+}
+
+/* Reduced motion: kill the streaming animations, keep the caret visible. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}

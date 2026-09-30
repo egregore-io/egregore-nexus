@@ -1,0 +1,14 @@
+{
+  "jsonrpc": "2.0",
+  "id": 11,
+  "result": {
+    "source": {
+      "name": "github-ci",
+      "topic": "ci.events",
+      "enabled": true,
+      "createdAt": 1719300000,
+      "lastFiredAt": null
+    },
+    "token": "tok_abc123secret"
+  }
+}

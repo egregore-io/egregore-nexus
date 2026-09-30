@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "id": 11,
+  "method": "source.register",
+  "params": {
+    "name": "github-ci",
+    "topic": "ci.events"
+  }
+}

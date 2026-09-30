@@ -1,0 +1,27 @@
+{
+  "jsonrpc": "2.0",
+  "id": 31,
+  "result": {
+    "rows": [
+      {
+        "inFlightId": "if_dead",
+        "messageId": "m_dead",
+        "sender": "ben",
+        "recipientName": "ana",
+        "recipientAgentId": "a_ana",
+        "recipientSession": "s_ana",
+        "createdAt": 1700000000,
+        "deadLetteredAt": 1700000123,
+        "attemptCount": 2,
+        "errorCode": "provider_error",
+        "errorReason": "provider server error",
+        "errorDetails": {
+          "retryable": true,
+          "source": "claude.acp.prompt_error"
+        },
+        "bodyPreview": "hello"
+      }
+    ],
+    "total": 1
+  }
+}

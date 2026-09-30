@@ -1,0 +1,50 @@
+[package]
+name = "nexus-harness-codex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = ["crates-io"]
+description = "Codex harness: ACP adapter + headed (TUI) command builders + bootstrap, over the shared nexus-agent substrate."
+
+[dependencies]
+nexus-agent = { workspace = true }
+nexus-contracts = { workspace = true }
+nexus-harness-core = { workspace = true }
+nexus-common = { workspace = true }
+nexus-store = { workspace = true }
+nexus-transcript = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+libsql = { workspace = true }
+# Normal (not dev) deps: the cross-crate fake `[[bin]]` is a binary
+# target and binaries cannot see dev-dependencies.
+agent-client-protocol = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+portable-pty = "0.9.0"
+
+[dev-dependencies]
+toml = "0.8"
+nexus-dispatch = { workspace = true }
+
+[[bin]]
+# Reuse nexus-agent's hermetic fake ACP harness source (no duplication) so this
+# crate's integration tests get CARGO_BIN_EXE_codex_fake_acp_agent. Cross-crate path is
+# valid; the source compiles against this crate's (matching) deps.
+name = "codex_fake_acp_agent"
+path = "../../nexus-agent/src/bin/fake_acp_agent.rs"
+
+[[bin]]
+# Hermetic fake Codex app-server for integration tests.
+# Speaks WebSocket-over-Unix-socket JSON-RPC (same framing as the real codex
+# app-server). Tests get CARGO_BIN_EXE_fake_codex_app_server injected by Cargo.
+# Must use normal deps only (binaries cannot see dev-dependencies).
+name = "fake_codex_app_server"
+path = "src/bin/fake_codex_app_server.rs"

@@ -1,0 +1,23 @@
+{
+  "name": "@egregore/nexus-gateway-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/egregore-io/egregore-nexus.git",
+    "directory": "gateway/gateway"
+  },
+  "homepage": "https://github.com/egregore-io/egregore-nexus#readme",
+  "bugs": {
+    "url": "https://github.com/egregore-io/egregore-nexus/issues"
+  },
+  "description": "Private workspace runner for the public @egregore/nexus-gateway package.",
+  "scripts": {
+    "start": "node ../scripts/gateway-serve.mjs",
+    "start:api": "node ../scripts/gateway-serve.mjs --api-only --discovery=none",
+    "test": "cd .. && pnpm exec vitest run src/server/gateway src/routes/api src/server/api",
+    "typecheck": "cd .. && pnpm exec tsc --noEmit"
+  }
+}

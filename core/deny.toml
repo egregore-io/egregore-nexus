@@ -1,0 +1,106 @@
+# cargo-deny configuration — the workspace's CI guard for:
+#   1. licenses — a permissive allowlist (deny anything else),
+#   2. dependency direction — the down-only layer graph (modules §4): a lower layer never depends on
+#      a higher one, and there are no cycles; only the `nexus` binary may depend on everything,
+#   3. advisories — fail on known security advisories / unmaintained crates.
+#
+# Layering (down-only): foundation (contracts, common, store) → capability (realtime, identity,
+# agent, search, notify) → domain (bus, admin) → composition (nexus). Enforced below by pinning, for
+# each higher-layer crate, the exact set of crates allowed to depend on it (`wrappers`); a
+# disallowed up-edge (e.g. `nexus-store` depending on `nexus-bus`) makes that crate appear as a
+# non-wrapper consumer and fails `cargo deny check bans`.
+
+[graph]
+all-features = true
+
+# ----------------------------------------------------------------------------------------------
+# Licenses — permissive allowlist (SPDX). Anything not listed fails the check.
+# ----------------------------------------------------------------------------------------------
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+]
+# Our own workspace crates carry no `license` field; they are private and skipped.
+private = { ignore = true }
+confidence-threshold = 0.8
+
+# ----------------------------------------------------------------------------------------------
+# Bans / dependency direction — the down-only layer graph guard.
+# ----------------------------------------------------------------------------------------------
+[bans]
+# Duplicate versions of the same crate are a warning (transitive churn), not a hard error.
+multiple-versions = "warn"
+wildcards = "allow"
+
+# Each entry: this workspace crate may ONLY be depended on by the listed `wrappers`. The binary
+# `nexus` and the test-only `nexus-acceptance` may depend on anything, so they appear in every set.
+
+# -- capability layer: only the composition binary (+ tests) and any legitimately-higher crate. --
+[[bans.deny]]
+name = "nexus-dispatch"
+wrappers = ["nexus", "nexus-acceptance"]
+
+[[bans.deny]]
+name = "nexus-identity"
+# `nexus-admin` (domain) legitimately sits above `nexus-identity` (capability) and uses its
+# `tier_guard` helper — a permitted down-edge.
+wrappers = ["nexus", "nexus-admin", "nexus-acceptance"]
+
+[[bans.deny]]
+name = "nexus-agent"
+wrappers = ["nexus", "nexus-acceptance"]
+
+[[bans.deny]]
+name = "nexus-search"
+wrappers = ["nexus", "nexus-acceptance"]
+
+[[bans.deny]]
+name = "nexus-notify"
+wrappers = ["nexus", "nexus-acceptance"]
+
+# -- domain layer: only the composition binary (+ tests). --
+[[bans.deny]]
+name = "nexus-bus"
+wrappers = ["nexus", "nexus-acceptance"]
+
+[[bans.deny]]
+name = "nexus-admin"
+wrappers = ["nexus", "nexus-acceptance"]
+
+# ----------------------------------------------------------------------------------------------
+# Advisories — RustSec database checks.
+# ----------------------------------------------------------------------------------------------
+[advisories]
+yanked = "warn"
+ignore = [
+    # bincode is the deliberately-chosen Rust-native socket codec (v4 rule 2). The advisory is
+    # "unmaintained", not a vulnerability; the 1.x wire format we use is stable and frozen.
+    "RUSTSEC-2025-0141",
+    # rustls-pemfile "unmaintained" — pulled in transitively by libsql's TLS stack (not used on the
+    # daemon's local libSQL path), no fix available short of a libsql bump.
+    "RUSTSEC-2025-0134",
+    # rustls-webpki advisories — all transitive via libsql → hyper-rustls → rustls → rustls-webpki.
+    # The daemon uses local file / :memory: libSQL and performs no remote-cert / CRL verification, so
+    # these certificate-validation paths are unreachable here. Resolved by a future libsql bump.
+    "RUSTSEC-2026-0049", # CRLs not authoritative by Distribution Point (faulty matching)
+    "RUSTSEC-2026-0098", # name constraints for URI names incorrectly accepted
+    "RUSTSEC-2026-0099", # name constraints accepted for wildcard-name certs
+    "RUSTSEC-2026-0104", # reachable panic in CRL parsing
+]
+
+# ----------------------------------------------------------------------------------------------
+# Sources — only crates.io (no unknown registries / git sources).
+# ----------------------------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "allow"

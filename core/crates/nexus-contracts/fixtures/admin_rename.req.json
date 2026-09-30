@@ -1,0 +1,9 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "admin.rename",
+  "params": {
+    "source": "s_staged",
+    "target": "nora"
+  }
+}

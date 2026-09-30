@@ -1,0 +1,10 @@
+{
+  "jsonrpc": "2.0",
+  "id": 33,
+  "method": "admin.dlq.purge",
+  "params": {
+    "for": "ana",
+    "since": "24h",
+    "yes": true
+  }
+}

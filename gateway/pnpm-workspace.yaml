@@ -1,0 +1,9 @@
+packages:
+  - ../packages/nexus-cli
+  - gateway
+  - webconsole
+
+linkWorkspacePackages: true
+
+allowBuilds:
+  esbuild: true

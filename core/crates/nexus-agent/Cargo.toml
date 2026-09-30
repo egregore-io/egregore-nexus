@@ -1,0 +1,43 @@
+[package]
+name = "nexus-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = ["crates-io"]
+description = "Nexus agent transport: adapter registry (mock/claude/codex), ACP session/prompt turn-injection with <nexus-batch> wrapping + plain-user-DM rule, session/update relay (AgentTurnExecutionPort, backend spec §2.3/§5/§6/§11)."
+
+[dependencies]
+nexus-contracts = { workspace = true }
+nexus-common = { workspace = true }
+nexus-transcript = { workspace = true }
+# Pure ACP session/update → tagged StreamEvent transform (the full-stream pass-through).
+nexus-acp-stream = { workspace = true }
+nexus-harness-core = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+# Real ACP engine (initialize / session/new / session/prompt / session/update relay).
+agent-client-protocol = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Key-preserving merge of the `nexus-bus` MCP server into hermes's `config.yaml` (the hermes way
+# to wire MCP — its ACP session reads `mcp_servers` from config, not from ACP `session/new`).
+serde_yaml = { workspace = true }
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[[bin]]
+# Hermetic fake ACP agent harness used by the integration tests (a real subprocess that speaks
+# the ACP wire protocol). A `[[bin]]` (not an example) so `cargo test -p nexus-agent` builds it
+# and exposes `CARGO_BIN_EXE_fake_acp_agent` to the tests — no separate `--examples` build needed.
+# It is test-only infrastructure; the library API does not depend on it.
+name = "fake_acp_agent"
+path = "src/bin/fake_acp_agent.rs"

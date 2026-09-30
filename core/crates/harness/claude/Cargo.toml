@@ -1,0 +1,32 @@
+[package]
+name = "nexus-harness-claude"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = ["crates-io"]
+description = "Claude harness: ACP adapter + headed command builders + bootstrap, over the shared nexus-agent substrate."
+
+[dependencies]
+nexus-agent = { workspace = true }
+nexus-contracts = { workspace = true }
+nexus-harness-core = { workspace = true }
+nexus-common = { workspace = true }
+nexus-store = { workspace = true }
+nexus-transcript = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+libsql = { workspace = true }
+# Normal deps because the cross-crate fake ACP binary is a binary target.
+agent-client-protocol = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+
+[[bin]]
+# Reuse nexus-agent's hermetic fake ACP harness source so this crate's
+# integration tests get their own Cargo bin target without duplicating code.
+name = "fake_claude_acp_agent"
+path = "../../nexus-agent/src/bin/fake_acp_agent.rs"
