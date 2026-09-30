@@ -35,6 +35,8 @@ type AcceptedInputKey = (String, String, String);
 #[derive(Default)]
 struct Inner {
     phase: OwnerPhase,
+    telemetry: super::telemetry::State,
+    account_telemetry: super::account_telemetry::State,
     native_revision: u64,
     fact_revision: u64,
     disconnected: bool,
@@ -554,15 +556,30 @@ impl CodexTurnTracker {
         if note.id.is_some() {
             return;
         }
-        let Some(thread) = note.params.get("threadId").and_then(Value::as_str) else {
+        if matches!(
+            note.method.as_str(),
+            "account/rateLimits/updated" | "account/updated"
+        ) {
+            // These native account-wide notifications have no threadId. They belong to this
+            // connection's captured reporter, never to a late/current registry lookup or turn.
+            if note.params.get("threadId").is_some() {
+                return;
+            }
+            let mut inner = self.lock("");
+            let root = match &inner.phase {
+                OwnerPhase::Published(root) if !inner.disconnected => root.clone(),
+                _ => return,
+            };
+            if let Some(reporting) = self
+                .owner
+                .as_ref()
+                .and_then(|owner| owner.model_reporting.as_ref())
+            {
+                inner.account_telemetry.ingest(note, &root, reporting);
+            }
             return;
-        };
-        let Some(turn) = note
-            .params
-            .get("turnId")
-            .and_then(Value::as_str)
-            .or_else(|| note.params.get("turn")?.get("id")?.as_str())
-        else {
+        }
+        let Some(thread) = note.params.get("threadId").and_then(Value::as_str) else {
             return;
         };
         let mut inner = self.lock(thread);
@@ -572,6 +589,29 @@ impl CodexTurnTracker {
             OwnerPhase::Provisional(Some(expected)) if expected != thread => return,
             _ => {}
         }
+        if matches!(&inner.phase, OwnerPhase::Published(expected) if expected == thread)
+            && !inner.disconnected
+        {
+            if let Some(reporting) = self
+                .owner
+                .as_ref()
+                .and_then(|owner| owner.model_reporting.as_ref())
+            {
+                inner.telemetry.ingest(note, thread, reporting);
+            }
+        }
+        // Token metadata is not native turn-start/status authority, including legacy owners.
+        if note.method == method::TOKEN_USAGE_UPDATED {
+            return;
+        }
+        let Some(turn) = note
+            .params
+            .get("turnId")
+            .and_then(Value::as_str)
+            .or_else(|| note.params.get("turn")?.get("id")?.as_str())
+        else {
+            return;
+        };
         // Fresh setup retains compact per-thread summaries until thread/start identifies its owner.
         if !inner.active_turn_ids.contains_key(thread)
             && inner.active_turn_ids.len() >= RECENT_COMPLETIONS_LIMIT

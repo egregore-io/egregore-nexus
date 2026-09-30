@@ -121,6 +121,7 @@ struct ModelMetadataSink {
     identity: nexus_contracts::model_report::ModelProfileIdentity,
     root: std::sync::Mutex<Option<String>>,
     values: std::sync::Mutex<Vec<nexus_contracts::model_report::NativeModelUpdate>>,
+    telemetry: std::sync::Mutex<Vec<nexus_contracts::telemetry::NativeTelemetryUpdate>>,
     closed: std::sync::atomic::AtomicBool,
 }
 impl nexus_contracts::model_report::ModelObservationSink for ModelMetadataSink {
@@ -154,12 +155,39 @@ impl nexus_contracts::model_report::ModelObservationSink for ModelMetadataSink {
     fn revoke(&self) {
         self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
     }
+    fn observe_telemetry(&self, update: nexus_contracts::telemetry::NativeTelemetryUpdate) -> bool {
+        use nexus_contracts::telemetry::NativeTelemetryUpdate;
+        let root = match &update {
+            NativeTelemetryUpdate::Context {
+                native_session_id, ..
+            }
+            | NativeTelemetryUpdate::Usage {
+                native_session_id, ..
+            }
+            | NativeTelemetryUpdate::Quota {
+                native_session_id, ..
+            } => native_session_id,
+        };
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst)
+            || self.root.lock().unwrap().as_deref() != Some(root)
+        {
+            return false;
+        }
+        self.telemetry.lock().unwrap().push(update);
+        true
+    }
 }
 fn model_metadata_engine(legacy: bool) -> (AcpEngine, Arc<ModelMetadataSink>) {
+    model_metadata_engine_with_context(legacy, false)
+}
+fn model_metadata_engine_with_context(
+    legacy: bool,
+    context: bool,
+) -> (AcpEngine, Arc<ModelMetadataSink>) {
     use nexus_agent::adapter::{AcpModelMetadataDialect, AdapterModelReportingProfile};
     use nexus_contracts::{ModelEvidenceCapability, ModelObservationSource, ModelReportBackend};
     let source = ModelObservationSource::new("fixture-config").unwrap();
-    let profile = AdapterModelReportingProfile::new(
+    let mut profile = AdapterModelReportingProfile::new(
         ModelReportBackend::new("fixture-backend").unwrap(),
         ModelEvidenceCapability::Supported,
         ModelEvidenceCapability::Unsupported,
@@ -174,10 +202,25 @@ fn model_metadata_engine(legacy: bool) -> (AcpEngine, Arc<ModelMetadataSink>) {
         },
     )
     .unwrap();
+    if context {
+        use nexus_agent::adapter::{AdapterTelemetryCapability, AdapterTelemetryReportingProfile};
+        let unavailable =
+            AdapterTelemetryCapability::new(ModelEvidenceCapability::Unverified, None).unwrap();
+        profile = profile.with_telemetry(AdapterTelemetryReportingProfile::new(
+            unavailable.clone(),
+            AdapterTelemetryCapability::new(
+                ModelEvidenceCapability::Supported,
+                Some(ModelObservationSource::new("codex.acp.usage_update").unwrap()),
+            )
+            .unwrap(),
+            unavailable,
+        ));
+    }
     let sink = Arc::new(ModelMetadataSink {
         identity: profile.identity().clone(),
         root: Default::default(),
         values: Default::default(),
+        telemetry: Default::default(),
         closed: Default::default(),
     });
     let captured = Arc::new(std::sync::Mutex::new(None));
@@ -199,6 +242,73 @@ fn model_metadata_engine(legacy: bool) -> (AcpEngine, Arc<ModelMetadataSink>) {
         .unwrap();
     let reporting = captured.lock().unwrap().take();
     (AcpEngine::new().with_reporting(reporting), sink)
+}
+
+#[tokio::test]
+async fn model_metadata_context_actual_dispatch_requires_capability_and_exact_root() {
+    use nexus_contracts::telemetry::{NativeTelemetryUpdate, NativeTelemetryValue};
+    for enabled in [false, true] {
+        let (engine, sink) = model_metadata_engine_with_context(false, enabled);
+        let mut command = fake_command();
+        command.env.push((
+            "FAKE_ACP_RAW_NEW".into(),
+            json!({"sessionId":"fixture-root","configOptions":[]}).to_string(),
+        ));
+        let update = |root, used| json!({"sessionId":root,"update":{"sessionUpdate":"usage_update","used":used,"size":200000}});
+        command.env.push((
+            "FAKE_ACP_RAW_MODEL_UPDATES".into(),
+            json!([
+                update("foreign-child", 99999),
+                update("fixture-root", 42000),
+                update("fixture-root", 42000),
+                update("fixture-root", 1000),
+                update("fixture-root", 0)
+            ])
+            .to_string(),
+        ));
+        engine.spawn_and_initialize(&command).await.unwrap();
+        engine
+            .new_session(None, &LaunchCtx::default())
+            .await
+            .unwrap();
+        let result = engine
+            .inject_completion_observed("context fixture".into())
+            .await;
+        let telemetry = sink.telemetry.lock().unwrap().clone();
+        engine.kill().await;
+        assert!(
+            !result.unwrap().is_empty(),
+            "telemetry must not alter prompt completion"
+        );
+        assert!(sink.closed.load(std::sync::atomic::Ordering::SeqCst));
+        if !enabled {
+            assert!(
+                telemetry.is_empty(),
+                "legacy profile cannot silently gain telemetry"
+            );
+            continue;
+        }
+        assert_eq!(
+            telemetry.len(),
+            4,
+            "foreign root is excluded; repeats remain snapshots"
+        );
+        for (update, expected) in telemetry.into_iter().zip([42000, 42000, 1000, 0]) {
+            let NativeTelemetryUpdate::Context {
+                native_session_id,
+                value: NativeTelemetryValue::Observed(value),
+            } = update
+            else {
+                panic!("only context observations are supported")
+            };
+            assert_eq!(native_session_id, "fixture-root");
+            assert_eq!(value.used_tokens.unwrap().value.get(), expected);
+            assert!(
+                value.reset_id.is_none(),
+                "a decrease cannot invent reset identity"
+            );
+        }
+    }
 }
 #[tokio::test]
 async fn model_metadata_actual_raw_new_and_load_dispatch_preserve_native_fixtures() {

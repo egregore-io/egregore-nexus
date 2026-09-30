@@ -53,12 +53,87 @@ that the constructed backend still reports `claude.acp`; the other ACP cases req
 ## Usage, context and allowance
 
 The adapter and public report contracts support separate usage, context and account-allowance
-capabilities/observations. These model collectors do not yet enable those native metrics. Unsupported
-or unknown is not zero, and contract support is not a claim that a collector supplies live values.
+capabilities/observations. The headed Codex app-server collector now supplies native-session token
+snapshots, last-reported context estimates and passive account-window observations using the pinned
+0.154.0 protocol. Other modes remain unverified/unwired. Unsupported or unknown is not zero, and contract
+support is not a claim that every collector supplies live values.
 Consumers preserve each value's native/derived/estimated basis and timestamp. Usage snapshots retain
 per-turn versus native-session scope and counter/reset identity; repeated cumulative values are
 replacements, not amounts to add. Remaining context must never be computed from lifetime token
 totals. Account allowance retains provider/account/window/reset scope, not per-session cost.
+
+Across all eight harness/mode paths, prefer a natively exposed metric or percentage; otherwise
+reuse a verified same-version native display calculation and label its derived/estimated basis.
+Do not invent a substitute from lifetime counters. A headed native source never enables ACP by
+implication. Consumers render supplied canonical percentages without repeating the calculation.
+
+Codex `thread/tokenUsage/updated` supplies `total`, `last` and optional `modelContextWindow`, not a
+percentage. Usage preserves `total` as a replacement snapshot, including input/output/cache/reasoning
+breakdowns. Missing optional cache-write, model, native timestamp and reset identity stay absent;
+counter decreases are not assigned invented epochs. Context token estimates use `last.totalTokens`,
+not cumulative usage. The remaining percentage matches Codex 0.154's fixed 12,000-token UI baseline:
+round the clamped ratio of remaining user-controllable context to `(capacity - 12000)` (zero when
+capacity is at most 12,000). This is a **last-reported display estimate**, not a direct native percent,
+guaranteed current occupancy, output reserve, or a user-configurable baseline. Raw remaining tokens
+are calculated independently from raw capacity minus the last sample, never from that percentage.
+Over-window samples preserve used tokens and the native-display zero percent, but omit negative
+remaining tokens rather than clamp them into an invented zero-token observation.
+
+Exact published-owner/root admission and native turn ordering fence telemetry. New turns clear
+context; old-turn notifications cannot restore it. Compaction items (and the legacy notification)
+or an explicit context-window error block occupancy until a distinct native turn starts. Capacity
+can remain observed while occupancy is absent. Identifiable synthetic/inconsistent full-window
+counts do not become usage or occupancy. Repeated same-turn samples remain last-reported estimates;
+there is no extra cumulative-append prerequisite that the Codex UI itself does not impose.
+
+Version evidence: installed `codex 0.154.0` generated schema, plus tagged
+[protocol calculation](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/protocol/src/protocol.rs)
+and [TUI caller](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/tui/src/chatwidget.rs).
+Fixtures are native-shaped examples, not recorded live-provider responses. This source change
+does not install or restart an existing daemon. Disposable authenticated Gateway WebSocket
+hydration checks cover these exact producer reports, including reconnect and stopped state;
+live-provider and rendered-client acceptance remain separate.
+
+### Headed Codex account windows
+
+Existing `account/rateLimits/updated` notifications supply native used percentages, rolling-window
+minutes and Unix-second reset times. Nexus converts only the units to seconds/milliseconds, retains
+primary/secondary windows by native limit ID, and does not infer remaining balances, prices or costs.
+Missing account identity stays absent: these rolling notifications do not include an account ID.
+The separately available `account/rateLimits/read` RPC is not automatically invoked, so this
+collector adds no provider request. Its OpenAI account scope is distinct from the configured model's
+provider and from per-session token counters.
+
+Sparse updates retain previously available windows, bounded to eight buckets/sixteen windows per
+captured connection. Each retained window keeps its sample time internally; the combined wire
+snapshot uses the oldest retained time, so updating one window or bucket cannot refresh another.
+Metadata-only updates do not refresh window age. Account-change notifications
+or invalid/overflowing snapshots clear retained evidence; native over-limit percentages are not
+clamped. Provisional, disconnected and revoked owners cannot publish. No global account snapshot
+is relabeled as native thread/turn status.
+
+Source pins: the 0.154.0 [account protocol](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server-protocol/src/protocol/v2/account.rs)
+and [account processor](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/app-server/src/request_processors/account_processor.rs)
+define the sparse notification and Codex/ChatGPT authentication boundary. Native-shaped fixtures
+exercise the real captured reporter, daemon/store and Gateway socket; they are not
+live account measurements.
+
+### Codex headless ACP context
+
+The pinned `@agentclientprotocol/codex-acp@1.1.2` emits structured `usage_update` notifications
+with its last model sample's `used` tokens and effective context `size`. The captured ACP
+connection/root publishes these through the same context slot. Capacity is native; occupancy,
+remaining tokens and remaining percentage are explicitly last-reported estimates. Percentage
+matches the bridge's native rounded `(size - used) / size * 100` display, not the headed TUI's
+12000-token baseline. Overfull used tokens remain visible; negative remaining values are omitted.
+No turn/reset/compaction identity or native timestamp is invented from an ordered notification
+that does not supply one. Duplicates and decreases replace the prior sample, never add to it.
+
+This does not enable cumulative token usage or account windows for ACP. The pinned bridge's
+prompt `usage` is built from its **last model sample**, despite generic ACP schema comments
+about cumulative usage. Account windows remain internal to its `/status` text; there is no
+verified structured quota export on this path. Requested command/package overrides do not
+establish additional capabilities. Other harness ACP profiles remain unchanged.
 
 ## Reproducible automated gate
 
@@ -77,11 +152,13 @@ NEW, then STOPPED, despite the higher stream sequences on OLD. The command print
 before deleting its temporary artifacts. Missing/malformed inputs fail; no synthetic fallback or
 optional skip is permitted. It is a required explicit gate, outside ordinary Vitest discovery.
 
-The read fixture supplies canonical rows to the snapshot source; this composition is not a real
-authenticated socket or live provider test. Separate Gateway socket tests cover transport
-behavior. External consumers must validate their own hydration, listener-ready subscription,
-owner/revision reduction, reconnect and stopped-state handling separately. Actual browser
-behavior requires a separate visual smoke test.
+The composition uses a real loopback WebSocket and the real authenticated REST dispatcher against
+the disposable canonical database. It checks read scope, missing/invalid/revoked credentials and
+fresh-subscription rehydration; no operator credentials or daemon read-view access are used. It is
+still a native-fixture test, not a live provider test. External consumers must validate their own
+hydration, listener-ready subscription, owner/revision reduction, reconnect and stopped-state
+handling separately; the base gate does not certify those integrations. Actual browser behavior
+requires a separate visual smoke test.
 
 Fixture coverage does not establish live-provider or platform-wide acceptance. Installation,
 provider execution and release validation are separate checks. Child-context segregation and

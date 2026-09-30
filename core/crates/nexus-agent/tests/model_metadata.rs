@@ -7,6 +7,72 @@ use serde_json::{json, Value};
 mod model_metadata;
 use model_metadata::{decode_configured, SnapshotKind};
 
+fn context(
+    raw: Value,
+) -> nexus_contracts::telemetry::NativeTelemetryValue<nexus_contracts::telemetry::ContextObservation>
+{
+    model_metadata::decode_context(
+        &raw,
+        "captured-root",
+        17,
+        &ModelObservationSource::new("codex.acp.usage_update").unwrap(),
+    )
+}
+
+#[test]
+fn acp_context_preserves_last_sample_and_native_display_ratio_not_lifetime_usage() {
+    use nexus_contracts::telemetry::NativeTelemetryValue;
+    let NativeTelemetryValue::Observed(value) = context(json!({"used":42000,"size":200000})) else {
+        panic!("structured ACP context must be observed")
+    };
+    let value = serde_json::to_value(value).unwrap();
+    assert_eq!(value["metadata"]["nativeSessionId"], "captured-root");
+    assert_eq!(value["metadata"]["observedAt"], 17);
+    assert_eq!(value["effectiveCapacityTokens"]["value"], 200000);
+    assert_eq!(value["effectiveCapacityTokens"]["provenance"], "native");
+    assert_eq!(value["usedTokens"]["value"], 42000);
+    assert_eq!(value["usedTokens"]["provenance"], "estimated");
+    assert_eq!(value["remainingTokens"]["value"], 158000);
+    assert_eq!(value["remainingPercent"]["value"], 79.0);
+    assert_eq!(value["remainingPercent"]["provenance"], "estimated");
+    for absent in [
+        "model",
+        "resetId",
+        "compactionCount",
+        "outputReserveTokens",
+        "usedPercent",
+    ] {
+        assert!(value.get(absent).is_none(), "no invented {absent}");
+    }
+}
+
+#[test]
+fn acp_context_preserves_zero_overage_and_rejects_malformed_or_unsafe_values() {
+    use nexus_contracts::telemetry::NativeTelemetryValue;
+    for raw in [
+        json!({}),
+        json!({"used":null,"size":200000}),
+        json!({"used":-1,"size":200000}),
+        json!({"used":1.5,"size":200000}),
+        json!({"used":1,"size":0}),
+        json!({"used":9007199254740992_u64,"size":200000}),
+    ] {
+        assert!(matches!(context(raw), NativeTelemetryValue::Invalid));
+    }
+    for (used, remaining) in [(0, Some(100.0)), (240000, None)] {
+        let NativeTelemetryValue::Observed(value) = context(json!({"used":used,"size":200000}))
+        else {
+            panic!("zero and native overage are not unavailable")
+        };
+        assert_eq!(value.used_tokens.unwrap().value.get(), used);
+        assert_eq!(
+            value.remaining_percent.map(|value| value.value.get()),
+            remaining
+        );
+        assert_eq!(value.remaining_tokens.is_some(), remaining.is_some());
+    }
+}
+
 fn dialect(legacy: bool) -> AcpModelMetadataDialect {
     let source = ModelObservationSource::new("test-config").unwrap();
     if legacy {

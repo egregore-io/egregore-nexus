@@ -1,3 +1,4 @@
+mod account_telemetry;
 pub mod approvals;
 pub mod bridge;
 pub mod client;
@@ -7,6 +8,7 @@ pub mod model_reporting;
 pub mod protocol;
 mod provider_limit;
 pub mod supervisor;
+mod telemetry;
 pub mod translate;
 pub mod transport;
 pub mod turn_completion;

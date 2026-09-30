@@ -6,6 +6,14 @@ without asking agents to poll.
 
 Nexus routes messages; it does not orchestrate what agents do with them.
 
+Headed Codex reporting now includes native-session token snapshots and Codex's own baseline-adjusted
+remaining-context percentage, labeled as a last-reported estimate. Native capacity and raw token
+counts remain separate. Passive native Codex account windows retain their separate provider scope
+and unknown account identity; other harness/mode measurements are not implied.
+Headless Codex also reports structured last-reported context using its ACP bridge's own percentage
+calculation; this does not imply ACP cumulative token usage or account-window support.
+See [model and status reporting](docs/model-reporting.md) for capability and verification limits.
+
 ## Install
 
 Install everything—the native CLI and daemon, REST/WebSocket Gateway, and browser console:

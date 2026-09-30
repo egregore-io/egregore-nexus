@@ -54,7 +54,7 @@ fn command(harness: &str, cwd: String) -> HarnessCommand {
     let payload = |method| {
         events.iter().find(|event| event["kind"] == method).unwrap()["payload"].to_string()
     };
-    HarnessCommand {
+    let mut command = HarnessCommand {
         program: env!("CARGO_BIN_EXE_nexus_model_fixture_acp").into(),
         cwd: Some(cwd),
         env: vec![
@@ -62,7 +62,18 @@ fn command(harness: &str, cwd: String) -> HarnessCommand {
             ("FAKE_ACP_RAW_LOAD".into(), payload("session/load")),
         ],
         ..Default::default()
+    };
+    if harness == "codex" {
+        let context: Value = serde_json::from_str(include_str!(
+            "fixtures/model_reporting/codex-acp-context.json"
+        ))
+        .unwrap();
+        command.env.push((
+            "FAKE_ACP_RAW_MODEL_UPDATES".into(),
+            json!([context]).to_string(),
+        ));
     }
+    command
 }
 
 async fn next_report(
@@ -83,6 +94,10 @@ async fn next_report(
                     && event.payload["modelReport"]["reportRevision"]
                         .as_u64()
                         .is_some_and(|r| r > after_revision)
+                    && (event.payload["modelReport"]["backend"] != "codex.acp"
+                        || event.payload["modelReport"]["telemetry"]["context"]["observation"]
+                            ["usedTokens"]["value"]
+                            == 42000)
                 {
                     return event.payload;
                 }
@@ -100,6 +115,15 @@ fn export_projection_run(harness: &str, fresh: &Value, resumed: &Value, stopped:
 }
 
 async fn run(harness: &'static str) {
+    if harness == "codex" {
+        assert!(
+            profile(harness)
+                .telemetry()
+                .is_some_and(|value| value.context().capability()
+                    == nexus_contracts::ModelEvidenceCapability::Supported),
+            "actual Codex ACP registration enables its structured context source"
+        );
+    }
     let dir = tempfile::tempdir().unwrap();
     let daemon = DaemonStore::open(dir.path().join("identity.db").to_str().unwrap())
         .await
@@ -149,6 +173,13 @@ async fn run(harness: &'static str) {
         panic!("actual {harness} launch must carry its reporting context: {error:?}");
     }
     let sid = launched.unwrap().session_id;
+    if harness == "codex" {
+        let adapter = native.lock().unwrap()[0].clone();
+        adapter
+            .inject_completion_observed("native-shaped context fixture".into())
+            .await
+            .unwrap();
+    }
     let expected = match harness {
         "claude" | "codex" => "gpt-astra",
         "opencode" => "fixture-provider/gpt-astra",
@@ -162,7 +193,13 @@ async fn run(harness: &'static str) {
                 .await
                 .unwrap()
                 .unwrap();
-            if row.model_report.as_ref().is_some_and(|r| r.observer_active) {
+            if row.model_report.as_ref().is_some_and(|r| {
+                r.observer_active
+                    && (harness != "codex"
+                        || serde_json::to_value(r).unwrap()["telemetry"]["context"]["observation"]
+                            ["usedTokens"]["value"]
+                            == 42000)
+            }) {
                 break row;
             }
             tokio::task::yield_now().await;
@@ -184,6 +221,16 @@ async fn run(harness: &'static str) {
     assert!(row.stopped_at.is_none());
     assert!(report.observer_active);
     assert_eq!(frame["modelReport"], serde_json::to_value(report).unwrap());
+    if harness == "codex" {
+        let context = &frame["modelReport"]["telemetry"]["context"]["observation"];
+        assert_eq!(context["remainingPercent"]["value"], 79.0);
+        assert_eq!(context["effectiveCapacityTokens"]["value"], 200000);
+        assert_eq!(context["metadata"]["source"], "codex.acp.usage_update");
+        assert!(context.get("resetId").is_none());
+        assert!(frame["modelReport"]["telemetry"]["usage"]
+            .get("observation")
+            .is_none());
+    }
     assert!(frame.get("modelObserverToken").is_none());
     assert!(!frame
         .to_string()
@@ -196,6 +243,13 @@ async fn run(harness: &'static str) {
         .await
         .unwrap();
     assert_eq!(resumed.session_id, sid);
+    if harness == "codex" {
+        let adapter = native.lock().unwrap()[1].clone();
+        adapter
+            .inject_completion_observed("resumed native-shaped context fixture".into())
+            .await
+            .unwrap();
+    }
     assert_eq!(
         native.lock().unwrap().len(),
         2,

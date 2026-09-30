@@ -5,13 +5,13 @@ import { join } from "node:path";
 import { expect, it, vi } from "vitest";
 import { z } from "zod";
 import { removeTempPath } from "../../test/removeTempPath";
-import { createRuntimeSnapshotSource, type RuntimeSnapshotFrame } from "../agui/runtimeSnapshots";
 import { canonicalRuntimes } from "../read/canonical";
 import { GatewayChangeBus } from "../store/changeBus";
 import { migrateGatewayStore } from "../store/migrations";
 import { parseRuntimeModelReport } from "./modelReport";
 import type { ProjectionFrame } from "./consumer";
 import { GatewayProjectionService } from "./service";
+import { openRuntimeModelSocket } from "./runtimeModelSocket.support";
 
 const payload = z.object({
   runtimeId: z.string().min(1), agentId: z.string().min(1), harness: z.string().min(1),
@@ -35,7 +35,8 @@ for (const mode of ["headless", "headed"] as const) for (const harness of ["clau
     const runId = process.env.NEXUS_MODEL_PROJECTION_RUN_ID;
     expect(directory, "required fresh Rust artifact directory").toBeTruthy();
     expect(runId, "required fresh run identity").toBeTruthy();
-    const raw = readFileSync(join(directory!, `${harness}.${mode}.json`), "utf8");
+    const artifactPath = join(directory!, `${harness}.${mode}.json`);
+    const raw = readFileSync(artifactPath, "utf8");
     expect(raw.length).toBeGreaterThan(0);
     const artifact = artifactSchema.parse(JSON.parse(raw));
     expect(artifact.runId).toBe(runId);
@@ -53,6 +54,46 @@ for (const mode of ["headless", "headed"] as const) for (const harness of ["clau
     expect(stopped.modelReport.observerActive).toBe(false);
     expect(stopped.active).toBe(false);
     expect(stopped.presence).toBe("offline");
+    if (harness === "codex" && mode === "headed") {
+      for (const body of [fresh, newer]) {
+        expect(body.modelReport.telemetry?.usage.observation).toMatchObject({
+          scope: "sessionCumulative", counterId: "codex.thread.tokenUsage.total",
+          inputTokens: 900000, outputTokens: 30000, totalTokens: 930000,
+          cacheReadTokens: 700000, cacheWriteTokens: 300, reasoningTokens: 9000,
+          nativeTurnId: "t1",
+        });
+        expect(body.modelReport.telemetry?.usage.observation).not.toHaveProperty("resetId");
+        expect(body.modelReport.telemetry?.context.observation).toMatchObject({
+          effectiveCapacityTokens: { value: 200000, provenance: "native" },
+          usedTokens: { value: 42000, provenance: "estimated" },
+          remainingTokens: { value: 158000, provenance: "estimated" },
+          remainingPercent: { value: 84, provenance: "estimated",
+            basis: "codex.0.154.display:baseline12000:last-reported-estimate" },
+        });
+        expect(body.modelReport.telemetry?.quota.observation).toMatchObject({
+          providerId: "openai", windows: [
+            {windowId:"codex/primary",units:"percent",usedPercent:42,windowSeconds:18000,resetsAt:1800000000000},
+            {windowId:"codex/secondary",units:"percent",usedPercent:7,windowSeconds:604800,resetsAt:1800600000000},
+          ],
+        });
+        expect(body.modelReport.telemetry?.quota.observation).not.toHaveProperty("accountId");
+      }
+    }
+    if (harness === "codex" && mode === "headless") {
+      for (const body of [fresh, newer]) {
+        expect(body.modelReport.telemetry?.context.observation).toMatchObject({
+          metadata: {source: "codex.acp.usage_update", nativeSessionId: "fixture-root"},
+          effectiveCapacityTokens: {value: 200000, provenance: "native"},
+          usedTokens: {value: 42000, provenance: "estimated"},
+          remainingTokens: {value: 158000, provenance: "estimated"},
+          remainingPercent: {value: 79, provenance: "estimated",
+            basis: "acp.usage_update:last-reported-context-ratio"},
+        });
+        expect(body.modelReport.telemetry?.context.observation).not.toHaveProperty("resetId");
+        expect(body.modelReport.telemetry?.usage.observation).toBeUndefined();
+        expect(body.modelReport.telemetry?.quota.observation).toBeUndefined();
+      }
+    }
     const bodies = [newer, fresh, stopped, fresh];
     expect(artifact.frames[3]!.event.occurredAt).toBeGreaterThan(artifact.frames[2]!.event.occurredAt);
     for (const [index, frame] of artifact.frames.entries()) {
@@ -74,22 +115,17 @@ for (const mode of ["headless", "headed"] as const) for (const harness of ["clau
       ready:Promise.resolve(), subscribeProjections(handlers){push=handlers.onFrame;return()=>{};},
       ackProjection:ack, close(){},
     }, bus);
-    const source = createRuntimeSnapshotSource({changeBus:bus,fetchHandler:async()=>
-      Response.json({agentId:fresh.agentId,runtimes:await canonicalRuntimes(db,{includeStopped:true})})});
-    const snapshots: RuntimeSnapshotFrame[] = [];
+    let socket: Awaited<ReturnType<typeof openRuntimeModelSocket>> | undefined;
     try {
       await migrateGatewayStore(db);
       await service.start();
-      await source.subscribe(new Request("http://localhost/api/agui/ws"), `model-${harness}`,
-        fresh.agentId, frame=>{snapshots.push(frame);}).ready;
-      expect(snapshots[0]).toMatchObject({t:"runtime.snapshot",runtimes:[]});
+      socket = await openRuntimeModelSocket(db, bus, fresh.agentId);
+      expect(await socket.next()).toMatchObject({t:"runtime.snapshot",sequence:1,runtimes:[]});
       for (const [index, frame] of artifact.frames.entries()) {
-        const count = snapshots.length;
         push(frame);
         await vi.waitFor(()=>expect(ack).toHaveBeenCalledTimes(index+1));
-        await vi.waitFor(()=>expect(snapshots.length).toBeGreaterThan(count));
         const expected = index < 2 ? newer : stopped;
-        const last = snapshots.at(-1)!;
+        const last = await socket.next();
         expect(last.t).toBe("runtime.snapshot");
         if (last.t !== "runtime.snapshot") throw new Error("canonical snapshot unavailable");
         expect(last.runtimes).toHaveLength(1);
@@ -100,13 +136,20 @@ for (const mode of ["headless", "headed"] as const) for (const harness of ["clau
         // Canonical descriptors expose the accepted projection timestamp, not the daemon's
         // original stop timestamp. A later OLD envelope must not advance that timestamp.
         if (!expected.active) expect(last.runtimes[0]?.stoppedAt).toBe(artifact.frames[2]!.event.occurredAt);
+        if (index === 0) {
+          const reconnected = await socket.reconnect();
+          expect(reconnected).toMatchObject({t:"runtime.snapshot",sequence:1,runtimes:last.runtimes});
+          await socket.probeConsumer(artifactPath, "newer");
+        }
+        if (index === 2) await socket.probeConsumer(artifactPath, "stopped");
       }
+      await socket.assertAuthorization();
       expect((await canonicalRuntimes(db))).toHaveLength(0);
       expect((await db.execute("SELECT through_seq FROM projection_cursors")).rows).toMatchObject([{through_seq:4}]);
       expect((await db.execute("SELECT * FROM projection_gaps")).rows).toHaveLength(0);
       expect((await db.execute("SELECT * FROM projection_quarantine")).rows).toHaveLength(0);
     } finally {
-      source.close(); await service.close(); db.close(); await removeTempPath(root, {recursive:true});
+      await socket?.close(); await service.close(); db.close(); await removeTempPath(root, {recursive:true});
     }
-  });
+  }, process.env.NEXUS_MODEL_CONSUMER_PROBE ? 90000 : 10000);
 }

@@ -39,6 +39,12 @@ async fn configured_frame(
                 if payload["runtimeId"] == session.0
                     && payload["modelReport"]["observerActive"] == true
                     && payload["modelReport"]["configured"]["observation"]["modelId"] == "gpt-astra"
+                    && payload["modelReport"]["telemetry"]["context"]["observation"]["usedTokens"]
+                        ["value"]
+                        == 42000
+                    && payload["modelReport"]["telemetry"]["quota"]["observation"]["windows"][0]
+                        ["usedPercent"]
+                        == 42.0
                     && payload["modelReport"]["reportRevision"]
                         .as_u64()
                         .is_some_and(|revision| revision > after)
@@ -185,7 +191,24 @@ async fn fresh_headed_codex_launch_persists_discovered_thread_in_resurrection_ca
     );
     let _path = EnvGuard::set("PATH", path);
     let _home = EnvGuard::set("HOME", &home);
+    let mut usage: serde_json::Value = serde_json::from_str(include_str!(
+        "../../harness/codex/tests/fixtures/codex-token-usage.json"
+    ))
+    .unwrap();
+    usage["threadId"] = serde_json::json!("THREAD_ID");
+    usage["turnId"] = serde_json::json!("t1");
+    let mut baseline: serde_json::Value = serde_json::from_str(include_str!(
+        "../../harness/codex/tests/fixtures/codex-token-usage-baseline.json"
+    ))
+    .unwrap();
+    baseline["threadId"] = serde_json::json!("THREAD_ID");
+    let quota: serde_json::Value = serde_json::from_str(include_str!(
+        "../../harness/codex/tests/fixtures/codex-account-rate-limits.json"
+    ))
+    .unwrap();
     let initial_prompt_script = serde_json::json!([
+        {"method":"thread/tokenUsage/updated", "params":baseline},
+        {"method":"turn/started","params":{"threadId":"THREAD_ID","turn":{"id":"t1"}}},
         {
             "method": "item/completed",
             "params": {
@@ -207,6 +230,13 @@ async fn fresh_headed_codex_launch_persists_discovered_thread_in_resurrection_ca
                 "delta": "boot acknowledged"
             }
         },
+        {
+            "method": "thread/tokenUsage/updated", "params": usage.clone()
+        },
+        {
+            "method": "thread/tokenUsage/updated", "params": usage
+        },
+        { "method": "account/rateLimits/updated", "params": quota },
         {
             "method": "turn/completed",
             "params": {
@@ -268,6 +298,13 @@ async fn fresh_headed_codex_launch_persists_discovered_thread_in_resurrection_ca
     );
 
     let fresh = configured_frame(&mut frames, &spawned.session_id, 0).await;
+    let stored_usage = AgentRuntimes::new(&store)
+        .find_by_runtime_id(&spawned.session_id.0)
+        .await
+        .unwrap()
+        .unwrap()
+        .model_report
+        .unwrap();
     state.teardown_owned_transports_for_shutdown().await;
     let stopped = AgentRuntimes::new(&store)
         .find_by_runtime_id(&spawned.session_id.0)
@@ -295,6 +332,23 @@ async fn fresh_headed_codex_launch_persists_discovered_thread_in_resurrection_ca
         .ensure_codex_appserver_live("headed-codex", "default")
         .await;
     let resumed_frame = if resumed.is_ok() {
+        // An explicit fixture-only turn on the actual cold app-server connection supplies
+        // new-owner telemetry. Setup metadata alone is not a resumed usage observation.
+        let current = CodexRuntimeStateRepo::new(&store)
+            .find_by_runtime_id(&spawned.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let client = CodexAppServerClient::connect(
+            current.app_server_sock.as_ref().unwrap(),
+            "usage-fixture",
+        )
+        .await
+        .unwrap();
+        client
+            .turn_start(native_root, "fixture measurement")
+            .await
+            .unwrap();
         configured_frame(
             &mut frames,
             &spawned.session_id,
@@ -420,6 +474,58 @@ async fn fresh_headed_codex_launch_persists_discovered_thread_in_resurrection_ca
     drop(daemon);
     let _ = std::fs::remove_dir_all(root);
     let fresh = fresh.expect("actual headed launch publishes captured configured model");
+    let telemetry = &fresh["modelReport"]["telemetry"];
+    // A repeat can publish a new receive timestamp between frame/store reads. Compare the
+    // actual measurement rather than asserting a nonexistent cross-read snapshot boundary.
+    let stored = serde_json::to_value(stored_usage.telemetry).unwrap();
+    assert_eq!(stored["usage"]["observation"]["totalTokens"], 930000);
+    for value in [&stored, &telemetry] {
+        assert_eq!(value["quota"]["observation"]["providerId"], "openai");
+        assert!(value["quota"]["observation"].get("accountId").is_none());
+        assert_eq!(
+            value["quota"]["observation"]["windows"][0]["usedPercent"],
+            42.0
+        );
+        assert_eq!(
+            value["quota"]["observation"]["windows"][0]["windowSeconds"],
+            18000
+        );
+        assert_eq!(
+            value["quota"]["observation"]["windows"][0]["resetsAt"],
+            1800000000000_i64
+        );
+    }
+    assert_eq!(
+        stored["context"]["observation"]["remainingPercent"]["value"],
+        84.0
+    );
+    assert_eq!(telemetry["usage"]["observation"]["totalTokens"], 930000);
+    assert_eq!(
+        telemetry["usage"]["observation"]["scope"],
+        "sessionCumulative"
+    );
+    assert_eq!(
+        telemetry["usage"]["observation"]["metadata"]["nativeSessionId"],
+        native_root
+    );
+    assert_eq!(telemetry["usage"]["observation"]["nativeTurnId"], "t1");
+    assert!(telemetry["usage"]["observation"].get("resetId").is_none());
+    assert_eq!(
+        telemetry["context"]["observation"]["effectiveCapacityTokens"]["provenance"],
+        "native"
+    );
+    assert_eq!(
+        telemetry["context"]["observation"]["remainingTokens"]["value"],
+        158000
+    );
+    assert_eq!(
+        telemetry["context"]["observation"]["usedTokens"]["provenance"],
+        "estimated"
+    );
+    assert_eq!(
+        telemetry["context"]["observation"]["remainingPercent"]["value"],
+        84.0
+    );
     assert!(
         turn_entered,
         "actual initial-turn submission must witness returned native setup"

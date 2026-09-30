@@ -44,7 +44,8 @@ pub struct CodexAdapter {
 
 impl CodexAdapter {
     /// Configured model evidence from the adapter's ACP metadata surface. This does not
-    /// advertise per-turn/response model selection or token/context/account telemetry.
+    /// advertise per-turn/response model selection, cumulative token usage or account windows.
+    /// Context is the bridge's structured last-reported usage_update, not headed TUI telemetry.
     pub fn model_reporting_profile() -> nexus_agent::adapter::AdapterModelReportingProfile {
         use nexus_agent::adapter::{AcpModelMetadataDialect, AdapterModelReportingProfile};
         use nexus_contracts::{
@@ -59,6 +60,23 @@ impl CodexAdapter {
             AcpModelMetadataDialect::ConfigOptions { source },
         )
         .expect("builtin ACP reporting profile is valid")
+        .with_telemetry(nexus_agent::adapter::AdapterTelemetryReportingProfile::new(
+            nexus_agent::adapter::AdapterTelemetryCapability::new(
+                ModelEvidenceCapability::Unverified,
+                None,
+            )
+            .unwrap(),
+            nexus_agent::adapter::AdapterTelemetryCapability::new(
+                ModelEvidenceCapability::Supported,
+                Some(ModelObservationSource::new("codex.acp.usage_update").unwrap()),
+            )
+            .unwrap(),
+            nexus_agent::adapter::AdapterTelemetryCapability::new(
+                ModelEvidenceCapability::Unverified,
+                None,
+            )
+            .unwrap(),
+        ))
     }
 
     /// Construct a Codex adapter that will spawn the **real** Codex ACP bridge for the given

@@ -1,6 +1,8 @@
 //! Configured-model evidence from the connected app-server's setup response. This is not a
 //! response-model decoder and never consults requested argv, a catalog, or another thread.
-use nexus_agent::adapter::NativeModelReportingProfile;
+use nexus_agent::adapter::{
+    AdapterTelemetryCapability, AdapterTelemetryReportingProfile, NativeModelReportingProfile,
+};
 use nexus_contracts::model_report::ModelEvidenceValue;
 use nexus_contracts::{
     ModelEvidenceCapability, ModelInvalidReason, ModelObservation, ModelObservationSource,
@@ -17,6 +19,23 @@ pub fn profile() -> NativeModelReportingProfile {
         ModelEvidenceCapability::Unverified,
     )
     .unwrap()
+    .with_telemetry(AdapterTelemetryReportingProfile::new(
+        AdapterTelemetryCapability::new(
+            ModelEvidenceCapability::Supported,
+            Some(ModelObservationSource::new(super::telemetry::SOURCE).unwrap()),
+        )
+        .unwrap(),
+        AdapterTelemetryCapability::new(
+            ModelEvidenceCapability::Supported,
+            Some(ModelObservationSource::new(super::telemetry::SOURCE).unwrap()),
+        )
+        .unwrap(),
+        AdapterTelemetryCapability::new(
+            ModelEvidenceCapability::Supported,
+            Some(ModelObservationSource::new(super::account_telemetry::SOURCE).unwrap()),
+        )
+        .unwrap(),
+    ))
 }
 
 pub(super) fn decode_configured(result: &Value, root: &str) -> Option<ModelEvidenceValue> {

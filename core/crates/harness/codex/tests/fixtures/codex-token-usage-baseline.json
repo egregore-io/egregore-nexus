@@ -1,0 +1,23 @@
+{
+  "threadId": "usage-root",
+  "turnId": "previous-turn",
+  "tokenUsage": {
+    "total": {
+      "inputTokens": 860000,
+      "cachedInputTokens": 670000,
+      "cacheWriteInputTokens": 300,
+      "outputTokens": 28000,
+      "reasoningOutputTokens": 8500,
+      "totalTokens": 888000
+    },
+    "last": {
+      "inputTokens": 38000,
+      "cachedInputTokens": 28000,
+      "cacheWriteInputTokens": 0,
+      "outputTokens": 1800,
+      "reasoningOutputTokens": 400,
+      "totalTokens": 39800
+    },
+    "modelContextWindow": 200000
+  }
+}

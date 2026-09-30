@@ -15,6 +15,71 @@ use nexus_contracts::model_report::{ModelEvidenceField, NativeModelUpdate};
 use nexus_contracts::ModelEvidenceCapability;
 use std::sync::{Arc, Mutex};
 
+pub(crate) fn decode_context(
+    raw: &Value,
+    root: &str,
+    observed_at: i64,
+    source: &ModelObservationSource,
+) -> nexus_contracts::telemetry::NativeTelemetryValue<nexus_contracts::telemetry::ContextObservation>
+{
+    use nexus_contracts::telemetry::*;
+    #[derive(serde::Deserialize)]
+    struct Usage {
+        used: TelemetryCounter,
+        size: TelemetryCounter,
+    }
+    let decode = || -> Option<ContextObservation> {
+        let usage: Usage = serde_json::from_value(raw.clone()).ok()?;
+        if usage.size.get() == 0 {
+            return None;
+        }
+        let basis = TelemetryId::new("acp.usage_update:last-reported-context-ratio").ok()?;
+        let token = |value, estimated| ContextTokenValue {
+            value,
+            provenance: if estimated {
+                TelemetryProvenance::Estimated
+            } else {
+                TelemetryProvenance::Native
+            },
+            basis: estimated.then(|| basis.clone()),
+        };
+        let remaining = usage.size.get().checked_sub(usage.used.get());
+        let value = ContextObservation {
+            metadata: TelemetryMetadata {
+                native_session_id: TelemetryId::new(root).ok()?,
+                source: source.clone(),
+                observed_at: TelemetryTimestamp::new(observed_at).ok()?,
+                native_reported_at: None,
+            },
+            model: None,
+            effective_capacity_tokens: Some(token(usage.size, false)),
+            used_tokens: Some(token(usage.used, true)),
+            remaining_tokens: remaining
+                .map(|value| token(TelemetryCounter::new(value).unwrap(), true)),
+            used_percent: None,
+            // Structured ACP occupancy uses the reported capacity, without a UI baseline offset.
+            // Preserve overfull native used tokens without inventing negative/zero availability.
+            remaining_percent: remaining.map(|remaining| ContextPercentageValue {
+                value: TelemetryQuantity::new(
+                    (remaining as f64 / usage.size.get() as f64 * 100.0).round(),
+                )
+                .unwrap(),
+                provenance: TelemetryProvenance::Estimated,
+                basis: Some(basis),
+            }),
+            output_reserve_tokens: None,
+            compaction_count: None,
+            reset_id: None,
+        };
+        value.validate().ok()?;
+        Some(value)
+    };
+    decode().map_or(
+        NativeTelemetryValue::Invalid,
+        NativeTelemetryValue::Observed,
+    )
+}
+
 #[derive(Clone)]
 pub(crate) enum OpenRequest {
     New,
@@ -147,6 +212,27 @@ impl ModelMetadataCollector {
                     == Some("config_option_update")
                 {
                     self.publish(update, root, SnapshotKind::ConfigReplacement);
+                } else if update.get("sessionUpdate").and_then(Value::as_str)
+                    == Some("usage_update")
+                {
+                    let reporting = self.reporting.as_ref().unwrap();
+                    let Some(capability) =
+                        reporting.profile().telemetry().map(|value| value.context())
+                    else {
+                        return;
+                    };
+                    if capability.capability() != ModelEvidenceCapability::Supported {
+                        return;
+                    }
+                    let Some(source) = capability.source() else {
+                        return;
+                    };
+                    reporting.sink().observe_telemetry(
+                        nexus_contracts::telemetry::NativeTelemetryUpdate::Context {
+                            native_session_id: root.clone(),
+                            value: decode_context(update, root, nexus_common::now(), source),
+                        },
+                    );
                 }
             }
             _ => {}

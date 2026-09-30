@@ -1,9 +1,18 @@
 # Changelog
 
-## [0.1.6-beta.3] - Unreleased
+## [0.1.6-beta.4] - Unreleased
 
 ### Changed
 
+- Collect Codex headless ACP last-reported context with exact native-session ownership and the
+  bridge's native display ratio; keep cumulative usage and account-window support separate.
+- Preserve headed Codex's passive native account-window percentages, durations and resets separately
+  from token usage. Missing account identity remains unknown; no provider request or inferred cost.
+- Collect headed Codex app-server native-session token snapshots and last-reported context,
+  using the pinned 0.154.0 native display percentage calculation with explicit estimated provenance.
+  Exact root/turn ownership and compaction fencing prevent stale context restoration. Missing
+  metrics stay absent; this collector does not cover account quota, ACP telemetry or other native harnesses.
+- Synchronize Cargo and npm packages at `0.1.6-beta.4` for the model/status reporting candidate.
 - Verify all eight headed/headless model-reporting paths through fresh native-fixture captures,
   the Rust publisher and canonical Gateway snapshots. The composed gate rejects missing artifacts
   and delayed older model/status frames; it does not stand in for live-provider or UI acceptance.
