@@ -6,10 +6,13 @@ timeout_seconds = 18000
 [env]
 CI = "1"
 NEXUS_HOME = "C:\\w\\data\\${RUN_ID}\\nexus"
-CARGO_BUILD_JOBS = "4"
-RUST_TEST_THREADS = "4"
-CARGO_INCREMENTAL = "1"
+CARGO_BUILD_JOBS = "2"
+# Keep Rust compilation and test execution below the four-vCPU guest ceiling so the host remains
+# responsive while the reusable Windows cache is populated.
+RUST_TEST_THREADS = "2"
+CARGO_INCREMENTAL = "0"
 CARGO_TARGET_DIR = "C:\\w\\cache\\cargo-target"
+CARGO_PROFILE_TEST_DEBUG = "0"
 
 [[sources]]
 name = "egregore-nexus"
@@ -23,7 +26,27 @@ excludes = [
   ".worktrees/**",
   "gateway/.dist-run-*/**",
   "output/**",
+  "packages/nexus-cli/native/**",
 ]
+
+[[steps]]
+name = "rust-cache-preflight"
+workdir = "C:\\w\\src\\egregore-nexus\\core"
+timeout_seconds = 1800
+command = '''
+$MinimumFreeBytes = 40GB
+$FreeBytes = [int64](Get-PSDrive -Name C).Free
+if ($FreeBytes -lt $MinimumFreeBytes) {
+    if (Test-Path -LiteralPath $env:CARGO_TARGET_DIR) {
+        Remove-Item -LiteralPath $env:CARGO_TARGET_DIR -Recurse -Force
+    }
+    New-Item -ItemType Directory -Force -Path $env:CARGO_TARGET_DIR | Out-Null
+}
+$FreeBytes = [int64](Get-PSDrive -Name C).Free
+if ($FreeBytes -lt $MinimumFreeBytes) {
+    throw "Windows lab has only $FreeBytes free bytes after Cargo cache cleanup"
+}
+'''
 
 [[steps]]
 name = "rust-format"
@@ -38,7 +61,7 @@ name = "rust-tests"
 workdir = "C:\\w\\src\\egregore-nexus\\core"
 timeout_seconds = 7200
 command = '''
-& cargo.exe test --workspace
+& cargo.exe test --workspace --no-fail-fast
 '''
 
 [[steps]]
@@ -46,7 +69,39 @@ name = "rust-release"
 workdir = "C:\\w\\src\\egregore-nexus\\core"
 timeout_seconds = 7200
 command = '''
+$SourceProvenancePath = Join-Path (Resolve-Path "..").Path ".git\egregore-source.json"
+$SourceProvenance = Get-Content -LiteralPath $SourceProvenancePath -Raw | ConvertFrom-Json
+$SourceRevision = [string]$SourceProvenance.original_revision
+if ($SourceRevision -notmatch '^[0-9a-f]{40}$') {
+    throw "Nexus source provenance does not contain a full Git revision"
+}
+$HomePrefixes = @(
+    [string]$env:USERPROFILE
+    ([string]$env:USERPROFILE).Replace('\', '/')
+) | Select-Object -Unique
+$RemapFlags = foreach ($Prefix in $HomePrefixes) {
+    "--remap-path-prefix=$Prefix=/build-home"
+}
+$env:CARGO_ENCODED_RUSTFLAGS = $RemapFlags -join [char]0x1f
+$env:NEXUS_BUILD_REVISION = $SourceRevision
 & cargo.exe build --release -p egregore-nexus
+'''
+
+[[steps]]
+name = "rust-native-teardown-stress"
+workdir = "C:\\w\\src\\egregore-nexus\\core"
+timeout_seconds = 900
+command = '''
+$exe = Get-ChildItem "$env:CARGO_TARGET_DIR\debug\deps\agent_session_materializer-*.exe" |
+    Sort-Object LastWriteTimeUtc -Descending |
+    Select-Object -First 1
+if (-not $exe) { throw 'agent_session_materializer executable was not found' }
+for ($iteration = 1; $iteration -le 100; $iteration++) {
+    & $exe.FullName '--test-threads=1'
+    if ($LASTEXITCODE -ne 0) {
+        throw "materializer teardown stress failed on iteration $iteration with exit $LASTEXITCODE"
+    }
+}
 '''
 
 [[steps]]
@@ -57,7 +112,13 @@ command = '''
 $nativeRoot = "packages\nexus-cli\native\win32-x64-msvc"
 New-Item -ItemType Directory -Force -Path $nativeRoot | Out-Null
 Copy-Item "C:\w\cache\cargo-target\release\nexus.exe" (Join-Path $nativeRoot "nexus.exe") -Force
-& node.exe packages/nexus-cli/bin/nexus.mjs --version
+$ExpectedVersion = '0.1.5'
+$VersionOutput = (& node.exe packages/nexus-cli/bin/nexus.mjs --version | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) { throw "Windows npm launcher version probe failed" }
+if ($VersionOutput -ne "nexus $ExpectedVersion") {
+    throw "Windows npm launcher reports the wrong release version: $VersionOutput"
+}
+Write-Output $VersionOutput
 & node.exe packages/nexus-cli/bin/nexus.mjs daemon install --help
 & node.exe scripts/nexus-cli-command-surface-smoke.mjs packages/nexus-cli/bin/nexus.mjs
 '''
@@ -79,6 +140,68 @@ command = '''
 & pnpm.cmd --dir gateway test
 & pnpm.cmd --dir gateway build:gateway-package
 & pnpm.cmd --dir gateway webconsole:build
+'''
+
+[[steps]]
+name = "webconsole-command-shim-lifecycle"
+workdir = "C:\\w\\src\\egregore-nexus"
+timeout_seconds = 900
+command = '''
+$ErrorActionPreference = 'Stop'
+$Nexus = (Resolve-Path "$env:CARGO_TARGET_DIR\release\nexus.exe").Path
+$Node = (Get-Command node.exe).Source
+$ShimRoot = Join-Path $env:NEXUS_HOME 'Program Files\Egregore Nexus'
+New-Item -ItemType Directory -Force -Path $ShimRoot | Out-Null
+$WebuiSource = (Resolve-Path 'gateway\webconsole\bin\nexus-webui.mjs').Path
+$GatewaySource = (Resolve-Path 'gateway\scripts\nexus-gateway.mjs').Path
+$WebuiShim = Join-Path $ShimRoot 'nexus-webui.cmd'
+$GatewayShim = Join-Path $ShimRoot 'nexus-gateway.cmd'
+Set-Content -LiteralPath $WebuiShim -Encoding Ascii -Value @(
+    '@echo off',
+    ('"{0}" "{1}" %*' -f $Node, $WebuiSource)
+)
+Set-Content -LiteralPath $GatewayShim -Encoding Ascii -Value @(
+    '@echo off',
+    ('"{0}" "{1}" %*' -f $Node, $GatewaySource)
+)
+$env:NEXUS_WEBUI_BIN = $WebuiShim
+$env:NEXUS_GATEWAY_BIN = $GatewayShim
+
+$Listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+$Listener.Start()
+$WebconsolePort = ([System.Net.IPEndPoint]$Listener.LocalEndpoint).Port
+$Listener.Stop()
+
+try {
+    $StartText = (& $Nexus --json webconsole start --host 127.0.0.1 --port $WebconsolePort | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw "Windows Webconsole start failed: $StartText" }
+    $Start = $StartText | ConvertFrom-Json
+    if ($Start.runtime.state -ne 'live' -or [int]$Start.runtime.port -ne $WebconsolePort) {
+        throw "Windows Webconsole start returned the wrong runtime: $StartText"
+    }
+    $StatusText = (& $Nexus --json webconsole status | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw "Windows Webconsole status failed: $StatusText" }
+    $Status = $StatusText | ConvertFrom-Json
+    if ($Status.runtime.state -ne 'live' -or [int]$Status.runtime.port -ne $WebconsolePort) {
+        throw "Windows Webconsole status did not preserve the shim argv: $StatusText"
+    }
+}
+finally {
+    & $Nexus webconsole stop --force | Out-Null
+    & $Nexus gateway stop --force | Out-Null
+    & $Nexus daemon stop | Out-Null
+}
+
+$Probe = [System.Net.Sockets.TcpClient]::new()
+try {
+    $Connect = $Probe.ConnectAsync('127.0.0.1', $WebconsolePort)
+    if ($Connect.Wait(500) -and $Probe.Connected) {
+        throw "Windows Webconsole listener survived webconsole stop --force"
+    }
+}
+finally {
+    $Probe.Dispose()
+}
 '''
 
 [[artifacts]]

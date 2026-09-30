@@ -145,5 +145,12 @@ NEXUS_CLI=${NEXUS_CLI:-nexus}
 const BUS_LAUNCHER_SH: &str = r#"#!/usr/bin/env bash
 set -euo pipefail
 
+case "${1:-}" in
+  listen)
+    printf '%s\n' 'error: listen is not available to agents; inbound Nexus messages are pushed automatically' >&2
+    exit 64
+    ;;
+esac
+
 exec "${NEXUS_CLI:-nexus}" "$@"
 "#;

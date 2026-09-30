@@ -1,19 +1,21 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use nexus::daemon::gateway_stream_socket::{GatewayStreamFrame, GatewayStreamPublisher};
 use nexus::daemon::{daemon_ipc, AppState};
 use nexus_agent::{Adapter, AdapterInjectError, AdapterRegistry, MockAdapter, StreamEvent};
 use nexus_common::{Config, NexusError};
 use nexus_contracts::{
-    ConsumeRequest, DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, HarnessId, Kind, Message,
-    MessageId, ProjectId, Provenance, RegisterRequest, Request, Scope, SendRequest, SendTarget,
-    SessionId, SpawnRequest, ThreadId, Tier, DAEMON_IPC_PROTOCOL_VERSION,
+    ConsumeRequest, DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, GatewayProjectionKind,
+    HarnessId, Kind, Message, MessageId, ProjectId, Provenance, RegisterRequest, Request, Scope,
+    SendRequest, SendTarget, SessionId, SpawnRequest, ThreadId, Tier, DAEMON_IPC_PROTOCOL_VERSION,
 };
 use nexus_store::repos::{
-    Agents, DeliveryObligations, IdentitySessions, Inbox, NewAgent, NewDeliveryObligation,
-    NewIdentitySession, NewSession, Sessions, StreamEvents, Threads,
+    AgentRuntimes, Agents, DeliveryObligations, IdentitySessions, Inbox, NewAgent, NewAgentRuntime,
+    NewDeliveryObligation, NewIdentitySession, NewSession, Sessions, StreamEvents, Threads,
 };
 use nexus_store::DaemonStore;
 
@@ -594,6 +596,184 @@ async fn daemon_boot_rehydrates_the_nexus_runtime_identity_from_its_capsule() {
 }
 
 #[tokio::test]
+async fn daemon_boot_projects_only_the_newest_runtime_capsule_per_agent() {
+    let path = unique_store_path("boot-latest-runtime-per-agent");
+    {
+        let daemon = DaemonStore::open(path.to_string_lossy().as_ref())
+            .await
+            .expect("first boot");
+        let store = daemon.compatibility_store();
+        for (agent_id, name) in [
+            ("a_relaunched", "relaunched-agent"),
+            ("a_following", "following-agent"),
+        ] {
+            Agents::new(&store)
+                .create(NewAgent {
+                    agent_id: agent_id.into(),
+                    project: "default".into(),
+                    name: Some(name.into()),
+                    default_harness: Some("codex".into()),
+                    role: None,
+                    tier: Some("agent".into()),
+                    owner: None,
+                })
+                .await
+                .expect("agent identity");
+        }
+        for (runtime_id, agent_id, client_key) in [
+            ("s_following", "a_following", "following-key"),
+            ("s_relaunched_old", "a_relaunched", "old-key"),
+            ("s_relaunched_new", "a_relaunched", "new-key"),
+        ] {
+            IdentitySessions::new(&store)
+                .upsert(NewIdentitySession {
+                    runtime_id: runtime_id.into(),
+                    agent_id: agent_id.into(),
+                    project: "default".into(),
+                    harness: "codex".into(),
+                    mode: "headless".into(),
+                    backend: Some("acp".into()),
+                    cwd: Some(format!("/work/{runtime_id}")),
+                    native_resume_key: Some(format!("native-{runtime_id}")),
+                    client_key: Some(client_key.into()),
+                })
+                .await
+                .expect("resurrection capsule");
+            AgentRuntimes::new(&store)
+                .create(NewAgentRuntime {
+                    runtime_id: runtime_id.into(),
+                    agent_id: agent_id.into(),
+                    harness: "codex".into(),
+                    cwd: Some(format!("/work/{runtime_id}")),
+                    transport: Some("acp".into()),
+                    presence: Some("online".into()),
+                    active: true,
+                })
+                .await
+                .expect("durable runtime descriptor");
+        }
+        for (runtime_id, updated_at) in [
+            ("s_following", 10_i64),
+            ("s_relaunched_old", 20_i64),
+            ("s_relaunched_new", 30_i64),
+        ] {
+            store
+                .identity_conn()
+                .execute(
+                    "UPDATE identity_sessions SET updated_at = ?2 WHERE runtime_id = ?1",
+                    libsql::params![runtime_id, updated_at],
+                )
+                .await
+                .expect("ordered resurrection capsule");
+        }
+    }
+
+    let daemon = DaemonStore::open(path.to_string_lossy().as_ref())
+        .await
+        .expect("second boot");
+    let store = Arc::new(daemon.compatibility_store());
+    let publisher = GatewayStreamPublisher::new(32);
+    let mut gateway_frames = publisher.subscribe();
+    let state =
+        AppState::wire_pty_with_gateway_stream(store.clone(), &Config::default(), Some(publisher));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        state.wait_for_runtime_identity_ready(),
+    )
+    .await
+    .expect("boot identity readiness");
+
+    let sessions = Sessions::new(&store);
+    let latest = sessions
+        .find_by_session_id(&SessionId("s_relaunched_new".into()))
+        .await
+        .expect("latest runtime lookup")
+        .expect("latest runtime must be projected");
+    assert_eq!(latest.agent_id.as_deref(), Some("a_relaunched"));
+    assert_eq!(latest.client_key.as_deref(), Some("new-key"));
+    assert!(
+        sessions
+            .find_by_session_id(&SessionId("s_relaunched_old".into()))
+            .await
+            .expect("old runtime lookup")
+            .is_none(),
+        "an older capsule for the same stable agent must remain history, not a live projection"
+    );
+    assert!(
+        sessions
+            .find_by_session_id(&SessionId("s_following".into()))
+            .await
+            .expect("following runtime lookup")
+            .is_some(),
+        "one stale capsule must not abort restoration for later agents"
+    );
+
+    let mut identities = HashMap::new();
+    let mut runtimes = HashMap::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    while (identities.len() < 2 || runtimes.len() < 2) && tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Ok(Ok(frame)) = tokio::time::timeout(remaining, gateway_frames.recv()).await else {
+            break;
+        };
+        let GatewayStreamFrame::Projection { event } = frame else {
+            continue;
+        };
+        match event.kind {
+            GatewayProjectionKind::IdentityUpserted => {
+                if let Some(agent_id) = event.payload["agentId"].as_str() {
+                    identities.insert(agent_id.to_string(), event.payload);
+                }
+            }
+            GatewayProjectionKind::RuntimeUpserted => {
+                if let Some(runtime_id) = event.payload["runtimeId"].as_str() {
+                    runtimes.insert(runtime_id.to_string(), event.payload);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        identities
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["a_following".to_string(), "a_relaunched".to_string()]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        runtimes
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        ["s_following".to_string(), "s_relaunched_new".to_string()]
+            .into_iter()
+            .collect()
+    );
+    let identity = &identities["a_relaunched"];
+    assert_eq!(identity["name"], "relaunched-agent");
+    assert_eq!(identity["project"], "default");
+    assert_eq!(identity["defaultHarness"], "codex");
+    assert_eq!(identity["tier"], "agent");
+    let runtime = &runtimes["s_relaunched_new"];
+    assert_eq!(runtime["agentId"], "a_relaunched");
+    assert_eq!(runtime["harness"], "codex");
+    assert_eq!(runtime["cwd"], "/work/s_relaunched_new");
+    assert_eq!(runtime["transport"], "acp");
+    assert_eq!(runtime["presence"], "online");
+    assert_eq!(runtime["active"], true);
+    assert_eq!(runtime["nativeResumeKey"], "native-s_relaunched_new");
+
+    drop(state);
+    drop(store);
+    drop(daemon);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(path.with_extension("db-shm"));
+}
+
+#[tokio::test]
 async fn concurrent_acp_revives_open_one_adapter_for_the_runtime() {
     let path = unique_store_path("concurrent-acp-revive");
     {
@@ -996,6 +1176,7 @@ async fn daemon_boot_restores_minimal_thread_routing_and_wakes_the_same_agent_id
                     summary: None,
                     body: "THREAD-RESTART-WAKE".into(),
                     mention: Vec::new(),
+                    metadata: None,
                     idempotency_key: Some("thread-restart-wake".into()),
                 })
                 .expect("send request json"),
@@ -1158,6 +1339,7 @@ async fn gateway_absent_delivery_uses_memory_transport_and_only_unsettled_contin
                 summary: None,
                 body: "transport without Gateway".into(),
                 mention: Vec::new(),
+                metadata: None,
                 idempotency_key: Some("lightweight-send-1".into()),
             },
         )

@@ -53,8 +53,10 @@ export interface ProjectRow {
 }
 
 export interface WhoamiRow {
+  agentId?: string;
   name: string;
   sessionId: string;
+  kind: string;
   role?: string;
   tier: string;
   project: string;

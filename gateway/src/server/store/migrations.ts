@@ -2,8 +2,16 @@ import type { Client, InStatement } from "@libsql/client";
 
 import { GATEWAY_CANONICAL_TABLES } from "./schema";
 
-export const CURRENT_GATEWAY_SCHEMA_VERSION = 1;
-export const CURRENT_GATEWAY_SCHEMA_NAME = "v0.1.0_baseline";
+const GATEWAY_V1_SCHEMA_VERSION = 1;
+const GATEWAY_V1_SCHEMA_NAME = "v0.1.0_baseline";
+const GATEWAY_V2_SCHEMA_VERSION = 2;
+const GATEWAY_V2_SCHEMA_NAME = "v0.1.5_message_hooks";
+const GATEWAY_V3_SCHEMA_VERSION = 3;
+const GATEWAY_V3_SCHEMA_NAME = "v0.1.5_message_hook_receipts";
+const GATEWAY_V4_SCHEMA_VERSION = 4;
+const GATEWAY_V4_SCHEMA_NAME = "v0.1.5_resumable_message_hooks";
+export const CURRENT_GATEWAY_SCHEMA_VERSION = 5;
+export const CURRENT_GATEWAY_SCHEMA_NAME = "v0.1.5_bearer_authority";
 
 const INITIAL_SCHEMA: InStatement[] = [
   `CREATE TABLE IF NOT EXISTS projection_events (
@@ -206,7 +214,76 @@ const PROJECTION_QUARANTINE_SCHEMA: InStatement[] = [
   )`,
 ];
 
-const REQUIRED_INDEXES = [
+const HOOK_AUDIT_SCHEMA: InStatement[] = [
+  `CREATE TABLE IF NOT EXISTS hook_pipeline_evaluations (
+    evaluation_id TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL,
+    event TEXT NOT NULL,
+    registry_generation TEXT NOT NULL,
+    original_message_json TEXT NOT NULL,
+    state TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    result_json TEXT
+  )`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_hook_pipeline_message_event
+    ON hook_pipeline_evaluations(message_id, event)`,
+  `CREATE TABLE IF NOT EXISTS hook_handler_executions (
+    invocation_id TEXT PRIMARY KEY,
+    evaluation_id TEXT NOT NULL,
+    hook_id TEXT NOT NULL,
+    event TEXT NOT NULL,
+    artifact_digest TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER NOT NULL,
+    outcome TEXT NOT NULL,
+    executed_by_json TEXT NOT NULL,
+    result_json TEXT
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_hook_execution_evaluation
+    ON hook_handler_executions(evaluation_id, started_at, invocation_id)`,
+  `CREATE TABLE IF NOT EXISTS hook_receipt_completion (
+    message_id TEXT PRIMARY KEY,
+    invocation_id TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'claimed',
+    claimed_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    metadata_patch_json TEXT,
+    executed_by_json TEXT,
+    merge_acked_at INTEGER,
+    last_error TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0
+  )`,
+];
+
+const MESSAGE_HOOK_PROJECTION_SCHEMA: InStatement[] = [
+  "ALTER TABLE bus_messages ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'",
+  "ALTER TABLE bus_messages ADD COLUMN mention_json TEXT NOT NULL DEFAULT '[]'",
+];
+
+const V2_RECEIPT_UPGRADE_SCHEMA: InStatement[] = [
+  "ALTER TABLE hook_receipt_completion ADD COLUMN state TEXT NOT NULL DEFAULT 'claimed'",
+  "ALTER TABLE hook_receipt_completion ADD COLUMN completed_at INTEGER",
+  "ALTER TABLE hook_receipt_completion ADD COLUMN metadata_patch_json TEXT",
+  "ALTER TABLE hook_receipt_completion ADD COLUMN executed_by_json TEXT",
+  "ALTER TABLE hook_receipt_completion ADD COLUMN merge_acked_at INTEGER",
+  "ALTER TABLE hook_receipt_completion ADD COLUMN last_error TEXT",
+  "ALTER TABLE hook_receipt_completion ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+];
+
+const RESUMABLE_HOOK_UPGRADE_SCHEMA: InStatement[] = [
+  "ALTER TABLE hook_pipeline_evaluations ADD COLUMN result_json TEXT",
+  "ALTER TABLE hook_handler_executions ADD COLUMN result_json TEXT",
+];
+
+const BEARER_AUTHORITY_UPGRADE_SCHEMA: InStatement[] = [
+  "ALTER TABLE rest_bearer_token ADD COLUMN actor_session_id TEXT",
+  "ALTER TABLE rest_bearer_token ADD COLUMN actor_agent_id TEXT",
+  "ALTER TABLE rest_bearer_token ADD COLUMN actor_runtime_id TEXT",
+  "ALTER TABLE rest_bearer_token ADD COLUMN actor_client_key TEXT",
+];
+
+const V1_REQUIRED_INDEXES = [
   "idx_projection_epoch_seq",
   "idx_runtime_agent",
   "idx_bus_messages_thread",
@@ -218,6 +295,11 @@ const REQUIRED_INDEXES = [
   "idx_logs_seq",
   "idx_rendered_messages_conv",
 ] as const;
+const HOOK_REQUIRED_INDEXES = [
+  "idx_hook_pipeline_message_event",
+  "idx_hook_execution_evaluation",
+] as const;
+const REQUIRED_INDEXES = [...V1_REQUIRED_INDEXES, ...HOOK_REQUIRED_INDEXES] as const;
 
 /** Bootstrap or validate the single local-only Gateway v0.1.0 schema baseline. */
 export async function migrateGatewayStore(db: Client): Promise<void> {
@@ -236,6 +318,9 @@ export async function migrateGatewayStore(db: Client): Promise<void> {
         )`,
         ...INITIAL_SCHEMA,
         ...PROJECTION_QUARANTINE_SCHEMA,
+        ...HOOK_AUDIT_SCHEMA,
+        ...MESSAGE_HOOK_PROJECTION_SCHEMA,
+        ...BEARER_AUTHORITY_UPGRADE_SCHEMA,
         {
           sql: `INSERT INTO gateway_schema_migrations (version, name, applied_at)
                 VALUES (?, ?, ?)`,
@@ -249,13 +334,13 @@ export async function migrateGatewayStore(db: Client): Promise<void> {
       "write",
     );
   } else {
-    await validateBaselineMarker(db);
+    await upgradeOrValidateBaseline(db);
   }
 
   await validateRequiredObjects(db);
 }
 
-async function validateBaselineMarker(db: Client): Promise<void> {
+async function upgradeOrValidateBaseline(db: Client): Promise<void> {
   const rows = await db.execute(
     "SELECT version, name FROM gateway_schema_migrations ORDER BY version",
   );
@@ -265,11 +350,95 @@ async function validateBaselineMarker(db: Client): Promise<void> {
   const marker = rows.rows[0]!;
   const version = Number(marker.version);
   const name = String(marker.name);
-  if (
-    version !== CURRENT_GATEWAY_SCHEMA_VERSION ||
-    name !== CURRENT_GATEWAY_SCHEMA_NAME
-  ) {
-    throw unsupportedSchema(`${name}@${version}`);
+  if (version === CURRENT_GATEWAY_SCHEMA_VERSION && name === CURRENT_GATEWAY_SCHEMA_NAME) {
+    return;
+  }
+  if (version === GATEWAY_V1_SCHEMA_VERSION && name === GATEWAY_V1_SCHEMA_NAME) {
+    await validateV1Objects(db);
+    await db.batch(
+      [
+        ...HOOK_AUDIT_SCHEMA,
+        ...MESSAGE_HOOK_PROJECTION_SCHEMA,
+        ...BEARER_AUTHORITY_UPGRADE_SCHEMA,
+        migrationMarkerUpdate(version, name),
+      ],
+      "write",
+    );
+    return;
+  }
+  if (version === GATEWAY_V2_SCHEMA_VERSION && name === GATEWAY_V2_SCHEMA_NAME) {
+    await validateV2Objects(db);
+    await db.batch(
+      [
+        ...MESSAGE_HOOK_PROJECTION_SCHEMA,
+        ...V2_RECEIPT_UPGRADE_SCHEMA,
+        ...RESUMABLE_HOOK_UPGRADE_SCHEMA,
+        ...BEARER_AUTHORITY_UPGRADE_SCHEMA,
+        migrationMarkerUpdate(version, name),
+      ],
+      "write",
+    );
+    return;
+  }
+  if (version === GATEWAY_V3_SCHEMA_VERSION && name === GATEWAY_V3_SCHEMA_NAME) {
+    await validateV2Objects(db);
+    await db.batch(
+      [
+        ...RESUMABLE_HOOK_UPGRADE_SCHEMA,
+        ...BEARER_AUTHORITY_UPGRADE_SCHEMA,
+        migrationMarkerUpdate(version, name),
+      ],
+      "write",
+    );
+    return;
+  }
+  if (version === GATEWAY_V4_SCHEMA_VERSION && name === GATEWAY_V4_SCHEMA_NAME) {
+    await validateV2Objects(db);
+    await db.batch(
+      [
+        ...BEARER_AUTHORITY_UPGRADE_SCHEMA,
+        migrationMarkerUpdate(version, name),
+      ],
+      "write",
+    );
+    return;
+  }
+  throw unsupportedSchema(`${name}@${version}`);
+}
+
+function migrationMarkerUpdate(version: number, name: string): InStatement {
+  return {
+    sql: `UPDATE gateway_schema_migrations
+          SET version = ?, name = ?, applied_at = ?
+          WHERE version = ? AND name = ?`,
+    args: [CURRENT_GATEWAY_SCHEMA_VERSION, CURRENT_GATEWAY_SCHEMA_NAME, Date.now(), version, name],
+  };
+}
+
+async function validateV1Objects(db: Client): Promise<void> {
+  for (const table of GATEWAY_CANONICAL_TABLES) {
+    if (table.startsWith("hook_")) continue;
+    if (!(await objectExists(db, "table", table))) {
+      throw new Error(`incomplete v0.1.0 Gateway schema: missing table ${table}`);
+    }
+  }
+  for (const index of V1_REQUIRED_INDEXES) {
+    if (!(await objectExists(db, "index", index))) {
+      throw new Error(`incomplete v0.1.0 Gateway schema: missing index ${index}`);
+    }
+  }
+}
+
+async function validateV2Objects(db: Client): Promise<void> {
+  for (const table of GATEWAY_CANONICAL_TABLES) {
+    if (!(await objectExists(db, "table", table))) {
+      throw new Error(`incomplete v0.1.5 Gateway hook schema: missing table ${table}`);
+    }
+  }
+  for (const index of REQUIRED_INDEXES) {
+    if (!(await objectExists(db, "index", index))) {
+      throw new Error(`incomplete v0.1.5 Gateway hook schema: missing index ${index}`);
+    }
   }
 }
 
@@ -311,4 +480,25 @@ async function objectExists(db: Client, kind: string, name: string): Promise<boo
     args: [kind, name],
   });
   return result.rows.length > 0;
+}
+
+/** @internal Test support for proving the one supported additive upgrade. */
+export async function createGatewayV1StoreForTest(db: Client): Promise<void> {
+  await db.batch(
+    [
+      `CREATE TABLE gateway_schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at INTEGER NOT NULL
+      )`,
+      ...INITIAL_SCHEMA,
+      ...PROJECTION_QUARANTINE_SCHEMA,
+      {
+        sql: `INSERT INTO gateway_schema_migrations (version, name, applied_at)
+              VALUES (?, ?, ?)`,
+        args: [GATEWAY_V1_SCHEMA_VERSION, GATEWAY_V1_SCHEMA_NAME, Date.now()],
+      },
+    ],
+    "write",
+  );
 }

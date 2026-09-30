@@ -138,6 +138,7 @@ async fn fresh_codex_launch_receives_thread_fanout_without_self_register_or_bus_
                 summary: None,
                 body: "thread fanout should drain after fresh codex reregister".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )

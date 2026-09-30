@@ -12,12 +12,14 @@
 //! back as ordered `agent.update` events. An adapter init failure surfaces as `agent.status`
 //! errored with the session retained for retry (spec §11), never silently dropped.
 
+pub mod active_turns;
 pub mod adapter;
 pub mod error;
 pub mod launcher;
 pub mod registry;
 pub mod service;
 
+pub use active_turns::ActiveTurnTracker;
 pub use adapter::engine::LaunchCtx;
 pub use adapter::hermes::skill::write_hermes_mcp_config;
 pub use adapter::opencode::harness::write_opencode_mcp_config;

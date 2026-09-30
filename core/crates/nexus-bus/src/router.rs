@@ -4,8 +4,8 @@
 //! (no orchestrator); the only decision it makes is name → scope → recipients.
 //!
 //! - **DM target** (`SendTarget::Dm{name, agent_id}`) → route by authoritative stable id when
-//!   present. A positional name target resolves its alias first and falls back to an exact stable
-//!   id only when no alias owns that token;
+//!   present. A positional target accepts an exact stable id first and resolves a display alias
+//!   only when no durable id owns that token;
 //!   if `name` is the local web-console `operator`, write a local-human DM row;
 //!   otherwise resolve it to exactly one runtime session.
 //! - **Thread** (`SendTarget::Post{thread}`) → the thread's member set. A `to` that names a thread
@@ -180,8 +180,8 @@ impl Router {
     }
 
     /// Generic positional target: thread names win so `nexus send --to <thread>` uses the same
-    /// one-`to` contract as `post`. A registered display alias wins over an equal-looking id token;
-    /// when no alias exists, an exact durable agent id is accepted. Every agent result then routes
+    /// one-`to` contract as `post`. An exact durable agent id wins over an equal-looking display
+    /// alias; aliases remain a fallback. Every agent result then routes
     /// through the stable-id path.
     async fn resolve_name_target(
         &self,
@@ -196,7 +196,7 @@ impl Router {
             return Ok(Resolved::Thread(row.thread_id, sessions));
         }
         let agents = Agents::new(&self.store);
-        if agents.find_by_name(name).await?.is_none() && agents.find_by_id(name).await?.is_some() {
+        if agents.find_by_id(name).await?.is_some() {
             return self
                 .resolve_dm_agent_id(caller, AgentId(name.to_string()))
                 .await;
@@ -407,102 +407,21 @@ impl Router {
         caller: &Caller,
         thread_id: &ThreadId,
     ) -> Result<Vec<Recipient>, NexusError> {
-        if self.store.has_split_authority() {
-            let members = Threads::new(&self.store).member_refs(thread_id).await?;
-            let mut recipients = Vec::with_capacity(members.len());
-            for member in members {
-                if let Some(agent_id) = member.agent_id.as_deref() {
-                    if let Some(recipient) = self
-                        .stable_edge_recipient(agent_id, None, Some(&member.session_name))
-                        .await?
-                    {
-                        recipients.push(recipient);
-                        continue;
-                    }
-                }
-                if let Some(recipient) = self.member_recipient(caller, &member.session_name).await?
+        let members = Threads::new(&self.store).member_refs(thread_id).await?;
+        let mut recipients = Vec::with_capacity(members.len());
+        for member in members {
+            if let Some(agent_id) = member.agent_id.as_deref() {
+                if let Some(recipient) = self
+                    .stable_edge_recipient(agent_id, None, Some(&member.session_name))
+                    .await?
                 {
                     recipients.push(recipient);
                 }
-            }
-            return Ok(recipients);
-        }
-
-        // One member-resolution query regardless of fan-out size. Stable agent ids prefer the
-        // current active runtime, then the most recent durable session; fossil name-only edges
-        // resolve from the globally visible agents/sessions rows. Project is deliberately absent:
-        // it is descriptive metadata, never a routing boundary.
-        let mut rows = self
-            .store
-            .conn
-            .query(
-                "WITH edges AS ( \
-                   SELECT tm.session_name, tm.joined_at, \
-                     COALESCE( \
-                       tm.agent_id, \
-                       (SELECT a.agent_id FROM agents a \
-                        WHERE a.name = tm.session_name LIMIT 1), \
-                       (SELECT s.agent_id FROM sessions s \
-                        WHERE s.name = tm.session_name AND s.agent_id IS NOT NULL \
-                        ORDER BY s.rowid DESC LIMIT 1) \
-                     ) AS resolved_agent_id, \
-                     (SELECT s.session_id FROM sessions s \
-                      WHERE s.name = tm.session_name ORDER BY s.rowid DESC LIMIT 1) \
-                       AS name_session_id, \
-                     (SELECT s.name FROM sessions s \
-                      WHERE s.name = tm.session_name ORDER BY s.rowid DESC LIMIT 1) \
-                       AS name_session_name \
-                   FROM thread_members tm WHERE tm.thread_id = ?1 \
-                 ) \
-                 SELECT resolved_agent_id, \
-                   COALESCE( \
-                     (SELECT r.runtime_id FROM agent_runtimes r \
-                      WHERE r.agent_id = edges.resolved_agent_id \
-                        AND r.active = 1 AND r.stopped_at IS NULL \
-                      ORDER BY r.rowid DESC LIMIT 1), \
-                     (SELECT s.session_id FROM sessions s \
-                      WHERE s.agent_id = edges.resolved_agent_id \
-                      ORDER BY s.rowid DESC LIMIT 1), \
-                     name_session_id \
-                   ) AS recipient_session, \
-                   COALESCE( \
-                     (SELECT a.name FROM agents a \
-                      WHERE a.agent_id = edges.resolved_agent_id LIMIT 1), \
-                     (SELECT s.name FROM sessions s \
-                      WHERE s.agent_id = edges.resolved_agent_id AND s.name IS NOT NULL \
-                      ORDER BY s.rowid DESC LIMIT 1), \
-                     name_session_name, session_name \
-                   ) AS recipient_name, \
-                   session_name \
-                 FROM edges \
-                 ORDER BY joined_at",
-                params![thread_id.0.clone()],
-            )
-            .await
-            .map_err(|e| NexusError::Store(e.to_string()))?;
-        let mut recipients = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| NexusError::Store(e.to_string()))?
-        {
-            let agent_id: Option<String> =
-                row.get(0).map_err(|e| NexusError::Store(e.to_string()))?;
-            let session: Option<String> =
-                row.get(1).map_err(|e| NexusError::Store(e.to_string()))?;
-            let name: Option<String> = row.get(2).map_err(|e| NexusError::Store(e.to_string()))?;
-            if let Some(session) = session {
-                recipients.push(Recipient {
-                    agent_id: agent_id.map(AgentId),
-                    session: SessionId(session),
-                    name,
-                });
+                // A stable edge is exclusive. If its runtime is absent, the member is offline;
+                // never reinterpret its mutable display alias as a different identity.
                 continue;
             }
-            // Compatibility fallback only for a fossil edge the batch could not resolve from
-            // durable store truth. Normal current members never pay this per-name lookup cost.
-            let fallback_name: String = row.get(3).map_err(|e| NexusError::Store(e.to_string()))?;
-            if let Some(recipient) = self.member_recipient(caller, &fallback_name).await? {
+            if let Some(recipient) = self.member_recipient(caller, &member.session_name).await? {
                 recipients.push(recipient);
             }
         }
@@ -619,32 +538,66 @@ impl Router {
             .find_by_id(agent_id)
             .await?
             .and_then(|agent| agent.name);
-        if let Some(runtime) = AgentRuntimes::new(&self.store)
-            .active_for_agent(agent_id)
-            .await?
-        {
+        let sessions = Sessions::new(&self.store);
+        if let Some(runtime) = sessions.active_runtime_session_for_agent(agent_id).await? {
             return Ok(Some(Recipient {
                 agent_id: Some(AgentId(agent_id.to_string())),
-                session: SessionId(runtime.runtime_id),
+                session: runtime.session_id,
                 name: agent_name.or_else(|| fallback_name.map(str::to_string)),
             }));
         }
 
-        let sessions = Sessions::new(&self.store);
-        let session = match sessions.find_by_agent_id(agent_id).await? {
-            Some(session) => Some(session),
-            None => match fallback_session {
-                Some(session_id) => {
-                    sessions
-                        .find_by_session_id(&SessionId(session_id.to_string()))
-                        .await?
+        let mut session = sessions.find_by_agent_id(agent_id).await?;
+        if session.is_none() {
+            // A stopped runtime remains exact stable-ID evidence. Its compatibility session may
+            // predate the sessions.agent_id stamp, but runtime ownership is immutable evidence;
+            // no mutable alias participates in this recovery path.
+            for runtime in AgentRuntimes::new(&self.store)
+                .list_for_agent(agent_id, true)
+                .await?
+            {
+                let Some(candidate) = sessions
+                    .find_by_session_id(&SessionId(runtime.runtime_id))
+                    .await?
+                else {
+                    continue;
+                };
+                if candidate
+                    .agent_id
+                    .as_deref()
+                    .is_some_and(|owner| owner != agent_id)
+                {
+                    return Err(NexusError::Invalid(format!(
+                        "stable edge for agent {agent_id} points at session {} owned by {}",
+                        candidate.session_id,
+                        candidate.agent_id.as_deref().unwrap_or("<unbound>")
+                    )));
                 }
-                None => match fallback_name {
-                    Some(name) => sessions.find_by_name_any_project(name).await?,
-                    None => None,
-                },
-            },
-        };
+                session = Some(candidate);
+                break;
+            }
+        }
+        if session.is_none() {
+            if let Some(session_id) = fallback_session {
+                if let Some(candidate) = sessions
+                    .find_by_session_id(&SessionId(session_id.to_string()))
+                    .await?
+                {
+                    if candidate
+                        .agent_id
+                        .as_deref()
+                        .is_some_and(|owner| owner != agent_id)
+                    {
+                        return Err(NexusError::Invalid(format!(
+                            "stable edge for agent {agent_id} points at session {} owned by {}",
+                            candidate.session_id,
+                            candidate.agent_id.as_deref().unwrap_or("<unbound>")
+                        )));
+                    }
+                    session = Some(candidate);
+                }
+            }
+        }
         let session_id = session
             .as_ref()
             .map(|session| session.session_id.clone())
@@ -665,32 +618,29 @@ impl Router {
         caller: &Caller,
         name: &str,
     ) -> Result<Option<Recipient>, NexusError> {
-        if let Some(agent) = Agents::new(&self.store).find_by_name(name).await? {
-            return self
-                .recipient_for_agent_id(caller, AgentId(agent.agent_id))
-                .await
-                .map(Some);
-        }
-
-        match self.identity.resolve(&caller.project, name).await {
-            Ok(c) => match c.agent_id {
-                Some(agent_id) => self
-                    .recipient_for_agent_id(caller, agent_id)
+        let mut agents = Agents::new(&self.store).find_all_by_name(name).await?;
+        match agents.len() {
+            0 => {}
+            1 => {
+                return self
+                    .recipient_for_agent_id(caller, AgentId(agents.remove(0).agent_id))
                     .await
-                    .map(Some),
-                None => Ok(Some(Recipient::from_caller(c))),
-            },
-            Err(_) => {
-                let row = Sessions::new(&self.store)
-                    .find_by_name_any_project(name)
-                    .await?;
-                Ok(row.map(|row| Recipient {
-                    agent_id: row.agent_id.map(AgentId),
-                    session: row.session_id,
-                    name: row.name,
-                }))
+                    .map(Some)
+            }
+            count => {
+                return Err(NexusError::Ambiguous(format!(
+                    "thread member name {name:?} matches {count} durable agents; address membership by stable agent id"
+                )))
             }
         }
+        let row = Sessions::new(&self.store)
+            .find_unique_by_name_any_project(name)
+            .await?;
+        Ok(row.map(|row| Recipient {
+            agent_id: row.agent_id.map(AgentId),
+            session: row.session_id,
+            name: row.name,
+        }))
     }
 }
 

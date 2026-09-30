@@ -1,6 +1,6 @@
 {
   "name": "@egregore/nexus",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": false,
   "license": "Apache-2.0",
   "description": "The complete Egregore Nexus CLI, transport daemon, Gateway, and WebUI.",
@@ -9,10 +9,14 @@
     "nexus-gateway": "bin/nexus-gateway.mjs",
     "nexus-webui": "bin/nexus-webui.mjs"
   },
+  "scripts": {
+    "prepack": "node scripts/check-version.mjs"
+  },
   "files": [
     "bin/nexus.mjs",
     "bin/nexus-gateway.mjs",
     "bin/nexus-webui.mjs",
+    "scripts/check-version.mjs",
     "README.md"
   ],
   "engines": {
@@ -22,8 +26,8 @@
     "access": "public"
   },
   "dependencies": {
-    "@egregore/nexus-cli": "0.1.4",
-    "@egregore/nexus-gateway": "0.1.4"
+    "@egregore/nexus-cli": "0.1.5",
+    "@egregore/nexus-gateway": "0.1.5"
   },
   "repository": {
     "type": "git",

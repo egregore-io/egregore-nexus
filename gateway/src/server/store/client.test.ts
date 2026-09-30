@@ -1,6 +1,8 @@
+import { spawn } from "node:child_process";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -9,6 +11,7 @@ import { closeGatewayStore, createGatewayStore, getGatewayStore } from "./client
 import { CURRENT_GATEWAY_SCHEMA_VERSION } from "./migrations";
 
 const temporaryDirectories: string[] = [];
+const gatewayRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
 afterEach(async () => {
   await closeGatewayStore();
@@ -69,4 +72,68 @@ describe("Gateway canonical store client", () => {
     expect(Number(synchronous.rows[0]?.synchronous)).toBe(1);
     db.close();
   });
+
+  it("waits for a concurrent initializer before applying WAL without retrying", async () => {
+    const url = await temporaryStoreUrl();
+    const lock = await holdExclusiveStoreLock(url);
+    const startedAt = Date.now();
+    try {
+      const db = await createGatewayStore({ url });
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(250);
+      const schema = await db.execute(
+        "SELECT version FROM gateway_schema_migrations ORDER BY version",
+      );
+      expect(schema.rows.map((row) => Number(row.version))).toEqual([
+        CURRENT_GATEWAY_SCHEMA_VERSION,
+      ]);
+      db.close();
+    } finally {
+      await lock.exit;
+    }
+  });
 });
+
+async function holdExclusiveStoreLock(url: string): Promise<{ exit: Promise<void> }> {
+  const child = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `import { createClient } from "@libsql/client";
+       const db = createClient({ url: process.env.LOCK_URL });
+       await db.execute("BEGIN EXCLUSIVE");
+       await db.execute("PRAGMA user_version = 1");
+       process.stdout.write("LOCKED\\n");
+       await new Promise((resolve) => setTimeout(resolve, 750));
+       await db.execute("ROLLBACK");
+       db.close();`,
+    ],
+    {
+      cwd: gatewayRoot,
+      env: { ...process.env, LOCK_URL: url },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  const exit = new Promise<void>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      if (code === 0) resolve();
+      else reject(new Error(`SQLite lock owner exited ${code ?? signal}: ${stderr}`));
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    let stdout = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+      if (stdout.includes("LOCKED\n")) resolve();
+    });
+    void exit.catch(reject);
+  });
+  return { exit };
+}

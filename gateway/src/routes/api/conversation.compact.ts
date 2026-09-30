@@ -47,10 +47,10 @@ function statusForError(err: unknown): number {
   return 502;
 }
 
-async function handlePost(request: Request): Promise<Response> {
-  let body: { name?: string; agentId?: string };
+export async function handleConversationCompactPost(request: Request): Promise<Response> {
+  let body: { name?: string; agentId?: string; clientMessageId?: string };
   try {
-    body = (await request.json()) as { name?: string; agentId?: string };
+    body = (await request.json()) as typeof body;
   } catch {
     return json({ error: "body must be JSON" }, 400);
   }
@@ -76,8 +76,13 @@ async function handlePost(request: Request): Promise<Response> {
   try {
     const result = await submitCommandIntent<CompactResponse>(
       COMMAND_KINDS.harnessCompact,
-      target,
+      {
+        ...target,
+        ...(body.clientMessageId ? { clientMessageId: body.clientMessageId } : {}),
+      },
       identity ?? undefined,
+      {},
+      body.clientMessageId,
     );
     return json({ ok: true, result }, 201);
   } catch (err) {
@@ -89,7 +94,7 @@ async function handlePost(request: Request): Promise<Response> {
 export const Route = createFileRoute("/api/conversation/compact")({
   server: {
     handlers: {
-      POST: ({ request }) => handlePost(request),
+      POST: ({ request }) => handleConversationCompactPost(request),
     },
   },
 });

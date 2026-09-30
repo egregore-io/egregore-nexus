@@ -1,21 +1,42 @@
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { once } from "node:events";
 
 import { dispatchNetworkMcp } from "../../routes/api/mcp";
 import { dispatchApiV1 } from "../../routes/api/v1/$";
 import { observeScoped } from "../../routes/api/agui.observe";
 import { attachAguiWsUpgrade } from "../agui/ws.mjs";
+import { closeSharedDaemonPushConnector } from "../agui/daemonPushRelay.mjs";
+import {
+  createGatewayDeveloperEventSource,
+  type GatewayDeveloperEventSource,
+} from "../agui/gatewayDeveloperEvents";
 import {
   startGatewayProjectionService,
   stopGatewayProjectionService,
+  type GatewayProjectionServiceOptions,
 } from "../projection/service";
-import { handleSessionEvents } from "../stream/sessionEvents";
+import {
+  startGatewayHookService,
+  stopGatewayHookService,
+  type GatewayHookService,
+} from "../hooks/service";
 import { dispatchWebuiApi, isWebuiApiPath } from "./webuiApi";
+import { browserMutationCsrfFailure } from "../auth/browserMutationAuth.mjs";
+import {
+  isLocalOperatorWebAuthMode,
+  webAuthModeFromEnv,
+} from "../auth/webAuthMode";
 import { createGatewayStore, getGatewayStore } from "../store/client";
 import { gatewayStoreConfig } from "../store/config";
 import { CURRENT_GATEWAY_SCHEMA_VERSION } from "../store/migrations";
 
-export { startGatewayProjectionService, stopGatewayProjectionService };
+export {
+  closeSharedDaemonPushConnector,
+  startGatewayHookService,
+  startGatewayProjectionService,
+  stopGatewayHookService,
+  stopGatewayProjectionService,
+};
 
 /** Apply the local canonical-store schema without starting REST, WS, MCP, or WebUI listeners. */
 export async function migrateHeadlessGatewayStore(
@@ -34,8 +55,28 @@ export interface HeadlessGatewayDispatchers {
   apiV1: (request: Request) => Promise<Response>;
   networkMcp: (request: Request) => Promise<Response>;
   webuiApi: (request: Request) => Promise<Response>;
-  sessionEvents?: (request: Request, sessionId: string) => Promise<Response> | Response;
 }
+
+export interface HeadlessGatewayLifecycle {
+  startHooks(): Promise<Pick<GatewayHookService, "afterReceipt"> | undefined>;
+  startProjection(options: GatewayProjectionServiceOptions): Promise<unknown>;
+  stopProjection(): Promise<void>;
+  stopHooks(): Promise<void>;
+  stopConnection?(): Promise<void> | void;
+}
+
+export interface HeadlessGatewayWsOptions {
+  fetchHandler: (request: Request) => Promise<Response>;
+  developerEvents?: GatewayDeveloperEventSource;
+}
+
+const DEFAULT_LIFECYCLE: HeadlessGatewayLifecycle = {
+  startHooks: startGatewayHookService,
+  startProjection: startGatewayProjectionService,
+  stopProjection: stopGatewayProjectionService,
+  stopHooks: stopGatewayHookService,
+  stopConnection: async () => closeSharedDaemonPushConnector(),
+};
 
 const DEFAULT_DISPATCHERS: HeadlessGatewayDispatchers = {
   aguiObserve: (request) => observeScoped(request, { canonicalDb: getGatewayStore }),
@@ -51,14 +92,13 @@ const DEFAULT_DISPATCHERS: HeadlessGatewayDispatchers = {
 export async function handleHeadlessGatewayRequest(
   request: Request,
   dispatchers: HeadlessGatewayDispatchers = DEFAULT_DISPATCHERS,
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<Response> {
+  const csrfFailure = browserMutationCsrfFailure(request, {
+    enforce: !isLocalOperatorWebAuthMode(webAuthModeFromEnv(env)),
+  });
+  if (csrfFailure) return csrfFailure;
   const url = new URL(request.url);
-  const sessionEvents = /^\/api\/v1\/agent-sessions\/([^/]+)\/events$/.exec(url.pathname);
-  if (request.method === "GET" && sessionEvents) {
-    return dispatchers.sessionEvents
-      ? dispatchers.sessionEvents(request, decodeURIComponent(sessionEvents[1]!))
-      : handleSessionEvents(request, decodeURIComponent(sessionEvents[1]!));
-  }
   if (url.pathname === "/api/mcp") {
     return dispatchers.networkMcp(request);
   }
@@ -82,24 +122,80 @@ export async function handleHeadlessGatewayRequest(
   );
 }
 
+/** Guard a packaged TanStack handler with the same browser mutation contract as headless mode. */
+export function guardGatewayBrowserRequest(
+  request: Request,
+  next: (request: Request) => Promise<Response>,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<Response> {
+  const failure = browserMutationCsrfFailure(request, {
+    enforce: !isLocalOperatorWebAuthMode(webAuthModeFromEnv(env)),
+  });
+  return failure ? Promise.resolve(failure) : next(request);
+}
+
 /**
  * Creates the independently distributed gateway server, including its public
  * AG-UI WebSocket upgrade lane. The WebUI remains a separate package.
  */
 export async function createHeadlessGatewayServer(
   dispatchers: HeadlessGatewayDispatchers = DEFAULT_DISPATCHERS,
+  lifecycle: HeadlessGatewayLifecycle = DEFAULT_LIFECYCLE,
 ) {
-  await startGatewayProjectionService();
+  const hooks = await lifecycle.startHooks();
+  try {
+    await lifecycle.startProjection({
+      ...(hooks ? { afterReceipt: (event) => hooks.afterReceipt(event) } : {}),
+    });
+  } catch (error) {
+    await lifecycle.stopHooks();
+    await lifecycle.stopConnection?.();
+    throw error;
+  }
   const fetchHandler = (request: Request) =>
     handleHeadlessGatewayRequest(request, dispatchers);
   const server = createServer((req, res) => {
     void handleNodeRequest(req, res, dispatchers);
   });
-  await attachAguiWsUpgrade(server, { fetchHandler });
+  await attachHeadlessGatewayWs(server, { fetchHandler });
+  let cleanup: Promise<void> | undefined;
+  const stopServices = () => cleanup ??= lifecycle.stopProjection()
+    .then(() => lifecycle.stopHooks())
+    .then(() => lifecycle.stopConnection?.())
+    .then(() => undefined);
   server.once("close", () => {
-    void stopGatewayProjectionService();
+    void stopServices()
+      .catch((error) => {
+        process.stderr.write(`Nexus Gateway shutdown failed: ${String(error)}\n`);
+      });
   });
-  return server;
+  return Object.assign(server, {
+    async shutdown(): Promise<void> {
+      if (server.listening) {
+        await new Promise<void>((resolve, reject) => {
+          server.close((error) => error ? reject(error) : resolve());
+        });
+      }
+      await stopServices();
+    },
+  });
+}
+
+/** Attach the bundled AG-UI upgrade lane with Gateway-owned durable message subscriptions. */
+export async function attachHeadlessGatewayWs(
+  server: Server,
+  options: HeadlessGatewayWsOptions,
+) {
+  const ownsDeveloperEvents = !options.developerEvents;
+  const developerEvents = options.developerEvents ?? createGatewayDeveloperEventSource();
+  const wss = await attachAguiWsUpgrade(server, {
+    fetchHandler: options.fetchHandler,
+    developerEvents,
+  });
+  if (ownsDeveloperEvents) {
+    server.once("close", () => developerEvents.close());
+  }
+  return wss;
 }
 
 async function main(): Promise<void> {
@@ -109,6 +205,16 @@ async function main(): Promise<void> {
   server.listen(port, host, () => {
     process.stdout.write(`Nexus headless gateway listening on http://${host}:${port}\n`);
   });
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.once(signal, () => {
+      void server.shutdown()
+        .then(() => process.exit(0))
+        .catch((error) => {
+          process.stderr.write(`Nexus Gateway shutdown failed: ${String(error)}\n`);
+          process.exit(1);
+        });
+    });
+  }
 }
 
 async function handleNodeRequest(

@@ -12,6 +12,7 @@ from unittest import mock
 
 
 PATH = Path(__file__).resolve().parent / "nexus-v01-release-validation"
+VERSION = (PATH.parent.parent / "VERSION").read_text(encoding="utf-8").strip()
 LOADER = importlib.machinery.SourceFileLoader("nexus_v01_release_validation", str(PATH))
 SPEC = importlib.util.spec_from_loader("nexus_v01_release_validation", LOADER)
 rv = importlib.util.module_from_spec(SPEC)
@@ -109,7 +110,7 @@ class LedgerTests(unittest.TestCase):
         self.assertIn("--kill-after=2s", argv)
         self.assertEqual(result.status, "limited")
 
-    def test_runner_rejects_a_binary_from_a_different_source_revision(self):
+    def test_runner_rejects_a_binary_from_a_different_release_version(self):
         runner = rv.Runner("candidate", Path("evidence"), "expected-sha")
         result = rv.Result(
             label="fixture:exact-binary",
@@ -124,14 +125,14 @@ class LedgerTests(unittest.TestCase):
         with mock.patch.object(
             runner,
             "command",
-            return_value=(result, "nexus 0.1.0 (revision stale-sha)\n", ""),
+            return_value=(result, "nexus 10.1.0\n", ""),
         ):
             self.assertFalse(runner.require_exact_binary())
 
         self.assertEqual(result.status, "fail")
         self.assertEqual(
             result.evidence["assertions"],
-            [{"pass": False, "detail": "binary revision matches expected-sha"}],
+            [{"pass": False, "detail": f"binary version matches {VERSION}"}],
         )
 
     def test_missing_behavior_case_prevents_pass(self):

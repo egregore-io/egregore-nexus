@@ -10,7 +10,7 @@ use nexus_common::NexusError;
 
 use crate::error::{store_err, store_msg};
 use crate::repos::sessions::{get_opt_int, get_opt_text, get_text};
-use crate::repos::Sessions;
+use crate::repos::{AgentRef, Agents, Sessions};
 use crate::state::Store;
 use crate::types::SessionRow;
 
@@ -456,30 +456,35 @@ impl<'a> CommandIntents<'a> {
             serde_json::from_str(&command.request_json).map_err(store_msg)?;
         let sessions = Sessions::new(self.store);
         if let Some(agent_id) = request.get("agentId").and_then(serde_json::Value::as_str) {
-            if let Some(session) = sessions.find_by_agent_id(agent_id).await? {
+            if let Some(session) = sessions.active_runtime_session_for_agent(agent_id).await? {
                 return Ok(Some(session));
             }
-            let mut rows = self
-                .store
-                .identity_conn()
-                .query(
-                    "SELECT runtime_id FROM agent_runtimes WHERE agent_id = ?1 AND active = 1 \
-                     AND stopped_at IS NULL ORDER BY started_at DESC LIMIT 1",
-                    params![agent_id],
-                )
-                .await
-                .map_err(store_err)?;
-            if let Some(row) = rows.next().await.map_err(store_err)? {
-                return sessions
-                    .find_by_session_id(&nexus_contracts::SessionId(get_text(&row, 0)?))
-                    .await;
-            }
-            return Ok(None);
+            return sessions.find_by_agent_id(agent_id).await;
         }
         let Some(name) = request.get("name").and_then(serde_json::Value::as_str) else {
             return Ok(None);
         };
-        sessions.find_by_name(&command.project, name).await
+        let agents = Agents::new(self.store);
+        let parsed = AgentRef::parse(name);
+        let resolved = match agents.resolve_ref("", &parsed, true).await {
+            Err(NexusError::NotFound(_)) if matches!(parsed, AgentRef::Id(_)) => {
+                agents
+                    .resolve_ref("", &AgentRef::Name(name.to_string()), true)
+                    .await
+            }
+            result => result,
+        };
+        match resolved {
+            Ok(agent) => match sessions
+                .active_runtime_session_for_agent(&agent.agent_id)
+                .await?
+            {
+                Some(session) => Ok(Some(session)),
+                None => sessions.find_by_agent_id(&agent.agent_id).await,
+            },
+            Err(NexusError::NotFound(_)) => sessions.find_unique_by_name_any_project(name).await,
+            Err(error) => Err(error),
+        }
     }
 
     async fn has_pending_initial_prompt(
@@ -939,9 +944,7 @@ impl<'a> CommandIntents<'a> {
                     .find_by_session_id(&nexus_contracts::SessionId(session_id.to_string()))
                     .await?
             } else if let Some(client_key) = candidate.caller_client_key.as_deref() {
-                sessions
-                    .find_by_client_key(&candidate.project, client_key)
-                    .await?
+                sessions.find_by_client_key_any_project(client_key).await?
             } else {
                 None
             };

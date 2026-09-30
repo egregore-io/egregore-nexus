@@ -324,18 +324,29 @@ impl<'a> Threads<'a> {
             .find_by_name(session_name)
             .await?
             .map(|agent| agent.agent_id);
+        self.remove_member_all_ref(Some(session_name), agent_id.as_deref())
+            .await
+    }
+
+    /// Remove every membership matching the stable identity and/or legacy display name.
+    /// Explicit-id admin paths pass only `agent_id`, making the mutable request label inert.
+    pub async fn remove_member_all_ref(
+        &self,
+        session_name: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> Result<(), NexusError> {
         self.store
             .conn
             .execute(
-                "DELETE FROM thread_members WHERE session_name = ?1 OR \
+                "DELETE FROM thread_members WHERE (?1 IS NOT NULL AND session_name = ?1) OR \
                  (?2 IS NOT NULL AND agent_id = ?2)",
-                params![session_name, agent_id.clone()],
+                params![session_name, agent_id],
             )
             .await
             .map_err(store_err)?;
         if self.store.has_split_authority() {
             RoutingThreads::new(self.store)
-                .remove_member_all(session_name, agent_id.as_deref())
+                .remove_member_all_ref(session_name, agent_id)
                 .await?;
         }
         Ok(())

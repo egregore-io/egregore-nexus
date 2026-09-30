@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use libsql::params;
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 use nexus_contracts::{EventSink, GatewayProjectionEffect, Notification, WsEvent, JSONRPC_VERSION};
-use nexus_store::repos::Sessions;
+use nexus_store::repos::{AgentAccessGrants, AgentRuntimes, Agents, IdentitySessions, Sessions};
 use nexus_store::Store;
 
 use crate::daemon::transcript_archive::archive_codex_once;
@@ -93,16 +93,14 @@ impl WsSink {
                 paused,
             } => {
                 let row = match &self.store {
-                    Some(store) => Sessions::new(store)
-                        .find_by_session_id(session_id)
-                        .await
-                        .ok()
-                        .flatten(),
+                    Some(store) => {
+                        match Sessions::new(store).find_by_session_id(session_id).await {
+                            Ok(Some(row)) if row.kind == "agent" => Some(row),
+                            Ok(Some(_)) | Ok(None) | Err(_) => return None,
+                        }
+                    }
                     None => None,
                 };
-                if row.as_ref().is_some_and(|row| row.kind != "agent") {
-                    return None;
-                }
                 Some(FleetStatusObservation {
                     lifecycle: "status",
                     agent: row.as_ref().and_then(|row| row.name.clone()),
@@ -120,11 +118,12 @@ impl WsSink {
                 agent_id,
             } => {
                 let row = match &self.store {
-                    Some(store) => Sessions::new(store)
-                        .find_by_session_id(session_id)
-                        .await
-                        .ok()
-                        .flatten(),
+                    Some(store) => {
+                        match Sessions::new(store).find_by_session_id(session_id).await {
+                            Ok(Some(row)) if row.kind == "agent" => Some(row),
+                            Ok(Some(_)) | Ok(None) | Err(_) => return None,
+                        }
+                    }
                     None => None,
                 };
                 Some(FleetStatusObservation {
@@ -159,104 +158,166 @@ impl WsSink {
         match event {
             WsEvent::AgentSpawned {
                 session_id,
-                name,
+                name: _,
                 agent_id,
             } => {
-                let mut effects = Vec::new();
-                if let Some(agent_id) = agent_id.as_deref() {
-                    let payload = match store
-                        .conn
-                        .query(
-                            "SELECT agent_id, name, project, default_harness, role, tier, owner, \
-                             created_at, updated_at FROM agents WHERE agent_id = ?1 LIMIT 1",
-                            params![agent_id],
-                        )
-                        .await
-                    {
-                        Ok(mut rows) => match rows.next().await {
-                            Ok(Some(row)) => serde_json::json!({
-                                "agentId": row.get::<String>(0).ok(),
-                                "name": row.get::<Option<String>>(1).ok().flatten(),
-                                "project": row.get::<String>(2).ok(),
-                                "defaultHarness": row.get::<Option<String>>(3).ok().flatten(),
-                                "role": row.get::<Option<String>>(4).ok().flatten(),
-                                "tier": row.get::<Option<String>>(5).ok().flatten(),
-                                "owner": row.get::<Option<String>>(6).ok().flatten(),
-                                "createdAt": row.get::<i64>(7).ok(),
-                                "updatedAt": row.get::<i64>(8).ok(),
-                            }),
-                            _ => serde_json::json!({
-                                "agentId": agent_id,
-                                "name": name,
-                            }),
-                        },
-                        Err(_) => serde_json::json!({
-                            "agentId": agent_id,
-                            "name": name,
-                        }),
-                    };
-                    effects.push(lifecycle_effect(
-                        "identity",
-                        nexus_contracts::GatewayProjectionKind::IdentityUpserted,
-                        payload,
-                    ));
+                let session = match Sessions::new(store).find_by_session_id(session_id).await {
+                    Ok(Some(row)) if row.kind == "agent" => row,
+                    Ok(Some(_)) | Ok(None) => return Vec::new(),
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "nexus::gateway_projection",
+                            session_id = %session_id,
+                            %error,
+                            "failed to load lifecycle projection session kind"
+                        );
+                        return Vec::new();
+                    }
+                };
+                let Some(agent_id) = agent_id.as_deref() else {
+                    return Vec::new();
+                };
+                if session.agent_id.as_deref() != Some(agent_id) {
+                    return Vec::new();
                 }
-                let runtime_payload = match store
-                    .conn
-                    .query(
-                        "SELECT runtime_id, agent_id, harness, cwd, transport, presence, active, \
-                         started_at, stopped_at, native_thread_id FROM agent_runtimes \
-                         WHERE runtime_id = ?1 LIMIT 1",
-                        params![session_id.0.clone()],
-                    )
+                let agent = match Agents::new(store).find_by_id(agent_id).await {
+                    Ok(Some(row)) => row,
+                    Ok(None) => return Vec::new(),
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "nexus::gateway_projection",
+                            agent_id,
+                            %error,
+                            "failed to load identity projection payload"
+                        );
+                        return Vec::new();
+                    }
+                };
+                let access_grants =
+                    match AgentAccessGrants::new(store).list_for_agent(agent_id).await {
+                        Ok(rows) => rows
+                            .into_iter()
+                            .map(|row| {
+                                serde_json::json!({
+                                    "principalProject": row.principal_project,
+                                    "principalName": row.principal_name,
+                                    "principalSessionId": row.principal_session_id,
+                                    "principalAgentId": row.principal_agent_id,
+                                    "role": row.role,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "nexus::gateway_projection",
+                                agent_id,
+                                %error,
+                                "failed to load identity access grants"
+                            );
+                            return Vec::new();
+                        }
+                    };
+                // Native resurrection metadata enriches the descriptor when available, but it is
+                // not part of the canonical agent/runtime ownership proof (compatibility stores
+                // predating split authority may not expose this table at all).
+                let capsule = IdentitySessions::new(store)
+                    .find(&session_id.0)
+                    .await
+                    .ok()
+                    .flatten();
+                let runtime = match AgentRuntimes::new(store)
+                    .find_by_runtime_id(&session_id.0)
                     .await
                 {
-                    Ok(mut rows) => match rows.next().await {
-                        Ok(Some(row)) => serde_json::json!({
-                            "runtimeId": row.get::<String>(0).ok(),
-                            "agentId": row.get::<String>(1).ok(),
-                            "harness": row.get::<String>(2).ok(),
-                            "cwd": row.get::<Option<String>>(3).ok().flatten(),
-                            "transport": row.get::<Option<String>>(4).ok().flatten(),
-                            "presence": row.get::<Option<String>>(5).ok().flatten(),
-                            "active": row.get::<i64>(6).ok().map(|v| v != 0),
-                            "startedAt": row.get::<i64>(7).ok(),
-                            "stoppedAt": row.get::<Option<i64>>(8).ok().flatten(),
-                            "nativeResumeKey": row.get::<Option<String>>(9).ok().flatten(),
-                            "name": name,
-                        }),
-                        _ => serde_json::json!({
-                            "runtimeId": session_id.0,
-                            "agentId": agent_id,
-                            "name": name,
-                        }),
-                    },
-                    Err(_) => serde_json::json!({
-                        "runtimeId": session_id.0,
-                        "agentId": agent_id,
-                        "name": name,
-                    }),
+                    Ok(Some(row)) if row.agent_id == agent_id => row,
+                    Ok(Some(_)) | Ok(None) => return Vec::new(),
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "nexus::gateway_projection",
+                            runtime_id = %session_id,
+                            %error,
+                            "failed to load runtime projection payload"
+                        );
+                        return Vec::new();
+                    }
                 };
-                effects.push(lifecycle_effect(
-                    "runtime",
-                    nexus_contracts::GatewayProjectionKind::RuntimeUpserted,
-                    runtime_payload,
-                ));
-                effects
+                let canonical_name = agent.name.clone();
+                let identity_payload = serde_json::json!({
+                    "agentId": agent.agent_id,
+                    "name": canonical_name,
+                    "kind": session.kind,
+                    "project": agent.project,
+                    "defaultHarness": agent.default_harness,
+                    "role": agent.role,
+                    "tier": agent.tier,
+                    "owner": agent.owner_name,
+                    "ownerProject": agent.owner_project,
+                    "ownerSessionId": agent.owner_session_id,
+                    "ownerAgentId": agent.owner_agent_id,
+                    "accessGrants": access_grants,
+                    "disabledAt": agent.disabled_at,
+                    "createdAt": agent.created_at,
+                });
+                let runtime_payload = serde_json::json!({
+                    "runtimeId": runtime.runtime_id,
+                    "sessionId": session_id.0,
+                    "agentId": runtime.agent_id,
+                    "kind": session.kind,
+                    "harness": runtime.harness,
+                    "mode": capsule.as_ref().map(|row| row.mode.as_str()),
+                    "backend": capsule.as_ref().and_then(|row| row.backend.as_deref()),
+                    "cwd": runtime.cwd,
+                    "transport": runtime.transport,
+                    "presence": runtime.presence,
+                    "active": runtime.active,
+                    "startedAt": runtime.started_at,
+                    "stoppedAt": runtime.stopped_at,
+                    "nativeResumeKey": capsule
+                        .as_ref()
+                        .and_then(|row| row.native_resume_key.as_deref()),
+                    "name": canonical_name,
+                });
+                vec![
+                    lifecycle_effect(
+                        "identity",
+                        nexus_contracts::GatewayProjectionKind::IdentityUpserted,
+                        identity_payload,
+                    ),
+                    lifecycle_effect(
+                        "runtime",
+                        nexus_contracts::GatewayProjectionKind::RuntimeUpserted,
+                        runtime_payload,
+                    ),
+                ]
             }
             WsEvent::AgentStatus {
                 session_id,
                 presence,
                 paused,
-            } => vec![lifecycle_effect(
-                "presence",
-                nexus_contracts::GatewayProjectionKind::PresenceChanged,
-                serde_json::json!({
-                    "runtimeId": session_id.0,
-                    "presence": presence,
-                    "paused": paused,
-                }),
-            )],
+            } => {
+                let session = match Sessions::new(store).find_by_session_id(session_id).await {
+                    Ok(Some(row)) if row.kind == "agent" && row.agent_id.is_some() => row,
+                    Ok(Some(_)) | Ok(None) | Err(_) => return Vec::new(),
+                };
+                let runtime = match AgentRuntimes::new(store)
+                    .find_by_runtime_id(&session_id.0)
+                    .await
+                {
+                    Ok(Some(row)) if Some(row.agent_id.as_str()) == session.agent_id.as_deref() => {
+                        row
+                    }
+                    Ok(Some(_)) | Ok(None) | Err(_) => return Vec::new(),
+                };
+                vec![lifecycle_effect(
+                    "presence",
+                    nexus_contracts::GatewayProjectionKind::PresenceChanged,
+                    serde_json::json!({
+                        "runtimeId": runtime.runtime_id,
+                        "presence": presence,
+                        "paused": paused,
+                    }),
+                )]
+            }
             WsEvent::AgentRemoved { session_id, name } => vec![lifecycle_effect(
                 "runtime",
                 nexus_contracts::GatewayProjectionKind::RuntimeStopped,
@@ -279,7 +340,9 @@ fn lifecycle_effect(
     let canonical = serde_json::to_vec(&payload).unwrap_or_default();
     let digest = Sha256::digest(canonical);
     GatewayProjectionEffect {
-        event_id: format!("{prefix}:{digest:x}"),
+        // Repeating a previously-seen state is still a new committed lifecycle fact. A payload
+        // digest alone would suppress transitions such as grant -> revoke back to an empty ACL.
+        event_id: format!("{prefix}:{}:{digest:x}", Uuid::new_v4().simple()),
         occurred_at: nexus_common::now(),
         kind,
         payload,
@@ -373,18 +436,27 @@ impl EventSink for WsSink {
                 });
             }
         }
+        let lifecycle_projection_effects = self.lifecycle_projection_effects(&event).await;
+        let lifecycle_projection_ready = !matches!(
+            event,
+            WsEvent::AgentSpawned { .. }
+                | WsEvent::AgentStatus { .. }
+                | WsEvent::AgentRemoved { .. }
+        ) || !lifecycle_projection_effects.is_empty();
         // FLEET STATUS → GATEWAY PUSH: presence/spawn/remove changes also ride the ephemeral
         // `sys.fleet.status` push topic so the web console gets realtime agent status without
         // polling (frontend spec §3.4 — WS-driven presence). In-memory only; the durable
         // `sys.agent.lifecycle` rows remain the record.
-        if let Some(gateway_stream) = &self.gateway_stream {
-            if let Some(observation) = self.fleet_status_observation(&event).await {
-                gateway_stream.publish_fleet_status(observation);
+        if lifecycle_projection_ready {
+            if let Some(gateway_stream) = &self.gateway_stream {
+                if let Some(observation) = self.fleet_status_observation(&event).await {
+                    gateway_stream.publish_fleet_status(observation);
+                }
             }
         }
         // Keep the established fleet-status frame first for existing realtime consumers, then
         // append the durable Gateway projection derived from the same committed lifecycle fact.
-        for effect in self.lifecycle_projection_effects(&event).await {
+        for effect in lifecycle_projection_effects {
             self.project(effect).await;
         }
         // Broadcast is best-effort: a send with zero live receivers is not an error.

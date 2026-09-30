@@ -234,6 +234,7 @@ fn dm_request() -> SendRequest {
         summary: Some("hello".into()),
         body: "hi".into(),
         mention: vec![],
+        metadata: None,
         idempotency_key: None,
     }
 }
@@ -290,6 +291,7 @@ async fn listen_ack_activity_keeps_consumer_heartbeat_fresh() {
                 summary: Some("listen heartbeat proof".to_string()),
                 body: "hello from listen-sender".to_string(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -392,6 +394,7 @@ async fn durable_listen_subscription_replays_pending_batch_until_subscription_ac
                 summary: Some("durable subscription replay".to_string()),
                 body: "hello durable listen".to_string(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -531,6 +534,7 @@ async fn durable_subscription_ack_does_not_resurrect_a_terminal_delivery() {
                 summary: None,
                 body: "terminal pull delivery".to_string(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -848,6 +852,7 @@ async fn inbox_consume_reissues_after_daemon_boot_epoch_changes() {
                 summary: None,
                 body: "restart-safe delivery".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -1120,6 +1125,70 @@ async fn ambient_store_client_follows_registered_client_key_after_rename() {
     assert_eq!(row.caller_kind.as_deref(), Some("agent"));
     assert_eq!(row.caller_tier.as_deref(), Some("agent"));
     assert_eq!(row.caller_session_id, None);
+
+    CommandIntents::new(&store)
+        .mark_error(
+            &row.command_id,
+            &serde_json::to_string(&ContractError {
+                code: codes::INTERNAL_ERROR,
+                message: "stop test".into(),
+            })
+            .unwrap(),
+            2,
+        )
+        .await
+        .unwrap();
+    let _ = pending.await.unwrap();
+}
+
+#[tokio::test]
+async fn ambient_store_client_follows_registered_client_key_across_project_metadata() {
+    let store = migrated_store().await;
+    Sessions::new(&store)
+        .create(NewSession {
+            session_id: nexus_contracts::SessionId("s_cross_project_key".into()),
+            name: Some("canonical-cross-project".into()),
+            agent: Some("claude".into()),
+            kind: "agent".into(),
+            role: None,
+            tier: "agent".into(),
+            harness_session_id: Some("hs_cross_project".into()),
+            client_key: Some("ck_cross_project".into()),
+            cwd: None,
+            project: "actual-project".into(),
+            transport: Some("pty".into()),
+        })
+        .await
+        .unwrap();
+
+    let client = StoreClient::from_store_with_identity_for_tests_resolving(
+        store.clone(),
+        RegisterRequest {
+            agent_id: None,
+            name: Some("stale-name".into()),
+            harness: hid("claude"),
+            harness_session_id: "stale-harness".into(),
+            project: "stale-project-metadata".into(),
+            client_key: "ck_cross_project".into(),
+            runtime_credential: None,
+            tier: Tier::Agent,
+            kind: Some(Kind::Agent),
+            role: None,
+            cwd: None,
+        },
+    )
+    .await
+    .unwrap()
+    .with_timeout(Duration::from_secs(2));
+
+    let pending = tokio::spawn({
+        let client = client.clone();
+        async move { client.message_post_send(&dm_request()).await }
+    });
+    let row = first_command(&store).await;
+    assert_eq!(row.caller_name, "canonical-cross-project");
+    assert_eq!(row.project, "actual-project");
+    assert_eq!(row.caller_client_key.as_deref(), Some("ck_cross_project"));
 
     CommandIntents::new(&store)
         .mark_error(

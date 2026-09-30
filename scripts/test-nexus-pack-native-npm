@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+VERSION=$(tr -d '\n' < "$ROOT/VERSION")
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+make_base_tools() {
+  local destination=$1
+  local tool source
+  mkdir -p "$destination"
+  for tool in bash sh dirname node tr mktemp rm cp chmod sha256sum cut grep mkdir; do
+    source=$(command -v "$tool")
+    ln -s "$source" "$destination/$tool"
+  done
+}
+
+write_uname() {
+  local destination=$1
+  local kernel=$2
+  cat >"$destination/uname" <<SH
+#!/usr/bin/env sh
+if [ "\${1:-}" = "-s" ]; then
+  printf '%s\n' '$kernel'
+elif [ "\${1:-}" = "-m" ]; then
+  printf '%s\n' 'x86_64'
+else
+  printf '%s\n' '$kernel'
+fi
+SH
+  chmod +x "$destination/uname"
+}
+
+write_sanitizing_tools() {
+  local destination=$1
+  local prefix=$2
+  local strip_name=$3
+  local nm_name=$4
+  cat >"$destination/$strip_name" <<SH
+#!/usr/bin/env sh
+printf '%s %s\n' '$prefix-strip' "\$*" >>"\$NEXUS_TEST_TOOL_LOG"
+for candidate do staged=\$candidate; done
+printf '%s\n' 'MACHO-SANITIZED' >"\$staged"
+SH
+  cat >"$destination/$nm_name" <<SH
+#!/usr/bin/env sh
+printf '%s %s\n' '$prefix-nm' "\$*" >>"\$NEXUS_TEST_TOOL_LOG"
+for candidate do staged=\$candidate; done
+if grep -aFq 'RUST_SYMBOL' "\$staged"; then
+  printf '%s\n' '0000000100001000 T __ZN5nexus4main17h0123456789abcdefE'
+fi
+SH
+  chmod +x "$destination/$strip_name" "$destination/$nm_name"
+}
+
+write_failing_tool() {
+  local destination=$1
+  local name=$2
+  local status=$3
+  cat >"$destination/$name" <<SH
+#!/usr/bin/env sh
+printf '%s %s\n' '$name' "\$*" >>"\$NEXUS_TEST_TOOL_LOG"
+exit $status
+SH
+  chmod +x "$destination/$name"
+}
+
+write_selective_grep_failure() {
+  local destination=$1
+  local real_grep
+  real_grep=$(command -v grep)
+  rm "$destination/grep"
+  cat >"$destination/grep" <<SH
+#!/usr/bin/env sh
+if [ "\${NEXUS_TEST_GREP_FAILURE:-}" = rust-symbols ] \
+  && [ "\$#" -eq 2 ] && [ "\${1:-}" = -Eq ]; then
+  exit 2
+fi
+if [ "\${NEXUS_TEST_GREP_FAILURE:-}" = private-bytes ] \
+  && [ "\$#" -eq 3 ] && [ "\${1:-}" = -aEq ]; then
+  exit 2
+fi
+exec "$real_grep" "\$@"
+SH
+  chmod +x "$destination/grep"
+}
+
+pack_with_evidence() {
+  local tools=$1
+  local target=$2
+  local binary=$3
+  local output=$4
+  local digest
+  digest=$(sha256sum -- "$binary" | cut -d' ' -f1)
+  PATH="$tools" NEXUS_TEST_TOOL_LOG="$TMP/tool.log" \
+    "$ROOT/scripts/nexus-pack-native-npm" \
+      --target "$target" \
+      --binary "$binary" \
+      --output "$output" \
+      --version-output "nexus ${VERSION}" \
+      --expected-sha256 "$digest"
+}
+
+printf '%s\n' \
+  'MACHO-RUST_SYMBOL /Users/private-builder/Projects/egregore-nexus' \
+  >"$TMP/darwin-x64"
+cp "$TMP/darwin-x64" "$TMP/darwin-x64.original"
+make_base_tools "$TMP/apple-tools"
+write_uname "$TMP/apple-tools" Darwin
+mkdir -p "$TMP/apple-xcode"
+write_sanitizing_tools "$TMP/apple-xcode" apple strip nm
+cat >"$TMP/apple-tools/xcrun" <<'SH'
+#!/usr/bin/env sh
+if [ "${1:-}" != "--find" ]; then exit 94; fi
+case "${2:-}" in
+  strip|nm) printf '%s/%s\n' "$NEXUS_TEST_APPLE_TOOLS" "$2" ;;
+  *) exit 95 ;;
+esac
+SH
+cat >"$TMP/apple-tools/llvm-strip" <<'SH'
+#!/usr/bin/env sh
+echo 'llvm-strip must not win on a Darwin host' >&2
+exit 91
+SH
+cat >"$TMP/apple-tools/llvm-nm" <<'SH'
+#!/usr/bin/env sh
+echo 'llvm-nm must not win on a Darwin host' >&2
+exit 92
+SH
+chmod +x "$TMP/apple-tools/xcrun" \
+  "$TMP/apple-tools/llvm-strip" "$TMP/apple-tools/llvm-nm"
+: >"$TMP/tool.log"
+APPLE_STAGED=$(NEXUS_TEST_APPLE_TOOLS="$TMP/apple-xcode" pack_with_evidence \
+  "$TMP/apple-tools" darwin-x64 "$TMP/darwin-x64" "$TMP/apple-pack")
+cmp "$TMP/darwin-x64" "$TMP/darwin-x64.original"
+test "$(cat "$APPLE_STAGED")" = 'MACHO-SANITIZED'
+grep -Fq 'apple-strip -u -r' "$TMP/tool.log"
+grep -Fq 'apple-nm -a' "$TMP/tool.log"
+if grep -Fq 'llvm-' "$TMP/tool.log"; then
+  echo "Darwin host must prefer the Apple Mach-O tools" >&2
+  exit 1
+fi
+
+printf '%s\n' \
+  'MACHO-RUST_SYMBOL /Users/private-builder/Projects/egregore-nexus' \
+  >"$TMP/darwin-arm64"
+cp "$TMP/darwin-arm64" "$TMP/darwin-arm64.original"
+make_base_tools "$TMP/llvm-tools"
+write_uname "$TMP/llvm-tools" Linux
+write_sanitizing_tools "$TMP/llvm-tools" llvm llvm-strip llvm-nm
+for tool in strip nm; do
+  cat >"$TMP/llvm-tools/$tool" <<'SH'
+#!/usr/bin/env sh
+echo 'host strip/nm must not inspect a cross-host Mach-O artifact' >&2
+exit 93
+SH
+  chmod +x "$TMP/llvm-tools/$tool"
+done
+: >"$TMP/tool.log"
+LLVM_STAGED=$(pack_with_evidence \
+  "$TMP/llvm-tools" darwin-arm64 "$TMP/darwin-arm64" "$TMP/llvm-pack")
+cmp "$TMP/darwin-arm64" "$TMP/darwin-arm64.original"
+test "$(cat "$LLVM_STAGED")" = 'MACHO-SANITIZED'
+grep -Fq 'llvm-strip --strip-all' "$TMP/tool.log"
+grep -Fq 'llvm-nm -a' "$TMP/tool.log"
+
+# `xcrun` is authoritative only when it exits successfully. Some wrappers
+# print a candidate path before failing; that output must not select Apple
+# tools over a complete LLVM pair.
+make_base_tools "$TMP/xcrun-nonzero-tools"
+write_uname "$TMP/xcrun-nonzero-tools" Darwin
+mkdir -p "$TMP/xcrun-nonzero-apple"
+write_sanitizing_tools "$TMP/xcrun-nonzero-apple" rejected strip nm
+write_sanitizing_tools "$TMP/xcrun-nonzero-tools" llvm llvm-strip llvm-nm
+cat >"$TMP/xcrun-nonzero-tools/xcrun" <<'SH'
+#!/usr/bin/env sh
+printf '%s/%s\n' "$NEXUS_TEST_APPLE_TOOLS" "${2:-missing}"
+[ "${2:-}" != "$NEXUS_TEST_XCRUN_FAILURE" ] || exit 96
+SH
+chmod +x "$TMP/xcrun-nonzero-tools/xcrun"
+for xcrun_failure in strip nm; do
+  : >"$TMP/tool.log"
+  XCRUN_NONZERO_STAGED=$( \
+    NEXUS_TEST_APPLE_TOOLS="$TMP/xcrun-nonzero-apple" \
+    NEXUS_TEST_XCRUN_FAILURE="$xcrun_failure" \
+    pack_with_evidence "$TMP/xcrun-nonzero-tools" darwin-x64 \
+      "$TMP/darwin-x64" "$TMP/xcrun-${xcrun_failure}-nonzero-pack"
+  )
+  test "$(cat "$XCRUN_NONZERO_STAGED")" = 'MACHO-SANITIZED'
+  grep -Fq 'llvm-strip --strip-all' "$TMP/tool.log"
+  grep -Fq 'llvm-nm -a' "$TMP/tool.log"
+  if grep -Fq 'rejected-' "$TMP/tool.log"; then
+    echo "failed xcrun $xcrun_failure discovery must not select its printed Apple tool path" >&2
+    exit 1
+  fi
+done
+
+# A selected stripping or inspection tool failing is fatal for both Apple and
+# LLVM paths, and must never publish a destination binary.
+for apple_failure in strip nm; do
+  tools="$TMP/apple-${apple_failure}-failure-tools"
+  xcode="$TMP/apple-${apple_failure}-failure-xcode"
+  make_base_tools "$tools"
+  write_uname "$tools" Darwin
+  mkdir -p "$xcode"
+  write_sanitizing_tools "$xcode" apple strip nm
+  write_failing_tool "$xcode" "$apple_failure" 71
+  cp "$TMP/apple-tools/xcrun" "$tools/xcrun"
+  chmod +x "$tools/xcrun"
+  : >"$TMP/tool.log"
+  if NEXUS_TEST_APPLE_TOOLS="$xcode" pack_with_evidence \
+    "$tools" darwin-x64 "$TMP/darwin-x64" \
+    "$TMP/apple-${apple_failure}-failure-pack" \
+    >"$TMP/apple-${apple_failure}-failure.out" \
+    2>"$TMP/apple-${apple_failure}-failure.err"; then
+    echo "Apple $apple_failure failure must abort Darwin packaging" >&2
+    exit 1
+  fi
+  grep -Fq "failed to ${apple_failure/strip/strip the staged}" \
+    "$TMP/apple-${apple_failure}-failure.err" || {
+      if [ "$apple_failure" = nm ]; then
+        grep -Fq 'failed to inspect the stripped Mach-O binary' \
+          "$TMP/apple-${apple_failure}-failure.err"
+      else
+        exit 1
+      fi
+    }
+  test ! -e "$TMP/apple-${apple_failure}-failure-pack/native/darwin-x64/nexus"
+done
+
+for llvm_failure in llvm-strip llvm-nm; do
+  tools="$TMP/${llvm_failure}-failure-tools"
+  make_base_tools "$tools"
+  write_uname "$tools" Linux
+  write_sanitizing_tools "$tools" llvm llvm-strip llvm-nm
+  write_failing_tool "$tools" "$llvm_failure" 72
+  : >"$TMP/tool.log"
+  if pack_with_evidence "$tools" darwin-arm64 "$TMP/darwin-arm64" \
+    "$TMP/${llvm_failure}-failure-pack" \
+    >"$TMP/${llvm_failure}-failure.out" \
+    2>"$TMP/${llvm_failure}-failure.err"; then
+    echo "$llvm_failure failure must abort Darwin packaging" >&2
+    exit 1
+  fi
+  if [ "$llvm_failure" = llvm-strip ]; then
+    grep -Fq 'failed to strip the staged Mach-O binary' \
+      "$TMP/${llvm_failure}-failure.err"
+  else
+    grep -Fq 'failed to inspect the stripped Mach-O binary' \
+      "$TMP/${llvm_failure}-failure.err"
+  fi
+  test ! -e "$TMP/${llvm_failure}-failure-pack/native/darwin-arm64/nexus"
+done
+
+# Inspection failures are not equivalent to a clean scan. grep(1) status 2 on
+# either the symbol output or the staged bytes must abort without publication.
+make_base_tools "$TMP/grep-failure-tools"
+write_uname "$TMP/grep-failure-tools" Linux
+write_sanitizing_tools "$TMP/grep-failure-tools" llvm llvm-strip llvm-nm
+write_selective_grep_failure "$TMP/grep-failure-tools"
+for grep_failure in rust-symbols private-bytes; do
+  : >"$TMP/tool.log"
+  if NEXUS_TEST_GREP_FAILURE="$grep_failure" pack_with_evidence \
+    "$TMP/grep-failure-tools" darwin-arm64 "$TMP/darwin-arm64" \
+    "$TMP/${grep_failure}-failure-pack" \
+    >"$TMP/${grep_failure}-failure.out" \
+    2>"$TMP/${grep_failure}-failure.err"; then
+    echo "$grep_failure inspection failure must abort Darwin packaging" >&2
+    exit 1
+  fi
+  grep -Fq 'native npm binary inspection failed' \
+    "$TMP/${grep_failure}-failure.err"
+  test ! -e "$TMP/${grep_failure}-failure-pack/native/darwin-arm64/nexus"
+done
+
+make_base_tools "$TMP/missing-tools"
+write_uname "$TMP/missing-tools" Linux
+if pack_with_evidence \
+  "$TMP/missing-tools" darwin-arm64 "$TMP/darwin-arm64" "$TMP/missing-pack" \
+  >"$TMP/missing.out" 2>"$TMP/missing.err"; then
+  echo "Darwin packaging must fail without a compatible strip/inspection pair" >&2
+  exit 1
+fi
+grep -Fq 'Darwin native npm packaging requires either Apple strip/nm on macOS or llvm-strip/llvm-nm' \
+  "$TMP/missing.err"
+test ! -e "$TMP/missing-pack/native/darwin-arm64/nexus"
+
+make_base_tools "$TMP/leaky-tools"
+write_uname "$TMP/leaky-tools" Linux
+cat >"$TMP/leaky-tools/llvm-strip" <<'SH'
+#!/usr/bin/env sh
+exit 0
+SH
+cat >"$TMP/leaky-tools/llvm-nm" <<'SH'
+#!/usr/bin/env sh
+printf '%s\n' '0000000100001000 T _rust_eh_personality'
+SH
+chmod +x "$TMP/leaky-tools/llvm-strip" "$TMP/leaky-tools/llvm-nm"
+if pack_with_evidence \
+  "$TMP/leaky-tools" darwin-arm64 "$TMP/darwin-arm64" "$TMP/leaky-pack" \
+  >"$TMP/leaky.out" 2>"$TMP/leaky.err"; then
+  echo "Darwin packaging must reject retained Rust symbol names" >&2
+  exit 1
+fi
+grep -Fq 'native npm Mach-O binary retains Rust symbol names after stripping' \
+  "$TMP/leaky.err"
+test ! -e "$TMP/leaky-pack/native/darwin-arm64/nexus"
+
+printf '%s\n' 'MZwindows-fixture' >"$TMP/nexus.exe"
+WINDOWS_STAGED=$(pack_with_evidence \
+  "$TMP/missing-tools" win32-x64-msvc "$TMP/nexus.exe" "$TMP/windows-pack")
+cmp "$TMP/nexus.exe" "$WINDOWS_STAGED"
+
+# Version evidence is a single exact line. Suffixes and additional lines are
+# rejected even when the binary digest itself is correct.
+WINDOWS_SHA256=$(sha256sum -- "$TMP/nexus.exe" | cut -d' ' -f1)
+for version_case in suffix multiline; do
+  case "$version_case" in
+    suffix) bad_version="nexus ${VERSION} (revision fixture)" ;;
+    multiline) bad_version=$(printf 'nexus %s\nextra' "$VERSION") ;;
+  esac
+  if PATH="$TMP/missing-tools" "$ROOT/scripts/nexus-pack-native-npm" \
+    --target win32-x64-msvc \
+    --binary "$TMP/nexus.exe" \
+    --output "$TMP/version-${version_case}-pack" \
+    --version-output "$bad_version" \
+    --expected-sha256 "$WINDOWS_SHA256" \
+    >"$TMP/version-${version_case}.out" \
+    2>"$TMP/version-${version_case}.err"; then
+    echo "$version_case native version evidence must be rejected" >&2
+    exit 1
+  fi
+  grep -Fq "native binary does not report nexus ${VERSION} exactly" \
+    "$TMP/version-${version_case}.err"
+  test ! -e "$TMP/version-${version_case}-pack/native/win32-x64-msvc/nexus.exe"
+done
+
+# The focused failure-contract suite is a required native artifact CI gate.
+grep -Fq 'scripts/test-nexus-pack-native-npm' \
+  "$ROOT/.github/workflows/npm-native-artifacts.yml"
+
+echo "native npm Mach-O packaging fixtures: PASS"

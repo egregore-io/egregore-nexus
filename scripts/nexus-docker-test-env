@@ -4,10 +4,10 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=$(cd "$SCRIPT_DIR/.." && pwd)
 IMAGE="${NEXUS_DOCKER_TEST_IMAGE:-egregore-nexus-test:local}"
-NAME="${NEXUS_DOCKER_TEST_NAME:-nexus-test}"
-HOST_PORT="${NEXUS_DOCKER_TEST_PORT:-4510}"
-CPUS="${NEXUS_DOCKER_TEST_CPUS:-2}"
-MEMORY="${NEXUS_DOCKER_TEST_MEMORY:-10g}"
+NAME="${NEXUS_DOCKER_TEST_NAME:-nexus-v010-load51}"
+HOST_PORT="${NEXUS_DOCKER_TEST_PORT:-4551}"
+CPUS="${NEXUS_DOCKER_TEST_CPUS:-6}"
+MEMORY="${NEXUS_DOCKER_TEST_MEMORY:-8g}"
 PIDS_LIMIT="${NEXUS_DOCKER_TEST_PIDS_LIMIT:-1024}"
 CLAUDE_MODEL="${NEXUS_DOCKER_TEST_CLAUDE_MODEL:-claude-sonnet-5}"
 HOST_UID=$(id -u)
@@ -34,11 +34,11 @@ Commands:
   clean          Remove stopped nexus-test containers.
 
 Environment:
-  NEXUS_DOCKER_TEST_NAME       Container name, default: nexus-test
-  NEXUS_DOCKER_TEST_PORT       Host gateway port, default: 4510
+  NEXUS_DOCKER_TEST_NAME       Container name, default: nexus-v010-load51
+  NEXUS_DOCKER_TEST_PORT       Host gateway port, default: 4551
   NEXUS_DOCKER_TEST_IMAGE      Image tag, default: egregore-nexus-test:local
-  NEXUS_DOCKER_TEST_CPUS       CPU quota for builds and gates, default: 2
-  NEXUS_DOCKER_TEST_MEMORY     Memory and memory+swap limit, default: 10g
+  NEXUS_DOCKER_TEST_CPUS       CPU quota for builds and gates, default: 6
+  NEXUS_DOCKER_TEST_MEMORY     Memory and memory+swap limit, default: 8g
   NEXUS_DOCKER_TEST_PIDS_LIMIT Process limit, default: 1024
   NEXUS_DOCKER_TEST_CLAUDE_MODEL Exact Claude model, default: claude-sonnet-5
 The container uses isolated /tmp Nexus state and never mounts ~/.nexus.
@@ -57,78 +57,162 @@ dockerfile() {
   printf '%s\n' "$REPO/tools/docker/nexus-test.Dockerfile"
 }
 
+CONTAINER_PRESENT=0
+CONTAINER_ID=""
+CONTAINER_RUNNING=false
+CONTAINER_KIND=""
+ACTIVE_CONTAINER_ID=""
+LOOKUP_CONTAINER_ID=""
+
+lookup_named_container_id() {
+  local output ids=()
+  LOOKUP_CONTAINER_ID=""
+  if ! output=$(docker ps -a --no-trunc \
+    --filter "name=^/${NAME}$" --format '{{.ID}}'); then
+    die "Docker container listing failed for $NAME"
+  fi
+  while IFS= read -r id; do
+    [ -n "$id" ] && ids+=("$id")
+  done <<<"$output"
+  [ "${#ids[@]}" -le 1 ] || die "Docker returned multiple containers for exact name $NAME"
+  if [ "${#ids[@]}" -eq 0 ]; then
+    return 1
+  fi
+  LOOKUP_CONTAINER_ID=${ids[0]}
+  return 0
+}
+
+inspect_container_identity() {
+  local id=$1 metadata observed_id test_label lens_label
+  if ! metadata=$(docker container inspect -f \
+    '{{.Id}} {{.State.Running}} {{if eq (index .Config.Labels "egregore-nexus-test") "true"}}true{{else}}false{{end}} {{if eq (index .Config.Labels "egregore-nexus-lens-lab") "true"}}true{{else}}false{{end}}' \
+    "$id"); then
+    die "Docker container inspect failed for immutable ID $id"
+  fi
+  read -r observed_id CONTAINER_RUNNING test_label lens_label extra <<<"$metadata"
+  [ -z "${extra:-}" ] && [ "$observed_id" = "$id" ] \
+    || die "Docker inspect identity mismatch for $id: ${metadata:-missing}"
+  # Legacy integration containers are not owned by this standalone helper.
+  case "$test_label:$lens_label" in
+    true:true) CONTAINER_KIND=lens ;;
+    true:false) CONTAINER_KIND=normal ;;
+    *) CONTAINER_KIND=foreign ;;
+  esac
+}
+
+refresh_named_container() {
+  local id
+  CONTAINER_PRESENT=0
+  CONTAINER_ID=""
+  CONTAINER_RUNNING=false
+  CONTAINER_KIND=""
+  ACTIVE_CONTAINER_ID=""
+  if ! lookup_named_container_id; then
+    return 1
+  fi
+  id=$LOOKUP_CONTAINER_ID
+  inspect_container_identity "$id"
+  CONTAINER_PRESENT=1
+  CONTAINER_ID=$id
+  ACTIVE_CONTAINER_ID=$id
+  return 0
+}
+
 container_exists() {
-  docker container inspect "$NAME" >/dev/null 2>&1
+  refresh_named_container
 }
 
 container_running() {
-  [ "$(docker container inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null || true)" = "true" ]
+  refresh_named_container && [ "$CONTAINER_RUNNING" = true ]
+}
+
+require_container_kind() {
+  local expected=$1
+  [ "$CONTAINER_PRESENT" -eq 1 ] || die "container $NAME does not exist"
+  [ "$CONTAINER_KIND" = "$expected" ] \
+    || die "container $NAME has ownership kind ${CONTAINER_KIND:-unknown}; expected $expected"
+}
+
+require_named_container_id() {
+  local expected=$1
+  refresh_named_container || die "container $NAME disappeared; expected immutable ID $expected"
+  [ "$CONTAINER_ID" = "$expected" ] \
+    || die "container ID changed for $NAME: expected $expected, observed $CONTAINER_ID"
+}
+
+inspect_current_format() {
+  local format=$1 output
+  [ "$CONTAINER_PRESENT" -eq 1 ] || die "container $NAME does not exist"
+  if ! output=$(docker container inspect -f "$format" "$CONTAINER_ID"); then
+    die "Docker container inspect failed for immutable ID $CONTAINER_ID"
+  fi
+  printf '%s\n' "$output"
 }
 
 container_real_harnesses() {
-  [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-real-harnesses" }}' "$NAME" 2>/dev/null || true)" = "true" ]
+  [ "$(inspect_current_format '{{ index .Config.Labels "egregore-nexus-real-harnesses" }}')" = "true" ]
 }
 
 container_uses_tmpfs_stream_db() {
-  docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+  inspect_current_format '{{range .Config.Env}}{{println .}}{{end}}' \
     | grep -qx 'NEXUS_STREAM_DB_PATH=/dev/shm/nexus-stream.db'
 }
 
 container_uses_internal_gateway_port() {
-  docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+  inspect_current_format '{{range .Config.Env}}{{println .}}{{end}}' \
     | grep -qx "NEXUS_GATEWAY_PORT=$GATEWAY_INTERNAL_PORT"
 }
 
 container_uses_in_tree_gateway() {
-  docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+  inspect_current_format '{{range .Config.Env}}{{println .}}{{end}}' \
     | grep -qx 'NEXUS_GATEWAY_BIN=/work/egregore-nexus/gateway/scripts/nexus-gateway.mjs'
 }
 
 container_uses_split_stores() {
-  docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+  inspect_current_format '{{range .Config.Env}}{{println .}}{{end}}' \
     | grep -qx 'NEXUS_DB_PATH=/tmp/nexus-home/nexus.db' \
-    && docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+    && inspect_current_format '{{range .Config.Env}}{{println .}}{{end}}' \
       | grep -qx 'NEXUS_GATEWAY_DB=file:/tmp/nexus-home/gateway.db' \
-    && ! docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+    && ! inspect_current_format '{{range .Config.Env}}{{println .}}{{end}}' \
       | grep -q '^NEXUS_DB_URL='
 }
 
 container_uses_debug_stack() {
-  docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+  inspect_current_format '{{range .Config.Env}}{{println .}}{{end}}' \
     | grep -qx 'RUST_MIN_STACK=33554432'
 }
 
 container_uses_resource_limits() {
-  [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-test-cpus" }}' "$NAME" 2>/dev/null || true)" = "$CPUS" ] \
-    && [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-test-memory" }}' "$NAME" 2>/dev/null || true)" = "$MEMORY" ] \
-    && [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-test-pids-limit" }}' "$NAME" 2>/dev/null || true)" = "$PIDS_LIMIT" ]
+  [ "$(inspect_current_format '{{ index .Config.Labels "egregore-nexus-test-cpus" }}')" = "$CPUS" ] \
+    && [ "$(inspect_current_format '{{ index .Config.Labels "egregore-nexus-test-memory" }}')" = "$MEMORY" ] \
+    && [ "$(inspect_current_format '{{ index .Config.Labels "egregore-nexus-test-pids-limit" }}')" = "$PIDS_LIMIT" ]
 }
 
 container_uses_init_reaper() {
-  [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-test-init" }}' "$NAME" 2>/dev/null || true)" = "true" ]
+  [ "$(inspect_current_format '{{ index .Config.Labels "egregore-nexus-test-init" }}')" = "true" ]
 }
 
 container_uses_host_user() {
-  [ "$(docker container inspect -f '{{ index .Config.Labels "egregore-nexus-test-user" }}' "$NAME" 2>/dev/null || true)" = "$HOST_UID:$HOST_GID" ]
+  [ "$(inspect_current_format '{{ index .Config.Labels "egregore-nexus-test-user" }}')" = "$HOST_UID:$HOST_GID" ]
 }
 
 container_mounts_host_bun() {
   [ ! -d "$HOME/.bun" ] && return 0
-  docker container inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$NAME" 2>/dev/null \
+  inspect_current_format '{{range .Mounts}}{{println .Destination}}{{end}}' \
     | grep -qx "$HOME/.bun" \
-    && docker container inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null \
+    && inspect_current_format '{{range .Config.Env}}{{println .}}{{end}}' \
       | grep -q "^PATH=.*$HOME/.bun/bin"
 }
 
 container_mounts_host_hermes() {
   [ ! -d "$HOME/.hermes" ] && return 0
-  docker container inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$NAME" 2>/dev/null \
+  inspect_current_format '{{range .Mounts}}{{println .Destination}}{{end}}' \
     | grep -qx "$HOME/.hermes"
 }
 
 container_mounts_host_uv_python() {
   [ ! -d "$HOME/.local/share/uv" ] && return 0
-  docker container inspect -f '{{range .Mounts}}{{println .Destination}}{{end}}' "$NAME" 2>/dev/null \
+  inspect_current_format '{{range .Mounts}}{{println .Destination}}{{end}}' \
     | grep -qx "$HOME/.local/share/uv"
 }
 
@@ -137,13 +221,17 @@ build_image() {
 }
 
 ensure_image() {
-  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  local images
+  if ! images=$(docker image ls --no-trunc --filter "reference=$IMAGE" --format '{{.ID}}'); then
+    die "Docker image listing failed for $IMAGE"
+  fi
+  if [ -z "$images" ]; then
     build_image
   fi
 }
 
 exec_bash() {
-  docker exec "$NAME" bash -c "$*"
+  docker exec "${ACTIVE_CONTAINER_ID:-$NAME}" bash -c "$*"
 }
 
 exec_interactive() {
@@ -153,7 +241,8 @@ exec_interactive() {
   else
     tty_flags=(-i)
   fi
-  docker exec "${tty_flags[@]}" -w /work/egregore-nexus "$NAME" "$@"
+  docker exec "${tty_flags[@]}" -w /work/egregore-nexus \
+    "${ACTIVE_CONTAINER_ID:-$NAME}" "$@"
 }
 
 add_mount_if_dir() {
@@ -164,6 +253,13 @@ add_mount_if_dir() {
   if [ -d "$src" ]; then
     eval "$args_name+=( -v \"\$src:\$dst:\$mode\" )"
   fi
+}
+
+remove_verified_named_container() {
+  local expected_id=$1 expected_kind=$2
+  require_named_container_id "$expected_id"
+  require_container_kind "$expected_kind"
+  docker rm -f "$expected_id" >/dev/null
 }
 
 host_node_root() {
@@ -177,7 +273,8 @@ host_node_root() {
 ensure_harness_home_owned() {
   # Older cached validator images created HOME as root. Repair the disposable directory on every
   # reuse before the host-UID process copies OAuth state into it; this does not touch host auth.
-  docker exec --user 0:0 "$NAME" install -d -o "$HOST_UID" -g "$HOST_GID" -m 0700 /tmp/harness-home
+  docker exec --user 0:0 "${ACTIVE_CONTAINER_ID:-$NAME}" \
+    install -d -o "$HOST_UID" -g "$HOST_GID" -m 0700 /tmp/harness-home
 }
 
 prepare_host_harnesses() {
@@ -281,14 +378,15 @@ EOF
 
 wait_for_daemon() {
   for _ in $(seq 1 160); do
-    if docker exec "$NAME" bash -c \
+    if docker exec "${ACTIVE_CONTAINER_ID:-$NAME}" bash -c \
       "pid=\$(cat /tmp/nexus-home/daemon.pid 2>/dev/null || true); proxy=\$(cat /tmp/nexus-home/gateway-proxy.pid 2>/dev/null || true); test -n \"\$pid\" && kill -0 \"\$pid\" 2>/dev/null && test -n \"\$proxy\" && kill -0 \"\$proxy\" 2>/dev/null && curl -fsS \"http://127.0.0.1:$CONTAINER_PORT/api/v1/health\" >/dev/null" \
       >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.25
   done
-  docker exec "$NAME" bash -c 'cat /tmp/nexus-home/daemon.log 2>/dev/null || true' >&2 || true
+  docker exec "${ACTIVE_CONTAINER_ID:-$NAME}" \
+    bash -c 'cat /tmp/nexus-home/daemon.log 2>/dev/null || true' >&2 || true
   die "isolated daemon/gateway did not become ready"
 }
 
@@ -346,56 +444,69 @@ cmd_up() {
 
   # Reusing the sole validation container must not start a transient image-probe
   # container alongside it. Only inspect/build the image when no container exists.
-  if ! container_exists; then
+  if container_exists; then
+    case "$CONTAINER_KIND" in
+      lens) die "preserving Lens lab $NAME; this helper manages standalone Nexus containers only" ;;
+      normal) ACTIVE_CONTAINER_ID=$CONTAINER_ID ;;
+      *) die "refusing normal up for foreign container $NAME" ;;
+    esac
+  else
     ensure_image
   fi
   if container_exists; then
     if [ "$with_host_harnesses" = "1" ] && ! container_real_harnesses; then
       echo "recreating $NAME with host harness mounts"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif [ "$with_host_harnesses" = "0" ] && container_real_harnesses; then
       echo "recreating $NAME without host harness mounts"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif ! container_uses_tmpfs_stream_db; then
       echo "recreating $NAME with tmpfs stream DB configuration"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif ! container_uses_internal_gateway_port; then
       echo "recreating $NAME with proxied gateway port configuration"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif ! container_uses_in_tree_gateway; then
       echo "recreating $NAME with the in-tree gateway package"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif ! container_uses_split_stores; then
       echo "recreating $NAME with split daemon/Gateway store configuration"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif ! container_uses_debug_stack; then
       echo "recreating $NAME with the debug daemon stack bound inherited by lifecycle children"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif ! container_uses_resource_limits; then
       echo "recreating $NAME with CPU, memory, and process limits"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif ! container_uses_init_reaper; then
       echo "recreating $NAME with Docker init child reaping"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif ! container_uses_host_user; then
       echo "recreating $NAME as the host user for OAuth harness compatibility"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif [ "$with_host_harnesses" = "1" ] && ! container_mounts_host_bun; then
       echo "recreating $NAME with host Bun mount"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif [ "$with_host_harnesses" = "1" ] && ! container_mounts_host_hermes; then
       echo "recreating $NAME with host Hermes mount"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     elif [ "$with_host_harnesses" = "1" ] && ! container_mounts_host_uv_python; then
       echo "recreating $NAME with host UV Python mount"
-      docker rm -f "$NAME" >/dev/null
+      remove_verified_named_container "$CONTAINER_ID" normal
     fi
   fi
 
   if container_exists; then
+    local existing_id=$CONTAINER_ID
+    require_container_kind normal
     if ! container_running; then
-      docker start "$NAME" >/dev/null
+      require_named_container_id "$existing_id"
+      require_container_kind normal
+      docker start "$existing_id" >/dev/null
     fi
+    require_named_container_id "$existing_id"
+    require_container_kind normal
+    ACTIVE_CONTAINER_ID=$existing_id
   else
     local run_args=()
     local real_label=false
@@ -420,7 +531,8 @@ cmd_up() {
       add_mount_if_dir run_args "$HOME/.hermes" /host-auth/hermes ro
     fi
 
-    docker run -d \
+    local normal_id
+    normal_id=$(docker run -d \
       --init \
       --user "$HOST_UID:$HOST_GID" \
       --name "$NAME" \
@@ -449,7 +561,12 @@ cmd_up() {
       "${run_args[@]}" \
       -w /work/egregore-nexus \
       "$IMAGE" \
-      sleep infinity >/dev/null
+      sleep infinity)
+    [[ "$normal_id" =~ ^[0-9a-f]{12,64}$ ]] \
+      || die "Docker run did not return an immutable container ID: ${normal_id:-missing}"
+    require_named_container_id "$normal_id"
+    require_container_kind normal
+    ACTIVE_CONTAINER_ID=$normal_id
   fi
 
   if [ "$with_host_harnesses" = "1" ]; then
@@ -619,24 +736,45 @@ PY'
 
 cmd_logs() {
   container_running || die "container $NAME is not running"
-  docker exec -it "$NAME" bash -c 'tail -n 200 -f /tmp/nexus-home/daemon.log'
+  docker exec -it "$CONTAINER_ID" bash -c 'tail -n 200 -f /tmp/nexus-home/daemon.log'
 }
 
 cmd_down() {
-  if container_exists; then
-    docker rm -f "$NAME" >/dev/null
-    echo "removed $NAME"
-  else
+  local id
+  if ! refresh_named_container; then
     echo "container $NAME does not exist"
+    return 0
   fi
+  case "$CONTAINER_KIND" in
+    lens)
+      echo "preserving Lens lab $NAME; this helper manages standalone Nexus containers only"
+      ;;
+    normal)
+      id=$CONTAINER_ID
+      remove_verified_named_container "$id" normal
+      echo "removed $NAME ($id)"
+      ;;
+    *) die "refusing to remove foreign container $NAME" ;;
+  esac
 }
 
 cmd_clean() {
-  docker ps -a \
+  local ids id
+  if ! ids=$(docker ps -a --no-trunc \
     --filter label=egregore-nexus-test=true \
     --filter status=exited \
-    --format '{{.Names}}' \
-    | xargs -r docker rm >/dev/null
+    --format '{{.ID}}'); then
+    die "Docker container listing failed while cleaning stopped validators"
+  fi
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    inspect_container_identity "$id"
+    case "$CONTAINER_KIND" in
+      lens) printf 'preserving stopped Lens lab %s\n' "$id" ;;
+      normal) docker rm "$id" >/dev/null ;;
+      *) die "refusing to clean container $id with invalid ownership" ;;
+    esac
+  done <<<"$ids"
 }
 
 case "${1:-}" in

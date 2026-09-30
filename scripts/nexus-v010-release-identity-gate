@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: scripts/nexus-v010-release-identity-gate
 
-Checks the v0.1.0 version, license, and internal naming contract.
+Checks the canonical distribution version, license, and internal naming contract.
 EOF
 }
 
@@ -14,7 +14,10 @@ case "${1:-}" in
 esac
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
+"$ROOT/scripts/nexus-version" check
 export NEXUS_RELEASE_GATE_ROOT="$ROOT"
+export NEXUS_RELEASE_VERSION
+NEXUS_RELEASE_VERSION=$(tr -d '\n' < "$ROOT/VERSION")
 
 python3 - <<'PY'
 import json
@@ -24,6 +27,7 @@ import subprocess
 import sys
 
 root = pathlib.Path(os.environ["NEXUS_RELEASE_GATE_ROOT"])
+version = os.environ["NEXUS_RELEASE_VERSION"]
 failures: list[str] = []
 
 license_path = root / "LICENSE"
@@ -75,9 +79,9 @@ if distribution.get("experimental-targets") != expected_experimental_targets:
 if distribution.get("wsl-target") != "x86_64-unknown-linux-gnu":
     failures.append("WSL must select the hardened Linux x64 native target")
 for package in sorted(workspace_packages, key=lambda p: p["name"]):
-    if package["version"] != "0.1.0":
+    if package["version"] != version:
         failures.append(
-            f"Cargo package {package['name']} reports {package['version']} (expected 0.1.0)"
+            f"Cargo package {package['name']} reports {package['version']} (expected {version})"
         )
     if package["name"] == "nexus-acceptance":
         if package.get("publish") != []:
@@ -88,11 +92,11 @@ for package in sorted(workspace_packages, key=lambda p: p["name"]):
     for dependency in package["dependencies"]:
         if (
             dependency["name"] in workspace_package_names
-            and dependency["req"] != "=0.1.0"
+            and dependency["req"] != f"={version}"
         ):
             failures.append(
                 f"Cargo package {package['name']} does not exactly pin "
-                f"{dependency['name']} to =0.1.0"
+                f"{dependency['name']} to ={version}"
             )
 
 package_names = workspace_package_names
@@ -103,9 +107,9 @@ if "nexus-realtime" in package_names:
 
 for relative in ("gateway/gateway/package.json",):
     manifest = json.loads((root / relative).read_text(encoding="utf-8"))
-    if manifest.get("version") != "0.1.0":
+    if manifest.get("version") != version:
         failures.append(
-            f"{relative} reports {manifest.get('version')!r} (expected '0.1.0')"
+            f"{relative} reports {manifest.get('version')!r} (expected {version!r})"
         )
     if manifest.get("license") != "Apache-2.0":
         failures.append(
@@ -127,9 +131,9 @@ public_npm = (
 internal_npm = ("gateway/webconsole/package.json",)
 for relative in public_npm + internal_npm:
     manifest = json.loads((root / relative).read_text(encoding="utf-8"))
-    if manifest.get("version") != "0.1.4":
+    if manifest.get("version") != version:
         failures.append(
-            f"{relative} reports {manifest.get('version')!r} (expected '0.1.4')"
+            f"{relative} reports {manifest.get('version')!r} (expected {version!r})"
         )
     if manifest.get("license") != "Apache-2.0":
         failures.append(
@@ -150,7 +154,7 @@ for target in native_targets:
         failures.append(f"separate native npm package still exists: {target}")
 
 gateway_manifest = json.loads((root / "gateway/package.json").read_text(encoding="utf-8"))
-if gateway_manifest.get("dependencies", {}).get("@egregore/nexus-cli") != "0.1.4":
+if gateway_manifest.get("dependencies", {}).get("@egregore/nexus-cli") != version:
     failures.append("@egregore/nexus-gateway must install @egregore/nexus-cli")
 if gateway_manifest.get("bin", {}).get("nexus") != "scripts/nexus.mjs":
     failures.append("@egregore/nexus-gateway must expose the nexus command")
@@ -189,11 +193,16 @@ if search.returncode not in (0, 1):
 elif search.returncode == 0:
     failures.append("live Cargo/Rust sources retain stale dispatch names:\n" + search.stdout.strip())
 
+umbrella_manifest = json.loads((root / "packages/nexus/package.json").read_text(encoding="utf-8"))
+for dependency in ("@egregore/nexus-cli", "@egregore/nexus-gateway"):
+    if umbrella_manifest.get("dependencies", {}).get(dependency) != version:
+        failures.append(f"@egregore/nexus must exactly install {dependency} at {version}")
+
 if failures:
-    print("FAIL Nexus v0.1.0 release identity gate", file=sys.stderr)
+    print(f"FAIL Nexus {version} release identity gate", file=sys.stderr)
     for failure in failures:
         print(f"- {failure}", file=sys.stderr)
     raise SystemExit(1)
 
-print("PASS Nexus v0.1.0 release identity gate")
+print(f"PASS Nexus {version} release identity gate")
 PY

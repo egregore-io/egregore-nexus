@@ -5,7 +5,6 @@
 // second queue and promote-to-steer never decomposes into cancel-plus-send.
 import type { Client, Transaction } from "@libsql/client";
 
-import { getReadDb } from "@drizzle/client";
 import { getConversationStore } from "@server/conversation/store";
 import { callDaemonQuery, type DaemonIpcCaller } from "@server/daemon/ipc";
 import { currentHuman } from "@server/identity/human";
@@ -44,6 +43,20 @@ interface QueueMutationWireResponse {
   body: Record<string, unknown>;
 }
 
+type QueueReadWireResponse = CommandQueueSnapshot | {
+  events: CommandQueueTransition[];
+  nextSeq: number;
+  latestSeq: number;
+  gap: boolean;
+};
+
+interface QueueReadInput {
+  project: string;
+  name?: string;
+  agentId?: string;
+  eventsAfter?: number;
+}
+
 const gatewayCaller: DaemonIpcCaller = {
   name: "Nexus Gateway",
   project: "default",
@@ -63,6 +76,8 @@ export interface ConversationQueueDeps {
   daemonQueueMutation?: (
     input: QueueMutationInput,
   ) => Promise<QueueMutationWireResponse>;
+  /** Test seam for daemon-owned queue snapshots and reconnect transitions. */
+  daemonQueueRead?: (input: QueueReadInput) => Promise<QueueReadWireResponse>;
   nexusHome?: string;
   now?: () => number;
 }
@@ -107,14 +122,34 @@ async function daemonQueueMutation(
   );
 }
 
-type QueueTarget = { name: string; agentId?: string };
+async function daemonQueueRead(
+  input: QueueReadInput,
+  deps: ConversationQueueDeps,
+): Promise<QueueReadWireResponse> {
+  if (deps.daemonQueueRead) return deps.daemonQueueRead(input);
+  return callDaemonQuery<QueueReadWireResponse>(
+    "local.sessionQueue.read",
+    input,
+    { ...gatewayCaller, project: input.project },
+    {
+      ...(deps.nexusHome ? { nexusHome: deps.nexusHome } : {}),
+    },
+  );
+}
+
+type QueueTarget = { name?: string; agentId?: string };
 
 function targetFromUrl(request: Request): QueueTarget | Response {
   const url = new URL(request.url);
   const name = url.searchParams.get("name")?.trim();
   const agentId = url.searchParams.get("agentId")?.trim() || undefined;
-  if (!name) return json({ error: "name is required" }, 400);
-  return { name, ...(agentId ? { agentId } : {}) };
+  if (!name && !agentId) {
+    return json({ error: "name or agentId is required" }, 400);
+  }
+  return {
+    ...(name ? { name } : {}),
+    ...(agentId ? { agentId } : {}),
+  };
 }
 
 function isResponse(value: unknown): value is Response {
@@ -123,6 +158,7 @@ function isResponse(value: unknown): value is Response {
 
 interface TargetRuntime {
   sessionId?: string;
+  name?: string;
   harness?: string;
   transport?: string;
   turnActive: boolean;
@@ -133,7 +169,6 @@ type SqlExecutor = Pick<Client, "execute"> | Pick<Transaction, "execute">;
 
 async function targetRuntime(
   db: SqlExecutor,
-  project: string,
   target: QueueTarget,
 ): Promise<TargetRuntime> {
   const result = await db.execute({
@@ -141,19 +176,20 @@ async function targetRuntime(
       "SELECT s.session_id, s.agent, s.transport, EXISTS(" +
       "SELECT 1 FROM agent_session_turns t WHERE t.session_id = s.session_id " +
       "AND t.status = 'streaming' AND t.finalized_at IS NULL LIMIT 1" +
-      ") AS turn_active FROM sessions s WHERE s.project = ? " +
-      "AND ((? IS NOT NULL AND s.agent_id = ?) OR s.name = ?) " +
+      ") AS turn_active, s.name FROM sessions s WHERE " +
+      "((? IS NOT NULL AND s.agent_id = ?) OR (? IS NULL AND s.name = ?)) " +
       "ORDER BY s.created_at DESC LIMIT 1",
     args: [
-      project,
       target.agentId ?? null,
       target.agentId ?? null,
-      target.name,
+      target.agentId ?? null,
+      target.name ?? null,
     ],
   });
   const row = result.rows[0];
   const sessionId =
     typeof row?.session_id === "string" ? row.session_id : undefined;
+  const name = typeof row?.name === "string" ? row.name : undefined;
   const harness = typeof row?.agent === "string" ? row.agent : undefined;
   const transport =
     typeof row?.transport === "string" ? row.transport : undefined;
@@ -164,7 +200,7 @@ async function targetRuntime(
       : harness
         ? SteerCapability.InterruptAndSend
         : SteerCapability.None;
-  return { sessionId, harness, transport, turnActive, steerCapability };
+  return { sessionId, name, harness, transport, turnActive, steerCapability };
 }
 
 function targetPredicate(
@@ -180,7 +216,7 @@ function targetPredicate(
         sql:
           "json_extract(request_json, '$.agentId') IS NULL " +
           "AND json_extract(request_json, '$.name') = ?",
-        args: [target.name],
+        args: [target.name ?? ""],
       };
   if (!sessionId) return direct;
   return {
@@ -193,7 +229,6 @@ function targetPredicate(
 
 async function queueEntries(
   db: SqlExecutor,
-  project: string,
   target: QueueTarget,
   sessionId?: string,
 ): Promise<CommandQueueEntry[]> {
@@ -203,13 +238,12 @@ async function queueEntries(
       "SELECT command_id, kind, status, request_json, error_json, revision, created_at, claimed_at, " +
       "started_at, completed_at, COALESCE((SELECT MAX(seq) FROM command_intent_events e " +
       "WHERE e.command_id = command_intents.command_id), 0) AS seq " +
-      "FROM command_intents WHERE project = ? " +
-      "AND kind IN (?, ?) AND " +
+      "FROM command_intents WHERE kind IN (?, ?) AND " +
       predicate.sql +
       " " +
       "ORDER BY CASE WHEN status IN ('pending', 'claimed') THEN 0 ELSE 1 END, created_at ASC " +
       "LIMIT ?",
-    args: [project, PROMPT, STEER, ...predicate.args, MAX_QUEUE_ROWS],
+    args: [PROMPT, STEER, ...predicate.args, MAX_QUEUE_ROWS],
   });
   return result.rows.map((row) =>
     queueEntry(row as Record<string, unknown>, sessionId),
@@ -243,25 +277,26 @@ function queueEntry(
 
 async function latestQueueSeq(
   db: SqlExecutor,
-  project: string,
 ): Promise<number> {
   const result = await db.execute({
-    sql: "SELECT COALESCE(MAX(seq), 0) AS seq FROM command_intent_events WHERE project = ?",
-    args: [project],
+    sql: "SELECT COALESCE(MAX(seq), 0) AS seq FROM command_intent_events",
+    args: [],
   });
   return Number(result.rows[0]?.seq ?? 0);
 }
 
 async function queueEvents(
   db: SqlExecutor,
-  project: string,
   afterSeq: number,
 ): Promise<CommandQueueTransition[]> {
   const result = await db.execute({
     sql:
-      "SELECT seq, session_id, command_id, client_message_id, state, mode, revision " +
-      "FROM command_intent_events WHERE project = ? AND seq > ? ORDER BY seq LIMIT 500",
-    args: [project, afterSeq],
+      "SELECT e.seq, e.session_id, e.command_id, e.client_message_id, " +
+      "c.kind, c.caller_name, c.caller_session_id, c.caller_agent_id, c.caller_kind, " +
+      "e.state, e.mode, e.revision FROM command_intent_events e " +
+      "JOIN command_intents c ON c.command_id = e.command_id " +
+      "WHERE e.seq > ? ORDER BY e.seq LIMIT 500",
+    args: [afterSeq],
   });
   return result.rows.map((row) => ({
     seq: Number(row.seq),
@@ -271,6 +306,13 @@ async function queueEvents(
       typeof row.client_message_id === "string"
         ? row.client_message_id
         : undefined,
+    commandKind: String(row.kind),
+    callerName: String(row.caller_name),
+    callerSessionId:
+      typeof row.caller_session_id === "string" ? row.caller_session_id : undefined,
+    callerAgentId:
+      typeof row.caller_agent_id === "string" ? row.caller_agent_id : undefined,
+    callerKind: typeof row.caller_kind === "string" ? row.caller_kind : undefined,
     state: String(row.state) as CommandQueueState,
     mode: String(row.mode),
     revision: Number(row.revision),
@@ -382,22 +424,26 @@ export async function handleConversationQueueGet(
 ): Promise<Response> {
   const auth = await authorizedProject(request, deps);
   if (isResponse(auth)) return auth;
-  const db = deps.getWriteDb
-    ? await deps.getWriteDb()
-    : getReadDb().$client;
   const url = new URL(request.url);
   if (url.searchParams.has("eventsAfter")) {
     const afterSeq = Number(url.searchParams.get("eventsAfter"));
     if (!Number.isInteger(afterSeq) || afterSeq < 0) {
       return json({ error: "eventsAfter must be a non-negative integer" }, 400);
     }
+    if (!deps.getWriteDb) {
+      try {
+        return json(await daemonQueueRead({ project: auth.project, eventsAfter: afterSeq }, deps));
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 502);
+      }
+    }
+    const db = await deps.getWriteDb();
     const [bounds, events] = await Promise.all([db.execute({
       sql:
         "SELECT COALESCE(MIN(CASE WHEN seq > ? THEN seq END), 0) AS next_seq, " +
-        "COALESCE(MAX(seq), 0) AS max_seq " +
-        "FROM command_intent_events WHERE project = ?",
-      args: [afterSeq, auth.project],
-    }), queueEvents(db, auth.project, afterSeq)]);
+        "COALESCE(MAX(seq), 0) AS max_seq FROM command_intent_events",
+      args: [afterSeq],
+    }), queueEvents(db, afterSeq)]);
     const nextSeq = Number(bounds.rows[0]?.next_seq ?? 0);
     const latestSeq = Number(bounds.rows[0]?.max_seq ?? 0);
     const gap = afterSeq > 0 && nextSeq > afterSeq + 1;
@@ -410,12 +456,24 @@ export async function handleConversationQueueGet(
   }
   const target = targetFromUrl(request);
   if (isResponse(target)) return target;
+  if (!deps.getWriteDb) {
+    try {
+      return json(await daemonQueueRead({
+        project: auth.project,
+        ...(target.name ? { name: target.name } : {}),
+        ...(target.agentId ? { agentId: target.agentId } : {}),
+      }, deps));
+    } catch (error) {
+      return json({ error: error instanceof Error ? error.message : String(error) }, 502);
+    }
+  }
+  const db = await deps.getWriteDb();
   const [runtime, seq] = await Promise.all([
-    targetRuntime(db, auth.project, target),
-    latestQueueSeq(db, auth.project),
+    targetRuntime(db, target),
+    latestQueueSeq(db),
   ]);
   const snapshot: CommandQueueSnapshot = {
-    target: target.name,
+    target: runtime.name ?? target.name ?? target.agentId ?? "",
     sessionId: runtime.sessionId,
     turnActive: runtime.turnActive,
     steerCapability: runtime.steerCapability,
@@ -423,7 +481,6 @@ export async function handleConversationQueueGet(
     revision: seq,
     commands: await queueEntries(
       db,
-      auth.project,
       target,
       runtime.sessionId,
     ),
@@ -442,12 +499,14 @@ export async function handleConversationQueuePost(
   } catch {
     return json({ error: "body must be JSON" }, 400);
   }
-  if (!body.name?.trim()) return mutationError(body, "name is required", 400);
+  if (!body.name?.trim() && !body.agentId) {
+    return mutationError(body, "name or agentId is required", 400);
+  }
   if (!body.clientMutationId?.trim()) {
     return mutationError(body, "clientMutationId is required", 400);
   }
   const target: QueueTarget = {
-    name: body.name.trim(),
+    ...(body.name?.trim() ? { name: body.name.trim() } : {}),
     ...(body.agentId ? { agentId: String(body.agentId) } : {}),
   };
   const auth = await authorizedProject(request, deps);
@@ -510,7 +569,7 @@ export async function handleConversationQueuePost(
         "VALUES (?, ?, ?, NULL, NULL, ?)",
       args: [auth.project, body.clientMutationId, requestJson, now],
     });
-    const runtime = await targetRuntime(tx, auth.project, target);
+    const runtime = await targetRuntime(tx, target);
     const predicate = targetPredicate(target, runtime.sessionId);
 
     const finish = async (

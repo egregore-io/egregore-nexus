@@ -11,14 +11,14 @@ describe("public gateway package contract", () => {
     const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 
     expect(manifest.name).toBe("@egregore/nexus-gateway");
-    expect(manifest.version).toBe("0.1.4");
+    expect(manifest.version).toBe("0.1.5");
     expect(manifest.private).toBe(false);
     expect(manifest.license).toBe("Apache-2.0");
     expect(manifest.engines?.node).toBe(">=20");
     expect(manifest.bin?.nexus).toBe("scripts/nexus.mjs");
     expect(manifest.bin?.["nexus-gateway"]).toBe("scripts/nexus-gateway.mjs");
     expect(manifest.bin?.["nexus-webui"]).toBe("webconsole/bin/nexus-webui.mjs");
-    expect(manifest.dependencies?.["@egregore/nexus-cli"]).toBe("0.1.4");
+    expect(manifest.dependencies?.["@egregore/nexus-cli"]).toBe("0.1.5");
     expect(manifest.files).toEqual([
       "dist-gateway/headless.mjs",
       "scripts/gateway-serve-impl.mjs",
@@ -39,12 +39,25 @@ describe("public gateway package contract", () => {
     expect(source).toContain('"--discovery=write"');
 
     const serveSource = await readFile(join(root, "scripts/gateway-serve-impl.mjs"), "utf8");
-    expect(serveSource).not.toContain('import { attachAguiWsUpgrade } from "../src/server/agui/ws.mjs"');
-    expect(serveSource).toContain('await import("../src/server/agui/ws.mjs")');
-    expect(serveSource).toContain('import.meta.resolve("tsx/cli")');
-    expect(serveSource).toContain('"--tsconfig", join(FRONTEND_DIR, "tsconfig.json")');
+    expect(serveSource).not.toContain("../src/server/");
+    expect(serveSource).toContain("attachHeadlessGatewayWs");
+    expect(serveSource).toContain("guardGatewayBrowserRequest");
+    expect(serveSource).toContain(
+      "const guardedHandler = (request) => guardGatewayBrowserRequest(request, handler)",
+    );
+    expect(serveSource).toContain("handlePackagedRequest(guardedHandler, req, res)");
+    expect(serveSource).toContain(
+      "await attachHeadlessGatewayWs(server, { fetchHandler: guardedHandler })",
+    );
+    expect(serveSource).not.toContain("tsx/cli");
+    expect(serveSource).not.toContain("src/server");
+    expect(serveSource).not.toContain("spawn(process.execPath");
+    expect(serveSource).toContain("await createHeadlessGatewayServer()");
     expect(serveSource).toContain('join(FRONTEND_DIR, "dist-gateway/headless.mjs")');
-    expect(serveSource).toContain("writeGatewayDiscovery(port, process.pid)");
+    expect(serveSource).toContain('value === "local-operator"');
+    expect(serveSource).toContain('value === "remote-human"');
+    expect(serveSource).toContain('value === "remote-agent"');
+    expect(serveSource).toContain("writeGatewayDiscovery(port, process.pid, host)");
     expect(serveSource).not.toContain("writeGatewayDiscovery(port, runner.pid)");
   });
 });

@@ -66,7 +66,11 @@ async fn fresh_store_creates_one_complete_named_baseline_and_reopens_idempotentl
 
     assert_eq!(
         schema_rows(&store).await,
-        vec![(1, "v0.1.0_baseline".into())]
+        vec![
+            (1, "v0.1.0_baseline".into()),
+            (2, "v0.1.5_message_hooks".into()),
+            (3, "v0.1.5_delivery_timing".into()),
+        ]
     );
 }
 
@@ -89,12 +93,14 @@ async fn baseline_contains_current_identity_routing_and_delivery_columns() {
         ("messages", "sender_session_id"),
         ("messages", "idempotency_key"),
         ("messages", "metadata_json"),
+        ("messages", "mention_json"),
         ("in_flight", "recipient_agent_id"),
         ("in_flight", "attempt_count"),
         ("in_flight", "attempt_started_at"),
         ("in_flight", "error_code"),
         ("in_flight", "error_reason"),
         ("in_flight", "error_details_json"),
+        ("in_flight", "delivery_timing"),
         ("threads", "archived_at"),
         ("threads", "metadata_json"),
         ("threads", "topic"),
@@ -120,6 +126,69 @@ async fn baseline_contains_current_identity_routing_and_delivery_columns() {
             "missing {table}.{column}"
         );
     }
+}
+
+#[tokio::test]
+async fn public_v010_baseline_upgrades_to_message_hook_schema_without_losing_rows() {
+    const PUBLIC_V010_SCHEMA: &str = include_str!("../../../migrations/0001_init.sql");
+
+    let store = Store::open(":memory:").await.unwrap();
+    store
+        .conn
+        .execute_batch(
+            "CREATE TABLE schema_migrations (
+               version INTEGER PRIMARY KEY,
+               name TEXT NOT NULL,
+               applied_at INTEGER NOT NULL
+             );",
+        )
+        .await
+        .unwrap();
+    store.conn.execute_batch(PUBLIC_V010_SCHEMA).await.unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO schema_migrations(version, name, applied_at)
+             VALUES (1, 'v0.1.0_baseline', 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO messages(
+               message_id, from_name, kind, to_name, body, provenance, project, created_at
+             ) VALUES (
+               'm_existing', 'ana', 'agent', 'ben', 'preserve-me', '{}', 'default', 1
+             )",
+            (),
+        )
+        .await
+        .unwrap();
+
+    store.migrate().await.unwrap();
+
+    assert_eq!(
+        schema_rows(&store).await,
+        vec![
+            (1, "v0.1.0_baseline".into()),
+            (2, "v0.1.5_message_hooks".into()),
+            (3, "v0.1.5_delivery_timing".into()),
+        ]
+    );
+    assert!(column_exists(&store, "messages", "mention_json").await);
+    assert!(view_column_exists(&store, "nexus_broadcast_ingress", "metadata_json").await);
+    assert!(view_column_exists(&store, "nexus_broadcast_ingress", "mention_json").await);
+    assert!(view_column_exists(&store, "nexus_broadcast_ingress", "delivery_timing").await);
+    assert_eq!(
+        single_text(
+            &store,
+            "SELECT body FROM messages WHERE message_id = 'm_existing'"
+        )
+        .await,
+        "preserve-me"
+    );
 }
 
 #[tokio::test]
@@ -184,7 +253,10 @@ async fn pre_release_upgrade_ladder_is_rejected_without_mutation() {
 
     let error = store.migrate().await.unwrap_err().to_string();
     assert!(error.contains("pre-release"), "unexpected error: {error}");
-    assert!(error.contains("fresh v0.1.0"), "unexpected error: {error}");
+    assert!(
+        error.contains("published forward migrations"),
+        "unexpected error: {error}"
+    );
     assert_eq!(
         single_text(&store, "SELECT value FROM pre_release_sentinel").await,
         "preserve-me"
@@ -264,6 +336,10 @@ async fn column_exists(store: &Store, table: &str, column: &str) -> bool {
         }
     }
     false
+}
+
+async fn view_column_exists(store: &Store, view: &str, column: &str) -> bool {
+    column_exists(store, view, column).await
 }
 
 async fn schema_rows(store: &Store) -> Vec<(i64, String)> {

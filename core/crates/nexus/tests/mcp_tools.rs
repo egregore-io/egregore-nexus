@@ -249,6 +249,7 @@ async fn dispatch_read_returns_full_message_by_id() {
                 summary: None,
                 body: "full body available after truncation".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )

@@ -537,6 +537,7 @@ async fn launch_display_name(
         return name.to_string();
     }
     read.members(nexus_contracts::MemberListRequest {
+        project: None,
         include_offline: Some(true),
         include_dead: None,
     })
@@ -692,6 +693,7 @@ pub async fn whoami(client: &ReadClient, json: bool) -> ExitCode {
 mod builder_tests {
     use super::*;
     use crate::cli::ambient::with_test_env_vars;
+    use nexus_harness_core::{native_harness_program, NativeProcessPlatform};
 
     #[test]
     fn launch_meta_accepts_objects_and_rejects_everything_else() {
@@ -754,15 +756,14 @@ mod builder_tests {
 
     #[test]
     fn codex_command_and_mcp_args() {
-        let (prog, args) = build_harness_command(
-            &HarnessId::new("codex").unwrap(),
-            "ada",
-            "lens",
-            "/usr/bin/nexus",
-            None,
-        )
-        .unwrap();
-        assert_eq!(prog, "codex");
+        let kind = HarnessId::new("codex").unwrap();
+        let (prog, args) =
+            build_harness_command(&kind, "ada", "lens", "/usr/bin/nexus", None).unwrap();
+        assert_eq!(
+            prog,
+            native_harness_program(kind.as_str(), NativeProcessPlatform::current())
+                .expect("built-in harness has a native headed executable")
+        );
         assert!(args.contains(&"-c".to_string()));
         assert!(args
             .iter()
@@ -776,15 +777,14 @@ mod builder_tests {
 
     #[test]
     fn claude_command_and_mcp_config() {
-        let (prog, args) = build_harness_command(
-            &HarnessId::new("claude").unwrap(),
-            "ada",
-            "lens",
-            "/usr/bin/nexus",
-            None,
-        )
-        .unwrap();
-        assert_eq!(prog, "claude");
+        let kind = HarnessId::new("claude").unwrap();
+        let (prog, args) =
+            build_harness_command(&kind, "ada", "lens", "/usr/bin/nexus", None).unwrap();
+        assert_eq!(
+            prog,
+            native_harness_program(kind.as_str(), NativeProcessPlatform::current())
+                .expect("built-in harness has a native headed executable")
+        );
         let idx = args
             .iter()
             .position(|a| a == "--mcp-config")

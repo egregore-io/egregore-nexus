@@ -8,7 +8,7 @@ use nexus_contracts::ack::{AckRequest, AckResponse, AckThreadsRequest};
 use nexus_contracts::batch::{ConsumeRequest, NexusBatch};
 use nexus_contracts::enums::Tier;
 use nexus_contracts::events::WsEvent;
-use nexus_contracts::ids::{MessageId, SessionId, ThreadId};
+use nexus_contracts::ids::{AgentId, MessageId, SessionId, ThreadId};
 use nexus_contracts::ports::{BusPort, Caller, DispatchPort, EventSink, IdentityPort, PortResult};
 use nexus_contracts::register::{
     HeartbeatResponse, MemberListRequest, MemberListResponse, RegisterRequest, RegisterResponse,
@@ -20,7 +20,7 @@ use nexus_contracts::threads::{
     LeaveThreadRequest, RenameThreadRequest,
 };
 use nexus_contracts::topics::{SubscribeRequest, UnsubscribeRequest};
-use nexus_store::repos::{DeveloperEvents, Threads};
+use nexus_store::repos::{DeveloperEvents, NewSession, Sessions, Threads};
 use nexus_store::Store;
 
 const PROJECT: &str = "default";
@@ -156,10 +156,33 @@ async fn action_names(store: &Store, topic: &str) -> Vec<String> {
         .collect()
 }
 
+async fn seed_legacy_sessions(store: &Store) {
+    let sessions = Sessions::new(store);
+    for (name, session_id) in [("ada", "s_ada"), ("ben", "s_ben"), ("cy", "s_cy")] {
+        sessions
+            .create(NewSession {
+                session_id: SessionId(session_id.into()),
+                name: Some(name.into()),
+                agent: Some("claude".into()),
+                kind: "agent".into(),
+                role: None,
+                tier: "agent".into(),
+                harness_session_id: None,
+                client_key: Some(format!("ck_{session_id}")),
+                cwd: None,
+                project: PROJECT.into(),
+                transport: Some("pty".into()),
+            })
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::test]
 async fn thread_post_writes_metadata_events_without_extra_turn_wakes() {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
+    seed_legacy_sessions(&store).await;
     let thread_id = ThreadId("t_ops".into());
     let threads = Threads::new(&store);
     threads
@@ -182,6 +205,7 @@ async fn thread_post_writes_metadata_events_without_extra_turn_wakes() {
                 summary: None,
                 body: "status".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -232,6 +256,7 @@ async fn dm_writes_private_per_party_sequences() {
                 summary: None,
                 body: "private".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -259,14 +284,14 @@ async fn dm_writes_private_per_party_sequences() {
 }
 
 #[tokio::test]
-async fn thread_create_writes_action_event() {
+async fn thread_new_emits_one_creator_bound_thread_create_action() {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
     let realtime = Arc::new(CountingRealtime::default());
     let bus = bus(store.clone(), realtime.clone());
 
     bus.create_thread(
-        &caller("ada", "s_ada"),
+        &caller("human", "s_human"),
         CreateThreadRequest {
             name: "launch".into(),
             members: vec!["ben".into()],
@@ -282,12 +307,47 @@ async fn thread_create_writes_action_event() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].kind, "action");
     assert_eq!(rows[0].thread_name.as_deref(), Some("launch"));
-    assert_eq!(rows[0].from_name.as_deref(), Some("ada"));
+    assert_eq!(rows[0].from_name.as_deref(), Some("human"));
+    assert_eq!(rows[0].session_id.as_deref(), Some("s_human"));
+    assert_eq!(rows[0].agent_name, None);
     let data: serde_json::Value =
         serde_json::from_str(rows[0].data_json.as_deref().unwrap()).unwrap();
     assert_eq!(data["action"], "thread.create");
-    assert_eq!(data["members"], serde_json::json!(["ada", "ben"]));
+    assert_eq!(data["event"], serde_json::Value::Null);
+    assert_ne!(data["action"], "thread.added");
+    assert_eq!(data["members"], serde_json::json!(["ben", "human"]));
     assert_eq!(realtime.enqueues.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn thread_create_action_carries_the_authenticated_agent_id_when_present() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let realtime = Arc::new(CountingRealtime::default());
+    let bus = bus(store.clone(), realtime);
+    let agent = Caller {
+        agent_id: Some(AgentId("a_ada".into())),
+        ..caller("ada", "s_ada")
+    };
+
+    bus.create_thread(
+        &agent,
+        CreateThreadRequest {
+            name: "agent-launch".into(),
+            members: vec![],
+        },
+    )
+    .await
+    .unwrap();
+
+    let rows = DeveloperEvents::new(&store)
+        .since("sys.thread.agent-launch", 0)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].from_name.as_deref(), Some("ada"));
+    assert_eq!(rows[0].session_id.as_deref(), Some("s_ada"));
+    assert_eq!(rows[0].agent_name.as_deref(), Some("a_ada"));
 }
 
 #[tokio::test]

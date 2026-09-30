@@ -8,6 +8,7 @@ import type { PaneMessage } from "./types";
 export interface GatewayHistoryRow {
   messageId: string;
   from: string;
+  fromKind?: string;
   when?: number;
   body: string;
   cursor?: { createdAt: number; rowid: number; opaque?: string };
@@ -67,7 +68,7 @@ export function historyRowsToPaneMessages(
       id: row.messageId,
       who: row.from,
       glyph: isYou ? you.glyph : row.from.charAt(0).toUpperCase() || "?",
-      chip: isYou ? "you" : "agent",
+      chip: isYou ? "you" : row.fromKind === "human" ? "human" : "agent",
       ...(isYou ? { isYou: true } : {}),
       time: row.when ? new Date(row.when).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : undefined,
       ...(row.cursor ? { messageCursor: row.cursor } : {}),

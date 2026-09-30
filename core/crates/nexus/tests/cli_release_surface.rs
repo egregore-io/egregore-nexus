@@ -1,5 +1,5 @@
 use clap::{CommandFactory, Parser};
-use nexus::cli::Cli;
+use nexus::cli::{commands::discover::member_list_request, Cli, Command};
 use nexus::gateway_lifecycle::{GatewayLifecycleError, GATEWAY_INSTALL_HINT};
 
 fn parse(args: &[&str]) -> Cli {
@@ -17,11 +17,28 @@ fn gateway_lifecycle_verbs_parse() {
     parse(&["gateway", "delivery-mode", "show"]);
     parse(&["gateway", "delivery-mode", "set", "buffered"]);
     parse(&["gateway", "delivery-mode", "set", "best-effort"]);
+    parse(&["gateway", "hooks", "list"]);
+    parse(&["--json", "gateway", "hooks", "list"]);
+    parse(&["gateway", "hooks", "list", "--json"]);
     parse(&["gateway", "uninstall"]);
 }
 
 #[test]
+fn gateway_read_client_forwards_the_standard_rest_bearer() {
+    let source = include_str!("../src/cli/gateway_read_client.rs");
+    assert!(source.contains("NEXUS_REST_TOKEN"));
+    assert!(source.contains("AUTHORIZATION"));
+}
+
+#[test]
 fn lifecycle_affordances_parse() {
+    parse(&[
+        "members",
+        "--project",
+        "v015-lab",
+        "--include-offline",
+        "--presence",
+    ]);
     parse(&["webconsole", "launch", "--no-open"]);
     parse(&[
         "webconsole",
@@ -42,6 +59,26 @@ fn lifecycle_affordances_parse() {
 }
 
 #[test]
+fn members_cli_maps_project_metadata_and_global_omission_into_the_read_request() {
+    let filtered = parse(&["members", "--project", "v015-lab", "--include-offline"]);
+    let global = parse(&["members"]);
+    let Command::Members(filtered) = filtered.command else {
+        panic!("expected members command");
+    };
+    let Command::Members(global) = global.command else {
+        panic!("expected members command");
+    };
+
+    let filtered = member_list_request(&filtered);
+    let global = member_list_request(&global);
+
+    assert_eq!(filtered.project.as_deref(), Some("v015-lab"));
+    assert_eq!(filtered.include_offline, Some(true));
+    assert_eq!(global.project, None);
+    assert_eq!(global.include_offline, Some(false));
+}
+
+#[test]
 fn gateway_delivery_mode_rejects_unknown_values_at_the_cli_boundary() {
     assert!(
         Cli::try_parse_from(["nexus", "gateway", "delivery-mode", "set", "lossy-maybe"]).is_err()
@@ -49,21 +86,13 @@ fn gateway_delivery_mode_rejects_unknown_values_at_the_cli_boundary() {
 }
 
 #[test]
-fn public_cli_reports_the_release_version() {
+fn public_cli_reports_only_the_release_version() {
     let command = Cli::command();
     assert_eq!(command.get_version(), Some(env!("CARGO_PKG_VERSION")));
     let long = command
         .get_long_version()
-        .expect("release CLI must expose source revision in its long version");
-    assert!(long.starts_with(env!("CARGO_PKG_VERSION")));
-    assert!(
-        long.contains("revision "),
-        "unexpected long version: {long}"
-    );
-    assert!(
-        !long.contains("revision unknown"),
-        "unexpected long version: {long}"
-    );
+        .expect("release CLI must expose its release version");
+    assert_eq!(long, env!("CARGO_PKG_VERSION"));
 }
 
 #[test]

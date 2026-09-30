@@ -97,6 +97,9 @@ const ROUTES: Route[] = [
   { method: "GET", pattern: "/agents/:id", projection: { read: "agent.show" }, handler: h.getAgent },
   { method: "GET", pattern: "/agents/:id/runtimes", projection: { read: "agent.runtimes" }, handler: h.getAgentRuntimes },
   { method: "GET", pattern: "/runtimes", projection: { read: "agent.runtimes" }, handler: h.getRuntimes },
+  { method: "GET", pattern: "/hooks", projection: { read: "hooks.list" }, handler: h.getHooks },
+  { method: "GET", pattern: "/hooks/public-key", projection: { read: "hooks.publicKey" }, handler: h.getHookPublicKey },
+  { method: "GET", pattern: "/hooks/audit", projection: { read: "hooks.audit" }, handler: h.getHookAudit },
 
   // ── writes / ops (command ingress) ──
   { method: "POST", pattern: "/notify", auth: false, projection: { command: COMMAND_KINDS.notificationNotify }, handler: h.postNotify },

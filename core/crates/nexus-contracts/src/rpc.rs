@@ -129,4 +129,10 @@ pub mod codes {
     pub const PAUSED: i32 = -32005;
     /// The requested active-turn operation raced with completion or no turn is active.
     pub const ACTIVE_TURN_REQUIRED: i32 = -32006;
+    /// A blocking message hook intentionally rejected the send before canonical acceptance.
+    pub const HOOK_REJECTED: i32 = -32007;
+    /// Hook evaluation is required but no usable Gateway hook provider is available.
+    pub const HOOK_GATEWAY_UNAVAILABLE: i32 = -32008;
+    /// The selected delivery timing cannot be honored by the target harness.
+    pub const DELIVERY_TIMING_UNSUPPORTED: i32 = -32009;
 }

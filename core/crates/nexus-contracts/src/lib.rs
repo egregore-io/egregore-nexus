@@ -70,6 +70,8 @@ pub mod enums;
 pub mod events;
 pub mod gateway_projection;
 pub mod harness;
+pub mod hook_ports;
+pub mod hooks;
 pub mod ids;
 pub mod message;
 pub mod metadata;
@@ -123,24 +125,36 @@ pub use gateway_projection::{
     GATEWAY_PROJECTION_VERSION,
 };
 pub use harness::{HarnessId, HarnessIdError, HARNESS_ID_MAX_LEN};
+pub use hook_ports::MessageHookPort;
+pub use hooks::{
+    DeliveryTiming, GatewayHookCapabilities, GatewayHookEvaluation, HookAction,
+    HookAfterReceiptRequest, HookAfterReceiptResult, HookBeforeSendRequest, HookBeforeSendResult,
+    HookEvaluationFailure, HookEvaluationRequest, HookEvaluationResponse, HookExecutedBy,
+    HookMessage, HookSender,
+};
 pub use ids::{AgentId, CredentialId, MessageId, ProjectId, SessionId, ThreadId, TopicId};
 pub use message::{Message, Provenance, ProvenanceStamp, ReadRequest};
-pub use metadata::{MetadataEntityKind, MetadataGetRequest, MetadataResponse, MetadataSetRequest};
+pub use metadata::{
+    MessageMetadataMergeRequest, MetadataEntityKind, MetadataGetRequest, MetadataResponse,
+    MetadataSetRequest,
+};
 pub use notify::{
     NotifyCommandRequest, NotifyRequest, NotifyResponse, NotifySendRequest, NotifyTarget,
     RouteRule, NOTIFY_SIGNATURE_HEADER, NOTIFY_TIMESTAMP_HEADER,
 };
 pub use ports::{
     AdminPort, AgentTurnExecutionPort, BusPort, Caller, ContractError, DispatchPort, EventSink,
-    IdentityPort, InjectError, InjectResult, NotifyPort, OperatorAction, PortResult, ProviderError,
-    ProviderLimit, ProviderLimitReason, RealtimePort, ResetHint, SearchPort,
+    IdentityPort, InjectError, InjectResult, NotifyPort, OperatorAction, PortResult,
+    PreparedBusSend, ProviderError, ProviderLimit, ProviderLimitReason, RealtimePort, ResetHint,
+    SearchPort,
 };
 pub use project::{Project, RegisterProjectRequest, RegisterProjectResponse};
 pub use prompt::{
     CommandExpectedRevision, CommandQueueAction, CommandQueueEntry, CommandQueueMutationRequest,
     CommandQueueMutationResponse, CommandQueueReceipt, CommandQueueSnapshot, CommandQueueState,
-    CommandQueueTransition, CompactRequest, CompactResponse, PromptRequest, PromptResponse,
-    SteerCapability, SteerDelivery, SteerRequest, SteerResponse, WarmRequest, WarmResponse,
+    CommandQueueTransition, CompactRequest, CompactResponse, InterruptRequest, InterruptResponse,
+    PromptRequest, PromptResponse, SteerCapability, SteerDelivery, SteerRequest, SteerResponse,
+    WarmRequest, WarmResponse,
 };
 pub use register::{
     HeartbeatRequest, HeartbeatResponse, MemberListRequest, MemberListResponse, MemberSummary,

@@ -36,8 +36,17 @@ pub enum GatewayCmd {
     /// Inspect or change daemon-to-Gateway projection delivery policy.
     #[command(subcommand, name = "delivery-mode")]
     DeliveryMode(GatewayDeliveryModeCmd),
+    /// Inspect Gateway-owned message hooks without mutating their manifests.
+    #[command(subcommand)]
+    Hooks(GatewayHooksCmd),
     /// Stop and remove the Gateway's native per-user service.
     Uninstall,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum GatewayHooksCmd {
+    /// List the active hook generation and registered handlers.
+    List,
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
@@ -116,11 +125,57 @@ pub async fn run(command: GatewayCmd, json: bool) -> ExitCode {
             Ok(report) => render_delivery_mode(&report, json),
             Err(error) => render_error(&error, json),
         },
+        GatewayCmd::Hooks(GatewayHooksCmd::List) => match list_hooks().await {
+            Ok(report) => render_hooks(&report, json),
+            Err(error) => render_error(&error, json),
+        },
         GatewayCmd::Uninstall => match uninstall_gateway_service() {
             Ok(report) => render_service_report(&report, json),
             Err(error) => render_error(&error, json),
         },
     }
+}
+
+async fn list_hooks() -> Result<serde_json::Value, GatewayLifecycleError> {
+    let paths = crate::gateway_lifecycle::GatewayPaths::resolve();
+    let client = crate::cli::gateway_read_client::GatewayReadClient::discover(&paths.home)
+        .map_err(|error| GatewayLifecycleError::lifecycle(error.message))?;
+    client
+        .get_json("/api/v1/hooks")
+        .await
+        .map_err(|error| GatewayLifecycleError::lifecycle(error.message))
+}
+
+fn render_hooks(report: &serde_json::Value, json: bool) -> ExitCode {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(report)
+                .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into())
+        );
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "gateway hooks: generation={} handlers={} errors={}",
+        report["generation"].as_str().unwrap_or("unknown"),
+        report["hooks"].as_array().map(Vec::len).unwrap_or(0),
+        report["errors"].as_array().map(Vec::len).unwrap_or(0),
+    );
+    if let Some(hooks) = report["hooks"].as_array() {
+        for hook in hooks {
+            println!(
+                "{}\t{}\t{}",
+                hook["id"].as_str().unwrap_or("unknown"),
+                hook["event"].as_str().unwrap_or("unknown"),
+                if hook["enabled"].as_bool().unwrap_or(false) {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+            );
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn render_service_report(report: &GatewayServiceReport, json: bool) -> ExitCode {

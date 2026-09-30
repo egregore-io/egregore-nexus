@@ -24,9 +24,25 @@ impl AppState {
         let descriptors = IdentitySessions::new(&self.store).list().await?;
         let sessions = Sessions::new(&self.store);
         let agents = Agents::new(&self.store);
+        // `identity_sessions` is continuity history keyed by runtime, while the boot-scoped
+        // address directory projects one current runtime per durable agent. The repository lists
+        // capsules newest first, so retain the first capsule for each immutable agent id and leave
+        // older launches as history. Selecting by mutable display name would reintroduce rename
+        // races and trying to materialize every historical runtime can violate the live name
+        // uniqueness constraint, aborting restoration for unrelated agents.
+        let mut projected_agent_ids = HashSet::new();
         let mut restored = 0;
 
         for descriptor in descriptors {
+            if !projected_agent_ids.insert(descriptor.agent_id.clone()) {
+                tracing::debug!(
+                    target: "nexus::revive",
+                    runtime_id = %descriptor.runtime_id,
+                    agent_id = %descriptor.agent_id,
+                    "skipping superseded resurrection capsule"
+                );
+                continue;
+            }
             let session = SessionId(descriptor.runtime_id.clone());
             if sessions.find_by_session_id(&session).await?.is_some() {
                 continue;
@@ -89,6 +105,17 @@ impl AppState {
             sessions
                 .set_agent_id(&session, &descriptor.agent_id)
                 .await?;
+            // A restored runtime is newly visible in this daemon boot just like a freshly bound
+            // runtime. Replay the existing lifecycle fact through the buffered Gateway projection
+            // lane so a Gateway that reconnects after daemon startup can rebuild its roster from
+            // the current boot without polling Core or retaining stale pre-boot state.
+            self.ws
+                .emit(WsEvent::AgentSpawned {
+                    session_id: session,
+                    name: agent.name,
+                    agent_id: Some(descriptor.agent_id),
+                })
+                .await;
             restored += 1;
         }
         Ok(restored)
@@ -368,10 +395,23 @@ impl AppState {
         // loop before the turn executor is actually bound; pending mail would otherwise be claimed
         // and terminalized as `session not registered` milliseconds before startup completes.
         let harness_still_opening = self.agent.is_harness_alive(&row.session_id) == Some(false);
-        if row.kind == "agent"
-            && !externally_drained
-            && !self.inbox_subscription_owns_delivery(&row.session_id).await
-        {
+        if row.kind == "agent" && !externally_drained {
+            // The same stable session may first register as an external pull client and later
+            // acquire a daemon-managed transport. Retire that old ownership before making the
+            // harness loop wakeable; otherwise the active subscription suppresses the loop and
+            // strands every later delivery. Failure is fail-closed: never create two consumers.
+            if let Err(error) = nexus_store::repos::InboxSubscriptions::new(&self.store)
+                .mark_inactive_for_session(&row.session_id.0, now())
+                .await
+            {
+                tracing::error!(
+                    target: "nexus::delivery",
+                    session = %row.session_id,
+                    %error,
+                    "failed to retire external inbox ownership during managed transport rebind"
+                );
+                return;
+            }
             if harness_still_opening {
                 if let Some(wiring) = &self.loop_wiring {
                     wiring

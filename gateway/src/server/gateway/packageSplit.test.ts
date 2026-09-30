@@ -29,7 +29,7 @@ describe("gateway/webconsole package split", () => {
     expect(publishedGateway.scripts.build).toBe("npm run build:gateway-package");
     expect(publishedGateway.scripts["webconsole:dev"]).toBe("pnpm --dir webconsole dev");
     expect(publishedGateway.scripts["webconsole:build"]).toBe(
-      "node webconsole/build-webconsole.mjs",
+      "node ../scripts/nexus-version check && node webconsole/build-webconsole.mjs",
     );
   });
 
@@ -48,30 +48,42 @@ describe("gateway/webconsole package split", () => {
     const webconsole = readJson<PackageJson>("webconsole/package.json");
     expect(webconsole.name).toBe("@egregore/nexus-webui-workspace");
     expect(webconsole.scripts.dev).toBe("vite --config vite.config.ts");
-    expect(webconsole.scripts.build).toBe("node build-webconsole.mjs");
+    expect(webconsole.scripts.build).toBe(
+      "node ../../scripts/nexus-version check && node build-webconsole.mjs",
+    );
     expect(webconsole.scripts.dev).not.toContain("gateway-serve");
     expect(webconsole.scripts.build).not.toContain("gateway-serve");
   });
 
-  it("runs gateway-serve relative to its script path, not the caller cwd", () => {
+  it("loads the bundled client and server entries relative to the packaged script", () => {
     const source = readFileSync(join(root, "scripts/gateway-serve-impl.mjs"), "utf8");
-    expect(source).toContain("fileURLToPath(import.meta.url)");
-    expect(source).toContain("cwd: FRONTEND_DIR");
-    expect(source).toContain('import.meta.resolve("tsx/cli")');
-    expect(source).toContain("join(FRONTEND_DIR, \"dist/server/server.js\")");
+    expect(source).toContain(
+      "const FRONTEND_DIR = dirname(dirname(fileURLToPath(import.meta.url)))",
+    );
+    expect(source).toContain('const DIST_CLIENT_DIR = join(FRONTEND_DIR, "dist/client")');
+    expect(source).toContain(
+      'const DIST_SERVER_ENTRY = join(FRONTEND_DIR, "dist/server/server.js")',
+    );
+    expect(source).toContain('await cp(join(FRONTEND_DIR, "dist"), dir, { recursive: true })');
   });
 
   it("binds the packaged webconsole server instead of executing the generated handler", () => {
     const source = readFileSync(join(root, "scripts/gateway-serve-impl.mjs"), "utf8");
-    expect(source).toContain("startPackagedGateway(port)");
+    expect(source).toContain("startPackagedGateway(port, host)");
     // The handler loads from the run-scoped dist SNAPSHOT (deploy hygiene: an in-place
     // rebuild of dist/ must not yank modules from under the running server).
     expect(source).toContain('loadPackagedServerHandler(join(distDir, "server/server.js"))');
     expect(source).toContain("snapshotDistForRun()");
     expect(source).toContain("createHttpServer");
-    expect(source).toContain("attachAguiWsUpgrade(server");
-    expect(source).toContain("startGatewayProjectionService()");
+    expect(source).toContain("attachHeadlessGatewayWs,");
+    expect(source).toContain(
+      "await attachHeadlessGatewayWs(server, { fetchHandler: guardedHandler })",
+    );
+    expect(source).toContain("startGatewayProjectionService({");
     expect(source).toContain("stopGatewayProjectionService()");
+    expect(source).toContain("startGatewayHookService()");
+    expect(source).toContain("stopGatewayHookService()");
+    expect(source).toContain("closeSharedDaemonPushConnector()");
     expect(source).toContain("pathToFileURL(serverEntry).href");
     expect(source).not.toContain("spawn(process.execPath, [join(FRONTEND_DIR, \"dist/server/server.js\")]");
   });
@@ -83,7 +95,9 @@ describe("gateway/webconsole package split", () => {
     expect(source).toContain("server.on(\"connection\", (socket) => trackSocket(sockets, socket))");
     expect(source).toContain("server.on(\"upgrade\", (_req, socket) => trackSocket(sockets, socket))");
     expect(source).toContain("destroyTrackedSockets(sockets)");
-    expect(source).toContain("stopChildWithDeadline(child");
+    expect(source).toContain(
+      "await closeHttpServerWithDeadline(server, sockets, GATEWAY_CLOSE_TIMEOUT_MS)",
+    );
   });
 
   it("preserves duplicate Set-Cookie headers from registration responses", () => {

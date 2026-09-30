@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use nexus_common::{hash_runtime_credential, now, Config, NexusError};
 use nexus_contracts::admin::{AdminAssignRequest, AdminRenameRequest};
-use nexus_contracts::enums::{Presence, Tier};
+use nexus_contracts::enums::{Kind, Presence, Tier};
 use nexus_contracts::events::WsEvent;
 use nexus_contracts::ids::{AgentId, SessionId, ThreadId};
 use nexus_contracts::ports::{Caller, EventSink, IdentityPort};
@@ -12,8 +12,9 @@ use nexus_contracts::HarnessId;
 use nexus_contracts::MemberListRequest;
 use nexus_identity::{tier_guard, Identity};
 use nexus_store::repos::{
-    AgentCredentials, AgentGroups, Agents, DeveloperEvents, NewAgent, NewAgentCredential, Sessions,
-    Threads, Topics, AGENT_LIFECYCLE_TOPIC,
+    AgentCredentials, AgentGroups, AgentRuntimes, Agents, DeveloperEvents, NewAgent,
+    NewAgentCredential, NewAgentRuntime, NewSession, Sessions, Threads, Topics,
+    AGENT_LIFECYCLE_TOPIC,
 };
 use nexus_store::{DaemonStore, Store};
 
@@ -247,6 +248,118 @@ async fn register_binds_name_to_harness_session() {
 }
 
 #[tokio::test]
+async fn whoami_prefers_the_authenticated_session_agent_id_over_a_reused_name() {
+    let (identity, store, _sink) = fixture().await;
+    let registered = identity
+        .register(req("stale-name", "ck_stable_who"))
+        .await
+        .unwrap();
+    let stable_agent_id = registered.agent_id.clone().unwrap();
+    store
+        .identity_conn()
+        .execute(
+            "UPDATE agents SET name = 'current-name' WHERE agent_id = ?1",
+            libsql::params![stable_agent_id.0.clone()],
+        )
+        .await
+        .unwrap();
+    create_agent(&store, "a_reused_who_owner", "stale-name").await;
+    let caller = Caller {
+        agent_id: None,
+        session: registered.session_id,
+        name: "stale-name".into(),
+        project: "stale-project-metadata".into(),
+        tier: Tier::Agent,
+    };
+
+    let who = identity.whoami(&caller).await.unwrap();
+
+    assert_eq!(who.agent_id, Some(stable_agent_id));
+    assert_eq!(who.name.as_deref(), Some("current-name"));
+}
+
+#[tokio::test]
+async fn whoami_rejects_an_ambiguous_agent_fallback_for_an_idless_session() {
+    let (identity, store, _sink) = fixture().await;
+    store
+        .identity_conn()
+        .execute("DROP INDEX idx_agents_name_unique", ())
+        .await
+        .unwrap();
+    create_agent(&store, "a_fossil_one", "ambiguous-fossil").await;
+    create_agent(&store, "a_fossil_two", "ambiguous-fossil").await;
+    Sessions::new(&store)
+        .create(NewSession {
+            session_id: SessionId("s_ambiguous_fossil".into()),
+            name: Some("ambiguous-fossil".into()),
+            agent: Some("claude".into()),
+            kind: "agent".into(),
+            role: None,
+            tier: "agent".into(),
+            harness_session_id: None,
+            client_key: Some("ck_ambiguous_fossil".into()),
+            cwd: None,
+            project: "p_demo".into(),
+            transport: Some("pty".into()),
+        })
+        .await
+        .unwrap();
+    let caller = Caller {
+        agent_id: None,
+        session: SessionId("s_ambiguous_fossil".into()),
+        name: "ambiguous-fossil".into(),
+        project: "p_demo".into(),
+        tier: Tier::Agent,
+    };
+
+    let error = identity.whoami(&caller).await.unwrap_err();
+
+    assert_eq!(error.code, nexus_contracts::codes::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn members_rejects_an_ambiguous_agent_fallback_for_an_idless_session() {
+    let (identity, store, _sink) = fixture().await;
+    store
+        .identity_conn()
+        .execute("DROP INDEX idx_agents_name_unique", ())
+        .await
+        .unwrap();
+    create_agent(&store, "a_member_fossil_one", "ambiguous-member").await;
+    create_agent(&store, "a_member_fossil_two", "ambiguous-member").await;
+    Sessions::new(&store)
+        .create(NewSession {
+            session_id: SessionId("s_ambiguous_member".into()),
+            name: Some("ambiguous-member".into()),
+            agent: Some("claude".into()),
+            kind: "agent".into(),
+            role: None,
+            tier: "agent".into(),
+            harness_session_id: None,
+            client_key: None,
+            cwd: None,
+            project: "p_demo".into(),
+            transport: Some("pty".into()),
+        })
+        .await
+        .unwrap();
+
+    let error = identity
+        .members(
+            &caller(Tier::Admin),
+            MemberListRequest {
+                project: None,
+                include_offline: Some(true),
+                include_dead: Some(true),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, nexus_contracts::codes::INVALID_PARAMS);
+}
+
+#[tokio::test]
 async fn register_and_resume_emit_lifecycle_events_after_runtime_bind() {
     let (identity, store, sink) = fixture().await;
     let registered = identity.register(req("ben", "ck1")).await.unwrap();
@@ -305,6 +418,190 @@ async fn register_and_resume_emit_lifecycle_events_after_runtime_bind() {
 }
 
 #[tokio::test]
+async fn human_registration_never_materializes_an_agent_identity_or_runtime() {
+    let (identity, store, sink) = fixture().await;
+    let mut request = req("operator", "ck_human_operator");
+    request.kind = Some(Kind::Human);
+    request.tier = Tier::Admin;
+
+    let registered = identity.register(request.clone()).await.unwrap();
+    let resumed = identity.register(request).await.unwrap();
+
+    assert_eq!(resumed.session_id, registered.session_id);
+    assert_eq!(registered.agent_id, None);
+    assert_eq!(resumed.agent_id, None);
+    let row = Sessions::new(&store)
+        .find_by_session_id(&registered.session_id)
+        .await
+        .unwrap()
+        .expect("human session remains durable");
+    assert_eq!(row.kind, "human");
+    assert_eq!(row.agent_id, None);
+
+    for table in ["agents", "agent_runtimes"] {
+        let mut rows = store
+            .identity_conn()
+            .query(&format!("SELECT COUNT(*) FROM {table}"), ())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            0,
+            "human registration must not create {table} rows"
+        );
+    }
+    assert!(
+        sink.events.lock().unwrap().is_empty(),
+        "human registration must not emit agent fleet events"
+    );
+    let lifecycle_events = DeveloperEvents::new(&store)
+        .since(AGENT_LIFECYCLE_TOPIC, 0)
+        .await
+        .unwrap();
+    assert!(
+        lifecycle_events.is_empty(),
+        "human registration must not emit agent lifecycle facts: {lifecycle_events:?}"
+    );
+
+    let human = Caller {
+        agent_id: None,
+        session: registered.session_id.clone(),
+        name: "operator".into(),
+        project: "p_demo".into(),
+        tier: Tier::Admin,
+    };
+    assert_eq!(identity.whoami(&human).await.unwrap().agent_id, None);
+    assert!(
+        identity
+            .members(
+                &human,
+                MemberListRequest {
+                    project: None,
+                    include_offline: Some(true),
+                    include_dead: Some(true),
+                },
+            )
+            .await
+            .unwrap()
+            .members
+            .is_empty(),
+        "the agent roster must not include durable human principals"
+    );
+}
+
+#[tokio::test]
+async fn human_resume_scrubs_a_persisted_stale_agent_binding() {
+    let (identity, store, sink) = fixture().await;
+    let mut request = req("browser-user", "ck_stale_human_binding");
+    request.kind = Some(Kind::Human);
+    request.tier = Tier::Admin;
+
+    let registered = identity.register(request.clone()).await.unwrap();
+    create_agent(&store, "a_same_human_label", "browser-user").await;
+    Sessions::new(&store)
+        .set_agent_id(&registered.session_id, "a_same_human_label")
+        .await
+        .unwrap();
+    AgentRuntimes::new(&store)
+        .create(NewAgentRuntime {
+            runtime_id: registered.session_id.0.clone(),
+            agent_id: "a_same_human_label".into(),
+            harness: "claude".into(),
+            cwd: None,
+            transport: None,
+            presence: Some("online".into()),
+            active: true,
+        })
+        .await
+        .unwrap();
+
+    let persisted_human = Caller {
+        agent_id: Some(AgentId("a_same_human_label".into())),
+        session: registered.session_id.clone(),
+        name: "browser-user".into(),
+        project: "p_demo".into(),
+        tier: Tier::Admin,
+    };
+    assert_eq!(
+        identity.whoami(&persisted_human).await.unwrap().agent_id,
+        None,
+        "session kind is authoritative even before compatibility residue is scrubbed"
+    );
+
+    let resumed = identity.register(request).await.unwrap();
+
+    assert_eq!(resumed.session_id, registered.session_id);
+    assert_eq!(resumed.agent_id, None);
+    let row = Sessions::new(&store)
+        .find_by_session_id(&registered.session_id)
+        .await
+        .unwrap()
+        .expect("human session survives the compatibility scrub");
+    assert_eq!(row.kind, "human");
+    assert_eq!(row.agent_id, None);
+    assert!(AgentRuntimes::new(&store)
+        .find_by_runtime_id(&registered.session_id.0)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        Agents::new(&store)
+            .find_by_id("a_same_human_label")
+            .await
+            .unwrap()
+            .is_some(),
+        "scrubbing the impossible human runtime must not delete the durable agent"
+    );
+
+    let caller = Caller {
+        agent_id: None,
+        session: registered.session_id,
+        name: "browser-user".into(),
+        project: "p_demo".into(),
+        tier: Tier::Admin,
+    };
+    let who = identity.whoami(&caller).await.unwrap();
+    assert_eq!(who.agent_id, None);
+    assert_eq!(who.name.as_deref(), Some("browser-user"));
+    assert!(sink.events.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_human_registration_cannot_resume_an_agent_session_by_client_key() {
+    let (identity, store, _sink) = fixture().await;
+    let agent = identity
+        .register(req("agent-owner", "ck_kind_boundary"))
+        .await
+        .unwrap();
+    let before = Sessions::new(&store)
+        .find_by_session_id(&agent.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut human = req("browser-user", "ck_kind_boundary");
+    human.kind = Some(Kind::Human);
+    human.tier = Tier::Admin;
+
+    let error = identity.register(human).await.unwrap_err();
+
+    assert_eq!(error.code, nexus_contracts::codes::INVALID_PARAMS);
+    assert!(error.message.contains("belongs to session kind agent"));
+    let after = Sessions::new(&store)
+        .find_by_session_id(&agent.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.name, before.name);
+    assert_eq!(after.kind, "agent");
+    assert_eq!(after.client_key, before.client_key);
+    assert!(Sessions::new(&store)
+        .find_by_name_any_project("browser-user")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn register_succeeds_when_register_lifecycle_telemetry_fails() {
     let (identity, store, _sink) = fixture().await;
     fail_register_resume_lifecycle_events(&store).await;
@@ -349,6 +646,7 @@ async fn resolve_and_members_expose_stable_agent_id() {
         .members(
             &caller,
             MemberListRequest {
+                project: None,
                 include_offline: Some(true),
                 include_dead: None,
             },
@@ -362,6 +660,236 @@ async fn resolve_and_members_expose_stable_agent_id() {
         .expect("ben appears in members");
     assert_eq!(ben.agent_id, response.agent_id);
     assert_eq!(ben.session_id, response.session_id);
+}
+
+#[tokio::test]
+async fn members_uses_explicit_project_metadata_instead_of_the_callers_project() {
+    let (identity, _store, _sink) = fixture().await;
+    let registered = identity
+        .register(req_in("v015-codex", "ck_v015", "v015-lab"))
+        .await
+        .unwrap();
+    let request: MemberListRequest = serde_json::from_value(serde_json::json!({
+        "project": "v015-lab",
+        "includeOffline": true,
+    }))
+    .unwrap();
+
+    let members = identity
+        .members(&caller(Tier::Admin), request)
+        .await
+        .unwrap();
+
+    assert_eq!(members.members.len(), 1);
+    assert_eq!(members.members[0].agent_id, registered.agent_id);
+    assert_eq!(members.members[0].name.as_deref(), Some("v015-codex"));
+}
+
+#[tokio::test]
+async fn members_without_a_filter_returns_the_global_directory() {
+    let (identity, _store, _sink) = fixture().await;
+    let registered = identity
+        .register(req_in("v015-codex", "ck_v015", "v015-lab"))
+        .await
+        .unwrap();
+
+    let members = identity
+        .members(
+            &caller(Tier::Admin),
+            MemberListRequest {
+                project: None,
+                include_offline: Some(true),
+                include_dead: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(members.members.len(), 1);
+    assert_eq!(members.members[0].agent_id, registered.agent_id);
+}
+
+#[tokio::test]
+async fn resolve_finds_a_globally_unique_name_across_project_metadata() {
+    let (identity, _store, _sink) = fixture().await;
+    let registered = identity
+        .register(req_in("v015-codex", "ck_v015", "v015-lab"))
+        .await
+        .unwrap();
+
+    let resolved = identity.resolve("default", "v015-codex").await.unwrap();
+
+    assert_eq!(resolved.agent_id, registered.agent_id);
+    assert_eq!(resolved.session, registered.session_id);
+    assert_eq!(resolved.project, "v015-lab");
+}
+
+#[tokio::test]
+async fn resolve_treats_an_agent_id_as_authoritative_across_project_metadata() {
+    let (identity, _store, _sink) = fixture().await;
+    let registered = identity
+        .register(req_in("v015-codex", "ck_v015", "v015-lab"))
+        .await
+        .unwrap();
+    let agent_id = registered.agent_id.clone().unwrap();
+
+    let resolved = identity.resolve("default", &agent_id.0).await.unwrap();
+
+    assert_eq!(resolved.agent_id, Some(agent_id));
+    assert_eq!(resolved.name, "v015-codex");
+    assert_eq!(resolved.session, registered.session_id);
+}
+
+#[tokio::test]
+async fn resolve_preserves_a_known_name_that_looks_like_an_agent_id() {
+    let (identity, _store, _sink) = fixture().await;
+    let registered = identity
+        .register(req_in("a_display_alias", "ck_alias", "v015-lab"))
+        .await
+        .unwrap();
+
+    let resolved = identity
+        .resolve("default", "a_display_alias")
+        .await
+        .unwrap();
+
+    assert_eq!(resolved.agent_id, registered.agent_id);
+    assert_eq!(resolved.name, "a_display_alias");
+}
+
+#[tokio::test]
+async fn resolve_prefers_an_exact_agent_id_over_a_colliding_display_alias() {
+    let (identity, store, _sink) = fixture().await;
+    create_staged_agent_session(&store, "a_collision", "s_id_owner").await;
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET name = 'id-owner' WHERE agent_id = 'a_collision'",
+            (),
+        )
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET name = 'id-owner' WHERE session_id = 's_id_owner'",
+            (),
+        )
+        .await
+        .unwrap();
+    let alias_owner = identity
+        .register(req("a_collision", "ck_alias_owner"))
+        .await
+        .unwrap();
+
+    let resolved = identity.resolve("default", "a_collision").await.unwrap();
+
+    assert_eq!(resolved.agent_id, Some(AgentId("a_collision".into())));
+    assert_eq!(resolved.session, SessionId("s_id_owner".into()));
+    assert_eq!(resolved.name, "id-owner");
+    assert_ne!(resolved.agent_id, alias_owner.agent_id);
+}
+
+#[tokio::test]
+async fn members_prefers_the_session_agent_id_over_a_reused_stale_name() {
+    let (identity, store, _sink) = fixture().await;
+    let registered = identity
+        .register(req("stale-name", "ck_stable"))
+        .await
+        .unwrap();
+    let stable_agent_id = registered.agent_id.clone().unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE agents SET name = 'current-name' WHERE agent_id = ?1",
+            libsql::params![stable_agent_id.0.clone()],
+        )
+        .await
+        .unwrap();
+    create_agent(&store, "a_reused_name_owner", "stale-name").await;
+
+    let members = identity
+        .members(
+            &caller(Tier::Admin),
+            MemberListRequest {
+                project: None,
+                include_offline: Some(true),
+                include_dead: None,
+            },
+        )
+        .await
+        .unwrap();
+    let member = members
+        .members
+        .iter()
+        .find(|member| member.session_id == registered.session_id)
+        .expect("registered session remains in the directory");
+
+    assert_eq!(member.agent_id, Some(stable_agent_id));
+    assert_eq!(member.name.as_deref(), Some("stale-name"));
+}
+
+#[tokio::test]
+async fn resolve_preserves_a_globally_unique_legacy_session_name() {
+    let (identity, store, _sink) = fixture().await;
+    Sessions::new(&store)
+        .create(NewSession {
+            session_id: SessionId("s_legacy_human".into()),
+            name: Some("legacy-human".into()),
+            agent: None,
+            kind: "human".into(),
+            role: None,
+            tier: "admin".into(),
+            harness_session_id: None,
+            client_key: Some("ck_legacy_human".into()),
+            cwd: None,
+            project: "legacy-project".into(),
+            transport: None,
+        })
+        .await
+        .unwrap();
+
+    let resolved = identity.resolve("default", "legacy-human").await.unwrap();
+
+    assert_eq!(resolved.agent_id, None);
+    assert_eq!(resolved.session.0, "s_legacy_human");
+    assert_eq!(resolved.project, "legacy-project");
+}
+
+#[tokio::test]
+async fn resolve_rejects_ambiguous_legacy_session_names_across_projects() {
+    let (identity, store, _sink) = fixture().await;
+    store
+        .conn
+        .execute("DROP INDEX idx_sessions_name", ())
+        .await
+        .unwrap();
+    for (session_id, project) in [("s_legacy_a", "proj-a"), ("s_legacy_b", "proj-b")] {
+        Sessions::new(&store)
+            .create(NewSession {
+                session_id: SessionId(session_id.into()),
+                name: Some("legacy-human".into()),
+                agent: None,
+                kind: "human".into(),
+                role: None,
+                tier: "admin".into(),
+                harness_session_id: None,
+                client_key: Some(format!("ck_{session_id}")),
+                cwd: None,
+                project: project.into(),
+                transport: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let error = identity
+        .resolve("proj-a", "legacy-human")
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, nexus_contracts::codes::INVALID_PARAMS);
+    assert!(error.message.contains("ambiguous"));
 }
 
 #[tokio::test]
@@ -430,6 +958,109 @@ async fn rename_rekeys_legacy_membership_rows() {
     assert_eq!(group_names, vec!["oscar"]);
 }
 
+async fn seed_cross_project_group_aliases(store: &Store, target_agent_id: &str) {
+    store
+        .conn
+        .execute(
+            "INSERT INTO agent_group_members \
+             (project, group_name, agent_id, agent_name, assigned_at) VALUES \
+             ('p_demo', 'ops', ?1, 'olive', 1), \
+             ('p_other', 'ops', ?1, 'olive', 2), \
+             ('p_demo', 'ops', 'a_other_alias_owner', 'olive', 3)",
+            libsql::params![target_agent_id],
+        )
+        .await
+        .unwrap();
+}
+
+async fn assert_cross_project_group_aliases_follow_only_the_stable_id(store: &Store) {
+    let mut rows = store
+        .conn
+        .query(
+            "SELECT project, agent_id, agent_name FROM agent_group_members ORDER BY assigned_at",
+            (),
+        )
+        .await
+        .unwrap();
+    let mut values = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        values.push((
+            row.get::<String>(0).unwrap(),
+            row.get::<String>(1).unwrap(),
+            row.get::<String>(2).unwrap(),
+        ));
+    }
+    assert_eq!(
+        values,
+        vec![
+            ("p_demo".into(), "a_target_olive".into(), "oscar".into()),
+            ("p_other".into(), "a_target_olive".into(), "oscar".into()),
+            (
+                "p_demo".into(),
+                "a_other_alias_owner".into(),
+                "olive".into()
+            ),
+        ]
+    );
+}
+
+async fn rename_cross_project_group_aliases_by_stable_id(identity: &Identity, store: &Store) {
+    create_agent(store, "a_target_olive", "olive").await;
+    let mut request = req("olive", "ck_group_rename");
+    request.agent_id = Some(AgentId("a_target_olive".into()));
+    request.runtime_credential = Some("group-secret".into());
+    AgentCredentials::new(store)
+        .create_hash(NewAgentCredential {
+            credential_id: "cred_group_rename".into(),
+            agent_id: "a_target_olive".into(),
+            secret_hash: hash_runtime_credential("group-secret"),
+            purpose: Some("runtime".into()),
+            label: None,
+            scopes_json: r#"["runtime:register"]"#.into(),
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+    let registered = identity.register(request).await.unwrap();
+    seed_cross_project_group_aliases(store, "a_target_olive").await;
+    let row = Sessions::new(store)
+        .find_by_session_id(&registered.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let caller = Caller {
+        agent_id: Some(AgentId("a_target_olive".into())),
+        session: row.session_id,
+        name: "olive".into(),
+        project: row.project,
+        tier: Tier::Agent,
+    };
+
+    identity
+        .rename(
+            &caller,
+            RenameRequest {
+                name: "oscar".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_cross_project_group_aliases_follow_only_the_stable_id(store).await;
+}
+
+#[tokio::test]
+async fn rename_updates_group_aliases_globally_by_stable_id() {
+    let (identity, store, _sink) = fixture().await;
+    rename_cross_project_group_aliases_by_stable_id(&identity, &store).await;
+}
+
+#[tokio::test]
+async fn split_rename_updates_group_aliases_globally_by_stable_id() {
+    let (_directory, identity, store, _sink) = split_fixture().await;
+    rename_cross_project_group_aliases_by_stable_id(&identity, &store).await;
+}
+
 #[tokio::test]
 async fn rename_updates_identity_and_transport_authorities_in_split_mode() {
     let (_directory, identity, store, _sink) = split_fixture().await;
@@ -464,6 +1095,298 @@ async fn rename_updates_identity_and_transport_authorities_in_split_mode() {
         .await
         .unwrap()
         .is_some());
+}
+
+#[tokio::test]
+async fn assign_project_updates_identity_and_transport_authorities_in_split_mode() {
+    let (_directory, identity, store, _sink) = split_fixture().await;
+    let registered = identity
+        .register(req("olive", "ck_split_project"))
+        .await
+        .unwrap();
+    let agent_id = registered.agent_id.unwrap();
+    let session_id = registered.session_id;
+
+    let assigned = identity
+        .assign_project(&agent_id.0, "p_moved")
+        .await
+        .unwrap();
+
+    assert_eq!(assigned.name.as_deref(), Some("olive"));
+    assert_eq!(assigned.project, "p_moved");
+    assert_eq!(
+        Agents::new(&store)
+            .find_by_id(&agent_id.0)
+            .await
+            .unwrap()
+            .unwrap()
+            .project,
+        "p_moved"
+    );
+    assert_eq!(
+        Sessions::new(&store)
+            .find_by_session_id(&session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .project,
+        "p_moved"
+    );
+}
+
+#[tokio::test]
+async fn split_assign_project_compensates_transport_when_durable_write_fails() {
+    let (_directory, identity, store, sink) = split_fixture().await;
+    let registered = identity
+        .register(req("olive", "ck_split_project_compensate"))
+        .await
+        .unwrap();
+    let agent_id = registered.agent_id.unwrap();
+    store
+        .identity_conn()
+        .execute(
+            "CREATE TRIGGER fail_durable_project_move \
+             BEFORE UPDATE OF project ON agents WHEN NEW.project = 'p_failed' BEGIN \
+             SELECT RAISE(ABORT, 'forced durable project failure'); END",
+            (),
+        )
+        .await
+        .unwrap();
+    let events_before = sink.events.lock().unwrap().len();
+
+    let error = identity
+        .assign_project(&agent_id.0, "p_failed")
+        .await
+        .unwrap_err();
+
+    assert!(error.message.contains("forced durable project failure"));
+    assert_eq!(
+        Agents::new(&store)
+            .find_by_id(&agent_id.0)
+            .await
+            .unwrap()
+            .unwrap()
+            .project,
+        "p_demo"
+    );
+    assert_eq!(
+        Sessions::new(&store)
+            .find_by_session_id(&registered.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .project,
+        "p_demo"
+    );
+    assert_eq!(sink.events.lock().unwrap().len(), events_before);
+}
+
+#[tokio::test]
+async fn split_assign_project_surfaces_a_failed_transport_compensation() {
+    let (_directory, identity, store, sink) = split_fixture().await;
+    let registered = identity
+        .register(req("olive", "ck_split_project_rollback_failure"))
+        .await
+        .unwrap();
+    let agent_id = registered.agent_id.unwrap();
+    store
+        .identity_conn()
+        .execute(
+            "CREATE TRIGGER fail_durable_project_move_with_rollback \
+             BEFORE UPDATE OF project ON agents WHEN NEW.project = 'p_failed' BEGIN \
+             SELECT RAISE(ABORT, 'forced durable project failure'); END",
+            (),
+        )
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "CREATE TRIGGER fail_transport_project_rollback \
+             BEFORE UPDATE OF project ON sessions \
+             WHEN OLD.project = 'p_failed' AND NEW.project = 'p_demo' BEGIN \
+             SELECT RAISE(ABORT, 'forced transport rollback failure'); END",
+            (),
+        )
+        .await
+        .unwrap();
+    let events_before = sink.events.lock().unwrap().len();
+
+    let error = identity
+        .assign_project(&agent_id.0, "p_failed")
+        .await
+        .unwrap_err();
+
+    assert!(error.message.contains("forced durable project failure"));
+    assert!(error.message.contains("forced transport rollback failure"));
+    assert_eq!(
+        Agents::new(&store)
+            .find_by_id(&agent_id.0)
+            .await
+            .unwrap()
+            .unwrap()
+            .project,
+        "p_demo"
+    );
+    assert_eq!(
+        Sessions::new(&store)
+            .find_by_session_id(&registered.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .project,
+        "p_failed",
+        "failed compensation must be reported instead of pretending rollback succeeded"
+    );
+    assert_eq!(sink.events.lock().unwrap().len(), events_before);
+}
+
+#[tokio::test]
+async fn unified_assign_role_rolls_back_both_identity_and_session_on_failure() {
+    let (identity, store, sink) = fixture().await;
+    let registered = identity
+        .register(req("olive", "ck_unified_role_atomic"))
+        .await
+        .unwrap();
+    let agent_id = registered.agent_id.unwrap();
+    store
+        .conn
+        .execute(
+            "CREATE TRIGGER fail_unified_role_update \
+             BEFORE UPDATE OF role ON sessions WHEN NEW.role = 'lead' BEGIN \
+             SELECT RAISE(ABORT, 'forced transport role failure'); END",
+            (),
+        )
+        .await
+        .unwrap();
+    let events_before = sink.events.lock().unwrap().len();
+
+    let error = identity.assign_role(&agent_id.0, "lead").await.unwrap_err();
+
+    assert!(error.message.contains("forced transport role failure"));
+    assert_eq!(
+        Agents::new(&store)
+            .find_by_id(&agent_id.0)
+            .await
+            .unwrap()
+            .unwrap()
+            .role,
+        None
+    );
+    assert_eq!(
+        Sessions::new(&store)
+            .find_by_session_id(&registered.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .role,
+        None
+    );
+    assert_eq!(sink.events.lock().unwrap().len(), events_before);
+}
+
+#[tokio::test]
+async fn split_assign_role_compensates_transport_when_durable_write_fails() {
+    let (_directory, identity, store, sink) = split_fixture().await;
+    let registered = identity
+        .register(req("olive", "ck_split_role_compensate"))
+        .await
+        .unwrap();
+    let agent_id = registered.agent_id.unwrap();
+    store
+        .conn
+        .execute(
+            "CREATE TRIGGER fail_split_role_update \
+             BEFORE UPDATE OF role ON sessions WHEN NEW.role = 'lead' BEGIN \
+             SELECT RAISE(ABORT, 'forced transport role failure'); END",
+            (),
+        )
+        .await
+        .unwrap();
+    let events_before = sink.events.lock().unwrap().len();
+
+    let error = identity.assign_role(&agent_id.0, "lead").await.unwrap_err();
+
+    assert!(error.message.contains("forced transport role failure"));
+    assert_eq!(
+        Agents::new(&store)
+            .find_by_id(&agent_id.0)
+            .await
+            .unwrap()
+            .unwrap()
+            .role,
+        None
+    );
+    assert_eq!(
+        Sessions::new(&store)
+            .find_by_session_id(&registered.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .role,
+        None
+    );
+    assert_eq!(sink.events.lock().unwrap().len(), events_before);
+}
+
+#[tokio::test]
+async fn split_assign_role_surfaces_a_failed_transport_compensation() {
+    let (_directory, identity, store, sink) = split_fixture().await;
+    let registered = identity
+        .register(req("olive", "ck_split_role_rollback_failure"))
+        .await
+        .unwrap();
+    let agent_id = registered.agent_id.unwrap();
+    store
+        .identity_conn()
+        .execute(
+            "CREATE TRIGGER fail_split_role_update_with_rollback \
+             BEFORE UPDATE OF role ON agents WHEN NEW.role = 'lead' BEGIN \
+             SELECT RAISE(ABORT, 'forced durable role failure'); END",
+            (),
+        )
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "CREATE TRIGGER fail_transport_role_rollback \
+             BEFORE UPDATE OF role ON sessions \
+             WHEN OLD.role = 'lead' AND NEW.role IS NULL BEGIN \
+             SELECT RAISE(ABORT, 'forced transport role rollback failure'); END",
+            (),
+        )
+        .await
+        .unwrap();
+    let events_before = sink.events.lock().unwrap().len();
+
+    let error = identity.assign_role(&agent_id.0, "lead").await.unwrap_err();
+
+    assert!(error.message.contains("forced durable role failure"));
+    assert!(error
+        .message
+        .contains("forced transport role rollback failure"));
+    assert_eq!(
+        Agents::new(&store)
+            .find_by_id(&agent_id.0)
+            .await
+            .unwrap()
+            .unwrap()
+            .role,
+        None
+    );
+    assert_eq!(
+        Sessions::new(&store)
+            .find_by_session_id(&registered.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .role
+            .as_deref(),
+        Some("lead"),
+        "failed compensation must report the indeterminate split state"
+    );
+    assert_eq!(sink.events.lock().unwrap().len(), events_before);
 }
 
 #[tokio::test]
@@ -748,6 +1671,272 @@ async fn admin_rename_rejects_collision_by_agent_id_source() {
 }
 
 #[tokio::test]
+async fn admin_rename_falls_back_to_a_globally_unique_id_shaped_alias() {
+    let (identity, store, _sink) = fixture().await;
+    let registered = identity
+        .register(req("a_display_alias", "ck_id_shaped_alias"))
+        .await
+        .unwrap();
+    let actual_id = registered.agent_id.clone().unwrap();
+
+    let renamed = identity
+        .admin_rename(
+            &caller(Tier::Admin),
+            AdminRenameRequest {
+                source: "a_display_alias".into(),
+                target: "renamed-alias".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(renamed.agent_id, actual_id);
+    assert_eq!(renamed.name, "renamed-alias");
+    assert!(Agents::new(&store)
+        .find_by_id("a_display_alias")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn admin_rename_rejects_an_ambiguous_id_shaped_alias_without_writes() {
+    let (identity, store, _sink) = fixture().await;
+    store
+        .conn
+        .execute("DROP INDEX idx_agents_name_unique", ())
+        .await
+        .unwrap();
+    for (agent_id, project, created_at) in [("a_one", "one", 1_i64), ("a_two", "two", 2)] {
+        store
+            .conn
+            .execute(
+                "INSERT INTO agents (agent_id, project, name, default_harness, tier, created_at) \
+                 VALUES (?1, ?2, 'a_shared_alias', 'claude', 'agent', ?3)",
+                libsql::params![agent_id, project, created_at],
+            )
+            .await
+            .unwrap();
+    }
+
+    let error = identity
+        .admin_rename(
+            &caller(Tier::Admin),
+            AdminRenameRequest {
+                source: "a_shared_alias".into(),
+                target: "must-not-land".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, nexus_contracts::codes::INVALID_PARAMS);
+    assert!(error.message.contains("matches 2 identities"));
+    assert!(Agents::new(&store)
+        .find_by_name("must-not-land")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn admin_rename_rejects_an_ambiguous_idless_session_owner_without_writes() {
+    let (identity, store, _sink) = fixture().await;
+    Sessions::new(&store)
+        .create(NewSession {
+            session_id: SessionId("s_ambiguous_owner".into()),
+            name: Some("ambiguous-session-owner".into()),
+            agent: Some("claude".into()),
+            kind: "agent".into(),
+            role: None,
+            tier: "agent".into(),
+            harness_session_id: Some("hs_ambiguous_owner".into()),
+            client_key: Some("ck_ambiguous_owner".into()),
+            cwd: None,
+            project: "session-project".into(),
+            transport: Some("pty".into()),
+        })
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute("DROP INDEX idx_agents_name_unique", ())
+        .await
+        .unwrap();
+    for (agent_id, project, created_at) in [
+        ("a_session_owner_one", "one", 1_i64),
+        ("a_session_owner_two", "two", 2_i64),
+    ] {
+        store
+            .conn
+            .execute(
+                "INSERT INTO agents (agent_id, project, name, default_harness, tier, created_at) \
+                 VALUES (?1, ?2, 'ambiguous-session-owner', 'claude', 'agent', ?3)",
+                libsql::params![agent_id, project, created_at],
+            )
+            .await
+            .unwrap();
+    }
+
+    let error = identity
+        .admin_rename(
+            &caller(Tier::Admin),
+            AdminRenameRequest {
+                source: "s_ambiguous_owner".into(),
+                target: "must-not-land".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, nexus_contracts::codes::INVALID_PARAMS);
+    assert_eq!(
+        Sessions::new(&store)
+            .find_by_session_id(&SessionId("s_ambiguous_owner".into()))
+            .await
+            .unwrap()
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("ambiguous-session-owner")
+    );
+    assert!(Agents::new(&store)
+        .find_by_name("must-not-land")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn assign_role_prefers_an_exact_id_over_an_id_shaped_alias() {
+    let (identity, store, _sink) = fixture().await;
+    create_agent(&store, "a_exact_role", "exact-role-owner").await;
+    create_agent(&store, "a_role_alias_owner", "a_exact_role").await;
+
+    let assigned = identity.assign_role("a_exact_role", "lead").await.unwrap();
+    assert_eq!(assigned.name.as_deref(), Some("exact-role-owner"));
+    assert_eq!(
+        Agents::new(&store)
+            .find_by_id("a_exact_role")
+            .await
+            .unwrap()
+            .unwrap()
+            .role
+            .as_deref(),
+        Some("lead")
+    );
+    assert_eq!(
+        Agents::new(&store)
+            .find_by_id("a_role_alias_owner")
+            .await
+            .unwrap()
+            .unwrap()
+            .role,
+        None
+    );
+}
+
+#[tokio::test]
+async fn assign_project_prefers_an_exact_id_over_an_id_shaped_alias() {
+    let (identity, store, _sink) = fixture().await;
+    create_agent(&store, "a_exact_project", "exact-project-owner").await;
+    create_agent(&store, "a_project_alias_owner", "a_exact_project").await;
+    for (session_id, agent_id, name) in [
+        ("s_exact_project", "a_exact_project", "exact-project-owner"),
+        (
+            "s_project_alias",
+            "a_project_alias_owner",
+            "a_exact_project",
+        ),
+    ] {
+        Sessions::new(&store)
+            .create(NewSession {
+                session_id: SessionId(session_id.into()),
+                name: Some(name.into()),
+                agent: Some("claude".into()),
+                kind: "agent".into(),
+                role: None,
+                tier: "agent".into(),
+                harness_session_id: Some(format!("hs_{session_id}")),
+                client_key: Some(format!("ck_{session_id}")),
+                cwd: None,
+                project: "p_demo".into(),
+                transport: Some("pty".into()),
+            })
+            .await
+            .unwrap();
+        Sessions::new(&store)
+            .set_agent_id(&SessionId(session_id.into()), agent_id)
+            .await
+            .unwrap();
+    }
+
+    let assigned = identity
+        .assign_project("a_exact_project", "moved")
+        .await
+        .unwrap();
+    assert_eq!(assigned.name.as_deref(), Some("exact-project-owner"));
+    assert_eq!(
+        Sessions::new(&store)
+            .find_by_session_id(&SessionId("s_exact_project".into()))
+            .await
+            .unwrap()
+            .unwrap()
+            .project,
+        "moved"
+    );
+    assert_eq!(
+        Sessions::new(&store)
+            .find_by_session_id(&SessionId("s_project_alias".into()))
+            .await
+            .unwrap()
+            .unwrap()
+            .project,
+        "p_demo"
+    );
+}
+
+#[tokio::test]
+async fn assign_role_and_project_reject_ambiguous_global_aliases_without_writes() {
+    let (identity, store, _sink) = fixture().await;
+    store
+        .conn
+        .execute("DROP INDEX idx_agents_name_unique", ())
+        .await
+        .unwrap();
+    for (agent_id, project, created_at) in [("a_amb_one", "one", 1_i64), ("a_amb_two", "two", 2)] {
+        store
+            .conn
+            .execute(
+                "INSERT INTO agents (agent_id, project, name, default_harness, tier, created_at) \
+                 VALUES (?1, ?2, 'ambiguous-admin-alias', 'claude', 'agent', ?3)",
+                libsql::params![agent_id, project, created_at],
+            )
+            .await
+            .unwrap();
+    }
+
+    let role_error = identity
+        .assign_role("ambiguous-admin-alias", "lead")
+        .await
+        .unwrap_err();
+    let project_error = identity
+        .assign_project("ambiguous-admin-alias", "moved")
+        .await
+        .unwrap_err();
+    assert_eq!(role_error.code, nexus_contracts::codes::INVALID_PARAMS);
+    assert_eq!(project_error.code, nexus_contracts::codes::INVALID_PARAMS);
+    for (agent_id, project) in [("a_amb_one", "one"), ("a_amb_two", "two")] {
+        let row = Agents::new(&store)
+            .find_by_id(agent_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.role, None);
+        assert_eq!(row.project, project);
+    }
+}
+
+#[tokio::test]
 async fn register_with_agent_id_requires_runtime_credential() {
     let (identity, store, _sink) = fixture().await;
     create_agent(&store, "a_ben", "ben").await;
@@ -798,6 +1987,69 @@ async fn register_with_agent_id_verifies_runtime_credential() {
         credential.last_used_at.is_some(),
         "verified credential should be touched"
     );
+}
+
+#[tokio::test]
+async fn split_registration_rolls_back_both_authorities_when_runtime_binding_fails() {
+    let (_directory, identity, store, sink) = split_fixture().await;
+    create_agent(&store, "a_split_atomic", "split-atomic").await;
+    let credential_id = create_runtime_credential(
+        &store,
+        "a_split_atomic",
+        "split-atomic-secret",
+        r#"["runtime:register"]"#,
+    )
+    .await;
+    store
+        .identity_conn()
+        .execute(
+            "CREATE TRIGGER fail_split_atomic_runtime
+             BEFORE INSERT ON agent_runtimes
+             BEGIN
+               SELECT RAISE(ABORT, 'forced split runtime bind failure');
+             END",
+            (),
+        )
+        .await
+        .unwrap();
+
+    let mut request = req("split-atomic", "ck_split_atomic");
+    request.agent_id = Some(AgentId("a_split_atomic".into()));
+    request.runtime_credential = Some("split-atomic-secret".into());
+    assert!(identity.register(request).await.is_err());
+
+    assert!(Sessions::new(&store)
+        .find_by_client_key_any_project("ck_split_atomic")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(AgentRuntimes::new(&store)
+        .active_for_agent("a_split_atomic")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        AgentCredentials::new(&store)
+            .find_by_id(&credential_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used_at,
+        None
+    );
+    let lifecycle_count: i64 = store
+        .conn
+        .query("SELECT COUNT(*) FROM developer_events", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(lifecycle_count, 0);
+    assert!(sink.events.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

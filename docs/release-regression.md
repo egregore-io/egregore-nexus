@@ -29,6 +29,45 @@ pnpm --dir gateway build
 The public hygiene gate rejects private plans, operator paths, internal personas, secret-like state,
 assistant workflow artifacts, and attribution trailers from the public tree.
 
+## v0.1.5 host-isolation evidence
+
+Freeze the live host runtime before an isolated validation run, then compare it afterward:
+
+```bash
+scripts/nexus-v015-host-isolation-snapshot snapshot > host-before.json
+# Run the disposable validator without mounting the host Nexus home.
+scripts/nexus-v015-host-isolation-snapshot snapshot > host-after.json
+scripts/nexus-v015-host-isolation-snapshot compare host-before.json host-after.json
+```
+
+The snapshots contain only daemon boot/PID/executable identity, Gateway and Webconsole listener
+ownership, and daemon IPC path/inode metadata. Comparison ignores `capturedAt` and fails on any
+other drift. The script never reads or hashes Nexus or Gateway databases, WALs, or logs; tests use
+`--home` and `--proc-root` fixture seams instead of the live host runtime.
+
+## Webconsole lifecycle validation
+
+Validate the packed CLI lifecycle before browser checks, using a disposable home, stores, ports,
+and process tree isolated from installed services. Never attach to, restart, or signal host Nexus
+processes for this validation. Retain commands, exit statuses, bounded logs, and health/discovery
+observations tied to the exact candidate and packed artifacts.
+
+Required checks cover every `nexus webconsole` subcommand and its release parameters:
+
+- install and uninstall, including registration and removal of the isolated per-user service;
+- launch, including browser opening and `--no-open` behavior;
+- start and status, including repeat-start idempotency;
+- URL output;
+- logs, including bounded log following;
+- adoption after discovery metadata is missing;
+- restart, verifying replacement of the intended process and renewed health;
+- graceful stop and forced stop, verifying process and listener shutdown;
+- final healthy recovery after those lifecycle transitions.
+
+These are validation requirements, not a promise of a bundled acceptance runner or a claim that
+they have passed. CLI lifecycle evidence does not substitute for rendered-browser behavior,
+human-attribution, authentication, or WebSocket validation.
+
 ## Fresh-schema gates
 
 v0.1.0 supports fresh stores only. The release gate must prove:
@@ -48,7 +87,9 @@ Validate what users install, not only the checkout:
 - Cargo-pack and install the CLI/daemon graph from a clean directory;
 - pack `@egregore/nexus` and the single multi-platform `@egregore/nexus-cli` tarball;
 - pack and start `@egregore/nexus-gateway` plus its bundled WebUI without the source checkout;
-- verify `nexus --version` reports `0.1.0` and the revision when available;
+- read the expected release version from the candidate's root `VERSION` file and verify
+  `nexus --version` reports exactly `nexus <VERSION>`; record the source revision separately in
+  the immutable candidate manifest;
 - exercise `gateway start|status|logs|restart|stop`;
 - confirm a missing Gateway installation returns `GATEWAY_NOT_INSTALLED` and an install command.
 

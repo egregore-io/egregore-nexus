@@ -101,6 +101,8 @@ pub mod harness {
     pub const PROMPT: &str = "harness.prompt";
     /// Explicitly steer a native Codex turn without entering the normal prompt boundary queue.
     pub const STEER: &str = "harness.steer";
+    /// Interrupt the active turn without injecting replacement input.
+    pub const INTERRUPT: &str = "harness.interrupt";
     /// Pre-warm a harness runtime without injecting a prompt.
     pub const WARM: &str = "harness.warm";
     /// Trigger native context compaction on a harness session.

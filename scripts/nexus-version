@@ -1,0 +1,281 @@
+#!/usr/bin/env node
+
+import {
+  chmodSync,
+  existsSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const DEFAULT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const ROOT = resolve(process.env.NEXUS_VERSION_ROOT || DEFAULT_ROOT);
+const JSON_MANIFESTS = [
+  "gateway/package.json",
+  "gateway/gateway/package.json",
+  "gateway/webconsole/package.json",
+  "packages/nexus-cli/package.json",
+  "packages/nexus/package.json",
+];
+const VERSION_FILES = [
+  "core/Cargo.toml",
+  "core/Cargo.lock",
+  ...JSON_MANIFESTS,
+  "gateway/pnpm-lock.yaml",
+];
+
+class VersionError extends Error {}
+
+function usage() {
+  return `Usage: scripts/nexus-version <check|sync>
+
+Keep Cargo and npm distribution versions synchronized with the repository VERSION file.
+
+Commands:
+  check  Report drift without modifying files
+  sync   Atomically update supported manifests and lockfiles
+`;
+}
+
+function readRequired(relative) {
+  const path = join(ROOT, relative);
+  if (!existsSync(path)) throw new VersionError(`missing required file: ${relative}`);
+  try {
+    return readFileSync(path, "utf8");
+  } catch (error) {
+    throw new VersionError(`cannot read ${relative}: ${error.message}`);
+  }
+}
+
+function canonicalVersion() {
+  const text = readRequired("VERSION");
+  const match = text.match(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\n$/);
+  if (!match) {
+    throw new VersionError("VERSION must contain one stable SemVer value and a trailing newline");
+  }
+  return text.trim();
+}
+
+function replaceOnce(text, pattern, replacement, label) {
+  const matches = [...text.matchAll(pattern)];
+  if (matches.length !== 1) {
+    throw new VersionError(`${label} must match exactly once (found ${matches.length})`);
+  }
+  return text.replace(pattern, replacement);
+}
+
+function workspaceDetails(cargo) {
+  const memberMatch = cargo.match(/^members = (\[[^\n]+\])$/m);
+  if (!memberMatch) {
+    throw new VersionError("core/Cargo.toml must expose a one-line workspace member list");
+  }
+  let members;
+  try {
+    members = JSON.parse(memberMatch[1]);
+  } catch (error) {
+    throw new VersionError(`cannot parse Cargo workspace members: ${error.message}`);
+  }
+  if (!Array.isArray(members) || members.length === 0) {
+    throw new VersionError("Cargo workspace must contain at least one member");
+  }
+
+  const names = new Set();
+  for (const member of members) {
+    if (typeof member !== "string" || member.includes("*")) {
+      throw new VersionError(`unsupported Cargo workspace member: ${String(member)}`);
+    }
+    const relative = `core/${member}/Cargo.toml`;
+    const manifest = readRequired(relative);
+    const nameMatch = manifest.match(/^name = "([^"]+)"$/m);
+    if (!nameMatch) throw new VersionError(`${relative} must declare one package name`);
+    if (names.has(nameMatch[1])) {
+      throw new VersionError(`duplicate Cargo workspace package name: ${nameMatch[1]}`);
+    }
+    names.add(nameMatch[1]);
+  }
+  return names;
+}
+
+function transformCargo(cargo, version) {
+  let transformed = replaceOnce(
+    cargo,
+    /(\[workspace\.package\]\nversion = ")[^"]+("\n)/g,
+    `$1${version}$2`,
+    "Cargo workspace version",
+  );
+
+  const sectionStart = transformed.indexOf("[workspace.dependencies]\n");
+  if (sectionStart < 0) throw new VersionError("core/Cargo.toml is missing workspace dependencies");
+  const sectionEnd = transformed.indexOf("\n[", sectionStart + 1);
+  const before = transformed.slice(0, sectionStart);
+  const section = transformed.slice(sectionStart, sectionEnd < 0 ? undefined : sectionEnd);
+  const after = sectionEnd < 0 ? "" : transformed.slice(sectionEnd);
+  let pins = 0;
+  const updatedSection = section.replace(
+    /^(.*\bpath = "[^"]+".*\bversion = ")=[^"]+(".*)$/gm,
+    (_match, prefix, suffix) => {
+      pins += 1;
+      return `${prefix}=${version}${suffix}`;
+    },
+  );
+  if (pins === 0) throw new VersionError("Cargo workspace has no exact internal path pins");
+  transformed = `${before}${updatedSection}${after}`;
+  return transformed;
+}
+
+function transformCargoLock(lock, workspaceNames, version) {
+  const found = new Set();
+  const transformed = lock.replace(
+    /\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"/g,
+    (match, name) => {
+      if (!workspaceNames.has(name)) return match;
+      if (found.has(name)) throw new VersionError(`duplicate Cargo.lock workspace package: ${name}`);
+      found.add(name);
+      return `[[package]]\nname = "${name}"\nversion = "${version}"`;
+    },
+  );
+  const missing = [...workspaceNames].filter((name) => !found.has(name)).sort();
+  if (missing.length > 0) {
+    throw new VersionError(`Cargo.lock is missing workspace package(s): ${missing.join(", ")}`);
+  }
+  return transformed;
+}
+
+function transformJson(relative, text, version) {
+  let manifest;
+  try {
+    manifest = JSON.parse(text);
+  } catch (error) {
+    throw new VersionError(`cannot parse ${relative}: ${error.message}`);
+  }
+  if (typeof manifest.version !== "string") {
+    throw new VersionError(`${relative} is missing a string version`);
+  }
+  manifest.version = version;
+
+  const expectedDependencies = {
+    "gateway/package.json": ["@egregore/nexus-cli"],
+    "packages/nexus/package.json": ["@egregore/nexus-cli", "@egregore/nexus-gateway"],
+  }[relative] || [];
+  for (const dependency of expectedDependencies) {
+    if (typeof manifest.dependencies?.[dependency] !== "string") {
+      throw new VersionError(`${relative} is missing internal dependency ${dependency}`);
+    }
+    manifest.dependencies[dependency] = version;
+  }
+  return `${JSON.stringify(manifest, null, 2)}\n`;
+}
+
+function transformPnpmLock(lock, version) {
+  return replaceOnce(
+    lock,
+    /('@egregore\/nexus-cli':\n\s+specifier: )[^\n]+/g,
+    `$1${version}`,
+    "pnpm workspace Nexus CLI specifier",
+  );
+}
+
+function transformations() {
+  const version = canonicalVersion();
+  const originals = new Map(VERSION_FILES.map((relative) => [relative, readRequired(relative)]));
+  const cargo = originals.get("core/Cargo.toml");
+  const workspaceNames = workspaceDetails(cargo);
+  const outputs = new Map(originals);
+  outputs.set("core/Cargo.toml", transformCargo(cargo, version));
+  outputs.set(
+    "core/Cargo.lock",
+    transformCargoLock(originals.get("core/Cargo.lock"), workspaceNames, version),
+  );
+  for (const relative of JSON_MANIFESTS) {
+    outputs.set(relative, transformJson(relative, originals.get(relative), version));
+  }
+  outputs.set(
+    "gateway/pnpm-lock.yaml",
+    transformPnpmLock(originals.get("gateway/pnpm-lock.yaml"), version),
+  );
+  return { version, originals, outputs };
+}
+
+function changedFiles(originals, outputs) {
+  return [...outputs].filter(([relative, output]) => originals.get(relative) !== output);
+}
+
+function syncFiles(originals, outputs) {
+  const changed = changedFiles(originals, outputs);
+  const staged = [];
+  const replaced = [];
+  try {
+    for (const [relative, output] of changed) {
+      const target = join(ROOT, relative);
+      const temporary = join(dirname(target), `.${basename(target)}.nexus-version-${process.pid}`);
+      const mode = statSync(target).mode;
+      writeFileSync(temporary, output, { encoding: "utf8", mode });
+      chmodSync(temporary, mode);
+      staged.push({ relative, target, temporary, mode });
+    }
+    for (const item of staged) {
+      renameSync(item.temporary, item.target);
+      replaced.push(item);
+    }
+  } catch (error) {
+    for (const item of [...replaced].reverse()) {
+      const rollback = `${item.temporary}.rollback`;
+      writeFileSync(rollback, originals.get(item.relative), { encoding: "utf8", mode: item.mode });
+      chmodSync(rollback, item.mode);
+      renameSync(rollback, item.target);
+    }
+    throw new VersionError(`failed to synchronize version files: ${error.message}`);
+  } finally {
+    for (const item of staged) rmSync(item.temporary, { force: true });
+  }
+  return changed.map(([relative]) => relative);
+}
+
+function main() {
+  const args = process.argv.slice(2);
+  if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) {
+    process.stdout.write(usage());
+    return 0;
+  }
+  if (args.length !== 1 || !["check", "sync"].includes(args[0])) {
+    process.stderr.write(usage());
+    return 2;
+  }
+
+  const { version, originals, outputs } = transformations();
+  const changed = changedFiles(originals, outputs);
+  if (args[0] === "check") {
+    if (changed.length > 0) {
+      for (const [relative] of changed) {
+        process.stderr.write(`version drift: ${relative} (expected ${version})\n`);
+      }
+      process.stderr.write("run scripts/nexus-version sync and commit the resulting diff\n");
+      return 1;
+    }
+    process.stdout.write(`Nexus version ${version} is synchronized\n`);
+    return 0;
+  }
+
+  const written = syncFiles(originals, outputs);
+  if (written.length === 0) {
+    process.stdout.write(`Nexus version ${version} is already synchronized\n`);
+  } else {
+    process.stdout.write(`Synchronized Nexus version ${version}: ${written.join(", ")}\n`);
+  }
+  return 0;
+}
+
+try {
+  process.exitCode = main();
+} catch (error) {
+  if (error instanceof VersionError) {
+    process.stderr.write(`error: ${error.message}\n`);
+    process.exitCode = 2;
+  } else {
+    throw error;
+  }
+}

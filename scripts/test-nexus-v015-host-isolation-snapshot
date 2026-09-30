@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""Fixture-only contract tests for the v0.1.5 host-isolation snapshot."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+import socket
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = ROOT / "scripts/nexus-v015-host-isolation-snapshot"
+TRACKED_FILES = (
+    "daemon.pid",
+    "daemon-ipc-endpoint.json",
+    "gateway.json",
+    "webconsole.json",
+    "nexus.db",
+    "nexus.db-wal",
+    "nexus.db-shm",
+    "gateway.db",
+    "gateway.db-wal",
+    "gateway.db-shm",
+)
+
+
+class Fixture:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.home = root / "home"
+        self.proc = root / "proc"
+        self.binaries = root / "binaries"
+        self.home.mkdir()
+        (self.proc / "net").mkdir(parents=True)
+        self.binaries.mkdir()
+        self.socket = socket.socket(socket.AF_UNIX)
+        self.ipc_path = self.home / "daemon-ipc.sock"
+        self.socket.bind(str(self.ipc_path))
+
+        self.processes = {
+            "daemon": (101, b"daemon executable\n"),
+            "gateway": (202, b"gateway executable\n"),
+            "webconsole": (303, b"webconsole executable\n"),
+        }
+        for name, (pid, executable_bytes) in self.processes.items():
+            executable = self.binaries / name
+            executable.write_bytes(executable_bytes)
+            process_root = self.proc / str(pid)
+            (process_root / "fd").mkdir(parents=True)
+            (process_root / "exe").symlink_to(executable)
+
+        (self.proc / "202/fd/7").symlink_to("socket:[7001]")
+        (self.proc / "303/fd/8").symlink_to("socket:[7002]")
+        (self.proc / "net/tcp").write_text(
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when "
+            "retrnsmt   uid  timeout inode\n"
+            + tcp_listener_line(0, "0100007F", 4100, 7001)
+            + tcp_listener_line(1, "0100007F", 4200, 7002),
+            encoding="utf-8",
+        )
+        (self.proc / "net/tcp6").write_text(
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when "
+            "retrnsmt   uid  timeout inode\n",
+            encoding="utf-8",
+        )
+
+        (self.home / "daemon.pid").write_text("101\n", encoding="utf-8")
+        write_json(
+            self.home / "daemon-ipc-endpoint.json",
+            {
+                "version": 1,
+                "path": str(self.ipc_path),
+                "token": "must-not-leak",
+                "daemonBootId": "boot_fixture",
+                "createdAt": 1,
+            },
+        )
+        write_json(
+            self.home / "gateway.json",
+            {
+                "instanceId": "inst_fixture",
+                "url": "http://127.0.0.1:4100",
+                "port": 4100,
+                "authMode": "local",
+                "pid": 202,
+                "boundAt": 2,
+            },
+        )
+        write_json(
+            self.home / "webconsole.json",
+            {
+                "pid": 303,
+                "host": "127.0.0.1",
+                "port": 4200,
+                "url": "http://127.0.0.1:4200",
+                "gatewayUrl": "http://127.0.0.1:4100",
+                "executable": "/discovery/value/is/not/process/exe",
+            },
+        )
+
+    def close(self) -> None:
+        self.socket.close()
+
+    def command(self, *args: str) -> subprocess.CompletedProcess[str]:
+        env = {
+            **os.environ,
+            "HOME": str(self.root / "unused-home"),
+            "NEXUS_HOME": str(self.home),
+            "NEXUS_HOST_ISOLATION_PROC_ROOT": str(self.proc),
+        }
+        return subprocess.run(
+            [str(SCRIPT), *args],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+
+    def expected_snapshot(self) -> dict[str, object]:
+        def process(name: str) -> dict[str, object]:
+            pid, executable_bytes = self.processes[name]
+            return {
+                "pid": pid,
+                "executable": str((self.binaries / name).resolve()),
+                "sha256": hashlib.sha256(executable_bytes).hexdigest(),
+            }
+
+        daemon = {**process("daemon"), "bootId": "boot_fixture"}
+        gateway = {
+            **process("gateway"),
+            "listener": "tcp://127.0.0.1:4100 inode=7001 owner=202",
+        }
+        webconsole = {
+            **process("webconsole"),
+            "listener": "tcp://127.0.0.1:4200 inode=7002 owner=303",
+        }
+
+        def file_identity(name: str) -> dict[str, object]:
+            path = self.home / name
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                return {
+                    "kind": "missing",
+                    "device": 0,
+                    "inode": 0,
+                    "mode": 0,
+                    "uid": 0,
+                    "gid": 0,
+                    "nlink": 0,
+                    "size": 0,
+                    "mtimeNs": 0,
+                    "ctimeNs": 0,
+                }
+            if path.is_fifo():
+                kind = "fifo"
+            elif path.is_file():
+                kind = "regular"
+            else:
+                kind = "other"
+            return {
+                "kind": kind,
+                "device": info.st_dev,
+                "inode": info.st_ino,
+                "mode": info.st_mode,
+                "uid": info.st_uid,
+                "gid": info.st_gid,
+                "nlink": info.st_nlink,
+                "size": info.st_size,
+                "mtimeNs": info.st_mtime_ns,
+                "ctimeNs": info.st_ctime_ns,
+            }
+        return {
+            "daemon": daemon,
+            "gateway": gateway,
+            "webconsole": webconsole,
+            "ipc": {"path": str(self.ipc_path), "inode": self.ipc_path.stat().st_ino},
+            "files": {name: file_identity(name) for name in TRACKED_FILES},
+        }
+
+
+def tcp_listener_line(index: int, address: str, port: int, inode: int) -> str:
+    return (
+        f" {index:3d}: {address}:{port:04X} 00000000:0000 0A "
+        f"00000000:00000000 00:00000000 00000000  1000 0 {inode} 1\n"
+    )
+
+
+def write_json(path: Path, value: object) -> None:
+    path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+
+
+class HostIsolationSnapshotTest(unittest.TestCase):
+    def setUp(self) -> None:
+        if not SCRIPT.is_file():
+            self.fail(f"implementation script is missing: {SCRIPT}")
+        self.temporary = tempfile.TemporaryDirectory(prefix="nexus-host-isolation-")
+        self.fixture = Fixture(Path(self.temporary.name))
+
+    def tearDown(self) -> None:
+        if hasattr(self, "fixture"):
+            self.fixture.close()
+        if hasattr(self, "temporary"):
+            self.temporary.cleanup()
+
+    def test_help_is_successful_and_does_not_read_or_write_runtime_state(self) -> None:
+        runtime = self.fixture.home / "gateway.json"
+        before = runtime.read_bytes()
+        env = {
+            **os.environ,
+            "HOME": str(self.fixture.root / "missing-home"),
+            "NEXUS_HOME": str(self.fixture.root / "missing-nexus-home"),
+            "NEXUS_HOST_ISOLATION_PROC_ROOT": str(self.fixture.root / "missing-proc"),
+        }
+
+        result = subprocess.run(
+            [str(SCRIPT), "--help"],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage:", result.stdout.lower())
+        self.assertEqual(runtime.read_bytes(), before)
+        self.assertFalse((self.fixture.root / "missing-home").exists())
+        self.assertFalse((self.fixture.root / "missing-nexus-home").exists())
+
+    def test_snapshot_records_only_discovery_and_proc_identity(self) -> None:
+        database_marker = "database-content-must-never-appear"
+        # Any attempt to open this test-only FIFO for reading blocks until the subprocess timeout.
+        # A passing snapshot therefore proves the implementation did not inspect the database.
+        os.mkfifo(self.fixture.home / "nexus.db")
+        (self.fixture.home / "gateway.db-wal").write_text(database_marker, encoding="utf-8")
+
+        result = self.fixture.command()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snapshot = json.loads(result.stdout)
+        captured_at = snapshot.pop("capturedAt")
+        self.assertIsInstance(captured_at, int)
+        self.assertGreater(captured_at, 0)
+        self.assertEqual(snapshot, self.fixture.expected_snapshot())
+        self.assertNotIn("must-not-leak", result.stdout)
+        self.assertNotIn(database_marker, result.stdout)
+
+    def test_database_metadata_changes_fail_host_isolation_comparison(self) -> None:
+        database = self.fixture.home / "nexus.db"
+        gateway_database = self.fixture.home / "gateway.db"
+        database.write_bytes(b"before daemon state")
+        gateway_database.write_bytes(b"before gateway state")
+        before_result = self.fixture.command("snapshot")
+        self.assertEqual(before_result.returncode, 0, before_result.stderr)
+
+        database.write_bytes(b"after daemon state with different bytes")
+        gateway_database.write_bytes(b"after gateway state with different bytes")
+        after_result = self.fixture.command("snapshot")
+        self.assertEqual(after_result.returncode, 0, after_result.stderr)
+
+        before_path = self.fixture.root / "before.json"
+        after_path = self.fixture.root / "after.json"
+        before_path.write_text(before_result.stdout, encoding="utf-8")
+        after_path.write_text(after_result.stdout, encoding="utf-8")
+        comparison = self.fixture.command("compare", str(before_path), str(after_path))
+
+        self.assertEqual(comparison.returncode, 1)
+        self.assertIn("files.nexus.db", comparison.stderr)
+        self.assertIn("files.gateway.db", comparison.stderr)
+
+    def test_missing_runtime_components_use_the_empty_contract_shape(self) -> None:
+        empty_home = self.fixture.root / "empty-home"
+        empty_proc = self.fixture.root / "empty-proc"
+        empty_home.mkdir()
+        (empty_proc / "net").mkdir(parents=True)
+        for table in ("tcp", "tcp6"):
+            (empty_proc / "net" / table).write_text("header\n", encoding="utf-8")
+
+        result = subprocess.run(
+            [str(SCRIPT), "--home", str(empty_home), "--proc-root", str(empty_proc)],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snapshot = json.loads(result.stdout)
+        self.assertEqual(
+            {key: value for key, value in snapshot.items() if key != "capturedAt"},
+            {
+                "daemon": {"pid": 0, "bootId": "", "executable": "", "sha256": ""},
+                "gateway": {
+                    "pid": 0,
+                    "listener": "",
+                    "executable": "",
+                    "sha256": "",
+                },
+                "webconsole": {
+                    "pid": 0,
+                    "listener": "",
+                    "executable": "",
+                    "sha256": "",
+                },
+                "ipc": {"path": "", "inode": 0},
+                "files": {
+                    name: {
+                        "kind": "missing",
+                        "device": 0,
+                        "inode": 0,
+                        "mode": 0,
+                        "uid": 0,
+                        "gid": 0,
+                        "nlink": 0,
+                        "size": 0,
+                        "mtimeNs": 0,
+                        "ctimeNs": 0,
+                    }
+                    for name in TRACKED_FILES
+                },
+            },
+        )
+
+    def test_snapshot_fails_when_discovered_listener_is_not_owned_by_pid(self) -> None:
+        (self.fixture.proc / "202/fd/7").unlink()
+
+        result = self.fixture.command()
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("gateway listener", result.stderr)
+        self.assertIn("pid 202", result.stderr)
+
+    def test_snapshot_accepts_listener_owned_by_discovered_process_child(self) -> None:
+        (self.fixture.proc / "202/fd/7").unlink()
+        child_fd = self.fixture.proc / "212/fd"
+        child_fd.mkdir(parents=True)
+        (child_fd / "9").symlink_to("socket:[7001]")
+        (self.fixture.proc / "212/status").write_text(
+            "Name:\tgateway-worker\nPPid:\t202\n",
+            encoding="utf-8",
+        )
+
+        result = self.fixture.command()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        snapshot = json.loads(result.stdout)
+        self.assertEqual(
+            snapshot["gateway"]["listener"],
+            "tcp://127.0.0.1:4100 inode=7001 owner=212",
+        )
+
+    def test_snapshot_rejects_listener_owned_by_a_different_process(self) -> None:
+        (self.fixture.proc / "202/fd/7").unlink()
+        other_fd = self.fixture.proc / "999/fd"
+        other_fd.mkdir(parents=True)
+        (other_fd / "9").symlink_to("socket:[7001]")
+
+        result = self.fixture.command()
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("gateway listener", result.stderr)
+        self.assertIn("pid 202", result.stderr)
+
+    def test_compare_ignores_only_capture_time(self) -> None:
+        before = {**self.fixture.expected_snapshot(), "capturedAt": 10}
+        after = {**copy.deepcopy(before), "capturedAt": 20}
+        before_path = self.fixture.root / "before.json"
+        after_path = self.fixture.root / "after.json"
+        write_json(before_path, before)
+        write_json(after_path, after)
+
+        result = self.fixture.command("compare", str(before_path), str(after_path))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unchanged", result.stdout)
+
+    def test_compare_fails_on_each_host_identity_drift(self) -> None:
+        baseline = {**self.fixture.expected_snapshot(), "capturedAt": 10}
+        changes = {
+            "daemon PID": ("daemon", "pid", 999),
+            "daemon boot ID": ("daemon", "bootId", "boot_changed"),
+            "executable hash": ("gateway", "sha256", "0" * 64),
+            "listener owner": (
+                "webconsole",
+                "listener",
+                "tcp://127.0.0.1:4200 inode=7002 owner=999",
+            ),
+            "socket inode": ("ipc", "inode", 999),
+        }
+        before_path = self.fixture.root / "before.json"
+        write_json(before_path, baseline)
+
+        for label, (section, field, replacement) in changes.items():
+            with self.subTest(label=label):
+                after = copy.deepcopy(baseline)
+                after[section][field] = replacement
+                after["capturedAt"] = 20
+                after_path = self.fixture.root / f"after-{field}.json"
+                write_json(after_path, after)
+
+                result = self.fixture.command("compare", str(before_path), str(after_path))
+
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"{section}.{field}", result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

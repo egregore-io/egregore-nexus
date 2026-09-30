@@ -191,6 +191,7 @@ async fn launch_autobinds_pty_but_durable_dm_fails_before_raw_write() {
             summary: None,
             body: "ping from ben".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         },
     )

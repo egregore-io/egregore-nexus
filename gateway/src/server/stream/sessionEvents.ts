@@ -18,6 +18,9 @@ export function handleSessionEvents(
   const view = sessionView(url.searchParams.get("view"));
   if (!view) return json({ error: { code: "bad_request", message: "view must be nexus, agui, or terminal" } }, 400);
   const after = url.searchParams.get("after") ?? undefined;
+  const legacyAfterId = url.searchParams.has("afterId")
+    ? (url.searchParams.get("afterId") ?? "")
+    : undefined;
   const fanout = deps.fanout ?? sessionFanout;
   const text = new TextEncoder();
   const agui = view === "agui" ? new AguiSessionView(sessionId) : undefined;
@@ -31,6 +34,7 @@ export function handleSessionEvents(
       subscription = fanout.subscribe(sessionId, {
         view,
         after,
+        legacyAfterId,
         onFrame(frame) {
           if (view === "nexus") {
             const payload = nexusView(frame);
@@ -40,13 +44,16 @@ export function handleSessionEvents(
             if (payload) send(payload);
           } else {
             const projected = agui!.project(frame);
-            for (const event of projected?.events ?? []) {
-              controller.enqueue(text.encode(encoder!.encodeSSE({
+            const encoded = (projected?.events ?? []).map((event) => (
+              encoder!.encodeSSE({
                 ...event,
                 cursor: projected!.cursor,
                 epoch: projected!.epoch,
-              })));
-            }
+              })
+            ));
+            // Preserve one stream chunk per semantic fanout cursor. The WebSocket relay can then
+            // accept or reject the complete projection group without advancing partway through it.
+            if (encoded.length > 0) controller.enqueue(text.encode(encoded.join("")));
           }
         },
         onError(error) {

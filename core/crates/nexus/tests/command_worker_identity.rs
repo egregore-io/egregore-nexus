@@ -846,6 +846,7 @@ async fn rename_keeps_mcp_and_cli_env_writes_live_and_canonically_attributed() {
             summary: None,
             body: "identity continuity after rename".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: Some("rename-continuity-send".into()),
         })
         .unwrap(),

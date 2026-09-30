@@ -151,7 +151,8 @@ impl<'a> Messages<'a> {
             .conn
             .query(
                 "SELECT message_id, from_name, from_agent_id, to_name, to_agent_id, kind, \
-                 thread_id, topic, summary, body, provenance, project, created_at \
+                 thread_id, topic, summary, body, provenance, project, created_at, metadata_json, \
+                 mention_json \
                  FROM messages WHERE message_id = ?1 LIMIT 1",
                 params![id.0.clone()],
             )
@@ -164,6 +165,16 @@ impl<'a> Messages<'a> {
         let provenance_raw = get_text(&row, 10)?;
         let provenance: Provenance = serde_json::from_str(&provenance_raw).map_err(store_msg)?;
         let occurred_at = get_opt_int(&row, 12)?.unwrap_or(0);
+        let metadata = get_opt_text(&row, 13)?
+            .map(|raw| serde_json::from_str::<serde_json::Value>(&raw))
+            .transpose()
+            .map_err(store_msg)?
+            .unwrap_or_else(|| serde_json::json!({}));
+        let mention = get_opt_text(&row, 14)?
+            .map(|raw| serde_json::from_str::<Vec<String>>(&raw))
+            .transpose()
+            .map_err(store_msg)?
+            .unwrap_or_default();
         let payload = serde_json::json!({
             "messageId": message_id,
             "fromName": get_text(&row, 1)?,
@@ -179,6 +190,8 @@ impl<'a> Messages<'a> {
                 .map_err(store_msg)?,
             "project": get_text(&row, 11)?,
             "createdAt": occurred_at,
+            "metadata": metadata,
+            "mention": mention,
         });
         let mut effects = vec![GatewayProjectionEffect {
             event_id: format!("message:{message_id}"),

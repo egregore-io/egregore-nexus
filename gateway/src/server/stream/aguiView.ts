@@ -1,4 +1,4 @@
-import type { BaseEvent } from "@ag-ui/client";
+import { EventType, type BaseEvent } from "@ag-ui/client";
 
 import { runFinished, runStarted, agentSessionThreadId } from "../agui/_sseCore";
 import {
@@ -28,7 +28,19 @@ export class AguiSessionView {
     if (frame.lane === "gap") {
       this.open = false;
       this.bracket = newBracket();
-      return { cursor: frame.cursor, epoch: frame.epoch, events: [] };
+      return {
+        cursor: frame.cursor,
+        epoch: frame.epoch,
+        events: [{
+          type: EventType.CUSTOM,
+          name: "nexus.session.resync",
+          value: {
+            reason: frame.reason,
+            cursor: frame.cursor,
+            daemonBootId: frame.epoch,
+          },
+        } as BaseEvent],
+      };
     }
     const update = frame.event as AgentUpdateEvent;
     const events: BaseEvent[] = [];

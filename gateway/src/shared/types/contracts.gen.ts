@@ -493,7 +493,7 @@ export enum CommandQueueAction {
 
 /** Request for one server-owned queue mutation. Fields not used by the selected action are absent. */
 export interface CommandQueueMutationRequest {
-	name: string;
+	name?: string;
 	agentId?: AgentId;
 	action: CommandQueueAction;
 	clientMutationId: string;
@@ -542,7 +542,7 @@ export interface CommandQueueSnapshot {
 	/** Derived exclusively from the durable normalized session-turn projection. */
 	turnActive: boolean;
 	steerCapability: SteerCapability;
-	/** Monotonic project queue cursor used as the reconnect `afterSeq` boundary. */
+	/** Monotonic global queue cursor used as the reconnect `afterSeq` boundary. */
 	seq: number;
 	/** Queue revision. It advances with `seq`; named separately for compare-and-set UI state. */
 	revision: number;
@@ -555,6 +555,11 @@ export interface CommandQueueTransition {
 	sessionId?: string;
 	commandId: string;
 	clientMessageId?: string;
+	commandKind: string;
+	callerName: string;
+	callerSessionId?: string;
+	callerAgentId?: AgentId;
+	callerKind?: string;
 	state: CommandQueueState;
 	mode: string;
 	revision: number;
@@ -570,6 +575,8 @@ export interface CompactRequest {
 	agentId?: AgentId;
 	/** The target agent's registered name fallback (resolved to its live session). */
 	name: string;
+	/** Client-generated id used to correlate the terminal command receipt. */
+	clientMessageId?: string;
 }
 
 /** Response: whether compaction was started (completion streams via observe). */
@@ -774,6 +781,24 @@ export interface DlqRequeueRequest {
 	since?: string;
 }
 
+/** Hook capability advertised by the local Gateway during stream negotiation. */
+export interface GatewayHookCapabilities {
+	protocolVersion: number;
+	generation: string;
+	events: string[];
+}
+
+/** Event-specific payload carried by one correlated daemon-to-Gateway evaluation. */
+export type HookEvaluationRequest =
+	| { event: "before_send", request: HookBeforeSendRequest }
+	| { event: "after_receipt", request: HookAfterReceiptRequest };
+
+/** One daemon request on the private correlated hook lane. */
+export interface GatewayHookEvaluation {
+	correlationId: string;
+	request: HookEvaluationRequest;
+}
+
 /** Gateway's durable projection watermark for one daemon boot epoch. */
 export interface GatewayProjectionAck {
 	daemonEpoch: string;
@@ -863,6 +888,83 @@ export interface HistoryResponse {
 	entries: HistoryEntry[];
 }
 
+/** Authenticated sender identity visible to a hook but immutable in hook output. */
+export interface HookSender {
+	agentId?: AgentId;
+	name: string;
+}
+
+/** Canonical message document passed through the hook pipeline. */
+export interface HookMessage {
+	sender: HookSender;
+	target: SendTarget;
+	body: string;
+	summary?: string;
+	mention?: string[];
+	metadata?: Record<string, unknown>;
+}
+
+/** Compact, signed execution provenance attached by Gateway after validating hook output. */
+export interface HookExecutedBy {
+	hookId: string;
+	entrypoint: string;
+	runtime: string;
+	artifactDigest: string;
+	invocationId: string;
+	outcome: string;
+	attestation: any;
+}
+
+/** Gateway-local invocation after the canonical send receipt exists. */
+export interface HookAfterReceiptRequest {
+	invocationId: string;
+	message: HookMessage;
+	receipt: Ack;
+	executedBy?: HookExecutedBy[];
+}
+
+/** Allowed `after_receipt` output. Message content and timing are immutable at this boundary. */
+export interface HookAfterReceiptResult {
+	invocationId: string;
+	metadata?: Record<string, unknown>;
+	executedBy?: HookExecutedBy[];
+}
+
+/** Correlated request from the daemon for a new logical send. */
+export interface HookBeforeSendRequest {
+	evaluationId: string;
+	message: HookMessage;
+}
+
+/** Terminal pipeline decision. Omitted hook output defaults to continuing the send. */
+export enum HookAction {
+	Continue = "continue",
+	Reject = "reject",
+}
+
+/** Public delivery timing selected by a `before_send` hook pipeline. */
+export enum DeliveryTiming {
+	Interrupt = "interrupt",
+	YieldTurn = "yield_turn",
+	AfterToolLoop = "after_tool_loop",
+}
+
+/** Final Gateway result for one `before_send` evaluation. */
+export interface HookBeforeSendResult {
+	evaluationId: string;
+	action?: HookAction;
+	message: HookMessage;
+	timing?: DeliveryTiming;
+	executedBy?: HookExecutedBy[];
+}
+
+/** Structured Gateway-side failure for one correlation ID. */
+export interface HookEvaluationFailure {
+	code: string;
+	message: string;
+	retryable?: boolean;
+}
+
 /** Register a daemon-tracked durable inbox subscription for the caller. */
 export interface InboxSubscribeRequest {
 	/** Held-receive window for follow-up `next` calls when no durable batch is ready. */
@@ -927,6 +1029,21 @@ export interface InboxUnsubscribeRequest {
 	subscriptionId: string;
 }
 
+/** Interrupt the active turn on one agent session without injecting replacement text. */
+export interface InterruptRequest {
+	/** The stable target agent id. When present, it is authoritative over `name`. */
+	agentId?: AgentId;
+	/** The target agent's registered name fallback. */
+	name: string;
+	/** Client-generated id used to correlate the terminal command receipt. */
+	clientMessageId?: string;
+}
+
+/** Response emitted only after the adapter accepted the interrupt. */
+export interface InterruptResponse {
+	interrupted: boolean;
+}
+
 /** `nexus thread join <name>` (caller joins). */
 export interface JoinThreadRequest {
 	name: string;
@@ -939,6 +1056,11 @@ export interface LeaveThreadRequest {
 
 /** `nexus members` request. */
 export interface MemberListRequest {
+	/**
+	 * Optional directory metadata filter. `None` returns the global directory; projects never
+	 * act as a routing or authorization boundary.
+	 */
+	project?: string;
 	/** Include offline members (default false). */
 	includeOffline?: boolean;
 	/** Include dead-marked members (default false; audit/admin views only). */
@@ -1021,6 +1143,13 @@ export interface Message {
 	provenance: Provenance;
 	/** Unix epoch millis. */
 	createdAt: number;
+}
+
+/** Idempotent recursive metadata merge produced by one completed hook invocation. */
+export interface MessageMetadataMergeRequest {
+	messageId: MessageId;
+	invocationId: string;
+	metadata: Record<string, unknown>;
 }
 
 /** Core entity families that support an opaque metadata JSON bag. */
@@ -1400,6 +1529,8 @@ export interface SendRequest {
 	summary?: string;
 	body: string;
 	mention?: string[];
+	/** Developer-owned metadata that is committed atomically with the message body. */
+	metadata?: Record<string, unknown>;
 	idempotencyKey?: string;
 }
 
@@ -1763,6 +1894,11 @@ export enum DeliveryState {
 	Delivered = "delivered",
 	Acked = "acked",
 }
+
+/** Event-specific terminal result returned by Gateway. */
+export type HookEvaluationResponse =
+	| { event: "before_send", result: HookBeforeSendResult }
+	| { event: "after_receipt", result: HookAfterReceiptResult };
 
 
 // --- Hand-authored wire unions (appended by gen-ts.sh / the ts_gen test) ---

@@ -10,6 +10,7 @@ pub mod claude_native_forwarder;
 pub mod claude_resume_harvest;
 pub mod command_worker;
 pub mod daemon_ipc;
+pub mod gateway_hook_bridge;
 pub mod gateway_projection_backlog;
 pub mod gateway_stream_socket;
 pub mod harness_launch;

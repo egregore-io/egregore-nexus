@@ -310,6 +310,7 @@ pub async fn dispatch_with_idempotency(
                 body: get_str("message").ok_or_else(|| missing("message"))?,
                 summary: get_str("summary"),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: idempotency_key.map(str::to_string),
             };
             let ack: Ack = send_message_post(store_client, &req, idempotency_key).await?;
@@ -323,6 +324,7 @@ pub async fn dispatch_with_idempotency(
                 body: get_str("message").ok_or_else(|| missing("message"))?,
                 summary: get_str("summary"),
                 mention: get_strvec("mention"),
+                metadata: None,
                 idempotency_key: idempotency_key.map(str::to_string),
             };
             let ack: Ack = send_message_post(store_client, &req, idempotency_key).await?;
@@ -334,6 +336,7 @@ pub async fn dispatch_with_idempotency(
                 body: get_str("message").ok_or_else(|| missing("message"))?,
                 summary: get_str("summary"),
                 mention: get_strvec("mention"),
+                metadata: None,
                 idempotency_key: idempotency_key.map(str::to_string),
             };
             let ack: Ack = send_message_post(store_client, &req, idempotency_key).await?;
@@ -347,6 +350,7 @@ pub async fn dispatch_with_idempotency(
                 body: get_str("message").ok_or_else(|| missing("message"))?,
                 summary: get_str("summary"),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: idempotency_key.map(str::to_string),
             };
             let ack: Ack = send_message_post(store_client, &req, idempotency_key).await?;
@@ -354,6 +358,7 @@ pub async fn dispatch_with_idempotency(
         }
         "members" => {
             let req = MemberListRequest {
+                project: None,
                 include_offline: Some(true),
                 include_dead: None,
             };

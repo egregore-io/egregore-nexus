@@ -6,7 +6,6 @@ import { createServer as createHttpServer } from "node:http";
 import { createServer as createNetServer } from "node:net";
 import { homedir } from "node:os";
 import { dirname, extname, join, relative, resolve, sep } from "node:path";
-import { spawn } from "node:child_process";
 import { Readable } from "node:stream";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -32,28 +31,14 @@ process.on("unhandledRejection", (error) => {
 const apiOnly = process.argv.includes("--api-only") || truthy(process.env.NEXUS_GATEWAY_API_ONLY);
 const discoveryMode = resolveDiscoveryMode(apiOnly);
 const port = await resolvePort();
-const runner = apiOnly ? startApiOnlyGateway(port) : await startPackagedGateway(port);
-
-function childOptions(port, apiOnly) {
-  return {
-    cwd: FRONTEND_DIR,
-    stdio: "inherit",
-    env: {
-      ...process.env,
-      PORT: String(port),
-      NEXUS_GATEWAY_PORT: String(port),
-      NEXUS_GATEWAY_API_ONLY: apiOnly ? "1" : process.env.NEXUS_GATEWAY_API_ONLY,
-    },
-  };
-}
-
-function tsxCli() {
-  return fileURLToPath(import.meta.resolve("tsx/cli"));
-}
+const host = clean(process.env.HOST) ?? clean(process.env.NEXUS_GATEWAY_BIND) ?? "127.0.0.1";
+const runner = apiOnly
+  ? await startApiOnlyGateway(port, host)
+  : await startPackagedGateway(port, host);
 
 await waitForGateway(port);
 const discoveryRecord = discoveryMode === "write"
-  ? await writeGatewayDiscovery(port, process.pid)
+  ? await writeGatewayDiscovery(port, process.pid, host)
   : undefined;
 
 runner.onExit((code, signal) => {
@@ -66,35 +51,41 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   });
 }
 
-function startApiOnlyGateway(port) {
+async function startApiOnlyGateway(port, host) {
   const packagedEntry = join(FRONTEND_DIR, "dist-gateway/headless.mjs");
-  const args = existsSync(packagedEntry)
-    ? [packagedEntry]
-    : [
-        tsxCli(),
-        "--tsconfig", join(FRONTEND_DIR, "tsconfig.json"),
-        "src/server/gateway/headless.ts",
-      ];
-  const child = spawn(process.execPath, args, childOptions(port, true));
-  let exited = false;
-  const exitPromise = new Promise((resolve) => child.once("exit", resolve));
-  child.once("exit", () => {
-    exited = true;
+  if (!existsSync(packagedEntry)) {
+    throw new Error(
+      "packaged Gateway entrypoint is missing; reinstall @egregore/nexus-gateway",
+    );
+  }
+  const { createHeadlessGatewayServer } = await import(pathToFileURL(packagedEntry).href);
+  const server = await createHeadlessGatewayServer();
+  const sockets = new Set();
+  server.on("connection", (socket) => trackSocket(sockets, socket));
+  server.on("upgrade", (_request, socket) => trackSocket(sockets, socket));
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, resolve);
   });
+  process.stdout.write(`Nexus headless gateway listening on http://${host}:${port}\n`);
   return {
-    pid: child.pid ?? process.pid,
-    onExit(callback) {
-      child.on("exit", callback);
+    pid: process.pid,
+    onExit() {
+      // API-only mode owns the listener in this process.
     },
-    async stop(signal) {
-      if (exited) return;
-      await stopChildWithDeadline(
-        child,
-        signal ?? "SIGTERM",
-        GATEWAY_CLOSE_TIMEOUT_MS,
-        () => exited,
-        exitPromise,
-      );
+    async stop() {
+      const shutdown = server.shutdown();
+      let timedOut = false;
+      await Promise.race([
+        shutdown,
+        delay(GATEWAY_CLOSE_TIMEOUT_MS).then(() => {
+          timedOut = true;
+        }),
+      ]);
+      if (!timedOut) return;
+      server.closeAllConnections?.();
+      destroyTrackedSockets(sockets);
+      await shutdown;
     },
   };
 }
@@ -121,8 +112,7 @@ async function removeRunDistSnapshot() {
   }
 }
 
-async function startPackagedGateway(port) {
-  const { attachAguiWsUpgrade } = await import("../src/server/agui/ws.mjs");
+async function startPackagedGateway(port, host) {
   const projectionBundle = join(FRONTEND_DIR, "dist-gateway/headless.mjs");
   if (!existsSync(projectionBundle)) {
     throw new Error(
@@ -130,21 +120,35 @@ async function startPackagedGateway(port) {
     );
   }
   const {
+    attachHeadlessGatewayWs,
+    closeSharedDaemonPushConnector,
+    guardGatewayBrowserRequest,
+    startGatewayHookService,
     startGatewayProjectionService,
+    stopGatewayHookService,
     stopGatewayProjectionService,
   } = await import(pathToFileURL(projectionBundle).href);
-  await startGatewayProjectionService();
+  const hooks = await startGatewayHookService();
+  try {
+    await startGatewayProjectionService({
+      afterReceipt: (event) => hooks.afterReceipt(event),
+    });
+  } catch (error) {
+    await stopGatewayHookService();
+    closeSharedDaemonPushConnector();
+    throw error;
+  }
   const distDir = await snapshotDistForRun();
   servingClientDir = join(distDir, "client");
   const handler = await loadPackagedServerHandler(join(distDir, "server/server.js"));
-  const host = clean(process.env.HOST) ?? clean(process.env.NEXUS_GATEWAY_BIND) ?? "127.0.0.1";
+  const guardedHandler = (request) => guardGatewayBrowserRequest(request, handler);
   const sockets = new Set();
   const server = createHttpServer((req, res) => {
-    void handlePackagedRequest(handler, req, res);
+    void handlePackagedRequest(guardedHandler, req, res);
   });
   server.on("connection", (socket) => trackSocket(sockets, socket));
   server.on("upgrade", (_req, socket) => trackSocket(sockets, socket));
-  await attachAguiWsUpgrade(server, { fetchHandler: handler });
+  await attachHeadlessGatewayWs(server, { fetchHandler: guardedHandler });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, resolve);
@@ -158,24 +162,10 @@ async function startPackagedGateway(port) {
     async stop() {
       await closeHttpServerWithDeadline(server, sockets, GATEWAY_CLOSE_TIMEOUT_MS);
       await stopGatewayProjectionService();
+      await stopGatewayHookService();
+      closeSharedDaemonPushConnector();
     },
   };
-}
-
-async function stopChildWithDeadline(child, signal, timeoutMs, isExited, exitPromise) {
-  if (isExited()) return;
-  child.kill(signal);
-  let timedOut = false;
-  await Promise.race([
-    exitPromise,
-    delay(timeoutMs).then(() => {
-      timedOut = true;
-    }),
-  ]);
-  if (timedOut && !isExited()) {
-    child.kill("SIGKILL");
-    await exitPromise;
-  }
 }
 
 async function closeHttpServerWithDeadline(server, sockets, timeoutMs) {
@@ -370,25 +360,36 @@ async function waitForGateway(port) {
   const healthUrl = `http://127.0.0.1:${port}/api/v1/health`;
   const capabilitiesUrl = `http://127.0.0.1:${port}/api/v1/capabilities`;
   const deadline = Date.now() + 10_000;
+  let lastHealth = "not reached";
+  let lastCapabilities = "not reached";
   while (Date.now() < deadline) {
     try {
       const health = await fetch(healthUrl);
       const capabilities = await fetch(capabilitiesUrl);
-      if (health.ok && capabilities.status < 500) return;
-    } catch {
+      lastHealth = `${health.status} ${await health.text()}`;
+      lastCapabilities = `${capabilities.status} ${await capabilities.text()}`;
+      // Remote-human mode intentionally denies anonymous reads. A typed 401/403 still proves
+      // that the packed route table is bound; authenticated health is exercised by its caller.
+      if (health.status < 500 && capabilities.status < 500) return;
+    } catch (error) {
+      lastHealth = error instanceof Error ? error.message : String(error);
       // Keep polling until the generated server finishes binding and its route table is ready.
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error(`gateway did not become ready on port ${port} (health + capabilities)`);
+  throw new Error(
+    `gateway did not become ready on port ${port} ` +
+    `(health=${lastHealth}; capabilities=${lastCapabilities})`,
+  );
 }
 
-async function writeGatewayDiscovery(port, pid) {
+async function writeGatewayDiscovery(port, pid, host) {
   const home = process.env.NEXUS_HOME ?? join(homedir(), ".nexus");
   const instanceId = await loadOrCreateInstanceId(home);
+  const urlHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   const record = {
     instanceId,
-    url: `http://localhost:${port}`,
+    url: `http://${urlHost}:${port}`,
     port,
     authMode: resolveAuthMode(),
     pid,
@@ -463,8 +464,14 @@ function resolveAuthMode() {
   const explicit = clean(process.env.NEXUS_WEB_AUTH_MODE);
   if (explicit) {
     const value = explicit.toLowerCase();
-    if (value === "local" || value === "remote") return value;
-    throw new Error(`invalid NEXUS_WEB_AUTH_MODE: ${explicit}; expected local or remote`);
+    if (value === "local" || value === "local-operator") return "local";
+    if (value === "remote" || value === "remote-human" || value === "remote-agent") {
+      return "remote";
+    }
+    throw new Error(
+      `invalid NEXUS_WEB_AUTH_MODE: ${explicit}; ` +
+      "expected local, local-operator, remote, remote-human, or remote-agent",
+    );
   }
   if (truthy(process.env.NEXUS_WEB_ALLOW_REMOTE) || truthy(process.env.NEXUS_ALLOW_REMOTE)) {
     return "remote";

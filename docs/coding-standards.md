@@ -15,6 +15,8 @@
 6. Preserve stable agent identity across runtime replacement, rename, and revival.
 7. Treat an agent name only as an ingress alias. Resolve it once to the immutable `agent_id`, then
    use that ID for authorization, routing, attribution, runtime lookup, delivery, and revival.
+8. Keep developer message-hook execution in Gateway. The daemon may expose a typed correlated port,
+   but it must never discover or execute hook programs.
 
 ## Boundaries
 
@@ -53,6 +55,11 @@ system speaks harness-agnostic traits and contracts.
 - Generated `contracts.gen.ts` is read-only; regenerate it from Rust.
 - Tests may inject stores and clocks, but production must not contain a mock-runtime switch.
 - Keep WebSocket events cursor-addressable and idempotent at presentation boundaries.
+- Implement a new hookable event with an event adapter. Reuse registry, engine, runner, audit, and
+  signing layers instead of branching on the event in the local command runner.
+- Keep hook programs language-neutral: one `nexus.hooks/v1` JSON input, one JSON output, logs on
+  stderr, and no shell interpolation unless the manifest explicitly invokes a shell.
+- Never expose token deltas or raw agent-session streams through message hooks.
 
 ## Tests
 
@@ -64,6 +71,8 @@ system speaks harness-agnostic traits and contracts.
 - A release-oriented script must return useful `--help` without invoking Docker, Cargo, Nexus,
   package managers, browsers, process cleanup, or runtime mutation.
 - A test result from a different source revision is historical evidence, not release proof.
+- Cover hook changes at both the deterministic adapter/runner boundary and the canonical-source
+  practical gate. Retry tests must assert one accepted message and one logical invocation.
 
 Common gates:
 

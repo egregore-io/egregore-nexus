@@ -92,6 +92,22 @@ fn human_register(name: &str, client_key: &str) -> RegisterRequest {
     }
 }
 
+fn agent_register(name: &str, client_key: &str) -> RegisterRequest {
+    RegisterRequest {
+        agent_id: None,
+        name: Some(name.into()),
+        harness: hid("other"),
+        harness_session_id: format!("hs_{client_key}"),
+        project: "default".into(),
+        client_key: client_key.into(),
+        runtime_credential: None,
+        tier: Tier::Agent,
+        kind: Some(Kind::Agent),
+        role: None,
+        cwd: None,
+    }
+}
+
 fn command_intent(
     command_id: &str,
     kind: &str,
@@ -156,7 +172,7 @@ async fn pending_initial_prompt_blocks_prompt_steer_compact_and_warm_until_accep
         .unwrap();
     let ada = state
         .identity
-        .register(human_register("Ada", "ck_ada"))
+        .register(agent_register("Ada", "ck_ada"))
         .await
         .unwrap();
 
@@ -212,6 +228,7 @@ async fn pending_initial_prompt_blocks_prompt_steer_compact_and_warm_until_accep
         serde_json::to_string(&CompactRequest {
             agent_id: None,
             name: "Ada".into(),
+            client_message_id: None,
         })
         .unwrap(),
         12,
@@ -282,7 +299,7 @@ async fn pending_initial_prompt_blocks_agent_id_targeted_commands_with_stale_nam
         .unwrap();
     let ada = state
         .identity
-        .register(human_register("Ada", "ck_ada"))
+        .register(agent_register("Ada", "ck_ada"))
         .await
         .unwrap();
     let ada_agent_id = ada.agent_id.as_ref().expect("agent id").clone();
@@ -328,6 +345,7 @@ async fn pending_initial_prompt_blocks_agent_id_targeted_commands_with_stale_nam
         serde_json::to_string(&CompactRequest {
             agent_id: Some(ada_agent_id.clone()),
             name: "stale-name".into(),
+            client_message_id: None,
         })
         .unwrap(),
         11,

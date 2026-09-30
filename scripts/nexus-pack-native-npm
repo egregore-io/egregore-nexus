@@ -19,6 +19,9 @@ BINARY=
 OUTPUT=
 VERSION_OUTPUT=
 EXPECTED_SHA256=
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+"$ROOT/scripts/nexus-version" check >/dev/null
+VERSION=$(tr -d '\n' < "$ROOT/VERSION")
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -73,10 +76,9 @@ else
     exit 1
   }
 fi
-if ! printf '%s\n' "$VERSION_OUTPUT" \
-  | grep -Eq '^nexus 0\.1\.0 \(revision [A-Za-z0-9._+-]+\)$' \
-  || printf '%s\n' "$VERSION_OUTPUT" | grep -q 'revision unknown'; then
-  echo "native binary does not report Nexus 0.1.0 with a source revision: $VERSION_OUTPUT" >&2
+EXPECTED_VERSION="nexus ${VERSION}"
+if [ "$VERSION_OUTPUT" != "$EXPECTED_VERSION" ]; then
+  echo "native binary does not report $EXPECTED_VERSION exactly: $VERSION_OUTPUT" >&2
   exit 1
 fi
 
@@ -118,11 +120,70 @@ if [[ "$TARGET" == linux-* ]]; then
   fi
 fi
 
+if [[ "$TARGET" == darwin-* ]]; then
+  MACHO_STRIP_TOOL=
+  MACHO_NM_TOOL=
+  MACHO_STRIP_ARGS=()
+  APPLE_STRIP_CANDIDATE=
+  APPLE_NM_CANDIDATE=
+  if [ "$(uname -s 2>/dev/null || true)" = Darwin ] \
+    && command -v xcrun >/dev/null 2>&1; then
+    if APPLE_STRIP_CANDIDATE=$(xcrun --find strip 2>/dev/null) \
+      && APPLE_NM_CANDIDATE=$(xcrun --find nm 2>/dev/null) \
+      && [ -x "$APPLE_STRIP_CANDIDATE" ] \
+      && [ -x "$APPLE_NM_CANDIDATE" ]; then
+      MACHO_STRIP_TOOL=$APPLE_STRIP_CANDIDATE
+      MACHO_NM_TOOL=$APPLE_NM_CANDIDATE
+    fi
+  fi
+  if [ -n "$MACHO_STRIP_TOOL" ] && [ -x "$MACHO_STRIP_TOOL" ] \
+    && [ -n "$MACHO_NM_TOOL" ] && [ -x "$MACHO_NM_TOOL" ]; then
+    # Apple documents -u -r as the maximum safe stripping level for a
+    # dynamically linked executable. Unlike -x, it does not preserve every
+    # globally visible Rust implementation symbol.
+    MACHO_STRIP_ARGS=(-u -r)
+  elif command -v llvm-strip >/dev/null 2>&1 \
+    && command -v llvm-nm >/dev/null 2>&1; then
+    MACHO_STRIP_TOOL=llvm-strip
+    MACHO_NM_TOOL=llvm-nm
+    MACHO_STRIP_ARGS=(--strip-all)
+  else
+    echo "Darwin native npm packaging requires either Apple strip/nm on macOS or llvm-strip/llvm-nm" >&2
+    exit 1
+  fi
+
+  if ! "$MACHO_STRIP_TOOL" "${MACHO_STRIP_ARGS[@]}" "$TMP/$EXECUTABLE"; then
+    echo "Darwin native npm packaging failed to strip the staged Mach-O binary" >&2
+    exit 1
+  fi
+  if ! MACHO_SYMBOLS=$("$MACHO_NM_TOOL" -a "$TMP/$EXECUTABLE" 2>&1); then
+    echo "Darwin native npm packaging failed to inspect the stripped Mach-O binary" >&2
+    exit 1
+  fi
+  RUST_SYMBOL_PATTERN='(^|[[:space:]])_*(ZN[^[:space:]]*17h[0-9A-Fa-f]{16}E|R[0-9A-Z][^[:space:]]*|rust(c)?[^[:space:]]*)($|[[:space:]])'
+  if printf '%s\n' "$MACHO_SYMBOLS" | grep -Eq "$RUST_SYMBOL_PATTERN"; then
+    echo "native npm Mach-O binary retains Rust symbol names after stripping" >&2
+    exit 1
+  else
+    GREP_STATUS=$?
+    if [ "$GREP_STATUS" -ne 1 ]; then
+      echo "native npm binary inspection failed while checking Mach-O symbols" >&2
+      exit 1
+    fi
+  fi
+fi
+
 if LC_ALL=C grep -aEq \
   '(/home/[^/[:space:]]+|/Users/[^/[:space:]]+)/(\.cargo|\.rustup|Projects)/|[A-Za-z]:[\\/]+Users[\\/]+[^\\/[:space:]]+[\\/]+(\.cargo|\.rustup|Projects)[\\/]' \
   "$TMP/$EXECUTABLE"; then
   echo "native binary exposes a private build-home path" >&2
   exit 1
+else
+  GREP_STATUS=$?
+  if [ "$GREP_STATUS" -ne 1 ]; then
+    echo "native npm binary inspection failed while checking private build paths" >&2
+    exit 1
+  fi
 fi
 
 if [ -z "$EXPECTED_SHA256" ]; then

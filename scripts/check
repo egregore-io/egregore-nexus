@@ -14,12 +14,13 @@
 #   scripts/check architecture                  # daemon/Gateway/WebUI ownership boundary
 #   scripts/check boundaries                    # harness isolation boundary (shrink-only)
 #   scripts/check gateway      # gateway only
+#   scripts/check hooks-practical             # live Gateway message-hook boundary
 #   scripts/check gateway useAgentSession       # focused vitest filter
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/check [all|rust|rust-workspace|acceptance|core-test-layout|cargo-targets|release-identity|architecture|boundaries|load|gateway] [extra args]
+Usage: scripts/check [all|rust|rust-workspace|acceptance|core-test-layout|cargo-targets|release-identity|architecture|boundaries|load|hooks-practical|gateway] [extra args]
 EOF
 }
 
@@ -97,6 +98,7 @@ case "$MODE" in
   # Load-regression gate: full incident-replay run in the isolated docker env (phases 1-6,
   # ~10-15 min). NOT part of `all` — run before every deploy: scripts/check load
   load) python3 scripts/test-nexus-load-gate && exec python3 -u scripts/nexus-load-gate run --skip-docker-build "$@" ;;
+  hooks-practical) scripts/test-nexus-hooks-practical-gate && exec scripts/nexus-hooks-practical-gate "$@" ;;
   gateway|front)  gateway_gate "$@" ;;
   all)            architecture_ownership_gate; boundary_gate; cargo_target_name_gate; rust_gate; gateway_gate ;;
   *) usage >&2; exit 64 ;;

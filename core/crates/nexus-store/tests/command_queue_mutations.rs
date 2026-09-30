@@ -1,7 +1,7 @@
 //! Atomic daemon-owned queue mutation behavior used by the gateway IPC surface.
 
 use nexus_contracts::{
-    AgentId, CommandExpectedRevision, CommandQueueAction, CommandQueueMutationRequest,
+    AgentId, CommandExpectedRevision, CommandQueueAction, CommandQueueMutationRequest, SessionId,
 };
 use nexus_store::repos::{CommandIntents, CommandQueue, NewCommandIntent};
 use nexus_store::Store;
@@ -61,7 +61,7 @@ fn mutation(
     command_id: Option<&str>,
 ) -> CommandQueueMutationRequest {
     CommandQueueMutationRequest {
-        name: "otto".into(),
+        name: Some("otto".into()),
         agent_id: Some(AgentId("a_otto".into())),
         action,
         client_mutation_id: mutation_id.into(),
@@ -138,6 +138,103 @@ async fn reused_mutation_id_with_different_payload_is_a_durable_conflict() {
     assert_eq!(
         conflict.body["error"],
         "clientMutationId was already used for a different mutation"
+    );
+}
+
+#[tokio::test]
+async fn stable_agent_id_is_a_complete_queue_mutation_target() {
+    let store = store(false).await;
+    prompt(&store, "cmd_id_only", 10).await;
+    let mut request = mutation(
+        CommandQueueAction::Cancel,
+        "mut_id_only",
+        Some("cmd_id_only"),
+    );
+    request.name = None;
+
+    let outcome = CommandQueue::new(&store)
+        .mutate("display-only-project", &request, 9_000)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, 200);
+    assert_eq!(outcome.body["commandId"], "cmd_id_only");
+    assert_eq!(outcome.body["state"], "cancelled");
+}
+
+#[tokio::test]
+async fn stable_agent_id_prefers_its_active_runtime_over_a_newer_stale_session_for_redirect() {
+    let store = store(true).await;
+    store
+        .conn
+        .execute(
+            "INSERT INTO agents (agent_id, project, name, tier, created_at) \
+             VALUES ('a_otto', 'identity-metadata', 'otto', 'agent', 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO agent_runtimes (runtime_id, agent_id, harness, transport, presence, active, started_at) \
+             VALUES ('s_otto', 'a_otto', 'codex', 'codex-appserver', 'busy', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO sessions (session_id, agent_id, name, agent, transport, project, created_at) \
+             VALUES ('s_otto_stale', 'a_otto', 'otto-stale', 'claude', 'acp', 'other', 2)",
+            (),
+        )
+        .await
+        .unwrap();
+    prompt(&store, "cmd_active_runtime", 10).await;
+    let active_sessions = [SessionId("s_otto".into())];
+
+    let snapshot = CommandQueue::new(&store)
+        .snapshot_with_active_sessions(
+            Some("stale-display-name"),
+            Some(&AgentId("a_otto".into())),
+            &active_sessions,
+        )
+        .await
+        .unwrap();
+    assert_eq!(snapshot.session_id.as_deref(), Some("s_otto"));
+    assert!(snapshot.turn_active);
+    assert_eq!(
+        snapshot.steer_capability,
+        nexus_contracts::SteerCapability::NativeSteer
+    );
+
+    let outcome = CommandQueue::new(&store)
+        .mutate_with_active_sessions(
+            "display-metadata-only",
+            &mutation(
+                CommandQueueAction::RedirectNow,
+                "mut_active_runtime",
+                Some("cmd_active_runtime"),
+            ),
+            9_000,
+            &active_sessions,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, 200);
+    assert_eq!(outcome.body["sessionId"], "s_otto");
+    assert_eq!(outcome.body["steerCapability"], "native_steer");
+    assert_eq!(
+        CommandIntents::new(&store)
+            .get("cmd_active_runtime")
+            .await
+            .unwrap()
+            .unwrap()
+            .kind,
+        nexus_store::command_kinds::harness::STEER,
     );
 }
 

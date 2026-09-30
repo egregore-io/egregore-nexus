@@ -10,7 +10,7 @@ use nexus_contracts::register::{RegisterRequest, RenameRequest};
 use nexus_contracts::{codes, HarnessId, Tier};
 use nexus_identity::Identity;
 use nexus_store::repos::{
-    AgentCredentials, Agents, NativeThreadBindings, NewAgent, NewAgentCredential,
+    AgentCredentials, AgentRuntimes, Agents, NativeThreadBindings, NewAgent, NewAgentCredential,
     NewNativeThreadBinding, Sessions,
 };
 use nexus_store::Store;
@@ -134,6 +134,485 @@ async fn register_same_client_key_resumes_without_duplicate_spawn_event() {
         .filter(|event| matches!(event, WsEvent::AgentSpawned { .. }))
         .count();
     assert_eq!(spawned, 1, "idempotent register must not duplicate spawn");
+}
+
+#[tokio::test]
+async fn register_same_client_key_resumes_across_project_metadata() {
+    let (identity, store, _sink) = fixture().await;
+    let first = identity
+        .register(register_request("ben", "ck_global_resume"))
+        .await
+        .unwrap();
+
+    let mut reconnect = register_request("ben", "ck_global_resume");
+    reconnect.project = "stale-project-metadata".into();
+    reconnect.harness_session_id = "hs_rebound_global".into();
+    let resumed = identity.register(reconnect).await.unwrap();
+
+    assert_eq!(resumed.session_id, first.session_id);
+    let row = Sessions::new(&store)
+        .find_by_session_id(&first.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.project, "p_demo", "project is descriptive metadata");
+    assert_eq!(row.harness_session_id.as_deref(), Some("hs_rebound_global"));
+}
+
+#[tokio::test]
+async fn exact_agent_credential_reconnect_accepts_a_stale_pre_rename_name() {
+    let (identity, store, _sink) = fixture().await;
+    let first = identity
+        .register(register_request("before-rename", "ck_rename_reconnect"))
+        .await
+        .unwrap();
+    let agent_id = first.agent_id.clone().expect("durable agent id");
+    create_runtime_credential(&store, &agent_id.0, "rename-secret", "cred_rename").await;
+    Agents::new(&store)
+        .rename(&agent_id.0, "after-rename")
+        .await
+        .unwrap();
+    Sessions::new(&store)
+        .set_name(&first.session_id, "after-rename")
+        .await
+        .unwrap();
+
+    let mut reconnect = register_request("before-rename", "ck_rename_reconnect");
+    reconnect.agent_id = Some(agent_id.clone());
+    reconnect.runtime_credential = Some("rename-secret".into());
+    reconnect.harness_session_id = "hs_after_rename".into();
+    let resumed = identity.register(reconnect).await.unwrap();
+
+    assert_eq!(resumed.session_id, first.session_id);
+    assert_eq!(resumed.agent_id, Some(agent_id));
+    let row = Sessions::new(&store)
+        .find_by_session_id(&first.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.name.as_deref(), Some("after-rename"));
+    assert_eq!(row.harness_session_id.as_deref(), Some("hs_after_rename"));
+}
+
+#[tokio::test]
+async fn native_exact_agent_reconnect_accepts_a_stale_pre_rename_name() {
+    let (identity, store, _sink) = fixture().await;
+    let first = identity
+        .register(register_request("native-before", "ck_native_rename"))
+        .await
+        .unwrap();
+    let agent_id = first.agent_id.clone().expect("durable agent id");
+    create_runtime_credential(
+        &store,
+        &agent_id.0,
+        "native-rename-secret",
+        "cred_native_rename",
+    )
+    .await;
+    NativeThreadBindings::new(&store)
+        .claim(NewNativeThreadBinding {
+            harness: "claude".into(),
+            native_thread_id: "native-renamed-thread".into(),
+            agent_id: agent_id.0.clone(),
+            project: "p_demo".into(),
+            runtime_id: Some(first.session_id.0.clone()),
+        })
+        .await
+        .unwrap();
+    Agents::new(&store)
+        .rename(&agent_id.0, "native-after")
+        .await
+        .unwrap();
+    Sessions::new(&store)
+        .set_name(&first.session_id, "native-after")
+        .await
+        .unwrap();
+
+    let mut reconnect = register_request("native-before", "ck_native_rename");
+    reconnect.agent_id = Some(agent_id.clone());
+    reconnect.runtime_credential = Some("native-rename-secret".into());
+    reconnect.harness_session_id = "native-renamed-thread".into();
+    let resumed = identity.register(reconnect).await.unwrap();
+
+    assert_eq!(resumed.session_id, first.session_id);
+    assert_eq!(resumed.agent_id, Some(agent_id));
+    assert_eq!(
+        Sessions::new(&store)
+            .find_by_session_id(&first.session_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("native-after")
+    );
+}
+
+#[tokio::test]
+async fn exact_agent_resume_ignores_duplicate_legacy_aliases_for_an_idless_session() {
+    let (identity, store, _sink) = fixture().await;
+    let first = identity
+        .register(register_request("shared-alias", "ck_exact_resume"))
+        .await
+        .unwrap();
+    let exact_agent_id = first.agent_id.clone().expect("durable agent id");
+    create_runtime_credential(
+        &store,
+        &exact_agent_id.0,
+        "exact-resume-secret",
+        "cred_exact_resume",
+    )
+    .await;
+
+    Sessions::new(&store)
+        .set_presence(&first.session_id, nexus_contracts::Presence::Offline)
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET agent_id = NULL WHERE session_id = ?1",
+            libsql::params![first.session_id.0.clone()],
+        )
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute("DROP INDEX idx_agents_name_unique", ())
+        .await
+        .unwrap();
+    create_agent(&store, "a_legacy_alias_collision", "shared-alias").await;
+
+    let mut reconnect = register_request("shared-alias", "ck_exact_resume");
+    reconnect.agent_id = Some(exact_agent_id.clone());
+    reconnect.runtime_credential = Some("exact-resume-secret".into());
+    reconnect.harness_session_id = "hs_exact_resume_after_alias_collision".into();
+    let resumed = identity.register(reconnect).await.unwrap();
+
+    assert_eq!(resumed.session_id, first.session_id);
+    assert_eq!(resumed.agent_id, Some(exact_agent_id.clone()));
+    let row = Sessions::new(&store)
+        .find_by_session_id(&first.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.agent_id.as_deref(), Some(exact_agent_id.0.as_str()));
+    assert_eq!(
+        row.harness_session_id.as_deref(),
+        Some("hs_exact_resume_after_alias_collision")
+    );
+}
+
+#[tokio::test]
+async fn fresh_exact_agent_binding_canonicalizes_a_stale_pre_rename_name() {
+    let (identity, store, _sink) = fixture().await;
+    create_agent(&store, "a_renamed_exact", "canonical-name").await;
+    create_runtime_credential(
+        &store,
+        "a_renamed_exact",
+        "fresh-exact-secret",
+        "cred_fresh_exact",
+    )
+    .await;
+
+    let mut request = register_request("stale-pre-rename-name", "ck_fresh_exact");
+    request.agent_id = Some(AgentId("a_renamed_exact".into()));
+    request.runtime_credential = Some("fresh-exact-secret".into());
+    let registered = identity.register(request).await.unwrap();
+
+    assert_eq!(registered.agent_id, Some(AgentId("a_renamed_exact".into())));
+    let row = Sessions::new(&store)
+        .find_by_session_id(&registered.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.name.as_deref(), Some("canonical-name"));
+    assert!(Sessions::new(&store)
+        .find_by_name_any_project("stale-pre-rename-name")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn failed_fresh_exact_agent_binding_leaves_no_registration_residue() {
+    let (identity, store, sink) = fixture().await;
+    create_agent(&store, "a_atomic_exact", "atomic-exact").await;
+    create_runtime_credential(
+        &store,
+        "a_atomic_exact",
+        "atomic-exact-secret",
+        "cred_atomic_exact",
+    )
+    .await;
+    store
+        .conn
+        .execute(
+            "CREATE TRIGGER fail_atomic_exact_runtime
+             BEFORE INSERT ON agent_runtimes
+             BEGIN
+               SELECT RAISE(ABORT, 'forced runtime bind failure');
+             END",
+            (),
+        )
+        .await
+        .unwrap();
+
+    let mut request = register_request("atomic-exact", "ck_atomic_exact");
+    request.agent_id = Some(AgentId("a_atomic_exact".into()));
+    request.runtime_credential = Some("atomic-exact-secret".into());
+    let error = identity.register(request).await.unwrap_err();
+
+    assert_eq!(error.code, codes::INTERNAL_ERROR);
+    assert!(Sessions::new(&store)
+        .find_by_client_key_any_project("ck_atomic_exact")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(AgentRuntimes::new(&store)
+        .active_for_agent("a_atomic_exact")
+        .await
+        .unwrap()
+        .is_none());
+    let credential = AgentCredentials::new(&store)
+        .find_by_id("cred_atomic_exact")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(credential.last_used_at, None);
+    let lifecycle_count: i64 = store
+        .conn
+        .query("SELECT COUNT(*) FROM developer_events", ())
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(lifecycle_count, 0);
+    assert!(sink.events.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn name_only_registration_cannot_seize_an_offline_durable_agent() {
+    let (identity, store, sink) = fixture().await;
+    create_agent(&store, "a_reserved_offline", "reserved-offline").await;
+
+    let error = identity
+        .register(register_request("reserved-offline", "ck_name_only_seizure"))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.code, codes::DUPLICATE_NAME);
+    assert!(Sessions::new(&store)
+        .find_by_client_key_any_project("ck_name_only_seizure")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(AgentRuntimes::new(&store)
+        .active_for_agent("a_reserved_offline")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(sink.events.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn null_agent_legacy_resume_rejects_a_conflicting_runtime_owner_before_rebind() {
+    let (identity, store, sink) = fixture().await;
+    let beta = identity
+        .register(register_request("beta", "ck_legacy_conflict"))
+        .await
+        .unwrap();
+    let beta_agent = beta.agent_id.as_ref().unwrap().0.clone();
+    create_agent(&store, "a_alpha", "alpha").await;
+    create_runtime_credential(&store, "a_alpha", "alpha-secret", "cred_alpha").await;
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET agent_id = NULL, name = 'alpha', presence = 'offline' \
+             WHERE session_id = ?1",
+            libsql::params![beta.session_id.0.clone()],
+        )
+        .await
+        .unwrap();
+    let before = Sessions::new(&store)
+        .find_by_session_id(&beta.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let event_count = sink.events.lock().unwrap().len();
+
+    let mut reconnect = register_request("alpha", "ck_legacy_conflict");
+    reconnect.agent_id = Some(AgentId("a_alpha".into()));
+    reconnect.runtime_credential = Some("alpha-secret".into());
+    reconnect.harness_session_id = "must-not-rebind".into();
+    let error = identity.register(reconnect).await.unwrap_err();
+
+    assert_eq!(error.code, codes::INVALID_PARAMS);
+    assert!(error.message.contains(&beta_agent));
+    assert!(error.message.contains("a_alpha"));
+    let after = Sessions::new(&store)
+        .find_by_session_id(&beta.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.client_key, before.client_key);
+    assert_eq!(after.harness_session_id, before.harness_session_id);
+    assert_eq!(after.presence, before.presence);
+    assert_eq!(sink.events.lock().unwrap().len(), event_count);
+}
+
+#[tokio::test]
+async fn native_binding_never_selects_a_last_runtime_owned_by_another_agent() {
+    let (identity, store, sink) = fixture().await;
+    let alpha = identity
+        .register(register_request("alpha", "ck_alpha_native"))
+        .await
+        .unwrap();
+    let beta = identity
+        .register(register_request("beta", "ck_beta_native"))
+        .await
+        .unwrap();
+    let alpha_agent = alpha.agent_id.as_ref().unwrap().0.clone();
+    let beta_agent = beta.agent_id.as_ref().unwrap().0.clone();
+    create_runtime_credential(
+        &store,
+        &alpha_agent,
+        "alpha-native-secret",
+        "cred_alpha_native",
+    )
+    .await;
+    NativeThreadBindings::new(&store)
+        .claim(NewNativeThreadBinding {
+            harness: "claude".into(),
+            native_thread_id: "native-cross-owner".into(),
+            agent_id: alpha_agent.clone(),
+            project: "p_demo".into(),
+            runtime_id: Some(beta.session_id.0.clone()),
+        })
+        .await
+        .unwrap();
+    let before = Sessions::new(&store)
+        .find_by_session_id(&beta.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let event_count = sink.events.lock().unwrap().len();
+
+    let mut reconnect = register_request("alpha", "ck_beta_native");
+    reconnect.agent_id = Some(AgentId(alpha_agent.clone()));
+    reconnect.runtime_credential = Some("alpha-native-secret".into());
+    reconnect.harness_session_id = "native-cross-owner".into();
+    let error = identity.register(reconnect).await.unwrap_err();
+
+    assert_eq!(error.code, codes::INVALID_PARAMS);
+    assert!(error.message.contains("native-cross-owner"));
+    assert!(error.message.contains(&alpha_agent));
+    assert!(error.message.contains(&beta_agent));
+    assert_eq!(
+        Sessions::new(&store)
+            .find_by_session_id(&beta.session_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    assert_eq!(sink.events.lock().unwrap().len(), event_count);
+}
+
+#[tokio::test]
+async fn register_harness_resume_is_global_and_rejects_a_mismatched_client_key_before_writes() {
+    let (identity, store, _sink) = fixture().await;
+    let mut first = register_request("ben", "ck_global_harness");
+    first.project = "first-project".into();
+    first.harness_session_id = "hs_global_harness".into();
+    let registered = identity.register(first).await.unwrap();
+
+    let mut leaked = register_request("ben", "ck_wrong_harness");
+    leaked.project = "second-project".into();
+    leaked.harness_session_id = "hs_global_harness".into();
+    let error = identity.register(leaked).await.unwrap_err();
+    assert_eq!(error.code, codes::UNAUTHORIZED);
+
+    let rows = Sessions::new(&store).list_all().await.unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "rejected global resume must not create a row"
+    );
+    assert_eq!(rows[0].session_id, registered.session_id);
+    assert_eq!(rows[0].client_key.as_deref(), Some("ck_global_harness"));
+}
+
+#[tokio::test]
+async fn register_treats_a_stored_agent_id_as_exclusive() {
+    let (identity, store, _sink) = fixture().await;
+    let first = identity
+        .register(register_request("ben", "ck_stored_agent"))
+        .await
+        .unwrap();
+    Sessions::new(&store)
+        .set_agent_id(&first.session_id, "a_missing_stored_owner")
+        .await
+        .unwrap();
+    create_agent(&store, "a_alias_owner", "a_missing_stored_owner").await;
+
+    let mut reconnect = register_request("ben", "ck_stored_agent");
+    reconnect.harness_session_id = "hs_must_not_persist".into();
+    let error = identity.register(reconnect).await.unwrap_err();
+    assert_eq!(error.code, codes::NOT_FOUND);
+    let row = Sessions::new(&store)
+        .find_by_session_id(&first.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.agent_id.as_deref(), Some("a_missing_stored_owner"));
+    assert_ne!(
+        row.harness_session_id.as_deref(),
+        Some("hs_must_not_persist")
+    );
+}
+
+#[tokio::test]
+async fn register_rejects_ambiguous_global_legacy_name_before_writes() {
+    let (identity, store, _sink) = fixture().await;
+    store
+        .conn
+        .execute("DROP INDEX idx_sessions_name", ())
+        .await
+        .unwrap();
+    for (session_id, project) in [("s_legacy_one", "one"), ("s_legacy_two", "two")] {
+        Sessions::new(&store)
+            .create(nexus_store::repos::NewSession {
+                session_id: SessionId(session_id.into()),
+                name: Some("legacy-duplicate".into()),
+                agent: Some("claude".into()),
+                kind: "agent".into(),
+                role: None,
+                tier: "agent".into(),
+                harness_session_id: None,
+                client_key: None,
+                cwd: None,
+                project: project.into(),
+                transport: Some("pty".into()),
+            })
+            .await
+            .unwrap();
+    }
+    let before = Sessions::new(&store).list_all().await.unwrap().len();
+    let mut request = register_request("legacy-duplicate", "ck_ambiguous_legacy");
+    request.project = "three".into();
+
+    let error = identity.register(request).await.unwrap_err();
+    assert_eq!(error.code, codes::INVALID_PARAMS);
+    assert!(error.message.contains("multiple legacy identities"));
+    assert_eq!(
+        Sessions::new(&store).list_all().await.unwrap().len(),
+        before
+    );
 }
 
 #[tokio::test]

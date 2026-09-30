@@ -1383,9 +1383,10 @@ impl PtySupervisor {
         .await
     }
 
-    /// REVIVE a headed codex app-server session under the SAME Nexus [`SessionId`]. The stored
-    /// Codex thread id, when present, is used both to bind the bridge immediately and to launch the
-    /// human TUI with `codex resume --remote ... <thread>`.
+    /// REVIVE a headed codex app-server session under the SAME Nexus [`SessionId`]. A live
+    /// deterministic app-server socket is adopted; only a dead or missing socket is replaced. The
+    /// stored Codex thread id, when present, binds a new completion forwarder and launches the human
+    /// TUI with `codex resume --remote ... <thread>`.
     #[allow(clippy::too_many_arguments)]
     pub async fn respawn_codex_appserver(
         &self,
@@ -1426,7 +1427,7 @@ impl PtySupervisor {
             resume_codex_homes,
             &[],
             on_thread_discovered,
-            true,
+            false,
             viewer_backend,
         )
         .await

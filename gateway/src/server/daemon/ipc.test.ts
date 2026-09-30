@@ -7,6 +7,7 @@ import {
   callDaemonCommand,
   callDaemonEnqueue,
   callDaemonQuery,
+  readDaemonBootId,
   type DaemonIpcRequest,
 } from "./ipc";
 
@@ -83,6 +84,16 @@ const caller = {
 };
 
 describe("gateway daemon IPC", () => {
+  it("reads the daemon boot epoch from the selected Nexus home", async () => {
+    const fx = await fixture(null);
+    try {
+      await expect(readDaemonBootId({ nexusHome: fx.home })).resolves.toBe("boot-test");
+      expect(fx.requests).toEqual([]);
+    } finally {
+      await fx.close();
+    }
+  });
+
   it("sends one bounded command frame and returns the held daemon result", async () => {
     const fx = await fixture({ messageId: "m_1", delivered: 1 });
     try {

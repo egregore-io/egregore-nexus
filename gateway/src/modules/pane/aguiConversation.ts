@@ -14,7 +14,11 @@ import type { BaseEvent } from "@ag-ui/client";
 
 import type { SendTarget } from "@shared/types";
 import { logEvent } from "@app/log";
-import { gatewayFetch, gatewayUrl } from "@app/gatewayClient";
+import {
+  gatewayFetch,
+  gatewayUrl,
+  gatewayWebSocketProtocols,
+} from "@app/gatewayClient";
 
 import type { Block, ChipLabel, Inline, PaneMessage } from "./types";
 
@@ -59,7 +63,7 @@ export interface AguiConversationState {
   agent: Required<Pick<AguiAgent, "who" | "glyph" | "chip">> & {
     presence?: PaneMessage["presence"];
   };
-  /** Operator identity for `role:"user"` rows the STREAM surfaces (TUI-origin input, etc.). */
+  /** Authenticated viewer identity used to distinguish self from other streamed humans. */
   you: { who: string; glyph: string };
   openRunId: string | null;
   /** Index of the open run's row in `messages` (-1 when none). */
@@ -77,6 +81,8 @@ export interface AguiConversationState {
    */
   openUserMessageId: string | null;
   openUserCommittedMessageId: string | null;
+  openUserName: string | null;
+  openUserKind: string | null;
   userBuffer: string;
   /**
    * Optimistic `you` rows (`appendUserMessage`) awaiting their stream copy. Agent-session prompts
@@ -109,6 +115,8 @@ export function newConversationState(
     openReasoningMessageId: null,
     openUserMessageId: null,
     openUserCommittedMessageId: null,
+    openUserName: null,
+    openUserKind: null,
     userBuffer: "",
     pendingEchoes: [],
     toolBlockIndex: new Map(),
@@ -169,6 +177,8 @@ function openRun(state: AguiConversationState, runId: string): AguiConversationS
     openReasoningMessageId: null,
     openUserMessageId: null,
     openUserCommittedMessageId: null,
+    openUserName: null,
+    openUserKind: null,
     userBuffer: "",
     toolBlockIndex: new Map(),
   };
@@ -193,6 +203,8 @@ function resetOpenRun(state: AguiConversationState, runId: string): AguiConversa
     openReasoningMessageId: null,
     openUserMessageId: null,
     openUserCommittedMessageId: null,
+    openUserName: null,
+    openUserKind: null,
     userBuffer: "",
     toolBlockIndex: new Map(),
   };
@@ -220,6 +232,8 @@ function ignoreOpenRun(state: AguiConversationState): AguiConversationState {
     openReasoningMessageId: null,
     openUserMessageId: null,
     openUserCommittedMessageId: null,
+    openUserName: null,
+    openUserKind: null,
     userBuffer: "",
     toolBlockIndex: new Map(),
   };
@@ -231,16 +245,18 @@ function ignoreOpenRun(state: AguiConversationState): AguiConversationState {
  * input, so we render it locally). Closes any open run so the agent's reply opens
  * a fresh row after it. `who`/`glyph` come from the operator identity.
  */
-export function appendUserMessage(
+type OptimisticUserMessage = {
+  id: string;
+  who: string;
+  glyph: string;
+  text: string;
+  time?: string;
+  reconcileBy?: "id" | "text";
+};
+
+function appendOptimisticUserState(
   state: AguiConversationState,
-  args: {
-    id: string;
-    who: string;
-    glyph: string;
-    text: string;
-    time?: string;
-    reconcileBy?: "id" | "text";
-  },
+  args: OptimisticUserMessage,
 ): AguiConversationState {
   const row: PaneMessage = {
     id: args.id,
@@ -260,6 +276,15 @@ export function appendUserMessage(
       ...state.pendingEchoes,
       { id: args.id, text: args.text, reconcileBy: args.reconcileBy ?? "text" },
     ],
+  };
+}
+
+export function appendUserMessage(
+  state: AguiConversationState,
+  args: OptimisticUserMessage,
+): AguiConversationState {
+  return {
+    ...appendOptimisticUserState(state, args),
     openRunId: null,
     openIndex: -1,
     openTextMessageId: null,
@@ -267,28 +292,35 @@ export function appendUserMessage(
     openReasoningMessageId: null,
     openUserMessageId: null,
     openUserCommittedMessageId: null,
+    openUserName: null,
+    openUserKind: null,
     userBuffer: "",
     toolBlockIndex: new Map(),
   };
 }
 
 /**
- * Insert a closed operator `you` row carrying `text`. Placed BEFORE the open agent run (if any) so
- * the order stays `you → reply`; appended at the end otherwise. Used for `role:"user"` messages the
- * STREAM surfaces that have no matching optimistic echo (input typed in the TUI, or another operator).
+ * Insert a closed attributed user row carrying `text`. Placed BEFORE the open agent run (if any)
+ * so input stays before its reply. Authenticated self is `you`; a differently named human remains
+ * `human`; legacy events without provenance retain the historical self fallback.
  */
 function insertUserRow(
   state: AguiConversationState,
   id: string,
   text: string,
-  opts: { durableId?: boolean } = {},
+  opts: { durableId?: boolean; name?: string; kind?: string } = {},
 ): AguiConversationState {
+  const attributedOther = Boolean(
+    opts.name && opts.kind && (opts.kind !== "human" || opts.name !== state.you.who),
+  );
+  const isYou = !attributedOther;
+  const who = isYou ? state.you.who : opts.name!;
   const row: PaneMessage = {
     id: opts.durableId ? id : `agui-user:${id}`,
-    who: state.you.who,
-    glyph: state.you.glyph,
-    chip: "you",
-    isYou: true,
+    who,
+    glyph: isYou ? state.you.glyph : who.charAt(0).toUpperCase() || "?",
+    chip: isYou ? "you" : opts.kind === "human" ? "human" : "agent",
+    ...(isYou ? { isYou: true } : {}),
     blocks: [{ b: "p", runs: [{ t: "text", v: text }] }],
   };
   if (state.openIndex < 0) {
@@ -370,6 +402,8 @@ export function reduceAguiEvents(
         openReasoningMessageId: null,
         openUserMessageId: null,
         openUserCommittedMessageId: null,
+        openUserName: null,
+        openUserKind: null,
         userBuffer: "",
         toolBlockIndex: new Map(),
       };
@@ -406,9 +440,9 @@ export function reduceAguiEvents(
     case EventType.TEXT_MESSAGE_START: {
       const messageId = str(field(ev, "messageId"));
       const committedMessageId = committedMessageIdFromStart(ev);
-      // A `role:"user"` message is the operator's OWN input echoed by the session stream — never
-      // agent text. Buffer it separately; decide on END (dup of our optimistic echo vs. a fresh
-      // TUI-origin `you` row). Do NOT fold it into the open agent run.
+      // A `role:"user"` message is input echoed by the session stream, never assistant text.
+      // Buffer it separately; on END, reconcile authenticated self with an optimistic echo or
+      // render the preserved actor as a distinct row. Do NOT fold it into the target's run.
       if (str(field(ev, "role")) === "user") {
         if (
           committedMessageId &&
@@ -420,6 +454,8 @@ export function reduceAguiEvents(
           ...state,
           openUserMessageId: messageId,
           openUserCommittedMessageId: committedMessageId,
+          openUserName: str(field(ev, "name")) || null,
+          openUserKind: str(field(ev, "kind")) || null,
           userBuffer: "",
         };
       }
@@ -437,13 +473,15 @@ export function reduceAguiEvents(
       // (Lane A / Message Post). Attribute this row to its real author instead
       // of the single global agent identity, so the UI shows who is speaking.
       const author = str(field(ev, "name"));
-      if (author && author !== row.who) {
+      const authorIsHuman = str(field(ev, "kind")) === "human";
+      if ((author && author !== row.who) || (authorIsHuman && row.chip !== "human")) {
         const messages = state.messages.slice();
         messages[state.openIndex] = {
           ...row,
           id: committedMessageId ?? row.id,
-          who: author,
-          glyph: author.charAt(0).toUpperCase(),
+          who: author || row.who,
+          glyph: author ? author.charAt(0).toUpperCase() : row.glyph,
+          chip: authorIsHuman ? "human" : row.chip,
           blocks,
         };
         return { ...state, messages, openTextMessageId: messageId };
@@ -489,10 +527,16 @@ export function reduceAguiEvents(
       if (state.openUserMessageId && messageId === state.openUserMessageId) {
         const text = state.userBuffer;
         const normalizedText = normalizedEchoText(text);
-        const echoIdx = state.pendingEchoes.findIndex((pending) => {
-          if (pending.reconcileBy === "id") return pending.id === messageId;
-          return normalizedEchoText(pending.text) === normalizedText;
-        });
+        const streamedIsSelf =
+          !state.openUserKind ||
+          (state.openUserKind === "human" &&
+            (!state.openUserName || state.openUserName === state.you.who));
+        const echoIdx = streamedIsSelf
+          ? state.pendingEchoes.findIndex((pending) => {
+              if (pending.reconcileBy === "id") return pending.id === messageId;
+              return normalizedEchoText(pending.text) === normalizedText;
+            })
+          : -1;
         if (echoIdx >= 0) {
           // Dup of our optimistic `you` echo → drop the stream copy, consume the pending entry.
           const pendingEchoes = state.pendingEchoes.slice();
@@ -507,18 +551,24 @@ export function reduceAguiEvents(
             messages,
             openUserMessageId: null,
             openUserCommittedMessageId: null,
+            openUserName: null,
+            openUserKind: null,
             userBuffer: "",
             pendingEchoes,
           };
         }
-        // No optimistic echo (TUI-origin / another operator) → render it as a `you` row.
+        // No optimistic self echo: render the preserved actor as self, human, or agent.
         const committedMessageId = state.openUserCommittedMessageId;
         return {
           ...insertUserRow(state, committedMessageId ?? messageId, text, {
             durableId: !!committedMessageId,
+            name: state.openUserName ?? undefined,
+            kind: state.openUserKind ?? undefined,
           }),
           openUserMessageId: null,
           openUserCommittedMessageId: null,
+          openUserName: null,
+          openUserKind: null,
           userBuffer: "",
         };
       }
@@ -677,6 +727,7 @@ const HISTORY_REFETCH_MS = 2500;
 export interface HistoryBacklogRow {
   messageId: string;
   from: string;
+  fromKind?: string;
   when?: number;
   body: string;
   cursor?: { createdAt: number; rowid: number; opaque?: string };
@@ -694,7 +745,7 @@ export function historyRowsToPaneMessages(
       id: row.messageId,
       who,
       glyph: isYou ? you.glyph : (who.trim()[0] ?? "?").toUpperCase(),
-      chip: isYou ? "you" : "agent",
+      chip: isYou ? "you" : row.fromKind === "human" ? "human" : "agent",
       ...(isYou ? { isYou: true } : {}),
       ...(row.cursor ? { messageCursor: row.cursor } : {}),
       blocks: [{ b: "p", runs: [{ t: "text", v: row.body }] }],
@@ -757,6 +808,12 @@ async function defaultLoadBacklog(
 export type AguiTransport = "sse" | "ws";
 export type AguiInputFrame =
   | {
+      /** Stable session-path sockets derive their immutable target server-side. */
+      t: "input";
+      text: string;
+      clientMessageId: string;
+    }
+  | {
       t: "input";
       mode: "session";
       target: string;
@@ -793,6 +850,13 @@ export function observeSessionUrl(sessionId: string, after?: string): string {
   const params = new URLSearchParams({ view: "agui" });
   if (after) params.set("after", after);
   return `/api/v1/agent-sessions/${encodeURIComponent(sessionId)}/events?${params.toString()}`;
+}
+
+/** Compatibility lane for links that predate stable session ids. */
+export function observeLegacySessionUrl(name: string, afterId?: number): string {
+  const params = new URLSearchParams({ session: name });
+  if (afterId && afterId > 0) params.set("afterId", String(afterId));
+  return `/api/agui/observe?${params.toString()}`;
 }
 
 /** Stable key for the active Message Post target, used to rebind reused pane instances. */
@@ -874,6 +938,40 @@ type PendingSocketInput = {
   reject: (reason?: unknown) => void;
 };
 
+const SESSION_BACKPRESSURE_CLOSE_CODE = 1013;
+const SESSION_BACKPRESSURE_CLOSE_PREFIX = "session.bp:";
+const SESSION_BACKPRESSURE_CURSOR = /^[A-Za-z0-9._~:%+\/=\-]+$/;
+
+type SessionBackpressureResume = { cursor: string | null };
+
+export class AguiWebSocketCloseError extends Error {
+  readonly code: number;
+  readonly reason: string;
+  readonly backpressureResume: SessionBackpressureResume | null;
+
+  constructor(code: number, reason: string) {
+    super(reason ? `AG-UI WebSocket closed (${code}): ${reason}` : `AG-UI WebSocket closed (${code})`);
+    this.name = "AguiWebSocketCloseError";
+    this.code = code;
+    this.reason = reason;
+    this.backpressureResume = sessionBackpressureResume(code, reason);
+  }
+}
+
+function sessionBackpressureResume(code: number, reason: string): SessionBackpressureResume | null {
+  if (code !== SESSION_BACKPRESSURE_CLOSE_CODE || !reason.startsWith(SESSION_BACKPRESSURE_CLOSE_PREFIX)) {
+    return null;
+  }
+  const cursor = reason.slice(SESSION_BACKPRESSURE_CLOSE_PREFIX.length);
+  if (cursor === "none") return { cursor: null };
+  if (!cursor || cursor.length > 112 || !SESSION_BACKPRESSURE_CURSOR.test(cursor)) return null;
+  return { cursor };
+}
+
+function backpressureResumeFromError(error: unknown): SessionBackpressureResume | null {
+  return error instanceof AguiWebSocketCloseError ? error.backpressureResume : null;
+}
+
 export class AguiWebSocketSource implements AguiEventSource {
   onmessage: ((ev: { data: string }) => void) | null = null;
   onerror: ((ev: unknown) => void) | null = null;
@@ -885,16 +983,17 @@ export class AguiWebSocketSource implements AguiEventSource {
   private closed = false;
 
   constructor(observeUrl: string, socketUrl: string = observeWebSocketUrl(observeUrl)) {
-    this.socket = new WebSocket(socketUrl);
+    this.socket = new WebSocket(socketUrl, gatewayWebSocketProtocols());
     this.socket.addEventListener("open", () => {
       this.missedPongs = 0;
       this.heartbeatTimer = setInterval(() => this.ping(), 15_000);
     });
     this.socket.addEventListener("message", (event) => this.handleMessage(event.data));
     this.socket.addEventListener("error", (event) => this.reportError(event));
-    this.socket.addEventListener("close", () => {
-      this.failPending(new Error("AG-UI WebSocket closed"));
-      if (!this.closed) this.reportError(new Error("AG-UI WebSocket closed"));
+    this.socket.addEventListener("close", (event) => {
+      const error = new AguiWebSocketCloseError(event.code, event.reason);
+      this.failPending(error);
+      if (!this.closed) this.reportError(error);
     });
   }
 
@@ -1085,6 +1184,8 @@ export function useAguiConversation(
   const messageAfterOpaqueRef = useRef("");
   const sessionAfterIdRef = useRef(0);
   const sessionAfterCursorRef = useRef("");
+  const sessionPendingCursorRef = useRef("");
+  const sessionCursorCheckpointRef = useRef<AguiConversationState | null>(null);
   const sourceRef = useRef<AguiEventSource | null>(null);
   const subscriptionKeyRef = useRef<string | null>(null);
   const observeEpochRef = useRef<string | number | null | undefined>(undefined);
@@ -1116,6 +1217,8 @@ export function useAguiConversation(
       messageAfterOpaqueRef.current = "";
       sessionAfterIdRef.current = 0;
       sessionAfterCursorRef.current = "";
+      sessionPendingCursorRef.current = "";
+      sessionCursorCheckpointRef.current = null;
       setMessages([]);
     } else if (isSessionObserve && epochChanged) {
       // `streamEventId` belongs to the daemon's tmpfs stream-store file, whose
@@ -1124,14 +1227,17 @@ export function useAguiConversation(
       // cursor instead of carrying a stale volatile afterId into the new store.
       sessionAfterIdRef.current = 0;
       sessionAfterCursorRef.current = "";
+      sessionPendingCursorRef.current = "";
+      sessionCursorCheckpointRef.current = null;
     }
     let cancelled = false;
     let source: AguiEventSource | null = null;
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
     let nextReconnectDelayMs = reconnectDelayMs;
     const historyAbort = new AbortController();
-    const currentObserveUrl = (): string =>
-      observeSessionUrl(sessionStreamId ?? sessionName!, sessionAfterCursorRef.current);
+    const currentObserveUrl = (): string => sessionStreamId
+      ? observeSessionUrl(sessionStreamId, sessionAfterCursorRef.current)
+      : observeLegacySessionUrl(sessionName!, sessionAfterIdRef.current);
     let renderFrame: number | undefined;
     let renderTimer: ReturnType<typeof setTimeout> | undefined;
     let pendingMessages: PaneMessage[] | null = null;
@@ -1256,7 +1362,13 @@ export function useAguiConversation(
         if (cursors.sessionAfterId) {
           sessionAfterIdRef.current = Math.max(sessionAfterIdRef.current, cursors.sessionAfterId);
         }
-        if (cursors.sessionCursor) sessionAfterCursorRef.current = cursors.sessionCursor;
+        if (cursors.sessionCursor) {
+          if (cursors.sessionCursor !== sessionPendingCursorRef.current) {
+            sessionPendingCursorRef.current = cursors.sessionCursor;
+            sessionCursorCheckpointRef.current = stateRef.current;
+          }
+          sessionAfterCursorRef.current = cursors.sessionCursor;
+        }
         if (accept && !accept(ev)) return;
         // Log EVERY streamed chunk — type + the text/reasoning delta when present —
         // so the LOGS drawer shows the realtime stream arriving token-by-token.
@@ -1271,9 +1383,19 @@ export function useAguiConversation(
         // flush immediately so completed turns and test-driven synchronous folds settle.
         commitConversationState(ev);
       };
-      source.onerror = () => {
+      source.onerror = (error) => {
         if (cancelled) return;
-        flushRender();
+        const resume = isSessionObserve ? backpressureResumeFromError(error) : null;
+        if (resume && sessionCursorCheckpointRef.current) {
+          cancelRenderFlush();
+          stateRef.current = sessionCursorCheckpointRef.current;
+          sessionAfterCursorRef.current = resume.cursor ?? "";
+          sessionPendingCursorRef.current = "";
+          sessionCursorCheckpointRef.current = null;
+          setMessages(stateRef.current.messages);
+        } else {
+          flushRender();
+        }
         logEvent("observe", "warn", "stream error (reconnecting)", { conversationId });
         source?.close();
         if (sourceRef.current === source) sourceRef.current = null;
@@ -1323,26 +1445,43 @@ export function useAguiConversation(
       // resets on mount, so include a timestamp) to avoid colliding with a
       // restored backlog row.
       const id = `you:${Date.now()}:${++sendSeq.current}`;
-      stateRef.current = appendUserMessage(stateRef.current, {
+      const optimisticInput: OptimisticUserMessage = {
         id,
         who: you?.who ?? "you",
         glyph: you?.glyph ?? "Y",
         text: body,
         reconcileBy: isSession ? "id" : "text",
-      });
+      };
+      stateRef.current = appendUserMessage(stateRef.current, optimisticInput);
+      // A 1013 resume rolls the stream reducer back to the state immediately before the
+      // server's unfinished cursor group. Local input can be accepted after that checkpoint,
+      // so mirror the optimistic mutation into the checkpoint; replay then restores only the
+      // stream portion while retaining the accepted bubble and its pending echo reconciliation.
+      if (sessionCursorCheckpointRef.current) {
+        sessionCursorCheckpointRef.current = appendOptimisticUserState(
+          sessionCursorCheckpointRef.current,
+          optimisticInput,
+        );
+      }
       setMessages(stateRef.current.messages);
       try {
         const activeSource = sourceRef.current;
         if (activeSource?.sendInput) {
           const delivered = await activeSource.sendInput(
             isSession
-              ? {
-                  t: "input",
-                  mode: "session",
-                  target: sessionName!,
-                  text: body,
-                  clientMessageId: id,
-                }
+              ? sessionStreamId
+                ? {
+                    t: "input",
+                    text: body,
+                    clientMessageId: id,
+                  }
+                : {
+                    t: "input",
+                    mode: "session",
+                    target: sessionName!,
+                    text: body,
+                    clientMessageId: id,
+                  }
               : {
                   t: "input",
                   mode: "bus",
@@ -1370,7 +1509,17 @@ export function useAguiConversation(
         });
       }
     },
-    [target, sessionName, sendMode, you?.who, you?.glyph, postRun, postPrompt, conversationId],
+    [
+      target,
+      sessionName,
+      sessionStreamId,
+      sendMode,
+      you?.who,
+      you?.glyph,
+      postRun,
+      postPrompt,
+      conversationId,
+    ],
   );
 
   return { messages, live, send };
@@ -1379,9 +1528,9 @@ export function useAguiConversation(
 // --- useAgentSession --------------------------------------------------------
 
 export interface UseAgentSessionOptions {
-  /** The agent name (resolves to its session via `?session=<name>`). */
+  /** Mutable display name used only for attribution and the explicit legacy lookup fallback. */
   name: string;
-  /** Durable Nexus session id from the route handle. Falls back to name for legacy links. */
+  /** Durable Nexus session id from the route handle. Stable-path sockets bind all writes to it. */
   sessionId?: string;
   /** Identity to attribute live agent rows to. */
   agent?: AguiAgent;
@@ -1390,8 +1539,8 @@ export interface UseAgentSessionOptions {
   /**
    * Open an AG-UI source for a URL. Defaults to browser `EventSource` unless
    * `NEXUS_WEB_TRANSPORT=ws`; tests inject a fake. The hook always opens
-   * `?session=<name>` (the injected opener
-   * overrides the URL that `useAguiConversation` would compute from the target).
+   * the stable session path when `sessionId` exists, otherwise the explicit
+   * compatibility `?session=<name>` route.
    */
   openSource?: (url: string) => AguiEventSource | null;
   /** Direct harness-session prompt (name, text). Defaults to a real `fetch`; tests inject. */
@@ -1403,13 +1552,14 @@ export interface UseAgentSessionOptions {
 }
 
 /**
- * Subscribe to an agent's session stream (`?session=<name>`, Lane B) and
+ * Subscribe to an agent's stable session stream (Lane B) and
  * expose a session-input composer (`POST /api/conversation/prompt`). This is
  * the `/agent/<handle>` route's data hook: it observes `agent.update` activity
  * (NOT `message.created`) and injects operator input directly into the harness
  * session — NOT the bus. The hook is a thin wrapper around `useAguiConversation`
- * with the observe URL fixed to `?session=<name>` and `sessionName` set for
- * prompt delivery. It does not fabricate a DM `SendTarget`.
+ * with the observe URL bound to `sessionId` whenever one exists. Name-only
+ * links use the compatibility route and targeted frame shape. It never
+ * fabricates a DM `SendTarget`.
  */
 export function useAgentSession(
   options: UseAgentSessionOptions,
@@ -1422,7 +1572,7 @@ export function useAgentSession(
     you,
     // Agent-session input is a direct session prompt, never a Message Post DM target.
     sessionName: name,
-    sessionStreamId: sessionId || name,
+    sessionStreamId: sessionId,
     sendMode: "session",
     openSource,
     postPrompt,

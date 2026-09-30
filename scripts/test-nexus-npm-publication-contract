@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+VERSION=$(tr -d '\n' < "$ROOT/VERSION")
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -41,6 +42,7 @@ node - "$ROOT" <<'NODE'
 const fs = require("node:fs");
 const path = require("node:path");
 const root = process.argv[2];
+const version = fs.readFileSync(path.join(root, "VERSION"), "utf8").trim();
 
 const publicPackages = new Map([
   ["packages/nexus/package.json", "@egregore/nexus"],
@@ -50,7 +52,7 @@ const publicPackages = new Map([
 const packages = [...publicPackages].map(([file, expectedName]) => {
   const pkg = JSON.parse(fs.readFileSync(path.join(root, file), "utf8"));
   if (pkg.name !== expectedName) throw new Error(`${file}: expected ${expectedName}, got ${pkg.name}`);
-  if (pkg.version !== "0.1.4") throw new Error(`${pkg.name}: wrong version`);
+  if (pkg.version !== version) throw new Error(`${pkg.name}: wrong version`);
   if (pkg.publishConfig?.access !== "public") throw new Error(`${pkg.name}: public access is not explicit`);
   return pkg;
 });
@@ -61,8 +63,8 @@ for (const pkg of packages) {
 }
 const [all, cli, gateway] = packages;
 const expectedAll = {
-  "@egregore/nexus-cli": "0.1.4",
-  "@egregore/nexus-gateway": "0.1.4",
+  "@egregore/nexus-cli": version,
+  "@egregore/nexus-gateway": version,
 };
 if (JSON.stringify(all.dependencies) !== JSON.stringify(expectedAll)) {
   throw new Error("@egregore/nexus: dependency contract mismatch");
@@ -74,7 +76,7 @@ if (JSON.stringify(all.bin) !== JSON.stringify({
 })) {
   throw new Error("@egregore/nexus: complete command surface is missing");
 }
-if (gateway.dependencies?.["@egregore/nexus-cli"] !== "0.1.4") {
+if (gateway.dependencies?.["@egregore/nexus-cli"] !== version) {
   throw new Error("@egregore/nexus-gateway must install the CLI automatically");
 }
 if (gateway.bin?.["nexus-webui"] !== "webconsole/bin/nexus-webui.mjs") {
@@ -83,7 +85,7 @@ if (gateway.bin?.["nexus-webui"] !== "webconsole/bin/nexus-webui.mjs") {
 if (!gateway.files?.includes("webconsole/dist")) {
   throw new Error("@egregore/nexus-gateway must carry the built WebUI");
 }
-if (gateway.dependencies?.["@egregore/nexus-cli"] !== "0.1.4") {
+if (gateway.dependencies?.["@egregore/nexus-cli"] !== version) {
   throw new Error("@egregore/nexus-gateway must install nexus-cli");
 }
 if (gateway.bin?.nexus !== "scripts/nexus.mjs") {
@@ -177,11 +179,11 @@ if grep -Eq 'npm (publish|dist-tag)' "$WORKFLOW"; then
   exit 1
 fi
 
-cat >"$TMP/nexus.c" <<'C'
+cat >"$TMP/nexus.c" <<C
 #include <stdio.h>
 int main(int argc, char **argv) {
   if (argc == 2 && argv[1][0] == '-' && argv[1][1] == '-') {
-    puts("nexus 0.1.0 (revision publication-contract)");
+    puts("nexus ${VERSION}");
     return 0;
   }
   return 0;
@@ -193,7 +195,7 @@ PACKED=$(
   "$ROOT/scripts/nexus-pack-native-npm" \
     --target linux-x64-gnu --binary "$TMP/nexus" --output "$TMP/assembly"
 )
-"$PACKED" --version | grep -q 'revision publication-contract'
+test "$("$PACKED" --version)" = "nexus ${VERSION}"
 
 SECTIONS=$(readelf -SW "$PACKED")
 if printf '%s\n' "$SECTIONS" | grep -Eq '\.(symtab|debug_[^ ]*|comment)([[:space:]]|$)'; then

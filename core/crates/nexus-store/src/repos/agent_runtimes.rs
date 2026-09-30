@@ -111,6 +111,80 @@ impl<'a> AgentRuntimes<'a> {
             .await
     }
 
+    /// Remove an impossible runtime row owned by a non-agent compatibility session.
+    ///
+    /// This is intentionally keyed only by the disposable runtime id: callers must first prove
+    /// that the authoritative `sessions` row has a non-agent kind. The durable agent identity and
+    /// every sibling runtime remain untouched.
+    pub async fn remove_non_agent_residue(&self, runtime_id: &str) -> Result<bool, NexusError> {
+        let changed = self
+            .store
+            .identity_conn()
+            .execute(
+                "DELETE FROM agent_runtimes WHERE runtime_id = ?1",
+                params![runtime_id],
+            )
+            .await
+            .map_err(store_err)?;
+        if changed > 0 {
+            self.store.events().session_lifecycle_changed().signal();
+        }
+        Ok(changed > 0)
+    }
+
+    /// Roll back identity-side rows for a registration that never became externally visible.
+    ///
+    /// `runtime_id` is the freshly generated compatibility session id, so deleting that exact row
+    /// cannot affect an older runtime. `generated_agent_id` is supplied only for the legacy
+    /// name-only path, whose durable id is derived from that fresh session id. Existing explicit
+    /// stable identities are never removed by this cleanup.
+    pub async fn remove_staged_registration(
+        &self,
+        runtime_id: &str,
+        generated_agent_id: Option<&str>,
+    ) -> Result<(), NexusError> {
+        let tx = self
+            .store
+            .begin_identity_write_txn("agent_registration_rollback")
+            .await?;
+        let result = async {
+            tx.execute(
+                "DELETE FROM agent_runtimes WHERE runtime_id = ?1",
+                params![runtime_id],
+            )
+            .await?;
+            if let Some(agent_id) = generated_agent_id {
+                tx.execute(
+                    "DELETE FROM agents WHERE agent_id = ?1
+                     AND NOT EXISTS (
+                       SELECT 1 FROM agent_runtimes WHERE agent_id = ?1
+                     )
+                     AND NOT EXISTS (
+                       SELECT 1 FROM agent_credentials WHERE agent_id = ?1
+                     )
+                     AND NOT EXISTS (
+                       SELECT 1 FROM native_thread_bindings WHERE agent_id = ?1
+                     )",
+                    params![agent_id],
+                )
+                .await?;
+            }
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                tx.commit().await?;
+                self.store.events().session_lifecycle_changed().signal();
+                Ok(())
+            }
+            Err(error) => {
+                tx.rollback(&error).await?;
+                Err(error)
+            }
+        }
+    }
+
     /// Update runtime presence and heartbeat. Takes the [`Presence`] enum and serializes it to the
     /// stored lowercase token via the canonical [`nexus_common::presence::presence_token`].
     pub async fn set_presence(

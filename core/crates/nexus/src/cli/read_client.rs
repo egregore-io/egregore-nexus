@@ -64,6 +64,7 @@ enum ReadClientBackend {
 
 #[derive(Debug, Clone)]
 struct ReadCaller {
+    agent_id: Option<String>,
     name: String,
     project: String,
     session_id: Option<String>,
@@ -142,6 +143,7 @@ impl ReadClient {
         ReadClient::new_store(
             store,
             ReadCaller {
+                agent_id: None,
                 name: name.into(),
                 project: project.into(),
                 session_id,
@@ -228,10 +230,12 @@ impl ReadClient {
         }
         match self.session_row().await? {
             Some(row) => Ok(Whoami {
-                agent_id: if let Some(name) = row.name.as_deref() {
-                    self.agent_id_for_name(name).await?
-                } else {
-                    row.agent_id.clone().map(AgentId)
+                agent_id: match row.agent_id.as_deref() {
+                    Some(agent_id) => Some(AgentId(agent_id.to_string())),
+                    None => match row.name.as_deref() {
+                        Some(name) => self.agent_id_for_name(name).await?,
+                        None => None,
+                    },
                 },
                 name: row.name,
                 session_id: row.session_id,
@@ -261,7 +265,8 @@ impl ReadClient {
         }
     }
 
-    /// List members in the caller's project using the same heartbeat-staleness rule as the daemon.
+    /// List the global member directory, optionally filtered by project metadata, using the same
+    /// heartbeat-staleness rule as the daemon.
     pub async fn members(
         &self,
         req: MemberListRequest,
@@ -273,11 +278,12 @@ impl ReadClient {
         let include_dead = req.include_dead.unwrap_or(false);
         let ts = now();
         let mut members = Vec::new();
-        for row in Sessions::new(self.store())
-            .list(&self.caller.project)
-            .await
-            .map_err(store_err)?
-        {
+        let sessions = Sessions::new(self.store());
+        let rows = match req.project.as_deref() {
+            Some(project) => sessions.list(project).await.map_err(store_err)?,
+            None => sessions.list_all().await.map_err(store_err)?,
+        };
+        for row in rows {
             let stale = nexus_common::presence::is_stale(
                 row.last_heartbeat.or(Some(row.created_at)),
                 ts,
@@ -291,10 +297,12 @@ impl ReadClient {
             if presence == Presence::Offline && !include_offline {
                 continue;
             }
-            let agent_id = if let Some(name) = row.name.as_deref() {
-                self.agent_id_for_name(name).await?
-            } else {
-                row.agent_id.clone().map(AgentId)
+            let agent_id = match row.agent_id.as_deref() {
+                Some(agent_id) => Some(AgentId(agent_id.to_string())),
+                None => match row.name.as_deref() {
+                    Some(name) => self.agent_id_for_name(name).await?,
+                    None => None,
+                },
             };
             // Dead-marking is durable agent state,
             // separate from presence. Dead rows leave the default roster; audit views
@@ -664,10 +672,12 @@ impl ReadClient {
 
     async fn caller(&self) -> Result<Caller, ContractError> {
         if let Some(row) = self.session_row().await? {
-            let agent_id = if let Some(name) = row.name.as_deref() {
-                self.agent_id_for_name(name).await?
-            } else {
-                row.agent_id.clone().map(AgentId)
+            let agent_id = match row.agent_id.as_deref() {
+                Some(agent_id) => Some(AgentId(agent_id.to_string())),
+                None => match row.name.as_deref() {
+                    Some(name) => self.agent_id_for_name(name).await?,
+                    None => None,
+                },
             };
             let mut session = row.session_id.clone();
             if let Some(agent_id) = &agent_id {
@@ -711,7 +721,7 @@ impl ReadClient {
         let sessions = Sessions::new(self.store());
         if let Some(client_key) = self.caller.client_key.as_deref() {
             if let Some(row) = sessions
-                .find_by_client_key(&self.caller.project, client_key)
+                .find_by_client_key_any_project(client_key)
                 .await
                 .map_err(store_err)?
             {
@@ -729,7 +739,7 @@ impl ReadClient {
             }
         }
         sessions
-            .find_by_name(&self.caller.project, &self.caller.name)
+            .find_unique_by_name_any_project(&self.caller.name)
             .await
             .map_err(store_err)
     }
@@ -737,14 +747,27 @@ impl ReadClient {
     async fn attach_row(&self, target: &str) -> Result<SessionRow, ContractError> {
         let sessions = Sessions::new(self.store());
         if matches!(AgentRef::parse(target), AgentRef::Id(_)) {
-            return sessions
+            if let Some(row) = sessions
                 .active_runtime_session_for_agent(target)
                 .await
                 .map_err(store_err)?
-                .ok_or_else(|| ContractError {
+            {
+                return Ok(row);
+            }
+            if Agents::new(self.store())
+                .find_by_id(target)
+                .await
+                .map_err(store_err)?
+                .is_some()
+            {
+                if let Some(row) = sessions.find_by_agent_id(target).await.map_err(store_err)? {
+                    return Ok(row);
+                }
+                return Err(ContractError {
                     code: codes::NOT_FOUND,
-                    message: format!("active runtime not found for agent id: {target}"),
+                    message: format!("runtime not found for agent id: {target}"),
                 });
+            }
         }
         if target.starts_with("s_") {
             if let Some(row) = sessions
@@ -760,12 +783,15 @@ impl ReadClient {
         // headed process is represented by a newer (possibly unnamed) session row. Follow the
         // stable identity to its active runtime first so `nexus attach <name>` projects the
         // terminal that is actually running.
-        if let Some(agent) = Agents::new(self.store())
-            .find_by_name(target)
+        match Agents::new(self.store())
+            .resolve_ref(
+                &self.caller.project,
+                &AgentRef::Name(target.to_string()),
+                true,
+            )
             .await
-            .map_err(store_err)?
         {
-            if self.caller.tier == Tier::Admin || agent.project == self.caller.project {
+            Ok(agent) => {
                 if let Some(row) = sessions
                     .active_runtime_session_for_agent(&agent.agent_id)
                     .await
@@ -774,9 +800,11 @@ impl ReadClient {
                     return Ok(row);
                 }
             }
+            Err(nexus_common::NexusError::NotFound(_)) => {}
+            Err(error) => return Err(store_err(error)),
         }
         if let Some(row) = sessions
-            .find_by_name(&self.caller.project, target)
+            .find_unique_by_name_any_project(target)
             .await
             .map_err(store_err)?
         {
@@ -894,11 +922,14 @@ impl ReadClient {
         let resolved_agent_id = match row.agent_id.as_deref() {
             Some(agent_id) => Some(agent_id.to_string()),
             None => match row.name.as_deref() {
-                Some(name) => Agents::new(self.store())
-                    .find_by_project_name(&row.project, name)
+                Some(name) => match Agents::new(self.store())
+                    .resolve_ref(&row.project, &AgentRef::Name(name.to_string()), true)
                     .await
-                    .map_err(store_err)?
-                    .map(|agent| agent.agent_id),
+                {
+                    Ok(agent) => Some(agent.agent_id),
+                    Err(nexus_common::NexusError::NotFound(_)) => None,
+                    Err(error) => return Err(store_err(error)),
+                },
                 None => None,
             },
         };
@@ -933,29 +964,37 @@ impl ReadClient {
     }
 
     async fn agent_id_for_name(&self, name: &str) -> Result<Option<AgentId>, ContractError> {
-        Ok(Agents::new(self.store())
-            .find_by_name(name)
+        let mut matches = Agents::new(self.store())
+            .find_all_by_name(name)
             .await
-            .map_err(store_err)?
-            .map(|row| AgentId(row.agent_id)))
+            .map_err(store_err)?;
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(Some(AgentId(matches.remove(0).agent_id))),
+            count => Err(store_err(nexus_common::NexusError::Ambiguous(format!(
+                "agent name {name:?} matches {count} identities; address it by stable agent id"
+            )))),
+        }
     }
 
     async fn resolve_agent(&self, name: &str) -> Result<AgentRow, ContractError> {
-        let agent = Agents::new(self.store())
-            .find_by_name(name)
+        let agents = Agents::new(self.store());
+        let agent_ref = AgentRef::parse(name);
+        match agents
+            .resolve_ref(&self.caller.project, &agent_ref, true)
             .await
-            .map_err(store_err)?
-            .ok_or_else(|| ContractError {
-                code: codes::NOT_FOUND,
-                message: format!("agent:{name}"),
-            })?;
-        if self.caller.tier == Tier::Admin || agent.project == self.caller.project {
-            Ok(agent)
-        } else {
-            Err(ContractError {
-                code: codes::NOT_FOUND,
-                message: format!("agent:{name}"),
-            })
+        {
+            Err(nexus_common::NexusError::NotFound(_)) if matches!(agent_ref, AgentRef::Id(_)) => {
+                agents
+                    .resolve_ref(
+                        &self.caller.project,
+                        &AgentRef::Name(name.to_string()),
+                        true,
+                    )
+                    .await
+                    .map_err(store_err)
+            }
+            result => result.map_err(store_err),
         }
     }
 
@@ -1204,6 +1243,7 @@ impl ReadCaller {
     /// The zero-auth local-operator Admin caller (env-less human shell).
     fn local_operator() -> ReadCaller {
         ReadCaller {
+            agent_id: None,
             name: local_operator_display_name(),
             project: std::env::var("NEXUS_PROJECT")
                 .ok()
@@ -1218,12 +1258,14 @@ impl ReadCaller {
 
     fn from_register(identity: RegisterRequest) -> ReadCaller {
         let kind = identity.kind.unwrap_or(Kind::Agent);
+        let agent_id = identity.agent_id.as_ref().map(|id| id.0.clone());
         let fallback = identity
             .agent_id
             .as_ref()
             .map(|id| id.0.clone())
             .unwrap_or_else(|| identity.client_key.clone());
         ReadCaller {
+            agent_id,
             name: identity.name.unwrap_or(fallback),
             project: identity.project,
             session_id: None,
@@ -1244,7 +1286,7 @@ impl ReadCaller {
             name: Some(self.name.clone()),
             project: self.project.clone(),
             session_id: self.session_id.clone(),
-            agent_id: None,
+            agent_id: self.agent_id.clone(),
             runtime_id: self.session_id.clone(),
             client_key: self.client_key.clone(),
             kind: self.kind,
@@ -1382,50 +1424,5 @@ impl IdentityPort for NoIdentity {
 }
 
 #[cfg(test)]
-mod caller_gate_tests {
-    use super::*;
-    use crate::cli::ambient::with_scrubbed_identity_env;
-
-    #[test]
-    fn envless_shell_is_the_local_operator() {
-        let caller = with_scrubbed_identity_env(&[], ReadCaller::from_env);
-        let caller = caller.unwrap();
-        assert!(caller.is_local_operator());
-    }
-
-    #[test]
-    fn agent_identity_always_wins_and_is_never_operator() {
-        let caller = with_scrubbed_identity_env(
-            &[("NEXUS_NAME", "demoa"), ("NEXUS_CLIENT_KEY", "ck_demoa")],
-            ReadCaller::from_env,
-        )
-        .unwrap();
-        assert_eq!(caller.name, "demoa");
-        assert_eq!(caller.tier, Tier::Agent);
-        assert!(!caller.is_local_operator());
-    }
-
-    #[test]
-    fn ambient_human_kind_survives_agent_tier_on_daemon_reads() {
-        let caller = with_scrubbed_identity_env(
-            &[
-                ("NEXUS_NAME", "endurance-controller"),
-                ("NEXUS_CLIENT_KEY", "ck_controller"),
-                ("NEXUS_KIND", "human"),
-            ],
-            ReadCaller::from_env,
-        )
-        .unwrap();
-        let ipc = caller.to_ipc();
-        assert_eq!(ipc.kind, Kind::Human);
-        assert_eq!(ipc.tier, Tier::Agent);
-    }
-
-    #[test]
-    fn partial_agent_env_is_not_local_operator() {
-        let error = with_scrubbed_identity_env(&[("NEXUS_NAME", "demoa")], ReadCaller::from_env)
-            .unwrap_err();
-        assert_eq!(error.code, codes::UNAUTHORIZED);
-        assert!(error.message.contains("NEXUS_CLIENT_KEY"));
-    }
-}
+#[path = "../../tests/unit/read_client_caller.rs"]
+mod caller_gate_tests;

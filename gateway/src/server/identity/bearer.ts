@@ -6,10 +6,8 @@ import type {
   GatewayCallerIdentity,
   PrincipalScope,
 } from "@server/api/http";
-import {
-  humanPrincipalAttributes,
-  principalHasScope,
-} from "@server/auth/principal";
+import { principalHasScope } from "@server/auth/principal";
+import { localOperatorCaller } from "@server/auth/webAuthMode";
 
 const ACCESS_PREFIX = "nx_at";
 const REFRESH_PREFIX = "nx_rt";
@@ -23,6 +21,10 @@ interface TokenRow {
   actor_project: string;
   actor_kind: string;
   actor_tier: string;
+  actor_session_id: string | null;
+  actor_agent_id: string | null;
+  actor_runtime_id: string | null;
+  actor_client_key: string | null;
   scopes_json: string;
   expires_at: number;
   refresh_expires_at: number;
@@ -98,9 +100,10 @@ export async function issueBearerToken(
   await deps.db.execute({
     sql: `INSERT INTO rest_bearer_token
             (token_id, family_id, actor_name, actor_project, actor_kind, actor_tier,
+             actor_session_id, actor_agent_id, actor_runtime_id, actor_client_key,
              scopes_json, access_hash, refresh_hash, expires_at, refresh_expires_at,
              revoked_at, last_used_at, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)`,
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)`,
     args: [
       tokenId,
       familyId,
@@ -108,6 +111,10 @@ export async function issueBearerToken(
       input.actor.project,
       input.actor.kind ?? Kind.Human,
       tier,
+      input.actor.sessionId ?? null,
+      input.actor.agentId ?? null,
+      input.actor.runtimeId ?? input.actor.sessionId ?? null,
+      input.actor.clientKey ?? null,
       JSON.stringify(scopes),
       hashToken(accessToken),
       hashToken(refreshToken),
@@ -142,13 +149,12 @@ export async function issueOperatorBearerToken(
   if (!name) {
     throw new BearerTokenError(400, "name is required");
   }
-  const attrs = humanPrincipalAttributes();
+  const project = input.project?.trim() || "default";
   return issueBearerToken(
     {
       actor: {
+        ...localOperatorCaller(project),
         name,
-        project: input.project?.trim() || "default",
-        ...attrs,
       },
       scopes: input.scopes,
       ttlMs: input.ttlMs,
@@ -206,9 +212,10 @@ export async function refreshBearerToken(
   await deps.db.execute({
     sql: `INSERT INTO rest_bearer_token
             (token_id, family_id, actor_name, actor_project, actor_kind, actor_tier,
+             actor_session_id, actor_agent_id, actor_runtime_id, actor_client_key,
              scopes_json, access_hash, refresh_hash, expires_at, refresh_expires_at,
              revoked_at, last_used_at, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)`,
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)`,
     args: [
       tokenId,
       row.family_id,
@@ -216,6 +223,10 @@ export async function refreshBearerToken(
       row.actor_project,
       row.actor_kind,
       row.actor_tier,
+      row.actor_session_id,
+      row.actor_agent_id,
+      row.actor_runtime_id,
+      row.actor_client_key,
       JSON.stringify(scopes),
       hashToken(accessToken),
       hashToken(nextRefreshToken),
@@ -259,6 +270,7 @@ async function findByHash(
   const res = await db.execute({
     sql:
       `SELECT token_id, family_id, actor_name, actor_project, actor_kind, actor_tier, ` +
+      `actor_session_id, actor_agent_id, actor_runtime_id, actor_client_key, ` +
       `scopes_json, expires_at, refresh_expires_at, revoked_at ` +
       `FROM rest_bearer_token WHERE ${column} = ? LIMIT 1`,
     args: [hash],
@@ -272,6 +284,10 @@ async function findByHash(
     actor_project: String(row.actor_project),
     actor_kind: String(row.actor_kind),
     actor_tier: String(row.actor_tier),
+    actor_session_id: row.actor_session_id == null ? null : String(row.actor_session_id),
+    actor_agent_id: row.actor_agent_id == null ? null : String(row.actor_agent_id),
+    actor_runtime_id: row.actor_runtime_id == null ? null : String(row.actor_runtime_id),
+    actor_client_key: row.actor_client_key == null ? null : String(row.actor_client_key),
     scopes_json: String(row.scopes_json),
     expires_at: Number(row.expires_at),
     refresh_expires_at: Number(row.refresh_expires_at),
@@ -299,6 +315,10 @@ function rowToPrincipal(row: TokenRow): GatewayCallerIdentity {
     scopes: parseScopes(row.scopes_json),
     tokenId: row.token_id,
     expiresAt: row.expires_at,
+    ...(row.actor_session_id ? { sessionId: row.actor_session_id } : {}),
+    ...(row.actor_agent_id ? { agentId: row.actor_agent_id } : {}),
+    ...(row.actor_runtime_id ? { runtimeId: row.actor_runtime_id } : {}),
+    ...(row.actor_client_key ? { clientKey: row.actor_client_key } : {}),
   };
 }
 

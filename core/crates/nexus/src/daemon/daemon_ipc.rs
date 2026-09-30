@@ -12,7 +12,7 @@ use nexus_contracts::{
     DaemonIpcCaller, DaemonIpcRequest, DaemonIpcResponse, Kind, MessageId, Presence, Request,
     RpcError, SessionId, Tier, Whoami, DAEMON_IPC_PROTOCOL_VERSION, JSONRPC_VERSION,
 };
-use nexus_store::repos::{CommandIntents, CommandQueue, Inbox, NewCommandIntent, Sessions};
+use nexus_store::repos::{Agents, CommandIntents, CommandQueue, Inbox, NewCommandIntent, Sessions};
 use nexus_store::types::SessionRow;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -532,6 +532,9 @@ async fn handle_query(
         }
         return handle_local_store_read_query(state, request_id, caller, params).await;
     }
+    if method == "local.sessionQueue.read" {
+        return handle_local_session_queue_read(state, request_id, caller, params).await;
+    }
     if method == "local.sessionQueue.mutate" {
         return handle_local_session_queue_mutation(state, request_id, caller, params).await;
     }
@@ -851,19 +854,101 @@ struct LocalSessionQueueMutationRequest {
     request: CommandQueueMutationRequest,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalSessionQueueReadRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    agent_id: Option<AgentId>,
+    #[serde(default)]
+    events_after: Option<i64>,
+}
+
+async fn handle_local_session_queue_read(
+    state: &AppState,
+    request_id: String,
+    caller: Option<DaemonIpcCaller>,
+    params: Value,
+) -> DaemonIpcResponse {
+    if !caller.as_ref().is_some_and(is_local_operator) {
+        return failure(
+            request_id,
+            codes::UNAUTHORIZED,
+            "session queue reads require local operator authority",
+        );
+    };
+    let request: LocalSessionQueueReadRequest = match serde_json::from_value(params) {
+        Ok(request) => request,
+        Err(error) => {
+            return failure(
+                request_id,
+                codes::INVALID_PARAMS,
+                format!("invalid session queue read: {error}"),
+            )
+        }
+    };
+    let queue = CommandQueue::new(&state.store);
+    let result: Result<Value, ContractError> = match request.events_after {
+        Some(after_seq) if after_seq >= 0 => queue
+            .events_after(after_seq)
+            .await
+            .map_err(|error| error.to_contract_error())
+            .map(|page| {
+                json!({
+                    "events": page.events,
+                    "nextSeq": page.next_seq,
+                    "latestSeq": page.latest_seq,
+                    "gap": page.gap,
+                })
+            }),
+        Some(_) => {
+            return failure(
+                request_id,
+                codes::INVALID_PARAMS,
+                "eventsAfter must be a non-negative integer",
+            )
+        }
+        None => {
+            let name = request
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+            if name.is_none() && request.agent_id.is_none() {
+                return failure(
+                    request_id,
+                    codes::INVALID_PARAMS,
+                    "name or agentId is required",
+                );
+            }
+            let active_sessions = state.agent.active_turn_sessions();
+            queue
+                .snapshot_with_active_sessions(name, request.agent_id.as_ref(), &active_sessions)
+                .await
+                .map_err(|error| error.to_contract_error())
+                .and_then(|snapshot| serde_json::to_value(snapshot).map_err(json_contract_error))
+        }
+    };
+    match result {
+        Ok(value) => DaemonIpcResponse::success(request_id, value),
+        Err(error) => store_failure(request_id, error),
+    }
+}
+
 async fn handle_local_session_queue_mutation(
     state: &AppState,
     request_id: String,
     caller: Option<DaemonIpcCaller>,
     params: Value,
 ) -> DaemonIpcResponse {
-    let Some(caller) = caller.filter(is_local_operator) else {
+    if caller.filter(is_local_operator).is_none() {
         return failure(
             request_id,
             codes::UNAUTHORIZED,
             "session queue mutations require local operator authority",
         );
-    };
+    }
     let request: LocalSessionQueueMutationRequest = match serde_json::from_value(params) {
         Ok(request) => request,
         Err(error) => {
@@ -874,13 +959,6 @@ async fn handle_local_session_queue_mutation(
             )
         }
     };
-    if request.project != caller.project {
-        return failure(
-            request_id,
-            codes::UNAUTHORIZED,
-            "session queue mutation project does not match the caller",
-        );
-    }
     let active_sessions = state.agent.active_turn_sessions();
     match CommandQueue::new(&state.store)
         .mutate_with_active_sessions(
@@ -1206,19 +1284,34 @@ async fn resolve_registered_query_caller(
         .await
         .map_err(|error| error.to_contract_error())?
         .ok_or_else(|| unauthorized("daemon IPC caller client key is not registered"))?;
-    let caller = if let Some(name) = session.name.as_deref() {
-        state.identity.resolve(&session.project, name).await?
-    } else {
-        let agent_id = session.agent_id.clone().ok_or_else(|| {
-            unauthorized("daemon IPC caller session has no durable agent identity")
-        })?;
-        Caller {
-            agent_id: Some(AgentId(agent_id)),
-            session: session.session_id.clone(),
-            name: session.display_name(),
-            project: session.project.clone(),
-            tier: tier_from_session(&session),
+    let caller = match session.agent_id.as_deref() {
+        Some(agent_id) => {
+            let agent = Agents::new(&state.store)
+                .find_by_id(agent_id)
+                .await
+                .map_err(|error| error.to_contract_error())?
+                .ok_or_else(|| {
+                    unauthorized("daemon IPC caller stored agent id is not registered")
+                })?;
+            Caller {
+                agent_id: Some(AgentId(agent.agent_id)),
+                session: session.session_id.clone(),
+                name: agent.name.unwrap_or_else(|| session.display_name()),
+                project: agent.project,
+                tier: match session.tier.as_str() {
+                    "admin" => Tier::Admin,
+                    _ => Tier::Agent,
+                },
+            }
         }
+        None => match session.name.as_deref() {
+            Some(name) => state.identity.resolve(&session.project, name).await?,
+            None => {
+                return Err(unauthorized(
+                    "daemon IPC caller session has no durable agent identity",
+                ));
+            }
+        },
     };
     validate_query_caller(evidence, &session, &caller)?;
     Ok(caller)
@@ -1267,13 +1360,6 @@ fn matches_session_id(value: &str, session: &SessionRow, caller: &Caller) -> boo
     value == session.session_id.0
         || value == caller.session.0
         || session.harness_session_id.as_deref() == Some(value)
-}
-
-fn tier_from_session(session: &SessionRow) -> Tier {
-    match session.tier.as_str() {
-        "admin" => Tier::Admin,
-        _ => Tier::Agent,
-    }
 }
 
 fn unauthorized(message: impl Into<String>) -> ContractError {

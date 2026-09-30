@@ -18,8 +18,12 @@ struct OpenCodeHarness;
 
 impl HarnessContract for OpenCodeHarness {
     fn program(&self) -> &'static str {
-        native_harness_program("opencode", NativeProcessPlatform::current())
-            .expect("OpenCode has a native headed executable")
+        native_harness_program(self.agent_token(), NativeProcessPlatform::current())
+            .expect("built-in harness has a native headed executable")
+    }
+
+    fn agent_token(&self) -> &'static str {
+        "opencode"
     }
 
     fn headed_runtime_kind(&self) -> HeadedRuntimeKind {
@@ -44,8 +48,12 @@ struct HermesHarness;
 
 impl HarnessContract for HermesHarness {
     fn program(&self) -> &'static str {
-        native_harness_program("hermes", NativeProcessPlatform::current())
-            .expect("Hermes has a native headed executable")
+        native_harness_program(self.agent_token(), NativeProcessPlatform::current())
+            .expect("built-in harness has a native headed executable")
+    }
+
+    fn agent_token(&self) -> &'static str {
+        "hermes"
     }
 
     fn headed_runtime_kind(&self) -> HeadedRuntimeKind {

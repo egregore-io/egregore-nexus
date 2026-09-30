@@ -15,7 +15,7 @@ use nexus_contracts::{
     GATEWAY_PROJECTION_VERSION,
 };
 use nexus_store::{
-    repos::{NewSession, Sessions, StreamEvents},
+    repos::{AgentRuntimes, Agents, NewAgent, NewAgentRuntime, NewSession, Sessions, StreamEvents},
     Store,
 };
 use nexus_transcript::{ToolCallObservation, ToolCallPhase};
@@ -97,6 +97,7 @@ async fn gateway_stream_accepts_projection_ack_and_keeps_connection_live() {
             version: 1,
             token: "expected-token".to_string(),
             subscriptions: vec![],
+            hooks: None,
         },
     )
     .await
@@ -176,6 +177,7 @@ async fn buffered_projection_replays_in_acknowledged_batches() {
             version: 1,
             token: "expected-token".to_string(),
             subscriptions: vec![],
+            hooks: None,
         },
     )
     .await
@@ -278,6 +280,7 @@ async fn partial_projection_ack_does_not_replay_the_unsettled_batch_tail() {
             version: 1,
             token: "expected-token".to_string(),
             subscriptions: vec![],
+            hooks: None,
         },
     )
     .await
@@ -379,6 +382,7 @@ async fn best_effort_projection_drops_disconnected_history_and_sends_live_once()
             version: 1,
             token: "expected-token".to_string(),
             subscriptions: vec![],
+            hooks: None,
         },
     )
     .await
@@ -430,6 +434,7 @@ async fn gateway_stream_rejects_bad_token_before_subscription() {
                 session_id: "s_ada".to_string(),
                 after_id: 0,
             }],
+            hooks: None,
         },
     )
     .await
@@ -485,6 +490,7 @@ async fn gateway_stream_drains_catchup_then_live_agent_update() {
                 session_id: session.0.clone(),
                 after_id: 0,
             }],
+            hooks: None,
         },
     )
     .await
@@ -569,6 +575,7 @@ async fn gateway_stream_raw_lane_is_reserved_with_store_gap() {
                 session_id: "s_ada".to_string(),
                 after_id: 7,
             }],
+            hooks: None,
         },
     )
     .await
@@ -637,6 +644,7 @@ async fn gateway_stream_drains_catchup_then_live_developer_tool_call_event() {
                 session_id: session.0.clone(),
                 after_id: 0,
             }],
+            hooks: None,
         },
     )
     .await
@@ -721,6 +729,7 @@ async fn fleet_subscribe_resets_an_ahead_cursor_with_ordered_resync_then_live_st
                 // Simulate a cursor retained from an older daemon boot.
                 after_id: 999,
             }],
+            hooks: None,
         },
     )
     .await
@@ -789,6 +798,7 @@ async fn fleet_resync_is_connection_local_and_does_not_refresh_existing_subscrib
                 session_id: FLEET_SESSION_KEY.to_string(),
                 after_id: 0,
             }],
+            hooks: None,
         },
     )
     .await
@@ -820,6 +830,7 @@ async fn fleet_resync_is_connection_local_and_does_not_refresh_existing_subscrib
                 session_id: FLEET_SESSION_KEY.to_string(),
                 after_id: 0,
             }],
+            hooks: None,
         },
     )
     .await
@@ -865,6 +876,19 @@ async fn ws_sink_enriches_ordered_fleet_status_with_authoritative_activity() {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
     let session = SessionId("s_demoa".to_string());
+    let agent_id = "a_demoa";
+    Agents::new(&store)
+        .create(NewAgent {
+            agent_id: agent_id.to_string(),
+            project: "default".to_string(),
+            name: Some("demoa".to_string()),
+            default_harness: Some("codex".to_string()),
+            role: None,
+            tier: Some("agent".to_string()),
+            owner: None,
+        })
+        .await
+        .unwrap();
     Sessions::new(&store)
         .create(NewSession {
             session_id: session.clone(),
@@ -878,6 +902,22 @@ async fn ws_sink_enriches_ordered_fleet_status_with_authoritative_activity() {
             cwd: None,
             project: "default".to_string(),
             transport: Some("codex-appserver".to_string()),
+        })
+        .await
+        .unwrap();
+    Sessions::new(&store)
+        .set_agent_id(&session, agent_id)
+        .await
+        .unwrap();
+    AgentRuntimes::new(&store)
+        .create(NewAgentRuntime {
+            runtime_id: session.0.clone(),
+            agent_id: agent_id.to_string(),
+            harness: "codex".to_string(),
+            cwd: None,
+            transport: Some("codex-appserver".to_string()),
+            presence: Some("busy".to_string()),
+            active: true,
         })
         .await
         .unwrap();
@@ -973,6 +1013,7 @@ async fn gateway_stream_reports_ephemeral_gap_for_dropped_developer_event_cursor
                 session_id: session.0.clone(),
                 after_id: 1,
             }],
+            hooks: None,
         },
     )
     .await
@@ -1085,6 +1126,7 @@ async fn gateway_stream_named_pipe_listener_accepts_client() {
             version: 1,
             token: endpoint.token,
             subscriptions: vec![],
+            hooks: None,
         },
     )
     .await

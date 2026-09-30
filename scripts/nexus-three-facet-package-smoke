@@ -14,6 +14,8 @@ case "${1:-}" in
 esac
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+"$ROOT/scripts/nexus-version" check >/dev/null
+VERSION=$(tr -d '\n' < "$ROOT/VERSION")
 
 # This fixture owns a disposable daemon and Gateway. Never let an ambient agent session inherit
 # operator authority or route the smoke test into the caller's live Nexus runtime.
@@ -64,8 +66,7 @@ mkdir -p "$TMP/packs" "$TMP/cargo-home" "$TMP/stack-install" \
 (cd "$ROOT/core" && \
   cargo package --workspace --exclude nexus-acceptance --no-verify --keep-going --allow-dirty && \
   cargo install --path crates/nexus --bin nexus --root "$TMP/cargo-home" --locked --force)
-"$TMP/cargo-home/bin/nexus" --version | grep -q '0.1.0'
-"$TMP/cargo-home/bin/nexus" --version | grep -Eq 'revision [^)]+\)'
+test "$("$TMP/cargo-home/bin/nexus" --version)" = "nexus $VERSION"
 test "$(wc -c <"$TMP/cargo-home/bin/nexus")" -lt 104857600
 NEXUS_HOME="$TMP/nexus-home" NEXUS_DB_PATH="$TMP/nexus-home/nexus.db" \
   "$TMP/cargo-home/bin/nexus" daemon start >/dev/null
@@ -86,7 +87,7 @@ cp -R "$ROOT/packages/nexus-cli/." "$TMP/cli-assembly/"
 "$ROOT/scripts/nexus-pack-native-npm" \
   --binary "$TMP/cargo-home/bin/nexus" --output "$TMP/cli-assembly" >/dev/null
 CLI_TARBALL=$(cd "$TMP/cli-assembly" && \
-  npm pack --pack-destination "$TMP/packs" --silent | tail -n 1)
+  NEXUS_VERSION_ROOT="$ROOT" npm pack --pack-destination "$TMP/packs" --silent | tail -n 1)
 NEXUS_TARBALL=$(cd "$ROOT/packages/nexus" && \
   npm pack --pack-destination "$TMP/packs" --silent | tail -n 1)
 
@@ -149,13 +150,14 @@ wait_http "http://127.0.0.1:$WEBUI_PORT/health" "$TMP/webui.log"
 curl -fsS "http://127.0.0.1:$WEBUI_PORT/" | grep -q '<div id="root"></div>'
 curl -fsS "http://127.0.0.1:$WEBUI_PORT/api/v1/health" | grep -q 'ok'
 
-HOME="$TMP/empty-home" CARGO_HOME="$TMP/empty-cargo" \
-  "$STACK_BIN/nexus" --version | grep -Eq 'nexus 0\.1\.0 \(revision [^)]+\)'
+test "$(HOME="$TMP/empty-home" CARGO_HOME="$TMP/empty-cargo" \
+  "$STACK_BIN/nexus" --version)" = "nexus $VERSION"
 
 node -e '
 const fs = require("node:fs");
 const path = require("node:path");
 const root = process.argv[1];
+const version = process.argv[2];
 const gateway = JSON.parse(fs.readFileSync(path.join(root, "gateway", "package.json"), "utf8"));
 const webui = JSON.parse(fs.readFileSync(path.join(root, "gateway", "webconsole", "package.json"), "utf8"));
 const cli = JSON.parse(fs.readFileSync(path.join(root, "packages", "nexus-cli", "package.json"), "utf8"));
@@ -164,12 +166,12 @@ if (gateway.name !== "@egregore/nexus-gateway" || gateway.private) process.exit(
 if (webui.name !== "@egregore/nexus-webui-workspace" || !webui.private) process.exit(1);
 if (cli.name !== "@egregore/nexus-cli" || cli.private) process.exit(1);
 if (nexus.name !== "@egregore/nexus" || nexus.private) process.exit(1);
-if ([gateway, webui, cli, nexus].some((pkg) => pkg.license !== "Apache-2.0" || pkg.version !== "0.1.4")) process.exit(1);
-if (gateway.dependencies?.["@egregore/nexus-cli"] !== "0.1.4") process.exit(1);
+if ([gateway, webui, cli, nexus].some((pkg) => pkg.license !== "Apache-2.0" || pkg.version !== version)) process.exit(1);
+if (gateway.dependencies?.["@egregore/nexus-cli"] !== version) process.exit(1);
 if (gateway.bin?.nexus !== "scripts/nexus.mjs") process.exit(1);
-if (nexus.dependencies?.["@egregore/nexus-cli"] !== "0.1.4") process.exit(1);
-if (nexus.dependencies?.["@egregore/nexus-gateway"] !== "0.1.4") process.exit(1);
-' "$ROOT"
+if (nexus.dependencies?.["@egregore/nexus-cli"] !== version) process.exit(1);
+if (nexus.dependencies?.["@egregore/nexus-gateway"] !== version) process.exit(1);
+' "$ROOT" "$VERSION"
 
 NEXUS_HOME="$TMP/nexus-home" NEXUS_DB_PATH="$TMP/nexus-home/nexus.db" \
   NEXUS_GATEWAY_BIN="$STACK_BIN/nexus-gateway" \

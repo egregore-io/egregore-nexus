@@ -108,6 +108,7 @@ async fn gateway_stream_soak_observes_catchup_then_live_without_missing_ids() {
                 session_id: session.0.clone(),
                 after_id: 0,
             }],
+            hooks: None,
         },
     )
     .await
@@ -178,6 +179,7 @@ async fn gateway_stream_raw_lane_reports_store_gap_for_fallback_repair() {
                 session_id: "s_soak_raw".to_string(),
                 after_id: 7,
             }],
+            hooks: None,
         },
     )
     .await

@@ -18,6 +18,7 @@ use nexus_contracts::enums::{Kind, Scope};
 use nexus_contracts::ids::{MessageId, ProjectId, ThreadId, TopicId};
 use nexus_contracts::message::{Message, Provenance};
 use nexus_contracts::ports::{Caller, DispatchPort};
+use nexus_contracts::DeliveryTiming;
 use nexus_store::repos::{DeliveryObligations, NewDeliveryObligation};
 use nexus_store::Store;
 
@@ -67,6 +68,9 @@ pub(crate) async fn broadcast_messages(
     spec: WriteSpec<'_>,
     summary: Option<String>,
     body: String,
+    metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    mention: Vec<String>,
+    delivery_timing: DeliveryTiming,
     created_at: i64,
     idempotency_key: Option<&str>,
     sender_kind: Kind,
@@ -99,6 +103,14 @@ pub(crate) async fn broadcast_messages(
     // ---- Single atomic unit: messages row + all in_flight rows (broadcast atomicity, §11). ----
     let provenance_json =
         serde_json::to_string(&msg.provenance).map_err(|e| NexusError::Store(e.to_string()))?;
+    let metadata_json = metadata
+        .map(|value| serde_json::to_string(&value))
+        .transpose()
+        .map_err(|error| NexusError::Store(error.to_string()))?;
+    let mention_json = (!mention.is_empty())
+        .then(|| serde_json::to_string(&mention))
+        .transpose()
+        .map_err(|error| NexusError::Store(error.to_string()))?;
     // `messages.to_name` is the display target used by UI/read models: DM rows carry the recipient
     // name when known; thread/topic rows carry the named conversation.
     let to_agent_id = match msg.scope {
@@ -142,7 +154,13 @@ pub(crate) async fn broadcast_messages(
     // separate from the boot-scoped rich message row: after a daemon restart only this payload,
     // stable recipient and idempotency identity are needed to resume unsettled delivery.
     let continuity_payload = if store.has_split_authority() {
-        Some(serde_json::to_string(&msg).map_err(|error| NexusError::Store(error.to_string()))?)
+        Some(
+            serde_json::to_string(&serde_json::json!({
+                "message": msg,
+                "deliveryTiming": delivery_timing,
+            }))
+            .map_err(|error| NexusError::Store(error.to_string()))?,
+        )
     } else {
         None
     };
@@ -225,6 +243,9 @@ pub(crate) async fn broadcast_messages(
                 to_agent_id,
                 caller.session.0.clone(),
                 idempotency_key.map(str::to_string),
+                metadata_json,
+                mention_json,
+                delivery_timing.as_str(),
                 recipients_json,
                 events_json,
             ],

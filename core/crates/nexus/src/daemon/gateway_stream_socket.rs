@@ -15,7 +15,8 @@ use nexus_common::{GatewayProjectionBacklogConfig, GatewayProjectionDeliveryMode
 
 type Result<T> = std::result::Result<T, NexusError>;
 use nexus_contracts::{
-    AgentUpdateKind, DeveloperEventEnvelope, GatewayProjectionAck, GatewayProjectionEvent,
+    AgentUpdateKind, DeveloperEventEnvelope, GatewayHookCapabilities, GatewayHookEvaluation,
+    GatewayProjectionAck, GatewayProjectionEvent, HookEvaluationFailure, HookEvaluationResponse,
     SessionId,
 };
 use nexus_transcript::ToolCallObservation;
@@ -66,6 +67,8 @@ pub enum GatewayStreamClientFrame {
         version: u32,
         token: String,
         subscriptions: Vec<GatewayStreamSubscription>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hooks: Option<GatewayHookCapabilities>,
     },
     #[serde(rename = "subscribe", rename_all = "camelCase")]
     Subscribe {
@@ -83,6 +86,16 @@ pub enum GatewayStreamClientFrame {
     /// Durable Gateway watermark after a projection transaction commits.
     #[serde(rename = "projection.ack", rename_all = "camelCase")]
     ProjectionAck { ack: GatewayProjectionAck },
+    #[serde(rename = "hook.result", rename_all = "camelCase")]
+    HookResult {
+        correlation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<HookEvaluationResponse>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<HookEvaluationFailure>,
+    },
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -119,6 +132,8 @@ pub enum GatewayStreamFrame {
     /// Explicit loss boundary when the volatile projection backlog overflows.
     #[serde(rename = "projection.gap", rename_all = "camelCase")]
     ProjectionGap { gap: GatewayProjectionGap },
+    #[serde(rename = "hook.evaluate", rename_all = "camelCase")]
+    HookEvaluate { evaluation: GatewayHookEvaluation },
     #[serde(rename = "gap", rename_all = "camelCase")]
     Gap {
         lane: GatewayStreamLane,
@@ -138,6 +153,7 @@ pub struct GatewayStreamPublisher {
     tool_call_events: ToolCallEventService,
     fleet_events: FleetEventService,
     projection_backlog: GatewayProjectionBacklog,
+    hook_bridge: crate::daemon::gateway_hook_bridge::GatewayHookBridge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,11 +222,16 @@ impl GatewayStreamPublisher {
             ),
             fleet_events: FleetEventService::default(),
             projection_backlog,
+            hook_bridge: crate::daemon::gateway_hook_bridge::GatewayHookBridge::default(),
         }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<GatewayStreamFrame> {
         self.tx.subscribe()
+    }
+
+    pub fn hook_bridge(&self) -> crate::daemon::gateway_hook_bridge::GatewayHookBridge {
+        self.hook_bridge.clone()
     }
 
     /// Publish a canonical fact without ever blocking the transport path on Gateway availability.
@@ -422,11 +443,12 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let hello = match read_gateway_client_frame(&mut reader).await {
+    let (hello, hook_capabilities) = match read_gateway_client_frame(&mut reader).await {
         Ok(GatewayStreamClientFrame::Hello {
             version: _,
             token: received,
             subscriptions,
+            hooks,
         }) => {
             if received != token {
                 let _ = write_gateway_stream_frame(
@@ -439,7 +461,7 @@ where
                 .await;
                 return Ok(());
             }
-            subscriptions
+            (subscriptions, hooks)
         }
         Ok(_) => {
             let _ = write_gateway_stream_frame(
@@ -459,6 +481,13 @@ where
             )))
         }
     };
+
+    let (hook_provider, mut hook_requests) = hook_capabilities
+        .map(|capabilities| publisher.hook_bridge.connect(capabilities))
+        .map_or((None, None), |(provider, requests)| {
+            (Some(provider), Some(requests))
+        });
+    let _hook_provider = hook_provider;
 
     write_gateway_stream_frame(
         &mut writer,
@@ -483,7 +512,6 @@ where
         let after_id = send_catchup(&mut writer, &store, &publisher, &sub).await?;
         subscriptions.set_after(sub.lane, &sub.session_id, after_id);
     }
-
     loop {
         tokio::select! {
             client = read_gateway_client_frame(&mut reader) => {
@@ -530,6 +558,28 @@ where
                             }
                         }
                     }
+                    Ok(GatewayStreamClientFrame::HookResult { correlation_id, result, error }) => {
+                        let accepted = match (&_hook_provider, result, error) {
+                            (Some(provider), Some(result), None) => {
+                                provider.complete(correlation_id, Ok(result))
+                            }
+                            (Some(provider), None, Some(error)) => {
+                                provider.complete(correlation_id, Err(error))
+                            }
+                            _ => false,
+                        };
+                        if !accepted {
+                            write_gateway_stream_frame(
+                                &mut writer,
+                                &GatewayStreamFrame::Error {
+                                    code: "hook_result".to_string(),
+                                    message: "unknown or invalid hook correlation".to_string(),
+                                },
+                            )
+                            .await
+                            .map_err(|e| NexusError::Internal(format!("gateway stream write hook result error: {e}")))?;
+                        }
+                    }
                     Ok(GatewayStreamClientFrame::Hello { .. }) => {
                         write_gateway_stream_frame(
                             &mut writer,
@@ -541,8 +591,28 @@ where
                         .await
                         .map_err(|e| NexusError::Internal(format!("gateway stream write error: {e}")))?;
                     }
+                    Ok(GatewayStreamClientFrame::Unknown) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
                     Err(error) => return Err(NexusError::Internal(format!("gateway stream read frame: {error}"))),
+                }
+            }
+            hook_request = async {
+                hook_requests
+                    .as_mut()
+                    .expect("hook request branch requires a provider")
+                    .recv()
+                    .await
+            }, if hook_requests.is_some() => {
+                match hook_request {
+                    Some(evaluation) => {
+                        write_gateway_stream_frame(
+                            &mut writer,
+                            &GatewayStreamFrame::HookEvaluate { evaluation },
+                        )
+                        .await
+                        .map_err(|e| NexusError::Internal(format!("gateway stream write hook evaluation: {e}")))?;
+                    }
+                    None => hook_requests = None,
                 }
             }
             live_frame = live.recv() => {

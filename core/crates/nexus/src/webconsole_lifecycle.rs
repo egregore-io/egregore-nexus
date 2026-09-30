@@ -4,7 +4,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -85,6 +85,7 @@ pub struct WebconsoleLifecycleError {
     code: &'static str,
     message: String,
     hint: Option<String>,
+    data: Option<serde_json::Value>,
     exit_code: u8,
 }
 
@@ -94,6 +95,7 @@ impl WebconsoleLifecycleError {
             code: "WEBCONSOLE_NOT_INSTALLED",
             message: "Nexus Webconsole is not installed".into(),
             hint: Some("Install it with npm install -g @egregore/nexus".into()),
+            data: None,
             exit_code: 3,
         }
     }
@@ -103,6 +105,7 @@ impl WebconsoleLifecycleError {
             code: "WEBCONSOLE_LIFECYCLE_FAILED",
             message: message.into(),
             hint: None,
+            data: None,
             exit_code: 1,
         }
     }
@@ -119,9 +122,35 @@ impl WebconsoleLifecycleError {
         self.hint.as_deref()
     }
 
+    pub fn data(&self) -> Option<&serde_json::Value> {
+        self.data.as_ref()
+    }
+
     pub fn exit_code(&self) -> u8 {
         self.exit_code
     }
+}
+
+#[doc(hidden)]
+pub fn classify_webconsole_start_error(
+    message: impl Into<String>,
+    options: &WebconsoleStartOptions,
+) -> WebconsoleLifecycleError {
+    let message = message.into();
+    let occupied_prefix = format!("Webconsole port {} is occupied", options.port);
+    if message.starts_with(&occupied_prefix) {
+        return WebconsoleLifecycleError {
+            code: "WEBCONSOLE_PORT_OCCUPIED",
+            message,
+            hint: None,
+            data: Some(serde_json::json!({
+                "host": options.host,
+                "port": options.port,
+            })),
+            exit_code: 1,
+        };
+    }
+    WebconsoleLifecycleError::lifecycle(message)
 }
 
 impl From<lifecycle::LifecycleError> for WebconsoleLifecycleError {
@@ -137,6 +166,12 @@ pub trait WebconsoleBackend {
     async fn ensure_gateway(&mut self) -> Result<String, String>;
     fn status(&mut self) -> WebconsoleRuntimeStatus;
     fn clear_stale(&mut self) -> Result<(), String>;
+    fn recover(
+        &mut self,
+        installation: &WebconsoleInstallation,
+        gateway_url: &str,
+        options: &WebconsoleStartOptions,
+    ) -> Result<Option<WebconsoleRuntimeStatus>, String>;
     fn spawn(
         &mut self,
         installation: &WebconsoleInstallation,
@@ -159,7 +194,11 @@ pub async fn start_webconsole_with<B: WebconsoleBackend>(
         WebconsoleRuntimeStatus::Degraded { .. } | WebconsoleRuntimeStatus::Stale { .. } => {
             backend.clear_stale()?;
         }
-        WebconsoleRuntimeStatus::Down => {}
+        WebconsoleRuntimeStatus::Down => {
+            if let Some(runtime) = backend.recover(&installation, &gateway_url, options)? {
+                return Ok(runtime);
+            }
+        }
     }
     backend.spawn(&installation, &gateway_url, options)?;
     backend.wait_ready().await
@@ -200,7 +239,7 @@ pub async fn start_webconsole(
     let mut backend = SystemWebconsoleBackend::new();
     let runtime = start_webconsole_with(&mut backend, &options)
         .await
-        .map_err(WebconsoleLifecycleError::lifecycle)?;
+        .map_err(|error| classify_webconsole_start_error(error, &options))?;
     Ok(backend.report(runtime))
 }
 
@@ -212,7 +251,7 @@ pub async fn launch_webconsole(
     let mut backend = SystemWebconsoleBackend::new();
     let runtime = launch_webconsole_with(&mut backend, &options, no_open)
         .await
-        .map_err(WebconsoleLifecycleError::lifecycle)?;
+        .map_err(|error| classify_webconsole_start_error(error, &options))?;
     Ok(backend.report(runtime))
 }
 
@@ -238,7 +277,7 @@ pub async fn restart_webconsole(
     stop_webconsole_with(&mut backend, false).map_err(WebconsoleLifecycleError::lifecycle)?;
     let runtime = start_webconsole_with(&mut backend, &options)
         .await
-        .map_err(WebconsoleLifecycleError::lifecycle)?;
+        .map_err(|error| classify_webconsole_start_error(error, &options))?;
     Ok(backend.report(runtime))
 }
 
@@ -291,7 +330,7 @@ impl WebconsolePaths {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WebconsoleDiscovery {
     pid: u32,
@@ -299,6 +338,18 @@ struct WebconsoleDiscovery {
     port: u16,
     url: String,
     gateway_url: String,
+    executable: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebconsoleHealth {
+    ok: bool,
+    service: String,
+    pid: u32,
+    host: String,
+    port: u16,
+    url: String,
+    gateway: String,
     executable: PathBuf,
 }
 
@@ -366,6 +417,66 @@ impl WebconsoleBackend for SystemWebconsoleBackend {
         Ok(())
     }
 
+    fn recover(
+        &mut self,
+        _installation: &WebconsoleInstallation,
+        gateway_url: &str,
+        options: &WebconsoleStartOptions,
+    ) -> Result<Option<WebconsoleRuntimeStatus>, String> {
+        let expected_url = webconsole_url_for(&options.host, options.port);
+        let health = match read_webconsole_health(&options.host, options.port) {
+            Ok(Some(health)) => health,
+            Ok(None) => {
+                return match TcpListener::bind((options.host.as_str(), options.port)) {
+                    Ok(listener) => {
+                        drop(listener);
+                        Ok(None)
+                    }
+                    Err(error) => Err(format!(
+                        "Webconsole port {} is occupied but no verified Nexus WebUI responded: {error}",
+                        options.port
+                    )),
+                };
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Webconsole port {} is occupied by an unverified process: {error}",
+                    options.port
+                ));
+            }
+        };
+        if !health.ok
+            || health.service != "nexus-webui"
+            || health.host != options.host
+            || health.port != options.port
+            || health.url != expected_url
+            || health.gateway.trim_end_matches('/') != gateway_url.trim_end_matches('/')
+            || !process_alive(health.pid)
+            || !process_matches(health.pid, &health.executable)
+        {
+            return Err(format!(
+                "Webconsole port {} is occupied by a process that cannot be safely adopted",
+                options.port
+            ));
+        }
+        let discovery = WebconsoleDiscovery {
+            pid: health.pid,
+            host: health.host,
+            port: health.port,
+            url: health.url,
+            gateway_url: health.gateway,
+            executable: health.executable,
+        };
+        write_discovery(&self.paths.discovery, &discovery).map_err(|error| error.to_string())?;
+        let runtime = runtime_status(&self.paths);
+        match runtime {
+            live @ WebconsoleRuntimeStatus::Live { .. } => Ok(Some(live)),
+            other => Err(format!(
+                "Webconsole discovery was recovered but verification failed: {other:?}"
+            )),
+        }
+    }
+
     fn spawn(
         &mut self,
         installation: &WebconsoleInstallation,
@@ -381,16 +492,13 @@ impl WebconsoleBackend for SystemWebconsoleBackend {
             .open(&self.paths.log)
             .map_err(|error| error.to_string())?;
         let stderr = log.try_clone().map_err(|error| error.to_string())?;
-        let mut command = webconsole_command(installation);
+        let mut command = build_webconsole_spawn_command(
+            installation,
+            gateway_url,
+            options,
+            &self.paths.discovery,
+        );
         command
-            .arg("--host")
-            .arg(&options.host)
-            .arg("--port")
-            .arg(options.port.to_string())
-            .arg("--gateway-url")
-            .arg(gateway_url)
-            .arg("--discovery")
-            .arg(&self.paths.discovery)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));
@@ -491,6 +599,11 @@ pub fn resolve_webconsole_installation(
 }
 
 fn webconsole_installation(executable: PathBuf, windows: bool) -> WebconsoleInstallation {
+    let executable = if windows {
+        executable
+    } else {
+        fs::canonicalize(&executable).unwrap_or(executable)
+    };
     let invocation = if windows
         && executable
             .extension()
@@ -521,6 +634,26 @@ fn webconsole_command(installation: &WebconsoleInstallation) -> Command {
             command
         }
     }
+}
+
+#[doc(hidden)]
+pub fn build_webconsole_spawn_command(
+    installation: &WebconsoleInstallation,
+    gateway_url: &str,
+    options: &WebconsoleStartOptions,
+    discovery: &Path,
+) -> Command {
+    let mut command = webconsole_command(installation);
+    command
+        .arg("--host")
+        .arg(&options.host)
+        .arg("--port")
+        .arg(options.port.to_string())
+        .arg("--gateway-url")
+        .arg(gateway_url)
+        .arg("--discovery")
+        .arg(discovery);
+    command
 }
 
 fn runtime_status(paths: &WebconsolePaths) -> WebconsoleRuntimeStatus {
@@ -557,6 +690,83 @@ fn runtime_status(paths: &WebconsolePaths) -> WebconsoleRuntimeStatus {
 
 fn read_discovery(path: &Path) -> io::Result<WebconsoleDiscovery> {
     serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)
+}
+
+fn write_discovery(path: &Path, discovery: &WebconsoleDiscovery) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let body = serde_json::to_vec(discovery).map_err(io::Error::other)?;
+    fs::write(&temporary, body)?;
+    match fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+fn webconsole_url_for(host: &str, port: u16) -> String {
+    format!("http://{}", webconsole_authority(host, port))
+}
+
+fn webconsole_authority(host: &str, port: u16) -> String {
+    let display_host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    format!("{display_host}:{port}")
+}
+
+fn read_webconsole_health(host: &str, port: u16) -> Result<Option<WebconsoleHealth>, String> {
+    let probe_host = match host {
+        "0.0.0.0" => "127.0.0.1",
+        "::" => "::1",
+        other => other,
+    };
+    let addresses = (probe_host, port)
+        .to_socket_addrs()
+        .map_err(|error| error.to_string())?;
+    let mut stream = None;
+    for address in addresses {
+        if let Ok(connected) = TcpStream::connect_timeout(&address, Duration::from_millis(500)) {
+            stream = Some(connected);
+            break;
+        }
+    }
+    let Some(mut stream) = stream else {
+        return Ok(None);
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .map_err(|error| error.to_string())?;
+    let authority = webconsole_authority(host, port);
+    let request = format!("GET /health HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let mut response = Vec::new();
+    stream
+        .take(16 * 1024)
+        .read_to_end(&mut response)
+        .map_err(|error| error.to_string())?;
+    let boundary = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "invalid HTTP response".to_string())?;
+    let head = String::from_utf8_lossy(&response[..boundary]);
+    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+        return Err(format!(
+            "health endpoint returned {}",
+            head.lines().next().unwrap_or("an invalid status")
+        ));
+    }
+    serde_json::from_slice(&response[boundary + 4..])
+        .map(Some)
+        .map_err(|error| format!("invalid Nexus WebUI health response: {error}"))
 }
 
 fn http_health_ok(base_url: &str, path: &str) -> bool {

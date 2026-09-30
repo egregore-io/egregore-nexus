@@ -1265,6 +1265,7 @@ mod rpc {
             summary: None,
             body: "rebase first".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         };
         let req = Request {
@@ -1435,6 +1436,7 @@ mod send {
             summary: None,
             body: "rebase before you start".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         };
         let json = serde_json::to_value(&req).unwrap();
@@ -1482,6 +1484,7 @@ mod send {
             summary: None,
             body: "has a body but no recipient".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         };
 
@@ -1499,6 +1502,7 @@ mod send {
             summary: Some("plan".into()),
             body: "step 1 ...".into(),
             mention: vec!["dylan".into()],
+            metadata: None,
             idempotency_key: None,
         };
         let json = serde_json::to_value(&req).unwrap();
@@ -1516,6 +1520,7 @@ mod send {
             summary: None,
             body: "build green".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         };
         assert_eq!(
@@ -1528,6 +1533,7 @@ mod send {
             summary: None,
             body: "on it".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         };
         let json = serde_json::to_value(&reply).unwrap();
@@ -1828,7 +1834,7 @@ mod prompt {
     #[test]
     fn durable_queue_mutation_uses_exact_redirect_and_capability_tokens() {
         let request = CommandQueueMutationRequest {
-            name: "otto".into(),
+            name: Some("otto".into()),
             agent_id: Some(AgentId("a_otto".into())),
             action: CommandQueueAction::RedirectNow,
             client_mutation_id: "mut_1".into(),
@@ -1845,6 +1851,24 @@ mod prompt {
         assert_eq!(
             serde_json::from_value::<CommandQueueMutationRequest>(json).unwrap(),
             request
+        );
+
+        let id_only = CommandQueueMutationRequest {
+            name: None,
+            agent_id: Some(AgentId("a_otto".into())),
+            action: CommandQueueAction::Cancel,
+            client_mutation_id: "mut_id_only".into(),
+            command_id: Some("cmd_1".into()),
+            expected_revision: Some(4),
+            text: None,
+            command_ids: Vec::new(),
+            expected_revisions: Vec::new(),
+        };
+        let id_only_json = serde_json::to_value(&id_only).unwrap();
+        assert!(id_only_json.get("name").is_none());
+        assert_eq!(
+            serde_json::from_value::<CommandQueueMutationRequest>(id_only_json).unwrap(),
+            id_only
         );
 
         assert_eq!(

@@ -17,6 +17,31 @@ pub enum GatewayProjectionDeliveryMode {
     BestEffort,
 }
 
+/// Whether canonical sends may bypass Gateway-owned message hooks when no provider is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HookGatewayMode {
+    /// Preserve the local-first transport path when Gateway is absent or reconnecting.
+    #[default]
+    Optional,
+    /// Fail sends before acceptance unless a hook-capable Gateway evaluates them.
+    Required,
+}
+
+impl std::str::FromStr for HookGatewayMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "optional" => Ok(Self::Optional),
+            "required" => Ok(Self::Required),
+            other => Err(format!(
+                "invalid hook Gateway mode {other:?}; expected optional or required"
+            )),
+        }
+    }
+}
+
 impl std::str::FromStr for GatewayProjectionDeliveryMode {
     type Err = String;
 
@@ -82,6 +107,8 @@ pub struct Config {
     pub launch_backend: Option<String>,
     /// Volatile daemon-to-Gateway projection delivery and capacity policy.
     pub gateway_projection: GatewayProjectionBacklogConfig,
+    /// Availability policy for the blocking Gateway-owned `before_send` hook boundary.
+    pub hook_gateway_mode: HookGatewayMode,
 }
 
 impl Default for Config {
@@ -99,6 +126,7 @@ impl Default for Config {
             hmac_secret: String::new(),
             launch_backend: None,
             gateway_projection: GatewayProjectionBacklogConfig::default(),
+            hook_gateway_mode: HookGatewayMode::Optional,
         }
     }
 }

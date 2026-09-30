@@ -23,10 +23,12 @@ const gateway = new URL(
   valueAfter("--gateway-url") ?? process.env.NEXUS_GATEWAY_URL ?? "http://127.0.0.1:4100",
 );
 const discoveryPath = valueAfter("--discovery") ?? process.env.NEXUS_WEBCONSOLE_DISCOVERY;
-const executable = await realpath(fileURLToPath(import.meta.url));
+const executable = await realpath(process.argv[1] ?? fileURLToPath(import.meta.url));
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const dist = process.env.NEXUS_WEBUI_DIST ?? join(packageRoot, "dist");
 await access(join(dist, "index.html"));
+const displayHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+const url = `http://${displayHost}:${port}`;
 
 const server = createServer((request, response) => {
   void dispatch(request, response).catch((error) => {
@@ -35,15 +37,11 @@ const server = createServer((request, response) => {
   });
 });
 server.listen(port, host, async () => {
-  const address = server.address();
-  const boundPort = typeof address === "object" && address ? address.port : port;
-  const displayHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-  const url = `http://${displayHost}:${boundPort}`;
   if (discoveryPath) {
     await writeDiscovery(discoveryPath, {
       pid: process.pid,
       host,
-      port: boundPort,
+      port,
       url,
       gatewayUrl: gateway.origin,
       startedAtMs: Date.now(),
@@ -63,7 +61,16 @@ async function dispatch(request, response) {
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? host}`);
   if (url.pathname === "/health") {
     response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({ ok: true, gateway: gateway.origin }));
+    response.end(JSON.stringify({
+      ok: true,
+      service: "nexus-webui",
+      pid: process.pid,
+      host,
+      port,
+      url: `http://${displayHost}:${port}`,
+      gateway: gateway.origin,
+      executable,
+    }));
     return;
   }
   if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {

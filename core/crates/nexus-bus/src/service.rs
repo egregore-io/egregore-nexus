@@ -12,12 +12,18 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use libsql::params;
-use nexus_common::{new_thread_id, now, NexusError};
+use nexus_common::{new_message_id, new_thread_id, now, NexusError};
 use nexus_contracts::enums::{Kind, Scope, Tier};
 use nexus_contracts::events::WsEvent;
-use nexus_contracts::ids::{MessageId, SessionId};
-use nexus_contracts::notify::NotifySendRequest;
-use nexus_contracts::ports::{BusPort, Caller, DispatchPort, EventSink, IdentityPort, PortResult};
+use nexus_contracts::hooks::{
+    DeliveryTiming, HookAction, HookBeforeSendRequest, HookMessage, HookSender,
+};
+use nexus_contracts::ids::{AgentId, MessageId, SessionId};
+use nexus_contracts::notify::{NotifySendRequest, NotifyTarget};
+use nexus_contracts::ports::{
+    BusPort, Caller, DispatchPort, EventSink, IdentityPort, MessageHookPort, PortResult,
+    PreparedBusSend,
+};
 use nexus_contracts::send::{
     validate_send_body, validate_send_request, Ack, SendRequest, SendTarget,
 };
@@ -42,6 +48,101 @@ use crate::{dm, thread, topic};
 
 const LEGACY_DUPLICATE_WINDOW_MS: i64 = 2_000;
 
+#[derive(Clone)]
+struct EvaluatedSend {
+    request: SendRequest,
+    timing: DeliveryTiming,
+}
+
+#[derive(Clone)]
+enum PreparedSendState {
+    Existing {
+        authorized_caller: Caller,
+        ack: Ack,
+    },
+    Ready {
+        authorized_caller: Caller,
+        effective_caller: Caller,
+        evaluated: EvaluatedSend,
+        sender_kind: Option<Kind>,
+        resolved: Resolved,
+    },
+}
+
+struct PreparedSendEntry {
+    prepared_at: i64,
+    committing: bool,
+    state: PreparedSendState,
+}
+
+struct PreparedCommitGuard<'a> {
+    prepared_sends: &'a Mutex<HashMap<String, PreparedSendEntry>>,
+    token: String,
+    consumed: bool,
+}
+
+impl PreparedCommitGuard<'_> {
+    fn consume(mut self) {
+        self.prepared_sends
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.token);
+        self.consumed = true;
+    }
+}
+
+impl Drop for PreparedCommitGuard<'_> {
+    fn drop(&mut self) {
+        if self.consumed {
+            return;
+        }
+        if let Some(entry) = self
+            .prepared_sends
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(&self.token)
+        {
+            entry.committing = false;
+        }
+    }
+}
+
+/// A bounded volatile ledger is sufficient because preparation is an internal, short-lived
+/// boundary. Durable idempotency keys remain the recovery authority after restart.
+#[doc(hidden)]
+pub const PREPARED_SEND_CAPACITY: usize = 1_024;
+#[doc(hidden)]
+pub const PREPARED_SEND_TTL_MS: i64 = 5 * 60 * 1_000;
+
+impl PreparedSendState {
+    fn authorized_caller(&self) -> &Caller {
+        match self {
+            Self::Existing {
+                authorized_caller, ..
+            }
+            | Self::Ready {
+                authorized_caller, ..
+            } => authorized_caller,
+        }
+    }
+
+    fn idempotency_key(&self) -> Option<&str> {
+        match self {
+            Self::Existing { .. } => None,
+            Self::Ready { evaluated, .. } => {
+                normalized_idempotency_key(evaluated.request.idempotency_key.as_deref())
+            }
+        }
+    }
+
+    fn hold_agent_id(&self) -> Option<AgentId> {
+        match self {
+            Self::Existing { .. } => None,
+            Self::Ready { resolved, .. } => resolved_agent_id(resolved),
+        }
+    }
+}
+
 /// The bus service. Owns the shared store (sole writer), the realtime port (enqueue + bell), the
 /// identity port (name resolution), and an event sink (web console WS broadcast).
 pub struct Bus {
@@ -49,10 +150,14 @@ pub struct Bus {
     realtime: Arc<dyn DispatchPort>,
     events: Arc<dyn EventSink>,
     router: Router,
+    message_hooks: Option<Arc<dyn MessageHookPort>>,
     now: Arc<dyn Fn() -> i64 + Send + Sync>,
     /// Session kind is immutable for one runtime id. A rebind mints a new SessionId, naturally
     /// invalidating this cache without coupling Bus to identity registration callbacks.
     sender_kinds: Mutex<HashMap<SessionId, Kind>>,
+    /// Accepted-but-uncommitted sends. The opaque token freezes routing and the evaluated hook
+    /// output across multi-effect producers and the one-shot runtime-hold boundary.
+    prepared_sends: Mutex<HashMap<String, PreparedSendEntry>>,
 }
 
 impl Bus {
@@ -63,25 +168,34 @@ impl Bus {
         identity: Arc<dyn IdentityPort>,
         events: Arc<dyn EventSink>,
     ) -> Self {
-        let router = Router::new(store.clone(), identity);
-        Bus {
-            store,
-            realtime,
-            events,
-            router,
-            now: Arc::new(now),
-            sender_kinds: Mutex::new(HashMap::new()),
-        }
+        Self::build(store, realtime, identity, events, None, Arc::new(now))
     }
 
-    /// Build a bus with an injected clock for tests that exercise short timing windows.
-    #[cfg(test)]
-    pub fn new_with_clock(
+    /// Build a bus whose single canonical send boundary delegates to a Gateway-owned hook port.
+    pub fn new_with_message_hooks(
         store: Arc<Store>,
         realtime: Arc<dyn DispatchPort>,
         identity: Arc<dyn IdentityPort>,
         events: Arc<dyn EventSink>,
-        now_fn: Arc<dyn Fn() -> i64 + Send + Sync>,
+        message_hooks: Arc<dyn MessageHookPort>,
+    ) -> Self {
+        Self::build(
+            store,
+            realtime,
+            identity,
+            events,
+            Some(message_hooks),
+            Arc::new(now),
+        )
+    }
+
+    fn build(
+        store: Arc<Store>,
+        realtime: Arc<dyn DispatchPort>,
+        identity: Arc<dyn IdentityPort>,
+        events: Arc<dyn EventSink>,
+        message_hooks: Option<Arc<dyn MessageHookPort>>,
+        now: Arc<dyn Fn() -> i64 + Send + Sync>,
     ) -> Self {
         let router = Router::new(store.clone(), identity);
         Bus {
@@ -89,9 +203,23 @@ impl Bus {
             realtime,
             events,
             router,
-            now: now_fn,
+            message_hooks,
+            now,
             sender_kinds: Mutex::new(HashMap::new()),
+            prepared_sends: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Build a bus with an injected clock for tests that exercise short timing windows.
+    #[doc(hidden)]
+    pub fn new_with_clock(
+        store: Arc<Store>,
+        realtime: Arc<dyn DispatchPort>,
+        identity: Arc<dyn IdentityPort>,
+        events: Arc<dyn EventSink>,
+        now_fn: Arc<dyn Fn() -> i64 + Send + Sync>,
+    ) -> Self {
+        Self::build(store, realtime, identity, events, None, now_fn)
     }
 
     /// The whole send path: resolve `to` → write + fan-out atomically → emit the event → ack.
@@ -104,9 +232,25 @@ impl Bus {
         req: SendRequest,
         sender_kind: Option<Kind>,
     ) -> Result<Ack, NexusError> {
+        let prepared = self.prepare_send_inner(caller, req, sender_kind).await?;
+        self.commit_prepared_inner(caller, prepared).await
+    }
+
+    async fn prepare_send_inner(
+        &self,
+        caller: &Caller,
+        req: SendRequest,
+        sender_kind: Option<Kind>,
+    ) -> Result<PreparedBusSend, NexusError> {
         validate_send_request(&req).map_err(|e| NexusError::Invalid(e.message))?;
+        if let Some(prepared) = self.prepared_retry(caller, req.idempotency_key.as_deref()) {
+            return Ok(prepared);
+        }
         let resolved = self.router.resolve(caller, &req.to).await?;
-        self.send_resolved(caller, req, sender_kind, resolved).await
+        let (token, _commits_new_effect) = self
+            .prepare_resolved(caller, caller, req, sender_kind, resolved)
+            .await?;
+        Ok(PreparedBusSend::resolved(token))
     }
 
     async fn notify_inner(
@@ -114,6 +258,15 @@ impl Bus {
         caller: &Caller,
         req: NotifySendRequest,
     ) -> Result<Ack, NexusError> {
+        let prepared = self.prepare_notify_inner(caller, req).await?;
+        self.commit_prepared_inner(caller, prepared).await
+    }
+
+    async fn prepare_notify_inner(
+        &self,
+        caller: &Caller,
+        req: NotifySendRequest,
+    ) -> Result<PreparedBusSend, NexusError> {
         validate_send_body(&req.body).map_err(|e| NexusError::Invalid(e.message))?;
         if req
             .source
@@ -123,6 +276,9 @@ impl Bus {
             return Err(NexusError::Invalid(
                 "notification source must not be empty".into(),
             ));
+        }
+        if let Some(prepared) = self.prepared_retry(caller, req.idempotency_key.as_deref()) {
+            return Ok(prepared);
         }
         let resolved = self.router.resolve_notify(caller, &req.target).await?;
         let source = req
@@ -137,40 +293,240 @@ impl Bus {
         // Local IPC and the authenticated gateway are the trust boundaries. The notification
         // transport does not add a second policy system after the target was accepted there.
         source_caller.tier = Tier::Admin;
-        self.send_resolved(
-            &source_caller,
-            SendRequest {
-                // Resolution already happened through NotifyTarget; this placeholder is never read.
-                to: SendTarget::Reply,
-                summary: Some(source),
-                body: req.body,
-                mention: Vec::new(),
-                idempotency_key: req.idempotency_key,
-            },
-            Some(Kind::Notification),
-            resolved,
-        )
-        .await
+        let hook_target = notify_hook_target(&req.target, &resolved);
+        let (token, _commits_new_effect) = self
+            .prepare_resolved(
+                caller,
+                &source_caller,
+                SendRequest {
+                    // Routing is already resolved, but hooks receive the equivalent immutable target.
+                    to: hook_target,
+                    summary: Some(source),
+                    body: req.body,
+                    mention: Vec::new(),
+                    metadata: None,
+                    idempotency_key: req.idempotency_key,
+                },
+                Some(Kind::Notification),
+                resolved,
+            )
+            .await?;
+        Ok(PreparedBusSend::resolved(token))
     }
 
-    async fn send_resolved(
+    async fn prepare_resolved(
         &self,
-        caller: &Caller,
+        authorized_caller: &Caller,
+        effective_caller: &Caller,
         req: SendRequest,
         sender_kind: Option<Kind>,
         resolved: Resolved,
+    ) -> Result<(String, bool), NexusError> {
+        let idempotency_key =
+            normalized_idempotency_key(req.idempotency_key.as_deref()).map(str::to_string);
+        let (state, commits_new_effect) = if let Some(ack) = match idempotency_key.as_deref() {
+            Some(key) => self.ack_for_idempotency_key(effective_caller, key).await?,
+            None => None,
+        } {
+            (
+                PreparedSendState::Existing {
+                    authorized_caller: authorized_caller.clone(),
+                    ack,
+                },
+                false,
+            )
+        } else {
+            MessagePolicy::new(&self.store)
+                .check(effective_caller, &resolved)
+                .await?;
+            let evaluated = self.evaluate_before_send(effective_caller, req).await?;
+            (
+                PreparedSendState::Ready {
+                    authorized_caller: authorized_caller.clone(),
+                    effective_caller: effective_caller.clone(),
+                    evaluated,
+                    sender_kind,
+                    resolved,
+                },
+                true,
+            )
+        };
+        Ok((self.store_prepared(state)?, commits_new_effect))
+    }
+
+    fn store_prepared(&self, state: PreparedSendState) -> Result<String, NexusError> {
+        let prepared_at = (self.now)();
+        let mut prepared = self
+            .prepared_sends
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reap_expired_prepared(&mut prepared, prepared_at);
+        if prepared.len() >= PREPARED_SEND_CAPACITY {
+            return Err(NexusError::Internal(format!(
+                "prepared-send capacity exhausted ({PREPARED_SEND_CAPACITY})"
+            )));
+        }
+        loop {
+            let token = format!("prepare:{}", new_message_id().0);
+            match prepared.entry(token.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(PreparedSendEntry {
+                        prepared_at,
+                        committing: false,
+                        state,
+                    });
+                    return Ok(token);
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+            }
+        }
+    }
+
+    fn prepared_retry(
+        &self,
+        caller: &Caller,
+        idempotency_key: Option<&str>,
+    ) -> Option<PreparedBusSend> {
+        let idempotency_key = normalized_idempotency_key(idempotency_key)?;
+        let mut prepared = self
+            .prepared_sends
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reap_expired_prepared(&mut prepared, (self.now)());
+        prepared.iter().find_map(|(token, entry)| {
+            (entry.state.authorized_caller() == caller
+                && entry.state.idempotency_key() == Some(idempotency_key))
+            .then(|| PreparedBusSend::resolved(token.clone()))
+        })
+    }
+
+    fn claim_prepared<'a>(
+        &'a self,
+        caller: &Caller,
+        token: &str,
+    ) -> Result<(PreparedSendState, PreparedCommitGuard<'a>), NexusError> {
+        let mut prepared = self
+            .prepared_sends
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reap_expired_prepared(&mut prepared, (self.now)());
+        let entry = prepared
+            .get_mut(token)
+            .ok_or_else(|| NexusError::Invalid("unknown or consumed prepared send".into()))?;
+        if entry.state.authorized_caller() != caller {
+            return Err(NexusError::Unauthorized);
+        }
+        if entry.committing {
+            return Err(NexusError::Invalid(
+                "prepared send is already committing".into(),
+            ));
+        }
+        entry.committing = true;
+        let state = entry.state.clone();
+        drop(prepared);
+        Ok((
+            state,
+            PreparedCommitGuard {
+                prepared_sends: &self.prepared_sends,
+                token: token.to_string(),
+                consumed: false,
+            },
+        ))
+    }
+
+    fn prepared_hold_agent_inner(
+        &self,
+        caller: &Caller,
+        prepared_send: &PreparedBusSend,
+    ) -> Result<Option<AgentId>, NexusError> {
+        let mut prepared = self
+            .prepared_sends
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reap_expired_prepared(&mut prepared, (self.now)());
+        let entry = prepared
+            .get(prepared_send.preparation_id())
+            .ok_or_else(|| NexusError::Invalid("unknown or consumed prepared send".into()))?;
+        if entry.state.authorized_caller() != caller {
+            return Err(NexusError::Unauthorized);
+        }
+        Ok(entry.state.hold_agent_id())
+    }
+
+    async fn commit_prepared_inner(
+        &self,
+        caller: &Caller,
+        prepared: PreparedBusSend,
     ) -> Result<Ack, NexusError> {
-        let idempotency_key = normalized_idempotency_key(req.idempotency_key.as_deref());
-        if let Some(key) = idempotency_key {
+        let token = prepared.preparation_id();
+        let (state, guard) = self.claim_prepared(caller, token)?;
+        let result = match state {
+            PreparedSendState::Existing { ack, .. } => Ok(ack),
+            PreparedSendState::Ready {
+                effective_caller,
+                evaluated,
+                sender_kind,
+                resolved,
+                ..
+            } => {
+                self.commit_evaluated_send(
+                    &effective_caller,
+                    evaluated.request,
+                    evaluated.timing,
+                    sender_kind,
+                    resolved,
+                )
+                .await
+            }
+        };
+        if result.is_ok() {
+            guard.consume();
+        }
+        result
+    }
+
+    fn discard_prepared_inner(
+        &self,
+        caller: &Caller,
+        prepared: PreparedBusSend,
+    ) -> Result<(), NexusError> {
+        let token = prepared.preparation_id();
+        let mut prepared = self
+            .prepared_sends
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reap_expired_prepared(&mut prepared, (self.now)());
+        let entry = prepared
+            .get(token)
+            .ok_or_else(|| NexusError::Invalid("unknown or consumed prepared send".into()))?;
+        if entry.state.authorized_caller() != caller {
+            return Err(NexusError::Unauthorized);
+        }
+        if entry.committing {
+            return Err(NexusError::Invalid(
+                "prepared send is already committing".into(),
+            ));
+        }
+        prepared.remove(token);
+        Ok(())
+    }
+
+    async fn commit_evaluated_send(
+        &self,
+        caller: &Caller,
+        req: SendRequest,
+        timing: DeliveryTiming,
+        sender_kind: Option<Kind>,
+        resolved: Resolved,
+    ) -> Result<Ack, NexusError> {
+        let idempotency_key =
+            normalized_idempotency_key(req.idempotency_key.as_deref()).map(str::to_string);
+        if let Some(key) = idempotency_key.as_deref() {
             if let Some(ack) = self.ack_for_idempotency_key(caller, key).await? {
                 return Ok(ack);
             }
         }
         let use_legacy_duplicate_window = idempotency_key.is_none();
-
-        MessagePolicy::new(&self.store)
-            .check(caller, &resolved)
-            .await?;
         let created_at = (self.now)();
 
         let (message_id, fanout, event): (MessageId, Option<u32>, WsEvent) = match resolved {
@@ -200,8 +556,11 @@ impl Bus {
                         dm::spec(&recipients),
                         req.summary.clone(),
                         req.body.clone(),
+                        req.metadata.clone(),
+                        req.mention.clone(),
+                        timing,
                         created_at,
-                        idempotency_key,
+                        idempotency_key.as_deref(),
                         sender_kind,
                     )
                     .await?;
@@ -233,8 +592,11 @@ impl Bus {
                         dm::local_operator_spec(operator_name, &recipients),
                         req.summary.clone(),
                         req.body.clone(),
+                        req.metadata.clone(),
+                        req.mention.clone(),
+                        timing,
                         created_at,
-                        idempotency_key,
+                        idempotency_key.as_deref(),
                         sender_kind,
                     )
                     .await?;
@@ -268,8 +630,11 @@ impl Bus {
                         thread::spec(&thread_id, thread_name, thread_project, &members),
                         req.summary.clone(),
                         req.body.clone(),
+                        req.metadata.clone(),
+                        req.mention.clone(),
+                        timing,
                         created_at,
-                        idempotency_key,
+                        idempotency_key.as_deref(),
                         sender_kind,
                     )
                     .await?;
@@ -300,8 +665,11 @@ impl Bus {
                         topic::spec(&topic_id, &subscribers),
                         req.summary.clone(),
                         req.body.clone(),
+                        req.metadata.clone(),
+                        req.mention.clone(),
+                        timing,
                         created_at,
-                        idempotency_key,
+                        idempotency_key.as_deref(),
                         sender_kind,
                     )
                     .await?;
@@ -329,8 +697,11 @@ impl Bus {
                         dm::group_spec(group, &members),
                         req.summary.clone(),
                         req.body.clone(),
+                        req.metadata.clone(),
+                        req.mention.clone(),
+                        timing,
                         created_at,
-                        idempotency_key,
+                        idempotency_key.as_deref(),
                         sender_kind,
                     )
                     .await?;
@@ -379,6 +750,9 @@ impl Bus {
         spec: WriteSpec<'_>,
         summary: Option<String>,
         body: String,
+        metadata: Option<serde_json::Map<String, serde_json::Value>>,
+        mention: Vec<String>,
+        timing: DeliveryTiming,
         created_at: i64,
         idempotency_key: Option<&str>,
         sender_kind: Option<Kind>,
@@ -394,6 +768,9 @@ impl Bus {
             spec,
             summary,
             body,
+            metadata,
+            mention,
+            timing,
             created_at,
             idempotency_key,
             sender_kind,
@@ -410,6 +787,93 @@ impl Bus {
             }
             (Err(err), _) => Err(err),
         }
+    }
+
+    async fn evaluate_before_send(
+        &self,
+        caller: &Caller,
+        req: SendRequest,
+    ) -> Result<EvaluatedSend, NexusError> {
+        if req
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.contains_key("_nexus"))
+        {
+            return Err(NexusError::Invalid(
+                "metadata._nexus is reserved for Nexus provenance".into(),
+            ));
+        }
+        let Some(hooks) = &self.message_hooks else {
+            return Ok(EvaluatedSend {
+                request: req,
+                timing: DeliveryTiming::default(),
+            });
+        };
+
+        let evaluation_id = hook_evaluation_id(caller, req.idempotency_key.as_deref());
+        let original_sender = HookSender {
+            agent_id: caller.agent_id.clone(),
+            name: caller.name.clone(),
+        };
+        let original_target = req.to.clone();
+        let result = hooks
+            .before_send(HookBeforeSendRequest {
+                evaluation_id: evaluation_id.clone(),
+                message: HookMessage {
+                    sender: original_sender.clone(),
+                    target: original_target.clone(),
+                    body: req.body,
+                    summary: req.summary,
+                    mention: req.mention,
+                    metadata: req.metadata.unwrap_or_default(),
+                },
+            })
+            .await
+            .map_err(NexusError::from)?;
+
+        if result.evaluation_id != evaluation_id {
+            return Err(NexusError::Invalid(
+                "hook result evaluationId does not match the request".into(),
+            ));
+        }
+        if result.message.sender != original_sender || result.message.target != original_target {
+            return Err(NexusError::Invalid(
+                "before_send hooks cannot change sender or target".into(),
+            ));
+        }
+        if result.message.metadata.contains_key("_nexus") {
+            return Err(NexusError::Invalid(
+                "hook result cannot write reserved metadata._nexus".into(),
+            ));
+        }
+        if result.action == HookAction::Reject {
+            return Err(NexusError::HookRejected);
+        }
+        validate_send_body(&result.message.body)
+            .map_err(|error| NexusError::Invalid(error.message))?;
+
+        let mut metadata = result.message.metadata;
+        if !result.executed_by.is_empty() {
+            metadata.insert(
+                "_nexus".into(),
+                serde_json::json!({
+                    "hooks": {
+                        "executedBy": result.executed_by,
+                    }
+                }),
+            );
+        }
+        Ok(EvaluatedSend {
+            request: SendRequest {
+                to: original_target,
+                summary: result.message.summary,
+                body: result.message.body,
+                mention: result.message.mention,
+                metadata: (!metadata.is_empty()).then_some(metadata),
+                idempotency_key: req.idempotency_key,
+            },
+            timing: result.timing.unwrap_or_default(),
+        })
     }
 
     async fn sender_kind(&self, caller: &Caller) -> Result<Kind, NexusError> {
@@ -844,6 +1308,63 @@ fn normalized_idempotency_key(key: Option<&str>) -> Option<&str> {
     key.map(str::trim).filter(|key| !key.is_empty())
 }
 
+fn hook_evaluation_id(caller: &Caller, idempotency_key: Option<&str>) -> String {
+    match normalized_idempotency_key(idempotency_key) {
+        Some(key) => {
+            let mut digest = Sha256::new();
+            digest.update(b"nexus.hooks.before_send.v1\0");
+            digest.update(
+                caller
+                    .agent_id
+                    .as_ref()
+                    .map(|agent_id| agent_id.0.as_str())
+                    .unwrap_or(&caller.session.0)
+                    .as_bytes(),
+            );
+            digest.update(b"\0");
+            digest.update(key.as_bytes());
+            format!("he_{:x}", digest.finalize())
+        }
+        None => nexus_common::new_message_id().0.replacen("m_", "he_", 1),
+    }
+}
+
+fn notify_hook_target(target: &NotifyTarget, resolved: &Resolved) -> SendTarget {
+    match target {
+        NotifyTarget::Agent { agent_id } => SendTarget::dm_agent(agent_id.clone(), None),
+        NotifyTarget::Name { name } | NotifyTarget::Group { group: name } => {
+            SendTarget::dm_name(name)
+        }
+        NotifyTarget::Thread { thread } => SendTarget::Post {
+            thread: thread.clone(),
+        },
+        NotifyTarget::Auto { value } => match resolved {
+            Resolved::Thread(_, _) => SendTarget::Post {
+                thread: value.clone(),
+            },
+            _ => SendTarget::dm_name(value),
+        },
+    }
+}
+
+fn resolved_agent_id(resolved: &Resolved) -> Option<nexus_contracts::AgentId> {
+    match resolved {
+        Resolved::Dm(recipient) => recipient.agent_id.clone(),
+        Resolved::LocalOperatorDm(_)
+        | Resolved::Thread(_, _)
+        | Resolved::Topic(_, _)
+        | Resolved::Group(_, _) => None,
+    }
+}
+
+fn reap_expired_prepared(prepared: &mut HashMap<String, PreparedSendEntry>, now_ms: i64) {
+    prepared.retain(|_, entry| {
+        entry.committing
+            || now_ms < entry.prepared_at
+            || now_ms.saturating_sub(entry.prepared_at) <= PREPARED_SEND_TTL_MS
+    });
+}
+
 fn scope_token(scope: Scope) -> &'static str {
     match scope {
         Scope::Dm => "dm",
@@ -867,6 +1388,49 @@ fn is_unique_constraint(err: &NexusError) -> bool {
 
 #[async_trait::async_trait]
 impl BusPort for Bus {
+    async fn preflight_send(&self, caller: &Caller, req: &SendRequest) -> PortResult<()> {
+        let result: Result<(), NexusError> = async {
+            validate_send_request(req).map_err(|e| NexusError::Invalid(e.message))?;
+            self.router.resolve(caller, &req.to).await?;
+            Ok(())
+        }
+        .await;
+        to_port(result)
+    }
+
+    async fn prepare_send(
+        &self,
+        caller: &Caller,
+        req: SendRequest,
+        sender_kind: Option<Kind>,
+    ) -> PortResult<PreparedBusSend> {
+        to_port(self.prepare_send_inner(caller, req, sender_kind).await)
+    }
+
+    async fn prepare_notify(
+        &self,
+        caller: &Caller,
+        req: NotifySendRequest,
+    ) -> PortResult<PreparedBusSend> {
+        to_port(self.prepare_notify_inner(caller, req).await)
+    }
+
+    async fn prepared_hold_agent(
+        &self,
+        caller: &Caller,
+        prepared: &PreparedBusSend,
+    ) -> PortResult<Option<AgentId>> {
+        to_port(self.prepared_hold_agent_inner(caller, prepared))
+    }
+
+    async fn commit_prepared(&self, caller: &Caller, prepared: PreparedBusSend) -> PortResult<Ack> {
+        to_port(self.commit_prepared_inner(caller, prepared).await)
+    }
+
+    async fn discard_prepared(&self, caller: &Caller, prepared: PreparedBusSend) -> PortResult<()> {
+        to_port(self.discard_prepared_inner(caller, prepared))
+    }
+
     async fn send(&self, caller: &Caller, req: SendRequest) -> PortResult<Ack> {
         to_port(self.send_inner(caller, req, None).await)
     }
@@ -882,6 +1446,25 @@ impl BusPort for Bus {
 
     async fn notify(&self, caller: &Caller, req: NotifySendRequest) -> PortResult<Ack> {
         to_port(self.notify_inner(caller, req).await)
+    }
+
+    async fn preflight_notify_target(
+        &self,
+        caller: &Caller,
+        target: &NotifyTarget,
+    ) -> PortResult<Option<nexus_contracts::AgentId>> {
+        let result =
+            self.router
+                .resolve_notify(caller, target)
+                .await
+                .map(|resolved| match resolved {
+                    Resolved::Dm(recipient) => recipient.agent_id,
+                    Resolved::LocalOperatorDm(_)
+                    | Resolved::Thread(_, _)
+                    | Resolved::Topic(_, _)
+                    | Resolved::Group(_, _) => None,
+                });
+        to_port(result)
     }
 
     async fn create_thread(&self, caller: &Caller, req: CreateThreadRequest) -> PortResult<()> {
@@ -905,7 +1488,7 @@ impl BusPort for Bus {
                 "thread.create",
                 caller,
                 Some(&req.name),
-                None,
+                Some(caller.session.0.as_str()),
                 serde_json::json!({
                     "thread": req.name.clone(),
                     "members": members.clone(),

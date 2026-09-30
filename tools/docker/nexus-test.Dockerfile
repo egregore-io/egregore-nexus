@@ -12,20 +12,40 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         bash \
+        binutils \
         ca-certificates \
         curl \
+        dbus-x11 \
+        fonts-liberation \
         git \
         jq \
+        libasound2 \
+        libatk-bridge2.0-0 \
+        libcups2 \
+        libdrm2 \
+        libgbm1 \
+        libgtk-3-0 \
+        libnss3 \
+        libpangocairo-1.0-0 \
         libssl-dev \
+        libx11-xcb1 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxkbcommon0 \
+        libxrandr2 \
+        libxss1 \
         netcat-openbsd \
         pkg-config \
         procps \
         python3 \
         python3-pip \
+        python3-venv \
+        python3-websockets \
         ripgrep \
         socat \
         sqlite3 \
         tmux \
+        xvfb \
         xz-utils \
         zsh \
     && npm install -g pnpm@10 \

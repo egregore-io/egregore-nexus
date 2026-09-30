@@ -17,6 +17,10 @@ pub enum NexusError {
     ProjectScope,
     #[error("target is paused")]
     Paused,
+    #[error("message rejected by before_send hook")]
+    HookRejected,
+    #[error("hook-capable Gateway is unavailable")]
+    HookGatewayUnavailable,
     #[error("message policy denied: {0}")]
     PolicyDenied(String),
     #[error("ambiguous name: {0}")]
@@ -40,6 +44,8 @@ impl NexusError {
             NexusError::Unauthorized => codes::UNAUTHORIZED,
             NexusError::ProjectScope => codes::PROJECT_SCOPE_VIOLATION,
             NexusError::Paused => codes::PAUSED,
+            NexusError::HookRejected => codes::HOOK_REJECTED,
+            NexusError::HookGatewayUnavailable => codes::HOOK_GATEWAY_UNAVAILABLE,
             NexusError::PolicyDenied(_) => codes::UNAUTHORIZED,
             NexusError::Invalid(_) | NexusError::Ambiguous(_) => codes::INVALID_PARAMS,
             _ => codes::INTERNAL_ERROR,
@@ -59,6 +65,8 @@ impl From<ContractError> for NexusError {
             codes::UNAUTHORIZED => NexusError::Unauthorized,
             codes::PROJECT_SCOPE_VIOLATION => NexusError::ProjectScope,
             codes::PAUSED => NexusError::Paused,
+            codes::HOOK_REJECTED => NexusError::HookRejected,
+            codes::HOOK_GATEWAY_UNAVAILABLE => NexusError::HookGatewayUnavailable,
             _ => NexusError::Internal(e.message),
         }
     }

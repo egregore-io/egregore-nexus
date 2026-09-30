@@ -1,6 +1,12 @@
-use nexus_contracts::{BatchCounts, BatchMessage, Kind, MessageId, NexusBatch, Scope};
+use nexus_contracts::{
+    BatchCounts, BatchMessage, Kind, Message, MessageId, NexusBatch, ProjectId, Provenance, Scope,
+    SessionId,
+};
+use nexus_store::daemon_store::DaemonStore;
 use nexus_store::repos::{
-    caller_subscription_id, DeveloperEvents, InboxSubscriptions, NewInboxSubscription,
+    caller_subscription_id, AgentRuntimes, Agents, DeliveryObligations, DeveloperEvents, Inbox,
+    InboxSubscriptions, Messages, NewAgent, NewAgentRuntime, NewDeliveryObligation,
+    NewInboxSubscription, NewSession, Sessions,
 };
 use nexus_store::Store;
 
@@ -45,6 +51,27 @@ fn batch() -> NexusBatch {
         dm_message_ids: vec![MessageId("m_1".to_string())],
         thread_message_ids: vec![],
         message_ids: vec![MessageId("m_1".to_string())],
+    }
+}
+
+fn message() -> Message {
+    Message {
+        id: MessageId("m_1".into()),
+        project: ProjectId("default".into()),
+        from: "ben".into(),
+        scope: Scope::Dm,
+        thread: None,
+        topic: None,
+        body: "hello".into(),
+        summary: None,
+        provenance: Provenance {
+            from: "ben".into(),
+            kind: Kind::Agent,
+            thread: None,
+            topic: None,
+            stamp: None,
+        },
+        created_at: 250,
     }
 }
 
@@ -172,4 +199,148 @@ async fn pending_batches_are_replayed_until_consumed() {
         .mark_batch_consumed(&sub, &first.batch_id, 401)
         .await
         .unwrap());
+}
+
+#[tokio::test]
+async fn acknowledged_pull_batch_settles_the_persistent_delivery_obligation() {
+    let daemon = DaemonStore::open(":memory:").await.unwrap();
+    let store = daemon.compatibility_store();
+    let session = SessionId("s_ada".into());
+
+    Agents::new(&store)
+        .create(NewAgent {
+            agent_id: "a_ada".into(),
+            project: "default".into(),
+            name: Some("ada".into()),
+            default_harness: Some("other".into()),
+            role: None,
+            tier: Some("agent".into()),
+            owner: None,
+        })
+        .await
+        .unwrap();
+    AgentRuntimes::new(&store)
+        .create(NewAgentRuntime {
+            runtime_id: session.0.clone(),
+            agent_id: "a_ada".into(),
+            harness: "other".into(),
+            cwd: None,
+            transport: None,
+            presence: Some("online".into()),
+            active: true,
+        })
+        .await
+        .unwrap();
+    Sessions::new(&store)
+        .create(NewSession {
+            session_id: session.clone(),
+            name: Some("ada".into()),
+            agent: Some("other".into()),
+            kind: "agent".into(),
+            role: None,
+            tier: "agent".into(),
+            harness_session_id: None,
+            client_key: Some("ck_ada".into()),
+            cwd: None,
+            project: "default".into(),
+            transport: None,
+        })
+        .await
+        .unwrap();
+    Sessions::new(&store)
+        .set_agent_id(&session, "a_ada")
+        .await
+        .unwrap();
+    Messages::new(&store).insert(&message()).await.unwrap();
+    Inbox::new(&store)
+        .enqueue(&MessageId("m_1".into()), &session)
+        .await
+        .unwrap();
+    DeliveryObligations::new(&store)
+        .insert(NewDeliveryObligation {
+            message_id: "m_1".into(),
+            recipient_agent_id: "a_ada".into(),
+            recipient_runtime_id: Some(session.0.clone()),
+            payload_json: serde_json::to_string(&message()).unwrap(),
+            dedupe_key: "delivery:m_1:a_ada".into(),
+            attempt: 0,
+            state: "pending".into(),
+            created_at: 250,
+        })
+        .await
+        .unwrap();
+
+    let repo = InboxSubscriptions::new(&store);
+    repo.upsert_active(subscription()).await.unwrap();
+    let durable = repo
+        .insert_pending_batch(&caller_subscription_id("default", "s_ada"), &batch(), 300)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(repo
+        .acknowledge_pull_batch(&durable.subscription_id, &durable.batch_id, &session, 400,)
+        .await
+        .unwrap());
+
+    assert!(
+        DeliveryObligations::new(&store)
+            .pending()
+            .await
+            .unwrap()
+            .is_empty(),
+        "a rendered+acknowledged pull batch must not leave a phantom pending obligation to replay"
+    );
+}
+
+#[tokio::test]
+async fn durable_pull_ack_settlement_survives_a_lost_volatile_commit_and_reopen() {
+    let identity_path = std::env::temp_dir().join(format!(
+        "nexus-pull-ack-settlement-{}-{}.db",
+        std::process::id(),
+        nexus_common::now()
+    ));
+    let daemon = DaemonStore::open(identity_path.to_string_lossy().as_ref())
+        .await
+        .unwrap();
+    let store = daemon.compatibility_store();
+    DeliveryObligations::new(&store)
+        .insert(NewDeliveryObligation {
+            message_id: "m_crash_window".into(),
+            recipient_agent_id: "a_ada".into(),
+            recipient_runtime_id: Some("s_ada".into()),
+            payload_json: serde_json::to_string(&message()).unwrap(),
+            dedupe_key: "delivery:m_crash_window:a_ada".into(),
+            attempt: 0,
+            state: "pending".into(),
+            created_at: 250,
+        })
+        .await
+        .unwrap();
+
+    // This is the durable half of pull ACK. Production performs it after validating the pending
+    // transport batch but before committing its boot-scoped rows. Dropping the daemon here models
+    // a crash that loses that volatile commit entirely.
+    assert_eq!(
+        DeliveryObligations::new(&store)
+            .settle_pull_batch_for_runtime(&[MessageId("m_crash_window".into())], "s_ada",)
+            .await
+            .unwrap(),
+        1
+    );
+    drop(store);
+    drop(daemon);
+
+    let reopened = DaemonStore::open(identity_path.to_string_lossy().as_ref())
+        .await
+        .unwrap();
+    assert!(
+        DeliveryObligations::new(&reopened.compatibility_store())
+            .pending()
+            .await
+            .unwrap()
+            .is_empty(),
+        "a pull ACK accepted at the durable boundary must not replay after daemon boot"
+    );
+    drop(reopened);
+    let _ = std::fs::remove_file(identity_path);
 }

@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use nexus_agent::adapter::opencode::classify_opencode_provider_error_payload;
+use nexus_agent::ActiveTurnTracker;
 use nexus_common::render_injected_turn_for;
 use nexus_contracts::batch::NexusBatch;
 use nexus_contracts::ids::SessionId;
@@ -44,6 +45,7 @@ const PROMPT_READY_RETRY_DELAYS: [std::time::Duration; 3] = [
 #[derive(Default, Clone)]
 pub struct PtyTransport {
     sessions: Arc<Mutex<HashMap<SessionId, Arc<dyn HarnessInput>>>>,
+    active_turns: ActiveTurnTracker,
 }
 
 impl PtyTransport {
@@ -82,6 +84,7 @@ impl PtyTransport {
         accepted_event: Option<(Arc<dyn EventSink>, WsEvent)>,
     ) -> PortResult<()> {
         let input = self.harness_for(recipient)?;
+        let _active_turn = self.active_turns.begin(recipient);
         send_turn_with_prompt_retries(input, &render_injected_turn_for(batch, &recipient.0))
             .await
             .map_err(|e| ContractError {
@@ -182,6 +185,7 @@ impl AgentTurnExecutionPort for PtyTransport {
                 ),
             }));
         }
+        let _active_turn = self.active_turns.begin(recipient);
         send_turn_with_prompt_retries(input, &render_injected_turn_for(batch, &recipient.0))
             .await
             .map_err(|error| inject_harness_error(recipient, error))?;
@@ -198,6 +202,7 @@ impl AgentTurnExecutionPort for PtyTransport {
     /// accepted (`delivered: true`) yet dropped, because a tmux harness has no ACP session.
     async fn prompt(&self, recipient: &SessionId, text: String) -> PortResult<()> {
         let input = self.harness_for(recipient)?;
+        let _active_turn = self.active_turns.begin(recipient);
         send_turn_with_prompt_retries(input, &text)
             .await
             .map_err(|e| ContractError {
@@ -215,6 +220,7 @@ impl AgentTurnExecutionPort for PtyTransport {
         accepted_event: WsEvent,
     ) -> PortResult<()> {
         let input = self.harness_for(recipient)?;
+        let _active_turn = self.active_turns.begin(recipient);
         send_turn_with_prompt_retries(input, &text)
             .await
             .map_err(|e| ContractError {
@@ -231,6 +237,15 @@ impl AgentTurnExecutionPort for PtyTransport {
         } else {
             SteerCapability::None
         }
+    }
+
+    fn active_turn_sessions(&self) -> Vec<SessionId> {
+        self.active_turns.sessions()
+    }
+
+    async fn wait_for_turn_completion(&self, recipient: &SessionId) -> PortResult<()> {
+        self.active_turns.wait_for_completion(recipient).await;
+        Ok(())
     }
 
     async fn interrupt_active_turn(&self, recipient: &SessionId) -> PortResult<()> {

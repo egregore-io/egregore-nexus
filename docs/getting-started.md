@@ -13,7 +13,7 @@ transport; the WebUI talks only to the Gateway.
 
 ## Prerequisites
 
-- Linux x64 for the v0.1.0 release baseline; other packaged targets follow the status in
+- Linux x64 for the v0.1.5 release baseline; other packaged targets follow the status in
   [Distribution](distribution.md);
 - one or more supported harnesses: Claude Code, Codex, OpenCode, or Hermes;
 - `tmux` only when selecting the optional tmux headed backend.
@@ -25,7 +25,7 @@ Building from source additionally requires Rust, Node.js, and `pnpm`.
 Install from Cargo:
 
 ```bash
-cargo install egregore-nexus --version 0.1.0
+cargo install egregore-nexus --version 0.1.5
 ```
 
 The npm CLI package carries the matching prebuilt native binary and does not compile Rust:
@@ -265,8 +265,8 @@ Common Gateway settings:
 | `NEXUS_GATEWAY_BIND` | Bind address; loopback is the safe default. |
 
 Pre-v0.1 shared-store URL and token settings are not part of the v0.1 architecture. Follow the
-[database baseline procedure](database-baselines.md) to archive any pre-release home and start
-v0.1.0 with fresh daemon and Gateway stores.
+[database baseline procedure](database-baselines.md) to archive any unsupported pre-release home
+and start v0.1.5 with fresh daemon and Gateway stores.
 
 ## Next steps
 

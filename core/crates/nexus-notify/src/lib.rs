@@ -84,6 +84,34 @@ mod tests {
 
     #[async_trait]
     impl BusPort for MockBus {
+        async fn preflight_send(&self, _caller: &Caller, req: &SendRequest) -> PortResult<()> {
+            if let SendTarget::Dm { name, agent_id } = &req.to {
+                let recipient = agent_id
+                    .as_ref()
+                    .map(|id| id.0.as_str())
+                    .or(name.as_deref())
+                    .unwrap_or("");
+                if !self.known.iter().any(|known| known == recipient) {
+                    return Err(ContractError {
+                        code: nexus_contracts::codes::NOT_FOUND,
+                        message: format!("no such recipient: {recipient}"),
+                    });
+                }
+            }
+            Ok(())
+        }
+
+        async fn preflight_notify_target(
+            &self,
+            _caller: &Caller,
+            target: &nexus_contracts::NotifyTarget,
+        ) -> PortResult<Option<nexus_contracts::AgentId>> {
+            Ok(match target {
+                nexus_contracts::NotifyTarget::Agent { agent_id } => Some(agent_id.clone()),
+                _ => None,
+            })
+        }
+
         async fn send(&self, _caller: &Caller, req: SendRequest) -> PortResult<Ack> {
             let desc = match &req.to {
                 SendTarget::Publish { topic } => format!("publish:{topic}"),

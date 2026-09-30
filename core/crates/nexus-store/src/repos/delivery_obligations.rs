@@ -1,6 +1,7 @@
 use libsql::params;
 
 use nexus_common::NexusError;
+use nexus_contracts::MessageId;
 
 use crate::error::store_err;
 use crate::Store;
@@ -134,6 +135,44 @@ impl<'a> DeliveryObligations<'a> {
                    )
                  )",
                 params![message_id, recipient_runtime_id],
+            )
+            .await
+            .map_err(store_err)
+    }
+
+    /// Durably settle every rendered message in one pull ACK before volatile transport commits.
+    ///
+    /// The split daemon cannot atomically commit its file-backed continuity store and boot-scoped
+    /// transport database. Pull ACK therefore uses the durable side as the acceptance boundary:
+    /// after the pending batch has been validated, this one SQLite statement removes the exact
+    /// recipient obligations atomically, then the caller commits its volatile batch/in-flight
+    /// rows. A crash anywhere after this statement cannot resurrect already-rendered messages on
+    /// the next boot; a lost volatile commit remains safely retryable against the pending batch.
+    pub async fn settle_pull_batch_for_runtime(
+        &self,
+        message_ids: &[MessageId],
+        recipient_runtime_id: &str,
+    ) -> Result<u64, NexusError> {
+        if message_ids.is_empty() {
+            return Ok(0);
+        }
+        let ids_json = serde_json::to_string(
+            &message_ids
+                .iter()
+                .map(|message_id| message_id.0.as_str())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| NexusError::Store(error.to_string()))?;
+        self.store
+            .identity_conn()
+            .execute(
+                "DELETE FROM delivery_obligations
+                 WHERE message_id IN (SELECT value FROM json_each(?1)) AND (
+                   recipient_runtime_id = ?2 OR recipient_agent_id = (
+                     SELECT agent_id FROM agent_runtimes WHERE runtime_id = ?2 LIMIT 1
+                   )
+                 )",
+                params![ids_json, recipient_runtime_id],
             )
             .await
             .map_err(store_err)

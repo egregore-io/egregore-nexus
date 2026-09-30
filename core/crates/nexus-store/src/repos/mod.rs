@@ -46,7 +46,7 @@ pub use agents::{AgentOwner, AgentRef, Agents, NewAgent};
 pub use command_intents::{
     CommandIntentDepth, CommandIntentReceipt, CommandIntentRow, CommandIntents, NewCommandIntent,
 };
-pub use command_queue::{CommandQueue, CommandQueueMutationOutcome};
+pub use command_queue::{CommandQueue, CommandQueueEventsPage, CommandQueueMutationOutcome};
 pub use daemon_state::DaemonState;
 pub use delivery_obligations::{DeliveryObligationRow, DeliveryObligations, NewDeliveryObligation};
 pub use developer_events::{

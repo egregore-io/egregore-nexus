@@ -1,5 +1,6 @@
 use nexus_common::{
     persist_gateway_projection_delivery_mode, Config, GatewayProjectionDeliveryMode,
+    HookGatewayMode,
 };
 use std::sync::{Mutex, OnceLock};
 
@@ -48,6 +49,35 @@ fn gateway_projection_defaults_to_buffered_and_env_can_explicitly_opt_out() {
     match previous_mode {
         Some(value) => std::env::set_var("NEXUS_GATEWAY_DELIVERY_MODE", value),
         None => std::env::remove_var("NEXUS_GATEWAY_DELIVERY_MODE"),
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn hook_gateway_defaults_optional_and_exact_environment_can_require_it() {
+    assert_eq!(
+        Config::default().hook_gateway_mode,
+        HookGatewayMode::Optional
+    );
+
+    let _guard = env_lock();
+    let dir = temp_config_dir("hook-gateway-mode");
+    let previous_home = std::env::var("NEXUS_HOME").ok();
+    let previous_mode = std::env::var("NEXUS_HOOK_GATEWAY_MODE").ok();
+    std::env::set_var("NEXUS_HOME", &dir);
+    std::env::set_var("NEXUS_HOOK_GATEWAY_MODE", "required");
+    assert_eq!(
+        Config::try_load().unwrap().hook_gateway_mode,
+        HookGatewayMode::Required
+    );
+
+    match previous_home {
+        Some(value) => std::env::set_var("NEXUS_HOME", value),
+        None => std::env::remove_var("NEXUS_HOME"),
+    }
+    match previous_mode {
+        Some(value) => std::env::set_var("NEXUS_HOOK_GATEWAY_MODE", value),
+        None => std::env::remove_var("NEXUS_HOOK_GATEWAY_MODE"),
     }
     let _ = std::fs::remove_dir_all(dir);
 }

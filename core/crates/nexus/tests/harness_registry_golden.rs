@@ -30,6 +30,12 @@ const TAILS: [&[&str]; 3] = [
 
 const SLASH_INPUTS: [&str; 4] = ["/compact", "/compress", "/compact now", "/clear"];
 
+/// The cross-platform golden records the stable harness contract. Native executable spelling is
+/// covered separately by `nexus-harness-core/tests/native_programs.rs`.
+fn stable_program(program: &str) -> &str {
+    program.strip_suffix(".exe").unwrap_or(program)
+}
+
 fn snapshot() -> String {
     let mut out = String::new();
     for (index, token) in KINDS.into_iter().enumerate() {
@@ -37,7 +43,7 @@ fn snapshot() -> String {
         let contract = harness_registry_by_id(&kind);
 
         writeln!(out, "[{token}]").unwrap();
-        writeln!(out, "program = {:?}", contract.program()).unwrap();
+        writeln!(out, "program = {:?}", stable_program(contract.program())).unwrap();
         writeln!(out, "agent_token = {:?}", contract.agent_token()).unwrap();
         writeln!(
             out,
@@ -87,7 +93,8 @@ fn snapshot() -> String {
             Ok(cmd) => writeln!(
                 out,
                 "headed_cli_command = program={:?} args={:?}",
-                cmd.program, cmd.args
+                stable_program(&cmd.program),
+                cmd.args
             )
             .unwrap(),
             Err(err) => writeln!(out, "headed_cli_command = err({err})").unwrap(),
@@ -96,7 +103,8 @@ fn snapshot() -> String {
             Ok(cmd) => writeln!(
                 out,
                 "headed_pty_command = program={:?} args={:?}",
-                cmd.program, cmd.args
+                stable_program(&cmd.program),
+                cmd.args
             )
             .unwrap(),
             Err(err) => writeln!(out, "headed_pty_command = err({err})").unwrap(),

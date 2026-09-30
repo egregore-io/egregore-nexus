@@ -40,18 +40,24 @@ impl RoutingTurnExec {
     ) -> Self {
         Self { codex, pty, acp }
     }
+
+    fn turn_backend(&self, recipient: &SessionId) -> &dyn AgentTurnExecutionPort {
+        if self.codex.is_bound(recipient) {
+            &self.codex
+        } else if self.pty.is_bound(recipient) {
+            &self.pty
+        } else {
+            self.acp.as_ref()
+        }
+    }
 }
 
 #[async_trait]
 impl AgentTurnExecutionPort for RoutingTurnExec {
     async fn inject_turn(&self, recipient: &SessionId, batch: &NexusBatch) -> PortResult<()> {
-        if self.codex.is_bound(recipient) {
-            self.codex.inject_turn(recipient, batch).await
-        } else if self.pty.is_bound(recipient) {
-            self.pty.inject_turn(recipient, batch).await
-        } else {
-            self.acp.inject_turn(recipient, batch).await
-        }
+        self.turn_backend(recipient)
+            .inject_turn(recipient, batch)
+            .await
     }
 
     async fn inject_turn_observed(
@@ -61,29 +67,13 @@ impl AgentTurnExecutionPort for RoutingTurnExec {
         events: Arc<dyn EventSink>,
         accepted_event: WsEvent,
     ) -> InjectResult<()> {
-        if self.codex.is_bound(recipient) {
-            self.codex
-                .inject_turn_observed(recipient, batch, events, accepted_event)
-                .await
-        } else if self.pty.is_bound(recipient) {
-            self.pty
-                .inject_turn_observed(recipient, batch, events, accepted_event)
-                .await
-        } else {
-            self.acp
-                .inject_turn_observed(recipient, batch, events, accepted_event)
-                .await
-        }
+        self.turn_backend(recipient)
+            .inject_turn_observed(recipient, batch, events, accepted_event)
+            .await
     }
 
     async fn prompt(&self, recipient: &SessionId, text: String) -> PortResult<()> {
-        if self.codex.is_bound(recipient) {
-            self.codex.prompt(recipient, text).await
-        } else if self.pty.is_bound(recipient) {
-            self.pty.prompt(recipient, text).await
-        } else {
-            self.acp.prompt(recipient, text).await
-        }
+        self.turn_backend(recipient).prompt(recipient, text).await
     }
 
     async fn prompt_observed(
@@ -93,19 +83,9 @@ impl AgentTurnExecutionPort for RoutingTurnExec {
         events: Arc<dyn EventSink>,
         accepted_event: WsEvent,
     ) -> PortResult<()> {
-        if self.codex.is_bound(recipient) {
-            self.codex
-                .prompt_observed(recipient, text, events, accepted_event)
-                .await
-        } else if self.pty.is_bound(recipient) {
-            self.pty
-                .prompt_observed(recipient, text, events, accepted_event)
-                .await
-        } else {
-            self.acp
-                .prompt_observed(recipient, text, events, accepted_event)
-                .await
-        }
+        self.turn_backend(recipient)
+            .prompt_observed(recipient, text, events, accepted_event)
+            .await
     }
 
     async fn steer_observed(
@@ -115,51 +95,23 @@ impl AgentTurnExecutionPort for RoutingTurnExec {
         events: Arc<dyn EventSink>,
         accepted_event: WsEvent,
     ) -> PortResult<SteerResponse> {
-        if self.codex.is_bound(recipient) {
-            self.codex
-                .steer_observed(recipient, text, events, accepted_event)
-                .await
-        } else if self.pty.is_bound(recipient) {
-            self.pty
-                .steer_observed(recipient, text, events, accepted_event)
-                .await
-        } else {
-            self.acp
-                .steer_observed(recipient, text, events, accepted_event)
-                .await
-        }
+        self.turn_backend(recipient)
+            .steer_observed(recipient, text, events, accepted_event)
+            .await
     }
 
     fn steer_capability(&self, recipient: &SessionId) -> SteerCapability {
-        if self.codex.is_bound(recipient) {
-            self.codex.steer_capability(recipient)
-        } else if self.pty.is_bound(recipient) {
-            self.pty.steer_capability(recipient)
-        } else {
-            self.acp.steer_capability(recipient)
-        }
+        self.turn_backend(recipient).steer_capability(recipient)
     }
 
     async fn interrupt_active_turn(&self, recipient: &SessionId) -> PortResult<()> {
-        if self.codex.is_bound(recipient) {
-            self.codex.interrupt_active_turn(recipient).await
-        } else if self.pty.is_bound(recipient) {
-            self.pty.interrupt_active_turn(recipient).await
-        } else {
-            self.acp.interrupt_active_turn(recipient).await
-        }
+        self.turn_backend(recipient)
+            .interrupt_active_turn(recipient)
+            .await
     }
 
     async fn compact(&self, recipient: &SessionId) -> PortResult<()> {
-        if self.codex.is_bound(recipient) {
-            self.codex.compact(recipient).await
-        } else if self.pty.is_bound(recipient) {
-            self.pty.compact(recipient).await
-        } else {
-            // ACP transports have no compact verb — the trait default reports
-            // "not supported" loudly instead of faking it.
-            self.acp.compact(recipient).await
-        }
+        self.turn_backend(recipient).compact(recipient).await
     }
 
     fn is_harness_alive(&self, recipient: &SessionId) -> Option<bool> {
@@ -196,8 +148,17 @@ impl AgentTurnExecutionPort for RoutingTurnExec {
 
     fn active_turn_sessions(&self) -> Vec<SessionId> {
         let mut sessions = self.codex.active_turn_sessions();
+        sessions.extend(self.pty.active_turn_sessions());
         sessions.extend(self.acp.active_turn_sessions());
+        sessions.sort_by(|left, right| left.0.cmp(&right.0));
+        sessions.dedup();
         sessions
+    }
+
+    async fn wait_for_turn_completion(&self, recipient: &SessionId) -> PortResult<()> {
+        self.turn_backend(recipient)
+            .wait_for_turn_completion(recipient)
+            .await
     }
 
     /// Not routed via this type — app.rs dispatches launch directly to the PTY supervisor or the
@@ -587,6 +548,48 @@ mod tests {
         assert_eq!(fake_acp.interrupt_sessions(), vec![session.clone()]);
         assert_eq!(fake_acp.prompt_sessions(), vec![session]);
         assert_eq!(events.0.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_interrupt_routes_to_native_transport_or_fallback_without_cross_delivery() {
+        use nexus_harness_codex::app_server::CodexAppServerClient;
+
+        let (sock, calls) =
+            test_support::spawn_fake_server("interrupt", "native-and-fallback").await;
+        let native_transport = CodexAppServerTransport::new();
+        let native = SessionId("s_native_interrupt".into());
+        let client = Arc::new(
+            CodexAppServerClient::connect(&sock, "nexus-interrupt")
+                .await
+                .expect("client connect"),
+        );
+        native_transport.bind(native.clone(), client, "thread-native".into());
+        native_transport
+            .turn_tracker()
+            .observe_active_turn("thread-native", "turn-native");
+
+        let non_native = SessionId("s_fallback_interrupt".into());
+        let fallback = FakeAcp::with_liveness(Some(true));
+        let router = RoutingTurnExec::new(
+            native_transport,
+            PtyTransport::default(),
+            Arc::new(fallback.clone()),
+        );
+
+        router.interrupt_active_turn(&native).await.unwrap();
+        router.interrupt_active_turn(&non_native).await.unwrap();
+
+        let recorded = calls.lock().unwrap();
+        assert!(recorded.iter().any(|call| {
+            call.get("method").and_then(|value| value.as_str()) == Some("turn/interrupt")
+                && call.get("params")
+                    == Some(&serde_json::json!({
+                        "threadId": "thread-native",
+                        "turnId": "turn-native"
+                    }))
+        }));
+        drop(recorded);
+        assert_eq!(fallback.interrupt_sessions(), vec![non_native]);
     }
 
     #[tokio::test]

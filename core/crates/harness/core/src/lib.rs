@@ -248,15 +248,13 @@ pub trait Harness: Send + Sync {
     /// reject those before spawning.
     fn program(&self) -> &'static str;
 
-    /// Stable runtime token stored in Nexus identity rows and exported as `NEXUS_AGENT`.
-    fn agent_token(&self) -> &'static str {
-        let program = self.program();
-        if program.is_empty() {
-            "other"
-        } else {
-            program
-        }
-    }
+    /// Stable, platform-neutral runtime token stored in Nexus identity rows and exported as
+    /// `NEXUS_AGENT`.
+    ///
+    /// This must not be derived from [`Harness::program`]: native executable names are
+    /// platform-specific (`codex` on Unix, `codex.exe` on Windows), while identity and registry
+    /// keys must remain identical across platforms.
+    fn agent_token(&self) -> &'static str;
 
     /// Runtime integration profile for headed launches.
     fn headed_runtime_kind(&self) -> HeadedRuntimeKind {

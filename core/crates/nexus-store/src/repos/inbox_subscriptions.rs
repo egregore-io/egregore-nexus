@@ -11,7 +11,7 @@ use nexus_contracts::{NexusBatch, SessionId};
 
 use crate::error::{store_err, store_msg};
 use crate::repos::sessions::{get_opt_int, get_opt_text, get_text};
-use crate::repos::{AgentRuntimes, DeveloperEvents};
+use crate::repos::{AgentRuntimes, DeliveryObligations, DeveloperEvents};
 use crate::state::Store;
 
 /// Active daemon-tracked inbox subscription.
@@ -207,6 +207,28 @@ impl<'a> InboxSubscriptions<'a> {
         Ok(changed > 0)
     }
 
+    /// Retire every active pull owner for one stable session before daemon delivery takes over.
+    ///
+    /// A transport rebind can turn an externally-drained `other` session into a daemon-managed
+    /// harness without changing its session id. Delivery ownership follows that stable session,
+    /// so the transition is one set-based write rather than a project/name lookup or a sequence of
+    /// per-subscription updates that could leave two consumers active.
+    pub async fn mark_inactive_for_session(
+        &self,
+        caller_session_id: &str,
+        updated_at: i64,
+    ) -> Result<u64, NexusError> {
+        self.store
+            .conn
+            .execute(
+                "UPDATE inbox_subscriptions SET status = 'inactive', updated_at = ?2 \
+                 WHERE caller_session_id = ?1 AND status = 'active'",
+                params![caller_session_id, updated_at],
+            )
+            .await
+            .map_err(store_err)
+    }
+
     async fn append_subscription_action_best_effort(
         &self,
         action: &str,
@@ -361,8 +383,9 @@ impl<'a> InboxSubscriptions<'a> {
     /// subscriber is itself the delivery endpoint: its explicit batch acknowledgement is the
     /// terminal receipt. The rows therefore move directly from `pending`/`notified` to `acked`
     /// here. A row already `delivered` (or `acked` by a legacy split-ack) is also accepted, while a
-    /// terminal error is never resurrected. The batch and every row commit together so a failed
-    /// acknowledgement cannot create a replayed rendered batch or a silently unsettled delivery.
+    /// terminal error is never resurrected. In a split store the validated durable continuity rows
+    /// settle before the boot-scoped transaction commits: this ordering makes a lost volatile
+    /// commit retryable without ever replaying an already-rendered message after daemon restart.
     pub async fn acknowledge_pull_batch(
         &self,
         subscription_id: &str,
@@ -427,6 +450,15 @@ impl<'a> InboxSubscriptions<'a> {
         .await;
         match result {
             Ok(()) => {
+                if self.store.has_split_authority() {
+                    if let Err(error) = DeliveryObligations::new(self.store)
+                        .settle_pull_batch_for_runtime(&batch.message_ids, &recipient.0)
+                        .await
+                    {
+                        txn.rollback(&error).await?;
+                        return Err(error);
+                    }
+                }
                 txn.commit().await?;
                 Ok(true)
             }

@@ -64,6 +64,45 @@ impl<'a> Notifications<'a> {
         Ok(notif_id)
     }
 
+    /// Record one verified logical ingest under a deterministic notification id.
+    ///
+    /// Returns the canonical row and whether this call inserted it. A command reclaim therefore
+    /// observes the same `notif_id`/audit bytes and does not emit a second accepted audit event.
+    pub async fn record_once(
+        &self,
+        notif_id: &str,
+        source: Option<&str>,
+        topic: Option<&str>,
+        hmac_ok: bool,
+        payload: &str,
+        routed_to: &str,
+    ) -> Result<(NotificationRow, bool), NexusError> {
+        let changed = self
+            .store
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO notifications \
+                 (notif_id, source, topic, hmac_ok, payload, routed_to, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    notif_id,
+                    source,
+                    topic,
+                    hmac_ok as i64,
+                    payload,
+                    routed_to,
+                    now()
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        let row = self
+            .get(notif_id)
+            .await?
+            .ok_or_else(|| NexusError::Store("idempotent notification audit disappeared".into()))?;
+        Ok((row, changed > 0))
+    }
+
     /// Fetch a recorded notification by id (audit read).
     pub async fn get(&self, notif_id: &str) -> Result<Option<NotificationRow>, NexusError> {
         let mut rows = self

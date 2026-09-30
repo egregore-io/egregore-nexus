@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -64,8 +64,77 @@ test("server publishes its bound endpoint and removes only its own record", asyn
     const record = await waitForDiscovery(discovery);
     assert.equal(record.pid, child.pid);
     assert.equal(record.url, `http://127.0.0.1:${port}`);
-    assert.equal((await fetch(`${record.url}/health`)).status, 200);
+    const healthResponse = await fetch(`${record.url}/health`);
+    assert.equal(healthResponse.status, 200);
+    assert.deepEqual(await healthResponse.json(), {
+      ok: true,
+      service: "nexus-webui",
+      pid: child.pid,
+      host: "127.0.0.1",
+      port,
+      url: record.url,
+      gateway: "http://127.0.0.1:4100",
+      executable: record.executable,
+    });
     assert.equal((await fetch(record.url)).status, 200);
+  } finally {
+    child.kill("SIGTERM");
+    await new Promise((resolve) => child.once("exit", resolve));
+  }
+  await assert.rejects(readFile(discovery, "utf8"), { code: "ENOENT" });
+});
+
+test("umbrella package launcher records the executable that Core spawned", async () => {
+  const home = await mkdtemp(join(tmpdir(), "nexus-webconsole-umbrella-"));
+  const dist = join(home, "dist");
+  const discovery = join(home, "webconsole.json");
+  const modules = join(home, "node_modules");
+  const umbrella = join(modules, "@egregore", "nexus");
+  const gateway = join(modules, "@egregore", "nexus-gateway");
+  const launcher = join(umbrella, "bin", "nexus-webui.mjs");
+  const installedBin = join(modules, ".bin", "nexus-webui");
+  await mkdir(dist, { recursive: true });
+  await mkdir(join(umbrella, "bin"), { recursive: true });
+  await mkdir(join(gateway, "webconsole", "bin"), { recursive: true });
+  await mkdir(join(gateway, "webconsole", "lib"), { recursive: true });
+  await mkdir(join(modules, ".bin"), { recursive: true });
+  await writeFile(join(dist, "index.html"), "<!doctype html><title>Nexus</title>");
+  await writeFile(join(umbrella, "package.json"), '{"type":"module"}\n');
+  await writeFile(join(gateway, "package.json"), '{"type":"module"}\n');
+  await writeFile(
+    launcher,
+    await readFile(new URL("../../../packages/nexus/bin/nexus-webui.mjs", import.meta.url)),
+  );
+  await writeFile(
+    join(gateway, "webconsole", "bin", "nexus-webui.mjs"),
+    await readFile(new URL("../bin/nexus-webui.mjs", import.meta.url)),
+  );
+  await writeFile(
+    join(gateway, "webconsole", "lib", "lifecycle.mjs"),
+    await readFile(new URL("../lib/lifecycle.mjs", import.meta.url)),
+  );
+  await symlink(launcher, installedBin);
+  const spawnedExecutable = await realpath(installedBin);
+  const port = await reservePort();
+  const child = spawn(
+    process.execPath,
+    [
+      spawnedExecutable,
+      "--host",
+      "127.0.0.1",
+      "--port",
+      String(port),
+      "--gateway-url",
+      "http://127.0.0.1:4100",
+      "--discovery",
+      discovery,
+    ],
+    { env: { ...process.env, NEXUS_WEBUI_DIST: dist }, stdio: "ignore" },
+  );
+  try {
+    const record = await waitForDiscovery(discovery);
+    assert.equal(record.pid, child.pid);
+    assert.equal(record.executable, spawnedExecutable);
   } finally {
     child.kill("SIGTERM");
     await new Promise((resolve) => child.once("exit", resolve));

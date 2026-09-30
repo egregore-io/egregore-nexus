@@ -165,6 +165,7 @@ async fn human_thread_post_stores_human_provenance_kind() {
             summary: None,
             body: "from the web console".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         },
     )
@@ -187,6 +188,7 @@ async fn human_thread_post_stores_human_provenance_kind() {
             summary: None,
             body: "cached human provenance".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: Some("cached-human-kind".into()),
         },
     )

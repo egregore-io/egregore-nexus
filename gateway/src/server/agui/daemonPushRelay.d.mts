@@ -4,8 +4,11 @@
 import type { RelayFactory } from "@server/agui/relayTypes";
 import type {
   DeveloperEventEnvelope,
+  GatewayHookCapabilities,
   GatewayProjectionAck,
   GatewayProjectionEvent,
+  HookEvaluationRequest,
+  HookEvaluationResponse,
 } from "@shared/types";
 
 export type DaemonPushLane = "agent" | "raw" | "developer_event";
@@ -39,6 +42,8 @@ export interface DaemonPushProjectionGapFrame {
 
 export interface DaemonPushConnection {
   ready: Promise<void>;
+  /** Authenticated daemon boot currently backing this connection. */
+  readonly daemonBootId?: string;
   subscribe(
     subscription: DaemonPushSubscription,
     handlers: {
@@ -51,6 +56,10 @@ export interface DaemonPushConnection {
     onError: (error: unknown) => void;
   }): () => void;
   ackProjection?(ack: GatewayProjectionAck): Promise<void>;
+  registerHooks?(
+    capabilities: GatewayHookCapabilities,
+    handler: (request: HookEvaluationRequest) => Promise<HookEvaluationResponse> | HookEvaluationResponse,
+  ): () => void;
   close(): void;
 }
 
@@ -84,6 +93,8 @@ export declare function createDaemonPushDeveloperEventSource(
 ): DaemonPushDeveloperEventSource | undefined;
 
 export declare function sharedDaemonPushConnector(): DaemonPushConnection | undefined;
+
+export declare function closeSharedDaemonPushConnector(): void;
 
 export declare function resetSharedDaemonPushConnectorForTests(): void;
 

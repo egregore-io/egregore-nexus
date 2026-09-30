@@ -81,6 +81,13 @@ export interface SourceRegistryReader {
   secret(name: string): Promise<SourceSecretRow | undefined>;
 }
 
+/** Gateway-local, read-only hook registry and attestation diagnostics. */
+export interface HookDiagnosticsReader {
+  list(includePrivate: boolean): Promise<unknown>;
+  publicKey(): Promise<unknown>;
+  audit(limit: number, includePrivate: boolean): Promise<unknown>;
+}
+
 /**
  * A plain inbound request — NOT the framework `Request`. The TanStack catch-all
  * route (`routes/api/v1/$.ts`) adapts the real request into this shape; tests
@@ -147,6 +154,8 @@ export interface ApiDeps {
   commands?: CommandIntentSender;
   /** Typed daemon identity seam for source metadata and HMAC credentials. */
   sourceRegistry?: SourceRegistryReader;
+  /** Read-only diagnostics for the Gateway-owned message-hook service. */
+  hooks?: HookDiagnosticsReader;
   /**
    * Lazy provider for the read-only Drizzle handle (display/query). Constructed
    * ONLY when a read handler calls it — never eagerly per request.

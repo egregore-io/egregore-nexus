@@ -48,11 +48,40 @@ describe("canonical Gateway projection application", () => {
         },
       }),
     ).resolves.toBe("applied");
-    expect((await db.execute("SELECT message_id, body FROM bus_messages")).rows).toMatchObject([
-      { message_id: "m1", body: "hello" },
+    expect((await db.execute(
+      "SELECT message_id, body, metadata_json, mention_json FROM bus_messages",
+    )).rows).toMatchObject([
+      { message_id: "m1", body: "hello", metadata_json: "{}", mention_json: "[]" },
     ]);
     expect((await db.execute("SELECT daemon_epoch, through_seq FROM projection_cursors")).rows)
       .toMatchObject([{ daemon_epoch: "boot-1", through_seq: 1 }]);
+  });
+
+  it("materializes canonical message metadata and mentions for receipt hooks", async () => {
+    await applyCanonicalProjection(db, {
+      eventId: "message:m_hook",
+      daemonEpoch: "boot-1",
+      seq: 1,
+      occurredAt: 10,
+      kind: "message.accepted",
+      version: 1,
+      payload: {
+        messageId: "m_hook",
+        scope: "thread",
+        threadId: "t_release",
+        body: "review",
+        metadata: { nested: { source: "before_send" } },
+        mention: ["fable"],
+      },
+    });
+
+    const row = (await db.execute(
+      "SELECT metadata_json, mention_json FROM bus_messages WHERE message_id = 'm_hook'",
+    )).rows[0];
+    expect(JSON.parse(String(row?.metadata_json))).toEqual({
+      nested: { source: "before_send" },
+    });
+    expect(JSON.parse(String(row?.mention_json))).toEqual(["fable"]);
   });
 
   it("rolls back the source event and cursor when materialization rejects", async () => {
@@ -92,5 +121,67 @@ describe("canonical Gateway projection application", () => {
     expect((await db.execute("SELECT daemon_epoch, through_seq FROM projection_cursors")).rows)
       .toMatchObject([{ daemon_epoch: "boot-2", through_seq: 1 }]);
     expect((await db.execute("SELECT * FROM bus_messages")).rows).toHaveLength(1);
+  });
+
+  it("retires stale runtimes and rematerializes current runtimes on a daemon epoch change", async () => {
+    const identity = (agentId: string, name: string, seq: number) => ({
+      eventId: `identity:${agentId}`,
+      daemonEpoch: "boot-1",
+      seq,
+      occurredAt: seq,
+      kind: "identity.upserted" as const,
+      version: 1,
+      payload: { agentId, name, project: "default", defaultHarness: "codex" },
+    });
+    const runtime = (runtimeId: string, agentId: string, seq: number) => ({
+      eventId: `runtime:${runtimeId}`,
+      daemonEpoch: "boot-1",
+      seq,
+      occurredAt: seq,
+      kind: "runtime.upserted" as const,
+      version: 1,
+      payload: {
+        runtimeId,
+        agentId,
+        harness: "codex",
+        transport: "acp",
+        presence: "online",
+        active: true,
+      },
+    });
+
+    const staleIdentity = identity("a_stale", "stale-agent", 1);
+    const staleRuntime = runtime("s_stale", "a_stale", 2);
+    const currentIdentity = identity("a_current", "current-agent", 3);
+    const currentRuntime = runtime("s_current", "a_current", 4);
+    for (const event of [staleIdentity, staleRuntime, currentIdentity, currentRuntime]) {
+      await applyCanonicalProjection(db, event);
+    }
+
+    await applyCanonicalProjection(db, {
+      ...currentIdentity,
+      daemonEpoch: "boot-2",
+      seq: 1,
+      occurredAt: 10,
+    });
+    await applyCanonicalProjection(db, {
+      ...currentRuntime,
+      daemonEpoch: "boot-2",
+      seq: 2,
+      occurredAt: 11,
+    });
+
+    expect((await db.execute(
+      "SELECT runtime_id, status FROM runtime_descriptors ORDER BY runtime_id",
+    )).rows).toMatchObject([
+      { runtime_id: "s_current", status: "online" },
+      { runtime_id: "s_stale", status: "stopped" },
+    ]);
+    expect((await db.execute(
+      "SELECT agent_id FROM identities ORDER BY agent_id",
+    )).rows).toMatchObject([
+      { agent_id: "a_current" },
+      { agent_id: "a_stale" },
+    ]);
   });
 });

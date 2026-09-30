@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+TARGET="$SCRIPT_DIR/nexus-docker-test-env"
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+mkdir -p "$TMP/bin"
+for command in docker cargo pnpm npm npx xdg-open; do
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    "touch '$TMP/unexpected-command'" \
+    'exit 97' >"$TMP/bin/$command"
+  chmod +x "$TMP/bin/$command"
+done
+
+PATH="$TMP/bin:/usr/bin:/bin" "$TARGET" --help >"$TMP/help"
+test ! -e "$TMP/unexpected-command"
+# The standalone helper advertises only its own commands.
+for command in build up status shell nexus smoke locks logs down clean; do
+  grep -Eq "^  $command([[:space:]]|$)" "$TMP/help"
+done
+if grep -Eq 'lab-(up|status|readiness|gate|evidence|down)' "$TMP/help"; then
+  echo 'standalone help advertises private lab commands' >&2
+  exit 1
+fi
+for command in lab-up lab-status lab-readiness lab-gate lab-evidence lab-down; do
+  if PATH="$TMP/bin:/usr/bin:/bin" "$TARGET" "$command" >"$TMP/rejected.out" 2>"$TMP/rejected.err"; then
+    echo "removed command unexpectedly accepted: $command" >&2
+    exit 1
+  fi
+  grep -Fq "unknown command: $command" "$TMP/rejected.err"
+  test ! -e "$TMP/unexpected-command"
+done
+for default in 6 8g 1024 4551; do
+  grep -Fq "default: $default" "$TMP/help"
+done
+grep -Fq 'binutils' "$SCRIPT_DIR/../tools/docker/nexus-test.Dockerfile"
+NPM_CONFIG_CACHE="$TMP/npm-cache" "$SCRIPT_DIR/test-nexus-v015-scoped-registry"
+
+# Preserve standalone topology and read-only host credential mounts.
+for token in \
+  '--cpus "$CPUS"' '--memory "$MEMORY"' '--memory-swap "$MEMORY"' \
+  '--pids-limit "$PIDS_LIMIT"' '--init' '--user "$HOST_UID:$HOST_GID"' \
+  '127.0.0.1:$HOST_PORT:$CONTAINER_PORT' \
+  'NEXUS_DB_PATH=/tmp/nexus-home/nexus.db' \
+  'NEXUS_GATEWAY_DB=file:/tmp/nexus-home/gateway.db' \
+  'NEXUS_STREAM_DB_PATH=/dev/shm/nexus-stream.db' \
+  'NEXUS_GATEWAY_BIN=/work/egregore-nexus/gateway/scripts/nexus-gateway.mjs' \
+  'add_mount_if_dir run_args "$HOME/.codex" /host-auth/.codex ro'; do
+  grep -Fq -- "$token" "$TARGET"
+done
+if grep -Eq '/work/(egregore-lens|egregore-v2|pactree)|/tmp/nexus-lab-bin|NEXUS_V015_RUN_ID' "$TARGET"; then
+  echo 'standalone helper retains private lab setup' >&2
+  exit 1
+fi
+
+# Docker discovery errors are not equivalent to an empty machine. In
+# particular, up may not create a validator after a failed ps.
+mkdir -p "$TMP/ps-error-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$1" in' \
+  '  ps) exit 55 ;;' \
+  '  *) touch "$DOCKER_FAKE_MUTATED"; exit 97 ;;' \
+  'esac' >"$TMP/ps-error-bin/docker"
+chmod +x "$TMP/ps-error-bin/docker"
+set +e
+env \
+  DOCKER_FAKE_LOG="$TMP/ps-error.log" \
+  DOCKER_FAKE_MUTATED="$TMP/ps-error-mutated" \
+  PATH="$TMP/ps-error-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" up >"$TMP/ps-error.out" 2>"$TMP/ps-error.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq "Docker container listing failed" "$TMP/ps-error.err"
+test ! -e "$TMP/ps-error-mutated"
+
+# Normal up/down/clean must preserve a Lens lab. Ownership is established by
+# an immutable ID plus both validator/lab labels; removal by mutable name is
+# forbidden.
+mkdir -p "$TMP/lens-preserve-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$*" in' \
+  '  ps*"name=^/nexus-v010-load51$"*) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;' \
+  '  ps*"status=exited"*) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;' \
+  '  *"{{.Id}}"*aaaaaaaa*) echo "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa true true true" ;;' \
+  '  "container inspect nexus-v010-load51") exit 0 ;;' \
+  '  *"egregore-nexus-real-harnesses"*) echo false ;;' \
+  '  *"egregore-nexus-test"*) echo true ;;' \
+  '  *"egregore-nexus-lens-lab"*) echo true ;;' \
+  '  rm*|"container rm"*) touch "$DOCKER_FAKE_REMOVED" ;;' \
+  '  *) exit 0 ;;' \
+  'esac' >"$TMP/lens-preserve-bin/docker"
+chmod +x "$TMP/lens-preserve-bin/docker"
+for command in up down clean; do
+  rm -f "$TMP/lens-preserve-removed"
+  set +e
+  DOCKER_FAKE_LOG="$TMP/lens-preserve.log" \
+    DOCKER_FAKE_REMOVED="$TMP/lens-preserve-removed" \
+    PATH="$TMP/lens-preserve-bin:$TMP/bin:/usr/bin:/bin" \
+    "$TARGET" "$command" >"$TMP/lens-preserve.out" 2>"$TMP/lens-preserve.err"
+  status=$?
+  set -e
+  test ! -e "$TMP/lens-preserve-removed"
+  if [ "$command" = up ]; then
+    test "$status" -ne 0
+    grep -Fq "preserving Lens lab" "$TMP/lens-preserve.err"
+  fi
+done
+
+# An ID swap between ownership validation and removal must fail closed. The
+# old and replacement IDs are both untouchable.
+mkdir -p "$TMP/id-swap-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'if [[ "$*" == ps*"name=^/nexus-v010-load51$"* ]]; then' \
+  '  count=$(cat "$DOCKER_FAKE_COUNT" 2>/dev/null || echo 0); count=$((count + 1)); echo "$count" >"$DOCKER_FAKE_COUNT"' \
+  '  if [ "$count" -eq 1 ]; then printf "%064d\n" 1; else printf "%064d\n" 2; fi' \
+  'elif [[ "$*" == *"{{.Id}}"* ]]; then' \
+  '  id=${@: -1}; echo "$id true true false"' \
+  'elif [[ "$1" == rm || "$*" == "container rm"* ]]; then' \
+  '  touch "$DOCKER_FAKE_REMOVED"' \
+  'else exit 97; fi' >"$TMP/id-swap-bin/docker"
+chmod +x "$TMP/id-swap-bin/docker"
+set +e
+DOCKER_FAKE_LOG="$TMP/id-swap.log" \
+  DOCKER_FAKE_COUNT="$TMP/id-swap-count" \
+  DOCKER_FAKE_REMOVED="$TMP/id-swap-removed" \
+  PATH="$TMP/id-swap-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" down >"$TMP/id-swap.out" 2>"$TMP/id-swap.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq "container ID changed" "$TMP/id-swap.err"
+test ! -e "$TMP/id-swap-removed"
+
+# A successful name lookup followed by an inspect failure is not absence and
+# cannot authorize removal.
+mkdir -p "$TMP/inspect-error-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$*" in' \
+  '  ps*"name=^/nexus-v010-load51$"*) printf "d%.0s" {1..64}; echo ;;' \
+  '  container\ inspect*) exit 56 ;;' \
+  '  rm*) touch "$DOCKER_FAKE_REMOVED" ;;' \
+  '  *) exit 97 ;;' \
+  'esac' >"$TMP/inspect-error-bin/docker"
+chmod +x "$TMP/inspect-error-bin/docker"
+set +e
+DOCKER_FAKE_LOG="$TMP/inspect-error.log" \
+  DOCKER_FAKE_REMOVED="$TMP/inspect-error-removed" \
+  PATH="$TMP/inspect-error-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" down >"$TMP/inspect-error.out" 2>"$TMP/inspect-error.err"
+status=$?
+set -e
+test "$status" -ne 0
+grep -Fq "Docker container inspect failed" "$TMP/inspect-error.err"
+test ! -e "$TMP/inspect-error-removed"
+
+
+# Successful removal is authorized by immutable ID, never by mutable name.
+mkdir -p "$TMP/normal-bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$*" in' \
+  '  ps*) printf "e%.0s" {1..64}; echo ;;' \
+  '  *"{{.Id}}"*) id=${@: -1}; echo "$id ${DOCKER_FAKE_RUNNING:-false} ${DOCKER_FAKE_OWNED:-true} false" ;;' \
+  '  *"{{range .Config.Env}}"*) exit 0 ;;' \
+  '  rm*|exec*|build*) exit 0 ;;' \
+  '  *) exit 97 ;;' \
+  'esac' >"$TMP/normal-bin/docker"
+chmod +x "$TMP/normal-bin/docker"
+id=$(printf 'e%.0s' {1..64})
+for command in down clean; do
+  DOCKER_FAKE_LOG="$TMP/normal-$command.log" \
+    PATH="$TMP/normal-bin:$TMP/bin:/usr/bin:/bin" \
+    "$TARGET" "$command" >"$TMP/normal-$command.out"
+  if [ "$command" = down ]; then
+    grep -Fxq "rm -f $id" "$TMP/normal-$command.log"
+  else
+    grep -Fxq "rm $id" "$TMP/normal-$command.log"
+  fi
+done
+for command in up down clean; do
+  if DOCKER_FAKE_OWNED=false DOCKER_FAKE_LOG="$TMP/foreign-$command.log" \
+    PATH="$TMP/normal-bin:$TMP/bin:/usr/bin:/bin" \
+    "$TARGET" "$command" >"$TMP/foreign.out" 2>"$TMP/foreign.err"; then
+    echo "foreign container unexpectedly accepted by $command" >&2
+    exit 1
+  fi
+  if grep -Eq '^(rm|run|start|exec) ' "$TMP/foreign-$command.log"; then
+    echo "foreign container mutated by $command" >&2
+    exit 1
+  fi
+done
+
+# All retained command entrypoints dispatch to the fake Docker executable.
+# No container-side command body is executed by this mock.
+for command in build status shell nexus smoke locks logs; do
+  DOCKER_FAKE_RUNNING=true DOCKER_FAKE_LOG="$TMP/dispatch-$command.log" \
+    PATH="$TMP/normal-bin:$TMP/bin:/usr/bin:/bin" \
+    "$TARGET" "$command" >"$TMP/dispatch-$command.out"
+  if [ "$command" = build ]; then
+    grep -Eq '^build -f .*/tools/docker/nexus-test.Dockerfile ' "$TMP/dispatch-$command.log"
+  else
+    grep -Eq "^exec .* $id |^exec $id " "$TMP/dispatch-$command.log"
+  fi
+done
+DOCKER_FAKE_RUNNING=true DOCKER_FAKE_LOG="$TMP/nexus-args.log" \
+  PATH="$TMP/normal-bin:$TMP/bin:/usr/bin:/bin" \
+  "$TARGET" nexus -- members --include-offline
+grep -Fq "$id /tmp/nexus-target/debug/nexus members --include-offline" "$TMP/nexus-args.log"
+
+# Exercise historical normal creation and read-only credential mounts without executing
+# any setup payload: the first mocked Docker exec deliberately stops the run.
+mkdir -p "$TMP/create-bin" "$TMP/home/.codex"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
+  'case "$1" in' \
+  '  ps) if [ -f "$DOCKER_FAKE_CREATED" ]; then printf "f%.0s" {1..64}; echo; fi ;;' \
+  '  image) echo available-fixture-image ;;' \
+  '  run) touch "$DOCKER_FAKE_CREATED"; printf "f%.0s" {1..64}; echo ;;' \
+  '  container) id=${@: -1}; echo "$id true true false" ;;' \
+  '  exec) exit 77 ;;' \
+  '  *) exit 97 ;;' \
+  'esac' >"$TMP/create-bin/docker"
+chmod +x "$TMP/create-bin/docker"
+for credential in unset; do
+  codex_home=""; expected="$TMP/home/.codex"
+  set +e
+  HOME="$TMP/home" CODEX_HOME="$codex_home" \
+    DOCKER_FAKE_LOG="$TMP/create-$credential.log" \
+    DOCKER_FAKE_CREATED="$TMP/created-$credential" \
+    PATH="$TMP/create-bin:$TMP/bin:/usr/bin:/bin" \
+    "$TARGET" up >"$TMP/create-$credential.out" 2>"$TMP/create-$credential.err"
+  status=$?
+  set -e
+  test "$status" -eq 77
+  grep -Fq -- "-v $expected:/host-auth/.codex:ro" "$TMP/create-$credential.log"
+  grep -Fq -- '--cpus 6 --memory 8g --memory-swap 8g --pids-limit 1024' "$TMP/create-$credential.log"
+  grep -Fq -- '-p 127.0.0.1:4551:4100' "$TMP/create-$credential.log"
+  if grep -Fq -- "-v $TMP/home/.nexus:" "$TMP/create-$credential.log"; then
+    echo 'normal up mounts live Nexus state' >&2
+    exit 1
+  fi
+done
+
+bash -n "$TARGET"
+grep -Fq "xvfb" "$SCRIPT_DIR/../tools/docker/nexus-test.Dockerfile"
+grep -Fq "python3-venv" "$SCRIPT_DIR/../tools/docker/nexus-test.Dockerfile"
+echo 'standalone Docker test environment contract: ok'

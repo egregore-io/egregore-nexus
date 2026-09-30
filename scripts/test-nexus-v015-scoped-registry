@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REGISTRY="$SCRIPT_DIR/nexus-v015-scoped-registry"
+TMP=$(mktemp -d)
+registry_pid=""
+cleanup() {
+  if [ -n "$registry_pid" ]; then
+    kill "$registry_pid" 2>/dev/null || true
+    wait "$registry_pid" 2>/dev/null || true
+  fi
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+python3 - "$TMP" <<'PY'
+import io
+import json
+import pathlib
+import sys
+import tarfile
+
+root = pathlib.Path(sys.argv[1])
+packages = {
+    "nexus-cli": {
+        "name": "@egregore/nexus-cli",
+        "version": "0.1.5",
+    },
+    "nexus-gateway": {
+        "name": "@egregore/nexus-gateway",
+        "version": "0.1.5",
+    },
+    "nexus": {
+        "name": "@egregore/nexus",
+        "version": "0.1.5",
+        "dependencies": {
+            "@egregore/nexus-cli": "0.1.5",
+            "@egregore/nexus-gateway": "0.1.5",
+        },
+        "bin": {
+            "nexus": "bin/nexus.mjs",
+            "nexus-gateway": "bin/nexus-gateway.mjs",
+            "nexus-webui": "bin/nexus-webui.mjs",
+        },
+    },
+}
+
+for route, document in packages.items():
+    with tarfile.open(root / f"{route}.tgz", "w:gz") as archive:
+        payload = json.dumps(document, separators=(",", ":")).encode()
+        info = tarfile.TarInfo("package/package.json")
+        info.size = len(payload)
+        info.mode = 0o644
+        archive.addfile(info, io.BytesIO(payload))
+        for launcher in document.get("bin", {}).values():
+            script = b"#!/usr/bin/env node\nconsole.log('fixture')\n"
+            info = tarfile.TarInfo(f"package/{launcher}")
+            info.size = len(script)
+            info.mode = 0o755
+            archive.addfile(info, io.BytesIO(script))
+PY
+
+"$REGISTRY" \
+  --ready-file "$TMP/registry.url" \
+  --npmrc "$TMP/npmrc" \
+  --package "@egregore/nexus-cli=$TMP/nexus-cli.tgz" \
+  --package "@egregore/nexus-gateway=$TMP/nexus-gateway.tgz" \
+  --package "@egregore/nexus=$TMP/nexus.tgz" \
+  >"$TMP/registry.log" 2>&1 &
+registry_pid=$!
+
+deadline=$((SECONDS + 10))
+while [ ! -s "$TMP/registry.url" ] || [ ! -s "$TMP/npmrc" ]; do
+  kill -0 "$registry_pid" 2>/dev/null || { cat "$TMP/registry.log" >&2; exit 1; }
+  [ "$SECONDS" -lt "$deadline" ] || { echo 'scoped registry did not become ready' >&2; exit 1; }
+  sleep 0.05
+done
+
+registry_url=$(cat "$TMP/registry.url")
+test "$(wc -l <"$TMP/npmrc")" -eq 2
+sed -n '1p' "$TMP/npmrc" | grep -Fx "@egregore:registry=$registry_url"
+sed -n '2p' "$TMP/npmrc" | grep -Fx 'registry=https://registry.npmjs.org/'
+
+python3 - "$registry_url" <<'PY'
+import json
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+base = sys.argv[1]
+for name in ("@egregore/nexus-cli", "@egregore/nexus-gateway", "@egregore/nexus"):
+    route = urllib.parse.quote(name, safe="@")
+    with urllib.request.urlopen(f"{base}/{route}") as response:
+        document = json.load(response)
+    assert document["name"] == name
+    assert document["dist-tags"] == {"latest": "0.1.5"}
+    assert set(document["versions"]) == {"0.1.5"}
+try:
+    urllib.request.urlopen(f"{base}/@egregore%2Funknown")
+except urllib.error.HTTPError as error:
+    assert error.code == 404
+else:
+    raise AssertionError("unknown scoped package unexpectedly resolved")
+PY
+
+install_root=$(mktemp -d "$TMP/nexus-lab-install.XXXXXX")
+foreign_cwd=$(mktemp -d "$TMP/foreign-cwd.XXXXXX")
+(
+  cd "$foreign_cwd"
+  NPM_CONFIG_USERCONFIG="$TMP/npmrc" \
+    npm install --global --prefix "$install_root" --ignore-scripts --no-audit --no-fund \
+    '@egregore/nexus@0.1.5' >/dev/null
+)
+
+test "$(find "$install_root/lib/node_modules" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')" = @egregore
+test "$(find "$install_root/lib/node_modules/@egregore" -mindepth 1 -maxdepth 1 -type d -printf '%f\n')" = nexus
+umbrella="$install_root/lib/node_modules/@egregore/nexus"
+test -f "$umbrella/node_modules/@egregore/nexus-cli/package.json"
+test -f "$umbrella/node_modules/@egregore/nexus-gateway/package.json"
+for command in nexus nexus-gateway nexus-webui; do
+  test -L "$install_root/bin/$command"
+  resolved=$(readlink -f "$install_root/bin/$command")
+  case "$resolved" in
+    "$umbrella"/*) ;;
+    *) echo "$command resolved outside the umbrella package: $resolved" >&2; exit 1 ;;
+  esac
+done
+
+printf 'v0.1.5 scoped registry/umbrella install contract: ok\n'

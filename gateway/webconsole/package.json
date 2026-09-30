@@ -1,6 +1,6 @@
 {
   "name": "@egregore/nexus-webui-workspace",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "private": true,
   "type": "module",
   "license": "Apache-2.0",
@@ -27,7 +27,7 @@
   "scripts": {
     "dev": "vite --config vite.config.ts",
     "preview": "vite preview --config vite.config.ts",
-    "build": "node build-webconsole.mjs",
+    "build": "node ../../scripts/nexus-version check && node build-webconsole.mjs",
     "test": "cd .. && pnpm exec vitest run src/app src/modules src/routes --exclude 'src/routes/api/**'",
     "typecheck": "cd .. && pnpm exec tsc --noEmit"
   }

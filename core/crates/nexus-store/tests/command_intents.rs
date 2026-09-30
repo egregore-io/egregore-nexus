@@ -77,6 +77,33 @@ async fn insert_session_with_agent_id(store: &Store, session_id: &str, name: &st
         .unwrap();
 }
 
+async fn insert_durable_agent_with_active_runtime(
+    store: &Store,
+    agent_id: &str,
+    name: &str,
+    active_session_id: &str,
+) {
+    store
+        .identity_conn()
+        .execute(
+            "INSERT INTO agents (agent_id, project, name, tier, created_at) \
+             VALUES (?1, 'identity-metadata', ?2, 'agent', 1)",
+            libsql::params![agent_id, name],
+        )
+        .await
+        .unwrap();
+    store
+        .identity_conn()
+        .execute(
+            "INSERT INTO agent_runtimes \
+             (runtime_id, agent_id, harness, transport, presence, active, started_at) \
+             VALUES (?1, ?2, 'codex', 'codex-appserver', 'online', 1, 1)",
+            libsql::params![active_session_id, agent_id],
+        )
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn insert_and_claim_oldest_pending_command() {
     let store = migrated().await;
@@ -140,6 +167,8 @@ fn command_kind_constants_are_the_published_ingress_contract() {
     assert_eq!(command_kinds::identity::ATTACH, "identity.attach");
     assert_eq!(command_kinds::harness::PROMPT, "harness.prompt");
     assert_eq!(command_kinds::harness::STEER, "harness.steer");
+    assert_eq!(command_kinds::harness::INTERRUPT, "harness.interrupt");
+    assert_eq!(command_kinds::harness::COMPACT, "harness.compact");
     assert_eq!(command_kinds::harness::WARM, "harness.warm");
     assert_eq!(command_kinds::thread::CREATE, "thread.create");
     assert_eq!(command_kinds::thread::JOIN, "thread.join");
@@ -650,6 +679,47 @@ async fn fresh_client_key_inbox_consume_without_session_id_is_not_expired() {
 }
 
 #[tokio::test]
+async fn fresh_client_key_in_another_project_is_not_expired() {
+    let store = migrated().await;
+    store
+        .conn
+        .execute(
+            "INSERT INTO sessions (session_id, name, kind, tier, project, presence, paused, \
+             client_key, last_heartbeat, created_at) VALUES ('s_cross_project_keyed', \
+             'cross-project-keyed', 'agent', 'agent', 'actual-project', 'online', 0, \
+             'ck_cross_project', 240, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    let repo = CommandIntents::new(&store);
+    let mut intent = pending_kind(
+        "cmd_cross_project_keyed_consume",
+        command_kinds::inbox::CONSUME,
+        None,
+        1,
+    );
+    intent.project = "stale-project-metadata".into();
+    intent.caller_client_key = Some("ck_cross_project".into());
+    repo.insert_pending(intent).await.unwrap();
+    repo.claim_next_kind(245, 10, command_kinds::inbox::CONSUME)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let expired = repo.expire_stale_inbox_consumes(250, 50).await.unwrap();
+    assert_eq!(expired, 0);
+    assert_eq!(
+        repo.get("cmd_cross_project_keyed_consume")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "claimed"
+    );
+}
+
+#[tokio::test]
 async fn fresh_heartbeat_inbox_consume_claims_are_not_expired() {
     let store = migrated().await;
     store
@@ -801,4 +871,104 @@ async fn harness_prompt_session_actor_matches_agent_id_targets() {
     assert_eq!(claimed.command_id, "cmd_ada");
     let blake = repo.get("cmd_blake").await.unwrap().unwrap();
     assert_eq!(blake.status, "pending");
+}
+
+#[tokio::test]
+async fn harness_prompt_agent_id_targets_the_active_runtime_not_a_newer_stale_session() {
+    let store = migrated().await;
+    insert_session_with_agent_id(&store, "s_ada_active", "ada", "a_ada").await;
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET project = 'runtime-metadata', created_at = 1 \
+             WHERE session_id = 's_ada_active'",
+            (),
+        )
+        .await
+        .unwrap();
+    insert_session_with_agent_id(&store, "s_ada_stale", "stale-ada", "a_ada").await;
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET project = 'other-metadata', created_at = 2 \
+             WHERE session_id = 's_ada_stale'",
+            (),
+        )
+        .await
+        .unwrap();
+    insert_durable_agent_with_active_runtime(&store, "a_ada", "current-ada", "s_ada_active").await;
+    let repo = CommandIntents::new(&store);
+    let mut prompt = prompt_pending("cmd_active_ada", "stale-name", 1);
+    prompt.project = "caller-metadata".into();
+    prompt.request_json =
+        r#"{"agentId":"a_ada","name":"stale-name","text":"hello","clientMessageId":null}"#.into();
+    repo.insert_pending(prompt).await.unwrap();
+
+    assert!(repo
+        .claim_next_ready_harness_prompt_for_session(100, 5_000, "s_ada_stale")
+        .await
+        .unwrap()
+        .is_none());
+    let claimed = repo
+        .claim_next_ready_harness_prompt_for_session(100, 5_000, "s_ada_active")
+        .await
+        .unwrap()
+        .expect("the active runtime owns the stable-id lane");
+    assert_eq!(claimed.command_id, "cmd_active_ada");
+}
+
+#[tokio::test]
+async fn harness_prompt_name_target_is_global_and_project_is_only_caller_metadata() {
+    let store = migrated().await;
+    insert_session(&store, "s_global_ada", "global-ada").await;
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET project = 'runtime-metadata' WHERE session_id = 's_global_ada'",
+            (),
+        )
+        .await
+        .unwrap();
+    let repo = CommandIntents::new(&store);
+    let mut prompt = prompt_pending("cmd_global_ada", "global-ada", 1);
+    prompt.project = "caller-metadata".into();
+    repo.insert_pending(prompt).await.unwrap();
+
+    let claimed = repo
+        .claim_next_ready_harness_prompt_for_session(100, 5_000, "s_global_ada")
+        .await
+        .unwrap()
+        .expect("globally unique names route across project metadata");
+    assert_eq!(claimed.command_id, "cmd_global_ada");
+}
+
+#[tokio::test]
+async fn harness_prompt_name_target_rejects_global_ambiguity() {
+    let store = migrated().await;
+    store
+        .conn
+        .execute("DROP INDEX idx_sessions_name", ())
+        .await
+        .unwrap();
+    insert_session(&store, "s_ada_one", "ambiguous-ada").await;
+    insert_session(&store, "s_ada_two", "ambiguous-ada").await;
+    store
+        .conn
+        .execute(
+            "UPDATE sessions SET project = CASE session_id \
+             WHEN 's_ada_one' THEN 'one' ELSE 'two' END",
+            (),
+        )
+        .await
+        .unwrap();
+    let repo = CommandIntents::new(&store);
+    repo.insert_pending(prompt_pending("cmd_ambiguous_ada", "ambiguous-ada", 1))
+        .await
+        .unwrap();
+
+    let error = repo
+        .claim_next_ready_harness_prompt(100, 5_000, &[])
+        .await
+        .expect_err("ambiguous global names must fail closed");
+    assert!(error.to_string().contains("ambiguous"));
 }

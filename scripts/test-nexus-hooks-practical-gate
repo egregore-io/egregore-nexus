@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Contract tests for the one-command Gateway message-hook practical gate."""
+
+from __future__ import annotations
+
+import json
+import os
+import runpy
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = ROOT / "scripts" / "nexus-hooks-practical-gate"
+BEFORE_SEND = ROOT / "core" / "tests" / "fixtures" / "hooks" / "before-send.py"
+AFTER_RECEIPT = ROOT / "core" / "tests" / "fixtures" / "hooks" / "after-receipt.mjs"
+CHECK = ROOT / "scripts" / "check"
+
+
+class HooksPracticalGateContractTests(unittest.TestCase):
+    def test_help_is_side_effect_free_and_describes_the_live_boundary(self) -> None:
+        result = subprocess.run(
+            [str(SCRIPT), "--help"],
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        help_text = result.stdout.lower()
+        self.assertIn("single existing clamped docker validator", help_text)
+        self.assertIn("canonical message sources", help_text)
+        self.assertIn("gateway outage", help_text)
+        self.assertIn("restart recovery", help_text)
+        self.assertIn("token stream", help_text)
+        self.assertNotIn("--packed-v015", help_text)
+        self.assertNotIn("--evidence-dir", help_text)
+
+    def test_private_evidence_options_are_rejected_before_runtime(self) -> None:
+        namespace = runpy.run_path(str(SCRIPT))
+        for arguments in (["--packed-v015"], ["--evidence-dir", "/tmp"], ["--run-id", "example"]):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(SystemExit) as error:
+                    namespace["parse_args"](arguments)
+                self.assertIn("unknown argument", str(error.exception))
+
+    def test_scenario_inventory_covers_every_required_source_and_failure_mode(self) -> None:
+        listed = subprocess.run(
+            [str(SCRIPT), "--list"],
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.splitlines()
+        self.assertEqual(
+            set(listed),
+            {
+                "direct-daemon-rpc",
+                "cli-command-intent",
+                "gateway-rest",
+                "network-mcp",
+                "notification",
+                "agent-origin",
+                "timing-interrupt",
+                "timing-yield-turn",
+                "timing-after-tool-loop",
+                "idempotent-retry",
+                "gateway-optional-outage",
+                "gateway-required-outage",
+                "gateway-restart-recovery",
+                "after-receipt-signature",
+                "token-stream-isolation",
+            },
+        )
+
+    def test_gate_enforces_single_clamped_disposable_runtime(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        for marker in (
+            "expected exactly one Nexus validation container",
+            "nano_cpus <= 2000000000",
+            "memory <= 10737418240",
+            "pids_limit <= 1024",
+            "NEXUS_HOME=/tmp/nexus-hooks-gate",
+            "CARGO_BUILD_JOBS=2",
+        ):
+            self.assertIn(marker, source)
+        self.assertNotIn("docker run", source)
+
+    def test_gateway_uses_the_public_local_auth_mode(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('"NEXUS_WEB_AUTH_MODE": "local"', source)
+        self.assertNotIn('"NEXUS_WEB_AUTH_MODE": "local-operator"', source)
+
+    def test_agent_origin_fixture_is_an_explicit_thread_member(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertRegex(
+            source,
+            r'"--member",\s*"hook-recipient",\s*"--member",\s*"hook-agent"',
+        )
+
+    def test_transport_verification_reads_the_live_daemon_store_through_ipc(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('"local.store.export"', source)
+        self.assertIn('daemon_export("delivery_outcomes")', source)
+        self.assertIn('daemon_export("messages")', source)
+        self.assertNotIn("SELECT DISTINCT delivery_timing FROM in_flight", source)
+        self.assertNotIn("SELECT COUNT(*) FROM messages", source)
+
+    def test_idempotent_retry_does_not_execute_hooks_twice(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("if (evaluations, executions) != (2, 6):", source)
+
+    def test_host_wrapper_converts_child_failures_to_one_gate_error(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertRegex(
+            source,
+            r'inside = command\([\s\S]*?capture=False,\s*check=False,\s*\)',
+        )
+
+    def test_repository_check_dispatches_the_named_gate(self) -> None:
+        source = CHECK.read_text(encoding="utf-8")
+        self.assertIn("hooks-practical", source)
+        self.assertIn("scripts/nexus-hooks-practical-gate", source)
+
+    def test_before_send_fixture_transforms_body_metadata_and_timing(self) -> None:
+        payload = {
+            "protocol": "nexus.hooks/v1",
+            "invocationId": "hi_fixture",
+            "event": "before_send",
+            "message": {
+                "sender": {"name": "fixture"},
+                "target": {"verb": "post", "thread": "hooks-gate"},
+                "body": "hello",
+                "mention": [],
+                "metadata": {
+                    "gateSource": "gateway-rest",
+                    "gateTiming": "yield_turn",
+                },
+            },
+        }
+        result = subprocess.run(
+            ["python3", str(BEFORE_SEND)],
+            input=json.dumps(payload),
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "action": "continue",
+                "message": {"body": "[hook:gateway-rest] hello"},
+                "metadata": {
+                    "hookGate": {
+                        "beforeSend": True,
+                        "source": "gateway-rest",
+                    }
+                },
+                "timing": "yield_turn",
+            },
+        )
+
+    def test_after_receipt_fixture_adds_only_metadata(self) -> None:
+        payload = {
+            "protocol": "nexus.hooks/v1",
+            "invocationId": "hi_receipt_fixture",
+            "event": "after_receipt",
+            "message": {
+                "sender": {"name": "fixture"},
+                "target": {"verb": "post", "thread": "hooks-gate"},
+                "body": "hello",
+                "mention": [],
+                "metadata": {},
+            },
+            "receipt": {"messageId": "m_fixture"},
+        }
+        result = subprocess.run(
+            ["node", str(AFTER_RECEIPT)],
+            input=json.dumps(payload),
+            check=True,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "metadata": {
+                    "hookGate": {
+                        "afterReceipt": True,
+                        "receiptMessageId": "m_fixture",
+                    }
+                }
+            },
+        )
+
+    def test_embedded_shell_javascript_and_python_handlers_cover_both_events(self) -> None:
+        namespace = runpy.run_path(str(SCRIPT))
+        assets = namespace["hook_programs"]()
+        invocation = {
+            "protocol": "nexus.hooks/v1",
+            "invocationId": "hi_f2_contract",
+            "event": "before_send",
+            "message": {
+                "sender": {"name": "fixture"},
+                "target": {"verb": "post", "thread": "hooks-gate"},
+                "body": "GATE[gateway-rest|yield_turn] hello",
+                "mention": [],
+                "metadata": {},
+            },
+        }
+        receipt = {
+            **invocation,
+            "event": "after_receipt",
+            "receipt": {"messageId": "m_f2_contract"},
+        }
+        commands = {
+            "shell": ["sh", "hook-shell.sh"],
+            "javascript": ["node", "hook-javascript.mjs"],
+            "python": ["python3", "hook-python.py"],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, contents in assets.items():
+                (root / name).write_text(contents, encoding="utf-8")
+            for language, command in commands.items():
+                before = subprocess.run(
+                    [command[0], str(root / command[1])],
+                    input=json.dumps(invocation),
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                after = subprocess.run(
+                    [command[0], str(root / command[1])],
+                    input=json.dumps(receipt),
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                before_metadata = json.loads(before.stdout)["metadata"]
+                after_metadata = json.loads(after.stdout)["metadata"]
+                self.assertIs(before_metadata[f"f2{language.title()}"]["beforeSend"], True)
+                self.assertIs(after_metadata[f"f2{language.title()}"]["afterReceipt"], True)
+
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

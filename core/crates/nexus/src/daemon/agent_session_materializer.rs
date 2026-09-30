@@ -597,6 +597,7 @@ fn push_user_input_block(content: &mut MaterializedContent, data: &Value, text: 
 fn copy_user_input_metadata(block: &mut Value, data: &Value) {
     copy_string_field(block, data, "source", "source");
     copy_string_field(block, data, "name", "name");
+    copy_string_field(block, data, "kind", "kind");
     copy_string_field(block, data, "harness", "harness");
     if !copy_string_field(block, data, "runtimeId", "runtimeId") {
         copy_string_field(block, data, "runtime_id", "runtimeId");

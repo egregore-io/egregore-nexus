@@ -54,6 +54,10 @@ impl Harness for CodexHarness {
             .expect("Codex has a native headed executable")
     }
 
+    fn agent_token(&self) -> &'static str {
+        "codex"
+    }
+
     fn headed_runtime_kind(&self) -> HeadedRuntimeKind {
         HeadedRuntimeKind::CodexAppServer
     }

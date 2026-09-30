@@ -24,9 +24,11 @@ import {
   listRoutingRules,
   listNotifications,
   listProjects,
+  agentShow,
   agentOwnerByName,
   whoamiRow,
 } from "@server/read/queries";
+import { entityMetadata } from "@server/read/metadata";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -104,6 +106,85 @@ describe("read-view queries (seeded in-memory libSQL)", () => {
     expect(owner?.ownerName).toBe("erin");
     expect(owner?.ownerProject).toBe("nexus");
     expect(owner?.ownerSessionId).toBe("s_erin");
+  });
+
+  it("legacy agent reads prefer an exact id and reject duplicate global names", async () => {
+    const localDb = await seedDb();
+    await localDb.$client.batch([
+      "DROP INDEX idx_agents_name_unique",
+      `INSERT INTO agents
+        (agent_id, project, name, tier, created_at) VALUES
+        ('a_collision','ops','id-owner','agent',10),
+        ('a_alias_owner','default','a_collision','agent',11),
+        ('a_duplicate_one','default','duplicate','agent',12),
+        ('a_duplicate_two','ops','duplicate','agent',13)`,
+    ], "write");
+
+    await expect(agentShow(localDb, "a_collision", { project: "default" }))
+      .resolves.toMatchObject({ agent: { agentId: "a_collision", name: "id-owner" } });
+    await expect(agentOwnerByName(localDb, "a_collision"))
+      .resolves.toMatchObject({ agentId: "a_collision", name: "id-owner" });
+    await expect(agentShow(localDb, "duplicate"))
+      .rejects.toThrow("ambiguous agent name");
+    await expect(agentOwnerByName(localDb, "duplicate"))
+      .rejects.toThrow("ambiguous agent name");
+  });
+
+  it("legacy agent owner resolution does not confuse multiple runtimes with duplicate identities", async () => {
+    const localDb = await seedDb();
+    await localDb.$client.batch([
+      "DROP INDEX idx_sessions_name",
+      `INSERT INTO sessions
+        (session_id, name, agent, kind, tier, project, presence, created_at, agent_id) VALUES
+        ('s_ben_replacement','ben','claude','agent','agent','nexus','online',20,'a_ben')`,
+    ], "write");
+
+    await expect(agentOwnerByName(localDb, "ben"))
+      .resolves.toMatchObject({ agentId: "a_ben", name: "ben" });
+  });
+
+  it("legacy agent owner session fallback is global and rejects ambiguous display aliases", async () => {
+    const localDb = await seedDb();
+    await localDb.$client.batch([
+      "DROP INDEX idx_sessions_name",
+      `INSERT INTO agents
+        (agent_id, project, name, tier, created_at) VALUES
+        ('a_global_session','default','global-session','agent',30),
+        ('a_ambiguous_session','default','ambiguous-session','agent',31)`,
+      `INSERT INTO sessions
+        (session_id, name, kind, role, tier, project, presence, created_at, agent_id) VALUES
+        ('s_global_session','global-session','agent','reviewer','admin','ops','offline',30,NULL),
+        ('s_ambiguous_session_default','ambiguous-session','agent','reviewer','agent','default','offline',31,NULL),
+        ('s_ambiguous_session_ops','ambiguous-session','agent','operator','admin','ops','offline',32,NULL)`,
+    ], "write");
+
+    await expect(agentOwnerByName(localDb, "a_global_session"))
+      .resolves.toMatchObject({
+        agentId: "a_global_session",
+        sessionKind: "agent",
+        sessionRole: "reviewer",
+        sessionTier: "admin",
+      });
+    await expect(agentOwnerByName(localDb, "a_ambiguous_session"))
+      .rejects.toThrow("ambiguous session name");
+  });
+
+  it("legacy agent metadata prefers exact ids and rejects duplicate names across projects", async () => {
+    const localDb = await seedDb();
+    await localDb.$client.batch([
+      "DROP INDEX idx_agents_name_unique",
+      `INSERT INTO agents
+        (agent_id, project, name, tier, metadata_json, created_at) VALUES
+        ('a_metadata_alias','default','a_metadata_exact','agent','{"marker":"alias"}',10),
+        ('a_metadata_exact','ops','id-owner','agent','{"marker":"id"}',11),
+        ('a_metadata_dup_one','default','metadata-duplicate','agent','{}',12),
+        ('a_metadata_dup_two','ops','metadata-duplicate','agent','{}',13)`,
+    ], "write");
+
+    await expect(entityMetadata(localDb, "agent", "a_metadata_exact", "default"))
+      .resolves.toMatchObject({ metadata: { marker: "id" } });
+    await expect(entityMetadata(localDb, "agent", "metadata-duplicate"))
+      .rejects.toThrow("ambiguous agent name");
   });
 
   it("listMembers treats stale heartbeats as offline", async () => {
@@ -532,6 +613,20 @@ describe("read-view queries (seeded in-memory libSQL)", () => {
     });
     expect(me).toBeDefined();
     expect(me!.presence).toBe("offline");
+  });
+
+  it("whoamiRow rejects an ambiguous global display alias", async () => {
+    const localDb = await seedDb();
+    await localDb.$client.batch([
+      "DROP INDEX idx_sessions_name",
+      `INSERT INTO sessions
+        (session_id, name, kind, tier, project, presence, created_at) VALUES
+        ('s_whoami_default','ambiguous-human','human','admin','default','online',40),
+        ('s_whoami_ops','ambiguous-human','human','admin','ops','online',41)`,
+    ], "write");
+
+    await expect(whoamiRow(localDb, "ambiguous-human"))
+      .rejects.toThrow("ambiguous session name");
   });
 });
 

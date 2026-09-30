@@ -10,8 +10,8 @@ use nexus_contracts::{
 };
 use nexus_harness_claude::storage::{ClaudeRuntimeLaunch, ClaudeRuntimeStateRepo};
 use nexus_store::repos::{
-    AgentRuntimes, NativeThreadBindings, NewAgentRuntime, NewNativeThreadBinding, NewSession,
-    Sessions,
+    AgentRuntimes, Agents, NativeThreadBindings, NewAgent, NewAgentRuntime, NewNativeThreadBinding,
+    NewSession, Sessions,
 };
 use nexus_store::Store;
 use std::path::PathBuf;
@@ -110,6 +110,7 @@ async fn read_client_renders_identity_roster_threads_topics_and_recall_from_stor
                 summary: None,
                 body: "store backed recall works".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -128,6 +129,7 @@ async fn read_client_renders_identity_roster_threads_topics_and_recall_from_stor
     assert_eq!(read.whoami().await.unwrap().name.as_deref(), Some("ben"));
     assert!(read
         .members(MemberListRequest {
+            project: None,
             include_offline: Some(true),
             include_dead: None,
         })
@@ -180,6 +182,127 @@ async fn read_client_renders_identity_roster_threads_topics_and_recall_from_stor
 }
 
 #[tokio::test]
+async fn read_client_members_uses_an_explicit_project_metadata_filter() {
+    let state = state().await;
+    let registered = state
+        .identity
+        .register(RegisterRequest {
+            project: "v015-lab".into(),
+            ..agent("v015-codex", "ck_v015", hid("codex"), "/work/v015")
+        })
+        .await
+        .unwrap();
+    let read = ReadClient::from_store_with_caller_for_tests(
+        state.store.clone(),
+        "operator",
+        "default",
+        Some("local-operator".into()),
+        None,
+        Tier::Admin,
+    );
+    let request: MemberListRequest = serde_json::from_value(serde_json::json!({
+        "project": "v015-lab",
+        "includeOffline": true,
+    }))
+    .unwrap();
+
+    let members = read.members(request).await.unwrap();
+
+    assert_eq!(members.members.len(), 1);
+    assert_eq!(members.members[0].agent_id, registered.agent_id);
+    assert_eq!(members.members[0].name.as_deref(), Some("v015-codex"));
+}
+
+#[tokio::test]
+async fn read_client_members_without_a_filter_returns_the_global_directory() {
+    let state = state().await;
+    let registered = state
+        .identity
+        .register(RegisterRequest {
+            project: "v015-lab".into(),
+            ..agent("v015-codex", "ck_v015", hid("codex"), "/work/v015")
+        })
+        .await
+        .unwrap();
+    let read = ReadClient::from_store_with_caller_for_tests(
+        state.store.clone(),
+        "operator",
+        "default",
+        Some("local-operator".into()),
+        None,
+        Tier::Admin,
+    );
+
+    let members = read
+        .members(MemberListRequest {
+            project: None,
+            include_offline: Some(true),
+            include_dead: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(members.members.len(), 1);
+    assert_eq!(members.members[0].agent_id, registered.agent_id);
+}
+
+#[tokio::test]
+async fn read_client_members_prefers_the_session_agent_id_over_a_reused_stale_name() {
+    let state = state().await;
+    let registered = state
+        .identity
+        .register(agent(
+            "stale-name",
+            "ck_stable",
+            hid("codex"),
+            "/work/stable",
+        ))
+        .await
+        .unwrap();
+    let stable_agent_id = registered.agent_id.clone().unwrap();
+    Agents::new(&state.store)
+        .rename(&stable_agent_id.0, "current-name")
+        .await
+        .unwrap();
+    Agents::new(&state.store)
+        .create(NewAgent {
+            agent_id: "a_reused_name_owner".into(),
+            project: "other".into(),
+            name: Some("stale-name".into()),
+            default_harness: Some("claude".into()),
+            role: None,
+            tier: Some("agent".into()),
+            owner: None,
+        })
+        .await
+        .unwrap();
+    let read = ReadClient::from_store_with_caller_for_tests(
+        state.store.clone(),
+        "operator",
+        "default",
+        Some("local-operator".into()),
+        None,
+        Tier::Admin,
+    );
+
+    let members = read
+        .members(MemberListRequest {
+            project: None,
+            include_offline: Some(true),
+            include_dead: None,
+        })
+        .await
+        .unwrap();
+    let member = members
+        .members
+        .iter()
+        .find(|member| member.session_id == registered.session_id)
+        .expect("stable session remains in the directory");
+
+    assert_eq!(member.agent_id, Some(stable_agent_id));
+}
+
+#[tokio::test]
 async fn read_client_fetches_full_message_body_by_id() {
     let state = state().await;
     let ben = state
@@ -202,6 +325,7 @@ async fn read_client_fetches_full_message_body_by_id() {
                 summary: Some("long".into()),
                 body: "this is the full message body that the drain view may truncate".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -241,6 +365,304 @@ async fn read_client_preserves_local_operator_whoami_without_session_row() {
     assert_eq!(who.name.as_deref(), Some("operator"));
     assert_eq!(who.session_id.0, "local-operator");
     assert_eq!(who.tier, Tier::Admin);
+}
+
+#[tokio::test]
+async fn read_client_whoami_and_caller_prefer_the_session_agent_id_over_a_reused_name() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    let agents = Agents::new(&store);
+    for (agent_id, name) in [("a_correct", "current-name"), ("a_wrong", "reused-name")] {
+        agents
+            .create(NewAgent {
+                agent_id: agent_id.into(),
+                project: "default".into(),
+                name: Some(name.into()),
+                default_harness: Some("codex".into()),
+                role: None,
+                tier: Some("agent".into()),
+                owner: None,
+            })
+            .await
+            .unwrap();
+    }
+    let sessions = Sessions::new(&store);
+    let authenticated_session = nexus_contracts::SessionId("s_authenticated".into());
+    sessions
+        .create(NewSession {
+            session_id: authenticated_session.clone(),
+            name: Some("reused-name".into()),
+            agent: Some("codex".into()),
+            kind: "agent".into(),
+            role: None,
+            tier: "agent".into(),
+            harness_session_id: None,
+            client_key: Some("ck_authenticated".into()),
+            cwd: None,
+            project: "drifted-metadata".into(),
+            transport: Some("codex-appserver".into()),
+        })
+        .await
+        .unwrap();
+    sessions
+        .set_agent_id(&authenticated_session, "a_correct")
+        .await
+        .unwrap();
+    for (runtime_id, agent_id) in [("rt_correct", "a_correct"), ("rt_wrong", "a_wrong")] {
+        AgentRuntimes::new(&store)
+            .create(NewAgentRuntime {
+                runtime_id: runtime_id.into(),
+                agent_id: agent_id.into(),
+                harness: "codex".into(),
+                cwd: None,
+                transport: Some("codex-appserver".into()),
+                presence: Some("online".into()),
+                active: true,
+            })
+            .await
+            .unwrap();
+    }
+    store
+        .conn
+        .execute(
+            "INSERT INTO subscriptions (topic, subscriber_session, cursor, subscribed_at) \
+             VALUES ('stable-caller', 'rt_correct', 0, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO messages (message_id, from_name, kind, topic, body, project, created_at) \
+             VALUES ('m_stable_caller', 'sender', 'topic', 'stable-caller', \
+                     'stable caller reached its subscription', 'drifted-metadata', 1)",
+            (),
+        )
+        .await
+        .unwrap();
+
+    let read = ReadClient::from_store_with_caller_for_tests(
+        store,
+        "reused-name",
+        "stale-caller-project",
+        Some(authenticated_session.0.clone()),
+        Some("ck_authenticated".into()),
+        Tier::Agent,
+    );
+
+    let who = read.whoami().await.unwrap();
+    assert_eq!(
+        who.agent_id,
+        Some(nexus_contracts::AgentId("a_correct".into()))
+    );
+    let history = read
+        .history(nexus_contracts::HistoryRequest {
+            thread: None,
+            with: None,
+            topic: Some("stable-caller".into()),
+            limit: Some(10),
+            before: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        history.entries.len(),
+        1,
+        "caller reconstruction must use rt_correct"
+    );
+    assert_eq!(
+        history.entries[0].body,
+        "stable caller reached its subscription"
+    );
+}
+
+#[tokio::test]
+async fn read_client_rejects_an_ambiguous_fossil_name_for_whoami_and_caller() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    store
+        .identity_conn()
+        .execute("DROP INDEX idx_agents_name_unique", ())
+        .await
+        .unwrap();
+    for (agent_id, project) in [("a_fossil_one", "one"), ("a_fossil_two", "two")] {
+        Agents::new(&store)
+            .create(NewAgent {
+                agent_id: agent_id.into(),
+                project: project.into(),
+                name: Some("fossil".into()),
+                default_harness: Some("codex".into()),
+                role: None,
+                tier: Some("agent".into()),
+                owner: None,
+            })
+            .await
+            .unwrap();
+    }
+    Sessions::new(&store)
+        .create(NewSession {
+            session_id: nexus_contracts::SessionId("s_fossil".into()),
+            name: Some("fossil".into()),
+            agent: Some("codex".into()),
+            kind: "agent".into(),
+            role: None,
+            tier: "agent".into(),
+            harness_session_id: None,
+            client_key: Some("ck_fossil".into()),
+            cwd: None,
+            project: "transport-metadata".into(),
+            transport: Some("codex-appserver".into()),
+        })
+        .await
+        .unwrap();
+    let read = ReadClient::from_store_with_caller_for_tests(
+        store,
+        "fossil",
+        "different-caller-metadata",
+        Some("s_fossil".into()),
+        Some("ck_fossil".into()),
+        Tier::Agent,
+    );
+
+    let who_error = read.whoami().await.unwrap_err();
+    assert_eq!(who_error.code, codes::INVALID_PARAMS);
+    let caller_error = read
+        .history(nexus_contracts::HistoryRequest {
+            thread: None,
+            with: None,
+            topic: None,
+            limit: Some(10),
+            before: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(caller_error.code, codes::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn read_client_no_key_caller_resolves_a_unique_session_across_project_metadata() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    Sessions::new(&store)
+        .create(NewSession {
+            session_id: nexus_contracts::SessionId("s_global_fossil".into()),
+            name: Some("global-fossil".into()),
+            agent: Some("codex".into()),
+            kind: "agent".into(),
+            role: None,
+            tier: "agent".into(),
+            harness_session_id: None,
+            client_key: None,
+            cwd: None,
+            project: "stored-metadata".into(),
+            transport: Some("codex-appserver".into()),
+        })
+        .await
+        .unwrap();
+    let read = ReadClient::from_store_with_caller_for_tests(
+        store,
+        "global-fossil",
+        "stale-caller-metadata",
+        None,
+        None,
+        Tier::Agent,
+    );
+
+    let who = read.whoami().await.unwrap();
+    assert_eq!(who.session_id.0, "s_global_fossil");
+    assert_eq!(who.project, "stored-metadata");
+}
+
+#[tokio::test]
+async fn read_client_no_key_caller_rejects_ambiguous_fossil_sessions() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    store
+        .conn
+        .execute("DROP INDEX idx_sessions_name", ())
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO sessions (session_id, name, agent, kind, tier, project, created_at) VALUES \
+             ('s_ambiguous_one', 'ambiguous-fossil', 'codex', 'agent', 'agent', 'one', 1), \
+             ('s_ambiguous_two', 'ambiguous-fossil', 'codex', 'agent', 'agent', 'two', 2)",
+            (),
+        )
+        .await
+        .unwrap();
+    let read = ReadClient::from_store_with_caller_for_tests(
+        store,
+        "ambiguous-fossil",
+        "one",
+        None,
+        None,
+        Tier::Agent,
+    );
+
+    let error = read.whoami().await.unwrap_err();
+    assert_eq!(error.code, codes::INVALID_PARAMS);
+}
+
+#[tokio::test]
+async fn read_client_members_rejects_an_ambiguous_agent_fallback_for_an_idless_session() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    store
+        .identity_conn()
+        .execute("DROP INDEX idx_agents_name_unique", ())
+        .await
+        .unwrap();
+    for (agent_id, project) in [("a_member_one", "one"), ("a_member_two", "two")] {
+        Agents::new(&store)
+            .create(NewAgent {
+                agent_id: agent_id.into(),
+                project: project.into(),
+                name: Some("ambiguous-member".into()),
+                default_harness: Some("codex".into()),
+                role: None,
+                tier: Some("agent".into()),
+                owner: None,
+            })
+            .await
+            .unwrap();
+    }
+    Sessions::new(&store)
+        .create(NewSession {
+            session_id: nexus_contracts::SessionId("s_ambiguous_member".into()),
+            name: Some("ambiguous-member".into()),
+            agent: Some("codex".into()),
+            kind: "agent".into(),
+            role: None,
+            tier: "agent".into(),
+            harness_session_id: None,
+            client_key: None,
+            cwd: None,
+            project: "transport".into(),
+            transport: Some("codex-appserver".into()),
+        })
+        .await
+        .unwrap();
+    let read = ReadClient::from_store_with_caller_for_tests(
+        store,
+        "operator",
+        "default",
+        Some("local-operator".into()),
+        None,
+        Tier::Admin,
+    );
+
+    let error = read
+        .members(MemberListRequest {
+            project: None,
+            include_offline: Some(true),
+            include_dead: Some(true),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, codes::INVALID_PARAMS);
 }
 
 #[tokio::test]
@@ -510,6 +932,306 @@ async fn read_client_resolves_attach_name_to_the_stable_agents_active_runtime() 
         descriptor.argv[5],
         tmux_session_name_for_test(&descriptor.session_id.0)
     );
+}
+
+#[tokio::test]
+async fn read_client_attach_routes_a_globally_unique_agent_across_project_metadata() {
+    let state = state().await;
+    let registered = state
+        .identity
+        .register(RegisterRequest {
+            project: "other".into(),
+            ..agent("cross-project", "ck_cross", hid("claude"), "/work/cross")
+        })
+        .await
+        .unwrap();
+    let sessions = Sessions::new(&state.store);
+    sessions
+        .set_transport(&registered.session_id, "pty")
+        .await
+        .unwrap();
+    sessions
+        .set_harness_session_id(&registered.session_id, "claude-cross-thread")
+        .await
+        .unwrap();
+    sessions
+        .set_presence(&registered.session_id, Presence::Offline)
+        .await
+        .unwrap();
+    let read = ReadClient::from_store_with_caller_for_tests(
+        state.store.clone(),
+        "caller",
+        "default",
+        Some("s_caller".into()),
+        Some("ck_caller".into()),
+        Tier::Agent,
+    );
+
+    let plan = read.attach_revive_plan("cross-project").await.unwrap();
+
+    assert_eq!(plan.session_id, registered.session_id);
+    assert_eq!(plan.spawn.project.as_deref(), Some("other"));
+}
+
+#[tokio::test]
+async fn read_client_agent_reads_prefer_an_exact_id_over_an_id_shaped_alias() {
+    let state = state().await;
+    let target = state
+        .identity
+        .register(agent(
+            "stable-read-target",
+            "ck_stable_read_target",
+            hid("codex"),
+            "/work/target",
+        ))
+        .await
+        .unwrap();
+    let target_agent_id = target.agent_id.expect("target agent id");
+    let alias = state
+        .identity
+        .register(agent(
+            &target_agent_id.0,
+            "ck_id_shaped_alias",
+            hid("claude"),
+            "/work/alias",
+        ))
+        .await
+        .unwrap();
+
+    let read = ReadClient::from_store_with_caller_for_tests(
+        state.store.clone(),
+        "operator",
+        "different-project-metadata",
+        Some("local-operator".into()),
+        None,
+        Tier::Admin,
+    );
+    let shown = read.agent_show(&target_agent_id.0).await.unwrap();
+    let runtimes = read.agent_runtimes(&target_agent_id.0, true).await.unwrap();
+
+    assert_eq!(shown.agent.agent_id, target_agent_id);
+    assert_eq!(runtimes.agent_id, shown.agent.agent_id);
+    assert_ne!(
+        shown.agent.agent_id,
+        alias.agent_id.expect("alias agent id")
+    );
+}
+
+#[tokio::test]
+async fn read_client_agent_reads_preserve_an_unowned_id_shaped_alias() {
+    let state = state().await;
+    let alias = state
+        .identity
+        .register(agent(
+            "a_read_alias_only",
+            "ck_read_alias_only",
+            hid("codex"),
+            "/work/alias-only",
+        ))
+        .await
+        .unwrap();
+    let read = ReadClient::from_store_with_caller_for_tests(
+        state.store.clone(),
+        "operator",
+        "different-project-metadata",
+        Some("local-operator".into()),
+        None,
+        Tier::Admin,
+    );
+
+    let shown = read.agent_show("a_read_alias_only").await.unwrap();
+    let runtimes = read
+        .agent_runtimes("a_read_alias_only", true)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        shown.agent.agent_id,
+        alias.agent_id.expect("alias agent id")
+    );
+    assert_eq!(runtimes.agent_id, shown.agent.agent_id);
+}
+
+#[tokio::test]
+async fn read_client_attach_and_revive_preserve_an_unowned_id_shaped_alias() {
+    let state = state().await;
+    let alias = state
+        .identity
+        .register(agent(
+            "a_attach_alias_only",
+            "ck_attach_alias_only",
+            hid("claude"),
+            "/work/attach-alias",
+        ))
+        .await
+        .unwrap();
+    let sessions = Sessions::new(&state.store);
+    sessions
+        .set_transport(&alias.session_id, "pty")
+        .await
+        .unwrap();
+    sessions
+        .set_harness_session_id(&alias.session_id, "claude-attach-alias-thread")
+        .await
+        .unwrap();
+    let read = ReadClient::from_store_with_caller_for_tests(
+        state.store.clone(),
+        "operator",
+        "different-project-metadata",
+        Some("local-operator".into()),
+        None,
+        Tier::Admin,
+    );
+
+    let descriptor = read
+        .pty_attach_descriptor("a_attach_alias_only")
+        .await
+        .unwrap();
+    assert_eq!(descriptor.session_id, alias.session_id);
+
+    AgentRuntimes::new(&state.store)
+        .stop(&alias.session_id.0)
+        .await
+        .unwrap();
+    sessions
+        .set_presence(&alias.session_id, Presence::Offline)
+        .await
+        .unwrap();
+    let plan = read
+        .attach_revive_plan("a_attach_alias_only")
+        .await
+        .unwrap();
+    assert_eq!(plan.session_id, alias.session_id);
+    assert_eq!(plan.spawn.project.as_deref(), Some("default"));
+}
+
+#[tokio::test]
+async fn read_client_attach_and_revive_prefer_an_exact_id_over_an_id_shaped_alias() {
+    let state = state().await;
+    let target = state
+        .identity
+        .register(agent(
+            "stable-attach-target",
+            "ck_stable_attach_target",
+            hid("claude"),
+            "/work/stable-attach",
+        ))
+        .await
+        .unwrap();
+    let target_agent_id = target.agent_id.clone().expect("target agent id");
+    let alias = state
+        .identity
+        .register(agent(
+            &target_agent_id.0,
+            "ck_attach_collision_alias",
+            hid("claude"),
+            "/work/collision-alias",
+        ))
+        .await
+        .unwrap();
+    let sessions = Sessions::new(&state.store);
+    for (session, native_id) in [
+        (&target.session_id, "claude-stable-thread"),
+        (&alias.session_id, "claude-alias-thread"),
+    ] {
+        sessions.set_transport(session, "pty").await.unwrap();
+        sessions
+            .set_harness_session_id(session, native_id)
+            .await
+            .unwrap();
+    }
+    let read = ReadClient::from_store_with_caller_for_tests(
+        state.store.clone(),
+        "operator",
+        "different-project-metadata",
+        Some("local-operator".into()),
+        None,
+        Tier::Admin,
+    );
+
+    let descriptor = read
+        .pty_attach_descriptor(&target_agent_id.0)
+        .await
+        .unwrap();
+    assert_eq!(descriptor.session_id, target.session_id);
+    assert_ne!(descriptor.session_id, alias.session_id);
+
+    AgentRuntimes::new(&state.store)
+        .stop(&target.session_id.0)
+        .await
+        .unwrap();
+    sessions
+        .set_presence(&target.session_id, Presence::Offline)
+        .await
+        .unwrap();
+    let plan = read.attach_revive_plan(&target_agent_id.0).await.unwrap();
+    assert_eq!(plan.session_id, target.session_id);
+    assert_ne!(plan.session_id, alias.session_id);
+}
+
+#[tokio::test]
+async fn read_client_native_resume_rejects_an_ambiguous_idless_agent_alias() {
+    let store = Arc::new(Store::open(":memory:").await.unwrap());
+    store.migrate().await.unwrap();
+    store
+        .identity_conn()
+        .execute("DROP INDEX idx_agents_name_unique", ())
+        .await
+        .unwrap();
+    for (agent_id, project) in [("a_resume_one", "one"), ("a_resume_two", "two")] {
+        Agents::new(&store)
+            .create(NewAgent {
+                agent_id: agent_id.into(),
+                project: project.into(),
+                name: Some("ambiguous-resume".into()),
+                default_harness: Some("codex".into()),
+                role: None,
+                tier: Some("agent".into()),
+                owner: None,
+            })
+            .await
+            .unwrap();
+    }
+    let session_id = nexus_contracts::SessionId("s_ambiguous_resume".into());
+    Sessions::new(&store)
+        .create(NewSession {
+            session_id: session_id.clone(),
+            name: Some("ambiguous-resume".into()),
+            agent: Some("codex".into()),
+            kind: "agent".into(),
+            role: None,
+            tier: "agent".into(),
+            harness_session_id: None,
+            client_key: None,
+            cwd: Some("/work/ambiguous".into()),
+            project: "one".into(),
+            transport: Some("codex-appserver".into()),
+        })
+        .await
+        .unwrap();
+    NativeThreadBindings::new(&store)
+        .claim(NewNativeThreadBinding {
+            harness: "codex".into(),
+            native_thread_id: "native-resume-one".into(),
+            agent_id: "a_resume_one".into(),
+            project: "one".into(),
+            runtime_id: Some(session_id.0.clone()),
+        })
+        .await
+        .unwrap();
+    let read = ReadClient::from_store_with_caller_for_tests(
+        store,
+        "operator",
+        "one",
+        Some("local-operator".into()),
+        None,
+        Tier::Admin,
+    );
+
+    let error = read.attach_revive_plan(&session_id.0).await.unwrap_err();
+
+    assert_eq!(error.code, codes::INVALID_PARAMS);
+    assert!(error.message.contains("ambiguous"));
 }
 
 #[tokio::test]
@@ -1369,6 +2091,7 @@ async fn members_hides_dead_agents_unless_include_dead() {
     // Default roster (even with offline rows) excludes the dead agent...
     let default_view = read
         .members(MemberListRequest {
+            project: None,
             include_offline: Some(true),
             include_dead: None,
         })
@@ -1385,6 +2108,7 @@ async fn members_hides_dead_agents_unless_include_dead() {
     // ...and the audit view names it, with lifecycle + reason.
     let audit_view = read
         .members(MemberListRequest {
+            project: None,
             include_offline: Some(true),
             include_dead: Some(true),
         })

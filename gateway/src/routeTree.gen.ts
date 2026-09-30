@@ -29,6 +29,7 @@ import { Route as ApiConversationSteerRouteImport } from './routes/api/conversat
 import { Route as ApiConversationPromptRouteImport } from './routes/api/conversation.prompt'
 import { Route as ApiConversationMessagesRouteImport } from './routes/api/conversation.messages'
 import { Route as ApiConversationLogsRouteImport } from './routes/api/conversation.logs'
+import { Route as ApiConversationInterruptRouteImport } from './routes/api/conversation.interrupt'
 import { Route as ApiConversationCompactRouteImport } from './routes/api/conversation.compact'
 import { Route as ApiAguiObserveRouteImport } from './routes/api/agui.observe'
 
@@ -132,6 +133,12 @@ const ApiConversationLogsRoute = ApiConversationLogsRouteImport.update({
   path: '/api/conversation/logs',
   getParentRoute: () => rootRouteImport,
 } as any)
+const ApiConversationInterruptRoute =
+  ApiConversationInterruptRouteImport.update({
+    id: '/api/conversation/interrupt',
+    path: '/api/conversation/interrupt',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const ApiConversationCompactRoute = ApiConversationCompactRouteImport.update({
   id: '/api/conversation/compact',
   path: '/api/conversation/compact',
@@ -160,6 +167,7 @@ export interface FileRoutesByFullPath {
   '/dm/$agent': typeof DmAgentRoute
   '/api/agui/observe': typeof ApiAguiObserveRoute
   '/api/conversation/compact': typeof ApiConversationCompactRoute
+  '/api/conversation/interrupt': typeof ApiConversationInterruptRoute
   '/api/conversation/logs': typeof ApiConversationLogsRoute
   '/api/conversation/messages': typeof ApiConversationMessagesRoute
   '/api/conversation/prompt': typeof ApiConversationPromptRoute
@@ -184,6 +192,7 @@ export interface FileRoutesByTo {
   '/dm/$agent': typeof DmAgentRoute
   '/api/agui/observe': typeof ApiAguiObserveRoute
   '/api/conversation/compact': typeof ApiConversationCompactRoute
+  '/api/conversation/interrupt': typeof ApiConversationInterruptRoute
   '/api/conversation/logs': typeof ApiConversationLogsRoute
   '/api/conversation/messages': typeof ApiConversationMessagesRoute
   '/api/conversation/prompt': typeof ApiConversationPromptRoute
@@ -209,6 +218,7 @@ export interface FileRoutesById {
   '/dm/$agent': typeof DmAgentRoute
   '/api/agui/observe': typeof ApiAguiObserveRoute
   '/api/conversation/compact': typeof ApiConversationCompactRoute
+  '/api/conversation/interrupt': typeof ApiConversationInterruptRoute
   '/api/conversation/logs': typeof ApiConversationLogsRoute
   '/api/conversation/messages': typeof ApiConversationMessagesRoute
   '/api/conversation/prompt': typeof ApiConversationPromptRoute
@@ -235,6 +245,7 @@ export interface FileRouteTypes {
     | '/dm/$agent'
     | '/api/agui/observe'
     | '/api/conversation/compact'
+    | '/api/conversation/interrupt'
     | '/api/conversation/logs'
     | '/api/conversation/messages'
     | '/api/conversation/prompt'
@@ -259,6 +270,7 @@ export interface FileRouteTypes {
     | '/dm/$agent'
     | '/api/agui/observe'
     | '/api/conversation/compact'
+    | '/api/conversation/interrupt'
     | '/api/conversation/logs'
     | '/api/conversation/messages'
     | '/api/conversation/prompt'
@@ -283,6 +295,7 @@ export interface FileRouteTypes {
     | '/dm/$agent'
     | '/api/agui/observe'
     | '/api/conversation/compact'
+    | '/api/conversation/interrupt'
     | '/api/conversation/logs'
     | '/api/conversation/messages'
     | '/api/conversation/prompt'
@@ -307,6 +320,7 @@ export interface RootRouteChildren {
   CChannelRoute: typeof CChannelRoute
   DmAgentRoute: typeof DmAgentRoute
   ApiConversationCompactRoute: typeof ApiConversationCompactRoute
+  ApiConversationInterruptRoute: typeof ApiConversationInterruptRoute
   ApiConversationLogsRoute: typeof ApiConversationLogsRoute
   ApiConversationMessagesRoute: typeof ApiConversationMessagesRoute
   ApiConversationPromptRoute: typeof ApiConversationPromptRoute
@@ -456,6 +470,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ApiConversationLogsRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/api/conversation/interrupt': {
+      id: '/api/conversation/interrupt'
+      path: '/api/conversation/interrupt'
+      fullPath: '/api/conversation/interrupt'
+      preLoaderRoute: typeof ApiConversationInterruptRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/api/conversation/compact': {
       id: '/api/conversation/compact'
       path: '/api/conversation/compact'
@@ -512,6 +533,7 @@ const rootRouteChildren: RootRouteChildren = {
   CChannelRoute: CChannelRoute,
   DmAgentRoute: DmAgentRoute,
   ApiConversationCompactRoute: ApiConversationCompactRoute,
+  ApiConversationInterruptRoute: ApiConversationInterruptRoute,
   ApiConversationLogsRoute: ApiConversationLogsRoute,
   ApiConversationMessagesRoute: ApiConversationMessagesRoute,
   ApiConversationPromptRoute: ApiConversationPromptRoute,

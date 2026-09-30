@@ -16,7 +16,7 @@ use nexus_contracts::register::{
     StatusRequest, StatusResponse, Whoami,
 };
 use nexus_contracts::send::{SendRequest, SendTarget};
-use nexus_store::repos::Threads;
+use nexus_store::repos::{NewSession, Sessions, Threads};
 use nexus_store::Store;
 
 const PROJECT: &str = "default";
@@ -177,6 +177,33 @@ fn caller(name: &str, session: &str) -> Caller {
     }
 }
 
+async fn seed_legacy_sessions(store: &Store) {
+    let sessions = Sessions::new(store);
+    for (name, session_id) in [
+        ("ana", "s_ana"),
+        ("ben", "s_ben"),
+        ("erin", "s_erin"),
+        ("zed", "s_zed"),
+    ] {
+        sessions
+            .create(NewSession {
+                session_id: SessionId(session_id.into()),
+                name: Some(name.into()),
+                agent: Some("claude".into()),
+                kind: "agent".into(),
+                role: None,
+                tier: "agent".into(),
+                harness_session_id: None,
+                client_key: Some(format!("ck_{session_id}")),
+                cwd: None,
+                project: PROJECT.into(),
+                transport: Some("pty".into()),
+            })
+            .await
+            .unwrap();
+    }
+}
+
 fn build(store: Arc<Store>) -> (Bus, Arc<MockRealtime>) {
     let realtime = Arc::new(MockRealtime::default());
     let identity = Arc::new(MockIdentity {
@@ -213,6 +240,7 @@ async fn reply_broadcast_owns_its_transaction_and_fails_loud_inside_a_foreign_on
             summary: None,
             body: "first inbound".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         },
     )
@@ -228,6 +256,7 @@ async fn reply_broadcast_owns_its_transaction_and_fails_loud_inside_a_foreign_on
                 summary: None,
                 body: "reply inside caller transaction".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -247,6 +276,7 @@ async fn reply_broadcast_owns_its_transaction_and_fails_loud_inside_a_foreign_on
                 summary: None,
                 body: "reply after caller transaction released".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -289,6 +319,7 @@ async fn reply_broadcast_owns_its_transaction_and_fails_loud_inside_a_foreign_on
 async fn fanout_statement_failure_rolls_back_message_fts_and_every_recipient_before_bells() {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
+    seed_legacy_sessions(&store).await;
     let (bus, realtime) = build(store.clone());
     let ana = caller("ana", "s_ana");
 
@@ -323,6 +354,7 @@ async fn fanout_statement_failure_rolls_back_message_fts_and_every_recipient_bef
                 summary: Some("must roll back".into()),
                 body: "no partial broadcast may survive".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: Some("atomic-failure-1".into()),
             },
         )
@@ -371,6 +403,7 @@ async fn large_quoted_unicode_body_is_bound_once_and_round_trips_through_fts() {
                 summary: Some("résumé 'quoted' 雪".into()),
                 body: body.clone(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: Some("parameterized-large-body".into()),
             },
         )
@@ -407,6 +440,7 @@ async fn large_quoted_unicode_body_is_bound_once_and_round_trips_through_fts() {
 async fn recipient_bells_run_in_parallel_and_one_failure_does_not_reject_durable_send() {
     let store = Arc::new(Store::open(":memory:").await.unwrap());
     store.migrate().await.unwrap();
+    seed_legacy_sessions(&store).await;
     let thread_id = ThreadId("t_parallel_bells".into());
     let threads = Threads::new(&store);
     threads
@@ -439,6 +473,7 @@ async fn recipient_bells_run_in_parallel_and_one_failure_does_not_reject_durable
                 summary: None,
                 body: "all bells enter together".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: Some("parallel-bells-1".into()),
             },
         ),

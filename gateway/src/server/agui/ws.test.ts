@@ -52,6 +52,25 @@ function controlledTextStream() {
   };
 }
 
+function boundSessionResponse(
+  stream: ReadableStream<Uint8Array>,
+  binding: { sessionId: string; agentId: string; name: string } = {
+    sessionId: "s_real",
+    agentId: "a_real",
+    name: "current-name",
+  },
+): Response {
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream",
+      "x-nexus-session-id": binding.sessionId,
+      "x-nexus-agent-id": binding.agentId,
+      "x-nexus-agent-name": binding.name,
+    },
+  });
+}
+
 async function loadWs(): Promise<WsModule> {
   return import("./ws.mjs") as Promise<WsModule>;
 }
@@ -126,7 +145,7 @@ describe("AG-UI WebSocket server transport", () => {
     );
     await control.closed;
 
-    expect(socket.closed).toEqual({ code: 1013, reason: "ag-ui websocket backpressure" });
+    expect(socket.closed).toEqual({ code: 1013, reason: "session.bp:none" });
     expect(socket.sent).toEqual([]);
   });
 
@@ -227,6 +246,134 @@ describe("AG-UI WebSocket server transport", () => {
       expect.any(Request),
     );
     expect(sessionInput).not.toHaveBeenCalled();
+  });
+
+  it("routes explicit interrupt frames through the authenticated conversation interrupt route", async () => {
+    const { handleWs } = await loadWs();
+    const socket = new FakeSocket();
+    const requests: Request[] = [];
+
+    handleWs(socket, new Request("http://localhost/api/agui/ws?session=otto", {
+      headers: { cookie: "nexus_human=human-token" },
+    }), {
+      observe: async () => new Response(textStream([]), { status: 200 }),
+      fetchHandler: vi.fn(async (request: Request) => {
+        requests.push(request);
+        return Response.json({ ok: true, result: { interrupted: true } }, { status: 201 });
+      }),
+    });
+
+    socket.emit("message", JSON.stringify({
+      t: "interrupt",
+      clientMessageId: "cm_interrupt_1",
+    }));
+
+    await vi.waitFor(() => expect(socket.sent).toContain(JSON.stringify({
+      t: "interrupt.ack",
+      clientMessageId: "cm_interrupt_1",
+      interrupted: true,
+    })));
+    expect(requests).toHaveLength(1);
+    expect(new URL(requests[0]!.url).pathname).toBe("/api/conversation/interrupt");
+    expect(requests[0]!.headers.get("cookie")).toBe("nexus_human=human-token");
+    await expect(requests[0]!.json()).resolves.toEqual({
+      name: "otto",
+      clientMessageId: "cm_interrupt_1",
+    });
+  });
+
+  it("forwards completed prompt, steer, interrupt, and compact events as caller-bound receipts", async () => {
+    const { handleWs } = await loadWs();
+    const socket = new FakeSocket();
+    const source = controlledTextStream();
+    let onTransition: ((transition: Record<string, unknown>) => void) | undefined;
+    const control = handleWs(
+      socket,
+      new Request("http://localhost/api/v1/agent-sessions/s_real/events?view=agui"),
+      {
+        observe: async () => boundSessionResponse(source.stream),
+        commandQueueHub: {
+          subscribe: (_request: Request, _target: unknown, handlers: {
+            onTransition: (transition: Record<string, unknown>) => void;
+          }) => {
+            onTransition = handlers.onTransition;
+            return () => {};
+          },
+        },
+      },
+    );
+    await vi.waitFor(() => expect(onTransition).toBeTypeOf("function"));
+
+    onTransition!({
+      seq: 8,
+      sessionId: "s_real",
+      commandId: "cmd_started",
+      clientMessageId: "cm_started",
+      commandKind: "harness.prompt",
+      callerName: "Operator",
+      callerSessionId: "s_human",
+      callerKind: "human",
+      state: "started",
+      mode: "queue",
+      revision: 3,
+    });
+    onTransition!({
+      seq: 9,
+      sessionId: "s_real",
+      commandId: "cmd_missing_caller",
+      clientMessageId: "cm_missing_caller",
+      commandKind: "harness.prompt",
+      state: "completed",
+      mode: "queue",
+      revision: 4,
+    });
+
+    for (const [index, commandKind] of [
+      "harness.prompt",
+      "harness.steer",
+      "harness.interrupt",
+      "harness.compact",
+    ].entries()) {
+      onTransition!({
+        seq: index + 10,
+        sessionId: "s_real",
+        commandId: `cmd_${index}`,
+        clientMessageId: `cm_${index}`,
+        commandKind,
+        callerName: "Operator",
+        callerSessionId: "s_human",
+        callerKind: "human",
+        state: "completed",
+        mode: commandKind.slice("harness.".length),
+        revision: 4,
+      });
+    }
+
+    expect(socket.sent.map((raw) => JSON.parse(raw)).filter((frame) => (
+      frame.t === "command.receipt"
+    ))).toEqual([
+      "harness.prompt",
+      "harness.steer",
+      "harness.interrupt",
+      "harness.compact",
+    ].map((commandKind, index) => ({
+      t: "command.receipt",
+      commandKind,
+      commandId: `cmd_${index}`,
+      clientId: `cm_${index}`,
+      sessionId: "s_real",
+      state: "completed",
+      revision: 4,
+      seq: index + 10,
+      callerId: "s_human",
+      callerKind: "human",
+      callerName: "Operator",
+      callerSessionId: "s_human",
+    })));
+
+    source.close();
+    control.close();
+    await control.closed;
   });
 
   it("defaults steer frames to the authenticated conversation steer route", async () => {
@@ -363,6 +510,281 @@ describe("AG-UI WebSocket server transport", () => {
     );
   });
 
+  it("keeps the stable agent id when a session socket carries a stale display name", async () => {
+    const { handleWs } = await loadWs();
+    const socket = new FakeSocket();
+    const sessionInput = vi.fn(async () => new Response(JSON.stringify({
+      receipt: {
+        commandId: "cmd_stable",
+        sessionId: "s_real",
+        state: "queued",
+        revision: 1,
+        seq: 1,
+      },
+    }), { status: 201 }));
+
+    handleWs(
+      socket,
+      new Request("http://localhost/api/agui/ws?session=stale-name&agentId=a_real"),
+      {
+        observe: async () => new Response(textStream([]), { status: 200 }),
+        sessionInput,
+      },
+    );
+    socket.emit("message", JSON.stringify({ t: "input", text: "continue" }));
+
+    await vi.waitFor(() => expect(sessionInput).toHaveBeenCalledWith(
+      expect.objectContaining({
+        mode: "session",
+        target: { name: "stale-name", agentId: "a_real" },
+      }),
+      expect.any(Request),
+    ));
+  });
+
+  it("supports an agent-id-only session socket for observe and input", async () => {
+    const { handleWs } = await loadWs();
+    const socket = new FakeSocket();
+    const observe = vi.fn(async () => new Response(textStream([]), { status: 200 }));
+    const sessionInput = vi.fn(async () => new Response(JSON.stringify({
+      receipt: {
+        commandId: "cmd_id_only",
+        sessionId: "s_real",
+        state: "queued",
+        revision: 1,
+        seq: 1,
+      },
+    }), { status: 201 }));
+
+    handleWs(socket, new Request("http://localhost/api/agui/ws?agentId=a_real"), {
+      observe,
+      sessionInput,
+    });
+    socket.emit("message", JSON.stringify({ t: "input", text: "continue" }));
+
+    await vi.waitFor(() => expect(sessionInput).toHaveBeenCalledWith(
+      expect.objectContaining({ mode: "session", target: { agentId: "a_real" } }),
+      expect.any(Request),
+    ));
+    expect(observe).toHaveBeenCalledWith(expect.objectContaining({
+      url: "http://localhost/api/agui/observe?agentId=a_real",
+    }));
+  });
+
+  it("binds every mutation on a stable session path to its one canonical agent target", async () => {
+    const { handleWs } = await loadWs();
+    const socket = new FakeSocket();
+    const source = controlledTextStream();
+    const sessionInput = vi.fn(async (input: { clientMessageId?: string }) => new Response(
+      JSON.stringify({
+        receipt: {
+          commandId: `cmd_${input.clientMessageId ?? "input"}`,
+          clientMessageId: input.clientMessageId,
+          sessionId: "s_real",
+          state: "queued",
+          revision: 1,
+          seq: 1,
+        },
+      }),
+      { status: 201 },
+    ));
+    const steerInput = vi.fn(async () => Response.json({
+      result: { accepted: true, delivery: "steered" },
+    }, { status: 201 }));
+    const queueSubscribe = vi.fn(() => () => {});
+    const routed: Array<{ path: string; body: unknown }> = [];
+    const fetchHandler = vi.fn(async (request: Request) => {
+      const path = new URL(request.url).pathname;
+      routed.push({ path, body: await request.json() });
+      if (path === "/api/conversation/prompt") {
+        return Response.json({
+          clientMutationId: "mut_bound",
+          commandId: "queued_bound",
+          state: "cancelled",
+          revision: 2,
+          seq: 2,
+        });
+      }
+      return Response.json({ ok: true }, { status: 201 });
+    });
+    const control = handleWs(
+      socket,
+      new Request("http://localhost/api/v1/agent-sessions/s_real/events?view=agui"),
+      {
+        observe: async () => boundSessionResponse(source.stream),
+        sessionInput,
+        steerInput,
+        resolveHarness: async () => "codex",
+        commandQueueHub: { subscribe: queueSubscribe },
+        fetchHandler,
+      },
+    );
+
+    await vi.waitFor(() => expect(queueSubscribe).toHaveBeenCalledWith(
+      expect.any(Request),
+      { name: "current-name", agentId: "a_real" },
+      expect.objectContaining({ onSnapshot: expect.any(Function) }),
+    ));
+    socket.emit("message", JSON.stringify({
+      t: "input",
+      text: "bare stable input",
+      clientMessageId: "cm_bare",
+    }));
+    socket.emit("message", JSON.stringify({
+      t: "input",
+      mode: "session",
+      target: { name: "stale-name", agentId: "a_real" },
+      text: "stable id wins",
+      clientMessageId: "cm_stable",
+    }));
+    socket.emit("message", JSON.stringify({
+      t: "steer",
+      text: "steer canonical lane",
+      clientMessageId: "cm_steer_bound",
+    }));
+    socket.emit("message", JSON.stringify({
+      t: "command",
+      name: "compact",
+      clientCommandId: "cc_bound",
+    }));
+    socket.emit("message", JSON.stringify({
+      t: "queue.cancel",
+      clientMutationId: "mut_bound",
+      commandId: "queued_bound",
+      expectedRevision: 1,
+    }));
+
+    await vi.waitFor(() => expect(sessionInput).toHaveBeenCalledTimes(2));
+    expect(sessionInput).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      mode: "session",
+      target: { name: "current-name", agentId: "a_real" },
+      text: "bare stable input",
+    }), expect.any(Request));
+    expect(sessionInput).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      mode: "session",
+      target: { name: "current-name", agentId: "a_real" },
+      text: "stable id wins",
+    }), expect.any(Request));
+    await vi.waitFor(() => expect(steerInput).toHaveBeenCalledWith({
+      target: { name: "current-name", agentId: "a_real" },
+      text: "steer canonical lane",
+      clientMessageId: "cm_steer_bound",
+    }, expect.any(Request)));
+    await vi.waitFor(() => expect(routed).toEqual(expect.arrayContaining([
+      {
+        path: "/api/conversation/compact",
+        body: { name: "current-name", agentId: "a_real", clientMessageId: "cc_bound" },
+      },
+      {
+        path: "/api/conversation/prompt",
+        body: {
+          name: "current-name",
+          agentId: "a_real",
+          action: "cancel",
+          clientMutationId: "mut_bound",
+          commandId: "queued_bound",
+          expectedRevision: 1,
+        },
+      },
+    ])));
+
+    source.close();
+    control.close();
+    await control.closed;
+  });
+
+  it.each([
+    {
+      label: "session input target",
+      frame: {
+        t: "input",
+        mode: "session",
+        target: "other-agent",
+        text: "cross lane",
+        clientMessageId: "cm_cross_input",
+      },
+      errorType: "input.err",
+    },
+    {
+      label: "bus mode on a session lane",
+      frame: {
+        t: "input",
+        mode: "bus",
+        target: { verb: "post", thread: "other-lane" },
+        text: "cross lane",
+        clientMessageId: "cm_cross_bus",
+      },
+      errorType: "input.err",
+    },
+    {
+      label: "steer target",
+      frame: {
+        t: "steer",
+        target: { name: "current-name", agentId: "a_other" },
+        text: "cross lane",
+        clientMessageId: "cm_cross_steer",
+      },
+      errorType: "steer.err",
+    },
+    {
+      label: "command target",
+      frame: {
+        t: "command",
+        target: "other-agent",
+        name: "compact",
+        clientCommandId: "cc_cross",
+      },
+      errorType: "command.err",
+    },
+    {
+      label: "queue target",
+      frame: {
+        t: "queue.cancel",
+        target: "other-agent",
+        clientMutationId: "mut_cross",
+        commandId: "cmd_cross",
+      },
+      errorType: "queue.mutation.err",
+    },
+  ])("rejects a cross-lane $label before mutation ingress", async ({ frame, errorType }) => {
+    const { handleWs } = await loadWs();
+    const socket = new FakeSocket();
+    const source = controlledTextStream();
+    const sessionInput = vi.fn();
+    const busInput = vi.fn();
+    const steerInput = vi.fn();
+    const fetchHandler = vi.fn();
+    const queueSubscribe = vi.fn(() => () => {});
+    const control = handleWs(
+      socket,
+      new Request("http://localhost/api/v1/agent-sessions/s_real/events?view=agui"),
+      {
+        observe: async () => boundSessionResponse(source.stream),
+        sessionInput,
+        busInput,
+        steerInput,
+        resolveHarness: async () => "codex",
+        commandQueueHub: { subscribe: queueSubscribe },
+        fetchHandler,
+      },
+    );
+    await vi.waitFor(() => expect(queueSubscribe).toHaveBeenCalled());
+
+    socket.emit("message", JSON.stringify(frame));
+
+    await vi.waitFor(() => expect(
+      socket.sent.map((raw) => JSON.parse(raw)).some((sent) => sent.t === errorType),
+    ).toBe(true));
+    expect(sessionInput).not.toHaveBeenCalled();
+    expect(busInput).not.toHaveBeenCalled();
+    expect(steerInput).not.toHaveBeenCalled();
+    expect(fetchHandler).not.toHaveBeenCalled();
+
+    source.close();
+    control.close();
+    await control.closed;
+  });
+
   it("defaults a bare legacy input frame on a dm socket to a bus dm send", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
@@ -483,9 +905,10 @@ describe("AG-UI WebSocket server transport", () => {
   it("replays developer events over a sys topic subscription", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
-    const since = vi.fn(async (topic: string, afterSeq: number) => {
-      if (topic !== "sys.agent.lifecycle" || afterSeq !== 7) return [];
-      return [{
+    const subscribe = vi.fn((topic: string, afterSeq: number, handlers: ToolCallEventHandlers) => {
+      expect(topic).toBe("sys.agent.lifecycle");
+      expect(afterSeq).toBe(7);
+      queueMicrotask(() => handlers.onEvent({
         kind: "agent_lifecycle",
         topic,
         seq: 8,
@@ -494,7 +917,8 @@ describe("AG-UI WebSocket server transport", () => {
         sessionId: "s_otto",
         lifecycle: "current_work",
         currentWork: "release preparation",
-      }];
+      }));
+      return { ready: Promise.resolve(), close: vi.fn() };
     });
 
     const control = handleWs(
@@ -502,8 +926,7 @@ describe("AG-UI WebSocket server transport", () => {
       new Request("http://localhost/api/agui/ws?session=otto"),
       {
         observe: async () => new Response(textStream([]), { status: 200 }),
-        developerEvents: { since },
-        developerEventPollMs: 10_000,
+        developerEvents: { subscribe },
       },
     );
 
@@ -538,6 +961,79 @@ describe("AG-UI WebSocket server transport", () => {
     await control.closed;
   });
 
+  it("uses an event-driven Gateway source for durable thread subscriptions", async () => {
+    const { handleWs } = await loadWs();
+    const socket = new FakeSocket();
+    const closeSubscription = vi.fn();
+    let handlers: ToolCallEventHandlers | undefined;
+    const subscribe = vi.fn((topic: string, afterSeq: number, next: ToolCallEventHandlers) => {
+      expect(topic).toBe("sys.message.thread.design");
+      expect(afterSeq).toBe(7);
+      handlers = next;
+      return { ready: Promise.resolve(), close: closeSubscription };
+    });
+    const control = handleWs(socket, new Request("http://localhost/api/agui/ws"), {
+      developerEvents: { subscribe },
+    });
+
+    socket.emit("message", JSON.stringify({
+      t: "subscribe",
+      topic: "sys.message.thread.design",
+      afterSeq: 7,
+    }));
+    handlers?.onEvent({
+      kind: "message",
+      topic: "sys.message.thread.design",
+      seq: 8,
+      ts: 1_780_000_000_008,
+      thread: "design",
+      from: "Ada",
+      messageId: "m_8",
+    });
+
+    await vi.waitFor(() => expect(developerEvents(socket)).toContainEqual(expect.objectContaining({
+      topic: "sys.message.thread.design",
+      seq: 8,
+      messageId: "m_8",
+    })));
+    expect(subscribe).toHaveBeenCalledTimes(1);
+
+    control.close();
+    await control.closed;
+    expect(closeSubscription).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes a durable event socket with its last cursor unadvanced under backpressure", async () => {
+    const { handleWs } = await loadWs();
+    const socket = new FakeSocket();
+    let handlers: ToolCallEventHandlers | undefined;
+    const control = handleWs(socket, new Request("http://localhost/api/agui/ws"), {
+      developerEvents: {
+        subscribe(_topic: string, _afterSeq: number, next: ToolCallEventHandlers) {
+          handlers = next;
+          return { ready: Promise.resolve(), close: vi.fn() };
+        },
+      },
+    });
+    socket.emit("message", JSON.stringify({
+      t: "subscribe",
+      topic: "sys.message.thread.design",
+      afterSeq: 7,
+    }));
+    socket.bufferedAmount = 1024 * 1024 + 1;
+
+    expect(handlers?.onEvent({
+      kind: "message",
+      topic: "sys.message.thread.design",
+      seq: 8,
+      ts: 1_780_000_000_008,
+      messageId: "m_8",
+    })).toBe(false);
+    await control.closed;
+    expect(socket.closed).toEqual({ code: 1013, reason: "developer.backpressure:7" });
+    expect(developerEvents(socket)).toEqual([]);
+  });
+
   it("tails ephemeral tool-call developer events for the observed session", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
@@ -548,7 +1044,6 @@ describe("AG-UI WebSocket server transport", () => {
       {
         observe: async () => new Response(source.stream, { status: 200 }),
         daemonToolCallEvents: null,
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -609,7 +1104,6 @@ describe("AG-UI WebSocket server transport", () => {
             return unsubscribe;
           },
         },
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -656,8 +1150,8 @@ describe("AG-UI WebSocket server transport", () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
     const source = controlledTextStream();
-    const durableSince = vi.fn(async () => {
-      throw new Error("fleet status must not poll durable developer_events");
+    const durableSubscribe = vi.fn(() => {
+      throw new Error("fleet status must not subscribe to durable message events");
     });
     let handlers: ToolCallEventHandlers | undefined;
     const unsubscribe = vi.fn();
@@ -667,7 +1161,7 @@ describe("AG-UI WebSocket server transport", () => {
       new Request("http://localhost/api/agui/ws"),
       {
         observe: async () => new Response(source.stream, { status: 200 }),
-        developerEvents: { since: durableSince },
+        developerEvents: { subscribe: durableSubscribe },
         daemonFleetStatusEvents: {
           subscribe(topic: string, afterSeq: number, h: ToolCallEventHandlers) {
             expect(topic).toBe("sys.fleet.status");
@@ -676,7 +1170,6 @@ describe("AG-UI WebSocket server transport", () => {
             return unsubscribe;
           },
         },
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -736,7 +1229,7 @@ describe("AG-UI WebSocket server transport", () => {
         data: { presence: "online", paused: false },
       });
     });
-    expect(durableSince).not.toHaveBeenCalled();
+    expect(durableSubscribe).not.toHaveBeenCalled();
 
     source.close();
     control.close();
@@ -754,7 +1247,6 @@ describe("AG-UI WebSocket server transport", () => {
       {
         observe: async () => new Response(source.stream, { status: 200 }),
         daemonFleetStatusEvents: null,
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -784,8 +1276,8 @@ describe("AG-UI WebSocket server transport", () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
     const source = controlledTextStream();
-    const durableSince = vi.fn(async () => {
-      throw new Error("tool-call topics must not poll durable developer_events");
+    const durableSubscribe = vi.fn(() => {
+      throw new Error("tool-call topics must not subscribe to durable message events");
     });
     let handlers: ToolCallEventHandlers | undefined;
     const sessionInput = vi.fn(async () => new Response(
@@ -809,7 +1301,7 @@ describe("AG-UI WebSocket server transport", () => {
       {
         observe: async () => new Response(source.stream, { status: 200 }),
         sessionInput,
-        developerEvents: { since: durableSince },
+        developerEvents: { subscribe: durableSubscribe },
         daemonToolCallEvents: {
           subscribe(topic: string, afterSeq: number, h: ToolCallEventHandlers) {
             expect(topic).toBe("sys.agent.smoke-agent.tool_call");
@@ -818,7 +1310,6 @@ describe("AG-UI WebSocket server transport", () => {
             return () => {};
           },
         },
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -905,7 +1396,7 @@ describe("AG-UI WebSocket server transport", () => {
       }),
       expect.any(Request),
     );
-    expect(durableSince).not.toHaveBeenCalled();
+    expect(durableSubscribe).not.toHaveBeenCalled();
 
     source.close();
     control.close();
@@ -928,7 +1419,6 @@ describe("AG-UI WebSocket server transport", () => {
             return () => {};
           },
         },
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -966,7 +1456,6 @@ describe("AG-UI WebSocket server transport", () => {
       {
         observe: async () => new Response(source.stream, { status: 200 }),
         daemonToolCallEvents: null,
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -1011,7 +1500,6 @@ describe("AG-UI WebSocket server transport", () => {
       {
         observe: async () => new Response(source.stream, { status: 200 }),
         daemonToolCallEvents: null,
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -1047,7 +1535,6 @@ describe("AG-UI WebSocket server transport", () => {
       {
         observe: async () => new Response(source.stream, { status: 200 }),
         daemonToolCallEvents: null,
-        developerEventPollMs: 10_000,
       },
     );
 
@@ -1082,12 +1569,12 @@ describe("AG-UI WebSocket server transport", () => {
   it("rejects tool-call subscriptions for a different observed session", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
-    const since = vi.fn(async () => []);
+    const subscribe = vi.fn();
 
     handleWs(socket, new Request("http://localhost/api/agui/ws?session=otto"), {
       observe: async () => new Response(textStream([]), { status: 200 }),
       daemonToolCallEvents: null,
-      developerEvents: { since },
+      developerEvents: { subscribe },
     });
 
     socket.emit("message", JSON.stringify({
@@ -1101,17 +1588,17 @@ describe("AG-UI WebSocket server transport", () => {
       topic: "sys.agent.iris.tool_call",
       error: "tool_call subscriptions require matching ?session=iris",
     }));
-    expect(since).not.toHaveBeenCalled();
+    expect(subscribe).not.toHaveBeenCalled();
   });
 
   it("rejects non-system developer event subscriptions", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
-    const since = vi.fn(async () => []);
+    const subscribe = vi.fn();
 
     handleWs(socket, new Request("http://localhost/api/agui/ws?session=otto"), {
       observe: async () => new Response(textStream([]), { status: 200 }),
-      developerEvents: { since },
+      developerEvents: { subscribe },
     });
 
     socket.emit("message", JSON.stringify({
@@ -1124,7 +1611,7 @@ describe("AG-UI WebSocket server transport", () => {
       t: "subscribe.err",
       error: "subscribe.topic must be a sys.* topic",
     }));
-    expect(since).not.toHaveBeenCalled();
+    expect(subscribe).not.toHaveBeenCalled();
   });
 
   it("shares one durable queue watcher across mounted lanes and filters by session", async () => {
@@ -1194,6 +1681,104 @@ describe("AG-UI WebSocket server transport", () => {
     expect(morgan[0]).toMatchObject({ seq: 7, sessionId: "s_morgan", state: "started" });
     offOtto();
     offMorgan();
+  });
+
+  it("hydrates a queue by stable agentId when its display name is stale", async () => {
+    const { CommandQueueHub } = await loadWs();
+    const fetchHandler = vi.fn(async (request: Request) => {
+      const url = new URL(request.url);
+      expect(url.searchParams.get("name")).toBe("stale-name");
+      expect(url.searchParams.get("agentId")).toBe("a_real");
+      return Response.json({
+        target: "current-name",
+        sessionId: "s_real",
+        turnActive: false,
+        steerCapability: "native_steer",
+        seq: 0,
+        revision: 0,
+        commands: [],
+      });
+    });
+    const hub = new CommandQueueHub({
+      fetchHandler,
+      commandQueueEventPollMs: 10_000,
+    });
+    const snapshots: unknown[] = [];
+    const unsubscribe = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=stale-name&agentId=a_real"),
+      { name: "stale-name", agentId: "a_real" },
+      {
+        onSnapshot: (snapshot) => snapshots.push(snapshot),
+        onTransition: vi.fn(),
+        onError: vi.fn(),
+      },
+    );
+
+    await vi.waitFor(() => expect(snapshots).toHaveLength(1));
+    expect(snapshots[0]).toMatchObject({ target: "current-name", sessionId: "s_real" });
+    unsubscribe();
+  });
+
+  it("uses the socket stable agentId for queue hydration and mutations", async () => {
+    const { handleWs } = await loadWs();
+    const socket = new FakeSocket();
+    const source = controlledTextStream();
+    const subscribe = vi.fn(() => () => {});
+    const fetchHandler = vi.fn(async (request: Request) => {
+      expect(new URL(request.url).pathname).toBe("/api/conversation/prompt");
+      expect(await request.json()).toEqual({
+        agentId: "a_real",
+        action: "cancel",
+        clientMutationId: "mut_real",
+        commandId: "cmd_real",
+        expectedRevision: 1,
+      });
+      return Response.json({
+        clientMutationId: "mut_real",
+        commandId: "cmd_real",
+        state: "cancelled",
+        steerCapability: "native_steer",
+        revision: 2,
+        seq: 9,
+      });
+    });
+    const control = handleWs(
+      socket,
+      new Request("http://localhost/api/agui/ws?agentId=a_real"),
+      {
+        observe: async () => new Response(source.stream, { status: 200 }),
+        commandQueueHub: { subscribe },
+        fetchHandler,
+      },
+    );
+
+    await vi.waitFor(() => expect(subscribe).toHaveBeenCalledWith(
+      expect.any(Request),
+      { agentId: "a_real" },
+      expect.objectContaining({ onSnapshot: expect.any(Function) }),
+    ));
+    socket.emit("message", JSON.stringify({
+      t: "queue.cancel",
+      clientMutationId: "mut_real",
+      commandId: "cmd_real",
+      expectedRevision: 1,
+    }));
+    await vi.waitFor(() => {
+      expect(socket.sent.map((raw) => JSON.parse(raw))).toContainEqual({
+        t: "queue.mutation.ack",
+        action: "cancel",
+        clientMutationId: "mut_real",
+        commandId: "cmd_real",
+        state: "cancelled",
+        steerCapability: "native_steer",
+        revision: 2,
+        seq: 9,
+      });
+    });
+
+    source.close();
+    control.close();
+    await control.closed;
   });
 
   it("coalesces queued-event redraws into one authoritative snapshot for every mounted client", async () => {
@@ -1329,6 +1914,882 @@ describe("AG-UI WebSocket server transport", () => {
     unsubscribe();
   });
 
+  it("marks initial and retained-gap hydration failures as fatal typed queue errors", async () => {
+    const { CommandQueueHub } = await loadWs();
+    let snapshotsServed = 0;
+    const errors: Array<[string, Record<string, unknown>]> = [];
+    const fetchHandler = vi.fn(async (request: Request) => {
+      const url = new URL(request.url);
+      if (url.searchParams.has("name")) {
+        snapshotsServed += 1;
+        if (snapshotsServed === 1) {
+          return Response.json({
+            target: "otto",
+            sessionId: "s_otto",
+            turnActive: false,
+            steerCapability: "native_steer",
+            seq: 5,
+            revision: 5,
+            commands: [],
+          });
+        }
+        return Response.json({ error: "snapshot authority unavailable" }, { status: 502 });
+      }
+      return Response.json({ events: [], latestSeq: 9, gap: true });
+    });
+    const hub = new CommandQueueHub({
+      fetchHandler,
+      commandQueueEventPollMs: 10_000,
+    });
+    const unsubscribe = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=otto"),
+      "otto",
+      {
+        onSnapshot: vi.fn(),
+        onTransition: vi.fn(),
+        onError: (error, details) => errors.push([error, details]),
+      },
+    );
+
+    await vi.waitFor(() => expect(errors).toHaveLength(1));
+    expect(errors).toEqual([[
+      "snapshot authority unavailable",
+      { phase: "hydrate", fatal: true },
+    ]]);
+    unsubscribe();
+
+    const initialErrors: Array<[string, Record<string, unknown>]> = [];
+    const initialHub = new CommandQueueHub({
+      fetchHandler: async () => Response.json(
+        { error: "initial subscription unavailable" },
+        { status: 502 },
+      ),
+      commandQueueEventPollMs: 10_000,
+    });
+    const offInitial = initialHub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=iris"),
+      "iris",
+      {
+        onSnapshot: vi.fn(),
+        onTransition: vi.fn(),
+        onError: (error, details) => initialErrors.push([error, details]),
+      },
+    );
+    await vi.waitFor(() => expect(initialErrors).toHaveLength(1));
+    expect(initialErrors).toEqual([[
+      "initial subscription unavailable",
+      { phase: "subscribe", fatal: true },
+    ]]);
+    offInitial();
+  });
+
+  it("keeps recoverable queue authority failures live and emits one restoration", async () => {
+    const { CommandQueueHub } = await loadWs();
+    let eventPolls = 0;
+    let snapshots = 0;
+    const errors: Array<[string, Record<string, unknown>]> = [];
+    const restored: number[] = [];
+    const fetchHandler = vi.fn(async (request: Request) => {
+      const url = new URL(request.url);
+      if (url.searchParams.has("name")) {
+        snapshots += 1;
+        if (snapshots === 2) {
+          return Response.json({ error: "queue redraw unavailable" }, { status: 503 });
+        }
+        return Response.json({
+          target: "otto",
+          sessionId: "s_otto",
+          turnActive: true,
+          steerCapability: "native_steer",
+          seq: snapshots === 1 ? 5 : 6,
+          revision: snapshots === 1 ? 5 : 6,
+          commands: [],
+        });
+      }
+      eventPolls += 1;
+      if (eventPolls === 1) {
+        return Response.json({
+          events: [{
+            seq: 6,
+            sessionId: "s_otto",
+            commandId: "cmd_1",
+            state: "queued",
+            mode: "queue",
+            revision: 1,
+          }],
+          latestSeq: 6,
+          gap: false,
+        });
+      }
+      return Response.json({ events: [], latestSeq: 6, gap: false });
+    });
+    const hub = new CommandQueueHub({ fetchHandler, commandQueueEventPollMs: 1 });
+    const unsubscribe = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=otto"),
+      "otto",
+      {
+        onSnapshot: vi.fn(),
+        onTransition: vi.fn(),
+        onError: (error, details) => errors.push([error, details]),
+        onRestored: (seq) => restored.push(seq),
+      },
+    );
+
+    await vi.waitFor(() => expect(restored).toEqual([6]));
+    expect(errors).toEqual([[
+      "queue redraw unavailable",
+      { phase: "refresh", fatal: false },
+    ]]);
+    expect(eventPolls).toBeGreaterThanOrEqual(2);
+    unsubscribe();
+  });
+
+  it("restores queue authority after a recoverable event-page failure", async () => {
+    const { CommandQueueHub } = await loadWs();
+    let eventPolls = 0;
+    const errors: Array<[string, Record<string, unknown>]> = [];
+    const restored: number[] = [];
+    const fetchHandler = vi.fn(async (request: Request) => {
+      const url = new URL(request.url);
+      if (url.searchParams.has("name")) {
+        return Response.json({
+          target: "otto",
+          sessionId: "s_otto",
+          turnActive: false,
+          steerCapability: "native_steer",
+          seq: 5,
+          revision: 5,
+          commands: [],
+        });
+      }
+      eventPolls += 1;
+      if (eventPolls === 1) {
+        return Response.json({ error: "transition page unavailable" }, { status: 503 });
+      }
+      return Response.json({ events: [], latestSeq: 7, gap: false });
+    });
+    const hub = new CommandQueueHub({ fetchHandler, commandQueueEventPollMs: 1 });
+    const unsubscribe = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=otto"),
+      "otto",
+      {
+        onSnapshot: vi.fn(),
+        onTransition: vi.fn(),
+        onError: (error, details) => errors.push([error, details]),
+        onRestored: (seq) => restored.push(seq),
+      },
+    );
+
+    await vi.waitFor(() => expect(restored).toEqual([7]));
+    expect(errors).toEqual([[
+      "transition page unavailable",
+      { phase: "events", fatal: false },
+    ]]);
+    unsubscribe();
+  });
+
+  it("isolates event-page failures to their authenticated queue group", async () => {
+    const { CommandQueueHub } = await loadWs();
+    const errorsA: unknown[] = [];
+    const errorsB: unknown[] = [];
+    const transitionsB: unknown[] = [];
+    let pollsA = 0;
+    let pollsB = 0;
+    const fetchHandler = vi.fn(async (request: Request) => {
+      const url = new URL(request.url);
+      const cookie = request.headers.get("cookie");
+      if (url.searchParams.has("name")) {
+        const name = url.searchParams.get("name");
+        return Response.json({
+          target: name,
+          sessionId: `s_${name}`,
+          turnActive: false,
+          steerCapability: "native_steer",
+          seq: 1,
+          revision: 1,
+          commands: [],
+        });
+      }
+      if (cookie === "auth=A") {
+        pollsA += 1;
+        return Response.json({ error: "A unavailable" }, { status: 503 });
+      }
+      pollsB += 1;
+      return Response.json({
+        events: [{
+          seq: 2,
+          sessionId: "s_b",
+          commandId: "cmd_b",
+          state: "started",
+          mode: "queue",
+          revision: 1,
+        }],
+        latestSeq: 2,
+        gap: false,
+      });
+    });
+    const hub = new CommandQueueHub({ fetchHandler, commandQueueEventPollMs: 1 });
+    const offA = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=a", { headers: { cookie: "auth=A" } }),
+      "a",
+      {
+        onSnapshot: vi.fn(),
+        onTransition: vi.fn(),
+        onError: (error, details) => errorsA.push([error, details]),
+        onRestored: vi.fn(),
+      },
+    );
+    const offB = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=b", { headers: { cookie: "auth=B" } }),
+      "b",
+      {
+        onSnapshot: vi.fn(),
+        onTransition: (event) => transitionsB.push(event),
+        onError: (error, details) => errorsB.push([error, details]),
+        onRestored: vi.fn(),
+      },
+    );
+
+    await vi.waitFor(() => expect(transitionsB).toHaveLength(1));
+    expect(pollsA).toBeGreaterThan(0);
+    expect(pollsB).toBeGreaterThan(0);
+    expect(errorsA.length).toBeGreaterThan(0);
+    expect(errorsB).toEqual([]);
+    offA();
+    offB();
+  });
+
+  it("isolates cookie-less bearer principals into distinct queue groups", async () => {
+    const { CommandQueueHub } = await loadWs();
+    const errorsA: unknown[] = [];
+    const errorsB: unknown[] = [];
+    const transitionsB: unknown[] = [];
+    const pollAuth: string[] = [];
+    const fetchHandler = vi.fn(async (request: Request) => {
+      const url = new URL(request.url);
+      const authorization = request.headers.get("authorization") ?? "";
+      if (url.searchParams.has("name")) {
+        const name = url.searchParams.get("name");
+        return Response.json({
+          target: name,
+          sessionId: `s_${name}`,
+          seq: 1,
+          revision: 1,
+          commands: [],
+        });
+      }
+      pollAuth.push(authorization);
+      if (authorization === "Bearer A") {
+        return Response.json({ error: "A unavailable" }, { status: 503 });
+      }
+      return Response.json({
+        events: [{
+          seq: 2,
+          sessionId: "s_b",
+          commandId: "cmd_bearer_b",
+          state: "started",
+          mode: "queue",
+          revision: 1,
+        }],
+        latestSeq: 2,
+        gap: false,
+      });
+    });
+    const hub = new CommandQueueHub({ fetchHandler, commandQueueEventPollMs: 5 });
+    const offA = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=a", {
+        headers: { authorization: "Bearer A" },
+      }),
+      "a",
+      {
+        onSnapshot: vi.fn(),
+        onTransition: vi.fn(),
+        onError: (error, details) => errorsA.push([error, details]),
+      },
+    );
+    const offB = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=b", {
+        headers: { authorization: "Bearer B" },
+      }),
+      "b",
+      {
+        onSnapshot: vi.fn(),
+        onTransition: (event) => transitionsB.push(event),
+        onError: (error, details) => errorsB.push([error, details]),
+      },
+    );
+
+    await vi.waitFor(() => expect(transitionsB).toHaveLength(1));
+    expect(pollAuth).toContain("Bearer A");
+    expect(pollAuth).toContain("Bearer B");
+    expect(errorsA.length).toBeGreaterThan(0);
+    expect(errorsB).toEqual([]);
+    offA();
+    offB();
+  });
+
+  it("waits for reversed initial hydrations and polls from the minimum cursor", async () => {
+    const { CommandQueueHub } = await loadWs();
+    let resolveA: ((response: Response) => void) | undefined;
+    let resolveB: ((response: Response) => void) | undefined;
+    const eventAfter: string[] = [];
+    const transitionsB: unknown[] = [];
+    const fetchHandler = vi.fn((request: Request) => {
+      const url = new URL(request.url);
+      const name = url.searchParams.get("name");
+      if (name === "a") {
+        return new Promise<Response>((resolve) => { resolveA = resolve; });
+      }
+      if (name === "b") {
+        return new Promise<Response>((resolve) => { resolveB = resolve; });
+      }
+      const after = url.searchParams.get("eventsAfter") ?? "";
+      eventAfter.push(after);
+      return Promise.resolve(Response.json({
+        events: after === "5"
+          ? [{
+              seq: 6,
+              sessionId: "s_b",
+              commandId: "cmd_b",
+              state: "started",
+              mode: "queue",
+              revision: 1,
+            }]
+          : [],
+        latestSeq: after === "5" ? 6 : 10,
+        gap: false,
+      }));
+    });
+    const hub = new CommandQueueHub({ fetchHandler, commandQueueEventPollMs: 1 });
+    const offA = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=a"),
+      "a",
+      { onSnapshot: vi.fn(), onTransition: vi.fn(), onError: vi.fn() },
+    );
+    const offB = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=b"),
+      "b",
+      { onSnapshot: vi.fn(), onTransition: (event) => transitionsB.push(event), onError: vi.fn() },
+    );
+    await vi.waitFor(() => {
+      expect(resolveA).toBeDefined();
+      expect(resolveB).toBeDefined();
+    });
+    resolveA?.(Response.json({
+      target: "a", sessionId: "s_a", seq: 10, revision: 10, commands: [],
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(eventAfter).toEqual([]);
+    resolveB?.(Response.json({
+      target: "b", sessionId: "s_b", seq: 5, revision: 5, commands: [],
+    }));
+
+    await vi.waitFor(() => expect(transitionsB).toHaveLength(1));
+    expect(eventAfter[0]).toBe("5");
+    offA();
+    offB();
+  });
+
+  it("discards an in-flight page when a newly hydrated subscriber lowers the group cursor", async () => {
+    const { CommandQueueHub } = await loadWs();
+    let resolveStalePage: ((response: Response) => void) | undefined;
+    const eventAfter: string[] = [];
+    const transitionsB: Array<Record<string, unknown>> = [];
+    const fetchHandler = vi.fn((request: Request) => {
+      const url = new URL(request.url);
+      const name = url.searchParams.get("name");
+      if (name) {
+        const seq = name === "a" ? 5 : 3;
+        return Promise.resolve(Response.json({
+          target: name,
+          sessionId: `s_${name}`,
+          seq,
+          revision: seq,
+          commands: [],
+        }));
+      }
+      const after = url.searchParams.get("eventsAfter") ?? "";
+      eventAfter.push(after);
+      if (eventAfter.length === 1) {
+        return new Promise<Response>((resolve) => { resolveStalePage = resolve; });
+      }
+      if (after === "3") {
+        return Promise.resolve(Response.json({
+          events: [4, 5].map((seq) => ({
+            seq,
+            sessionId: "s_b",
+            commandId: `cmd_b_${seq}`,
+            state: "started",
+            mode: "queue",
+            revision: 1,
+          })),
+          latestSeq: 5,
+          gap: false,
+        }));
+      }
+      return Promise.resolve(Response.json({ events: [], latestSeq: 6, gap: false }));
+    });
+    const hub = new CommandQueueHub({ fetchHandler, commandQueueEventPollMs: 5 });
+    const offA = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=a"),
+      "a",
+      { onSnapshot: vi.fn(), onTransition: vi.fn(), onError: vi.fn() },
+    );
+    await vi.waitFor(() => expect(eventAfter).toEqual(["5"]));
+    const offB = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=b"),
+      "b",
+      {
+        onSnapshot: vi.fn(),
+        onTransition: (event) => transitionsB.push(event as Record<string, unknown>),
+        onError: vi.fn(),
+      },
+    );
+    await vi.waitFor(() => expect(resolveStalePage).toBeDefined());
+    resolveStalePage?.(Response.json({
+      events: [{
+        seq: 6,
+        sessionId: "s_a",
+        commandId: "cmd_stale_page",
+        state: "started",
+        mode: "queue",
+        revision: 1,
+      }],
+      latestSeq: 6,
+      gap: false,
+    }));
+
+    await vi.waitFor(() => expect(transitionsB.map((event) => event.seq)).toEqual([4, 5]));
+    expect(eventAfter.slice(0, 2)).toEqual(["5", "3"]);
+    offA();
+    offB();
+  });
+
+  it("waits for reversed gap hydrations and resumes from the minimum cursor", async () => {
+    const { CommandQueueHub } = await loadWs();
+    const snapshotCounts = new Map<string, number>();
+    let resolveGapA: ((response: Response) => void) | undefined;
+    let resolveGapB: ((response: Response) => void) | undefined;
+    const eventAfter: string[] = [];
+    const transitionsB: unknown[] = [];
+    const fetchHandler = vi.fn((request: Request) => {
+      const url = new URL(request.url);
+      const name = url.searchParams.get("name");
+      if (name) {
+        const count = (snapshotCounts.get(name) ?? 0) + 1;
+        snapshotCounts.set(name, count);
+        if (count === 1) {
+          return Promise.resolve(Response.json({
+            target: name,
+            sessionId: `s_${name}`,
+            seq: 1,
+            revision: 1,
+            commands: [],
+          }));
+        }
+        return new Promise<Response>((resolve) => {
+          if (name === "a") resolveGapA = resolve;
+          else resolveGapB = resolve;
+        });
+      }
+      const after = url.searchParams.get("eventsAfter") ?? "";
+      eventAfter.push(after);
+      if (eventAfter.length === 1) {
+        return Promise.resolve(Response.json({ events: [], latestSeq: 10, gap: true }));
+      }
+      return Promise.resolve(Response.json({
+        events: after === "5"
+          ? [{
+              seq: 6,
+              sessionId: "s_b",
+              commandId: "cmd_gap_b",
+              state: "started",
+              mode: "queue",
+              revision: 1,
+            }]
+          : [],
+        latestSeq: after === "5" ? 6 : 10,
+        gap: false,
+      }));
+    });
+    const hub = new CommandQueueHub({ fetchHandler, commandQueueEventPollMs: 1 });
+    const offA = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=a"),
+      "a",
+      { onSnapshot: vi.fn(), onTransition: vi.fn(), onError: vi.fn() },
+    );
+    const offB = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=b"),
+      "b",
+      { onSnapshot: vi.fn(), onTransition: (event) => transitionsB.push(event), onError: vi.fn() },
+    );
+    await vi.waitFor(() => {
+      expect(resolveGapA).toBeDefined();
+      expect(resolveGapB).toBeDefined();
+    });
+    resolveGapA?.(Response.json({
+      target: "a", sessionId: "s_a", seq: 10, revision: 10, commands: [],
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(eventAfter).toEqual(["1"]);
+    resolveGapB?.(Response.json({
+      target: "b", sessionId: "s_b", seq: 5, revision: 5, commands: [],
+    }));
+
+    await vi.waitFor(() => expect(eventAfter.length).toBeGreaterThanOrEqual(2));
+    expect(eventAfter[1]).toBe("5");
+    await vi.waitFor(() => expect(transitionsB).toHaveLength(1));
+    offA();
+    offB();
+  });
+
+  it("restores once only after overlapping event and refresh failures both recover", async () => {
+    const { CommandQueueHub } = await loadWs();
+    let snapshots = 0;
+    let eventPolls = 0;
+    const trace: string[] = [];
+    const fetchHandler = vi.fn(async (request: Request) => {
+      const url = new URL(request.url);
+      if (url.searchParams.has("name")) {
+        snapshots += 1;
+        if (snapshots === 2 || snapshots === 3) {
+          trace.push("refresh-fail");
+          return Response.json({ error: "refresh unavailable" }, { status: 503 });
+        }
+        if (snapshots === 4) trace.push("refresh-success");
+        return Response.json({
+          target: "otto",
+          sessionId: "s_otto",
+          seq: 6,
+          revision: 6,
+          commands: [],
+        });
+      }
+      eventPolls += 1;
+      if (eventPolls === 1) {
+        return Response.json({
+          events: [{
+            seq: 6,
+            sessionId: "s_otto",
+            commandId: "cmd_overlap",
+            state: "queued",
+            mode: "queue",
+            revision: 1,
+          }],
+          latestSeq: 6,
+          gap: false,
+        });
+      }
+      if (eventPolls === 2) {
+        trace.push("events-fail");
+        return Response.json({ error: "events unavailable" }, { status: 503 });
+      }
+      if (eventPolls === 3) trace.push("events-success");
+      return Response.json({ events: [], latestSeq: 6, gap: false });
+    });
+    const hub = new CommandQueueHub({ fetchHandler, commandQueueEventPollMs: 1 });
+    const restored: number[] = [];
+    const unsubscribe = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=otto"),
+      "otto",
+      {
+        onSnapshot: vi.fn(),
+        onTransition: vi.fn(),
+        onError: vi.fn(),
+        onRestored: (seq) => {
+          trace.push("restored");
+          restored.push(seq);
+        },
+      },
+    );
+
+    await vi.waitFor(() => expect(restored).toEqual([6]));
+    expect(trace.indexOf("restored")).toBeGreaterThan(trace.indexOf("events-success"));
+    expect(trace.indexOf("restored")).toBeGreaterThan(trace.indexOf("refresh-success"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(restored).toEqual([6]);
+    unsubscribe();
+  });
+
+  it("does not restore events authority before a queued-event refresh succeeds", async () => {
+    const { CommandQueueHub } = await loadWs();
+    let snapshots = 0;
+    let eventPolls = 0;
+    const trace: string[] = [];
+    const fetchHandler = vi.fn(async (request: Request) => {
+      const url = new URL(request.url);
+      if (url.searchParams.has("name")) {
+        snapshots += 1;
+        if (snapshots === 2) {
+          return Response.json({ error: "refresh unavailable" }, { status: 503 });
+        }
+        return Response.json({
+          target: "otto",
+          sessionId: "s_otto",
+          seq: snapshots === 1 ? 1 : 2,
+          revision: snapshots === 1 ? 1 : 2,
+          commands: [],
+        });
+      }
+      eventPolls += 1;
+      if (eventPolls === 1) {
+        return Response.json({ error: "events unavailable" }, { status: 503 });
+      }
+      return Response.json({
+        events: eventPolls === 2
+          ? [{
+              seq: 2,
+              sessionId: "s_otto",
+              commandId: "cmd_inverse_overlap",
+              state: "queued",
+              mode: "queue",
+              revision: 1,
+            }]
+          : [],
+        latestSeq: 2,
+        gap: false,
+      });
+    });
+    const hub = new CommandQueueHub({ fetchHandler, commandQueueEventPollMs: 5 });
+    const restored: number[] = [];
+    const unsubscribe = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=otto"),
+      "otto",
+      {
+        onSnapshot: vi.fn(),
+        onTransition: vi.fn(),
+        onError: (_error, details) => trace.push(`err:${details.phase}`),
+        onRestored: (seq) => {
+          trace.push("restored");
+          restored.push(seq);
+        },
+      },
+    );
+
+    await vi.waitFor(() => expect(restored).toEqual([2]));
+    expect(trace).toContain("err:events");
+    expect(trace).toContain("err:refresh");
+    expect(trace.indexOf("restored")).toBeGreaterThan(trace.indexOf("err:refresh"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(restored).toEqual([2]);
+    unsubscribe();
+  });
+
+  it("keeps an always-gapping group on bounded cadence while another group catches up", async () => {
+    const { CommandQueueHub } = await loadWs();
+    let gapPolls = 0;
+    const pollMs = 30;
+    const fetchHandler = vi.fn(async (request: Request) => {
+      const url = new URL(request.url);
+      const cookie = request.headers.get("cookie");
+      const name = url.searchParams.get("name");
+      if (name) {
+        return Response.json({
+          target: name,
+          sessionId: `s_${name}`,
+          seq: 0,
+          revision: 0,
+          commands: [],
+        });
+      }
+      const after = Number(url.searchParams.get("eventsAfter") ?? "0");
+      if (cookie === "auth=gap") {
+        gapPolls += 1;
+        return Response.json({ events: [], latestSeq: after + 1, gap: true });
+      }
+      return Response.json({
+        events: [{
+          seq: after + 1,
+          sessionId: "s_busy",
+          commandId: `cmd_busy_${after + 1}`,
+          state: "started",
+          mode: "queue",
+          revision: 1,
+        }],
+        latestSeq: after + 2,
+        gap: false,
+      });
+    });
+    const hub = new CommandQueueHub({ fetchHandler, commandQueueEventPollMs: pollMs });
+    const offGap = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=gap", { headers: { cookie: "auth=gap" } }),
+      "gap",
+      { onSnapshot: vi.fn(), onTransition: vi.fn(), onError: vi.fn() },
+    );
+    const offBusy = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=busy", { headers: { cookie: "auth=busy" } }),
+      "busy",
+      { onSnapshot: vi.fn(), onTransition: vi.fn(), onError: vi.fn() },
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 125));
+    expect(gapPolls).toBeGreaterThanOrEqual(2);
+    expect(gapPolls).toBeLessThanOrEqual(6);
+    offGap();
+    offBusy();
+  });
+
+  it("supersedes a retained refresh when a gap starts fatal rehydration", async () => {
+    const { CommandQueueHub } = await loadWs();
+    let snapshots = 0;
+    let eventPolls = 0;
+    let rejectGapHydrate: ((response: Response) => void) | undefined;
+    const visibleSnapshots: unknown[] = [];
+    const errors: Array<Record<string, unknown>> = [];
+    const restored: number[] = [];
+    const fetchHandler = vi.fn((request: Request) => {
+      const url = new URL(request.url);
+      if (url.searchParams.has("name")) {
+        snapshots += 1;
+        if (snapshots === 1) {
+          return Promise.resolve(Response.json({
+            target: "otto", sessionId: "s_otto", seq: 1, revision: 1, commands: [],
+          }));
+        }
+        if (snapshots === 2) {
+          return Promise.resolve(Response.json({ error: "refresh unavailable" }, { status: 503 }));
+        }
+        if (snapshots === 3) {
+          return new Promise<Response>((resolve) => { rejectGapHydrate = resolve; });
+        }
+        return Promise.resolve(Response.json({
+          target: "otto", sessionId: "s_otto", seq: 2, revision: 2, commands: [],
+        }));
+      }
+      eventPolls += 1;
+      if (eventPolls === 1) {
+        return Promise.resolve(Response.json({
+          events: [{
+            seq: 2,
+            sessionId: "s_otto",
+            commandId: "cmd_before_gap",
+            state: "queued",
+            mode: "queue",
+            revision: 1,
+          }],
+          latestSeq: 2,
+          gap: false,
+        }));
+      }
+      return Promise.resolve(Response.json({ events: [], latestSeq: 3, gap: true }));
+    });
+    const hub = new CommandQueueHub({ fetchHandler, commandQueueEventPollMs: 5 });
+    const unsubscribe = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=otto"),
+      "otto",
+      {
+        onSnapshot: (snapshot) => visibleSnapshots.push(snapshot),
+        onTransition: vi.fn(),
+        onError: (_error, details) => errors.push(details),
+        onRestored: (seq) => restored.push(seq),
+      },
+    );
+
+    await vi.waitFor(() => expect(rejectGapHydrate).toBeDefined());
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(visibleSnapshots).toHaveLength(1);
+    expect(restored).toEqual([]);
+    rejectGapHydrate?.(Response.json({ error: "gap hydrate unavailable" }, { status: 503 }));
+    await vi.waitFor(() => expect(errors).toContainEqual({ phase: "hydrate", fatal: true }));
+    expect(visibleSnapshots).toHaveLength(1);
+    expect(restored).toEqual([]);
+    unsubscribe();
+  });
+
+  it("restores queue authority when successful gap hydration supersedes an older refresh outage", async () => {
+    const { CommandQueueHub } = await loadWs();
+    let snapshots = 0;
+    let eventPolls = 0;
+    const errors: Array<Record<string, unknown>> = [];
+    const restored: number[] = [];
+    const fetchHandler = vi.fn(async (request: Request) => {
+      const url = new URL(request.url);
+      if (url.searchParams.has("name")) {
+        snapshots += 1;
+        if (snapshots === 2) {
+          return Response.json({ error: "refresh unavailable" }, { status: 503 });
+        }
+        return Response.json({
+          target: "otto",
+          sessionId: "s_otto",
+          seq: snapshots === 1 ? 1 : 5,
+          revision: snapshots === 1 ? 1 : 5,
+          commands: [],
+        });
+      }
+      eventPolls += 1;
+      if (eventPolls === 1) {
+        return Response.json({
+          events: [{
+            seq: 2,
+            sessionId: "s_otto",
+            commandId: "cmd_before_recovery_gap",
+            state: "queued",
+            mode: "queue",
+            revision: 1,
+          }],
+          latestSeq: 2,
+          gap: false,
+        });
+      }
+      return Response.json({ events: [], latestSeq: 5, gap: true });
+    });
+    const hub = new CommandQueueHub({ fetchHandler, commandQueueEventPollMs: 5 });
+    const unsubscribe = hub.subscribe(
+      new Request("http://localhost/api/agui/ws?session=otto"),
+      "otto",
+      {
+        onSnapshot: vi.fn(),
+        onTransition: vi.fn(),
+        onError: (_error, details) => errors.push(details),
+        onRestored: (seq) => restored.push(seq),
+      },
+    );
+
+    await vi.waitFor(() => expect(restored).toEqual([5]));
+    expect(errors).toContainEqual({ phase: "refresh", fatal: false });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(restored).toEqual([5]);
+    unsubscribe();
+  });
+
+  it("emits typed queue error and restoration frames on a session socket", async () => {
+    const { handleWs } = await loadWs();
+    const socket = new FakeSocket();
+    const source = controlledTextStream();
+    let handlers: Record<string, (...args: any[]) => void> | undefined;
+    const control = handleWs(
+      socket,
+      new Request("http://localhost/api/agui/ws?session=otto"),
+      {
+        observe: async () => new Response(source.stream, { status: 200 }),
+        commandQueueHub: {
+          subscribe: vi.fn((_request, _target, nextHandlers) => {
+            handlers = nextHandlers;
+            return () => {};
+          }),
+        },
+      },
+    );
+    await vi.waitFor(() => expect(handlers).toBeDefined());
+
+    handlers?.onError?.("queue events unavailable", { phase: "events", fatal: false });
+    handlers?.onRestored?.(17);
+
+    expect(socket.sent.map((raw) => JSON.parse(raw))).toEqual(expect.arrayContaining([
+      {
+        t: "queue.err",
+        error: "queue events unavailable",
+        phase: "events",
+        fatal: false,
+      },
+      { t: "queue.restored", seq: 17 },
+    ]));
+    source.close();
+    control.close();
+    await control.closed;
+  });
+
   it("maps observe auth failures to websocket close codes", async () => {
     const { handleWs } = await loadWs();
     const socket = new FakeSocket();
@@ -1416,10 +2877,66 @@ describe("AG-UI WebSocket command surface (SPEC-ws-full-command-access v1)", () 
     });
   });
 
+  it("resolves command catalogs and dispatch by stable agentId before a stale name", async () => {
+    const { handleWs } = await loadWs();
+    const socket = new FakeSocket();
+    const source = controlledTextStream();
+    const fetchHandler = vi.fn(async (request: Request) => {
+      const url = new URL(request.url);
+      if (url.pathname === "/api/v1/members") {
+        return Response.json([
+          { name: "current-name", agentId: "a_real", agent: "claude", sessionId: "s_real" },
+        ]);
+      }
+      expect(url.pathname).toBe("/api/conversation/compact");
+      expect(await request.json()).toEqual({
+        name: "stale-name",
+        agentId: "a_real",
+        clientMessageId: "cc_stable",
+      });
+      return Response.json({ ok: true }, { status: 201 });
+    });
+    const control = handleWs(
+      socket,
+      new Request("http://localhost/api/agui/ws?session=stale-name&agentId=a_real"),
+      {
+        observe: async () => new Response(source.stream, { status: 200 }),
+        fetchHandler,
+      },
+    );
+
+    socket.emit("message", JSON.stringify({ t: "commands.list" }));
+    await vi.waitFor(() => {
+      expect(frames(socket)).toContainEqual(expect.objectContaining({
+        t: "commands.catalog",
+        target: "stale-name",
+        agentId: "a_real",
+        harness: "claude",
+      }));
+    });
+
+    socket.emit("message", JSON.stringify({
+      t: "command",
+      name: "compact",
+      clientCommandId: "cc_stable",
+    }));
+    await vi.waitFor(() => {
+      expect(frames(socket)).toContainEqual({
+        t: "command.done",
+        clientCommandId: "cc_stable",
+        ok: true,
+      });
+    });
+
+    source.close();
+    control.close();
+    await control.closed;
+  });
+
   it("dispatches a gateway verb to its REST handler and replies ack then done", async () => {
     const fetchHandler = vi.fn(async (request: Request) => {
       expect(new URL(request.url).pathname).toBe("/api/conversation/compact");
-      expect(await request.json()).toEqual({ name: "otto" });
+      expect(await request.json()).toEqual({ name: "otto", clientMessageId: "cc_1" });
       return new Response(JSON.stringify({ ok: true }), { status: 201 });
     });
     const socket = await openSocket({ resolveHarness: claudeHarness, fetchHandler });

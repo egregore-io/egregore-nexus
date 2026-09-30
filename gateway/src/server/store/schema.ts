@@ -21,6 +21,9 @@ export const GATEWAY_CANONICAL_TABLES = [
   "logs",
   "rendered_conversations",
   "rendered_messages",
+  "hook_pipeline_evaluations",
+  "hook_handler_executions",
+  "hook_receipt_completion",
 ] as const;
 
 export type GatewayCanonicalTable = (typeof GATEWAY_CANONICAL_TABLES)[number];

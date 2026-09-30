@@ -1,9 +1,11 @@
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    verify_repository_version();
     println!("cargo:rerun-if-env-changed=NEXUS_BUILD_REVISION");
     println!("cargo:rerun-if-changed=.cargo_vcs_info.json");
 
@@ -13,6 +15,39 @@ fn main() {
         .unwrap_or_else(|| "unknown".to_owned());
 
     println!("cargo:rustc-env=NEXUS_BUILD_REVISION={revision}");
+}
+
+fn verify_repository_version() {
+    let manifest_dir = env::var_os("CARGO_MANIFEST_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("Cargo must provide CARGO_MANIFEST_DIR");
+    let version_path = manifest_dir.join("../../..").join("VERSION");
+    println!("cargo:rerun-if-changed={}", version_path.display());
+
+    let repository_version = match fs::read_to_string(&version_path) {
+        Ok(value) => value,
+        Err(error)
+            if error.kind() == ErrorKind::NotFound
+                && manifest_dir.join(".cargo_vcs_info.json").is_file() =>
+        {
+            return;
+        }
+        Err(error) => panic!(
+            "cannot read canonical Nexus version at {}: {error}",
+            version_path.display()
+        ),
+    };
+    let canonical = repository_version.trim();
+    let cargo = env::var("CARGO_PKG_VERSION").expect("Cargo must provide CARGO_PKG_VERSION");
+    assert_eq!(
+        repository_version,
+        format!("{canonical}\n"),
+        "VERSION must contain one value followed by a newline"
+    );
+    assert_eq!(
+        cargo, canonical,
+        "Cargo package version {cargo} does not match canonical Nexus version {canonical}; run scripts/nexus-version sync"
+    );
 }
 
 fn configured_revision() -> Option<String> {

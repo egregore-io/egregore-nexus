@@ -59,6 +59,61 @@ async function waitFor(
 }
 
 describe("agent session materialized projection", () => {
+  it("replays authenticated human provenance from durable user_input blocks", async () => {
+    const db = await createStore();
+    await db.batch([
+      {
+        sql:
+          "INSERT INTO agent_session_turns (id, session_id, status, first_stream_event_id, " +
+          "last_stream_event_id, started_at, updated_at, finalized_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        args: ["turn_human", "s_ben", "final", 1, 2, 100, 120, 120],
+      },
+      {
+        sql:
+          "INSERT INTO agent_session_messages (id, session_id, turn_id, ordinal, role, author, " +
+          "content_json, status, first_stream_event_id, last_stream_event_id, created_at, updated_at, finalized_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        args: [
+          "m_human",
+          "s_ben",
+          "turn_human",
+          0,
+          "user",
+          "alice",
+          JSON.stringify({
+            schema: 1,
+            blocks: [{
+              type: "text",
+              text: "authenticated replay",
+              id: "you:replay:1",
+              clientMessageId: "you:replay:1",
+              name: "alice",
+              kind: "human",
+            }],
+          }),
+          "final",
+          1,
+          1,
+          100,
+          100,
+          120,
+        ],
+      },
+    ]);
+
+    const snapshot = await loadAgentSessionSnapshot("s_ben", "ben", { client: db });
+    const start = (snapshot.events as Array<Record<string, unknown>>).find(
+      (event) => event.type === EventType.TEXT_MESSAGE_START && event.role === "user",
+    );
+
+    expect(start).toMatchObject({
+      messageId: "you:replay:1",
+      name: "alice",
+      kind: "human",
+    });
+    expect(start).not.toMatchObject({ name: "ben" });
+  });
+
   it("hydrates finalized turns as AG-UI and returns the last finalized stream cursor", async () => {
     const db = await createStore();
     await db.batch([

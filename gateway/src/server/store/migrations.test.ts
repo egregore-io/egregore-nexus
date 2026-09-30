@@ -22,11 +22,92 @@ describe("Gateway v0.1.0 store baseline", () => {
     for (const table of GATEWAY_CANONICAL_TABLES) expect(names.has(table)).toBe(true);
     expect(names.has("projects")).toBe(false);
     expect(names.has("project_threads")).toBe(false);
+    expect(names.has("hook_pipeline_evaluations")).toBe(true);
+    expect(names.has("hook_handler_executions")).toBe(true);
+    expect(names.has("hook_receipt_completion")).toBe(true);
+    expect(await columnNames(db, "hook_pipeline_evaluations")).toContain("result_json");
+    expect(await columnNames(db, "hook_handler_executions")).toContain("result_json");
+    expect(await columnNames(db, "rest_bearer_token")).toEqual(expect.arrayContaining([
+      "actor_session_id",
+      "actor_agent_id",
+      "actor_runtime_id",
+      "actor_client_key",
+    ]));
 
     const versions = await db.execute(
       "SELECT version, name FROM gateway_schema_migrations ORDER BY version",
     );
     expect(versions.rows).toMatchObject([
+      { version: CURRENT_GATEWAY_SCHEMA_VERSION, name: CURRENT_GATEWAY_SCHEMA_NAME },
+    ]);
+    db.close();
+  });
+
+  it("upgrades the complete v0.1.0 baseline additively without losing data", async () => {
+    const db = createClient({ url: ":memory:" });
+    await createGatewayV1StoreForTest(db);
+    await db.execute("INSERT INTO logs (ts, level, scope, message) VALUES (1, 'info', 'test', 'keep')");
+
+    await migrateGatewayStore(db);
+
+    expect(await singleText(db, "SELECT message FROM logs")).toBe("keep");
+    expect(await tableExists(db, "hook_pipeline_evaluations")).toBe(true);
+    const versions = await db.execute(
+      "SELECT version, name FROM gateway_schema_migrations ORDER BY version",
+    );
+    expect(versions.rows).toMatchObject([
+      { version: CURRENT_GATEWAY_SCHEMA_VERSION, name: CURRENT_GATEWAY_SCHEMA_NAME },
+    ]);
+    db.close();
+  });
+
+  it("upgrades the receipt-era hook schema with replay results", async () => {
+    const db = createClient({ url: ":memory:" });
+    await migrateGatewayStore(db);
+    await db.batch([
+      "ALTER TABLE hook_pipeline_evaluations DROP COLUMN result_json",
+      "ALTER TABLE hook_handler_executions DROP COLUMN result_json",
+      "ALTER TABLE rest_bearer_token DROP COLUMN actor_session_id",
+      "ALTER TABLE rest_bearer_token DROP COLUMN actor_agent_id",
+      "ALTER TABLE rest_bearer_token DROP COLUMN actor_runtime_id",
+      "ALTER TABLE rest_bearer_token DROP COLUMN actor_client_key",
+      `UPDATE gateway_schema_migrations
+       SET version = 3, name = 'v0.1.5_message_hook_receipts'`,
+    ], "write");
+
+    await migrateGatewayStore(db);
+
+    expect(await columnNames(db, "hook_pipeline_evaluations")).toContain("result_json");
+    expect(await columnNames(db, "hook_handler_executions")).toContain("result_json");
+    const marker = await db.execute("SELECT version, name FROM gateway_schema_migrations");
+    expect(marker.rows).toMatchObject([
+      { version: CURRENT_GATEWAY_SCHEMA_VERSION, name: CURRENT_GATEWAY_SCHEMA_NAME },
+    ]);
+    db.close();
+  });
+
+  it("upgrades resumable hooks with bearer authority fields", async () => {
+    const db = createClient({ url: ":memory:" });
+    await migrateGatewayStore(db);
+    await db.batch([
+      "ALTER TABLE rest_bearer_token DROP COLUMN actor_session_id",
+      "ALTER TABLE rest_bearer_token DROP COLUMN actor_agent_id",
+      "ALTER TABLE rest_bearer_token DROP COLUMN actor_runtime_id",
+      "ALTER TABLE rest_bearer_token DROP COLUMN actor_client_key",
+      `UPDATE gateway_schema_migrations
+       SET version = 4, name = 'v0.1.5_resumable_message_hooks'`,
+    ], "write");
+
+    await migrateGatewayStore(db);
+
+    expect(await columnNames(db, "rest_bearer_token")).toEqual(expect.arrayContaining([
+      "actor_session_id",
+      "actor_agent_id",
+      "actor_runtime_id",
+      "actor_client_key",
+    ]));
+    const marker = await db.execute("SELECT version, name FROM gateway_schema_migrations");
+    expect(marker.rows).toMatchObject([
       { version: CURRENT_GATEWAY_SCHEMA_VERSION, name: CURRENT_GATEWAY_SCHEMA_NAME },
     ]);
     db.close();
@@ -98,4 +179,14 @@ async function tableExists(db: Client, table: string): Promise<boolean> {
 async function singleText(db: Client, sql: string): Promise<string> {
   const result = await db.execute(sql);
   return String(result.rows[0]?.[0]);
+}
+
+async function columnNames(db: Client, table: string): Promise<string[]> {
+  const result = await db.execute(`PRAGMA table_info(${table})`);
+  return result.rows.map((row) => String(row.name));
+}
+
+async function createGatewayV1StoreForTest(db: Client): Promise<void> {
+  const migrations = await import("./migrations");
+  await migrations.createGatewayV1StoreForTest(db);
 }

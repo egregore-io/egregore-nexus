@@ -2,6 +2,7 @@ use super::*;
 use async_trait::async_trait;
 use nexus_contracts::batch::{BatchCounts, NexusBatch};
 use nexus_contracts::ports::AgentTurnExecutionPort;
+use nexus_harness_core::{native_harness_program, NativeProcessPlatform};
 
 struct LivenessProbeInput {
     alive: bool,
@@ -237,10 +238,23 @@ fn claude_headed_env_re_exports_custom_config_after_tmux_sanitization() {
 
 #[test]
 fn harness_program_maps_each_tui_binary() {
-    assert_eq!(harness_program(&hid("claude")), Some("claude"));
-    assert_eq!(harness_program(&hid("codex")), Some("codex"));
-    assert_eq!(harness_program(&hid("opencode")), Some("opencode"));
-    assert_eq!(harness_program(&hid("hermes")), Some("hermes"));
+    let platform = NativeProcessPlatform::current();
+    assert_eq!(
+        harness_program(&hid("claude")),
+        native_harness_program("claude", platform)
+    );
+    assert_eq!(
+        harness_program(&hid("codex")),
+        native_harness_program("codex", platform)
+    );
+    assert_eq!(
+        harness_program(&hid("opencode")),
+        native_harness_program("opencode", platform)
+    );
+    assert_eq!(
+        harness_program(&hid("hermes")),
+        native_harness_program("hermes", platform)
+    );
     assert_eq!(harness_program(&hid("pi")), None);
     assert_eq!(harness_program(&hid("other")), None);
 }

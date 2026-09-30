@@ -15,6 +15,7 @@ import { useQuery } from "@tanstack/react-query";
 
 import type { PresenceValue } from "@shared/ui";
 import { gatewayFetch } from "@app/gatewayClient";
+import { useCurrentIdentity } from "@app/identity";
 import { qk } from "@shared/queryKeys";
 import type {
   MemberRow,
@@ -41,18 +42,6 @@ async function getJson<T>(path: string): Promise<T> {
     throw new Error(`read-view ${path} → HTTP ${res.status}`);
   }
   return (await res.json()) as T;
-}
-
-/** GET the optional caller identity; logged-out browsers are a normal state. */
-async function getWhoami(): Promise<WhoamiRow | null> {
-  const res = await gatewayFetch("/api/v1/whoami", {
-    headers: { accept: "application/json" },
-  });
-  if (res.status === 401) return null;
-  if (!res.ok) {
-    throw new Error(`read-view /api/v1/whoami → HTTP ${res.status}`);
-  }
-  return (await res.json()) as WhoamiRow;
 }
 
 // ── normalizers (read view-model → shell nav shape) ───────────────────────────
@@ -159,12 +148,11 @@ export function useProjects() {
 
 /** The resolved caller → the rail's "me" footer. */
 export function useMe() {
-  return useQuery({
-    queryKey: qk.whoami(),
-    queryFn: getWhoami,
-    select: (row) => (row ? toMe(row) : undefined),
-    staleTime: STALE,
-  });
+  const query = useCurrentIdentity();
+  return {
+    ...query,
+    data: query.data ? toMe(query.data) : undefined,
+  };
 }
 
 // ── derived (presentational) values ───────────────────────────────────────────

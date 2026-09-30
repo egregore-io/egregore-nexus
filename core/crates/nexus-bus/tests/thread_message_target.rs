@@ -151,6 +151,7 @@ async fn thread_post_stores_thread_name_as_to_name() {
             summary: None,
             body: "thread target check".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         },
     )
@@ -210,6 +211,7 @@ async fn archived_or_deleted_threads_do_not_route_as_thread_targets() {
                     summary: None,
                     body: "should not route".into(),
                     mention: vec![],
+                    metadata: None,
                     idempotency_key: None,
                 },
             )

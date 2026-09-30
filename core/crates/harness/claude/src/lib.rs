@@ -39,6 +39,10 @@ impl Harness for ClaudeHarness {
             .expect("Claude has a native headed executable")
     }
 
+    fn agent_token(&self) -> &'static str {
+        "claude"
+    }
+
     fn headed_runtime_kind(&self) -> HeadedRuntimeKind {
         HeadedRuntimeKind::ClaudeNative
     }
@@ -128,8 +132,7 @@ impl Harness for ClaudeHarness {
         Ok(SlashCommandAction::InjectVerbatim)
     }
 
-    /// The claude quirk: claude's transcript jsonl is keyed
-    /// by the launch cwd's project slug
+    /// Claude's transcript jsonl is keyed by the launch cwd's project slug
     /// (`~/.claude/projects/<slug>/<sid>.jsonl`), and our streaming/observe
     /// capture reads that file. Spawning every session in the SAME folder makes
     /// their transcripts collide under one slug, so a fresh claude launch gets

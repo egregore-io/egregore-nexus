@@ -249,6 +249,16 @@ mod tests {
         }
     }
 
+    async fn seed_legacy_sessions(store: &Store, pairs: &[(&str, &str)]) {
+        let sessions = Sessions::new(store);
+        for (name, session_id) in pairs {
+            sessions
+                .create(new_session(session_id, name))
+                .await
+                .unwrap();
+        }
+    }
+
     async fn seed_agent_runtime(store: &Store, agent_id: &str, name: &str, session_id: &str) {
         Agents::new(store)
             .create(new_agent(agent_id, name))
@@ -337,6 +347,7 @@ mod tests {
                     summary: None,
                     body: "take the auth refactor?".into(),
                     mention: vec![],
+                    metadata: None,
                     idempotency_key: None,
                 },
             )
@@ -363,6 +374,7 @@ mod tests {
                         summary: None,
                         body: body.into(),
                         mention: vec![],
+                        metadata: None,
                         idempotency_key: None,
                     },
                 )
@@ -388,6 +400,7 @@ mod tests {
             summary: None,
             body: "retry once".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: Some("web:dm:ben:client-1".into()),
         };
         let first = bus
@@ -421,6 +434,7 @@ mod tests {
             summary: None,
             body: "same click twice".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         };
         let first = bus
@@ -455,6 +469,7 @@ mod tests {
             summary: None,
             body: "same click after debounce".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         };
         let first = bus
@@ -483,6 +498,7 @@ mod tests {
             summary: None,
             body: "same body intentional".into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: Some("web:dm:ben:first".into()),
         };
         let mut second = first.clone();
@@ -513,6 +529,7 @@ mod tests {
                 summary: None,
                 body: "stable ids".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -588,6 +605,11 @@ mod tests {
                 threads.add_member(&tid, m).await.unwrap();
             }
         }
+        seed_legacy_sessions(
+            &store,
+            &[("ben", "s_ben"), ("dylan", "s_dylan"), ("ana", "s_ana")],
+        )
+        .await;
         let id = identity(&[("ben", "s_ben"), ("dylan", "s_dylan"), ("ana", "s_ana")]);
         let (bus, realtime) = build(store.clone(), id);
 
@@ -601,6 +623,7 @@ mod tests {
                     summary: Some("plan".into()),
                     body: "step 1 ...".into(),
                     mention: vec!["dylan".into()],
+                    metadata: None,
                     idempotency_key: None,
                 },
             )
@@ -676,6 +699,7 @@ mod tests {
                     summary: None,
                     body: "route by member id".into(),
                     mention: vec![],
+                    metadata: None,
                     idempotency_key: None,
                 },
             )
@@ -741,6 +765,7 @@ mod tests {
                     summary: None,
                     body: "ship it".into(),
                     mention: vec![],
+                    metadata: None,
                     idempotency_key: None,
                 },
             )
@@ -815,6 +840,7 @@ mod tests {
                 summary: None,
                 body: "wake when you return".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -846,6 +872,11 @@ mod tests {
                 .unwrap();
             threads.add_member(&tid, "ben").await.unwrap();
         }
+        seed_legacy_sessions(
+            &store,
+            &[("ben", "s_ben"), ("ana", "s_ana"), ("dylan", "s_dylan")],
+        )
+        .await;
         let id = identity(&[("ben", "s_ben"), ("ana", "s_ana"), ("dylan", "s_dylan")]);
         let (bus, realtime) = build(store.clone(), id);
 
@@ -858,6 +889,7 @@ mod tests {
                 summary: None,
                 body: "before anyone else joined".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -989,6 +1021,7 @@ mod tests {
                 threads.add_member(&tid, m).await.unwrap();
             }
         }
+        seed_legacy_sessions(&store, &[("ben", "s_ben"), ("dylan", "s_dylan")]).await;
         let id = identity(&[
             ("ben", "s_ben"),
             ("dylan", "s_dylan"),
@@ -1004,6 +1037,7 @@ mod tests {
                     summary: None,
                     body: "thread wins".into(),
                     mention: vec![],
+                    metadata: None,
                     idempotency_key: None,
                 },
             )
@@ -1032,6 +1066,7 @@ mod tests {
                 summary: None,
                 body: "private".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -1060,6 +1095,7 @@ mod tests {
                     summary: None,
                     body: "anyone?".into(),
                     mention: vec![],
+                    metadata: None,
                     idempotency_key: None,
                 },
             )
@@ -1087,6 +1123,7 @@ mod tests {
                 summary: None,
                 body: "take the auth refactor?".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -1103,6 +1140,7 @@ mod tests {
                 summary: None,
                 body: "on it".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -1134,6 +1172,7 @@ mod tests {
                     summary: None,
                     body: "reply after projection cleanup".into(),
                     mention: vec![],
+                    metadata: None,
                     idempotency_key: None,
                 },
             )
@@ -1172,6 +1211,7 @@ mod tests {
                 summary: None,
                 body: "still routes back to erin".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -1200,6 +1240,7 @@ mod tests {
                 summary: None,
                 body: "this lands on the old runtime".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -1214,6 +1255,7 @@ mod tests {
                 summary: None,
                 body: "reply from revived runtime".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )
@@ -1272,6 +1314,7 @@ mod tests {
                 summary: None,
                 body: "reply to original".into(),
                 mention: vec![],
+                metadata: None,
                 idempotency_key: None,
             },
         )

@@ -18,7 +18,7 @@ pub mod time;
 pub use config::{
     gateway_projection_delivery_mode_path, persist_gateway_projection_delivery_mode,
     read_gateway_projection_delivery_mode, Config, GatewayProjectionBacklogConfig,
-    GatewayProjectionDeliveryMode,
+    GatewayProjectionDeliveryMode, HookGatewayMode,
 };
 pub use credential::hash_runtime_credential;
 pub use error::NexusError;

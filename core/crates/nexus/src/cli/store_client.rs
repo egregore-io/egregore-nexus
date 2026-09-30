@@ -538,7 +538,7 @@ impl StoreCaller {
         };
 
         let Some(row) = Sessions::new(store)
-            .find_by_client_key(&self.project, client_key)
+            .find_by_client_key_any_project(client_key)
             .await
             .map_err(store_err)?
         else {

@@ -329,15 +329,17 @@ class EnduranceFixtureTests(unittest.TestCase):
         launch = source.index("nexus gateway start --json")
         self.assertLess(build, launch)
 
-    def test_candidate_binary_is_pinned_and_proved_at_the_exact_revision(self):
+    def test_candidate_binary_reports_the_canonical_release_version(self):
         source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(
             encoding="utf-8"
         )
 
         self.assertIn('FULL_CANDIDATE=$(git -C "$ROOT" rev-parse', source)
-        self.assertIn('-e "NEXUS_BUILD_REVISION=$FULL_CANDIDATE"', source)
         self.assertIn('"$NEXUS_BIN" --version', source)
-        self.assertIn('grep -Fq "revision $FULL_CANDIDATE)"', source)
+        self.assertIn('VERSION=$(tr -d', source)
+        self.assertIn('test "$(cat "$OUT/runtime/nexus-version.txt")" = "nexus $VERSION"', source)
+        self.assertNotIn('NEXUS_BUILD_REVISION', source)
+        self.assertNotIn('revision $FULL_CANDIDATE', source)
 
     def test_shared_thread_fixture_starts_and_sustains_a_bounded_debate(self):
         source = (_PATH.parent / "nexus-v010-endurance-gate").read_text(

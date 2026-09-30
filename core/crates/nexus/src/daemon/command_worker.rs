@@ -23,10 +23,10 @@ use tokio::task::JoinHandle;
 use nexus_common::{now, NexusError};
 use nexus_contracts::{
     codes, AgentId, Caller, ContractError, MessageId, NotifyCommandRequest, NotifyRequest,
-    NotifyTarget, PromptRequest, Request, SessionId, Tier, JSONRPC_VERSION,
+    PromptRequest, Request, SessionId, Tier, JSONRPC_VERSION,
 };
 use nexus_store::command_kinds;
-use nexus_store::repos::{Agents, CommandIntentRow, CommandIntents, Inbox, Sessions};
+use nexus_store::repos::{AgentRef, Agents, CommandIntentRow, CommandIntents, Inbox, Sessions};
 use nexus_store::types::SessionRow;
 
 use crate::daemon::app::AppState;
@@ -363,10 +363,32 @@ async fn resolve_harness_prompt_target_session(
             .await?
             .map(|session| session.session_id.0));
     }
-    Ok(sessions
-        .find_by_name(&row.project, &prompt.name)
-        .await?
-        .map(|session| session.session_id.0))
+    let agents = Agents::new(&state.store);
+    let parsed = AgentRef::parse(&prompt.name);
+    let resolved = match agents.resolve_ref("", &parsed, true).await {
+        Err(NexusError::NotFound(_)) if matches!(parsed, AgentRef::Id(_)) => {
+            agents
+                .resolve_ref("", &AgentRef::Name(prompt.name.clone()), true)
+                .await
+        }
+        result => result,
+    };
+    let session = match resolved {
+        Ok(agent) => match sessions
+            .active_runtime_session_for_agent(&agent.agent_id)
+            .await?
+        {
+            Some(session) => Some(session),
+            None => sessions.find_by_agent_id(&agent.agent_id).await?,
+        },
+        Err(NexusError::NotFound(_)) => {
+            sessions
+                .find_unique_by_name_any_project(&prompt.name)
+                .await?
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(session.map(|session| session.session_id.0))
 }
 
 async fn wait_for_command_intent_or_poll(state: &AppState, idle_epoch: u64) {
@@ -590,16 +612,14 @@ async fn execute(state: &AppState, row: CommandIntentRow) -> Result<Value, Contr
                 code: codes::INVALID_PARAMS,
                 message: format!("invalid notification.send request_json: {error}"),
             })?;
-        match &request.target {
-            NotifyTarget::Agent { agent_id } => {
-                state.hold_cold_dm_target(None, Some(agent_id)).await;
-            }
-            NotifyTarget::Name { name } | NotifyTarget::Auto { value: name } => {
-                state.hold_cold_dm_target(Some(name), None).await;
-            }
-            NotifyTarget::Group { .. } | NotifyTarget::Thread { .. } => {}
+        // Resolve the immutable recipient, authorize policy, and execute `before_send` before the
+        // runtime registry is touched. The returned preparation freezes that exact delivery set;
+        // commit cannot re-resolve a renamed alias or execute the hook a second time.
+        let prepared = state.bus.prepare_notify(caller, request).await?;
+        if let Some(agent_id) = state.bus.prepared_hold_agent(caller, &prepared).await? {
+            state.hold_cold_dm_target(None, Some(&agent_id)).await;
         }
-        let response = state.bus.notify(caller, request).await?;
+        let response = state.bus.commit_prepared(caller, prepared).await?;
         state
             .wake_notification_recipients(&response.message_id)
             .await;
@@ -737,14 +757,18 @@ async fn drive_verified_notification_routes(
     routed_to: &[String],
 ) -> Result<(), ContractError> {
     let sessions = Sessions::new(&state.store);
+    let mut targets = Vec::with_capacity(routed_to.len());
     for recipient in routed_to {
         let Some(target) = sessions
-            .find_by_name_any_project(recipient)
+            .find_unique_by_name_any_project(recipient)
             .await
             .map_err(|error| error.to_contract_error())?
         else {
             continue;
         };
+        targets.push((recipient, target));
+    }
+    for (recipient, target) in targets {
         if state
             .inbox_subscription_owns_delivery(&target.session_id)
             .await
@@ -967,6 +991,7 @@ fn command_method(kind: &str) -> Option<&'static str> {
         command_kinds::harness::LAUNCH => Some("launch"),
         command_kinds::harness::PROMPT => Some("prompt"),
         command_kinds::harness::STEER => Some("steer"),
+        command_kinds::harness::INTERRUPT => Some("interrupt"),
         command_kinds::harness::COMPACT => Some("compact"),
         command_kinds::harness::WARM => Some("warm"),
         command_kinds::admin::SPAWN => Some("admin.spawn"),
@@ -1052,24 +1077,45 @@ async fn resolve_command_caller(
             "command intent caller client key is not registered",
         ));
     };
-    let caller = if let Some(session_name) = session.name.as_deref() {
-        state
-            .identity
-            .resolve(&session.project, session_name)
-            .await?
-    } else {
-        let agent_id = session.agent_id.clone().ok_or_else(|| {
-            unauthorized_command_caller(
-                "command intent caller session has no durable agent identity",
-            )
-        })?;
+    let caller = if session.kind != "agent" {
+        // The registered session kind is authoritative. Ignore pre-fix `agent_id` residue (and
+        // mutable caller labels) so a durable human/app credential cannot inherit an agent alias.
         Caller {
-            agent_id: Some(AgentId(agent_id)),
+            agent_id: None,
             session: session.session_id.clone(),
             name: session.display_name(),
             project: session.project.clone(),
             tier: tier_from_session(&session),
         }
+    } else if let Some(agent_id) = session.agent_id.as_deref() {
+        let agent = Agents::new(&state.store)
+            .find_by_id(agent_id)
+            .await
+            .map_err(|error| error.to_contract_error())?
+            .ok_or_else(|| {
+                unauthorized_command_caller(
+                    "command intent caller registered agent id is not a durable identity",
+                )
+            })?;
+        Caller {
+            agent_id: Some(AgentId(agent.agent_id)),
+            session: session.session_id.clone(),
+            name: agent.name.unwrap_or_else(|| session.display_name()),
+            project: session.project.clone(),
+            tier: tier_from_session(&session),
+        }
+    } else if session.kind == "agent" {
+        let session_name = session.name.as_deref().ok_or_else(|| {
+            unauthorized_command_caller(
+                "command intent caller agent session has no durable agent identity",
+            )
+        })?;
+        state
+            .identity
+            .resolve(&session.project, session_name)
+            .await?
+    } else {
+        unreachable!("agent-session branch handles missing durable ids above")
     };
     validate_command_caller_row(row, &session, &caller)?;
     // Any verified registered command proves recent activity for presence purposes. Route the
@@ -1135,11 +1181,13 @@ fn validate_command_caller_row(
             ));
         }
     }
-    if let Some(caller_agent_id) = row.caller_agent_id.as_deref() {
-        if caller.agent_id.as_ref().map(|id| id.0.as_str()) != Some(caller_agent_id) {
-            return Err(unauthorized_command_caller(
-                "command intent caller agent does not match registered client key",
-            ));
+    if session.kind == "agent" {
+        if let Some(caller_agent_id) = row.caller_agent_id.as_deref() {
+            if caller.agent_id.as_ref().map(|id| id.0.as_str()) != Some(caller_agent_id) {
+                return Err(unauthorized_command_caller(
+                    "command intent caller agent does not match registered client key",
+                ));
+            }
         }
     }
     if let Some(caller_kind) = row.caller_kind.as_deref() {

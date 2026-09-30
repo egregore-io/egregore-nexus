@@ -232,6 +232,7 @@ async fn dm_to_launched_real_adapter_agent_reaches_harness_as_session_prompt() {
             summary: None,
             body: BODY.into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         },
     )
@@ -323,6 +324,7 @@ async fn boot_respawn_with_stale_resume_key_delivers_pending_dm() {
             summary: None,
             body: BODY.into(),
             mention: vec![],
+            metadata: None,
             idempotency_key: None,
         },
     )

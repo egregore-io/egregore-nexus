@@ -132,9 +132,13 @@ export function sharedDaemonPushConnector() {
   return sharedConnection;
 }
 
-export function resetSharedDaemonPushConnectorForTests() {
+export function closeSharedDaemonPushConnector() {
   sharedConnection?.close();
   sharedConnection = undefined;
+}
+
+export function resetSharedDaemonPushConnectorForTests() {
+  closeSharedDaemonPushConnector();
 }
 
 export function gatewayStreamEndpointManifestPath(env = process.env) {
@@ -154,9 +158,12 @@ class DaemonPushConnection {
   #connected = false;
   #closed = false;
   #manifest;
+  #daemonBootId;
   #manifestPath;
   #subscriptions = new Map();
   #projectionHandlers = new Set();
+  #hookProvider;
+  #hookReadiness;
   #opening = false;
   #reconnectAttempt = 0;
   #reconnectTimer;
@@ -168,6 +175,10 @@ class DaemonPushConnection {
       this.#scheduleReconnect();
       throw error;
     });
+  }
+
+  get daemonBootId() {
+    return this.#daemonBootId ?? this.#manifest?.daemonBootId;
   }
 
   subscribe(subscription, handlers) {
@@ -215,6 +226,25 @@ class DaemonPushConnection {
     this.#writeFrame({ t: "projection.ack", ack });
   }
 
+  registerHooks(capabilities, handler) {
+    if (!capabilities || typeof capabilities !== "object") {
+      throw new Error("hook capabilities are required");
+    }
+    if (typeof handler !== "function") throw new Error("hook handler is required");
+    const registration = { capabilities, handler };
+    this.#hookProvider = registration;
+    this.#hookReadiness?.resolve();
+    this.ready = new Promise((resolve) => {
+      this.#hookReadiness = { registration, resolve };
+    });
+    if (this.#connected) this.#socket?.destroy();
+    return () => {
+      if (this.#hookProvider !== registration) return;
+      this.#hookProvider = undefined;
+      if (this.#connected) this.#socket?.destroy();
+    };
+  }
+
   close() {
     this.#closed = true;
     if (this.#reconnectTimer) clearTimeout(this.#reconnectTimer);
@@ -223,6 +253,9 @@ class DaemonPushConnection {
     this.#socket = undefined;
     this.#subscriptions.clear();
     this.#projectionHandlers.clear();
+    this.#hookProvider = undefined;
+    this.#hookReadiness?.resolve();
+    this.#hookReadiness = undefined;
   }
 
   async #connect() {
@@ -243,6 +276,9 @@ class DaemonPushConnection {
         }
       }
       this.#manifest = nextManifest;
+      this.#daemonBootId = typeof nextManifest.daemonBootId === "string"
+        ? nextManifest.daemonBootId
+        : undefined;
       this.#buffer = Buffer.alloc(0);
       await this.#openSocket();
       this.#reconnectAttempt = 0;
@@ -257,14 +293,17 @@ class DaemonPushConnection {
       this.#socket = socket;
       let opened = false;
       let protocolReady = false;
+      let helloHookProvider;
       socket.once("connect", () => {
         opened = true;
         this.#connected = true;
+        helloHookProvider = this.#hookProvider;
         this.#writeFrame({
           t: "hello",
           version: 1,
           token: this.#manifest.token,
           subscriptions: [...this.#subscriptions.values()].map((entry) => entry.subscription),
+          ...(helloHookProvider ? { hooks: helloHookProvider.capabilities } : {}),
         });
       });
       socket.once("error", (error) => {
@@ -272,7 +311,20 @@ class DaemonPushConnection {
       });
       socket.on("data", (chunk) => this.#onData(chunk, (frame) => {
         if (frame?.t === "ready") {
+          if (typeof frame.daemonBootId !== "string" || !frame.daemonBootId) {
+            const error = new Error("daemon push ready frame is missing daemonBootId");
+            this.#broadcastError(error);
+            reject(error);
+            socket.destroy();
+            return true;
+          }
+          this.#daemonBootId = frame.daemonBootId;
           protocolReady = true;
+          const hookReadiness = this.#hookReadiness;
+          if (hookReadiness && hookReadiness.registration === helloHookProvider) {
+            hookReadiness.resolve();
+            this.#hookReadiness = undefined;
+          }
           resolve();
           return true;
         }
@@ -344,6 +396,10 @@ class DaemonPushConnection {
 
   #routeFrame(frame) {
     if (!frame || typeof frame !== "object") return;
+    if (frame.t === "hook.evaluate") {
+      this.#handleHookEvaluation(frame);
+      return;
+    }
     if (frame.t === "projection" || frame.t === "projection.gap") {
       for (const handlers of [...this.#projectionHandlers]) handlers.onFrame(frame);
       return;
@@ -368,6 +424,33 @@ class DaemonPushConnection {
     }
     this.#advanceCursor(entry, frame);
     for (const handlers of [...entry.handlers]) handlers.onFrame(frame);
+  }
+
+  #handleHookEvaluation(frame) {
+    const provider = this.#hookProvider;
+    const correlationId = frame.evaluation?.correlationId;
+    const request = frame.evaluation?.request;
+    if (!provider || typeof correlationId !== "string" || !request || typeof request !== "object") {
+      return;
+    }
+    Promise.resolve()
+      .then(() => provider.handler(request))
+      .then((result) => {
+        if (this.#hookProvider !== provider) return;
+        this.#writeFrame({ t: "hook.result", correlationId, result });
+      })
+      .catch((error) => {
+        if (this.#hookProvider !== provider) return;
+        this.#writeFrame({
+          t: "hook.result",
+          correlationId,
+          error: {
+            code: typeof error?.code === "string" ? error.code : "hook_failed",
+            message: error instanceof Error ? error.message : String(error),
+            retryable: error?.retryable === true,
+          },
+        });
+      });
   }
 
   #advanceCursor(entry, frame) {

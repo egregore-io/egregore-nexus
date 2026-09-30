@@ -179,6 +179,7 @@ async fn concrete_acp_adapters_deliver_unique_markers_once_without_cross_runtime
                     summary: None,
                     body: marker.into(),
                     mention: vec![],
+                    metadata: None,
                     idempotency_key: Some(format!("parity-{name}")),
                 },
             )
@@ -294,6 +295,7 @@ async fn concrete_acp_adapter_provider_and_contract_errors_never_settle_delivere
                         summary: None,
                         body: format!("ERROR-MARKER-{token}-{expected_code}"),
                         mention: vec![],
+                        metadata: None,
                         idempotency_key: None,
                     },
                 )

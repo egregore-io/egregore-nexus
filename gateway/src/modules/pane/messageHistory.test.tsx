@@ -26,12 +26,29 @@ describe("Gateway message history", () => {
 
   it("maps canonical rows into attributed pane rows", () => {
     expect(historyRowsToPaneMessages([
-      { messageId: "m1", from: "alex", body: "hello", when: 1 },
+      { messageId: "m1", from: "alex", fromKind: "human", body: "hello", when: 1 },
       { messageId: "m2", from: "ada", body: "hi", when: 2 },
     ], { who: "alex", glyph: "E" })).toMatchObject([
-      { id: "m1", who: "alex", isYou: true },
+      { id: "m1", who: "alex", chip: "you", isYou: true },
       { id: "m2", who: "ada", chip: "agent" },
     ]);
+  });
+
+  it("renders a canonical human sender as human when no local self name is available", () => {
+    const [row] = historyRowsToPaneMessages([
+      {
+        messageId: "m-human",
+        from: "browser-user",
+        fromKind: "human",
+        body: "hello from the browser",
+      },
+    ]);
+    expect(row).toMatchObject({
+      id: "m-human",
+      who: "browser-user",
+      chip: "human",
+    });
+    expect(row).not.toHaveProperty("isYou");
   });
 
   it("loads latest once, then waits from the opaque cursor without opening a socket", async () => {

@@ -16,6 +16,7 @@ use nexus_contracts::{
     SpawnResponse, SteerCapability, SteerDelivery, SteerResponse, WsEvent,
 };
 
+use crate::active_turns::ActiveTurnTracker;
 use crate::adapter::engine::LaunchCtx;
 use crate::adapter::{Adapter, StreamEvent};
 use crate::error::AgentError;
@@ -43,6 +44,7 @@ pub struct Agent {
     identity: Arc<dyn IdentityPort>,
     events: Arc<dyn EventSink>,
     sessions: Arc<Mutex<HashMap<SessionId, SessionEntry>>>,
+    active_turns: ActiveTurnTracker,
 }
 
 impl Agent {
@@ -59,6 +61,7 @@ impl Agent {
             identity,
             events,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            active_turns: ActiveTurnTracker::default(),
         }
     }
 
@@ -248,6 +251,7 @@ impl Agent {
             );
             InjectError::Contract(to_contract(e))
         })?;
+        let _active_turn = self.active_turns.begin(recipient);
         relay_turn(
             adapter,
             self.events.clone(),
@@ -482,16 +486,21 @@ impl AgentTurnExecutionPort for Agent {
         })?;
         let events = self.events.clone();
         let recipient = recipient.clone();
+        let active_turn = self.active_turns.begin(&recipient);
         // Source=DirectDrive: the operator's typed input is echoed as `user_input` on the session
         // stream so the web console and `nexus attach` TUI mirror each other.
-        tokio::spawn(relay_turn(
-            adapter,
-            events,
-            recipient,
-            text,
-            InjectSource::DirectDrive,
-            None,
-        ));
+        tokio::spawn(async move {
+            let _active_turn = active_turn;
+            let _ = relay_turn(
+                adapter,
+                events,
+                recipient,
+                text,
+                InjectSource::DirectDrive,
+                None,
+            )
+            .await;
+        });
         Ok(())
     }
 
@@ -506,14 +515,19 @@ impl AgentTurnExecutionPort for Agent {
         let adapter = self.adapter_for(recipient).map_err(to_contract)?;
         let events = self.events.clone();
         let recipient = recipient.clone();
-        tokio::spawn(relay_turn(
-            adapter,
-            events,
-            recipient,
-            text,
-            InjectSource::Bus,
-            Some(accepted_event),
-        ));
+        let active_turn = self.active_turns.begin(&recipient);
+        tokio::spawn(async move {
+            let _active_turn = active_turn;
+            let _ = relay_turn(
+                adapter,
+                events,
+                recipient,
+                text,
+                InjectSource::Bus,
+                Some(accepted_event),
+            )
+            .await;
+        });
         Ok(())
     }
 
@@ -521,6 +535,15 @@ impl AgentTurnExecutionPort for Agent {
         self.adapter_for(recipient)
             .map(|adapter| adapter.steer_capability())
             .unwrap_or(SteerCapability::None)
+    }
+
+    fn active_turn_sessions(&self) -> Vec<SessionId> {
+        self.active_turns.sessions()
+    }
+
+    async fn wait_for_turn_completion(&self, recipient: &SessionId) -> Result<(), ContractError> {
+        self.active_turns.wait_for_completion(recipient).await;
+        Ok(())
     }
 
     async fn interrupt_active_turn(&self, recipient: &SessionId) -> Result<(), ContractError> {

@@ -6,10 +6,12 @@ import {
   COMMAND_KINDS,
   enqueueCommandIntent,
   submitCommandIntent,
+  type CommandIngressOptions,
 } from "./ingress";
 import { localOperatorCaller } from "@server/auth/webAuthMode";
 import { migrateGatewayStore } from "@server/store/migrations";
 import { DaemonIpcError } from "@server/daemon/ipc";
+import { Kind, Tier } from "@shared/types";
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS command_intents (
@@ -78,6 +80,222 @@ async function complete(db: Client, commandId: string, result: unknown): Promise
 }
 
 describe("submitCommandIntent", () => {
+  it("rebinds a persisted human once per daemon boot before durable acceptance", async () => {
+    const calls: Array<{
+      mode: "command" | "enqueue";
+      kind: string;
+      request: unknown;
+      caller: unknown;
+    }> = [];
+    let daemonBootId = "boot_2";
+    let registrations = 0;
+    const options = {
+      daemonBootId: async () => daemonBootId,
+      daemonCommand: async (kind: string, request: unknown, caller: unknown) => {
+        calls.push({ mode: "command", kind, request, caller });
+        registrations += 1;
+        return {
+          sessionId: `s_rebound_${registrations}`,
+          agentId: "a_human_fixture",
+        };
+      },
+      daemonEnqueue: async (kind: string, request: unknown, caller: unknown) => {
+        calls.push({ mode: "enqueue", kind, request, caller });
+        return {
+          commandId: `cmd_prompt_${calls.length}`,
+          status: "pending",
+          createdAt: 1_000,
+          revision: 1,
+          sessionId: "s_target",
+          seq: calls.length,
+        };
+      },
+    } as unknown as CommandIngressOptions;
+    const persistedHuman = {
+      id: "human:default:nexus_ck_human",
+      name: "test-user",
+      project: "default",
+      kind: Kind.Human,
+      tier: Tier.Admin,
+      credentialFacet: "human" as const,
+      sessionId: "s_from_previous_boot",
+      runtimeId: "s_from_previous_boot",
+      clientKey: "nexus_ck_human",
+    };
+
+    await enqueueCommandIntent(
+      COMMAND_KINDS.harnessPrompt,
+      { name: "fable", agentId: "a_fable", text: "first" },
+      persistedHuman,
+      options,
+    );
+    expect(calls).toEqual([
+      expect.objectContaining({
+        mode: "command",
+        kind: COMMAND_KINDS.identityRegister,
+        request: expect.objectContaining({
+          name: "test-user",
+          project: "default",
+          clientKey: "nexus_ck_human",
+          kind: "human",
+        }),
+      }),
+      expect.objectContaining({
+        mode: "enqueue",
+        kind: COMMAND_KINDS.harnessPrompt,
+        request: expect.objectContaining({
+          name: "fable",
+          agentId: "a_fable",
+        }),
+        caller: expect.objectContaining({
+          sessionId: "s_rebound_1",
+          runtimeId: "s_rebound_1",
+          clientKey: "nexus_ck_human",
+          kind: "human",
+        }),
+      }),
+    ]);
+    expect(calls[1]!.caller).not.toHaveProperty("agentId");
+
+    calls.length = 0;
+    await enqueueCommandIntent(
+      COMMAND_KINDS.harnessPrompt,
+      { name: "fable", text: "same boot" },
+      persistedHuman,
+      options,
+    );
+    expect(calls).toEqual([
+      expect.objectContaining({
+        mode: "enqueue",
+        kind: COMMAND_KINDS.harnessPrompt,
+        caller: expect.objectContaining({ sessionId: "s_rebound_1" }),
+      }),
+    ]);
+
+    calls.length = 0;
+    daemonBootId = "boot_3";
+    await enqueueCommandIntent(
+      COMMAND_KINDS.harnessPrompt,
+      { name: "fable", text: "next boot" },
+      persistedHuman,
+      options,
+    );
+    expect(calls).toEqual([
+      expect.objectContaining({ mode: "command", kind: COMMAND_KINDS.identityRegister }),
+      expect.objectContaining({
+        mode: "enqueue",
+        kind: COMMAND_KINDS.harnessPrompt,
+        caller: expect.objectContaining({ sessionId: "s_rebound_2" }),
+      }),
+    ]);
+  });
+
+  it("coalesces concurrent first writes into one human rebind per daemon boot", async () => {
+    let releaseRegistration!: () => void;
+    const registrationReleased = new Promise<void>((resolve) => {
+      releaseRegistration = resolve;
+    });
+    let registrationStarted!: () => void;
+    const registrationObserved = new Promise<void>((resolve) => {
+      registrationStarted = resolve;
+    });
+    const daemonCommand = vi.fn(async () => {
+      registrationStarted();
+      await registrationReleased;
+      return { sessionId: "s_concurrent_human", agentId: "a_concurrent_human" };
+    });
+    let enqueueSeq = 0;
+    const daemonEnqueue = vi.fn(async (
+      _kind: string,
+      _request: unknown,
+      _caller: unknown,
+    ) => ({
+      commandId: `cmd_concurrent_${++enqueueSeq}`,
+      status: "pending",
+      createdAt: 1_000,
+      revision: 1,
+      sessionId: "s_target",
+      seq: enqueueSeq,
+    }));
+    const options = {
+      daemonBootId: async () => "boot_concurrent",
+      daemonCommand,
+      daemonEnqueue,
+    } as unknown as CommandIngressOptions;
+    const caller = {
+      id: "human:default:nexus_ck_concurrent_human",
+      name: "concurrent-human",
+      project: "default",
+      kind: Kind.Human,
+      tier: Tier.Admin,
+      credentialFacet: "human" as const,
+      sessionId: "s_previous_boot",
+      runtimeId: "s_previous_boot",
+      clientKey: "nexus_ck_concurrent_human",
+    };
+
+    const first = enqueueCommandIntent(
+      COMMAND_KINDS.harnessPrompt,
+      { name: "fable", text: "first concurrent write" },
+      caller,
+      options,
+    );
+    await registrationObserved;
+    const second = enqueueCommandIntent(
+      COMMAND_KINDS.harnessPrompt,
+      { name: "fable", text: "second concurrent write" },
+      caller,
+      options,
+    );
+    await vi.waitFor(() => expect(daemonCommand).toHaveBeenCalledTimes(1));
+    releaseRegistration();
+
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+    expect(daemonCommand).toHaveBeenCalledTimes(1);
+    expect(daemonEnqueue).toHaveBeenCalledTimes(2);
+    for (const call of daemonEnqueue.mock.calls) {
+      expect(call[2]).toEqual(expect.objectContaining({
+        sessionId: "s_concurrent_human",
+        runtimeId: "s_concurrent_human",
+        clientKey: "nexus_ck_concurrent_human",
+        kind: "human",
+      }));
+      expect(call[2]).not.toHaveProperty("agentId");
+    }
+  });
+
+  it("fails before durable acceptance when the human rebind cannot reach the daemon", async () => {
+    const daemonEnqueue = vi.fn(async () => ({
+      commandId: "cmd_must_not_exist",
+      status: "pending",
+      createdAt: 1_000,
+      revision: 1,
+      seq: 1,
+    }));
+
+    await expect(enqueueCommandIntent(
+      COMMAND_KINDS.harnessPrompt,
+      { name: "fable", text: "do not accept this" },
+      {
+        name: "remote-human",
+        project: "default",
+        kind: Kind.Human,
+        tier: Tier.Admin,
+        credentialFacet: "human",
+        sessionId: "s_stale",
+        clientKey: "nexus_ck_unreachable_human",
+      },
+      {
+        daemonBootId: async () => {
+          throw new DaemonIpcError("Nexus daemon IPC endpoint is unavailable");
+        },
+        daemonEnqueue,
+      },
+    )).rejects.toMatchObject({ code: 503 });
+
+    expect(daemonEnqueue).not.toHaveBeenCalled();
+  });
+
   it("settles Gateway-local idempotency around daemon IPC and replays the original result", async () => {
     const ingressDb = createClient({ url: ":memory:" });
     await migrateGatewayStore(ingressDb);
