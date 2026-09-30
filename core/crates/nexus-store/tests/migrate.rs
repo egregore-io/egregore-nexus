@@ -70,6 +70,8 @@ async fn fresh_store_creates_one_complete_named_baseline_and_reopens_idempotentl
             (1, "v0.1.0_baseline".into()),
             (2, "v0.1.5_message_hooks".into()),
             (3, "v0.1.5_delivery_timing".into()),
+            (4, "v0.1.6_caller_principal".into()),
+            (5, "v0.1.6_caller_authority".into()),
         ]
     );
 }
@@ -109,17 +111,21 @@ async fn baseline_contains_current_identity_routing_and_delivery_columns() {
         ("subscriptions", "subscriber_agent_id"),
         ("command_intents", "caller_agent_id"),
         ("command_intents", "caller_runtime_id"),
+        ("command_intents", "caller_principal_id"),
         ("command_intents", "idempotency_key"),
         ("command_intents", "revision"),
         ("developer_events", "data_json"),
         ("agent_acl_grants", "principal_agent_id"),
         ("agent_acl_grants", "granted_by_agent_id"),
         ("initial_prompt_deliveries", "client_message_id"),
+        ("native_thread_bindings", "provider"),
+        ("native_thread_bindings", "kind"),
         ("inbox_subscription_batches", "message_signature"),
         ("native_thread_bindings", "native_thread_id"),
         ("producer_identities", "producer_id"),
         ("transcript_archive", "archive_offset"),
         ("reply_contexts", "recipient_key"),
+        ("command_intents", "caller_validated_boot_epoch"),
     ] {
         assert!(
             column_exists(&store, table, column).await,
@@ -145,6 +151,14 @@ async fn public_v010_baseline_upgrades_to_message_hook_schema_without_losing_row
         .await
         .unwrap();
     store.conn.execute_batch(PUBLIC_V010_SCHEMA).await.unwrap();
+    store
+        .conn
+        .execute_batch(
+            "ALTER TABLE command_intents DROP COLUMN caller_principal_id;
+             ALTER TABLE command_intents DROP COLUMN caller_validated_boot_epoch;",
+        )
+        .await
+        .unwrap();
     store
         .conn
         .execute(
@@ -175,12 +189,16 @@ async fn public_v010_baseline_upgrades_to_message_hook_schema_without_losing_row
             (1, "v0.1.0_baseline".into()),
             (2, "v0.1.5_message_hooks".into()),
             (3, "v0.1.5_delivery_timing".into()),
+            (4, "v0.1.6_caller_principal".into()),
+            (5, "v0.1.6_caller_authority".into()),
         ]
     );
     assert!(column_exists(&store, "messages", "mention_json").await);
     assert!(view_column_exists(&store, "nexus_broadcast_ingress", "metadata_json").await);
     assert!(view_column_exists(&store, "nexus_broadcast_ingress", "mention_json").await);
     assert!(view_column_exists(&store, "nexus_broadcast_ingress", "delivery_timing").await);
+    assert!(column_exists(&store, "command_intents", "caller_principal_id").await);
+    assert!(column_exists(&store, "command_intents", "caller_validated_boot_epoch").await);
     assert_eq!(
         single_text(
             &store,
@@ -188,6 +206,72 @@ async fn public_v010_baseline_upgrades_to_message_hook_schema_without_losing_row
         )
         .await,
         "preserve-me"
+    );
+}
+
+#[tokio::test]
+async fn published_v015_caller_validation_upgrades_to_combined_authority() {
+    let store = seeded_v4_caller_store(
+        "v0.1.5_caller_validation",
+        "caller_principal_id",
+        "caller_validated_boot_epoch",
+        "boot_beta",
+    )
+    .await;
+
+    store.migrate().await.unwrap();
+
+    assert!(column_exists(&store, "command_intents", "caller_principal_id").await);
+    assert_eq!(
+        single_text(
+            &store,
+            "SELECT caller_validated_boot_epoch FROM command_intents WHERE command_id = 'cmd_v4'"
+        )
+        .await,
+        "boot_beta"
+    );
+    assert_eq!(
+        schema_rows(&store).await,
+        vec![
+            (1, "v0.1.0_baseline".into()),
+            (2, "v0.1.5_message_hooks".into()),
+            (3, "v0.1.5_delivery_timing".into()),
+            (4, "v0.1.5_caller_validation".into()),
+            (5, "v0.1.6_caller_authority".into()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn published_v016_caller_principal_upgrades_to_combined_authority() {
+    let store = seeded_v4_caller_store(
+        "v0.1.6_caller_principal",
+        "caller_validated_boot_epoch",
+        "caller_principal_id",
+        "h_external",
+    )
+    .await;
+
+    store.migrate().await.unwrap();
+
+    assert!(column_exists(&store, "command_intents", "caller_validated_boot_epoch").await);
+    assert_eq!(
+        single_text(
+            &store,
+            "SELECT caller_principal_id FROM command_intents WHERE command_id = 'cmd_v4'"
+        )
+        .await,
+        "h_external"
+    );
+    assert_eq!(
+        schema_rows(&store).await,
+        vec![
+            (1, "v0.1.0_baseline".into()),
+            (2, "v0.1.5_message_hooks".into()),
+            (3, "v0.1.5_delivery_timing".into()),
+            (4, "v0.1.6_caller_principal".into()),
+            (5, "v0.1.6_caller_authority".into()),
+        ]
     );
 }
 
@@ -300,6 +384,72 @@ async fn named_baseline_with_missing_required_object_fails_closed() {
         "unexpected error: {error}"
     );
     assert!(error.contains("messages"), "unexpected error: {error}");
+}
+
+async fn seeded_v4_caller_store(
+    marker: &str,
+    drop_column: &str,
+    authority_column: &str,
+    authority_value: &str,
+) -> Store {
+    const BASELINE: &str = include_str!("../../../migrations/0001_init.sql");
+    const MESSAGE_HOOKS: &str = include_str!("../../../migrations/0002_message_hooks.sql");
+    const DELIVERY_TIMING: &str = include_str!("../../../migrations/0003_delivery_timing.sql");
+
+    let store = Store::open(":memory:").await.unwrap();
+    store
+        .conn
+        .execute_batch(
+            "CREATE TABLE schema_migrations (
+               version INTEGER PRIMARY KEY,
+               name TEXT NOT NULL,
+               applied_at INTEGER NOT NULL
+             );",
+        )
+        .await
+        .unwrap();
+    store.conn.execute_batch(BASELINE).await.unwrap();
+    store.conn.execute_batch(MESSAGE_HOOKS).await.unwrap();
+    store.conn.execute_batch(DELIVERY_TIMING).await.unwrap();
+    store
+        .conn
+        .execute(
+            &format!("ALTER TABLE command_intents DROP COLUMN {drop_column}"),
+            (),
+        )
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute_batch(
+            "INSERT INTO schema_migrations VALUES (1, 'v0.1.0_baseline', 1);
+             INSERT INTO schema_migrations VALUES (2, 'v0.1.5_message_hooks', 2);
+             INSERT INTO schema_migrations VALUES (3, 'v0.1.5_delivery_timing', 3);",
+        )
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO schema_migrations VALUES (4, ?1, 4)",
+            libsql::params![marker],
+        )
+        .await
+        .unwrap();
+    store
+        .conn
+        .execute(
+            &format!(
+                "INSERT INTO command_intents (
+                   command_id, kind, status, project, caller_name, {authority_column},
+                   request_json, created_at
+                 ) VALUES ('cmd_v4', 'test.intent', 'pending', 'default', 'caller', ?1, '{{}}', 5)"
+            ),
+            libsql::params![authority_value],
+        )
+        .await
+        .unwrap();
+    store
 }
 
 async fn object_exists(store: &Store, kind: &str, name: &str) -> bool {

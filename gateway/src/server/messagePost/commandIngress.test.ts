@@ -3,7 +3,7 @@ import { createClient, type Client } from "@libsql/client";
 
 import { sendViaCommandIngress } from "./commandIngress";
 import type { GatewayCallerIdentity } from "@server/api/http";
-import type { SendRequest } from "@shared/types";
+import { Kind, Locality, Tier, type SendRequest } from "@shared/types";
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS command_intents (
@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS command_intents (
   caller_agent_id   TEXT,
   caller_runtime_id TEXT,
   caller_client_key TEXT,
+  caller_principal_id TEXT,
   caller_kind       TEXT,
   caller_tier       TEXT,
   idempotency_key   TEXT,
@@ -103,7 +104,7 @@ describe("sendViaCommandIngress", () => {
       caller_agent_id: null,
       caller_runtime_id: "s_human",
       caller_client_key: "ck_human",
-      caller_kind: "human",
+      caller_kind: "local.human",
       caller_tier: "admin",
       attempts: 0,
       created_at: 1_000,
@@ -220,5 +221,71 @@ describe("sendViaCommandIngress", () => {
       code: 401,
       message: expect.stringContaining("logged-in human"),
     });
+  });
+
+  it("accepts a gateway-bound external human principal without a native client key", async () => {
+    const db = await makeDb();
+    const external: GatewayCallerIdentity = {
+      name: "outside-user",
+      project: "default",
+      sessionId: "transport:telegram",
+      kind: Kind.Human,
+      locality: Locality.External,
+      access: "guest",
+      principalId: "x_outside",
+      tier: Tier.Agent,
+      credentialFacet: "source",
+    };
+
+    await expect(sendViaCommandIngress(req, external, {
+      db,
+      genCommandId: () => "cmd_external_transport",
+      now: () => 1_000,
+      sleep: async () => {
+        await complete(db, "cmd_external_transport", { messageId: "m_external", fanout: 1 });
+      },
+    })).resolves.toEqual({ messageId: "m_external" });
+
+    const row = (await db.execute(
+      "SELECT caller_session_id, caller_client_key, caller_principal_id, caller_kind " +
+      "FROM command_intents WHERE command_id = 'cmd_external_transport'",
+    )).rows[0];
+    expect(row).toMatchObject({
+      caller_session_id: "transport:telegram",
+      caller_client_key: null,
+      caller_principal_id: "x_outside",
+      caller_kind: "external.human",
+    });
+  });
+
+  it.each([
+    ["external agent", { kind: Kind.Agent }],
+    ["local kind", { locality: Locality.Local }],
+    ["trusted kind", { locality: Locality.Trusted }],
+    ["local principal", { principalId: "h_local" }],
+    ["non-transport session", { sessionId: "source:telegram" }],
+    ["non-source facet", { credentialFacet: "human" as const }],
+    ["agent-shaped caller", { agentId: "a_intruder" }],
+    ["wrong access", { access: "admin" }],
+    ["wrong tier", { tier: Tier.Admin }],
+    ["mismatched runtime", { runtimeId: "transport:other" }],
+  ])("rejects a client-key-less %s before command mutation", async (_label, changed) => {
+    const db = await makeDb();
+    const external: GatewayCallerIdentity = {
+      name: "outside-user",
+      project: "default",
+      sessionId: "transport:telegram",
+      kind: Kind.Human,
+      locality: Locality.External,
+      access: "guest",
+      principalId: "x_outside",
+      tier: Tier.Agent,
+      credentialFacet: "source",
+      ...changed,
+    };
+
+    await expect(sendViaCommandIngress(req, external, { db })).rejects.toMatchObject({ code: 401 });
+    const rows = await db.execute("SELECT COUNT(*) AS count FROM command_intents");
+    expect(Number(rows.rows[0]!.count)).toBe(0);
   });
 });

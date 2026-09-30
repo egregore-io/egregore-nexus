@@ -255,6 +255,8 @@ mod tests {
             provenance: Provenance {
                 from: from.into(),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,

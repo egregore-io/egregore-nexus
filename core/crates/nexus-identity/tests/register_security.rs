@@ -47,6 +47,8 @@ fn register_request(name: &str, client_key: &str) -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Agent,
         kind: None,
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -211,7 +213,8 @@ async fn native_exact_agent_reconnect_accepts_a_stale_pre_rename_name() {
     .await;
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "claude".into(),
+            provider: "claude".into(),
+            kind: "harness".into(),
             native_thread_id: "native-renamed-thread".into(),
             agent_id: agent_id.0.clone(),
             project: "p_demo".into(),
@@ -487,7 +490,8 @@ async fn native_binding_never_selects_a_last_runtime_owned_by_another_agent() {
     .await;
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "claude".into(),
+            provider: "claude".into(),
+            kind: "harness".into(),
             native_thread_id: "native-cross-owner".into(),
             agent_id: alpha_agent.clone(),
             project: "p_demo".into(),
@@ -704,7 +708,8 @@ async fn register_rejects_native_resume_key_claimed_by_different_identity() {
     let kai_agent = kai.agent_id.as_ref().expect("agent id").0.clone();
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "claude".into(),
+            provider: "claude".into(),
+            kind: "harness".into(),
             native_thread_id: "claude-native-fork".into(),
             agent_id: kai_agent.clone(),
             project: "p_demo".into(),
@@ -748,7 +753,8 @@ async fn register_rejects_native_resume_key_with_mismatched_client_key() {
     let kai_agent = kai.agent_id.as_ref().expect("agent id").0.clone();
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "claude".into(),
+            provider: "claude".into(),
+            kind: "harness".into(),
             native_thread_id: "claude-native-kai".into(),
             agent_id: kai_agent,
             project: "p_demo".into(),
@@ -855,6 +861,9 @@ fn caller_for(session: &SessionId, name: &str) -> Caller {
         name: name.into(),
         project: "p_demo".into(),
         tier: Tier::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 

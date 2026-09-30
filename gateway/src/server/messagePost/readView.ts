@@ -12,6 +12,7 @@ import { getReadDb } from "@drizzle/client";
 import { getGatewayStore } from "@server/store/client";
 import { gatewayChangeBus, type GatewayChangeBus } from "@server/store/changeBus";
 import { Kind, Scope, type Message, type SendTarget } from "@shared/types";
+import { parseEntityKind } from "@server/identity/entityKind";
 
 export interface MessagePostTailOptions {
   after: number;
@@ -318,12 +319,13 @@ function canonicalRowToMessage(row: Row): MessagePostMessage {
   const createdAt = Number(row.created_at);
   const rawProvenance = parseCanonicalProvenance(row.provenance_json);
   const from = row.from_name === null ? "" : String(row.from_name);
+  const entityKind = parseEntityKind(rawProvenance.kind ?? Kind.Agent, rawProvenance.locality);
   const provenance: Message["provenance"] = {
     ...rawProvenance,
     from: typeof rawProvenance.from === "string" ? rawProvenance.from : from,
-    kind: typeof rawProvenance.kind === "string"
-      ? rawProvenance.kind as Message["provenance"]["kind"]
-      : Kind.Agent,
+    kind: entityKind.kind,
+    locality: entityKind.locality,
+    ...(typeof rawProvenance.access === "string" ? { access: rawProvenance.access } : {}),
   };
   return {
     id: String(row.message_id),

@@ -245,7 +245,8 @@ pub(crate) async fn persist_codex_thread_binding_once(
     };
     NativeThreadBindings::new(store.as_ref())
         .claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: thread_id.to_string(),
             agent_id,
             project: row.project,
@@ -361,7 +362,7 @@ pub(crate) fn codex_resume_session_owner_matches(
 }
 
 pub(crate) fn protected_remove_target(row: &SessionRow) -> bool {
-    row.kind == kind_token(Kind::Human)
+    row.is_human()
         || row.tier == tier_token(Tier::Admin)
         || row
             .role

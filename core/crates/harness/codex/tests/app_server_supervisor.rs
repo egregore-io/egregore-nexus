@@ -100,7 +100,7 @@ async fn dropping_supervisor_reaps_owned_app_server_process_group() {
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,
@@ -151,12 +151,13 @@ async fn dropping_supervisor_reaps_owned_app_server_process_group() {
 #[tokio::test]
 async fn start_waits_until_initialize_round_trips() {
     let dir = tempdir("supervisor");
+    let machine_home = tempdir("supervisor-machine-home");
 
     let opts = SupervisorOpts {
         // The fake binary accepts the same native app-server listen shape as real Codex.
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(machine_home.clone()),
         model: Some("gpt-5".to_string()),
         bus_mcp: None,
         cwd: None,
@@ -190,13 +191,11 @@ async fn start_waits_until_initialize_round_trips() {
         drop(client);
     }
 
-    // config.toml is copied into CODEX_HOME by the supervisor. Nexus runtime settings such as the
-    // model are passed as argv overrides, not persisted into this file.
-    let config_path = dir.join("codex-home").join("config.toml");
+    // The session directory is runtime-only. Authentication and provider configuration remain in
+    // the explicitly selected machine-owned Codex home.
     assert!(
-        config_path.exists(),
-        "config.toml should have been seeded at {:?}",
-        config_path
+        !dir.join("codex-home").exists(),
+        "launch must not create a session-local Codex home"
     );
 
     let pid_path = dir.join("app-server.pid");
@@ -215,6 +214,7 @@ async fn start_waits_until_initialize_round_trips() {
     );
 
     cleanup(&dir);
+    cleanup(&machine_home);
 }
 
 #[cfg(unix)]
@@ -225,7 +225,7 @@ async fn start_adopts_existing_app_server_socket_without_owning_process() {
     let opts = SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: Some("gpt-5".to_string()),
         bus_mcp: None,
         cwd: None,
@@ -256,7 +256,7 @@ async fn start_runs_app_server_in_requested_cwd() {
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: Some(launch_cwd.clone()),

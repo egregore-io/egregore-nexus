@@ -10,12 +10,12 @@ import { createClient, type Client } from "@libsql/client";
 import { initSchema } from "@server/conversation/store";
 import { seedDb } from "@drizzle/__mocks__/seedDb";
 import { registerHuman } from "@server/identity/human";
-import { issueBearerToken } from "@server/identity/bearer";
+import { currentBearer, issueBearerToken } from "@server/identity/bearer";
 import type { CommandIntentSender, MessagePostSender } from "@server/api/http";
 import { AGENT_ATTACH_SCOPE } from "@server/auth/principal";
 import { localOperatorCaller } from "@server/auth/webAuthMode";
 import { migrateGatewayStore } from "@server/store/migrations";
-import { Kind, Tier } from "@shared/types";
+import { Kind, Locality, Tier } from "@shared/types";
 // The chokepoint must expose a `makeDispatch` factory for DI; we test that.
 import { makeDispatch } from "./$";
 
@@ -33,6 +33,38 @@ async function makeDb(): Promise<Client> {
   return db;
 }
 
+it("preserves dotted bearer locality through the stored caller evidence", async () => {
+  const db = await makeDb();
+  let id = 0;
+  const deps = {
+    db,
+    now: () => 2_000_000,
+    genId: () => `external_${++id}`,
+    randomSecret: (prefix: string) => `${prefix}_secret_${++id}`,
+  };
+  const issued = await issueBearerToken(
+    {
+      actor: {
+        name: "outside",
+        project: "default",
+        kind: Kind.Human,
+        locality: Locality.External,
+        tier: Tier.Admin,
+        scopes: ["message:read"],
+      },
+      scopes: ["message:read"],
+    },
+    deps,
+  );
+  await expect(currentBearer(issued.accessToken, deps)).resolves.toMatchObject({
+    kind: Kind.Human,
+    locality: Locality.External,
+  });
+  expect((await db.execute("SELECT actor_kind FROM rest_bearer_token")).rows[0]?.actor_kind)
+    .toBe("external.human");
+  db.close();
+});
+
 const COMMAND_DDL = `
 CREATE TABLE IF NOT EXISTS command_intents (
   command_id        TEXT PRIMARY KEY,
@@ -44,6 +76,7 @@ CREATE TABLE IF NOT EXISTS command_intents (
   caller_agent_id   TEXT,
   caller_runtime_id TEXT,
   caller_client_key TEXT,
+  caller_principal_id TEXT,
   caller_kind       TEXT,
   caller_tier       TEXT,
   idempotency_key   TEXT,
@@ -226,7 +259,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
       caller_session_id: "sess_mock_chokepoint",
       caller_agent_id: null,
       caller_runtime_id: "sess_mock_chokepoint",
-      caller_kind: "human",
+      caller_kind: "local.human",
       caller_tier: "admin",
       idempotency_key: "web:post:backend:client-1",
     });
@@ -369,6 +402,41 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
     canonicalDb.close();
   });
 
+  it("warms the exact stable agent when an authorized canonical session lane reconnects", async () => {
+    const canonicalDb = await makeCanonicalDb();
+    await canonicalDb.batch([
+      `INSERT INTO identities VALUES
+        ('a_target','current-target','old-owner-name','agent','agent',
+         '{"ownerAgentId":"a_owner"}',1)`,
+      `INSERT INTO runtime_descriptors VALUES
+        ('r_target','a_target','s_target','codex','headless',NULL,NULL,NULL,'offline',2)`,
+    ], "write");
+    const submit = vi.fn(async () => ({ warmed: true }));
+    const commands: CommandIntentSender = {
+      submit: submit as CommandIntentSender["submit"],
+    };
+    const dispatch = makeDispatch({
+      db: async () => db,
+      canonicalDb: () => canonicalDb,
+      authMode: "local",
+      commands,
+    });
+
+    const response = await dispatch(new Request(
+      "http://localhost/api/v1/agent-sessions/s_target/events?view=agui",
+    ));
+
+    expect(response.status).toBe(200);
+    await vi.waitFor(() => expect(submit).toHaveBeenCalledOnce());
+    expect(submit).toHaveBeenCalledWith(
+      "harness.warm",
+      { name: "current-target", agentId: "a_target" },
+      localOperatorCaller(),
+    );
+    await response.body?.cancel();
+    canonicalDb.close();
+  });
+
   it("does not let a mutable owner-name match override a different stable owner id", async () => {
     const canonicalDb = await makeCanonicalDb();
     await canonicalDb.batch([
@@ -399,11 +467,16 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
         randomSecret: (prefix) => `${prefix}_secret_${++idSeq}`,
       },
     );
+    const submit = vi.fn(async () => ({ warmed: true }));
+    const commands: CommandIntentSender = {
+      submit: submit as CommandIntentSender["submit"],
+    };
     const dispatch = makeDispatch({
       db: async () => db,
       canonicalDb: () => canonicalDb,
       authMode: "remote",
       now: () => 2_000_000,
+      commands,
     });
 
     const response = await dispatch(new Request(
@@ -415,6 +488,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
     await expect(response.json()).resolves.toEqual({
       error: { code: "forbidden", message: "agent session owner required" },
     });
+    expect(submit).not.toHaveBeenCalled();
     canonicalDb.close();
   });
 
@@ -784,7 +858,7 @@ describe("/api/v1/$ chokepoint — cookie→_caller wiring", () => {
       caller_session_id: "local-operator",
       caller_runtime_id: "local-operator",
       caller_client_key: null,
-      caller_kind: "human",
+      caller_kind: "local.human",
       caller_tier: "admin",
     });
   });

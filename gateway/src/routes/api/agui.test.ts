@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS command_intents (
   caller_agent_id   TEXT,
   caller_runtime_id TEXT,
   caller_client_key TEXT,
+  caller_principal_id TEXT,
   caller_kind       TEXT,
   caller_tier       TEXT,
   idempotency_key   TEXT,
@@ -152,7 +153,7 @@ describe("/api/agui route wiring", () => {
       caller_session_id: "sess_agui_human",
       caller_agent_id: null,
       caller_runtime_id: "sess_agui_human",
-      caller_kind: "human",
+      caller_kind: "local.human",
       caller_tier: "admin",
     });
     expect(JSON.parse(String(row.request_json))).toEqual({
@@ -199,7 +200,7 @@ describe("/api/agui route wiring", () => {
       caller_session_id: "local-operator",
       caller_runtime_id: "local-operator",
       caller_client_key: null,
-      caller_kind: "human",
+      caller_kind: "local.human",
       caller_tier: "admin",
     });
   });

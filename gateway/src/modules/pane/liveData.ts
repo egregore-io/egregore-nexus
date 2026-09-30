@@ -40,7 +40,6 @@ export interface AdminRow {
   name: string;
   presence: PresenceValue;
   harness: string;
-  role: string;
   tier: string;
   status: string;
 }
@@ -184,7 +183,6 @@ export function useAdminAgents(): { rows: AdminRow[]; isLoading: boolean } {
       name: m.name,
       presence: presenceOf(m.presence),
       harness: m.agent ?? "—",
-      role: m.role ?? "agent",
       tier: m.tier ?? "agent",
       status: presenceState(m),
     }));
@@ -213,7 +211,6 @@ export function useAgentFacts(name: string): { facts: Fact[]; isLoading: boolean
     ? [
         { dt: "Name", dd: m.name },
         { dt: "Harness", dd: m.agent ?? "—" },
-        { dt: "Role", dd: m.role ?? "agent" },
         { dt: "Status", dd: presenceState(m) },
       ]
     : [];
@@ -292,25 +289,6 @@ export function useAgentOp() {
           rows?.filter((row) => row.name !== name),
         );
       }
-    },
-  });
-}
-
-/**
- * Reassign an agent to a different project. POSTs to
- * `/api/v1/agents/:id/project`, where `:id` may be a stable agent id or current name, and
- * Project is metadata and is not part of the roster cache identity.
- */
-export function useAssignProject() {
-  return useMutation({
-    mutationFn: async ({ name, project }: { name: string; project: string }) => {
-      const res = await gatewayFetch(`/api/v1/agents/${encodeURIComponent(name)}/project`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ project }),
-      });
-      if (!res.ok) throw new Error(`assign-project → HTTP ${res.status}`);
-      return res.json();
     },
   });
 }

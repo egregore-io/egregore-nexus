@@ -216,8 +216,6 @@ endpoints enqueue daemon command intents unless explicitly marked as not impleme
 | PATCH | `/agents/:id/metadata` | Replace an agent's opaque metadata bag. Body: `{ "metadata": <any JSON> }`; `:id` may be `agentId` or name. | command intent: `metadata.set` |
 | POST | `/agents` | Spawn an agent (admin). | command intent: `admin.spawn` |
 | DELETE | `/agents/:id` | Remove/detach, evict, or delete an agent by stable `agentId` or current name (admin). Remove retains history, marks the resolved session offline immediately, and releases harness-native resume ownership. Query: `kill`, `evict`, `delete`. | command intent: `admin.remove` / `admin.evict` / `admin.delete` |
-| POST | `/agents/:id/role` | Set an agent's label role (admin). | command intent: `admin.assign_role` |
-| POST | `/agents/:id/project` | Move an agent to a project (admin). | command intent: `admin.assign_project` |
 | POST | `/agents/:id/tier` | Grant or revoke an agent's durable privilege tier (`agent` / `admin`). Human-admin gated. | command intent: `admin.grant_tier` |
 | POST | `/agents/:id/access` | Grant delegated `/agent` session access. Body: `{ "principal": "...", "role": "viewer" \| "coOwner", "project": "..."? }`. | command intent: `agent.grant_access` |
 | DELETE | `/agents/:id/access/:principal` | Revoke delegated `/agent` session access. Query: `project` (defaults to caller project). | command intent: `agent.revoke_access` |
@@ -641,18 +639,15 @@ retried unless an operator explicitly requeues the delivery.
 `POST /agents` (admin spawn):
 
 ```jsonc
-{ "kind": "codex", "name": "dylan", "role": "worker", "cwd": "/repo", "project": "default" }
+{ "kind": "codex", "name": "dylan", "cwd": "/repo" }
 // kind required; the rest optional
 ```
 
 This spawns a runtime. It does not call `agent.create`; the daemon creates or reuses the durable
-identity behind the launch/spawn path.
-
-`POST /agents/:id/role` (admin):
-
-```jsonc
-{ "role": "lead" }                                   // required
-```
+identity behind the launch/spawn path. Project and display-role labels are consumer affordances,
+not transport identity. Store them as opaque consumer metadata through
+`PATCH /agents/:id/metadata` (for example under a consumer-owned `lens` key); they are neither
+accepted by this request nor promoted by `GET /agents/:id`.
 
 `POST /admin/channel`:
 

@@ -79,6 +79,8 @@ fn operator_request() -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Admin,
         kind: Some(Kind::Human),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -95,6 +97,8 @@ fn agent_request(name: &str, client_key: &str) -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Agent,
         kind: Some(Kind::Agent),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -388,6 +392,7 @@ async fn reclaimed_source_command_does_not_repeat_an_exhausted_revive() {
             caller_agent_id: operator.agent_id.as_ref().map(|id| id.0.clone()),
             caller_runtime_id: Some(operator.session_id.0.clone()),
             caller_client_key: Some("source-wake-operator-client".into()),
+            caller_principal_id: None,
             caller_kind: Some("human".into()),
             caller_tier: Some("admin".into()),
             idempotency_key: Some("source-terminal-reclaim-key".into()),

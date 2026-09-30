@@ -13,12 +13,12 @@
 //!    `rollout-*.jsonl` under `CODEX_HOME/sessions`.
 //! 4. Bind injection and forward notifications to Nexus.
 //!
-//! Explicit resume is different: Nexus finds the existing Codex home that already contains the
-//! requested thread rollout, starts `codex app-server` with that `CODEX_HOME`, and opens the TUI
-//! with `codex resume --remote ... <thread>`. It never copies rollout history into a fresh home.
+//! Explicit resume first checks the machine Codex home. A rollout found only in a legacy
+//! Nexus-owned session home is migrated into the machine home; an intentional external profile
+//! remains authoritative. Credentials and configuration are never copied.
 
 use std::collections::{HashMap, HashSet};
-use std::io::BufRead;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -27,12 +27,13 @@ use nexus_common::RuntimeProcessIds;
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::EventSink;
 use nexus_store::Store;
+use serde_json::Value;
 
 use super::approvals::AutoApprove;
 use super::client::CodexAppServerClient;
 use super::forwarder::{spawn_codex_forwarder_with_tool_observations, CodexToolObservationSink};
 use super::jsonrpc::CodexRpcError;
-use super::supervisor::{CodexAppServer, SupervisorOpts};
+use super::supervisor::{resolve_machine_codex_home_from_env, CodexAppServer, SupervisorOpts};
 use super::transport::CodexAppServerTransport;
 use crate::storage::{CodexRuntimeLaunch, CodexRuntimeStateRepo};
 
@@ -191,10 +192,26 @@ impl CodexBridge {
             create_thread_if_missing,
             tool_observations,
         } = options;
+        let await_binding = known_thread_id.is_some();
+
+        let canonical_home = match opts.codex_home.clone() {
+            Some(home) => home,
+            None => resolve_machine_codex_home_from_env(&opts.session_dir)
+                .map_err(CodexRpcError::Connect)?,
+        };
 
         if let Some(thread_id) = known_thread_id.as_deref() {
-            let Some(home) =
-                codex_home_with_thread(&opts.session_dir, &resume_codex_homes, thread_id)
+            let Some(home) = resolve_resume_codex_home(
+                &opts.session_dir,
+                &canonical_home,
+                &resume_codex_homes,
+                thread_id,
+            )
+            .map_err(|error| {
+                CodexRpcError::Connect(format!(
+                    "migrate codex rollout for thread {thread_id}: {error}"
+                ))
+            })?
             else {
                 return Err(CodexRpcError::Connect(format!(
                     "cannot resume codex thread {thread_id}: no rollout found under explicit resume homes, CODEX_HOME, ~/.codex, or Nexus codex session homes"
@@ -208,6 +225,8 @@ impl CodexBridge {
                 "codex bridge: resolved existing codex home for thread resume"
             );
             opts.codex_home = Some(home);
+        } else if opts.codex_home.is_none() {
+            opts.codex_home = Some(canonical_home);
         }
         let rollout_root = opts
             .codex_home
@@ -252,19 +271,36 @@ impl CodexBridge {
                     )
                     .await?;
                 } else {
-                    spawn_binding_task(
-                        self.handles.clone(),
-                        self.transport(),
-                        session.clone(),
-                        sock_path.clone(),
-                        rollout_root,
-                        desired_thread_id,
-                        resume_cwd,
-                        on_thread_discovered,
-                        runtime_store,
-                        events,
-                        tool_observations,
-                    );
+                    if await_binding {
+                        bind_thread(
+                            self.handles.clone(),
+                            self.transport(),
+                            session.clone(),
+                            sock_path.clone(),
+                            rollout_root,
+                            desired_thread_id,
+                            resume_cwd,
+                            on_thread_discovered,
+                            runtime_store,
+                            events,
+                            tool_observations,
+                        )
+                        .await?;
+                    } else {
+                        spawn_binding_task(
+                            self.handles.clone(),
+                            self.transport(),
+                            session.clone(),
+                            sock_path.clone(),
+                            rollout_root,
+                            desired_thread_id,
+                            resume_cwd,
+                            on_thread_discovered,
+                            runtime_store,
+                            events,
+                            tool_observations,
+                        );
+                    }
                 }
             }
             return Ok(sock_path);
@@ -357,6 +393,25 @@ impl CodexBridge {
                 self.kill(&session);
                 return Err(error);
             }
+        } else if await_binding {
+            if let Err(error) = bind_thread(
+                self.handles.clone(),
+                self.transport(),
+                session.clone(),
+                sock_path.clone(),
+                rollout_root,
+                known_thread_id,
+                resume_cwd,
+                on_thread_discovered,
+                runtime_store,
+                events,
+                tool_observations,
+            )
+            .await
+            {
+                self.kill(&session);
+                return Err(error);
+            }
         } else {
             spawn_binding_task(
                 self.handles.clone(),
@@ -394,7 +449,6 @@ async fn create_and_bind_thread(
         .thread_start_in(cwd.as_deref().and_then(Path::to_str))
         .await?;
 
-    transport.bind(session.clone(), client.clone(), thread_id.clone());
     if let Some(store) = &runtime_store {
         CodexRuntimeStateRepo::new(store)
             .set_thread(&session, &thread_id, None)
@@ -410,7 +464,7 @@ async fn create_and_bind_thread(
     }
     let forwarder = spawn_codex_forwarder_with_tool_observations(
         session.clone(),
-        client,
+        client.clone(),
         events,
         Arc::new(AutoApprove),
         transport.turn_tracker(),
@@ -428,6 +482,7 @@ async fn create_and_bind_thread(
         previous.abort();
     }
     handle.thread_id = Some(thread_id.clone());
+    transport.bind(session, client, thread_id.clone());
     Ok(thread_id)
 }
 
@@ -445,147 +500,372 @@ fn spawn_binding_task(
     tool_observations: Option<Arc<dyn CodexToolObservationSink>>,
 ) {
     tokio::spawn(async move {
-        let (thread_id, rollout_path) = match known_thread_id {
-            Some(id) => {
-                let rollout_path = rollout_with_thread_id(&rollout_root, &id);
-                (id, rollout_path)
-            }
-            None => {
-                let Some(discovered) =
-                    wait_for_thread_id(&rollout_root, Duration::from_secs(900)).await
-                else {
-                    tracing::warn!(
-                        session = %discovery_session.0,
-                        rollout_root = %rollout_root.display(),
-                        "no thread discovered"
-                    );
-                    return;
-                };
-                discovered
-            }
-        };
+        if let Err(error) = bind_thread(
+            handles,
+            transport,
+            discovery_session.clone(),
+            discovery_sock,
+            rollout_root,
+            known_thread_id,
+            resume_cwd,
+            on_thread_discovered,
+            runtime_store,
+            events,
+            tool_observations,
+        )
+        .await
+        {
+            tracing::warn!(
+                session = %discovery_session,
+                error = %error,
+                "codex bridge: asynchronous thread binding failed"
+            );
+        }
+    });
+}
 
-        let client = match CodexAppServerClient::connect(&discovery_sock, "nexus-bridge").await {
-            Ok(client) => Arc::new(client),
-            Err(e) => {
+#[allow(clippy::too_many_arguments)]
+async fn bind_thread(
+    handles: Arc<Mutex<HashMap<SessionId, Handle>>>,
+    transport: CodexAppServerTransport,
+    discovery_session: SessionId,
+    discovery_sock: PathBuf,
+    rollout_root: PathBuf,
+    known_thread_id: Option<String>,
+    resume_cwd: Option<PathBuf>,
+    on_thread_discovered: Option<ThreadDiscovered>,
+    runtime_store: Option<Arc<Store>>,
+    events: Arc<dyn EventSink>,
+    tool_observations: Option<Arc<dyn CodexToolObservationSink>>,
+) -> Result<String, CodexRpcError> {
+    let (thread_id, rollout_path) = match known_thread_id {
+        Some(id) => {
+            let rollout_path = rollout_with_thread_id(&rollout_root, &id);
+            (id, rollout_path)
+        }
+        None => {
+            let Some(discovered) =
+                wait_for_thread_id(&rollout_root, Duration::from_secs(900)).await
+            else {
                 tracing::warn!(
                     session = %discovery_session.0,
-                    socket = %discovery_sock.display(),
-                    "codex bridge: connect after thread discovery failed: {e}"
+                    rollout_root = %rollout_root.display(),
+                    "no thread discovered"
                 );
-                return;
-            }
-        };
+                return Err(CodexRpcError::Connect(format!(
+                    "no codex thread discovered for session {discovery_session} under {}",
+                    rollout_root.display()
+                )));
+            };
+            discovered
+        }
+    };
 
-        let resume_cwd = resume_cwd
-            .as_deref()
-            .and_then(|path| path.to_str())
-            .map(str::to_owned);
-        tracing::info!(
-            target: "nexus::codex_bridge",
-            session = %discovery_session,
-            thread_id = %thread_id,
-            cwd = resume_cwd.as_deref().unwrap_or(""),
-            "codex bridge: resuming thread for transport bind"
-        );
-        if let Err(e) = client
-            .thread_resume_in(&thread_id, resume_cwd.as_deref())
+    let client = Arc::new(CodexAppServerClient::connect(&discovery_sock, "nexus-bridge").await?);
+
+    let resume_cwd = resume_cwd
+        .as_deref()
+        .and_then(|path| path.to_str())
+        .map(str::to_owned);
+    tracing::info!(
+        target: "nexus::codex_bridge",
+        session = %discovery_session,
+        thread_id = %thread_id,
+        cwd = resume_cwd.as_deref().unwrap_or(""),
+        "codex bridge: resuming thread for transport bind"
+    );
+    let resume = client
+        .thread_resume_in(&thread_id, resume_cwd.as_deref())
+        .await?;
+    let resumed_active_turn = resumed_active_turn_id(&resume, &thread_id)?;
+    if let Some(turn_id) = resumed_active_turn.as_deref() {
+        transport
+            .turn_tracker()
+            .observe_active_turn(&thread_id, turn_id);
+    }
+    if let Some(store) = &runtime_store {
+        if let Err(e) = CodexRuntimeStateRepo::new(store)
+            .set_thread(&discovery_session, &thread_id, rollout_path.clone())
             .await
         {
             tracing::warn!(
                 session = %discovery_session.0,
                 thread_id = %thread_id,
-                "codex bridge: thread_resume after discovery failed: {e}"
+                error = %e,
+                "codex bridge: failed to persist runtime thread state"
             );
-            return;
         }
+    }
+    if let Some(callback) = &on_thread_discovered {
+        callback(discovery_session.clone(), thread_id.clone());
+    }
+    let forwarder = spawn_codex_forwarder_with_tool_observations(
+        discovery_session.clone(),
+        client.clone(),
+        events,
+        Arc::new(AutoApprove),
+        transport.turn_tracker(),
+        tool_observations,
+    );
 
-        transport.bind(discovery_session.clone(), client.clone(), thread_id.clone());
+    let mut map = handles.lock().unwrap();
+    if let Some(handle) = map.get_mut(&discovery_session) {
+        if let Some(old_forwarder) = handle.forwarder.take() {
+            old_forwarder.abort();
+        }
+        handle.forwarder = Some(forwarder);
+        handle.thread_id = Some(thread_id.clone());
+        // Binding is the final readiness publication. Once routing can observe this session,
+        // the resume snapshot has seeded any in-progress turn and the sole forwarder is owned
+        // by the live handle, so a recovered prompt cannot race the old native boundary.
+        transport.bind(discovery_session.clone(), client, thread_id.clone());
         tracing::info!(
             target: "nexus::codex_bridge",
             session = %discovery_session,
             thread_id = %thread_id,
+            resumed_active_turn = resumed_active_turn.as_deref().unwrap_or(""),
             "codex bridge: transport bound"
         );
-        if let Some(store) = &runtime_store {
-            if let Err(e) = CodexRuntimeStateRepo::new(store)
-                .set_thread(&discovery_session, &thread_id, rollout_path.clone())
-                .await
-            {
-                tracing::warn!(
-                    session = %discovery_session.0,
-                    thread_id = %thread_id,
-                    error = %e,
-                    "codex bridge: failed to persist runtime thread state"
-                );
-            }
-        }
-        if let Some(callback) = &on_thread_discovered {
-            callback(discovery_session.clone(), thread_id.clone());
-        }
-        let forwarder = spawn_codex_forwarder_with_tool_observations(
-            discovery_session.clone(),
-            client,
-            events,
-            Arc::new(AutoApprove),
-            transport.turn_tracker(),
-            tool_observations,
-        );
-
-        let mut map = handles.lock().unwrap();
-        if let Some(handle) = map.get_mut(&discovery_session) {
-            if let Some(old_forwarder) = handle.forwarder.take() {
-                old_forwarder.abort();
-            }
-            handle.forwarder = Some(forwarder);
-            handle.thread_id = Some(thread_id);
-        } else {
-            transport.unbind(&discovery_session);
-            forwarder.abort();
-        }
-    });
+    } else {
+        forwarder.abort();
+        return Err(CodexRpcError::Connect(format!(
+            "codex bridge session {discovery_session} disappeared while binding thread {thread_id}"
+        )));
+    }
+    Ok(thread_id)
 }
 
-fn codex_home_with_thread(
+fn resumed_active_turn_id(
+    resume: &Value,
+    expected_thread_id: &str,
+) -> Result<Option<String>, CodexRpcError> {
+    let Some(thread) = resume.get("thread") else {
+        // Older/fake app-servers returned an empty object. They provide no resume authority, but
+        // they also cannot claim an active turn.
+        return Ok(None);
+    };
+    let actual_thread_id = thread
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CodexRpcError::Decode("thread/resume response missing thread.id".into()))?;
+    if actual_thread_id != expected_thread_id {
+        return Err(CodexRpcError::Decode(format!(
+            "thread/resume returned thread {actual_thread_id}, expected {expected_thread_id}"
+        )));
+    }
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            CodexRpcError::Decode("thread/resume response missing thread.turns".into())
+        })?;
+    let mut active = Vec::new();
+    for turn in turns {
+        if turn.get("status").and_then(Value::as_str) != Some("inProgress") {
+            continue;
+        }
+        active.push(turn.get("id").and_then(Value::as_str).ok_or_else(|| {
+            CodexRpcError::Decode("thread/resume in-progress turn missing id".into())
+        })?);
+    }
+    match active.as_slice() {
+        [] => Ok(None),
+        [turn_id] => Ok(Some((*turn_id).to_string())),
+        _ => Err(CodexRpcError::Decode(format!(
+            "thread/resume returned {} in-progress turns for {expected_thread_id}",
+            active.len()
+        ))),
+    }
+}
+
+#[doc(hidden)]
+pub fn resolve_resume_codex_home(
     session_dir: &Path,
+    canonical_home: &Path,
     explicit_homes: &[PathBuf],
     thread_id: &str,
-) -> Option<PathBuf> {
+) -> std::io::Result<Option<PathBuf>> {
     let mut seen = HashSet::new();
-    let mut matching_home = |home: PathBuf| {
-        if !seen.insert(home.clone()) {
+    let mut matching_rollout = |home: &Path| {
+        if !seen.insert(home.to_path_buf()) {
             return None;
         }
         rollout_with_thread_id(&home.join("sessions"), thread_id)
-            .is_some()
-            .then_some(home)
     };
 
+    if matching_rollout(canonical_home).is_some() {
+        return Ok(Some(canonical_home.to_path_buf()));
+    }
+
     for home in explicit_homes {
-        if let Some(home) = matching_home(home.clone()) {
-            return Some(home);
-        }
-    }
-    if let Some(home) = std::env::var_os("CODEX_HOME") {
-        if let Some(home) = matching_home(PathBuf::from(home)) {
-            return Some(home);
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        if let Some(home) = matching_home(PathBuf::from(home).join(".codex")) {
-            return Some(home);
+        if let Some(source) = matching_rollout(home) {
+            if nexus_managed_codex_home(home) {
+                migrate_rollout(home, canonical_home, &source)?;
+                return Ok(Some(canonical_home.to_path_buf()));
+            }
+            return Ok(Some(home.clone()));
         }
     }
     if let Some(codex_sessions_root) = session_dir.parent() {
         if let Ok(entries) = std::fs::read_dir(codex_sessions_root) {
-            for entry in entries.flatten() {
-                if let Some(home) = matching_home(entry.path().join("codex-home")) {
-                    return Some(home);
+            let mut homes = entries
+                .flatten()
+                .map(|entry| entry.path().join("codex-home"))
+                .collect::<Vec<_>>();
+            homes.sort();
+            for home in homes {
+                if let Some(source) = matching_rollout(&home) {
+                    migrate_rollout(&home, canonical_home, &source)?;
+                    return Ok(Some(canonical_home.to_path_buf()));
                 }
             }
         }
     }
-    None
+    Ok(None)
+}
+
+fn nexus_managed_codex_home(home: &Path) -> bool {
+    home.file_name().is_some_and(|name| name == "codex-home")
+        && home
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "codex-sessions")
+}
+
+fn migrate_rollout(source_home: &Path, target_home: &Path, source: &Path) -> std::io::Result<()> {
+    if !nexus_managed_codex_home(source_home) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refuse rollout migration from non-Nexus home {}",
+                source_home.display()
+            ),
+        ));
+    }
+    let source_root = source_home.join("sessions");
+    let relative = source.strip_prefix(&source_root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "rollout {} escapes {}",
+                source.display(),
+                source_root.display()
+            ),
+        )
+    })?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("rollout path is not contained: {}", relative.display()),
+        ));
+    }
+
+    let metadata = std::fs::symlink_metadata(source)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("rollout source is not a regular file: {}", source.display()),
+        ));
+    }
+    let bytes = std::fs::read(source)?;
+    let target_root = target_home.join("sessions");
+    let destination = target_root.join(relative);
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "rollout destination has no parent",
+        )
+    })?;
+    create_contained_directories(
+        &target_root,
+        relative.parent().unwrap_or_else(|| Path::new("")),
+    )?;
+
+    match std::fs::symlink_metadata(&destination) {
+        Ok(destination_metadata) => {
+            if !destination_metadata.file_type().is_file()
+                || destination_metadata.file_type().is_symlink()
+                || std::fs::read(&destination)? != bytes
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    format!("conflicting rollout destination {}", destination.display()),
+                ));
+            }
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(".nexus-rollout-{}-{nonce}.tmp", std::process::id()));
+    let publish = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &destination)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if publish.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    publish
+}
+
+fn create_contained_directories(root: &Path, relative: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(root)?;
+    let root_metadata = std::fs::symlink_metadata(root)?;
+    if !root_metadata.file_type().is_dir() || root_metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "rollout destination root is not a real directory: {}",
+                root.display()
+            ),
+        ));
+    }
+
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "rollout destination contains a non-normal component",
+            ));
+        };
+        current.push(name);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            }
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "rollout destination ancestry is not a directory: {}",
+                        current.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Read the newest Codex rollout under `CODEX_HOME/sessions` and return its thread id.
@@ -661,8 +941,17 @@ fn newest_rollout_matching(root: &Path, matches: impl Fn(&Path) -> bool) -> Opti
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 walk(&path, best, matches);
+                continue;
+            }
+            if !file_type.is_file() {
                 continue;
             }
 

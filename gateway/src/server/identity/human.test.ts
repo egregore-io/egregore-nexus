@@ -22,12 +22,12 @@ function makeDb(): Promise<Client> {
 
 function makeCommandMock(): {
   commands: CommandIntentSender;
-  calls: Array<{ kind: string; request: unknown }>;
+  calls: Array<{ kind: string; request: unknown; caller: unknown }>;
 } {
-  const calls: Array<{ kind: string; request: unknown }> = [];
+  const calls: Array<{ kind: string; request: unknown; caller: unknown }> = [];
   const commands: CommandIntentSender = {
-    submit: vi.fn(async (kind, request) => {
-      calls.push({ kind, request });
+    submit: vi.fn(async (kind, request, caller) => {
+      calls.push({ kind, request, caller });
       // Return a minimal RegisterResponse shape.
       return { sessionId: "sess_mock_1", name: (request as { name?: string })?.name ?? "unknown", token: "t" };
     }) as CommandIntentSender["submit"],
@@ -123,6 +123,8 @@ describe("registerHuman + currentHuman", () => {
     expect(Number(rows.rows[0]!.n)).toBe(0);
     const users = await db.execute("SELECT COUNT(*) AS n FROM human_user");
     expect(Number(users.rows[0]!.n)).toBe(0);
+    const principals = await db.execute("SELECT COUNT(*) AS n FROM principals");
+    expect(Number(principals.rows[0]!.n)).toBe(0);
   });
 
   it("uses injected genId and now (no Date.now / Math.random in unit)", async () => {
@@ -158,6 +160,33 @@ describe("registerHuman + currentHuman", () => {
     const firstKey = (calls[0]!.request as { clientKey: string }).clientKey;
     const secondKey = (calls[1]!.request as { clientKey: string }).clientKey;
     expect(secondKey).toBe(firstKey);
+  });
+
+  it("keeps one immutable human and principal identity across login and rename", async () => {
+    const { commands, calls } = makeCommandMock();
+    let seq = 0;
+    const deps = makeDeps(db, commands, {
+      genId: vi.fn(() => `id_${++seq}`),
+      now: vi.fn().mockReturnValue(1_000_000),
+    });
+
+    const first = await registerHuman({ name: "alex", password: "pw" }, deps);
+    const firstIdentity = await currentHuman(first.cookieToken, { db });
+    expect(firstIdentity?.humanUserId).toMatch(/^hu_[a-f0-9]{24}$/);
+    expect(firstIdentity?.principalId).toMatch(/^h_[a-f0-9]{24}$/);
+    expect(calls[0]?.caller).toMatchObject({ principalId: firstIdentity?.principalId });
+
+    await db.execute({
+      sql: "UPDATE human_user SET name_key = ?, name = ? WHERE human_user_id = ?",
+      args: ["alex-renamed", "Alex Renamed", firstIdentity!.humanUserId],
+    });
+    const second = await registerHuman({ name: "alex-renamed", password: "pw" }, deps);
+    const secondIdentity = await currentHuman(second.cookieToken, { db });
+
+    expect(secondIdentity?.humanUserId).toBe(firstIdentity?.humanUserId);
+    expect(secondIdentity?.principalId).toBe(firstIdentity?.principalId);
+    const principals = await db.execute("SELECT COUNT(*) AS n FROM principals");
+    expect(Number(principals.rows[0]!.n)).toBe(1);
   });
 
   it("rejects a wrong password without registering a daemon session", async () => {

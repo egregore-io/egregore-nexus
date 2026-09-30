@@ -29,7 +29,7 @@ impl AppState {
                 .find_by_session_id(&session)
                 .await
             {
-                Ok(Some(row)) if row.kind == "agent" => row,
+                Ok(Some(row)) if row.is_agent() => row,
                 Ok(_) => continue,
                 Err(error) => {
                     tracing::warn!(
@@ -113,7 +113,7 @@ impl AppState {
                 .find_by_session_id(&session)
                 .await
             {
-                Ok(Some(row)) if row.kind == "agent" => row,
+                Ok(Some(row)) if row.is_agent() => row,
                 Ok(_) => continue,
                 Err(error) => {
                     tracing::warn!(

@@ -103,6 +103,8 @@ pub fn mcp_identity(
         runtime_credential: None,
         tier: Tier::Agent,
         kind: None,
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -138,6 +140,9 @@ async fn resolve_mcp_identity(args: &McpArgs) -> RegisterRequest {
                 runtime_id: Some(crate::local_operator::LOCAL_OPERATOR_SESSION_ID.into()),
                 client_key: None,
                 kind: Kind::Human,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
                 tier: Tier::Admin,
             }),
             call: DaemonIpcCall::Query {

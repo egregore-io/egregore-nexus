@@ -57,7 +57,6 @@ export {
   useAdminAgents,
   useSpawnAgent,
   useAgentOp,
-  useAssignProject,
   useGrantTier,
   useAddThreadMember,
   useRemoveThreadMember,

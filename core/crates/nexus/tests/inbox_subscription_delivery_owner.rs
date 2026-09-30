@@ -58,6 +58,8 @@ fn register(
             Tier::Agent
         },
         kind: Some(kind),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }

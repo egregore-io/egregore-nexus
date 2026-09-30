@@ -350,6 +350,8 @@ async fn seed_stable_agent_pending_row(store: Arc<Store>, message_id: MessageId)
             provenance: Provenance {
                 from: "operator".to_string(),
                 kind: Kind::Human,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,

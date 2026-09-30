@@ -363,6 +363,8 @@ async fn heartbeat_dead_probe_terminalizes_owned_injecting_delivery() {
             provenance: Provenance {
                 from: "sender".to_string(),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,
@@ -914,6 +916,9 @@ fn admin_caller() -> Caller {
         name: "ws2-admin".to_string(),
         project: PROJECT.to_string(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 

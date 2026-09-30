@@ -7,9 +7,11 @@
 //! `source.push` carries its command-envelope idempotency key through an internal service seam
 //! because crash-reclaim identity is transaction context, not part of the public producer payload.
 //!
-//! Authenticated command rows resolve their caller from the registered session `client_key` only.
-//! A bare `caller_name` or copied session id is not proof of identity. Verified registered
-//! command activity refreshes that caller session's heartbeat and runtime presence.
+//! Authenticated native command rows resolve their caller from the registered session `client_key`
+//! only. The one client-key-less human lane is a Gateway-authenticated external transport
+//! principal on `message.post.send`; it is bound by its `x_*` principal id and `transport:*`
+//! session evidence and never resolves through a mutable name. Verified registered command
+//! activity refreshes that caller session's heartbeat and runtime presence.
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -22,14 +24,16 @@ use tokio::task::JoinHandle;
 
 use nexus_common::{now, NexusError};
 use nexus_contracts::{
-    codes, AgentId, Caller, ContractError, MessageId, NotifyCommandRequest, NotifyRequest,
-    PromptRequest, Request, SessionId, Tier, JSONRPC_VERSION,
+    codes, entity_kind, AgentId, Caller, ContractError, Kind, Locality, MessageId,
+    NotifyCommandRequest, NotifyRequest, PromptRequest, Request, SessionId, Tier, JSONRPC_VERSION,
 };
 use nexus_store::command_kinds;
-use nexus_store::repos::{AgentRef, Agents, CommandIntentRow, CommandIntents, Inbox, Sessions};
+use nexus_store::repos::{
+    AgentRef, Agents, CommandIntentRow, CommandIntents, DaemonState, Inbox, Sessions,
+};
 use nexus_store::types::SessionRow;
 
-use crate::daemon::app::AppState;
+use crate::daemon::app::{AppState, PROMPT_DEFERRED_FOR_SHUTDOWN};
 use crate::daemon::retention_policy::{maybe_reap_operational_tables, RetentionPolicyState};
 use crate::daemon::routing;
 use crate::local_operator::LOCAL_OPERATOR_SESSION_ID;
@@ -67,6 +71,37 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
     tokio::spawn(supervise_worker_lanes(state))
 }
 
+/// Fence new ingress and wake idle lanes so the daemon can drain every command accepted before
+/// this boundary, plus the provider turns those commands start, before tearing down transports.
+pub async fn begin_shutdown(state: &AppState) {
+    state.begin_command_worker_shutdown().await;
+}
+
+/// Await every transport-reported active turn without inferring completion from rendered output.
+///
+/// A transport that reports an active session is required to expose its authoritative completion
+/// boundary. If that contract is temporarily unavailable, keep the shutdown drain open; the
+/// caller's outer timeout remains the only authority allowed to abandon the graceful path.
+pub async fn wait_for_active_turns(state: &AppState) {
+    loop {
+        let sessions = state.agent.active_turn_sessions();
+        if sessions.is_empty() {
+            return;
+        }
+        for session in sessions {
+            if let Err(error) = state.agent.wait_for_turn_completion(&session).await {
+                tracing::warn!(
+                    %error,
+                    session_id = %session.0,
+                    "active turn completion boundary unavailable during shutdown"
+                );
+                tokio::time::sleep(POLL_INTERVAL).await;
+                break;
+            }
+        }
+    }
+}
+
 /// Claim and execute at most one pending command. Returns `true` when a row was claimed.
 pub async fn process_next(state: &AppState) -> Result<bool, NexusError> {
     process_next_for_lane(state, WorkerLane::Any).await
@@ -85,32 +120,60 @@ async fn supervise_worker_lanes(state: AppState) {
         tokio::select! {
             result = &mut control.handle => {
                 log_lane_exit(WorkerLane::Control, result);
-                control.restart(state.clone());
+                if !state.command_worker_is_shutting_down() {
+                    control.restart(state.clone());
+                }
             }
             result = &mut inbox.handle => {
                 log_lane_exit(WorkerLane::InboxConsume, result);
-                inbox.restart(state.clone());
+                if !state.command_worker_is_shutting_down() {
+                    inbox.restart(state.clone());
+                }
             }
             result = &mut harness_prompt.handle => {
                 log_lane_exit(WorkerLane::HarnessPrompt, result);
-                harness_prompt.restart(state.clone());
+                if !state.command_worker_is_shutting_down() {
+                    harness_prompt.restart(state.clone());
+                }
             }
             result = &mut harness_steer.handle => {
                 log_lane_exit(WorkerLane::HarnessSteer, result);
-                harness_steer.restart(state.clone());
+                if !state.command_worker_is_shutting_down() {
+                    harness_steer.restart(state.clone());
+                }
             }
             result = &mut harness_warm.handle => {
                 log_lane_exit(WorkerLane::HarnessWarm, result);
-                harness_warm.restart(state.clone());
+                if !state.command_worker_is_shutting_down() {
+                    harness_warm.restart(state.clone());
+                }
             }
             result = &mut harness_compact.handle => {
                 log_lane_exit(WorkerLane::HarnessCompact, result);
-                harness_compact.restart(state.clone());
+                if !state.command_worker_is_shutting_down() {
+                    harness_compact.restart(state.clone());
+                }
             }
             result = &mut harness_launch.handle => {
                 log_lane_exit(WorkerLane::HarnessLaunch, result);
-                harness_launch.restart(state.clone());
+                if !state.command_worker_is_shutting_down() {
+                    harness_launch.restart(state.clone());
+                }
             }
+        }
+        if state.command_worker_is_shutting_down() {
+            for lane in [
+                &mut control,
+                &mut inbox,
+                &mut harness_prompt,
+                &mut harness_steer,
+                &mut harness_warm,
+                &mut harness_compact,
+                &mut harness_launch,
+            ] {
+                lane.wait_for_shutdown().await;
+            }
+            return;
         }
     }
 }
@@ -130,6 +193,12 @@ impl LaneHandle {
 
     fn restart(&mut self, state: AppState) {
         self.handle = spawn_lane_task(state, self.lane);
+    }
+
+    async fn wait_for_shutdown(&mut self) {
+        if !self.handle.is_finished() {
+            let _ = (&mut self.handle).await;
+        }
     }
 }
 
@@ -178,6 +247,20 @@ async fn run_worker_loop(state: AppState, lane: WorkerLane) {
         let idle_epoch = state.store.command_intents_epoch();
         match process_next_for_lane(&state, lane).await {
             Ok(true) => {}
+            Ok(false) if state.command_worker_is_shutting_down() => {
+                match lane_has_unsettled_commands(&state, lane).await {
+                    Ok(false) => return,
+                    Ok(true) => wait_for_command_intent_or_poll(&state, idle_epoch).await,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            ?lane,
+                            "failed to verify command lane drain during shutdown"
+                        );
+                        wait_for_command_intent_or_poll(&state, idle_epoch).await;
+                    }
+                }
+            }
             Ok(false) => wait_for_command_intent_or_poll(&state, idle_epoch).await,
             Err(err) => {
                 tracing::warn!(error = %err, ?lane, "command worker tick failed");
@@ -193,7 +276,7 @@ async fn run_harness_prompt_worker_loop(state: AppState) {
         actors.reap_finished();
         let idle_epoch = state.store.command_intents_epoch();
         let actor_sessions = actors.active_sessions();
-        match claim_next_harness_prompt(&state, &actor_sessions).await {
+        match claim_next_harness_prompt_serialized(&state, &actor_sessions).await {
             Ok(Some(row)) => match resolve_harness_prompt_target_session(&state, &row).await {
                 Ok(Some(session_id)) => {
                     if let Err(row) = actors.spawn(state.clone(), session_id, row) {
@@ -233,6 +316,11 @@ async fn run_harness_prompt_worker_loop(state: AppState) {
                     }
                 }
             },
+            Ok(None) if state.command_worker_is_shutting_down() => {
+                actors.wait_for_shutdown().await;
+                wait_for_active_turns(&state).await;
+                return;
+            }
             Ok(None) => wait_for_command_intent_or_poll(&state, idle_epoch).await,
             Err(err) => {
                 tracing::warn!(
@@ -267,6 +355,17 @@ impl PromptActorSet {
             }
             keep
         });
+    }
+
+    async fn wait_for_shutdown(&mut self) {
+        let handles = self
+            .handles
+            .drain()
+            .map(|(_, handle)| handle)
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let _ = handle.await;
+        }
     }
 
     fn spawn(
@@ -477,6 +576,9 @@ async fn claim_next_harness_prompt(
     state: &AppState,
     actor_sessions: &[String],
 ) -> Result<Option<CommandIntentRow>, NexusError> {
+    if state.command_worker_is_shutting_down() {
+        return Ok(None);
+    }
     let mut busy_sessions = state
         .agent
         .active_turn_sessions()
@@ -491,11 +593,22 @@ async fn claim_next_harness_prompt(
         .await
 }
 
+async fn claim_next_harness_prompt_serialized(
+    state: &AppState,
+    actor_sessions: &[String],
+) -> Result<Option<CommandIntentRow>, NexusError> {
+    let _claim_guard = state.store.write_lock().lock_owned().await;
+    claim_next_harness_prompt(state, actor_sessions).await
+}
+
 async fn claim_next_harness_prompt_for_session(
     state: &AppState,
     session_id: &str,
 ) -> Result<Option<CommandIntentRow>, NexusError> {
     let _claim_guard = state.store.write_lock().lock_owned().await;
+    if state.command_worker_is_shutting_down() {
+        return Ok(None);
+    }
     CommandIntents::new(&state.store)
         .claim_next_ready_harness_prompt_for_session(now(), HARNESS_PROMPT_LEASE_MS, session_id)
         .await
@@ -541,6 +654,24 @@ async fn complete_claimed_row(
             }
         }
         Err(error) => {
+            if matches!(lane, WorkerLane::HarnessPrompt)
+                && error.code == codes::INTERNAL_ERROR
+                && error.message == PROMPT_DEFERRED_FOR_SHUTDOWN
+            {
+                if let Some(claimed_at) = claimed_at {
+                    if !repo
+                        .release_claim_for_shutdown_retry(&command_id, claimed_at)
+                        .await?
+                    {
+                        tracing::warn!(
+                            command_id = %command_id,
+                            claimed_at,
+                            "skipped shutdown retry release because its claim was no longer current"
+                        );
+                    }
+                    return Ok(());
+                }
+            }
             if let Some(claimed_at) = claimed_at {
                 if !repo
                     .mark_error_for_claim(&command_id, claimed_at, &json_string(&error)?, now())
@@ -571,6 +702,42 @@ enum WorkerLane {
     HarnessWarm,
     HarnessCompact,
     HarnessLaunch,
+}
+
+impl WorkerLane {
+    fn owns_kind(self, kind: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::InboxConsume => matches!(
+                kind,
+                command_kinds::inbox::CONSUME | command_kinds::inbox::SUBSCRIPTION_NEXT
+            ),
+            Self::HarnessPrompt => kind == command_kinds::harness::PROMPT,
+            Self::HarnessSteer => kind == command_kinds::harness::STEER,
+            Self::HarnessWarm => kind == command_kinds::harness::WARM,
+            Self::HarnessCompact => kind == command_kinds::harness::COMPACT,
+            Self::HarnessLaunch => kind == command_kinds::harness::LAUNCH,
+            Self::Control => {
+                !Self::InboxConsume.owns_kind(kind)
+                    && !Self::HarnessPrompt.owns_kind(kind)
+                    && !Self::HarnessSteer.owns_kind(kind)
+                    && !Self::HarnessWarm.owns_kind(kind)
+                    && !Self::HarnessCompact.owns_kind(kind)
+                    && !Self::HarnessLaunch.owns_kind(kind)
+            }
+        }
+    }
+}
+
+async fn lane_has_unsettled_commands(
+    state: &AppState,
+    lane: WorkerLane,
+) -> Result<bool, NexusError> {
+    Ok(CommandIntents::new(&state.store)
+        .lane_depths()
+        .await?
+        .into_iter()
+        .any(|depth| lane.owns_kind(&depth.kind) && depth.pending + depth.claimed > 0))
 }
 
 async fn execute(state: &AppState, row: CommandIntentRow) -> Result<Value, ContractError> {
@@ -1048,6 +1215,9 @@ async fn resolve_command_caller(
             name: row.caller_name.clone(),
             project: row.project.clone(),
             tier: nexus_contracts::Tier::Admin,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         });
     }
 
@@ -1058,7 +1228,35 @@ async fn resolve_command_caller(
             name: row.caller_name.clone(),
             project: row.project.clone(),
             tier: Tier::Agent,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         });
+    }
+
+    if is_gateway_transport_external_principal(row) {
+        return Ok(Caller {
+            agent_id: None,
+            session: SessionId(
+                row.caller_session_id
+                    .clone()
+                    .expect("verified transport caller has a session id"),
+            ),
+            name: row.caller_name.clone(),
+            project: row.project.clone(),
+            tier: Tier::Agent,
+            locality: Locality::External,
+            access: Some("guest".into()),
+            principal_id: row.caller_principal_id.clone(),
+        });
+    }
+
+    // A human command accepted under the previous daemon boot owns the exact caller snapshot
+    // stamped at ingress. A reconnect may legitimately bind the same client key to a fresh
+    // session before the new worker drains that command; the new registration must not replace
+    // or invalidate the already-accepted authority.
+    if let Some(caller) = resolve_restart_validated_human_caller(state, row).await? {
+        return Ok(caller);
     }
 
     let sessions = Sessions::new(&state.store);
@@ -1077,15 +1275,23 @@ async fn resolve_command_caller(
             "command intent caller client key is not registered",
         ));
     };
-    let caller = if session.kind != "agent" {
+    let caller = if !session.is_agent() {
         // The registered session kind is authoritative. Ignore pre-fix `agent_id` residue (and
         // mutable caller labels) so a durable human/app credential cannot inherit an agent alias.
+        let (locality, _) = session
+            .entity_kind()
+            .map_err(|error| error.to_contract_error())?;
         Caller {
             agent_id: None,
             session: session.session_id.clone(),
             name: session.display_name(),
             project: session.project.clone(),
             tier: tier_from_session(&session),
+            locality,
+            access: session
+                .access()
+                .map_err(|error| error.to_contract_error())?,
+            principal_id: None,
         }
     } else if let Some(agent_id) = session.agent_id.as_deref() {
         let agent = Agents::new(&state.store)
@@ -1097,14 +1303,22 @@ async fn resolve_command_caller(
                     "command intent caller registered agent id is not a durable identity",
                 )
             })?;
+        let (locality, _) = session
+            .entity_kind()
+            .map_err(|error| error.to_contract_error())?;
         Caller {
             agent_id: Some(AgentId(agent.agent_id)),
             session: session.session_id.clone(),
             name: agent.name.unwrap_or_else(|| session.display_name()),
             project: session.project.clone(),
             tier: tier_from_session(&session),
+            locality,
+            access: session
+                .access()
+                .map_err(|error| error.to_contract_error())?,
+            principal_id: None,
         }
-    } else if session.kind == "agent" {
+    } else if session.is_agent() {
         let session_name = session.name.as_deref().ok_or_else(|| {
             unauthorized_command_caller(
                 "command intent caller agent session has no durable agent identity",
@@ -1130,6 +1344,67 @@ async fn resolve_command_caller(
     Ok(caller)
 }
 
+async fn resolve_restart_validated_human_caller(
+    state: &AppState,
+    row: &CommandIntentRow,
+) -> Result<Option<Caller>, ContractError> {
+    let Some(validated_boot_epoch) = row
+        .caller_validated_boot_epoch
+        .as_deref()
+        .filter(|epoch| !epoch.is_empty())
+    else {
+        return Ok(None);
+    };
+    let current_boot_epoch = DaemonState::new(&state.store)
+        .boot_epoch()
+        .await
+        .map_err(|error| error.to_contract_error())?;
+    if current_boot_epoch
+        .as_deref()
+        .is_none_or(|epoch| epoch.is_empty() || epoch == validated_boot_epoch)
+    {
+        return Ok(None);
+    }
+    let Some((locality, caller_kind)) = row.caller_kind.as_deref().and_then(entity_kind::parse)
+    else {
+        return Ok(None);
+    };
+    if locality != Locality::Local
+        || caller_kind != Kind::Human
+        || row.caller_agent_id.is_some()
+        || row.caller_client_key.as_deref().is_none_or(str::is_empty)
+        || row.caller_name.is_empty()
+        || row.project.is_empty()
+    {
+        return Ok(None);
+    }
+    let Some(session_id) = row
+        .caller_session_id
+        .as_deref()
+        .filter(|session_id| !session_id.is_empty())
+    else {
+        return Ok(None);
+    };
+    if row.caller_runtime_id.as_deref() != Some(session_id) {
+        return Ok(None);
+    }
+    let tier = match row.caller_tier.as_deref() {
+        Some("admin") => Tier::Admin,
+        Some("agent") => Tier::Agent,
+        _ => return Ok(None),
+    };
+    Ok(Some(Caller {
+        agent_id: None,
+        session: SessionId(session_id.to_string()),
+        name: row.caller_name.clone(),
+        project: row.project.clone(),
+        tier,
+        locality,
+        access: None,
+        principal_id: row.caller_principal_id.clone(),
+    }))
+}
+
 fn is_local_operator(row: &CommandIntentRow) -> bool {
     row.caller_session_id.as_deref() == Some(LOCAL_OPERATOR_SESSION_ID)
         && matches!(
@@ -1137,15 +1412,35 @@ fn is_local_operator(row: &CommandIntentRow) -> bool {
             None | Some(LOCAL_OPERATOR_SESSION_ID)
         )
         && row.caller_client_key.is_none()
-        && row.caller_kind.as_deref() == Some("human")
+        && row.caller_kind.as_deref()
+            == Some(entity_kind::dotted(Locality::Local, Kind::Human).as_str())
         && row.caller_tier.as_deref() == Some("admin")
 }
 
 fn is_verified_source_push(row: &CommandIntentRow) -> bool {
     row.kind == command_kinds::source::PUSH
-        && row.caller_kind.as_deref() == Some("notification")
+        && row.caller_kind.as_deref()
+            == Some(entity_kind::dotted(Locality::Local, Kind::Notification).as_str())
         && row.caller_tier.as_deref() == Some("agent")
         && row.caller_client_key.is_none()
+}
+
+fn is_gateway_transport_external_principal(row: &CommandIntentRow) -> bool {
+    row.kind == command_kinds::message_post::SEND
+        && row
+            .caller_session_id
+            .as_deref()
+            .is_some_and(|session_id| session_id.starts_with("transport:") && session_id.len() > 10)
+        && row.caller_runtime_id == row.caller_session_id
+        && row.caller_agent_id.is_none()
+        && row.caller_client_key.is_none()
+        && row
+            .caller_principal_id
+            .as_deref()
+            .is_some_and(|principal_id| principal_id.starts_with("x_") && principal_id.len() > 2)
+        && row.caller_kind.as_deref()
+            == Some(entity_kind::dotted(Locality::External, Kind::Human).as_str())
+        && row.caller_tier.as_deref() == Some("agent")
 }
 
 fn unauthorized_command_caller(message: impl Into<String>) -> ContractError {
@@ -1181,7 +1476,7 @@ fn validate_command_caller_row(
             ));
         }
     }
-    if session.kind == "agent" {
+    if session.is_agent() {
         if let Some(caller_agent_id) = row.caller_agent_id.as_deref() {
             if caller.agent_id.as_ref().map(|id| id.0.as_str()) != Some(caller_agent_id) {
                 return Err(unauthorized_command_caller(

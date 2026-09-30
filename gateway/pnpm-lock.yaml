@@ -15,7 +15,7 @@ importers:
         specifier: ^0.0.57
         version: 0.0.57
       '@egregore/nexus-cli':
-        specifier: 0.1.5
+        specifier: 0.1.6-beta.1
         version: link:../packages/nexus-cli
       '@libsql/client':
         specifier: ^0.17.4

@@ -95,7 +95,7 @@ impl WsSink {
                 let row = match &self.store {
                     Some(store) => {
                         match Sessions::new(store).find_by_session_id(session_id).await {
-                            Ok(Some(row)) if row.kind == "agent" => Some(row),
+                            Ok(Some(row)) if row.is_agent() => Some(row),
                             Ok(Some(_)) | Ok(None) | Err(_) => return None,
                         }
                     }
@@ -120,7 +120,7 @@ impl WsSink {
                 let row = match &self.store {
                     Some(store) => {
                         match Sessions::new(store).find_by_session_id(session_id).await {
-                            Ok(Some(row)) if row.kind == "agent" => Some(row),
+                            Ok(Some(row)) if row.is_agent() => Some(row),
                             Ok(Some(_)) | Ok(None) | Err(_) => return None,
                         }
                     }
@@ -162,7 +162,7 @@ impl WsSink {
                 agent_id,
             } => {
                 let session = match Sessions::new(store).find_by_session_id(session_id).await {
-                    Ok(Some(row)) if row.kind == "agent" => row,
+                    Ok(Some(row)) if row.is_agent() => row,
                     Ok(Some(_)) | Ok(None) => return Vec::new(),
                     Err(error) => {
                         tracing::warn!(
@@ -296,7 +296,7 @@ impl WsSink {
                 paused,
             } => {
                 let session = match Sessions::new(store).find_by_session_id(session_id).await {
-                    Ok(Some(row)) if row.kind == "agent" && row.agent_id.is_some() => row,
+                    Ok(Some(row)) if row.is_agent() && row.agent_id.is_some() => row,
                     Ok(Some(_)) | Ok(None) | Err(_) => return Vec::new(),
                 };
                 let runtime = match AgentRuntimes::new(store)

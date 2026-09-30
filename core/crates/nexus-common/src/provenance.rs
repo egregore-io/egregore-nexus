@@ -59,6 +59,8 @@ pub fn render_injected_turn_for(batch: &NexusBatch, receiver: &str) -> String {
         let prov = Provenance {
             from: m.from.clone(),
             kind: m.kind,
+            locality: Default::default(),
+            access: None,
             thread: m.thread.clone(),
             topic: m.topic.clone(),
             stamp: None,

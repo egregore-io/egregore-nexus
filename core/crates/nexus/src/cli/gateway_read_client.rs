@@ -1,8 +1,8 @@
 use std::path::Path;
 
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use hyper::header::{ACCEPT, AUTHORIZATION};
+use hyper::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
@@ -52,7 +52,7 @@ struct GatewayErrorBody {
 pub(crate) struct GatewayReadClient {
     base_url: String,
     bearer_token: Option<String>,
-    client: Client<HttpConnector, Empty<Bytes>>,
+    client: Client<HttpConnector, Full<Bytes>>,
 }
 
 impl GatewayReadClient {
@@ -165,10 +165,32 @@ impl GatewayReadClient {
         self.get(path, &[]).await
     }
 
+    pub(crate) async fn post_json(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, ContractError> {
+        self.request_json(Method::POST, path, &[], Some(body)).await
+    }
+
+    pub(crate) async fn delete_json(&self, path: &str) -> Result<serde_json::Value, ContractError> {
+        self.request_json(Method::DELETE, path, &[], None).await
+    }
+
     async fn get<T: DeserializeOwned>(
         &self,
         path: &str,
         query: &[(&str, String)],
+    ) -> Result<T, ContractError> {
+        self.request_json(Method::GET, path, query, None).await
+    }
+
+    async fn request_json<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<&serde_json::Value>,
     ) -> Result<T, ContractError> {
         let suffix = if query.is_empty() {
             String::new()
@@ -188,14 +210,22 @@ impl GatewayReadClient {
         };
         let uri = format!("{}{}{}", self.base_url, path, suffix);
         let mut builder = Request::builder()
-            .method(Method::GET)
+            .method(method)
             .uri(&uri)
             .header(ACCEPT, "application/json");
+        if body.is_some() {
+            builder = builder.header(CONTENT_TYPE, "application/json");
+        }
         if let Some(token) = &self.bearer_token {
             builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
         }
+        let bytes = body
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|error| unavailable(&format!("cannot encode request: {error}")))?
+            .unwrap_or_default();
         let request = builder
-            .body(Empty::<Bytes>::new())
+            .body(Full::new(Bytes::from(bytes)))
             .map_err(|error| unavailable(&format!("invalid request: {error}")))?;
         let response = self
             .client

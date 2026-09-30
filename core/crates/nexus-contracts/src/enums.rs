@@ -15,6 +15,18 @@ pub enum Kind {
     App,
 }
 
+/// Where an entity originates. This is deliberately parallel to [`Kind`]: the nature vocabulary
+/// remains closed while locality can be carried independently across wire and storage seams.
+#[typeshare]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Locality {
+    #[default]
+    Local,
+    External,
+    Trusted,
+}
+
 /// Message scope (the one `to` contract resolves into one of these).
 #[typeshare]
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]

@@ -237,6 +237,37 @@ fn claude_headed_env_re_exports_custom_config_after_tmux_sanitization() {
 }
 
 #[test]
+fn hermes_machine_home_collapses_runtime_profile_to_global_root() {
+    let home = PathBuf::from("/home/operator");
+    let profile = home.join(".hermes/profiles/nexus-s_agent");
+    assert_eq!(
+        resolve_machine_hermes_home(None, Some(&profile), Some(&home)).unwrap(),
+        home.join(".hermes")
+    );
+
+    let custom_root = PathBuf::from("/srv/hermes-data");
+    let custom_profile = custom_root.join("profiles/nexus-s_agent");
+    assert_eq!(
+        resolve_machine_hermes_home(None, Some(&custom_profile), Some(&home)).unwrap(),
+        custom_root
+    );
+}
+
+#[test]
+fn hermes_machine_home_preserves_explicit_root_and_home_default() {
+    let home = PathBuf::from("/home/operator");
+    let explicit = PathBuf::from("/srv/hermes-data");
+    assert_eq!(
+        resolve_machine_hermes_home(None, Some(&explicit), Some(&home)).unwrap(),
+        explicit
+    );
+    assert_eq!(
+        resolve_machine_hermes_home(None, None, Some(&home)).unwrap(),
+        home.join(".hermes")
+    );
+}
+
+#[test]
 fn harness_program_maps_each_tui_binary() {
     let platform = NativeProcessPlatform::current();
     assert_eq!(

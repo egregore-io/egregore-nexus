@@ -8,11 +8,13 @@ use std::path::{Path, PathBuf};
 
 use nexus_common::now;
 use nexus_contracts::{
-    codes, AgentId, Caller, CommandQueueMutationRequest, ContractError, DaemonIpcCall,
-    DaemonIpcCaller, DaemonIpcRequest, DaemonIpcResponse, Kind, MessageId, Presence, Request,
-    RpcError, SessionId, Tier, Whoami, DAEMON_IPC_PROTOCOL_VERSION, JSONRPC_VERSION,
+    codes, entity_kind, AgentId, Caller, CommandQueueMutationRequest, ContractError, DaemonIpcCall,
+    DaemonIpcCaller, DaemonIpcRequest, DaemonIpcResponse, Kind, Locality, MessageId, Presence,
+    Request, RpcError, SessionId, Tier, Whoami, DAEMON_IPC_PROTOCOL_VERSION, JSONRPC_VERSION,
 };
-use nexus_store::repos::{Agents, CommandIntents, CommandQueue, Inbox, NewCommandIntent, Sessions};
+use nexus_store::repos::{
+    Agents, CommandIntents, CommandQueue, DaemonState, Inbox, NewCommandIntent, Sessions,
+};
 use nexus_store::types::SessionRow;
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -29,6 +31,7 @@ use crate::local_operator::{
 /// Maximum encoded local IPC frame. Large transcripts are paginated domain responses; one caller
 /// cannot turn the daemon socket into an unbounded allocation.
 pub const MAX_DAEMON_IPC_FRAME_LEN: usize = 16 * 1024 * 1024;
+const MAX_PENDING_SESSION_PROMPTS: i64 = 100;
 const ENDPOINT_MANIFEST: &str = "daemon-ipc-endpoint.json";
 
 /// Boot-scoped local endpoint published for CLI, MCP, and gateway producers.
@@ -482,11 +485,23 @@ async fn handle_enqueue(
     params: Value,
     idempotency_key: Option<String>,
 ) -> DaemonIpcResponse {
-    let row = command_row(caller, command_id, kind, params, idempotency_key);
+    let (row, caller_validated_boot_epoch) =
+        match command_row_for_acceptance(state, caller, command_id, kind, params, idempotency_key)
+            .await
+        {
+            Ok(row) => row,
+            Err(error) => return store_failure(request_id, error),
+        };
     let commands = CommandIntents::new(&state.store);
-    let durable_command_id = match commands.insert_pending_or_resume(row).await {
+    let durable_command_id = match insert_before_shutdown_fence(
+        state,
+        row,
+        caller_validated_boot_epoch.as_deref(),
+    )
+    .await
+    {
         Ok(command_id) => command_id,
-        Err(error) => return store_failure(request_id, error.to_contract_error()),
+        Err(error) => return store_failure(request_id, error),
     };
     let receipt = match commands.receipt(&durable_command_id).await {
         Ok(Some(receipt)) => receipt,
@@ -585,6 +600,9 @@ async fn handle_query(
             name: local_operator_display_name(),
             project: caller.project,
             tier: Tier::Admin,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         }),
         Some(caller) => match resolve_registered_query_caller(state, &caller).await {
             Ok(caller) => Some(caller),
@@ -1275,6 +1293,15 @@ async fn resolve_registered_query_caller(
     state: &AppState,
     evidence: &DaemonIpcCaller,
 ) -> Result<Caller, ContractError> {
+    resolve_registered_query_caller_with_session(state, evidence)
+        .await
+        .map(|(caller, _)| caller)
+}
+
+async fn resolve_registered_query_caller_with_session(
+    state: &AppState,
+    evidence: &DaemonIpcCaller,
+) -> Result<(Caller, SessionRow), ContractError> {
     let client_key = evidence
         .client_key
         .as_deref()
@@ -1302,6 +1329,41 @@ async fn resolve_registered_query_caller(
                     "admin" => Tier::Admin,
                     _ => Tier::Agent,
                 },
+                locality: session
+                    .entity_kind()
+                    .map_err(|error| error.to_contract_error())?
+                    .0,
+                access: session
+                    .access()
+                    .map_err(|error| error.to_contract_error())?,
+                principal_id: evidence.principal_id.clone(),
+            }
+        }
+        None if session
+            .entity_kind()
+            .map_err(|error| error.to_contract_error())?
+            .1
+            == Kind::Human =>
+        {
+            Caller {
+                agent_id: None,
+                session: session.session_id.clone(),
+                name: session.name.clone().ok_or_else(|| {
+                    unauthorized("daemon IPC human caller session has no canonical name")
+                })?,
+                project: session.project.clone(),
+                tier: match session.tier.as_str() {
+                    "admin" => Tier::Admin,
+                    _ => Tier::Agent,
+                },
+                locality: session
+                    .entity_kind()
+                    .map_err(|error| error.to_contract_error())?
+                    .0,
+                access: session
+                    .access()
+                    .map_err(|error| error.to_contract_error())?,
+                principal_id: evidence.principal_id.clone(),
             }
         }
         None => match session.name.as_deref() {
@@ -1314,7 +1376,7 @@ async fn resolve_registered_query_caller(
         },
     };
     validate_query_caller(evidence, &session, &caller)?;
-    Ok(caller)
+    Ok((caller, session))
 }
 
 fn validate_query_caller(
@@ -1348,7 +1410,9 @@ fn validate_query_caller(
             "daemon IPC caller agent does not match registered client key",
         ));
     }
-    if session.kind != kind_token(evidence.kind) || session.tier != tier_token(evidence.tier) {
+    if session.kind != entity_kind::dotted(evidence.locality, evidence.kind)
+        || session.tier != tier_token(evidence.tier)
+    {
         return Err(unauthorized(
             "daemon IPC caller kind or tier does not match registered client key",
         ));
@@ -1396,17 +1460,29 @@ async fn handle_command(
     params: Value,
     idempotency_key: Option<String>,
 ) -> DaemonIpcResponse {
-    let row = command_row(
+    let (row, caller_validated_boot_epoch) = match command_row_for_acceptance(
+        state,
         caller,
         command_id.clone(),
         kind.clone(),
         params,
         idempotency_key,
-    );
+    )
+    .await
+    {
+        Ok(row) => row,
+        Err(error) => return store_failure(request_id, error),
+    };
     let commands = CommandIntents::new(&state.store);
-    let durable_command_id = match commands.insert_pending_or_resume(row).await {
+    let durable_command_id = match insert_before_shutdown_fence(
+        state,
+        row,
+        caller_validated_boot_epoch.as_deref(),
+    )
+    .await
+    {
         Ok(command_id) => command_id,
-        Err(error) => return store_failure(request_id, error.to_contract_error()),
+        Err(error) => return store_failure(request_id, error),
     };
 
     loop {
@@ -1457,6 +1533,139 @@ async fn handle_command(
     }
 }
 
+/// Linearize durable ingress against the daemon shutdown fence.
+///
+/// If insertion owns the store write gate first, shutdown waits and the worker drains that row. If
+/// shutdown owns it first, the request is rejected without a durable acceptance that a new boot
+/// could no longer authenticate from its boot-local session registry.
+async fn insert_before_shutdown_fence(
+    state: &AppState,
+    row: NewCommandIntent,
+    caller_validated_boot_epoch: Option<&str>,
+) -> Result<String, ContractError> {
+    let _ingress_guard = state.store.write_lock().lock_owned().await;
+    if state.command_worker_is_shutting_down() {
+        return Err(ContractError {
+            code: codes::INTERNAL_ERROR,
+            message: "daemon is shutting down; retry against the next boot".into(),
+        });
+    }
+    let commands = CommandIntents::new(&state.store);
+    match (row.kind.as_str(), caller_validated_boot_epoch) {
+        (nexus_store::command_kinds::harness::PROMPT, Some(boot_epoch)) => {
+            commands
+                .insert_pending_or_resume_bounded_session_prompt_with_validated_caller(
+                    row,
+                    MAX_PENDING_SESSION_PROMPTS,
+                    boot_epoch,
+                )
+                .await
+        }
+        (nexus_store::command_kinds::harness::PROMPT, None) => {
+            commands
+                .insert_pending_or_resume_bounded_session_prompt(row, MAX_PENDING_SESSION_PROMPTS)
+                .await
+        }
+        (_, Some(boot_epoch)) => {
+            commands
+                .insert_pending_or_resume_with_validated_caller(row, boot_epoch)
+                .await
+        }
+        (_, None) => commands.insert_pending_or_resume(row).await,
+    }
+    .map_err(|error| error.to_contract_error())
+}
+
+async fn command_row_for_acceptance(
+    state: &AppState,
+    caller: Option<DaemonIpcCaller>,
+    command_id: String,
+    kind: String,
+    params: Value,
+    idempotency_key: Option<String>,
+) -> Result<(NewCommandIntent, Option<String>), ContractError> {
+    let Some(evidence) = caller else {
+        return Ok((
+            command_row(None, command_id, kind, params, idempotency_key),
+            None,
+        ));
+    };
+    if !command_requires_registered_caller(&kind)
+        || is_local_operator(&evidence)
+        || is_source_push_caller(&kind, &evidence)
+        || is_gateway_transport_external_principal(&kind, &evidence)
+    {
+        return Ok((
+            command_row(Some(evidence), command_id, kind, params, idempotency_key),
+            None,
+        ));
+    }
+
+    let evidence_kind = evidence.kind;
+    let evidence_tier = evidence.tier;
+    let (caller, session) = resolve_registered_query_caller_with_session(state, &evidence).await?;
+    let boot_epoch = DaemonState::new(&state.store)
+        .boot_epoch()
+        .await
+        .map_err(|error| error.to_contract_error())?
+        .filter(|epoch| !epoch.is_empty())
+        .ok_or_else(|| ContractError {
+            code: codes::INTERNAL_ERROR,
+            message: "daemon boot epoch is unavailable at command acceptance".into(),
+        })?;
+    let canonical = DaemonIpcCaller {
+        name: Some(caller.name),
+        project: caller.project,
+        session_id: Some(caller.session.0.clone()),
+        agent_id: caller.agent_id.map(|agent_id| agent_id.0),
+        runtime_id: Some(caller.session.0),
+        client_key: session.client_key,
+        kind: evidence_kind,
+        locality: caller.locality,
+        access: caller.access,
+        principal_id: caller.principal_id,
+        tier: evidence_tier,
+    };
+    Ok((
+        command_row(Some(canonical), command_id, kind, params, idempotency_key),
+        Some(boot_epoch),
+    ))
+}
+
+fn command_requires_registered_caller(kind: &str) -> bool {
+    !matches!(
+        kind,
+        nexus_store::command_kinds::identity::REGISTER
+            | nexus_store::command_kinds::notification::NOTIFY
+    )
+}
+
+fn is_source_push_caller(kind: &str, caller: &DaemonIpcCaller) -> bool {
+    kind == nexus_store::command_kinds::source::PUSH
+        && caller.kind == Kind::Notification
+        && caller.tier == Tier::Agent
+        && caller.client_key.is_none()
+}
+
+fn is_gateway_transport_external_principal(kind: &str, caller: &DaemonIpcCaller) -> bool {
+    kind == nexus_store::command_kinds::message_post::SEND
+        && caller
+            .session_id
+            .as_deref()
+            .is_some_and(|session_id| session_id.starts_with("transport:") && session_id.len() > 10)
+        && caller.runtime_id == caller.session_id
+        && caller.agent_id.is_none()
+        && caller.client_key.is_none()
+        && caller
+            .principal_id
+            .as_deref()
+            .is_some_and(|principal_id| principal_id.starts_with("x_") && principal_id.len() > 2)
+        && caller.kind == Kind::Human
+        && caller.locality == Locality::External
+        && caller.access.as_deref() == Some("guest")
+        && caller.tier == Tier::Agent
+}
+
 fn command_row(
     caller: Option<DaemonIpcCaller>,
     command_id: String,
@@ -1481,7 +1690,8 @@ fn command_row(
         caller_agent_id: caller.agent_id,
         caller_runtime_id: caller.runtime_id,
         caller_client_key: caller.client_key,
-        caller_kind: Some(kind_token(caller.kind).into()),
+        caller_principal_id: caller.principal_id,
+        caller_kind: Some(entity_kind::dotted(caller.locality, caller.kind)),
         caller_tier: Some(tier_token(caller.tier).into()),
         idempotency_key,
         request_json: serde_json::to_string(&params).unwrap_or_else(|_| "null".into()),
@@ -1498,16 +1708,10 @@ fn anonymous_caller() -> DaemonIpcCaller {
         runtime_id: None,
         client_key: None,
         kind: Kind::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
         tier: Tier::Agent,
-    }
-}
-
-fn kind_token(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Agent => "agent",
-        Kind::Human => "human",
-        Kind::Notification => "notification",
-        Kind::App => "app",
     }
 }
 

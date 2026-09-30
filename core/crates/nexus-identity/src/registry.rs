@@ -174,7 +174,7 @@ pub(crate) async fn resolve_register(
     // Durable agent aliases are exclusive within the agent registration lane. Human/app sessions
     // occupy a separate authenticated principal namespace: sharing a display label must not turn
     // them into the agent, and command authentication explicitly strips any contaminated agent id.
-    if kind_str(req.kind) == "agent" {
+    if req.kind.unwrap_or(nexus_contracts::Kind::Agent) == nexus_contracts::Kind::Agent {
         let durable_name_matches = Agents::new(store).find_all_by_name(req_name).await?;
         match durable_name_matches.as_slice() {
             [] => {}
@@ -210,7 +210,7 @@ pub(crate) async fn resolve_register(
         session_id: new_session_id(),
         name: Some(req_name.to_string()),
         agent: Some(req.harness.as_str().to_string()),
-        kind: kind_str(req.kind).to_string(),
+        kind: kind_str(req.locality, req.kind),
         role: req.role.clone(),
         tier: tier_str(req.tier).to_string(),
         harness_session_id: Some(req.harness_session_id.clone()),
@@ -219,7 +219,13 @@ pub(crate) async fn resolve_register(
         project: req.project.clone(),
         transport: None, // legacy register path — transport unknown at registration time
     };
-    let id = repo.create_staged_registration(new).await?;
+    let metadata_json = req
+        .access
+        .as_ref()
+        .map(|access| serde_json::json!({"access": access}).to_string());
+    let id = repo
+        .create_staged_registration_with_metadata(new, metadata_json)
+        .await?;
     match repo.find_by_session_id(&id).await {
         Ok(Some(created)) => Ok(RegisterOutcome::Created(created)),
         Ok(None) => {

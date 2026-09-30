@@ -56,6 +56,9 @@ impl PtyAgent {
             name: self.name.clone(),
             project: PROJECT.into(),
             tier: Tier::Agent,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         }
     }
 }
@@ -98,6 +101,8 @@ impl PtyTestDaemon {
                     runtime_credential: None,
                     tier: Tier::Agent,
                     kind: Some(Kind::Agent),
+                    locality: Default::default(),
+                    access: None,
                     role: None,
                     cwd: None,
                 },

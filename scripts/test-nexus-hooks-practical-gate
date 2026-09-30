@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import runpy
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -106,8 +107,54 @@ class HooksPracticalGateContractTests(unittest.TestCase):
         self.assertNotIn("SELECT COUNT(*) FROM messages", source)
 
     def test_idempotent_retry_does_not_execute_hooks_twice(self) -> None:
-        source = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("if (evaluations, executions) != (2, 6):", source)
+        namespace = runpy.run_path(str(SCRIPT))
+        live_gate = object.__new__(namespace["LiveGate"])
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "gateway.db"
+            with sqlite3.connect(database) as db:
+                db.executescript(
+                    """
+                    CREATE TABLE hook_pipeline_evaluations (
+                        evaluation_id TEXT PRIMARY KEY,
+                        message_id TEXT NOT NULL
+                    );
+                    CREATE TABLE hook_handler_executions (
+                        invocation_id TEXT PRIMARY KEY,
+                        evaluation_id TEXT NOT NULL
+                    );
+                    INSERT INTO hook_pipeline_evaluations VALUES ('before', 'pending:m1');
+                    INSERT INTO hook_pipeline_evaluations VALUES ('after', 'm1');
+                    INSERT INTO hook_handler_executions VALUES ('before-1', 'before');
+                    INSERT INTO hook_handler_executions VALUES ('before-2', 'before');
+                    INSERT INTO hook_handler_executions VALUES ('before-3', 'before');
+                    INSERT INTO hook_handler_executions VALUES ('after-1', 'after');
+                    INSERT INTO hook_handler_executions VALUES ('after-2', 'after');
+                    INSERT INTO hook_handler_executions VALUES ('after-3', 'after');
+                    """
+                )
+
+            live_gate.message_ids = {"gateway-rest": "m1"}
+            live_gate.scenario_status = {"idempotent-retry": "pending"}
+            live_gate.gateway_db = lambda: sqlite3.connect(database)
+            live_gate.http_json = lambda *_args, **_kwargs: {"messageId": "m1"}
+            live_gate.verify_idempotent_retry()
+            self.assertEqual(live_gate.scenario_status["idempotent-retry"], "pass")
+
+            def duplicated_retry(*_args: object, **_kwargs: object) -> dict[str, str]:
+                with sqlite3.connect(database) as db:
+                    db.execute(
+                        "INSERT INTO hook_pipeline_evaluations VALUES ('duplicate', 'm1')"
+                    )
+                    for index in range(3):
+                        db.execute(
+                            "INSERT INTO hook_handler_executions VALUES (?, 'duplicate')",
+                            (f"duplicate-{index}",),
+                        )
+                return {"messageId": "m1"}
+
+            live_gate.http_json = duplicated_retry
+            with self.assertRaises(namespace["GateFailure"]):
+                live_gate.verify_idempotent_retry()
 
     def test_host_wrapper_converts_child_failures_to_one_gate_error(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")

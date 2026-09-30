@@ -27,6 +27,8 @@ fn register_agent(name: &str, client_key: &str) -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Agent,
         kind: Some(Kind::Agent),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -36,6 +38,8 @@ fn register_admin(name: &str, client_key: &str) -> RegisterRequest {
     RegisterRequest {
         tier: Tier::Admin,
         kind: Some(Kind::Human),
+        locality: Default::default(),
+        access: None,
         ..register_agent(name, client_key)
     }
 }
@@ -58,6 +62,7 @@ async fn enqueue_send(
             caller_agent_id: caller.agent_id.as_ref().map(|id| id.0.clone()),
             caller_runtime_id: Some(caller.session_id.0.clone()),
             caller_client_key: Some(caller_key.into()),
+            caller_principal_id: None,
             caller_kind: Some("agent".into()),
             caller_tier: Some("agent".into()),
             idempotency_key: None,
@@ -110,6 +115,7 @@ async fn admin_group_assign_command_creates_membership() {
             caller_agent_id: admin.agent_id.as_ref().map(|id| id.0.clone()),
             caller_runtime_id: Some(admin.session.0.clone()),
             caller_client_key: Some("ck_operator".into()),
+            caller_principal_id: None,
             caller_kind: Some("human".into()),
             caller_tier: Some("admin".into()),
             idempotency_key: None,

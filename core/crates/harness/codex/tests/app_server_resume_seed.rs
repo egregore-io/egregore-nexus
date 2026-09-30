@@ -73,7 +73,7 @@ async fn known_thread_resume_uses_existing_codex_home_without_copying_rollout() 
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(external_codex_home.clone()),
                 model: None,
                 bus_mcp: None,
                 cwd: None,
@@ -132,4 +132,167 @@ async fn known_thread_resume_uses_existing_codex_home_without_copying_rollout() 
 
     assert!(bridge.kill(&session));
     let _ = std::fs::remove_dir_all(state_root);
+}
+
+#[tokio::test]
+async fn resumed_in_progress_turn_blocks_new_prompt_until_native_boundary() {
+    let state_root = tempdir("active-turn");
+    let external_codex_home = state_root.join("external-codex-home");
+    write_rollout(&external_codex_home);
+    let session_dir = state_root.join("s_active");
+    std::fs::create_dir_all(&session_dir).expect("create session dir");
+
+    let bridge = CodexBridge::new();
+    let session = SessionId("s_active".into());
+    let resume_response = serde_json::json!({
+        "thread": {
+            "id": THREAD_ID,
+            "status": {"type": "active", "activeFlags": []},
+            "turns": [{
+                "id": "turn-before-daemon-restart",
+                "status": "inProgress",
+                "items": []
+            }]
+        }
+    });
+    bridge
+        .launch_with_options(
+            session.clone(),
+            SupervisorOpts {
+                codex_exe: FAKE_BIN.to_string(),
+                session_dir: session_dir.clone(),
+                codex_home: Some(external_codex_home.clone()),
+                model: None,
+                bus_mcp: None,
+                cwd: None,
+                env: vec![(
+                    "FAKE_CODEX_RESUME_RESPONSE".into(),
+                    resume_response.to_string(),
+                )],
+            },
+            Arc::new(RecSink) as Arc<dyn EventSink>,
+            BridgeLaunchOptions {
+                known_thread_id: Some(THREAD_ID.to_string()),
+                resume_codex_homes: vec![external_codex_home],
+                ..BridgeLaunchOptions::default()
+            },
+        )
+        .await
+        .expect("bridge launch should start fake app-server");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while bridge.transport().bound_thread_id(&session).as_deref() != Some(THREAD_ID) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for resumed transport binding"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        bridge.transport().active_turn_sessions(),
+        vec![session.clone()],
+        "thread/resume in-progress turn must seed transport authority before binding"
+    );
+
+    let transport = bridge.transport();
+    let prompt_session = session.clone();
+    let prompt_transport = transport.clone();
+    let prompt = tokio::spawn(async move {
+        prompt_transport
+            .prompt(&prompt_session, "must wait for prior native turn".into())
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(
+        !prompt.is_finished(),
+        "a prompt must not start while thread/resume reports an in-progress native turn"
+    );
+    transport
+        .turn_tracker()
+        .complete(THREAD_ID, "turn-before-daemon-restart");
+    tokio::time::timeout(std::time::Duration::from_secs(2), prompt)
+        .await
+        .expect("prompt should resume after the restored native boundary")
+        .expect("prompt task should not panic")
+        .expect("prompt should start after the restored native boundary");
+
+    assert!(bridge.kill(&session));
+    let _ = std::fs::remove_dir_all(state_root);
+}
+
+#[tokio::test]
+async fn resume_refuses_mismatched_or_ambiguous_native_turn_authority() {
+    let cases = [
+        (
+            "wrong-thread",
+            serde_json::json!({
+                "thread": {
+                    "id": "different-thread",
+                    "turns": [{"id": "active", "status": "inProgress"}]
+                }
+            }),
+        ),
+        (
+            "ambiguous-turns",
+            serde_json::json!({
+                "thread": {
+                    "id": THREAD_ID,
+                    "turns": [
+                        {"id": "active-a", "status": "inProgress"},
+                        {"id": "active-b", "status": "inProgress"}
+                    ]
+                }
+            }),
+        ),
+    ];
+
+    for (tag, resume_response) in cases {
+        let state_root = tempdir(tag);
+        let external_codex_home = state_root.join("external-codex-home");
+        write_rollout(&external_codex_home);
+        let session_dir = state_root.join("session");
+        std::fs::create_dir_all(&session_dir).expect("create session dir");
+
+        let bridge = CodexBridge::new();
+        let session = SessionId(format!("s_{tag}"));
+        let error = bridge
+            .launch_with_options(
+                session.clone(),
+                SupervisorOpts {
+                    codex_exe: FAKE_BIN.to_string(),
+                    session_dir,
+                    codex_home: Some(external_codex_home.clone()),
+                    model: None,
+                    bus_mcp: None,
+                    cwd: None,
+                    env: vec![(
+                        "FAKE_CODEX_RESUME_RESPONSE".into(),
+                        resume_response.to_string(),
+                    )],
+                },
+                Arc::new(RecSink) as Arc<dyn EventSink>,
+                BridgeLaunchOptions {
+                    known_thread_id: Some(THREAD_ID.to_string()),
+                    resume_codex_homes: vec![external_codex_home],
+                    ..BridgeLaunchOptions::default()
+                },
+            )
+            .await
+            .expect_err("invalid resume authority must fail the known-thread launch");
+
+        assert!(
+            error.to_string().contains("thread/resume"),
+            "{tag} should report the rejected thread/resume authority: {error}"
+        );
+        assert!(
+            !bridge.transport().is_bound(&session),
+            "{tag} resume authority must fail closed before transport publication"
+        );
+        assert!(
+            !bridge.has(&session),
+            "{tag} failed launch must clean up the app-server handle"
+        );
+
+        let _ = std::fs::remove_dir_all(state_root);
+    }
 }

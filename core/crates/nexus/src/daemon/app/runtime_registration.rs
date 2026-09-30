@@ -184,29 +184,53 @@ impl AppState {
                 workers.to_string_lossy().into_owned(),
             ));
         }
-        // The ACP engine scrubs inherited CODEX_* state. Pin an explicitly resolved Codex home in
-        // the launch context so headless Codex uses the operator-selected OAuth/profile boundary
-        // instead of silently falling back to $HOME/.codex.
+        // The ACP engine scrubs inherited harness-home variables. Reapply only the canonical
+        // machine provider authority for the selected harness; Nexus runtime homes never become
+        // credential homes.
         if kind.as_str() == "codex" {
-            if let Some(home) = std::env::var_os("CODEX_HOME") {
+            let session_dir = std::path::PathBuf::from(&self.nexus_home)
+                .join("codex-sessions")
+                .join(agent_id);
+            if let Ok(home) =
+                nexus_harness_codex::app_server::supervisor::resolve_machine_codex_home_from_env(
+                    &session_dir,
+                )
+            {
                 env.push((
                     "CODEX_HOME".to_string(),
                     home.to_string_lossy().into_owned(),
                 ));
             }
         }
-        // The ACP engine deliberately removes inherited harness-home variables before spawning a
-        // child, so a daemon configured with an explicit Hermes home must pin that value in the
-        // launch context. Otherwise headless Hermes silently falls back to `$HOME/.hermes` and can
-        // lose the selected provider or credentials even though the daemon itself resolves them.
         if kind.as_str() == "hermes" {
-            if let Some(home) = std::env::var_os("HERMES_HOME") {
+            let source_override =
+                std::env::var_os("NEXUS_HERMES_SOURCE_HOME").map(std::path::PathBuf::from);
+            let selected = std::env::var_os("HERMES_HOME").map(std::path::PathBuf::from);
+            let machine_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            if let Ok(home) = crate::daemon::pty_supervisor::resolve_machine_hermes_home(
+                source_override.as_deref(),
+                selected.as_deref(),
+                machine_home.as_deref(),
+            ) {
                 env.push((
                     "HERMES_HOME".to_string(),
                     home.to_string_lossy().into_owned(),
                 ));
             }
         }
+        if kind.as_str() == "claude" {
+            if let Some(config_dir) =
+                std::env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty())
+            {
+                env.push((
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    config_dir.to_string_lossy().into_owned(),
+                ));
+            }
+        }
+        // OpenCode auth is machine-owned under HOME/XDG_DATA_HOME (and provider API-key env).
+        // Those variables remain inherited; only Nexus/OpenCode runtime DB/config overrides are
+        // scrubbed and rebuilt by the adapter.
         (Some(dir), env)
     }
 
@@ -395,7 +419,7 @@ impl AppState {
         // loop before the turn executor is actually bound; pending mail would otherwise be claimed
         // and terminalized as `session not registered` milliseconds before startup completes.
         let harness_still_opening = self.agent.is_harness_alive(&row.session_id) == Some(false);
-        if row.kind == "agent" && !externally_drained {
+        if row.is_agent() && !externally_drained {
             // The same stable session may first register as an external pull client and later
             // acquire a daemon-managed transport. Retire that old ownership before making the
             // harness loop wakeable; otherwise the active subscription suppresses the loop and
@@ -471,7 +495,7 @@ impl AppState {
             .ok_or_else(|| {
                 NexusError::NotFound(format!("session:{}", session.0)).to_contract_error()
             })?;
-        if row.kind != "agent" {
+        if !row.is_agent() {
             return Err(NexusError::Invalid(format!(
                 "{}:{} is not an agent session",
                 row.display_name(),
@@ -540,7 +564,7 @@ impl AppState {
         else {
             return Ok(());
         };
-        if row.kind != "agent" {
+        if !row.is_agent() {
             return Ok(());
         }
         if let Some(name) = row.name.as_deref() {

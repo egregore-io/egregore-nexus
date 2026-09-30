@@ -134,6 +134,43 @@ describe("POST /api/login", () => {
     expect(res.status).toBe(401);
   });
 
+  it("keeps the immutable human and principal ids across repeated login and rename", async () => {
+    let idSeq = 0;
+    const handler = makeLoginHandler({
+      db: async () => db,
+      commands,
+      genId: () => `id_${++idSeq}`,
+      now: () => 1_000_000,
+    });
+    const login = (name: string) => handler(new Request("http://localhost/api/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name, password: "pw" }),
+    }));
+
+    expect((await login("alex")).status).toBe(200);
+    const account = (await db.execute(
+      "SELECT human_user_id FROM human_user WHERE name_key = 'alex'",
+    )).rows[0]!;
+    await db.execute({
+      sql: "UPDATE human_user SET name_key = ?, name = ? WHERE human_user_id = ?",
+      args: ["alex-renamed", "Alex Renamed", String(account.human_user_id)],
+    });
+    expect((await login("alex-renamed")).status).toBe(200);
+
+    const sessions = await db.execute(
+      `SELECT human_user_id, principal_id FROM human_session
+       ORDER BY cookie_token`,
+    );
+    expect(sessions.rows).toHaveLength(2);
+    expect(new Set(sessions.rows.map((row) => String(row.human_user_id)))).toEqual(
+      new Set([String(account.human_user_id)]),
+    );
+    expect(new Set(sessions.rows.map((row) => String(row.principal_id))).size).toBe(1);
+    const principals = await db.execute("SELECT COUNT(*) AS n FROM principals");
+    expect(Number(principals.rows[0]!.n)).toBe(1);
+  });
+
   it("returns 400 on blank name", async () => {
     const handler = makeLoginHandler({
       db: async () => db,

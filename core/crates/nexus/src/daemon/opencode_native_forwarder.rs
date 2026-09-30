@@ -342,7 +342,8 @@ impl<'a> OpenCodeRuntimeStateRepo<'a> {
         };
         NativeThreadBindings::new(self.store)
             .claim(NewNativeThreadBinding {
-                harness: "opencode".into(),
+                provider: "opencode".into(),
+                kind: "harness".into(),
                 native_thread_id: opencode_session_id.to_string(),
                 agent_id,
                 project: row.project,

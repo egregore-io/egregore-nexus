@@ -30,12 +30,33 @@ use nexus_contracts::{
     RemoveRequest, RemoveResponse, SpawnRequest, SpawnResponse, SteerCapability, SteerDelivery,
     SteerResponse, WsEvent,
 };
+use tokio::sync::Mutex as AsyncMutex;
 
 use super::provider_limit::{classify_rpc_error, classify_turn_error};
-use super::turn_completion::CodexTurnTracker;
+use super::turn_completion::{CodexTurnTracker, QueuedAcceptedEvent, QueuedAcceptedUserInputEcho};
 use super::{CodexAppServerClient, CodexRpcError};
 
 const TURN_COMPLETION_TIMEOUT: Duration = Duration::from_secs(600);
+const PROMPT_INPUT_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct PromptAcceptanceCleanup {
+    tracker: CodexTurnTracker,
+    accepted_event: QueuedAcceptedEvent,
+    accepted_echo: QueuedAcceptedUserInputEcho,
+    text: String,
+    turn_id: Option<String>,
+}
+
+impl Drop for PromptAcceptanceCleanup {
+    fn drop(&mut self) {
+        self.tracker.cancel_accepted_event(&self.accepted_event);
+        self.tracker.tombstone_cancelled_user_input_echo(
+            &self.accepted_echo,
+            self.turn_id.as_deref(),
+            &self.text,
+        );
+    }
+}
 
 /// Delivers injected turns / operator prompts to a headed codex app-server session
 /// by calling `turn/start` on a dedicated inject client. Each session is bound with
@@ -46,6 +67,9 @@ const TURN_COMPLETION_TIMEOUT: Duration = Duration::from_secs(600);
 #[derive(Clone, Default)]
 pub struct CodexAppServerTransport {
     sessions: Arc<Mutex<HashMap<SessionId, (Arc<CodexAppServerClient>, String)>>>,
+    /// Serializes Nexus-owned `turn/start` boundaries per session. Durable prompts and realtime
+    /// bus delivery run on independent lanes and must not race two starts onto one Codex thread.
+    turn_start_locks: Arc<Mutex<HashMap<SessionId, Arc<AsyncMutex<()>>>>>,
     /// Sessions whose codex app-server PROCESS is alive — marked at launch, independent of
     /// `sessions` (the turn-routing binding), which is only populated after first-turn discovery.
     /// Value = the app-server root OS pid when the daemon spawned it; `None` for stamp-only
@@ -155,6 +179,11 @@ impl CodexAppServerTransport {
         accepted_event: Option<(Arc<dyn EventSink>, WsEvent)>,
     ) -> InjectResult<()> {
         let (client, thread_id) = self.client_for(recipient).map_err(InjectError::Contract)?;
+        let turn_start_lock = self.turn_start_lock(recipient);
+        let _turn_start_guard = turn_start_lock.lock().await;
+        self.wait_for_prior_turn_boundary(&thread_id)
+            .await
+            .map_err(InjectError::Contract)?;
         let text = render_injected_turn_for(batch, &recipient.0);
         let accepted_event = accepted_event.map(|(events, event)| {
             self.turn_tracker
@@ -222,6 +251,9 @@ impl CodexAppServerTransport {
     /// rejects the turn.
     pub async fn prompt(&self, recipient: &SessionId, text: String) -> PortResult<()> {
         let (client, thread_id) = self.client_for(recipient)?;
+        let turn_start_lock = self.turn_start_lock(recipient);
+        let _turn_start_guard = turn_start_lock.lock().await;
+        self.wait_for_prior_turn_boundary(&thread_id).await?;
         let accepted_echo = self
             .turn_tracker
             .queue_accepted_user_input_echo(&thread_id, text.clone());
@@ -257,12 +289,24 @@ impl CodexAppServerTransport {
         accepted_event: WsEvent,
     ) -> PortResult<()> {
         let (client, thread_id) = self.client_for(recipient)?;
-        let queued_event =
-            self.turn_tracker
-                .queue_accepted_event(&thread_id, events, accepted_event);
+        let turn_start_lock = self.turn_start_lock(recipient);
+        let _turn_start_guard = turn_start_lock.lock().await;
+        self.wait_for_prior_turn_boundary(&thread_id).await?;
+        let queued_event = self.turn_tracker.queue_accepted_event_on_native_user_input(
+            &thread_id,
+            events,
+            accepted_event,
+        );
         let accepted_echo = self
             .turn_tracker
             .queue_accepted_user_input_echo(&thread_id, text.clone());
+        let mut acceptance_cleanup = PromptAcceptanceCleanup {
+            tracker: self.turn_tracker.clone(),
+            accepted_event: queued_event.clone(),
+            accepted_echo: accepted_echo.clone(),
+            text: text.clone(),
+            turn_id: None,
+        };
         let turn_id = match client.turn_start_id(&thread_id, &text).await {
             Ok(turn_id) => turn_id,
             Err(e) => {
@@ -275,14 +319,33 @@ impl CodexAppServerTransport {
                 });
             }
         };
+        let Some(turn_id) = turn_id else {
+            return Err(ContractError {
+                code: -32004,
+                message: "codex turn/start response missing native turn id".into(),
+            });
+        };
+        acceptance_cleanup.turn_id = Some(turn_id.clone());
         self.turn_tracker
-            .emit_accepted_event(&queued_event, turn_id.as_deref())
-            .await;
-        if let Some(turn_id) = turn_id {
-            self.turn_tracker
-                .record_turn_start_acceptance(&thread_id, &turn_id);
-            self.turn_tracker
-                .record_accepted_user_input_echo_for_queued(&accepted_echo, &turn_id);
+            .record_turn_start_acceptance(&thread_id, &turn_id);
+        self.turn_tracker
+            .record_accepted_user_input_echo_for_queued(&accepted_echo, &turn_id);
+        if let Err(error) = self
+            .turn_tracker
+            .wait_for_accepted_user_input_echo(
+                &thread_id,
+                &turn_id,
+                &text,
+                PROMPT_INPUT_RECEIPT_TIMEOUT,
+            )
+            .await
+        {
+            return Err(ContractError {
+                code: -32004,
+                message: format!(
+                    "timed out waiting for codex native prompt context receipt: {error}"
+                ),
+            });
         }
         Ok(())
     }
@@ -458,6 +521,36 @@ impl CodexAppServerTransport {
     }
 
     // -- Internal helpers --
+
+    fn turn_start_lock(&self, recipient: &SessionId) -> Arc<AsyncMutex<()>> {
+        self.turn_start_locks
+            .lock()
+            .unwrap()
+            .entry(recipient.clone())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    async fn wait_for_prior_turn_boundary(&self, thread_id: &str) -> PortResult<()> {
+        while let Some(turn_id) = self.turn_tracker.active_turn_id(thread_id) {
+            match self
+                .turn_tracker
+                .wait_for_completion(thread_id, &turn_id, TURN_COMPLETION_TIMEOUT)
+                .await
+            {
+                Ok(()) | Err(super::turn_completion::CodexTurnWaitError::Failed(_)) => {}
+                Err(error) => {
+                    return Err(ContractError {
+                        code: -32004,
+                        message: format!(
+                        "failed waiting for prior Codex turn boundary before turn/start: {error}"
+                    ),
+                    })
+                }
+            }
+        }
+        Ok(())
+    }
 
     fn client_for(&self, recipient: &SessionId) -> PortResult<(Arc<CodexAppServerClient>, String)> {
         let map = self.sessions.lock().unwrap();
@@ -851,6 +944,62 @@ mod tests {
         assert!(
             input_text.contains("RAW-OPERATOR-TEXT-9999"),
             "turn/start input must contain the raw operator text; got: {input_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_waits_for_existing_active_turn_boundary() {
+        let (sock, calls) = spawn_fake_server("cat-transport", "prompt-active-boundary").await;
+
+        let client = CodexAppServerClient::connect(&sock, "nexus-inject")
+            .await
+            .expect("client connect should succeed");
+
+        let thread_id = "test-thread-prompt-active".to_string();
+        let transport = CodexAppServerTransport::new();
+        let session = SessionId("s_prompt_active".into());
+        transport.bind(session.clone(), Arc::new(client), thread_id.clone());
+        transport
+            .turn_tracker()
+            .observe_active_turn(&thread_id, "turn-existing");
+
+        let pending = tokio::spawn({
+            let transport = transport.clone();
+            let session = session.clone();
+            async move {
+                transport
+                    .prompt(&session, "MUST-WAIT-FOR-BOUNDARY".to_string())
+                    .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            calls.lock().unwrap().iter().all(|call| {
+                call.get("method").and_then(|method| method.as_str()) != Some("turn/start")
+            }),
+            "a queued prompt must not turn/start while the prior session turn is active"
+        );
+
+        transport
+            .turn_tracker()
+            .complete(&thread_id, "turn-existing");
+        tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .expect("prompt did not resume after the prior turn completed")
+            .expect("prompt task panicked")
+            .expect("prompt failed after the prior turn completed");
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|call| {
+                    call.get("method").and_then(|method| method.as_str()) == Some("turn/start")
+                })
+                .count(),
+            1,
+            "the queued prompt must start exactly once after the active boundary"
         );
     }
 

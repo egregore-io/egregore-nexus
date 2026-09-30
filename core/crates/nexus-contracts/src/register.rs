@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use typeshare::typeshare;
 
-use crate::enums::{Kind, Presence, Tier};
+use crate::enums::{Kind, Locality, Presence, Tier};
 use crate::harness::HarnessId;
 use crate::ids::{AgentId, SessionId};
 
@@ -38,6 +38,12 @@ pub struct RegisterRequest {
     /// `agent` | `app` (defaults to agent server-side if omitted).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<Kind>,
+    /// Entity origin, independent of its closed nature. Legacy callers default to local.
+    #[serde(default)]
+    pub locality: Locality,
+    /// Provider or policy-defined access label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
     /// Registered label (display/addressing only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
@@ -99,6 +105,12 @@ pub struct MemberSummary {
     /// The harness/runtime label (`claude`/`codex`/…); `None` for human/app sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Entity origin, independent of its closed nature. Legacy rows default to local.
+    #[serde(default)]
+    pub locality: Locality,
+    /// Provider or policy-defined access label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     pub presence: Presence,

@@ -51,6 +51,7 @@ import {
   type CommandIngressSenderOptions,
 } from "@server/messagePost/commandIngress";
 import {
+  COMMAND_KINDS,
   createCommandIngressSubmitter,
   type CommandIngressOptions,
 } from "@server/command/ingress";
@@ -63,6 +64,7 @@ import { parseCookies } from "@server/http/cookies";
 import { handleSessionEvents } from "@server/stream/sessionEvents";
 import { createDaemonSourceRegistry } from "@server/source/daemonRegistry";
 import { gatewayHookDiagnostics } from "@server/hooks/diagnostics";
+import { gatewayTransportStates } from "@server/transport/registry";
 import { browserMutationCsrfFailure } from "@server/auth/browserMutationAuth.mjs";
 import {
   canonicalAgentAccessGrantsByAgentId,
@@ -160,6 +162,8 @@ export interface DispatchDeps {
   sourceRegistry?: SourceRegistryReader;
   /** Process-local read-only hook diagnostics; resolved per request after service startup. */
   hookDiagnostics?: () => HookDiagnosticsReader | undefined;
+  /** Process-local live transport host states; resolved for each capability request. */
+  transportStates?: typeof gatewayTransportStates;
   /** Public notification signing secret; production falls back to `NEXUS_HMAC_SECRET`. */
   notifyHmacSecret?: string;
   /** Optional human read-receipt marker; production defaults to the daemon DB. */
@@ -191,6 +195,7 @@ const realDispatchDeps: DispatchDeps = {
   canonicalDb: () => getGatewayStore(),
   sourceRegistry: createDaemonSourceRegistry(),
   hookDiagnostics: gatewayHookDiagnostics,
+  transportStates: gatewayTransportStates,
 };
 
 // ── dispatch factory ──────────────────────────────────────────────────────────
@@ -304,6 +309,11 @@ export function makeDispatch(deps: DispatchDeps) {
           error: { code: "forbidden", message: "agent session owner required" },
         }, 403);
       }
+      void commands.submit(
+        COMMAND_KINDS.harnessWarm,
+        { name: target.owner.name, agentId: target.owner.agentId },
+        apiReq.caller,
+      ).catch(() => {});
       return withAgentSessionBinding(handleSessionEvents(request, target.sessionId), target);
     }
 
@@ -314,6 +324,7 @@ export function makeDispatch(deps: DispatchDeps) {
       commands,
       sourceRegistry: deps.sourceRegistry,
       hooks: deps.hookDiagnostics?.(),
+      transportStates: deps.transportStates,
       humanReads,
       notifyHmacSecret: deps.notifyHmacSecret ?? process.env.NEXUS_HMAC_SECRET,
       now: deps.now ?? Date.now,

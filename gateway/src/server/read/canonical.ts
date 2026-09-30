@@ -6,6 +6,7 @@ import {
   type MessagePageOptions,
 } from "../store/repos/messages";
 import { Kind, Scope, type Message, type Provenance } from "@shared/types";
+import { parseEntityKind } from "@server/identity/entityKind";
 import type {
   AgentAccessGrantRow,
   AgentOwnerRow,
@@ -66,7 +67,7 @@ export async function canonicalMembers(
   options: { includeOffline?: boolean; project?: string } = {},
 ): Promise<MemberRow[]> {
   const result = await db.execute(`
-    SELECT i.agent_id, i.name, i.role, i.tier, i.metadata_json,
+    SELECT i.agent_id, i.name, i.tier, i.metadata_json,
            r.runtime_id, r.session_id, r.harness, r.status, r.updated_at
     FROM identities i
     LEFT JOIN runtime_descriptors r ON r.agent_id = i.agent_id
@@ -90,7 +91,6 @@ export async function canonicalMembers(
       agentId,
       ...(kind === "agent" && harness ? { agent: harness } : {}),
       kind,
-      role: optionalString(row.role),
       tier: optionalString(row.tier),
       presence: status,
       currentWork: optionalString(metadata.currentWork),
@@ -159,9 +159,7 @@ export async function canonicalAgentShow(
     agent: {
       agentId: identity.agentId,
       name: identity.name,
-      project: identity.project,
       defaultHarness: optionalString(identity.metadata.defaultHarness) ?? runtimes[0]?.harness,
-      role: identity.role,
       tier: identity.tier,
       disabled: identity.metadata.disabledAt !== undefined && identity.metadata.disabledAt !== null,
       activeRuntime: runtimes.find((runtime) => runtime.active),
@@ -211,9 +209,7 @@ export async function canonicalWhoami(db: Client, name: string): Promise<WhoamiR
     agentId: identity.agentId,
     name: identity.name,
     sessionId: member?.sessionId ?? "",
-    role: identity.role,
     tier: identity.tier ?? "Agent",
-    project: identity.project,
     presence: member?.presence ?? "offline",
   };
 }
@@ -335,7 +331,7 @@ export async function canonicalAgentSessionTarget(
   let identity: CanonicalIdentity | undefined;
   let sessionId: string | undefined;
   if (exactSessionId) {
-    const runtimeColumns = `SELECT i.agent_id, i.name, i.owner, i.role, i.tier, i.metadata_json,
+    const runtimeColumns = `SELECT i.agent_id, i.name, i.owner, i.tier, i.metadata_json,
                    r.session_id, r.runtime_id
             FROM runtime_descriptors r
             JOIN identities i ON i.agent_id = r.agent_id`;
@@ -346,7 +342,7 @@ export async function canonicalAgentSessionTarget(
             r.updated_at DESC
             LIMIT 1`;
     let result = await db.execute({
-      sql: `SELECT i.agent_id, i.name, i.owner, i.role, i.tier, i.metadata_json,
+      sql: `SELECT i.agent_id, i.name, i.owner, i.tier, i.metadata_json,
                    r.session_id, r.runtime_id
             FROM runtime_descriptors r
             JOIN identities i ON i.agent_id = r.agent_id
@@ -389,15 +385,11 @@ export async function canonicalAgentSessionTarget(
     owner: {
       agentId: identity.agentId,
       name: identity.name,
-      project: identity.project,
-      role: identity.role,
       tier: identity.tier,
       ownerName: identity.owner,
-      ownerProject: optionalString(identity.metadata.ownerProject),
       ownerSessionId: optionalString(identity.metadata.ownerSessionId),
       ownerAgentId: optionalString(identity.metadata.ownerAgentId),
       sessionKind: optionalString(identity.metadata.kind),
-      sessionRole: optionalString(identity.metadata.sessionRole),
       sessionTier: optionalString(identity.metadata.sessionTier),
     },
   };
@@ -624,9 +616,12 @@ export async function canonicalMessageById(
   }
   const raw = parseObject(row.provenance_json);
   const from = optionalString(row.from_name) ?? optionalString(row.from_agent_id) ?? "unknown";
+  const entityKind = parseEntityKind(raw.kind ?? Kind.Agent, raw.locality);
   const provenance: Provenance = {
     from: typeof raw.from === "string" ? raw.from : from,
-    kind: parseKind(raw.kind),
+    kind: entityKind.kind,
+    locality: entityKind.locality,
+    access: optionalString(raw.access),
     thread: typeof raw.thread === "string" ? raw.thread : undefined,
     topic: typeof raw.topic === "string" ? raw.topic : undefined,
     stamp: isStamp(raw.stamp) ? raw.stamp : undefined,
@@ -781,8 +776,6 @@ function canonicalPresence(status: unknown): string {
 interface CanonicalIdentity {
   agentId: string;
   name: string;
-  project: string;
-  role?: string;
   tier?: string;
   owner?: string;
   metadata: Record<string, unknown>;
@@ -793,8 +786,6 @@ function canonicalIdentityFromRow(row: Row): CanonicalIdentity {
   return {
     agentId: String(row.agent_id),
     name: optionalString(row.name) ?? String(row.agent_id),
-    project: identityProject(metadata),
-    role: optionalString(row.role),
     tier: optionalString(row.tier),
     owner: optionalString(row.owner),
     metadata,
@@ -806,7 +797,7 @@ async function canonicalIdentityByAgentId(
   agentId: string,
 ): Promise<CanonicalIdentity | undefined> {
   const result = await db.execute({
-    sql: `SELECT agent_id, name, owner, role, tier, metadata_json
+    sql: `SELECT agent_id, name, owner, tier, metadata_json
           FROM identities WHERE agent_id = ? LIMIT 1`,
     args: [agentId],
   });
@@ -818,7 +809,7 @@ async function canonicalIdentity(db: Client, id: string): Promise<CanonicalIdent
   const exact = await canonicalIdentityByAgentId(db, id);
   if (exact) return exact;
   const result = await db.execute({
-    sql: `SELECT agent_id, name, owner, role, tier, metadata_json
+    sql: `SELECT agent_id, name, owner, tier, metadata_json
           FROM identities WHERE name = ? ORDER BY agent_id LIMIT 2`,
     args: [id],
   });
@@ -827,19 +818,6 @@ async function canonicalIdentity(db: Client, id: string): Promise<CanonicalIdent
   }
   const row = result.rows[0];
   return row ? canonicalIdentityFromRow(row) : undefined;
-}
-
-function parseKind(value: unknown): Kind {
-  switch (value) {
-    case Kind.Human:
-      return Kind.Human;
-    case Kind.Notification:
-      return Kind.Notification;
-    case Kind.App:
-      return Kind.App;
-    default:
-      return Kind.Agent;
-  }
 }
 
 function isStamp(value: unknown): value is Provenance["stamp"] & object {

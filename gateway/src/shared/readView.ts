@@ -5,7 +5,6 @@ export interface MemberRow {
   agentId?: string;
   agent?: string;
   kind?: string;
-  role?: string;
   tier?: string;
   presence: string;
   currentWork?: string;
@@ -57,8 +56,6 @@ export interface WhoamiRow {
   name: string;
   sessionId: string;
   kind: string;
-  role?: string;
   tier: string;
-  project: string;
   presence: string;
 }

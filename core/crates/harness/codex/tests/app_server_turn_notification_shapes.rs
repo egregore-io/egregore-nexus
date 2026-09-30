@@ -63,7 +63,7 @@ async fn assert_completion_observed(tag: &str, completed_params: serde_json::Val
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,

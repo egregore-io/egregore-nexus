@@ -103,6 +103,15 @@ fn turn_timeout() -> Duration {
 /// on the full [`TURN_TIMEOUT`], not this.
 const QUIESCENCE_WINDOW: Duration = Duration::from_secs(8);
 
+/// Largest text delta Nexus relays from one ACP assistant update.
+///
+/// Some real ACP bridges coalesce a complete response into one `AgentMessageChunk`. Keeping that
+/// provider framing would turn a multi-paragraph answer into one large WebSocket frame and prevent
+/// clients from painting progressive content. Nexus therefore normalizes only oversized text
+/// updates into bounded UTF-8 slices. Concatenating the slices is byte-for-byte identical to the
+/// provider text; all non-text updates retain their original one-notification/one-event framing.
+const MAX_LIVE_TEXT_DELTA_BYTES: usize = 512;
+
 /// Grace period for harness process-tree shutdown. ACP stdio adapters commonly launch a shell /
 /// node wrapper that spawns provider-specific children; stopping only the wrapper leaks the
 /// descendants. The engine therefore starts each harness in its own process group and terminates
@@ -596,9 +605,29 @@ enum TurnEnd {
     Response(Result<PromptResponse, agent_client_protocol::Error>),
     /// Turn-end inferred from stream quiescence: content streamed, then no further
     /// `session/update` arrived for the quiescence window. Direct/legacy turns accept any buffered
-    /// content. Observed Hermes turns accept this only after a real renderable harness event; the
-    /// synthetic accepted-input event is deliberately excluded.
+    /// content. Observed Hermes and compatibility-fallback turns accept this only after a real
+    /// renderable harness event; the synthetic accepted-input event is deliberately excluded.
     Quiescent,
+    /// The bridge appended an interrupt-and-send replacement prompt, answered the cancelled
+    /// request with its exact handoff diagnostic, and then emitted real replacement model output.
+    /// The model-output boundary prevents retrying a prompt already present in its context.
+    InterruptedPromptHandoff,
+    /// Nexus successfully sent `session/cancel` for this locally active turn. ACP cancel is a
+    /// notification, so some bridges leave the old `session/prompt` unanswered until a replacement
+    /// arrives. This boundary releases local serialization so that replacement can be sent.
+    Cancelled,
+}
+
+const INTERRUPTED_HANDOFF_DIAGNOSTIC: &str =
+    "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null";
+const INTERRUPTED_HANDOFF_MESSAGE: &str =
+    "Internal error: [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null";
+
+fn is_interrupted_prompt_handoff(error: &agent_client_protocol::Error) -> bool {
+    (error.message == INTERRUPTED_HANDOFF_MESSAGE && error.data.is_none())
+        || (error.message == "Internal error"
+            && error.data.as_ref().and_then(serde_json::Value::as_str)
+                == Some(INTERRUPTED_HANDOFF_DIAGNOSTIC))
 }
 
 /// Resolve once the reply stream has **streamed content and then gone quiet** for `window`.
@@ -793,11 +822,13 @@ struct TurnActivity {
     /// Pulsed alongside `activity` so a waiting `inject` wakes promptly on new stream traffic
     /// instead of sleeping out the whole window every time.
     notify: tokio::sync::Notify,
-    /// Optional LIVE sink: when a turn is being relayed in realtime, each renderable
+    /// Optional LIVE sink: when a turn is being relayed in realtime, each normalized renderable
     /// [`StreamEvent`] is sent here AS IT ARRIVES (in addition to buffering), so the caller can
-    /// emit `agent.update` per chunk instead of waiting for turn-end. This is the realtime
-    /// streaming path (AionUi `responseStream` model); the buffer remains for quiescence detection
-    /// and a non-live fallback. Set per turn via `install_live`, dropped via `clear_live`.
+    /// emit bounded `agent.update` deltas instead of waiting for turn-end. A provider text update
+    /// may normalize into multiple deltas; other renderable updates remain one event. This is the
+    /// realtime streaming path (AionUi `responseStream` model); the buffer remains for quiescence
+    /// detection and a non-live fallback. Set per turn via `install_live`, dropped via
+    /// `clear_live`.
     live: Mutex<Option<tokio::sync::mpsc::UnboundedSender<StreamEvent>>>,
 }
 
@@ -814,8 +845,8 @@ impl TurnActivity {
     }
 
     /// Begin live relay for a turn: install a fresh channel and return its receiver. Each subsequent
-    /// `ingest` sends the renderable event here AS IT ARRIVES (realtime). Call `clear_live` at
-    /// turn-end to close the receiver.
+    /// `ingest` sends normalized renderable events here AS THEY ARRIVE (realtime). Call
+    /// `clear_live` at turn-end to close the receiver.
     fn install_live(&self) -> tokio::sync::mpsc::UnboundedReceiver<StreamEvent> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         *self.live.lock().unwrap() = Some(tx);
@@ -849,16 +880,17 @@ impl TurnActivity {
             return;
         }
 
-        match translate(update) {
-            Some(event) => {
-                // Hermes 0.17 emits this adapter-authored status line when it has only placed the
-                // prompt in a process-private queue. It is not model output and must not satisfy
-                // observed-delivery quiescence. The event remains buffered/relayed so clients can
-                // display the truthful harness status.
-                if !is_hermes_busy_queue_ack(&event) {
-                    self.model_events
-                        .fetch_add(1, std::sync::atomic::Ordering::Release);
-                }
+        let events = translate_for_relay(update);
+        if let Some(first) = events.first() {
+            // Hermes 0.17 emits this adapter-authored status line when it has only placed the
+            // prompt in a process-private queue. It is not model output and must not satisfy
+            // observed-delivery quiescence. The event remains buffered/relayed so clients can
+            // display the truthful harness status.
+            if events.len() != 1 || !is_hermes_busy_queue_ack(first) {
+                self.model_events
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+            for event in events {
                 let idx = self.push_event(event);
                 debug!(
                     target: "nexus_agent::acp",
@@ -866,14 +898,13 @@ impl TurnActivity {
                     "captured renderable session/update (relayed as agent.update)"
                 );
             }
-            None => {
-                self.touch();
-                debug!(
-                    target: "nexus_agent::acp",
-                    update = ?std::mem::discriminant(update),
-                    "non-renderable session/update (kept stream alive, not buffered)"
-                );
-            }
+        } else {
+            self.touch();
+            debug!(
+                target: "nexus_agent::acp",
+                update = ?std::mem::discriminant(update),
+                "non-renderable session/update (kept stream alive, not buffered)"
+            );
         }
     }
 
@@ -940,6 +971,34 @@ impl TurnActivity {
     }
 }
 
+/// Translate one ACP update into the events Nexus relays. The pure ACP translator deliberately
+/// preserves provider framing; this engine boundary adds one transport normalization: oversized
+/// assistant text becomes bounded UTF-8 deltas so a coalescing bridge cannot collapse progressive
+/// browser output into one WebSocket frame.
+fn translate_for_relay(update: &SessionUpdate) -> Vec<StreamEvent> {
+    let SessionUpdate::AgentMessageChunk(chunk) = update else {
+        return translate(update).into_iter().collect();
+    };
+    let ContentBlock::Text(text) = &chunk.content else {
+        return translate(update).into_iter().collect();
+    };
+    if text.text.len() <= MAX_LIVE_TEXT_DELTA_BYTES {
+        return vec![StreamEvent::text(text.text.clone())];
+    }
+
+    let mut events = Vec::new();
+    let mut start = 0;
+    while start < text.text.len() {
+        let mut end = (start + MAX_LIVE_TEXT_DELTA_BYTES).min(text.text.len());
+        while !text.text.is_char_boundary(end) {
+            end -= 1;
+        }
+        events.push(StreamEvent::text(&text.text[start..end]));
+        start = end;
+    }
+    events
+}
+
 /// Hermes' exact ACP busy-session acknowledgement. This is emitted by adapter code, not the model,
 /// and accompanies an immediate `EndTurn` while the submitted prompt exists only in Hermes memory.
 fn is_hermes_busy_queue_ack(event: &StreamEvent) -> bool {
@@ -974,6 +1033,11 @@ pub struct AcpEngine {
     /// concurrently. Holding `conn` across the prompt response used to make cancellation
     /// impossible: the cancel notification waited behind the very turn it needed to stop.
     turn_lock: AsyncMutex<()>,
+    /// Monotonic accepted-cancel generation. A prompt snapshots it after acquiring `turn_lock`, so
+    /// a stale cancellation can never terminate the next prompt.
+    cancel_generation: std::sync::atomic::AtomicU64,
+    /// Wakes the locally active prompt when `cancel_generation` advances.
+    cancel_notify: tokio::sync::Notify,
     /// Per-turn reply buffer + stream-activity signal shared with the notification handler.
     updates: Arc<TurnActivity>,
     /// Handle to the spawned child process retained for [`AcpEngine::kill`]. Populated by
@@ -1013,6 +1077,8 @@ impl AcpEngine {
         Self {
             conn: AsyncMutex::new(None),
             turn_lock: AsyncMutex::new(()),
+            cancel_generation: std::sync::atomic::AtomicU64::new(0),
+            cancel_notify: tokio::sync::Notify::new(),
             updates: Arc::new(TurnActivity::new()),
             child: Arc::new(Mutex::new(None)),
             kill_tx: Mutex::new(None),
@@ -1063,8 +1129,9 @@ impl AcpEngine {
     /// Cancel the active ACP turn for this engine's current session.
     ///
     /// `session/cancel` is a notification and therefore returns once it is accepted by the SDK
-    /// connection. The next prompt remains serialized by `turn_lock` until the cancelled prompt
-    /// observes its terminal response, so redirect-now cannot overlap two model turns.
+    /// connection. Advancing `cancel_generation` then closes the exact locally active prompt wait:
+    /// bridges that answer only after receiving a replacement cannot otherwise release
+    /// `turn_lock`, making the replacement structurally impossible to send.
     pub async fn cancel_active_turn(&self) -> Result<(), NexusError> {
         let (connection, session_id) = {
             let guard = self.conn.lock().await;
@@ -1079,12 +1146,30 @@ impl AcpEngine {
         connection
             .send_notification(CancelNotification::new(session_id))
             .map_err(|e| NexusError::Adapter(format!("session/cancel failed: {e}")))?;
+        self.cancel_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.cancel_notify.notify_waiters();
         Ok(())
     }
 
+    async fn wait_for_cancel_after(&self, observed_generation: u64) {
+        loop {
+            let notified = self.cancel_notify.notified();
+            if self
+                .cancel_generation
+                .load(std::sync::atomic::Ordering::Acquire)
+                != observed_generation
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Install the realtime relay channel for the turn about to be injected: each renderable
-    /// `session/update` is forwarded here AS IT ARRIVES, so the caller emits `agent.update` per
-    /// chunk (true streaming) instead of waiting for turn-end. Pair with [`AcpEngine::clear_live`].
+    /// `session/update` is forwarded here AS IT ARRIVES, so the caller emits bounded
+    /// `agent.update` deltas (true streaming) instead of waiting for turn-end. Pair with
+    /// [`AcpEngine::clear_live`].
     pub fn install_live(&self) -> tokio::sync::mpsc::UnboundedReceiver<StreamEvent> {
         self.updates.install_live()
     }
@@ -1420,8 +1505,10 @@ impl AcpEngine {
     /// Like [`AcpEngine::inject`], but prepends a synthetic stream event immediately after the ACP
     /// prompt request is submitted and before assistant updates can be relayed. Presence of this
     /// event identifies durable observed delivery, which normally requires the canonical
-    /// `PromptResponse`. Hermes may also settle from quiescence after a real model event; the
-    /// synthetic accepted event alone is never sufficient.
+    /// `PromptResponse`. Hermes and the pinned compatibility bridge may also settle from
+    /// quiescence after a real model event. The exact interrupt-and-send handoff diagnostic may
+    /// settle only after subsequent replacement model output becomes quiescent. The synthetic
+    /// accepted event alone is never sufficient.
     pub async fn inject_with_accepted_event(
         &self,
         prompt: String,
@@ -1430,6 +1517,9 @@ impl AcpEngine {
         // Prompt turns are serialized independently of the connection handle. Cancellation must
         // be able to acquire/clone `conn` while this turn is awaiting its response.
         let _turn = self.turn_lock.lock().await;
+        let cancel_generation = self
+            .cancel_generation
+            .load(std::sync::atomic::Ordering::Acquire);
 
         // Fresh buffer for this turn. Snapshot the (monotonic) activity counter so we measure only
         // THIS turn's stream traffic, never a stale notification from a prior turn.
@@ -1476,7 +1566,7 @@ impl AcpEngine {
         let timeout = turn_timeout();
         let quiescence = quiescence_window();
         let mut prompt_response = Box::pin(prompt_turn.block_task());
-        let outcome = tokio::time::timeout(timeout, async {
+        let prompt_outcome = async {
             if require_terminal_response
                 && self
                     .harness
@@ -1519,9 +1609,39 @@ impl AcpEngine {
                         quiescence,
                     ) => TurnEnd::Quiescent,
                 }
+            } else if require_terminal_response
+                && self.harness.as_ref().is_some_and(|h| h.as_str() == "codex")
+            {
+                tokio::select! {
+                    // Canonical completion remains preferred when available.
+                    response = &mut prompt_response => TurnEnd::Response(response),
+                    // The pinned compatibility bridge can stream a complete model turn yet never
+                    // answer `session/prompt`. A new renderable model event followed by silence is
+                    // recipient-side evidence for this exact observed delivery; the synthetic
+                    // accepted-input event does not advance `model_events`.
+                    () = wait_for_model_quiescence(
+                        &activity,
+                        model_events_before,
+                        quiescence,
+                    ) => TurnEnd::Quiescent,
+                }
             } else if require_terminal_response {
                 // Other durable bus deliveries require the authoritative ACP terminal response.
-                TurnEnd::Response(prompt_response.await)
+                // The ACP bridge has one bounded handoff exception: after cancel + replace it
+                // can append the replacement prompt, answer the cancelled request with a machine
+                // diagnostic, then stream the replacement model turn. Never retry that already-
+                // appended prompt; require a new real model event and quiescence instead.
+                let response = prompt_response.await;
+                if response
+                    .as_ref()
+                    .err()
+                    .is_some_and(is_interrupted_prompt_handoff)
+                {
+                    wait_for_model_quiescence(&activity, model_events_before, quiescence).await;
+                    TurnEnd::InterruptedPromptHandoff
+                } else {
+                    TurnEnd::Response(response)
+                }
             } else {
                 tokio::select! {
                     // (1) Canonical: the prompt request was answered. This is the authoritative end.
@@ -1530,6 +1650,13 @@ impl AcpEngine {
                     // silent. Never used by the observed durable bus-delivery seam.
                     () = wait_for_quiescence(&activity, quiescence) => TurnEnd::Quiescent,
                 }
+            }
+        };
+        let outcome = tokio::time::timeout(timeout, async {
+            tokio::select! {
+                biased;
+                turn_end = prompt_outcome => turn_end,
+                () = self.wait_for_cancel_after(cancel_generation) => TurnEnd::Cancelled,
             }
         })
         .await;
@@ -1610,8 +1737,8 @@ impl AcpEngine {
                 Err(NexusError::Adapter(format!("session/prompt failed: {e}")).into())
             }
             // (2) Quiescence turn-end: the bridge streamed the reply and went idle without ever
-            // answering session/prompt. For observed Hermes delivery, the waiter already proved
-            // that at least one real model event arrived; direct calls retain legacy behavior.
+            // answering session/prompt. For observed compatibility delivery, the waiter already
+            // proved that at least one real model event arrived; direct calls retain legacy behavior.
             Ok(TurnEnd::Quiescent) => {
                 info!(
                     target: "nexus_agent::acp",
@@ -1620,6 +1747,27 @@ impl AcpEngine {
                     quiescence_ms = quiescence.as_millis() as u64,
                     "ACP turn-end inferred from stream quiescence (no PromptResponse; bridge went \
                      idle after streaming the reply)"
+                );
+                Ok(())
+            }
+            Ok(TurnEnd::InterruptedPromptHandoff) => {
+                info!(
+                    target: "nexus_agent::acp",
+                    acp_session = %acp_session,
+                    buffered_chunks = buffered,
+                    model_events,
+                    quiescence_ms = quiescence.as_millis() as u64,
+                    "ACP replacement handoff completed after causal model output"
+                );
+                Ok(())
+            }
+            Ok(TurnEnd::Cancelled) => {
+                info!(
+                    target: "nexus_agent::acp",
+                    acp_session = %acp_session,
+                    buffered_chunks = buffered,
+                    model_events,
+                    "ACP session/cancel accepted; releasing the old local turn for replacement"
                 );
                 Ok(())
             }
@@ -1741,7 +1889,8 @@ fn scrub_inherited_identity_env(command: &mut Command) {
     }
 }
 
-fn should_scrub_inherited_env(key: &std::ffi::OsStr) -> bool {
+#[doc(hidden)]
+pub fn should_scrub_inherited_env(key: &std::ffi::OsStr) -> bool {
     let Some(key) = key.to_str() else {
         return false;
     };

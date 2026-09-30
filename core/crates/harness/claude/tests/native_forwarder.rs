@@ -926,7 +926,8 @@ async fn forwarder_ignores_legacy_global_binding_and_keeps_claude_hint_runtime_s
     seed_identity_session(&store, &owner, "owner", "a_owner").await;
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "claude".into(),
+            provider: "claude".into(),
+            kind: "harness".into(),
             native_thread_id: "claude-owned-by-other-agent".into(),
             agent_id: "a_owner".into(),
             project: "default".into(),

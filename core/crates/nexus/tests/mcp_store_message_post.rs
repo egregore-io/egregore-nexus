@@ -204,7 +204,7 @@ async fn mcp_message_post_tools_submit_through_store_ingress() {
     assert_eq!(row.project, "demo");
     assert_eq!(row.caller_name, "ada");
     assert_eq!(row.caller_client_key.as_deref(), Some("ck_ada"));
-    assert_eq!(row.caller_kind.as_deref(), Some("agent"));
+    assert_eq!(row.caller_kind.as_deref(), Some("local.agent"));
     assert_eq!(row.caller_tier.as_deref(), Some("agent"));
 }
 

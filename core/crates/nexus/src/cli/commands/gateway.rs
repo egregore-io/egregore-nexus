@@ -1,5 +1,6 @@
 //! Operator-facing lifecycle commands for the independently installed Nexus Gateway.
 
+use std::io::Read;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -39,6 +40,9 @@ pub enum GatewayCmd {
     /// Inspect Gateway-owned message hooks without mutating their manifests.
     #[command(subcommand)]
     Hooks(GatewayHooksCmd),
+    /// Manage Gateway-hosted external transports.
+    #[command(subcommand)]
+    Transport(GatewayTransportCmd),
     /// Stop and remove the Gateway's native per-user service.
     Uninstall,
 }
@@ -47,6 +51,30 @@ pub enum GatewayCmd {
 pub enum GatewayHooksCmd {
     /// List the active hook generation and registered handlers.
     List,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum GatewayTransportCmd {
+    /// Manage Gateway-owned transport secrets.
+    #[command(subcommand)]
+    Secret(GatewayTransportSecretCmd),
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum GatewayTransportSecretCmd {
+    /// Set a secret, reading its value from standard input.
+    Set(GatewayTransportSecretArgs),
+    /// Rotate a secret, reading its replacement value from standard input.
+    Rotate(GatewayTransportSecretArgs),
+    /// Remove a secret.
+    Rm(GatewayTransportSecretArgs),
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct GatewayTransportSecretArgs {
+    pub key: String,
+    #[arg(hide = true)]
+    pub value: Option<String>,
 }
 
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
@@ -129,11 +157,111 @@ pub async fn run(command: GatewayCmd, json: bool) -> ExitCode {
             Ok(report) => render_hooks(&report, json),
             Err(error) => render_error(&error, json),
         },
+        GatewayCmd::Transport(command) => match run_transport(command).await {
+            Ok(report) => render_transport_report(&report, json),
+            Err(error) => render_error(&error, json),
+        },
         GatewayCmd::Uninstall => match uninstall_gateway_service() {
             Ok(report) => render_service_report(&report, json),
             Err(error) => render_error(&error, json),
         },
     }
+}
+
+async fn run_transport(
+    command: GatewayTransportCmd,
+) -> Result<serde_json::Value, GatewayLifecycleError> {
+    let GatewayTransportCmd::Secret(command) = command;
+    let paths = crate::gateway_lifecycle::GatewayPaths::resolve();
+    let client = crate::cli::gateway_read_client::GatewayReadClient::discover(&paths.home)
+        .map_err(|error| GatewayLifecycleError::lifecycle(error.message))?;
+    match command {
+        GatewayTransportSecretCmd::Set(args) | GatewayTransportSecretCmd::Rotate(args) => {
+            refuse_secret_argv(&args)?;
+            let key = transport_secret_key(&args.key)?;
+            let value = read_secret_stdin()?;
+            client
+                .post_json(
+                    "/api/v1/admin/transport/secrets",
+                    &serde_json::json!({ "key": key, "value": value }),
+                )
+                .await
+                .map_err(|error| GatewayLifecycleError::lifecycle(error.message))
+        }
+        GatewayTransportSecretCmd::Rm(args) => {
+            refuse_secret_argv(&args)?;
+            let key = transport_secret_key(&args.key)?;
+            client
+                .delete_json(&format!("/api/v1/admin/transport/secrets/{key}"))
+                .await
+                .map_err(|error| GatewayLifecycleError::lifecycle(error.message))
+        }
+    }
+}
+
+fn refuse_secret_argv(args: &GatewayTransportSecretArgs) -> Result<(), GatewayLifecycleError> {
+    if args.value.is_some() {
+        return Err(GatewayLifecycleError::lifecycle(
+            "transport secret values must be supplied on stdin, never argv",
+        ));
+    }
+    Ok(())
+}
+
+fn read_secret_stdin() -> Result<String, GatewayLifecycleError> {
+    let mut value = String::new();
+    std::io::stdin()
+        .read_to_string(&mut value)
+        .map_err(|error| {
+            GatewayLifecycleError::lifecycle(format!("read transport secret from stdin: {error}"))
+        })?;
+    while value.ends_with('\n') || value.ends_with('\r') {
+        value.pop();
+    }
+    if value.is_empty() {
+        return Err(GatewayLifecycleError::lifecycle(
+            "transport secret value is required on stdin",
+        ));
+    }
+    if value.contains('\0') {
+        return Err(GatewayLifecycleError::lifecycle(
+            "transport secret value contains an invalid NUL byte",
+        ));
+    }
+    Ok(value)
+}
+
+fn transport_secret_key(value: &str) -> Result<&str, GatewayLifecycleError> {
+    let key = value.trim();
+    if key.is_empty()
+        || key.len() > 128
+        || !key.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric() || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
+        })
+    {
+        return Err(GatewayLifecycleError::lifecycle(
+            "transport secret key must match [A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+        ));
+    }
+    Ok(key)
+}
+
+fn render_transport_report(report: &serde_json::Value, json: bool) -> ExitCode {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(report)
+                .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".into())
+        );
+    } else {
+        let key = report["key"].as_str().unwrap_or("unknown");
+        if report["removed"].as_bool().is_some() {
+            println!("gateway transport secret {key}: removed");
+        } else {
+            println!("gateway transport secret {key}: stored");
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 async fn list_hooks() -> Result<serde_json::Value, GatewayLifecycleError> {
@@ -248,6 +376,9 @@ async fn run_delivery_mode(
                 runtime_id: Some(crate::local_operator::LOCAL_OPERATOR_SESSION_ID.into()),
                 client_key: None,
                 kind: Kind::Human,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
                 tier: Tier::Admin,
             }),
             call: DaemonIpcCall::Query {

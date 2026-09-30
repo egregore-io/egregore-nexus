@@ -93,19 +93,7 @@ export const spawnSchema = z.object({
   kind: harnessSchema,
   name: z.string().min(1).optional(),
   cwd: z.string().optional(),
-  project: z.string().optional(),
-  role: z.string().optional(),
-});
-
-/** POST /agents/:id/role → admin.assignRole (name comes from the path param) */
-export const assignRoleSchema = z.object({
-  role: z.string().min(1),
-});
-
-/** POST /agents/:id/project → admin.assignProject (name comes from the path param) */
-export const assignProjectSchema = z.object({
-  project: z.string().min(1),
-});
+}).strict();
 
 /** POST /agents/:id/tier → admin.grantTier (name comes from the path param). */
 export const grantTierSchema = z.object({
@@ -214,6 +202,12 @@ export const monitorSchema = z.object({
   scope: z.string().optional(),
 });
 
+/** POST /admin/transport/secrets — the value is carried only in the request body. */
+export const transportSecretSchema = z.object({
+  key: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/),
+  value: z.string().min(1),
+});
+
 /** POST /routing-rules → route (standing rule; at least one of source/topic). */
 export const routeRuleSchema = z
   .object({
@@ -244,8 +238,6 @@ export type SourcePushBody = z.infer<typeof sourcePushSchema>;
 export type NotifyBody = z.infer<typeof notifySchema>;
 export type SendBody = z.infer<typeof sendSchema>;
 export type SpawnBody = z.infer<typeof spawnSchema>;
-export type AssignRoleBody = z.infer<typeof assignRoleSchema>;
-export type AssignProjectBody = z.infer<typeof assignProjectSchema>;
 export type GrantTierBody = z.infer<typeof grantTierSchema>;
 export type AgentAccessGrantBody = z.infer<typeof agentAccessGrantSchema>;
 export type AgentOwnerTransferBody = z.infer<typeof agentOwnerTransferSchema>;

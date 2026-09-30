@@ -33,6 +33,8 @@ fn human(name: &str, client_key: &str) -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Admin,
         kind: Some(Kind::Human),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -54,6 +56,8 @@ fn agent(
         runtime_credential: None,
         tier: Tier::Agent,
         kind: Some(Kind::Agent),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: Some(cwd.into()),
     }
@@ -1211,7 +1215,8 @@ async fn read_client_native_resume_rejects_an_ambiguous_idless_agent_alias() {
         .unwrap();
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: "native-resume-one".into(),
             agent_id: "a_resume_one".into(),
             project: "one".into(),
@@ -1878,7 +1883,8 @@ async fn read_client_prefers_identity_owned_codex_thread_over_sidecar_thread() {
         .unwrap();
     NativeThreadBindings::new(&state.store)
         .claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: "codex-thread-identity".into(),
             agent_id,
             project: "default".into(),

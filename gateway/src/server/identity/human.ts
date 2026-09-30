@@ -20,12 +20,18 @@ import { randomBytes, scrypt as scryptCb, timingSafeEqual } from "node:crypto";
 import {
   Tier,
   Kind,
+  Locality,
   type HarnessId,
   type RegisterResponse,
 } from "@shared/types";
 import type { CommandIntentSender, GatewayCallerIdentity } from "@server/api/http";
 import { humanPrincipalAttributes } from "@server/auth/principal";
 import { COMMAND_KINDS } from "@server/command/ingress";
+import {
+  bindHumanPrincipal,
+  humanUserIdForClientKey,
+  principalIdForHumanUserId,
+} from "@server/store/repos/principals";
 
 const SCRYPT_N = 16_384;
 const SCRYPT_R = 8;
@@ -130,6 +136,10 @@ export interface RegisterHumanResult {
   project: string;
   /** The daemon-assigned session id. */
   sessionId: string;
+  /** Immutable Gateway human account id. */
+  humanUserId: string;
+  /** Immutable Gateway principal id. */
+  principalId: string;
 }
 
 export interface HumanIdentity extends GatewayCallerIdentity {
@@ -138,6 +148,10 @@ export interface HumanIdentity extends GatewayCallerIdentity {
   sessionId: string;
   /** Stable daemon client key for this human account; carried onto command-intent caller metadata. */
   clientKey: string;
+  /** Immutable Gateway human account id. */
+  humanUserId: string;
+  /** Immutable local-human principal id. */
+  principalId: string;
 }
 
 // ── registerHuman ────────────────────────────────────────────────────────────
@@ -158,7 +172,7 @@ export async function registerHuman(
   if (!input.password) throw new HumanAuthError();
 
   const existing = await db.execute({
-    sql: `SELECT name, password_hash, client_key, project, daemon_session_id
+    sql: `SELECT name, password_hash, client_key, project, daemon_session_id, human_user_id
           FROM human_user
           WHERE name_key = ?
           LIMIT 1`,
@@ -170,6 +184,7 @@ export async function registerHuman(
   let clientKey: string;
   let previousSessionId: string | null = null;
   let newUserPasswordHash: string | null = null;
+  let humanUserId: string;
 
   const existingUser = existing.rows[0];
   if (existingUser) {
@@ -182,10 +197,17 @@ export async function registerHuman(
       existingUser.daemon_session_id == null
         ? null
         : String(existingUser.daemon_session_id);
+    humanUserId = String(existingUser.human_user_id ?? "");
+    if (!humanUserId) {
+      throw new Error(`registerHuman: existing account ${nameKey} has no immutable human id`);
+    }
   } else {
     clientKey = genId();
+    humanUserId = humanUserIdForClientKey(clientKey);
     newUserPasswordHash = await hashPassword(input.password);
   }
+
+  const principalId = principalIdForHumanUserId(humanUserId);
 
   // Generate a fresh browser-login cookie, while keeping the daemon client key stable.
   const cookieToken = genId();
@@ -202,11 +224,16 @@ export async function registerHuman(
       clientKey,
       tier: Tier.Admin,
       kind: Kind.Human,
+      locality: Locality.Local,
+      access: "admin",
     },
     {
       name: displayName,
       project,
       kind: Kind.Human,
+      locality: Locality.Local,
+      access: "admin",
+      principalId,
       tier: Tier.Admin,
       credentialFacet: "human",
       scopes: humanPrincipalAttributes().scopes,
@@ -229,12 +256,18 @@ export async function registerHuman(
     );
   }
 
+  const principal = await bindHumanPrincipal(db, { humanUserId });
+  if (principal.principalId !== principalId) {
+    throw new Error(`registerHuman: principal binding changed for ${humanUserId}`);
+  }
+
   const at = now();
   if (newUserPasswordHash) {
     await db.execute({
       sql: `INSERT INTO human_user
-              (name_key, name, password_hash, client_key, project, daemon_session_id, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              (name_key, name, password_hash, client_key, project, daemon_session_id,
+               created_at, updated_at, human_user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       args: [
         nameKey,
         displayName,
@@ -244,25 +277,40 @@ export async function registerHuman(
         sessionId || previousSessionId,
         at,
         at,
+        humanUserId,
       ],
     });
   } else {
     await db.execute({
       sql: `UPDATE human_user
             SET daemon_session_id = ?, updated_at = ?
-            WHERE name_key = ?`,
-      args: [sessionId, at, nameKey],
+            WHERE human_user_id = ?`,
+      args: [sessionId, at, humanUserId],
     });
   }
 
   // Persist the session row.
   await db.execute({
     sql: `INSERT INTO human_session
-            (cookie_token, name, client_key, project, daemon_session_id, created_at)
-          VALUES (?, ?, ?, ?, ?, ?)
+            (cookie_token, name, client_key, project, daemon_session_id, created_at,
+             human_user_id, principal_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(cookie_token) DO UPDATE SET
-            daemon_session_id = excluded.daemon_session_id`,
-    args: [cookieToken, displayName, clientKey, project, sessionId, at],
+            name = excluded.name,
+            project = excluded.project,
+            daemon_session_id = excluded.daemon_session_id,
+            human_user_id = excluded.human_user_id,
+            principal_id = excluded.principal_id`,
+    args: [
+      cookieToken,
+      displayName,
+      clientKey,
+      project,
+      sessionId,
+      at,
+      humanUserId,
+      principal.principalId,
+    ],
   });
 
   return {
@@ -270,6 +318,8 @@ export async function registerHuman(
     name: displayName,
     project,
     sessionId: sessionId || previousSessionId || "",
+    humanUserId,
+    principalId: principal.principalId,
   };
 }
 
@@ -286,9 +336,12 @@ export async function currentHuman(
 ): Promise<HumanIdentity | null> {
   const { db } = deps;
   const res = await db.execute({
-    sql: `SELECT name, project, daemon_session_id, client_key
-          FROM human_session
-          WHERE cookie_token = ?
+    sql: `SELECT s.name, s.project, s.daemon_session_id, s.client_key,
+                 s.human_user_id, s.principal_id
+          FROM human_session AS s
+          JOIN human_user AS u
+            ON u.client_key = s.client_key AND u.human_user_id = s.human_user_id
+          WHERE s.cookie_token = ?
           LIMIT 1`,
     args: [cookieToken],
   });
@@ -297,11 +350,13 @@ export async function currentHuman(
   if (!row) return null;
 
   return {
-    id: `human:${String(row.project)}:${String(row.client_key)}`,
+    id: String(row.principal_id),
     name: String(row.name),
     project: String(row.project),
     ...humanPrincipalAttributes(),
     sessionId: String(row.daemon_session_id),
     clientKey: String(row.client_key),
+    humanUserId: String(row.human_user_id),
+    principalId: String(row.principal_id),
   };
 }

@@ -245,6 +245,8 @@ async fn boot_adoption_restarts_drain_loop_for_active_claude_pty_runtime() {
             provenance: Provenance {
                 from: "operator".into(),
                 kind: Kind::Human,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,

@@ -4,6 +4,10 @@ import {
   applyProjectionEvent,
   type GatewayProjectionRecord,
 } from "../store/repos/events";
+import {
+  enqueueObligationsForMessage,
+  notifyTransportOutbox,
+} from "../transport/outbox";
 
 export interface CanonicalProjectionEvent extends GatewayProjectionRecord {
   version: number;
@@ -30,7 +34,7 @@ export async function applyCanonicalProjection(
   if (event.version !== 1) {
     throw new Error(`unsupported projection version ${event.version}`);
   }
-  return applyProjectionEvent(db, "daemon", event, async (tx, context) => {
+  const result = await applyProjectionEvent(db, "daemon", event, async (tx, context) => {
     if (context.epochChanged) {
       await tx.execute({
         sql: `UPDATE runtime_descriptors
@@ -41,6 +45,8 @@ export async function applyCanonicalProjection(
     }
     await materialize(tx, event);
   });
+  if (result === "applied" && event.kind === "message.accepted") notifyTransportOutbox();
+  return result;
 }
 
 async function materialize(tx: Transaction, event: CanonicalProjectionEvent): Promise<void> {
@@ -195,7 +201,7 @@ async function materialize(tx: Transaction, event: CanonicalProjectionEvent): Pr
     case "message.accepted": {
       const provenance = objectPayload(payload.provenance ?? {});
       if (payload.project !== undefined) provenance.project = payload.project;
-      await tx.execute({
+      const inserted = await tx.execute({
         sql: `INSERT OR IGNORE INTO bus_messages
               (message_id, kind, from_name, from_agent_id, to_name, to_agent_id,
                thread_id, topic, summary, body, provenance_json, metadata_json,
@@ -218,6 +224,16 @@ async function materialize(tx: Transaction, event: CanonicalProjectionEvent): Pr
           optionalNumber(payload.createdAt) ?? event.occurredAt,
         ],
       });
+      if (inserted.rowsAffected > 0) {
+        await enqueueObligationsForMessage(tx, {
+          messageId: requiredString(payload, "messageId"),
+          kind: requiredString(payload, "scope"),
+          toName: optionalString(payload.toName) ?? undefined,
+          threadId: optionalString(payload.threadId) ?? undefined,
+          body: requiredString(payload, "body"),
+          createdAt: optionalNumber(payload.createdAt) ?? event.occurredAt,
+        });
+      }
       return;
     }
     case "delivery.settled": {

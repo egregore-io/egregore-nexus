@@ -79,6 +79,9 @@ fn caller(name: &str, project: &str, tier: Tier) -> Caller {
         name: name.into(),
         project: project.into(),
         tier,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 

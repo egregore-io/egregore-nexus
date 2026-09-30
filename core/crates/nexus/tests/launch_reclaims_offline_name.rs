@@ -511,7 +511,7 @@ async fn launch_reclaims_a_dead_name_for_the_new_session() {
     assert_ne!(client_key, NEW_SESSION);
     assert_eq!(row.presence.as_deref(), Some("online"));
     assert_eq!(row.agent.as_deref(), Some("codex"));
-    assert_eq!(row.kind, "agent");
+    assert_eq!(row.kind, "local.agent");
     assert_eq!(row.tier, "agent");
     assert_eq!(row.cwd.as_deref(), Some("/tmp/new-cwd"));
     assert_eq!(row.transport.as_deref(), Some("acp"));
@@ -844,7 +844,8 @@ async fn codex_resume_without_name_reuses_durable_native_owner() {
         .unwrap();
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: CODEX_THREAD.into(),
             agent_id: "a_otto".into(),
             project: PROJECT.into(),
@@ -893,7 +894,8 @@ async fn codex_resume_after_remove_reuses_preserved_durable_thread_on_owner_row(
         .unwrap();
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: CODEX_THREAD.into(),
             agent_id: "a_otto_removed".into(),
             project: PROJECT.into(),
@@ -909,6 +911,9 @@ async fn codex_resume_after_remove_reuses_preserved_durable_thread_on_owner_row(
         name: "operator".into(),
         project: PROJECT.into(),
         tier: nexus_contracts::Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     state
         .remove_agent(
@@ -968,7 +973,8 @@ async fn codex_resume_with_different_explicit_name_rejects_durable_owner() {
         .unwrap();
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: CODEX_THREAD.into(),
             agent_id: "a_otto".into(),
             project: PROJECT.into(),
@@ -1032,7 +1038,8 @@ async fn codex_launch_explicit_agent_id_resume_validates_thread_before_active_ru
         .unwrap();
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: CODEX_THREAD.into(),
             agent_id: "a_celia".into(),
             project: PROJECT.into(),
@@ -1317,7 +1324,8 @@ async fn admin_remove_preserves_codex_native_resume_state() {
         .unwrap();
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: CODEX_THREAD.into(),
             agent_id: "a_beatrice".into(),
             project: PROJECT.into(),
@@ -1350,6 +1358,9 @@ async fn admin_remove_preserves_codex_native_resume_state() {
         name: "operator".into(),
         project: PROJECT.into(),
         tier: nexus_contracts::Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     let removed = state
         .remove_agent(&admin, None, "beatrice", false)
@@ -1412,7 +1423,8 @@ async fn admin_delete_removes_codex_native_thread_ownership() {
         .unwrap();
     NativeThreadBindings::new(&store)
         .claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: CODEX_THREAD.into(),
             agent_id: "a_beatrice_delete".into(),
             project: PROJECT.into(),
@@ -1428,6 +1440,9 @@ async fn admin_delete_removes_codex_native_thread_ownership() {
         name: "operator".into(),
         project: PROJECT.into(),
         tier: nexus_contracts::Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     state
         .delete_agent(
@@ -1509,6 +1524,9 @@ async fn admin_remove_final_flushes_codex_rollout_while_preserving_sidecar() {
         name: "operator".into(),
         project: PROJECT.into(),
         tier: nexus_contracts::Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     let removed = state
         .remove_agent(&admin, None, "beatrice", false)
@@ -1594,6 +1612,9 @@ async fn admin_remove_preserves_all_native_session_bindings() {
         name: "operator".into(),
         project: PROJECT.into(),
         tier: nexus_contracts::Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     let removed = state
         .remove_agent(&admin, None, "beatrice", false)
@@ -1701,6 +1722,9 @@ async fn admin_delete_releases_all_native_session_bindings() {
         name: "operator".into(),
         project: PROJECT.into(),
         tier: nexus_contracts::Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     state.delete_agent(&admin, None, "beatrice").await.unwrap();
 
@@ -1787,6 +1811,9 @@ async fn admin_delete_releases_native_bindings_when_archive_final_flush_fails() 
         name: "operator".into(),
         project: PROJECT.into(),
         tier: nexus_contracts::Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     state.delete_agent(&admin, None, "beatrice").await.unwrap();
 

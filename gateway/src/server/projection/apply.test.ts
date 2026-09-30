@@ -42,17 +42,31 @@ describe("canonical Gateway projection application", () => {
           fromName: "ada",
           toAgentId: "a_blake",
           body: "hello",
-          provenance: { from: "ada", kind: "agent" },
+          provenance: {
+            from: "ada",
+            kind: "human",
+            locality: "external",
+            access: "guest",
+          },
           project: "metadata-only",
           createdAt: 10,
         },
       }),
     ).resolves.toBe("applied");
-    expect((await db.execute(
-      "SELECT message_id, body, metadata_json, mention_json FROM bus_messages",
-    )).rows).toMatchObject([
-      { message_id: "m1", body: "hello", metadata_json: "{}", mention_json: "[]" },
-    ]);
+    const projected = (await db.execute(
+      "SELECT message_id, body, provenance_json, metadata_json, mention_json FROM bus_messages",
+    )).rows[0];
+    expect(projected).toMatchObject({
+      message_id: "m1",
+      body: "hello",
+      metadata_json: "{}",
+      mention_json: "[]",
+    });
+    expect(JSON.parse(String(projected?.provenance_json))).toMatchObject({
+      kind: "human",
+      locality: "external",
+      access: "guest",
+    });
     expect((await db.execute("SELECT daemon_epoch, through_seq FROM projection_cursors")).rows)
       .toMatchObject([{ daemon_epoch: "boot-1", through_seq: 1 }]);
   });
@@ -82,6 +96,46 @@ describe("canonical Gateway projection application", () => {
       nested: { source: "before_send" },
     });
     expect(JSON.parse(String(row?.mention_json))).toEqual(["fable"]);
+  });
+
+  it("uses the projection ingest transaction as the sole idempotent outbox producer", async () => {
+    await db.execute(`INSERT INTO transport_lane_bindings
+      (provider, external_chat_id, lane_kind, lane_name, created_at)
+      VALUES ('telegram', 'group-design', 'thread', 'design', 1)`);
+    const event = {
+      eventId: "message:m_transport",
+      daemonEpoch: "boot-1",
+      seq: 1,
+      occurredAt: 10,
+      kind: "message.accepted" as const,
+      version: 1,
+      payload: {
+        messageId: "m_transport",
+        scope: "thread",
+        threadId: "t_design",
+        toName: "design",
+        fromAgentId: "a_author",
+        body: "ship it",
+        createdAt: 10,
+      },
+    };
+
+    await expect(applyCanonicalProjection(db, event)).resolves.toBe("applied");
+    await expect(applyCanonicalProjection(db, event)).resolves.toBe("duplicate");
+    await expect(applyCanonicalProjection(db, {
+      ...event,
+      daemonEpoch: "boot-2",
+      seq: 1,
+    })).resolves.toBe("duplicate");
+
+    expect((await db.execute("SELECT * FROM transport_outbox")).rows).toMatchObject([{
+      message_id: "m_transport",
+      provider: "telegram",
+      external_chat_id: "group-design",
+      lane_kind: "thread",
+      lane_name: "design",
+      state: "pending",
+    }]);
   });
 
   it("rolls back the source event and cursor when materialization rejects", async () => {

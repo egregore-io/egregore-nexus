@@ -19,6 +19,8 @@ fn message(id: &str) -> Message {
         provenance: Provenance {
             from: "sender".into(),
             kind: Kind::Agent,
+            locality: Default::default(),
+            access: None,
             thread: None,
             topic: None,
             stamp: None,

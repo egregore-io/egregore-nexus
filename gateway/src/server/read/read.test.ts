@@ -75,7 +75,7 @@ describe("read-view queries (seeded in-memory libSQL)", () => {
     // must read it here, never derive it (daemon rejects fabricated ids).
     expect(ben.agentId).toBe("a_ben");
     expect(ben.agentId).not.toBe(`a_${ben.sessionId}`);
-    expect(ben.role).toBe("admin");
+    expect(ben).not.toHaveProperty("role");
     expect(ben.presence).toBe("online");
     expect(ben.currentWork).toBe("post-merge gate");
 
@@ -104,7 +104,6 @@ describe("read-view queries (seeded in-memory libSQL)", () => {
   it("agentOwnerByName projects managed owner fields", async () => {
     const owner = await agentOwnerByName(db, "ben");
     expect(owner?.ownerName).toBe("erin");
-    expect(owner?.ownerProject).toBe("nexus");
     expect(owner?.ownerSessionId).toBe("s_erin");
   });
 
@@ -162,7 +161,6 @@ describe("read-view queries (seeded in-memory libSQL)", () => {
       .resolves.toMatchObject({
         agentId: "a_global_session",
         sessionKind: "agent",
-        sessionRole: "reviewer",
         sessionTier: "admin",
       });
     await expect(agentOwnerByName(localDb, "a_ambiguous_session"))
@@ -596,7 +594,7 @@ describe("read-view queries (seeded in-memory libSQL)", () => {
     expect(me).toBeDefined();
     expect(me!.name).toBe("erin");
     expect(me!.tier).toBe("admin");
-    expect(me!.project).toBe("nexus");
+    expect(me).not.toHaveProperty("project");
     expect(me!.presence).toBe("online");
   });
 

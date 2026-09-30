@@ -362,7 +362,7 @@ async fn inbox_subscribe(
         .await
         .map_err(|error| contract_to_rpc(&error.to_contract_error()))?
     {
-        if row.kind == "agent" && !AppState::is_externally_drained_session(&row) {
+        if row.is_agent() && !AppState::is_externally_drained_session(&row) {
             return Err(invalid_params(
                 "managed agent inbox is daemon-owned; use automatic delivery instead of inbox.subscribe",
             ));
@@ -501,7 +501,10 @@ async fn session_client_key(state: &AppState, caller: &Caller) -> Result<Option<
 
 async fn authenticated_caller_kind(state: &AppState, caller: &Caller) -> Result<String, RpcError> {
     if caller.session.0 == crate::local_operator::LOCAL_OPERATOR_SESSION_ID {
-        return Ok("human".into());
+        return Ok(nexus_contracts::entity_kind::dotted(
+            nexus_contracts::Locality::Local,
+            nexus_contracts::Kind::Human,
+        ));
     }
     Ok(Sessions::new(&state.store)
         .find_by_session_id(&caller.session)
@@ -870,8 +873,7 @@ async fn route_request_inner(
             }
             let caller_kind = authenticated_caller_kind(state, c).await?;
             state
-                .agent
-                .prompt_observed(
+                .prompt_observed_before_shutdown(
                     &session,
                     r.text.clone(),
                     std::sync::Arc::new(state.ws.clone()),

@@ -13,6 +13,10 @@ v0.1.5 exposes two events:
 - `after_receipt` runs after Nexus has accepted the message and assigned its canonical message ID.
   It may add metadata or perform a local side effect, but it cannot change the accepted message.
 
+> **Capability truth:** read `GET /api/v1/capabilities` and inspect
+> `protocol.surfaces.hooks`. Its `events` list is generated from the same registry that validates
+> hook manifests, so clients should not infer support from documentation or version strings.
+
 Hooks are a Gateway feature. The daemon never loads developer code, and token deltas, model-text
 streams, tool events, and terminal bytes do not enter this hook pipeline.
 

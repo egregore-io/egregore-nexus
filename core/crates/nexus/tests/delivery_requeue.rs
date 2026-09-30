@@ -72,6 +72,9 @@ fn admin() -> Caller {
         name: "operator".into(),
         project: "default".into(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 
@@ -135,6 +138,8 @@ async fn terminal_delivery_retries_only_after_explicit_admin_requeue() {
             provenance: nexus_contracts::message::Provenance {
                 from: "operator".into(),
                 kind: nexus_contracts::Kind::Human,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,

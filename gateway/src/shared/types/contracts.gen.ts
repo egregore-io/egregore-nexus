@@ -559,6 +559,7 @@ export interface CommandQueueTransition {
 	callerName: string;
 	callerSessionId?: string;
 	callerAgentId?: AgentId;
+	callerPrincipalId?: string;
 	callerKind?: string;
 	state: CommandQueueState;
 	mode: string;
@@ -598,6 +599,16 @@ export interface CreateThreadRequest {
 	members?: string[];
 }
 
+/**
+ * Where an entity originates. This is deliberately parallel to [`Kind`]: the nature vocabulary
+ * remains closed while locality can be carried independently across wire and storage seams.
+ */
+export enum Locality {
+	Local = "local",
+	External = "external",
+	Trusted = "trusted",
+}
+
 /** Privilege tier (overview §5). The human user sits above tiers and is not represented here. */
 export enum Tier {
 	Agent = "agent",
@@ -623,6 +634,9 @@ export interface DaemonIpcCaller {
 	runtimeId?: string;
 	clientKey?: string;
 	kind: Kind;
+	locality?: Locality;
+	access?: string;
+	principalId?: string;
 	tier: Tier;
 }
 
@@ -1080,6 +1094,10 @@ export interface MemberSummary {
 	sessionId: SessionId;
 	/** The harness/runtime label (`claude`/`codex`/…); `None` for human/app sessions. */
 	agent?: string;
+	/** Entity origin, independent of its closed nature. Legacy rows default to local. */
+	locality?: Locality;
+	/** Provider or policy-defined access label. */
+	access?: string;
 	role?: string;
 	presence: Presence;
 	currentWork?: string;
@@ -1119,6 +1137,10 @@ export interface Provenance {
 	from: string;
 	/** `agent` | `human` | `notification` (the `kind` attr). */
 	kind: Kind;
+	/** Entity origin, independent of its closed nature. Legacy messages default to local. */
+	locality?: Locality;
+	/** Provider or policy-defined access label. */
+	access?: string;
 	/** Thread NAME (omitted for DMs) — the `thread` attr. */
 	thread?: string;
 	/** Topic name for pub/sub — the `topic` attr. */
@@ -1359,6 +1381,10 @@ export interface RegisterRequest {
 	tier: Tier;
 	/** `agent` | `app` (defaults to agent server-side if omitted). */
 	kind?: Kind;
+	/** Entity origin, independent of its closed nature. Legacy callers default to local. */
+	locality?: Locality;
+	/** Provider or policy-defined access label. */
+	access?: string;
 	/** Registered label (display/addressing only). */
 	role?: string;
 	cwd?: string;

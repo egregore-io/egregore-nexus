@@ -71,7 +71,7 @@ function toDm(m: MemberRow): DmNavItem {
     sessionId: m.sessionId,
     kind: memberKind(m),
     presence: presence(m.presence),
-    kindLabel: m.agent ?? (m.role ? m.role : undefined),
+    kindLabel: m.agent,
   };
 }
 
@@ -83,7 +83,7 @@ function toProject(p: ProjectRow): ProjectNavItem {
 function toMe(w: WhoamiRow): MeIdentity {
   return {
     name: w.name,
-    role: w.role ?? w.tier,
+    role: w.tier,
     presence: presence(w.presence),
   };
 }

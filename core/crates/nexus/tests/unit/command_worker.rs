@@ -1,24 +1,43 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use tokio::sync::Notify;
 
 use nexus_common::{Config, HookGatewayMode};
 use nexus_contracts::{
-    AgentTurnExecutionPort, InterruptRequest, Kind, NexusBatch, NotifySendRequest, NotifyTarget,
-    PortResult, PromptRequest, RegisterRequest, RemoveRequest, RemoveResponse, SessionId,
-    SpawnRequest, SpawnResponse, SteerRequest, Tier,
+    AgentTurnExecutionPort, DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, InterruptRequest,
+    Kind, Locality, NexusBatch, NotifySendRequest, NotifyTarget, PortResult, PromptRequest,
+    RegisterRequest, RemoveRequest, RemoveResponse, SessionId, SpawnRequest, SpawnResponse,
+    SteerRequest, Tier, DAEMON_IPC_PROTOCOL_VERSION,
 };
 use nexus_store::command_kinds;
 use nexus_store::repos::{
-    Agents, CommandIntents, InboxSubscriptions, NewAgent, NewCommandIntent, NewInboxSubscription,
-    NewSession, Sessions,
+    Agents, CommandIntents, DaemonState, InboxSubscriptions, NewAgent, NewCommandIntent,
+    NewInboxSubscription, NewSession, Sessions,
 };
-use nexus_store::Store;
+use nexus_store::{DaemonStore, Store};
 
 use super::*;
 
 struct FirstPromptHangs {
     calls: AtomicUsize,
+}
+
+#[derive(Default)]
+struct PromptDispatchBarrier {
+    calls: AtomicUsize,
+    entered: Notify,
+    release: Notify,
+}
+
+#[derive(Default)]
+struct FireAndForgetPromptBarrier {
+    active: AtomicBool,
+    session: Mutex<Option<SessionId>>,
+    prompt_entered: Notify,
+    wait_entered: Notify,
+    release: Notify,
 }
 
 #[derive(Default)]
@@ -89,6 +108,65 @@ impl AgentTurnExecutionPort for FirstPromptHangs {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutionPort for PromptDispatchBarrier {
+    async fn inject_turn(&self, _recipient: &SessionId, _batch: &NexusBatch) -> PortResult<()> {
+        Ok(())
+    }
+
+    async fn launch(&self, _req: SpawnRequest) -> PortResult<SpawnResponse> {
+        unimplemented!("command-worker shutdown tests do not launch harnesses")
+    }
+
+    async fn remove(&self, _req: RemoveRequest) -> PortResult<RemoveResponse> {
+        unimplemented!("command-worker shutdown tests do not remove harnesses")
+    }
+
+    async fn prompt(&self, _recipient: &SessionId, _text: String) -> PortResult<()> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutionPort for FireAndForgetPromptBarrier {
+    async fn inject_turn(&self, _recipient: &SessionId, _batch: &NexusBatch) -> PortResult<()> {
+        Ok(())
+    }
+
+    async fn launch(&self, _req: SpawnRequest) -> PortResult<SpawnResponse> {
+        unimplemented!("command-worker shutdown tests do not launch harnesses")
+    }
+
+    async fn remove(&self, _req: RemoveRequest) -> PortResult<RemoveResponse> {
+        unimplemented!("command-worker shutdown tests do not remove harnesses")
+    }
+
+    async fn prompt(&self, recipient: &SessionId, _text: String) -> PortResult<()> {
+        *self.session.lock().unwrap() = Some(recipient.clone());
+        self.active.store(true, Ordering::SeqCst);
+        self.prompt_entered.notify_one();
+        Ok(())
+    }
+
+    fn active_turn_sessions(&self) -> Vec<SessionId> {
+        if !self.active.load(Ordering::SeqCst) {
+            return Vec::new();
+        }
+        self.session.lock().unwrap().clone().into_iter().collect()
+    }
+
+    async fn wait_for_turn_completion(&self, recipient: &SessionId) -> PortResult<()> {
+        assert_eq!(self.session.lock().unwrap().as_ref(), Some(recipient));
+        self.wait_entered.notify_one();
+        self.release.notified().await;
+        self.active.store(false, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -262,6 +340,7 @@ async fn notification_send_resolves_a_name_before_installing_any_runtime_hold() 
             caller_agent_id: None,
             caller_runtime_id: Some(caller.session_id.0.clone()),
             caller_client_key: Some("ck_notify_preflight".into()),
+            caller_principal_id: None,
             caller_kind: Some("human".into()),
             caller_tier: Some("admin".into()),
             idempotency_key: request.idempotency_key.clone(),
@@ -362,6 +441,7 @@ async fn notification_hook_rejection_leaves_the_target_lifecycle_untouched() {
             caller_agent_id: None,
             caller_runtime_id: Some(caller.session_id.0.clone()),
             caller_client_key: Some("ck_notify_hook_reject".into()),
+            caller_principal_id: None,
             caller_kind: Some("human".into()),
             caller_tier: Some("admin".into()),
             idempotency_key: request.idempotency_key.clone(),
@@ -412,6 +492,8 @@ fn human_register(name: &str, client_key: &str) -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Admin,
         kind: Some(Kind::Human),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -434,6 +516,7 @@ fn prompt_intent(
         caller_agent_id: caller.agent_id.as_ref().map(|id| id.0.clone()),
         caller_runtime_id: Some(caller.session_id.0.clone()),
         caller_client_key: Some(caller_client_key.into()),
+        caller_principal_id: None,
         caller_kind: Some("human".into()),
         caller_tier: Some("admin".into()),
         idempotency_key: None,
@@ -518,6 +601,204 @@ async fn harness_prompt_claim_lease_outlives_execution_timeout() {
 }
 
 #[tokio::test]
+async fn graceful_shutdown_drains_the_active_prompt_and_defers_pre_fence_backlog() {
+    let exec = Arc::new(PromptDispatchBarrier::default());
+    let state = test_state_with_turn_exec(exec.clone()).await;
+    let operator = state
+        .identity
+        .register(human_register("Alex Morgan", "ck_shutdown_operator"))
+        .await
+        .unwrap();
+    state
+        .identity
+        .register(human_register("Target Human", "ck_shutdown_target"))
+        .await
+        .unwrap();
+    let repo = CommandIntents::new(&state.store);
+    repo.insert_pending(prompt_intent(
+        "cmd_shutdown_active",
+        &operator,
+        "Alex Morgan",
+        "ck_shutdown_operator",
+        "reach the accepted boundary",
+        1,
+    ))
+    .await
+    .unwrap();
+    repo.insert_pending(prompt_intent(
+        "cmd_shutdown_pre_fence",
+        &operator,
+        "Alex Morgan",
+        "ck_shutdown_operator",
+        "also accepted before shutdown",
+        2,
+    ))
+    .await
+    .unwrap();
+
+    let worker = spawn(state.clone());
+    tokio::time::timeout(Duration::from_secs(1), exec.entered.notified())
+        .await
+        .expect("the active prompt must enter the transport boundary");
+
+    begin_shutdown(&state).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !worker.is_finished(),
+        "shutdown must wait for the active dispatch boundary"
+    );
+    exec.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("the command worker should stop after the active prompt settles")
+        .expect("the command worker must not panic during shutdown");
+
+    let active = repo.get("cmd_shutdown_active").await.unwrap().unwrap();
+    assert_eq!(active.status, "done");
+    let pre_fence = repo.get("cmd_shutdown_pre_fence").await.unwrap().unwrap();
+    assert_eq!(pre_fence.status, "pending");
+    assert_eq!(pre_fence.claimed_at, None);
+    assert_eq!(pre_fence.started_at, None);
+    assert_eq!(exec.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn graceful_shutdown_waits_for_a_fire_and_forget_provider_turn() {
+    let exec = Arc::new(FireAndForgetPromptBarrier::default());
+    let state = test_state_with_turn_exec(exec.clone()).await;
+    let operator = state
+        .identity
+        .register(human_register("Alex Morgan", "ck_shutdown_turn_operator"))
+        .await
+        .unwrap();
+    state
+        .identity
+        .register(human_register("Target Human", "ck_shutdown_turn_target"))
+        .await
+        .unwrap();
+    CommandIntents::new(&state.store)
+        .insert_pending(prompt_intent(
+            "cmd_shutdown_fire_and_forget",
+            &operator,
+            "Alex Morgan",
+            "ck_shutdown_turn_operator",
+            "finish the provider turn before transport teardown",
+            1,
+        ))
+        .await
+        .unwrap();
+
+    let worker = spawn(state.clone());
+    tokio::time::timeout(Duration::from_secs(1), exec.prompt_entered.notified())
+        .await
+        .expect("the prompt must reach the fire-and-forget boundary");
+    begin_shutdown(&state).await;
+    tokio::time::timeout(Duration::from_secs(1), exec.wait_entered.notified())
+        .await
+        .expect("shutdown must await the active provider turn");
+    assert!(
+        !worker.is_finished(),
+        "the worker must remain alive until provider completion"
+    );
+
+    exec.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("the worker should finish after provider completion")
+        .expect("the worker must not panic during shutdown");
+    assert!(exec.active_turn_sessions().is_empty());
+}
+
+#[tokio::test]
+async fn prompt_acceptance_permit_linearizes_before_shutdown_fence() {
+    let exec = Arc::new(PromptDispatchBarrier::default());
+    let state = test_state_with_turn_exec(exec.clone()).await;
+    let operator = state
+        .identity
+        .register(human_register("Alex Morgan", "ck_prompt_fence_operator"))
+        .await
+        .unwrap();
+    state
+        .identity
+        .register(human_register("Target Human", "ck_prompt_fence_target"))
+        .await
+        .unwrap();
+    CommandIntents::new(&state.store)
+        .insert_pending(prompt_intent(
+            "cmd_prompt_fence",
+            &operator,
+            "Alex Morgan",
+            "ck_prompt_fence_operator",
+            "accept before shutdown",
+            1,
+        ))
+        .await
+        .unwrap();
+
+    let worker_state = state.clone();
+    let worker = tokio::spawn(async move {
+        process_next_for_lane(&worker_state, WorkerLane::HarnessPrompt).await
+    });
+    tokio::time::timeout(Duration::from_secs(1), exec.entered.notified())
+        .await
+        .expect("prompt must enter its external acceptance boundary");
+
+    begin_shutdown(&state).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        !worker.is_finished(),
+        "a prompt permitted before shutdown must retain its accepted-boundary task"
+    );
+
+    exec.release.notify_one();
+    assert!(tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("prompt worker should finish")
+        .expect("prompt worker task must not panic")
+        .unwrap());
+}
+
+#[tokio::test]
+async fn graceful_shutdown_defers_a_prompt_claimed_before_its_actor_starts() {
+    let exec = Arc::new(PromptDispatchBarrier::default());
+    let state = test_state_with_turn_exec(exec.clone()).await;
+    let operator = state
+        .identity
+        .register(human_register("Alex Morgan", "ck_shutdown_claim_operator"))
+        .await
+        .unwrap();
+    let target = state
+        .identity
+        .register(human_register("Target Human", "ck_shutdown_claim_target"))
+        .await
+        .unwrap();
+    let repo = CommandIntents::new(&state.store);
+    repo.insert_pending(prompt_intent(
+        "cmd_shutdown_claimed",
+        &operator,
+        "Alex Morgan",
+        "ck_shutdown_claim_operator",
+        "finish the owned dispatch",
+        1,
+    ))
+    .await
+    .unwrap();
+    let row = claim_next_for_lane(&state, WorkerLane::HarnessPrompt)
+        .await
+        .unwrap()
+        .expect("the prompt should be owned before shutdown starts");
+
+    begin_shutdown(&state).await;
+    run_harness_prompt_session_actor(state.clone(), target.session_id.0, row).await;
+
+    let row = repo.get("cmd_shutdown_claimed").await.unwrap().unwrap();
+    assert_eq!(row.status, "pending");
+    assert_eq!(row.claimed_at, None);
+    assert_eq!(row.started_at, None);
+    assert_eq!(exec.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn explicit_steer_lane_bypasses_claimed_prompt_boundary() {
     let state = test_state().await;
     let alex = state
@@ -588,6 +869,7 @@ async fn durable_interrupt_runs_once_on_the_control_lane_with_the_authenticated_
         caller_agent_id: None,
         caller_runtime_id: Some(operator.session_id.0.clone()),
         caller_client_key: Some("ck_interrupt_operator".into()),
+        caller_principal_id: None,
         caller_kind: Some("human".into()),
         caller_tier: Some("admin".into()),
         idempotency_key: Some("cm_interrupt_control".into()),
@@ -609,7 +891,7 @@ async fn durable_interrupt_runs_once_on_the_control_lane_with_the_authenticated_
     let row = repo.get("cmd_interrupt_control").await.unwrap().unwrap();
     assert_eq!(row.status, "done");
     assert_eq!(row.caller_session_id, Some(operator.session_id.0));
-    assert_eq!(row.caller_kind.as_deref(), Some("human"));
+    assert_eq!(row.caller_kind.as_deref(), Some("local.human"));
 }
 
 #[tokio::test]
@@ -675,6 +957,7 @@ async fn idle_worker_wait_wakes_on_command_intent_signal_before_poll_interval() 
             caller_agent_id: None,
             caller_runtime_id: None,
             caller_client_key: None,
+            caller_principal_id: None,
             caller_kind: None,
             caller_tier: None,
             idempotency_key: None,
@@ -785,6 +1068,7 @@ async fn registered_agent_id_is_exclusive_and_cannot_alias_hop_during_command_au
         caller_agent_id: Some("a_orphan".into()),
         caller_runtime_id: Some(registered.session_id.0.clone()),
         caller_client_key: Some("ck_orphan_agent".into()),
+        caller_principal_id: None,
         caller_kind: Some("agent".into()),
         caller_tier: Some("agent".into()),
         idempotency_key: None,
@@ -874,6 +1158,7 @@ async fn human_command_auth_never_resolves_its_display_name_as_an_agent() {
         caller_agent_id: Some("a_same_human_label".into()),
         caller_runtime_id: Some(human.session_id.0.clone()),
         caller_client_key: Some("ck_browser_user".into()),
+        caller_principal_id: None,
         caller_kind: Some("human".into()),
         caller_tier: Some("admin".into()),
         idempotency_key: None,
@@ -895,6 +1180,327 @@ async fn human_command_auth_never_resolves_its_display_name_as_an_agent() {
     assert_eq!(caller.session, human.session_id);
     assert_eq!(caller.name, "browser-user");
     assert_eq!(caller.agent_id, None);
+}
+
+#[tokio::test]
+async fn gateway_transport_external_principal_is_a_caller_without_native_session_identity() {
+    let state = test_state().await;
+    Agents::new(&state.store)
+        .create(NewAgent {
+            agent_id: "a_outside_alias".into(),
+            project: "default".into(),
+            name: Some("outside-user".into()),
+            default_harness: None,
+            role: None,
+            tier: Some("agent".into()),
+            owner: None,
+        })
+        .await
+        .unwrap();
+    let repo = CommandIntents::new(&state.store);
+    repo.insert_pending(NewCommandIntent {
+        command_id: "cmd_external_transport".into(),
+        kind: command_kinds::message_post::SEND.into(),
+        project: "default".into(),
+        caller_name: "outside-user".into(),
+        caller_session_id: Some("transport:telegram".into()),
+        caller_agent_id: None,
+        caller_runtime_id: Some("transport:telegram".into()),
+        caller_client_key: None,
+        caller_principal_id: Some("x_outside".into()),
+        caller_kind: Some("external.human".into()),
+        caller_tier: Some("agent".into()),
+        idempotency_key: Some("transport:telegram:update-1".into()),
+        request_json: "{}".into(),
+        created_at: 1,
+    })
+    .await
+    .unwrap();
+    let row = repo
+        .get("cmd_external_transport")
+        .await
+        .unwrap()
+        .expect("external transport command");
+
+    let caller = resolve_command_caller(&state, &row)
+        .await
+        .expect("gateway-authenticated external principal");
+
+    assert_eq!(caller.agent_id, None);
+    assert_eq!(caller.session, SessionId("transport:telegram".into()));
+    assert_eq!(caller.name, "outside-user");
+    assert_eq!(caller.locality, Locality::External);
+    assert_eq!(caller.access.as_deref(), Some("guest"));
+    assert_eq!(caller.principal_id.as_deref(), Some("x_outside"));
+}
+
+#[tokio::test]
+async fn no_other_client_keyless_shape_can_enter_the_gateway_transport_principal_lane() {
+    let state = test_state().await;
+    let repo = CommandIntents::new(&state.store);
+    repo.insert_pending(NewCommandIntent {
+        command_id: "cmd_external_shape_base".into(),
+        kind: command_kinds::message_post::SEND.into(),
+        project: "default".into(),
+        caller_name: "outside-user".into(),
+        caller_session_id: Some("transport:telegram".into()),
+        caller_agent_id: None,
+        caller_runtime_id: Some("transport:telegram".into()),
+        caller_client_key: None,
+        caller_principal_id: Some("x_outside".into()),
+        caller_kind: Some("external.human".into()),
+        caller_tier: Some("agent".into()),
+        idempotency_key: None,
+        request_json: "{}".into(),
+        created_at: 1,
+    })
+    .await
+    .unwrap();
+    let base = repo
+        .get("cmd_external_shape_base")
+        .await
+        .unwrap()
+        .expect("shape base");
+
+    let mut invalid = Vec::new();
+    let mut row = base.clone();
+    row.caller_kind = Some("external.agent".into());
+    invalid.push(("external agent", row));
+    let mut row = base.clone();
+    row.caller_kind = Some("local.human".into());
+    invalid.push(("local human", row));
+    let mut row = base.clone();
+    row.caller_kind = Some("trusted.human".into());
+    invalid.push(("trusted human", row));
+    let mut row = base.clone();
+    row.caller_principal_id = Some("h_local".into());
+    invalid.push(("non-external principal", row));
+    let mut row = base.clone();
+    row.caller_session_id = Some("source:telegram".into());
+    row.caller_runtime_id = row.caller_session_id.clone();
+    invalid.push(("non-transport session", row));
+    let mut row = base.clone();
+    row.kind = command_kinds::thread::CREATE.into();
+    invalid.push(("non-message command", row));
+
+    for (label, row) in invalid {
+        let error = resolve_command_caller(&state, &row).await.expect_err(label);
+        assert_eq!(error.code, codes::UNAUTHORIZED, "{label}");
+        assert!(error.message.contains("verified client key"), "{label}");
+    }
+}
+
+#[tokio::test]
+async fn daemon_accepted_human_command_survives_only_a_real_boot_change() {
+    let state = test_state().await;
+    DaemonState::new(&state.store)
+        .set_boot_epoch("boot_accept", 1)
+        .await
+        .unwrap();
+    let human = state
+        .identity
+        .register(human_register("restart-human", "ck_restart_human"))
+        .await
+        .unwrap();
+    let response = crate::daemon::daemon_ipc::handle_request(
+        &state,
+        "boot-token",
+        DaemonIpcRequest {
+            version: DAEMON_IPC_PROTOCOL_VERSION,
+            token: "boot-token".into(),
+            request_id: "rpc-restart-human".into(),
+            caller: Some(DaemonIpcCaller {
+                name: Some("restart-human".into()),
+                project: "default".into(),
+                session_id: Some(human.session_id.0.clone()),
+                agent_id: None,
+                runtime_id: Some(human.session_id.0.clone()),
+                client_key: Some("ck_restart_human".into()),
+                kind: Kind::Human,
+                locality: Locality::Local,
+                access: None,
+                principal_id: None,
+                tier: Tier::Admin,
+            }),
+            call: DaemonIpcCall::Enqueue {
+                command_id: "cmd-restart-human".into(),
+                kind: command_kinds::thread::CREATE.into(),
+                params: serde_json::json!({"name": "restart-boundary", "members": []}),
+                idempotency_key: None,
+            },
+        },
+    )
+    .await;
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let row = CommandIntents::new(&state.store)
+        .get("cmd-restart-human")
+        .await
+        .unwrap()
+        .expect("daemon-accepted command");
+
+    state
+        .store
+        .conn
+        .execute(
+            "DELETE FROM sessions WHERE session_id = ?1",
+            libsql::params![human.session_id.0.clone()],
+        )
+        .await
+        .unwrap();
+    let same_boot = resolve_command_caller(&state, &row)
+        .await
+        .expect_err("same-boot session loss must remain unauthorized");
+    assert_eq!(same_boot.code, nexus_contracts::codes::UNAUTHORIZED);
+
+    DaemonState::new(&state.store)
+        .set_boot_epoch("boot_restarted", 2)
+        .await
+        .unwrap();
+    let rebound = state
+        .identity
+        .register(human_register("restart-human", "ck_restart_human"))
+        .await
+        .unwrap();
+    assert_ne!(
+        rebound.session_id, human.session_id,
+        "a fresh daemon registration must exercise the new-session boundary"
+    );
+    let caller = resolve_command_caller(&state, &row)
+        .await
+        .expect("daemon-validated human authority must survive a boot change");
+    assert_eq!(caller.name, "restart-human");
+    assert_eq!(caller.session, human.session_id);
+    assert_eq!(caller.agent_id, None);
+    assert_eq!(caller.project, "default");
+    assert_eq!(caller.tier, Tier::Admin);
+
+    let forged = NewCommandIntent {
+        command_id: "cmd-forged-restart-human".into(),
+        kind: command_kinds::thread::CREATE.into(),
+        project: "default".into(),
+        caller_name: "restart-human".into(),
+        caller_session_id: Some(human.session_id.0.clone()),
+        caller_agent_id: None,
+        caller_runtime_id: Some(human.session_id.0.clone()),
+        caller_client_key: Some("ck_restart_human".into()),
+        caller_principal_id: None,
+        caller_kind: Some("human".into()),
+        caller_tier: Some("admin".into()),
+        idempotency_key: None,
+        request_json: serde_json::json!({"name": "forged-restart", "members": []}).to_string(),
+        created_at: 2,
+    };
+    CommandIntents::new(&state.store)
+        .insert_pending(forged)
+        .await
+        .unwrap();
+    let forged = CommandIntents::new(&state.store)
+        .get("cmd-forged-restart-human")
+        .await
+        .unwrap()
+        .unwrap();
+    let error = resolve_command_caller(&state, &forged)
+        .await
+        .expect_err("an unattested durable row must not gain restart authority");
+    assert_eq!(error.code, nexus_contracts::codes::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn split_daemon_restart_executes_the_pre_restart_validated_human_command() {
+    let path = std::env::temp_dir().join(format!(
+        "nexus-command-caller-restart-{}-{}.db",
+        std::process::id(),
+        now()
+    ));
+    let human_session;
+    {
+        let daemon = DaemonStore::open(path.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        let state = AppState::wire(Arc::new(daemon.compatibility_store()), &Config::default());
+        DaemonState::new(&state.store)
+            .set_boot_epoch("boot_split_accept", 1)
+            .await
+            .unwrap();
+        let human = state
+            .identity
+            .register(human_register(
+                "split-restart-human",
+                "ck_split_restart_human",
+            ))
+            .await
+            .unwrap();
+        human_session = human.session_id.0.clone();
+        let response = crate::daemon::daemon_ipc::handle_request(
+            &state,
+            "boot-token",
+            DaemonIpcRequest {
+                version: DAEMON_IPC_PROTOCOL_VERSION,
+                token: "boot-token".into(),
+                request_id: "rpc-split-restart-human".into(),
+                caller: Some(DaemonIpcCaller {
+                    name: Some("split-restart-human".into()),
+                    project: "default".into(),
+                    session_id: Some(human_session.clone()),
+                    agent_id: None,
+                    runtime_id: Some(human_session.clone()),
+                    client_key: Some("ck_split_restart_human".into()),
+                    kind: Kind::Human,
+                    locality: Locality::Local,
+                    access: None,
+                    principal_id: None,
+                    tier: Tier::Admin,
+                }),
+                call: DaemonIpcCall::Enqueue {
+                    command_id: "cmd-split-restart-human".into(),
+                    kind: command_kinds::thread::CREATE.into(),
+                    params: serde_json::json!({
+                        "name": "split-restart-boundary",
+                        "members": []
+                    }),
+                    idempotency_key: None,
+                },
+            },
+        )
+        .await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let row = CommandIntents::new(&state.store)
+            .get("cmd-split-restart-human")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.caller_validated_boot_epoch.as_deref(),
+            Some("boot_split_accept")
+        );
+    }
+
+    {
+        let daemon = DaemonStore::open(path.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        let state = AppState::wire(Arc::new(daemon.compatibility_store()), &Config::default());
+        DaemonState::new(&state.store)
+            .set_boot_epoch("boot_split_restarted", 2)
+            .await
+            .unwrap();
+        assert!(Sessions::new(&state.store)
+            .find_by_session_id(&SessionId(human_session.clone()))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(process_next(&state).await.unwrap());
+        let row = CommandIntents::new(&state.store)
+            .get("cmd-split-restart-human")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done", "{:?}", row.error_json);
+    }
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("db-wal"));
+    let _ = std::fs::remove_file(path.with_extension("db-shm"));
 }
 
 #[tokio::test]

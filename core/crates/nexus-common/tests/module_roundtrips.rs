@@ -44,6 +44,10 @@ mod error {
             codes::PROJECT_SCOPE_VIOLATION
         );
         assert_eq!(NexusError::Paused.to_contract_error().code, codes::PAUSED);
+        assert_eq!(
+            NexusError::CommandQueueFull.to_contract_error().code,
+            codes::COMMAND_QUEUE_FULL
+        );
     }
 }
 
@@ -76,6 +80,8 @@ mod provenance {
         let p = Provenance {
             from: "ben".into(),
             kind: Kind::Agent,
+            locality: Default::default(),
+            access: None,
             thread: None,
             topic: None,
             stamp: None,
@@ -91,6 +97,8 @@ mod provenance {
         let p = Provenance {
             from: "erin".into(),
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
             thread: None,
             topic: None,
             stamp: None,
@@ -106,6 +114,8 @@ mod provenance {
         let p = Provenance {
             from: "dylan".into(),
             kind: Kind::Agent,
+            locality: Default::default(),
+            access: None,
             thread: Some("backend".into()),
             topic: None,
             stamp: None,
@@ -315,6 +325,8 @@ register/wake directive: {rendered}"
         let p = Provenance {
             from: "dylan".into(),
             kind: Kind::Agent,
+            locality: Default::default(),
+            access: None,
             thread: Some("backend".into()),
             topic: None,
             stamp: None,
@@ -333,6 +345,8 @@ register/wake directive: {rendered}"
         let pt = Provenance {
             from: "dylan".into(),
             kind: Kind::Agent,
+            locality: Default::default(),
+            access: None,
             thread: None,
             topic: Some("ci".into()),
             stamp: None,

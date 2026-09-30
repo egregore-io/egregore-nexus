@@ -11,7 +11,7 @@ import {
 import { localOperatorCaller } from "@server/auth/webAuthMode";
 import { migrateGatewayStore } from "@server/store/migrations";
 import { DaemonIpcError } from "@server/daemon/ipc";
-import { Kind, Tier } from "@shared/types";
+import { Kind, Locality, Tier } from "@shared/types";
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS command_intents (
@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS command_intents (
   caller_agent_id   TEXT,
   caller_runtime_id TEXT,
   caller_client_key TEXT,
+  caller_principal_id TEXT,
   caller_kind       TEXT,
   caller_tier       TEXT,
   idempotency_key   TEXT,
@@ -296,6 +297,23 @@ describe("submitCommandIntent", () => {
     expect(daemonEnqueue).not.toHaveBeenCalled();
   });
 
+  it("maps the daemon session queue capacity rejection to typed HTTP 429", async () => {
+    await expect(enqueueCommandIntent(
+      COMMAND_KINDS.harnessPrompt,
+      { name: "fable", agentId: "a_fable", text: "bounded" },
+      localOperatorCaller(),
+      {
+        daemonEnqueue: async () => {
+          throw new DaemonIpcError("session command queue is full", -32010);
+        },
+      },
+      "cm-queue-full",
+    )).rejects.toMatchObject({
+      code: 429,
+      message: "session command queue is full",
+    });
+  });
+
   it("settles Gateway-local idempotency around daemon IPC and replays the original result", async () => {
     const ingressDb = createClient({ url: ":memory:" });
     await migrateGatewayStore(ingressDb);
@@ -326,6 +344,35 @@ describe("submitCommandIntent", () => {
     expect(first).toEqual({ messageId: "m_once" });
     expect(replay).toEqual(first);
     expect(calls).toBe(1);
+  });
+
+  it("persists gateway-local principal evidence around daemon IPC", async () => {
+    const ingressDb = createClient({ url: ":memory:" });
+    await migrateGatewayStore(ingressDb);
+    await submitCommandIntent(
+      COMMAND_KINDS.messagePostSend,
+      { body: "principal evidence" },
+      {
+        ...localOperatorCaller(),
+        principalId: "h_operator",
+      },
+      {
+        ingressDb,
+        genCommandId: () => "cmd_principal_evidence",
+        now: () => 1_000,
+        daemonCommand: async () => ({ messageId: "m_principal" }),
+      },
+      "principal-evidence",
+    );
+
+    const row = (await ingressDb.execute(
+      `SELECT request_json, caller_principal_id FROM gateway_ingress
+       WHERE command_id = 'cmd_principal_evidence'`,
+    )).rows[0]!;
+    expect(row.caller_principal_id).toBe("h_operator");
+    expect(JSON.parse(String(row.request_json))).toMatchObject({
+      caller: { principalId: "h_operator" },
+    });
   });
 
   it("maps an absent daemon to an explicit transport-unavailable 503 without terminal settlement", async () => {
@@ -566,7 +613,7 @@ describe("submitCommandIntent", () => {
       caller_session_id: "local-operator",
       caller_runtime_id: "local-operator",
       caller_client_key: null,
-      caller_kind: "human",
+      caller_kind: "local.human",
       caller_tier: "admin",
       created_at: 1_000,
     });
@@ -574,6 +621,63 @@ describe("submitCommandIntent", () => {
       name: "backend",
       members: ["blake"],
     });
+  });
+
+  it("persists dotted caller locality and forwards parallel caller evidence", async () => {
+    const db = await makeDb();
+    const caller = {
+      name: "outside",
+      project: "default",
+      kind: Kind.Human,
+      locality: Locality.External,
+      access: "guest",
+      principalId: "x_outside",
+      sessionId: "s_outside",
+      clientKey: "ck_outside",
+    };
+    const daemonCaller = vi.fn(async () => ({ ok: true }));
+
+    await submitCommandIntent(
+      COMMAND_KINDS.threadCreate,
+      { name: "outside-thread" },
+      caller,
+      {
+        daemonCommand: daemonCaller,
+        genCommandId: () => "cmd_external_daemon",
+      },
+    );
+    expect(daemonCaller).toHaveBeenCalledWith(
+      COMMAND_KINDS.threadCreate,
+      { name: "outside-thread" },
+      expect.objectContaining({
+        kind: "human",
+        locality: "external",
+        access: "guest",
+        principalId: "x_outside",
+      }),
+      expect.any(Object),
+    );
+
+    const direct = await makeDb();
+    await submitCommandIntent(
+      COMMAND_KINDS.threadCreate,
+      { name: "outside-thread" },
+      caller,
+      {
+        db: direct,
+        genCommandId: () => "cmd_external_direct",
+        now: () => 1_000,
+        sleep: async () => {
+          await complete(direct, "cmd_external_direct", null);
+        },
+      },
+    );
+    const row = (await direct.execute(
+      "SELECT caller_kind, caller_principal_id FROM command_intents " +
+      "WHERE command_id = 'cmd_external_direct'",
+    )).rows[0];
+    expect(row?.caller_kind).toBe("external.human");
+    expect(row?.caller_principal_id).toBe("x_outside");
   });
 
   it("dedupes retry-prone writes with the same idempotency key", async () => {

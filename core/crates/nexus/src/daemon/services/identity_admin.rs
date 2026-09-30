@@ -14,7 +14,7 @@ use nexus_contracts::{
     AgentRuntimeListRequest, AgentRuntimeListResponse, AgentRuntimeSummary, AgentShowRequest,
     AgentShowResponse, AgentSummary, AssignProjectRequest, AssignProjectResponse,
     AssignRoleRequest, AssignRoleResponse, Caller, ContractError, EventSink, GrantTierRequest,
-    GrantTierResponse, HarnessId, Kind, MetadataEntityKind, MetadataResponse, MetadataSetRequest,
+    GrantTierResponse, HarnessId, MetadataEntityKind, MetadataResponse, MetadataSetRequest,
     Presence, Tier, WsEvent,
 };
 use nexus_store::repos::{
@@ -186,7 +186,7 @@ impl IdentityAdminService {
             .await
             .map_err(|e| e.to_contract_error())?
         {
-            Some(row) => Ok(row.kind == kind_token(Kind::Human)),
+            Some(row) => Ok(row.is_human()),
             None => Ok(caller.session.0 == LOCAL_OPERATOR_SESSION_ID),
         }
     }
@@ -324,7 +324,7 @@ impl IdentityAdminService {
             if let Some(agent_id) = row.agent_id {
                 return Ok(Some(AclCallerPrincipal::StableAgent(agent_id)));
             }
-            let allow_unbound_name = if row.kind == kind_token(Kind::Agent) {
+            let allow_unbound_name = if row.is_agent() {
                 match sessions.find_unique_by_name_any_project(&caller.name).await {
                     Ok(Some(unique)) => unique.session_id == row.session_id,
                     Ok(None) | Err(NexusError::NotFound(_)) | Err(NexusError::Ambiguous(_)) => {
@@ -745,7 +745,7 @@ impl IdentityAdminService {
             .await?;
         let sessions = Sessions::new(&self.store);
         let session = self.session_row_for_agent_id(&row.agent_id).await?;
-        if matches!(session.as_ref(), Some(s) if s.kind != kind_token(Kind::Agent)) {
+        if matches!(session.as_ref(), Some(s) if !s.is_agent()) {
             return Err(NexusError::Unauthorized.to_contract_error());
         }
 
@@ -1203,16 +1203,6 @@ impl IdentityAdminService {
     }
 }
 
-/// The kind token stored on `sessions.kind`.
-fn kind_token(k: Kind) -> &'static str {
-    match k {
-        Kind::Agent => "agent",
-        Kind::Human => "human",
-        Kind::Notification => "notification",
-        Kind::App => "app",
-    }
-}
-
 /// The tier token stored on `sessions.tier`.
 fn tier_token(t: Tier) -> &'static str {
     match t {
@@ -1222,7 +1212,7 @@ fn tier_token(t: Tier) -> &'static str {
 }
 
 fn protected_remove_target(row: &SessionRow) -> bool {
-    row.kind == kind_token(Kind::Human)
+    row.is_human()
         || row.tier == tier_token(Tier::Admin)
         || row
             .role

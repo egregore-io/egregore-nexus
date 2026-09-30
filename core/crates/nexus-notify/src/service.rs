@@ -402,6 +402,8 @@ impl Notify {
         let provenance = Provenance {
             from: caller.name.clone(),
             kind: Kind::Notification,
+            locality: Default::default(),
+            access: None,
             thread: None,
             topic: Some(topic.to_string()),
             stamp: None,

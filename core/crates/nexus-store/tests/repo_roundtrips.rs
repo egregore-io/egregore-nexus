@@ -30,6 +30,8 @@ mod search_index {
             provenance: Provenance {
                 from: from.into(),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,
@@ -735,6 +737,8 @@ mod inbox {
             provenance: Provenance {
                 from: "ben".into(),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,
@@ -2126,6 +2130,8 @@ mod sessions {
             provenance: Provenance {
                 from: from.to_string(),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,
@@ -2948,12 +2954,13 @@ mod native_thread_bindings {
     }
 
     #[tokio::test]
-    async fn native_thread_binding_claim_roundtrips_by_harness_thread() {
+    async fn native_thread_binding_claim_roundtrips_by_provider_thread() {
         let store = migrated().await;
         let repo = NativeThreadBindings::new(&store);
 
         repo.claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: "codex-thread-1".into(),
             agent_id: "a_otto".into(),
             project: "default".into(),
@@ -2979,7 +2986,8 @@ mod native_thread_bindings {
         let repo = NativeThreadBindings::new(&store);
 
         repo.claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: "codex-thread-1".into(),
             agent_id: "a_otto".into(),
             project: "default".into(),
@@ -2991,7 +2999,8 @@ mod native_thread_bindings {
             .await
             .unwrap();
         repo.claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: "codex-thread-1".into(),
             agent_id: "a_otto".into(),
             project: "default".into(),
@@ -3012,7 +3021,8 @@ mod native_thread_bindings {
         let repo = NativeThreadBindings::new(&store);
 
         repo.claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: "codex-thread-1".into(),
             agent_id: "a_otto".into(),
             project: "default".into(),
@@ -3023,7 +3033,8 @@ mod native_thread_bindings {
 
         let err = repo
             .claim(NewNativeThreadBinding {
-                harness: "codex".into(),
+                provider: "codex".into(),
+                kind: "harness".into(),
                 native_thread_id: "codex-thread-1".into(),
                 agent_id: "a_celia".into(),
                 project: "default".into(),
@@ -3035,12 +3046,13 @@ mod native_thread_bindings {
     }
 
     #[tokio::test]
-    async fn native_thread_binding_is_harness_scoped_for_same_native_key_text() {
+    async fn native_thread_binding_is_provider_scoped_for_same_native_key_text() {
         let store = migrated().await;
         let repo = NativeThreadBindings::new(&store);
 
         repo.claim(NewNativeThreadBinding {
-            harness: "claude".into(),
+            provider: "claude".into(),
+            kind: "harness".into(),
             native_thread_id: "shared-native-key".into(),
             agent_id: "a_claude".into(),
             project: "default".into(),
@@ -3049,7 +3061,8 @@ mod native_thread_bindings {
         .await
         .unwrap();
         repo.claim(NewNativeThreadBinding {
-            harness: "codex".into(),
+            provider: "codex".into(),
+            kind: "harness".into(),
             native_thread_id: "shared-native-key".into(),
             agent_id: "a_codex".into(),
             project: "default".into(),
@@ -3082,7 +3095,8 @@ mod native_thread_bindings {
         let repo = NativeThreadBindings::new(&store);
 
         repo.claim(NewNativeThreadBinding {
-            harness: "claude".into(),
+            provider: "claude".into(),
+            kind: "harness".into(),
             native_thread_id: "claude-old".into(),
             agent_id: "a_hugo".into(),
             project: "default".into(),
@@ -3094,7 +3108,8 @@ mod native_thread_bindings {
             .await
             .unwrap();
         repo.claim(NewNativeThreadBinding {
-            harness: "claude".into(),
+            provider: "claude".into(),
+            kind: "harness".into(),
             native_thread_id: "claude-live".into(),
             agent_id: "a_hugo".into(),
             project: "default".into(),
@@ -3140,6 +3155,8 @@ mod messages {
             provenance: Provenance {
                 from: "erin".into(),
                 kind: Kind::Human,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,

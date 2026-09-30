@@ -86,6 +86,9 @@ impl IdentityPort for MockIdentity {
             name: name.to_string(),
             project: project.to_string(),
             tier: Tier::Agent,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         })
     }
 
@@ -121,12 +124,18 @@ fn caller(name: &str, session: &str) -> Caller {
         name: name.into(),
         project: PROJECT.into(),
         tier: Tier::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 
 fn admin_caller(name: &str, session: &str) -> Caller {
     Caller {
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
         ..caller(name, session)
     }
 }
@@ -315,7 +324,14 @@ async fn thread_new_emits_one_creator_bound_thread_create_action() {
     assert_eq!(data["action"], "thread.create");
     assert_eq!(data["event"], serde_json::Value::Null);
     assert_ne!(data["action"], "thread.added");
-    assert_eq!(data["members"], serde_json::json!(["ben", "human"]));
+    let mut members = data["members"]
+        .as_array()
+        .expect("thread.create members array")
+        .iter()
+        .map(|member| member.as_str().expect("member name"))
+        .collect::<Vec<_>>();
+    members.sort_unstable();
+    assert_eq!(members, vec!["ben", "human"]);
     assert_eq!(realtime.enqueues.load(Ordering::SeqCst), 0);
 }
 

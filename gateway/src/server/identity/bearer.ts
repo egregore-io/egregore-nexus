@@ -1,13 +1,14 @@
 import { createHash, randomBytes } from "node:crypto";
 
 import type { Client } from "@libsql/client";
-import { Kind, Tier } from "@shared/types";
+import { Kind, Locality, Tier } from "@shared/types";
 import type {
   GatewayCallerIdentity,
   PrincipalScope,
 } from "@server/api/http";
 import { principalHasScope } from "@server/auth/principal";
 import { localOperatorCaller } from "@server/auth/webAuthMode";
+import { dottedEntityKind, parseEntityKind } from "@server/identity/entityKind";
 
 const ACCESS_PREFIX = "nx_at";
 const REFRESH_PREFIX = "nx_rt";
@@ -109,7 +110,10 @@ export async function issueBearerToken(
       familyId,
       input.actor.name,
       input.actor.project,
-      input.actor.kind ?? Kind.Human,
+      dottedEntityKind(
+        input.actor.locality ?? Locality.Local,
+        input.actor.kind ?? Kind.Human,
+      ),
       tier,
       input.actor.sessionId ?? null,
       input.actor.agentId ?? null,
@@ -208,6 +212,7 @@ export async function refreshBearerToken(
   const tokenId = `bt_${newId(deps)}`;
   const scopes = parseScopes(row.scopes_json);
   const expiresAt = now + DEFAULT_ACCESS_TTL_MS;
+  const actorEntityKind = parseEntityKind(row.actor_kind);
 
   await deps.db.execute({
     sql: `INSERT INTO rest_bearer_token
@@ -221,7 +226,7 @@ export async function refreshBearerToken(
       row.family_id,
       row.actor_name,
       row.actor_project,
-      row.actor_kind,
+      dottedEntityKind(actorEntityKind.locality, actorEntityKind.kind),
       row.actor_tier,
       row.actor_session_id,
       row.actor_agent_id,
@@ -305,11 +310,13 @@ async function revokeFamily(db: Client, familyId: string, now: number): Promise<
 }
 
 function rowToPrincipal(row: TokenRow): GatewayCallerIdentity {
+  const entityKind = parseEntityKind(row.actor_kind);
   return {
     id: `bearer:${row.token_id}`,
     name: row.actor_name,
     project: row.actor_project,
-    kind: parseKind(row.actor_kind),
+    kind: entityKind.kind,
+    locality: entityKind.locality,
     tier: parseTier(row.actor_tier),
     credentialFacet: "machine",
     scopes: parseScopes(row.scopes_json),
@@ -335,12 +342,6 @@ function parseScopes(raw: string): PrincipalScope[] {
   } catch {
     return [];
   }
-}
-
-function parseKind(value: string): Kind {
-  return value === Kind.Agent || value === Kind.App || value === Kind.Notification
-    ? value
-    : Kind.Human;
 }
 
 function parseTier(value: string): Tier {

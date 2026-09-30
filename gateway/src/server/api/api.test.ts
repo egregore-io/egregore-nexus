@@ -29,11 +29,12 @@ import {
 import { seedDb } from "@drizzle/__mocks__/seedDb";
 import type { ReadDb } from "@drizzle/client";
 import { COMMAND_KINDS } from "@server/command/ingress";
+import { HOOK_EVENTS } from "@server/hooks/events";
 import {
   createHumanReadDeliveryMarker,
   type HumanReadDeliveryMarker,
 } from "@server/delivery/humanRead";
-import { Kind, Tier } from "@shared/types";
+import { Kind, Locality, Tier } from "@shared/types";
 
 const API_KEY = "test-secret-key";
 const NOTIFY_HMAC_SECRET = "notify-test-secret";
@@ -751,6 +752,9 @@ describe("public API — reads go to the read-view (NOT the daemon)", () => {
           name: "erin",
           project: "nexus",
           kind: Kind.Human,
+          locality: Locality.External,
+          access: "guest",
+          principalId: "x_erin",
           tier: Tier.Admin,
           sessionId: "s_erin_browser",
           agentId: "a_erin_browser",
@@ -764,6 +768,10 @@ describe("public API — reads go to the read-view (NOT the daemon)", () => {
       name: "erin",
       agentId: "a_erin_browser",
       kind: "human",
+      locality: "external",
+      entityKind: "external.human",
+      access: "guest",
+      principalId: "x_erin",
       tier: "admin",
       project: "nexus",
       presence: "online",
@@ -1400,9 +1408,7 @@ describe("public API — reads go to the read-view (NOT the daemon)", () => {
       agent: {
         agentId: "a_ben",
         name: "ben",
-        project: "nexus",
         defaultHarness: "claude",
-        role: "admin",
         tier: "agent",
         disabled: false,
         activeRuntime: {
@@ -1708,7 +1714,7 @@ describe("public API — EXTENDED surface dispatches to command ingress", () => 
       req({
         method: "POST",
         path: "/api/v1/agents",
-        body: { kind: "claude", name: "worker-1", role: "agent" },
+        body: { kind: "claude", name: "worker-1" },
       }),
       deps(undefined, commands),
     );
@@ -1716,7 +1722,7 @@ describe("public API — EXTENDED surface dispatches to command ingress", () => 
     expect(commands.calls).toEqual([
       {
         kind: COMMAND_KINDS.adminSpawn,
-        req: { kind: "claude", name: "worker-1", role: "agent" },
+        req: { kind: "claude", name: "worker-1" },
         caller: API_CALLER,
       },
     ]);
@@ -1920,26 +1926,22 @@ describe("public API — EXTENDED surface dispatches to command ingress", () => 
     ]);
   });
 
-  it("POST /api/v1/agents/:id/project → admin.assignProject with path-param name + body project", async () => {
+  it.each(["project", "role"])(
+    "does not expose the Lens-owned agent %s affordance as a command route",
+    async (field) => {
     const commands = makeCommandSpy();
     const res = await handle(
       req({
         method: "POST",
-        path: "/api/v1/agents/ben/project",
-        body: { project: "lens" },
+        path: `/api/v1/agents/ben/${field}`,
+        body: { [field]: "lens" },
       }),
       deps(undefined, commands),
     );
-    expect(res.status).toBe(200);
-    expect(commands.calls).toEqual([
-      {
-        kind: COMMAND_KINDS.adminAssignProject,
-        req: { name: "ben", project: "lens" },
-        caller: API_CALLER,
-      },
-    ]);
-    expect(res.body).toMatchObject({ name: "ben", project: "lens" });
-  });
+    expect(res.status).toBe(404);
+    expect(commands.calls).toEqual([]);
+    },
+  );
 
   it("POST /api/v1/agents/:id/tier → admin.grantTier with path-param name + body tier", async () => {
     const commands = makeCommandSpy();
@@ -2035,14 +2037,6 @@ describe("public API — EXTENDED surface dispatches to command ingress", () => 
     await handle(
       req({
         method: "POST",
-        path: "/api/v1/agents/a_ben/project",
-        body: { project: "lens" },
-      }),
-      deps(undefined, commands),
-    );
-    await handle(
-      req({
-        method: "POST",
         path: "/api/v1/agents/a_ben/tier",
         body: { tier: Tier.Admin },
       }),
@@ -2077,11 +2071,6 @@ describe("public API — EXTENDED surface dispatches to command ingress", () => 
       {
         kind: COMMAND_KINDS.adminRemove,
         req: { name: "a_ben", agentId: "a_ben", kill: true },
-        caller: API_CALLER,
-      },
-      {
-        kind: COMMAND_KINDS.adminAssignProject,
-        req: { name: "a_ben", agentId: "a_ben", project: "lens" },
         caller: API_CALLER,
       },
       {
@@ -2274,6 +2263,20 @@ describe("public API — EXTENDED surface dispatches to command ingress", () => 
     expect(capabilities.status).toBe(200);
     expect(capabilities.body).toMatchObject({
       version: 1,
+      protocol: {
+        gateway: "0.1.6",
+        surfaces: {
+          eventsLane: { version: 1, replay: "afterSeq-ring" },
+          sessionLane: { version: 1, replay: "cursor" },
+          threadDmRead: { version: 1, replay: "durable-cursor" },
+          notify: { version: 1, idempotency: true },
+          hooks: {
+            version: 1,
+            events: [...HOOK_EVENTS],
+          },
+          transports: { version: 1, providers: [] },
+        },
+      },
       routes: expect.arrayContaining([
         expect.objectContaining({ method: "GET", path: "/api/v1/health", auth: false, read: "health" }),
         expect.objectContaining({ method: "GET", path: "/api/v1/search", read: "search.messages" }),

@@ -67,7 +67,7 @@ async fn launch_discovers_rollout_binds_transport_and_forwards_notifications() {
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: None,
@@ -148,7 +148,7 @@ async fn fresh_launch_can_create_and_bind_an_injectable_thread_immediately() {
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: Some(session_dir.clone()),
@@ -188,7 +188,7 @@ async fn launch_reports_discovered_thread_id_for_persistence() {
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: None,
@@ -241,7 +241,7 @@ async fn launch_with_known_thread_rebinds_existing_bound_session_when_thread_dif
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: None,
@@ -271,7 +271,7 @@ async fn launch_with_known_thread_rebinds_existing_bound_session_when_thread_dif
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: None,
@@ -291,15 +291,11 @@ async fn launch_with_known_thread_rebinds_existing_bound_session_when_thread_dif
         "same app-server socket is reused"
     );
 
-    let rebind_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-    while transport.bound_thread_id(&session).as_deref() != Some("thread-two") {
-        assert!(
-            tokio::time::Instant::now() < rebind_deadline,
-            "existing live bridge stayed bound to {:?}",
-            transport.bound_thread_id(&session)
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    assert_eq!(
+        transport.bound_thread_id(&session).as_deref(),
+        Some("thread-two"),
+        "known-thread launch must not return before rebinding an existing live bridge"
+    );
 
     assert!(bridge.kill(&session));
     let _ = std::fs::remove_dir_all(&session_dir);
@@ -321,7 +317,7 @@ async fn launch_with_known_thread_id_binds_from_existing_codex_home() {
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: None,
@@ -347,6 +343,48 @@ async fn launch_with_known_thread_id_binds_from_existing_codex_home() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+
+    assert!(bridge.kill(&session));
+    let _ = std::fs::remove_dir_all(&session_dir);
+    let _ = std::fs::remove_dir_all(&external_session_dir);
+}
+
+#[tokio::test]
+async fn launch_with_known_thread_returns_only_after_transport_binding() {
+    let session_dir = tempdir("known-thread-ready");
+    let external_session_dir = tempdir("known-thread-ready-source");
+    let external_codex_home = external_session_dir.join("codex-home");
+    write_rollout(&external_session_dir, "known-thread-ready");
+    let bridge = CodexBridge::new();
+    let session = SessionId("test-codex-known-thread-ready".into());
+
+    let _sock_path = bridge
+        .launch_with_options(
+            session.clone(),
+            SupervisorOpts {
+                codex_exe: FAKE_BIN.to_string(),
+                session_dir: session_dir.clone(),
+                codex_home: Some(session_dir.join("codex-home")),
+                model: None,
+                bus_mcp: None,
+                cwd: None,
+                env: vec![("FAKE_CODEX_RESUME_DELAY_MS".into(), "250".into())],
+            },
+            Arc::new(RecSink::default()) as Arc<dyn EventSink>,
+            BridgeLaunchOptions {
+                known_thread_id: Some("known-thread-ready".to_string()),
+                resume_codex_homes: vec![external_codex_home],
+                ..BridgeLaunchOptions::default()
+            },
+        )
+        .await
+        .expect("known-thread launch should bind before returning");
+
+    assert_eq!(
+        bridge.transport().bound_thread_id(&session).as_deref(),
+        Some("known-thread-ready"),
+        "known-thread launch returned before publishing the exact transport binding"
+    );
 
     assert!(bridge.kill(&session));
     let _ = std::fs::remove_dir_all(&session_dir);

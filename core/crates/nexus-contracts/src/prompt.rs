@@ -205,6 +205,8 @@ pub struct CommandQueueTransition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub caller_agent_id: Option<AgentId>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_principal_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub caller_kind: Option<String>,
     pub state: CommandQueueState,
     pub mode: String,

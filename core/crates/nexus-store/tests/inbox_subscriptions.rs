@@ -67,6 +67,8 @@ fn message() -> Message {
         provenance: Provenance {
             from: "ben".into(),
             kind: Kind::Agent,
+            locality: Default::default(),
+            access: None,
             thread: None,
             topic: None,
             stamp: None,

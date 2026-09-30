@@ -14,6 +14,7 @@ fn pending(command_id: &str) -> NewCommandIntent {
         caller_agent_id: Some("a_casey".into()),
         caller_runtime_id: Some("r_casey".into()),
         caller_client_key: Some("client-casey".into()),
+        caller_principal_id: None,
         caller_kind: Some("agent".into()),
         caller_tier: Some("agent".into()),
         idempotency_key: None,

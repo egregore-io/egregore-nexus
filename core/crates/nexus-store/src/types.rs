@@ -10,6 +10,7 @@
 
 use nexus_common::{NexusError, RuntimeProcessIds};
 use nexus_contracts::ids::SessionId;
+use nexus_contracts::{entity_kind, Kind, Locality};
 
 /// A row of the `sessions` table — the daemon-internal identity record. Wire-facing identity
 /// DTOs (`RegisterResponse`, `Whoami`, member lists) are assembled from this by `nexus-identity`.
@@ -64,6 +65,37 @@ pub struct AgentRow {
 }
 
 impl SessionRow {
+    /// Parsed parallel locality and closed nature from the canonical-or-legacy stored token.
+    pub fn entity_kind(&self) -> Result<(Locality, Kind), NexusError> {
+        entity_kind::parse(&self.kind).ok_or_else(|| {
+            NexusError::Invalid(format!("unknown stored session kind {:?}", self.kind))
+        })
+    }
+
+    pub fn is_agent(&self) -> bool {
+        matches!(self.entity_kind(), Ok((_, Kind::Agent)))
+    }
+
+    pub fn is_human(&self) -> bool {
+        matches!(self.entity_kind(), Ok((_, Kind::Human)))
+    }
+
+    /// Provider/policy access label carried in the existing session metadata object.
+    pub fn access(&self) -> Result<Option<String>, NexusError> {
+        let Some(raw) = self.metadata_json.as_deref() else {
+            return Ok(None);
+        };
+        let metadata: serde_json::Value = serde_json::from_str(raw)
+            .map_err(|error| NexusError::Invalid(format!("invalid session metadata: {error}")))?;
+        match metadata.get("access") {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(access)) => Ok(Some(access.clone())),
+            Some(_) => Err(NexusError::Invalid(
+                "session metadata access must be a string".into(),
+            )),
+        }
+    }
+
     pub fn display_name(&self) -> String {
         self.name
             .clone()
@@ -145,13 +177,14 @@ impl AgentRuntimeRow {
     }
 }
 
-/// Durable ownership binding between a harness-native conversation/session id and a Nexus agent.
+/// Durable ownership binding between a provider-native conversation/session id and a Nexus agent.
 ///
 /// Runtime rows can be stopped, deleted, or replaced. This row answers the separate identity
 /// question: "which stable agent owns this native conversation?"
 #[derive(Debug, Clone, PartialEq)]
 pub struct NativeThreadBindingRow {
-    pub harness: String,
+    pub provider: String,
+    pub kind: String,
     pub native_thread_id: String,
     pub agent_id: String,
     pub project: String,

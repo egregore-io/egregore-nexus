@@ -45,7 +45,10 @@ struct Inner {
     accepted_events: HashMap<String, VecDeque<AcceptedEvent>>,
     accepted_user_input_echo_queue: HashMap<String, VecDeque<PendingAcceptedUserInputEcho>>,
     accepted_user_input_echoes: HashMap<String, VecDeque<AcceptedUserInputEcho>>,
-    accepted_input_receipt_waiters: HashMap<AcceptedInputKey, Vec<oneshot::Sender<()>>>,
+    cancelled_user_input_echo_queue: HashMap<String, VecDeque<String>>,
+    cancelled_user_input_echoes: HashMap<String, VecDeque<AcceptedUserInputEcho>>,
+    next_accepted_input_receipt_waiter_id: u64,
+    accepted_input_receipt_waiters: HashMap<AcceptedInputKey, Vec<AcceptedInputReceiptWaiter>>,
     accepted_input_receipts: HashMap<AcceptedInputKey, ()>,
     accepted_input_receipt_order: VecDeque<AcceptedInputKey>,
 }
@@ -54,6 +57,13 @@ struct AcceptedEvent {
     id: u64,
     events: Arc<dyn EventSink>,
     event: WsEvent,
+    boundary: AcceptedEventBoundary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptedEventBoundary {
+    AnyTurnNotification,
+    NativeUserInput,
 }
 
 struct AcceptedUserInputEcho {
@@ -64,6 +74,25 @@ struct AcceptedUserInputEcho {
 struct PendingAcceptedUserInputEcho {
     id: u64,
     text: String,
+}
+
+struct AcceptedInputReceiptWaiter {
+    id: u64,
+    tx: oneshot::Sender<()>,
+}
+
+struct AcceptedInputReceiptRegistration {
+    tracker: CodexTurnTracker,
+    key: AcceptedInputKey,
+    id: u64,
+    rx: oneshot::Receiver<()>,
+}
+
+impl Drop for AcceptedInputReceiptRegistration {
+    fn drop(&mut self) {
+        self.tracker
+            .remove_accepted_input_receipt_waiter(&self.key, self.id);
+    }
 }
 
 /// Shared tracker that lets the app-server transport wait for forwarder-observed turn completion.
@@ -207,6 +236,38 @@ impl CodexTurnTracker {
         events: Arc<dyn EventSink>,
         event: WsEvent,
     ) -> QueuedAcceptedEvent {
+        self.queue_accepted_event_at_boundary(
+            thread_id,
+            events,
+            event,
+            AcceptedEventBoundary::AnyTurnNotification,
+        )
+    }
+
+    /// Queue an accepted event that may publish only when the exact native user-message receipt
+    /// arrives. Restarted Codex threads can replay unrelated turn notifications before a new
+    /// prompt reaches context; those notifications must not claim the prompt's visible echo.
+    pub fn queue_accepted_event_on_native_user_input(
+        &self,
+        thread_id: &str,
+        events: Arc<dyn EventSink>,
+        event: WsEvent,
+    ) -> QueuedAcceptedEvent {
+        self.queue_accepted_event_at_boundary(
+            thread_id,
+            events,
+            event,
+            AcceptedEventBoundary::NativeUserInput,
+        )
+    }
+
+    fn queue_accepted_event_at_boundary(
+        &self,
+        thread_id: &str,
+        events: Arc<dyn EventSink>,
+        event: WsEvent,
+        boundary: AcceptedEventBoundary,
+    ) -> QueuedAcceptedEvent {
         let mut inner = self.inner.lock().unwrap();
         let id = inner.next_accepted_id;
         inner.next_accepted_id += 1;
@@ -214,7 +275,12 @@ impl CodexTurnTracker {
             .accepted_events
             .entry(thread_id.to_string())
             .or_default()
-            .push_back(AcceptedEvent { id, events, event });
+            .push_back(AcceptedEvent {
+                id,
+                events,
+                event,
+                boundary,
+            });
         QueuedAcceptedEvent {
             thread_id: thread_id.to_string(),
             id,
@@ -269,7 +335,11 @@ impl CodexTurnTracker {
         thread_id: &str,
         turn_id: Option<&str>,
     ) -> bool {
-        let Some(accepted) = self.take_accepted_event(thread_id, None) else {
+        let Some(accepted) = self.take_next_accepted_event(
+            thread_id,
+            AcceptedEventBoundary::AnyTurnNotification,
+            None,
+        ) else {
             return false;
         };
         let accepted_text = accepted_user_input_text(&accepted.event).map(str::to_string);
@@ -277,6 +347,24 @@ impl CodexTurnTracker {
         if let (Some(turn_id), Some(text)) = (turn_id, accepted_text) {
             self.record_accepted_user_input_echo(thread_id, turn_id, text);
         }
+        true
+    }
+
+    /// Publish one prompt event only at its exact native user-message boundary.
+    pub async fn emit_native_user_input_accepted_event(
+        &self,
+        thread_id: &str,
+        _turn_id: &str,
+        text: &str,
+    ) -> bool {
+        let Some(accepted) = self.take_next_accepted_event(
+            thread_id,
+            AcceptedEventBoundary::NativeUserInput,
+            Some(text),
+        ) else {
+            return false;
+        };
+        accepted.events.emit(accepted.event).await;
         true
     }
 
@@ -294,6 +382,124 @@ impl CodexTurnTracker {
             .is_some()
     }
 
+    /// Cancel a prompt wait without allowing its late native user-message echo to repaint as
+    /// unowned input. The tombstone is consumed by the exact next native receipt and is bounded
+    /// by the same ceiling as accepted echo markers.
+    pub fn tombstone_cancelled_user_input_echo(
+        &self,
+        queued: &QueuedAcceptedUserInputEcho,
+        turn_id: Option<&str>,
+        text: &str,
+    ) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let mut removed = false;
+
+        if let Some(turn_id) = turn_id {
+            let mut remove_queue = false;
+            if let Some(queue) = inner.accepted_user_input_echoes.get_mut(&queued.thread_id) {
+                if let Some(pos) = queue
+                    .iter()
+                    .position(|echo| echo.turn_id == turn_id && echo.text == text)
+                {
+                    queue.remove(pos);
+                    removed = true;
+                }
+                remove_queue = queue.is_empty();
+            }
+            if remove_queue {
+                inner.accepted_user_input_echoes.remove(&queued.thread_id);
+            }
+        }
+
+        if !removed {
+            let mut remove_queue = false;
+            if let Some(queue) = inner
+                .accepted_user_input_echo_queue
+                .get_mut(&queued.thread_id)
+            {
+                if let Some(pos) = queue.iter().position(|echo| echo.id == queued.id) {
+                    queue.remove(pos);
+                    removed = true;
+                }
+                remove_queue = queue.is_empty();
+            }
+            if remove_queue {
+                inner
+                    .accepted_user_input_echo_queue
+                    .remove(&queued.thread_id);
+            }
+        }
+
+        if !removed {
+            return false;
+        }
+        if let Some(turn_id) = turn_id {
+            let queue = inner
+                .cancelled_user_input_echoes
+                .entry(queued.thread_id.clone())
+                .or_default();
+            queue.push_back(AcceptedUserInputEcho {
+                turn_id: turn_id.to_string(),
+                text: text.to_string(),
+            });
+            while queue.len() > ACCEPTED_ECHO_LIMIT {
+                queue.pop_front();
+            }
+        } else {
+            let queue = inner
+                .cancelled_user_input_echo_queue
+                .entry(queued.thread_id.clone())
+                .or_default();
+            queue.push_back(text.to_string());
+            while queue.len() > ACCEPTED_ECHO_LIMIT {
+                queue.pop_front();
+            }
+        }
+        true
+    }
+
+    /// Consume an exact cancellation tombstone. A match suppresses the late native echo but does
+    /// not publish the cancelled Nexus accepted event or satisfy its dropped waiter.
+    pub fn take_cancelled_user_input_echo(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        text: &str,
+    ) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let mut matched = false;
+        let mut remove_bound_queue = false;
+        if let Some(queue) = inner.cancelled_user_input_echoes.get_mut(thread_id) {
+            if let Some(pos) = queue
+                .iter()
+                .position(|echo| echo.turn_id == turn_id && echo.text == text)
+            {
+                queue.remove(pos);
+                matched = true;
+            }
+            remove_bound_queue = queue.is_empty();
+        }
+        if remove_bound_queue {
+            inner.cancelled_user_input_echoes.remove(thread_id);
+        }
+        if matched {
+            return true;
+        }
+
+        let mut remove_pending_queue = false;
+        if let Some(queue) = inner.cancelled_user_input_echo_queue.get_mut(thread_id) {
+            if let Some(pos) = queue.iter().position(|pending| pending == text) {
+                queue.remove(pos);
+                matched = true;
+            }
+            remove_pending_queue = queue.is_empty();
+        }
+        if remove_pending_queue {
+            inner.cancelled_user_input_echo_queue.remove(thread_id);
+        }
+        matched
+    }
+
     fn take_accepted_event(&self, thread_id: &str, id: Option<u64>) -> Option<AcceptedEvent> {
         let mut inner = self.inner.lock().unwrap();
         let queue = inner.accepted_events.get_mut(thread_id)?;
@@ -308,6 +514,27 @@ impl CodexTurnTracker {
             inner.accepted_events.remove(thread_id);
         }
         accepted
+    }
+
+    fn take_next_accepted_event(
+        &self,
+        thread_id: &str,
+        boundary: AcceptedEventBoundary,
+        text: Option<&str>,
+    ) -> Option<AcceptedEvent> {
+        let mut inner = self.inner.lock().unwrap();
+        let queue = inner.accepted_events.get_mut(thread_id)?;
+        let pos = queue.iter().position(|accepted| {
+            accepted.boundary == boundary
+                && text.is_none_or(|expected| {
+                    accepted_user_input_text(&accepted.event) == Some(expected)
+                })
+        })?;
+        let accepted = queue.remove(pos)?;
+        if queue.is_empty() {
+            inner.accepted_events.remove(thread_id);
+        }
+        Some(accepted)
     }
 
     fn take_queued_user_input_echo(
@@ -346,22 +573,6 @@ impl CodexTurnTracker {
         true
     }
 
-    /// Record the next queued direct-prompt echo marker for the first notification of this turn.
-    ///
-    /// This covers the app-server race where Codex emits turn notifications before the
-    /// `turn/start` response reaches the transport.
-    pub fn record_next_accepted_user_input_echo_for_thread(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-    ) -> bool {
-        let Some(pending) = self.take_queued_user_input_echo(thread_id, None) else {
-            return false;
-        };
-        self.record_accepted_user_input_echo(thread_id, turn_id, pending.text);
-        true
-    }
-
     fn record_accepted_user_input_echo(&self, thread_id: &str, turn_id: &str, text: String) {
         let mut inner = self.inner.lock().unwrap();
         let queue = inner
@@ -377,10 +588,11 @@ impl CodexTurnTracker {
         }
     }
 
-    /// Consume one previously emitted accepted user-input echo for this Codex turn.
+    /// Claim one Nexus-owned user-input echo for this exact native turn and text.
     ///
-    /// Codex app-server may later report the same input as `item/completed userMessage`. Direct
-    /// native TUI input has no matching accepted event, so it still renders normally.
+    /// The turn/start response and native notification may arrive in either order. Match a marker
+    /// already bound by the response first, then an exact-text pending marker. Unrelated resumed
+    /// turn notifications can therefore never steal a newly queued prompt.
     pub fn take_accepted_user_input_echo(
         &self,
         thread_id: &str,
@@ -388,22 +600,37 @@ impl CodexTurnTracker {
         text: &str,
     ) -> bool {
         let mut inner = self.inner.lock().unwrap();
-        let Some(queue) = inner.accepted_user_input_echoes.get_mut(thread_id) else {
-            return false;
-        };
-        let Some(pos) = queue
-            .iter()
-            .position(|echo| echo.turn_id == turn_id && echo.text == text)
-        else {
-            return false;
-        };
-        queue.remove(pos);
-        if queue.is_empty() {
+        let mut matched = false;
+        let mut remove_bound_queue = false;
+        if let Some(queue) = inner.accepted_user_input_echoes.get_mut(thread_id) {
+            if let Some(pos) = queue
+                .iter()
+                .position(|echo| echo.turn_id == turn_id && echo.text == text)
+            {
+                queue.remove(pos);
+                matched = true;
+            }
+            remove_bound_queue = queue.is_empty();
+        }
+        if remove_bound_queue {
             inner.accepted_user_input_echoes.remove(thread_id);
         }
-        drop(inner);
-        self.observe_accepted_user_input_echo(thread_id, turn_id, text);
-        true
+        if matched {
+            return true;
+        }
+
+        let mut remove_pending_queue = false;
+        if let Some(queue) = inner.accepted_user_input_echo_queue.get_mut(thread_id) {
+            if let Some(pos) = queue.iter().position(|echo| echo.text == text) {
+                queue.remove(pos);
+                matched = true;
+            }
+            remove_pending_queue = queue.is_empty();
+        }
+        if remove_pending_queue {
+            inner.accepted_user_input_echo_queue.remove(thread_id);
+        }
+        matched
     }
 
     /// Record the exact native `item/completed userMessage` echo for one Nexus-accepted input.
@@ -431,7 +658,20 @@ impl CodexTurnTracker {
             }
         };
         for waiter in waiters {
-            let _ = waiter.send(());
+            let _ = waiter.tx.send(());
+        }
+    }
+
+    fn remove_accepted_input_receipt_waiter(&self, key: &AcceptedInputKey, id: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        let remove_key = if let Some(waiters) = inner.accepted_input_receipt_waiters.get_mut(key) {
+            waiters.retain(|waiter| waiter.id != id);
+            waiters.is_empty()
+        } else {
+            false
+        };
+        if remove_key {
+            inner.accepted_input_receipt_waiters.remove(key);
         }
     }
 
@@ -447,37 +687,37 @@ impl CodexTurnTracker {
         timeout: Duration,
     ) -> Result<(), CodexTurnWaitError> {
         let key = (thread_id.to_string(), turn_id.to_string(), text.to_string());
-        let rx = {
+        let registration = {
             let mut inner = self.inner.lock().unwrap();
             if inner.accepted_input_receipts.remove(&key).is_some() {
                 inner.accepted_input_receipt_order.retain(|row| row != &key);
                 return Ok(());
             }
             let (tx, rx) = oneshot::channel();
+            let id = inner.next_accepted_input_receipt_waiter_id;
+            inner.next_accepted_input_receipt_waiter_id =
+                inner.next_accepted_input_receipt_waiter_id.wrapping_add(1);
             inner
                 .accepted_input_receipt_waiters
                 .entry(key.clone())
                 .or_default()
-                .push(tx);
-            rx
-        };
-
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(())) | Ok(Err(_)) => Ok(()),
-            Err(_elapsed) => {
-                let mut inner = self.inner.lock().unwrap();
-                if let Some(waiters) = inner.accepted_input_receipt_waiters.get_mut(&key) {
-                    waiters.retain(|tx| !tx.is_closed());
-                    if waiters.is_empty() {
-                        inner.accepted_input_receipt_waiters.remove(&key);
-                    }
-                }
-                Err(CodexTurnWaitError::Timeout {
-                    thread_id: thread_id.to_string(),
-                    turn_id: turn_id.to_string(),
-                    timeout,
-                })
+                .push(AcceptedInputReceiptWaiter { id, tx });
+            AcceptedInputReceiptRegistration {
+                tracker: self.clone(),
+                key,
+                id,
+                rx,
             }
+        };
+        let mut registration = registration;
+
+        match tokio::time::timeout(timeout, &mut registration.rx).await {
+            Ok(Ok(())) | Ok(Err(_)) => Ok(()),
+            Err(_elapsed) => Err(CodexTurnWaitError::Timeout {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                timeout,
+            }),
         }
     }
 

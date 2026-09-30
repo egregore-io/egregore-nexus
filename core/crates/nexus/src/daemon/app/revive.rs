@@ -181,7 +181,7 @@ impl AppState {
 
         let mut torn_down = 0;
         for row in rows {
-            if row.kind != kind_token(Kind::Agent) || row.transport.is_none() {
+            if !row.is_agent() || row.transport.is_none() {
                 continue;
             }
             self.teardown_harness_row(&row).await;
@@ -253,7 +253,7 @@ impl AppState {
         let project = row.project.clone();
         let client_key = row.client_key.clone().unwrap_or_else(|| session.0.clone());
 
-        if row.kind != "agent" {
+        if !row.is_agent() {
             return Ok(session);
         }
         let requested_thread_id = requested_thread_id.map(str::to_string);
@@ -274,6 +274,10 @@ impl AppState {
         let Some(supervisor) = self.pty.clone() else {
             return Ok(session);
         };
+        // Boot adoption and durable prompt recovery can both discover the same dead structured
+        // runtime. Collapse them into one revive, then re-check the final transport binding while
+        // still holding the shared gate.
+        let _revive = self.runtime_revive_gate.acquire(&session).await;
         let transport = supervisor.codex_transport();
         if transport.is_bound(&session) {
             let bound_thread_id = transport.bound_thread_id(&session);
@@ -380,17 +384,13 @@ impl AppState {
                 message: format!("codex app-server respawn failed: {e}"),
             })?;
 
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while transport.bound_thread_id(&session).as_deref() != Some(thread_id.as_str()) {
-            if tokio::time::Instant::now() >= deadline {
-                return Err(nexus_contracts::ContractError {
-                    code: -32004,
-                    message: format!(
-                        "timed out rebinding codex app-server session {session} to thread {thread_id}"
-                    ),
-                });
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if transport.bound_thread_id(&session).as_deref() != Some(thread_id.as_str()) {
+            return Err(nexus_contracts::ContractError {
+                code: -32004,
+                message: format!(
+                    "codex app-server respawn returned without binding session {session} to thread {thread_id}"
+                ),
+            });
         }
 
         self.finish_codex_appserver_resume(&name, &session, &project, row.paused)
@@ -445,7 +445,7 @@ impl AppState {
         let project = row.project.clone();
         let client_key = row.client_key.clone().unwrap_or_else(|| session.0.clone());
 
-        if row.kind != "agent" {
+        if !row.is_agent() {
             return Ok(session);
         }
         let Some(supervisor) = self.pty.clone() else {
@@ -580,7 +580,7 @@ impl AppState {
         let client_key = row.client_key.clone().unwrap_or_else(|| session.0.clone());
 
         // Only AGENTS have a harness to revive — a DM/whatever can target an operator/app member.
-        if row.kind != "agent" {
+        if !row.is_agent() {
             return Ok(session);
         }
         if row.agent.as_deref() == Some("codex")

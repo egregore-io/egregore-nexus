@@ -21,7 +21,8 @@ use nexus_dispatch::{
 };
 use nexus_harness_codex::app_server::spawn_codex_forwarder;
 use nexus_harness_codex::{
-    AutoApprove, CodexAppServer, CodexAppServerClient, CodexAppServerTransport, SupervisorOpts,
+    AutoApprove, CodexAppServer, CodexAppServerClient, CodexAppServerTransport, CodexTurnTracker,
+    SupervisorOpts,
 };
 use nexus_store::repos::Messages;
 use nexus_store::Store;
@@ -84,12 +85,55 @@ fn batch() -> NexusBatch {
 }
 
 #[tokio::test]
+async fn cancelled_native_receipt_waits_unregister_before_late_receipts() {
+    let tracker = CodexTurnTracker::default();
+    let mut keys = Vec::new();
+
+    for index in 0..32 {
+        let thread_id = format!("thread-cancel-{index}");
+        let turn_id = format!("turn-cancel-{index}");
+        let text = format!("unique cancelled prompt {index}");
+        let mut wait = Box::pin(tracker.wait_for_accepted_user_input_echo(
+            &thread_id,
+            &turn_id,
+            &text,
+            Duration::from_secs(60),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut wait)
+                .await
+                .is_err(),
+            "receipt wait must be registered and pending before cancellation"
+        );
+        drop(wait);
+
+        tracker.observe_accepted_user_input_echo(&thread_id, &turn_id, &text);
+        keys.push((thread_id, turn_id, text));
+    }
+
+    for (thread_id, turn_id, text) in keys {
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tracker.wait_for_accepted_user_input_echo(
+                &thread_id,
+                &turn_id,
+                &text,
+                Duration::from_millis(25),
+            ),
+        )
+        .await
+        .expect("late receipt lookup must remain bounded")
+        .expect("late receipt must be buffered after the cancelled waiter unregisters");
+    }
+}
+
+#[tokio::test]
 async fn inject_turn_waits_for_forwarded_turn_completion() {
     let dir = tempdir("inject-waits");
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,
@@ -155,7 +199,7 @@ async fn inject_turn_settles_after_model_progress_while_the_turn_remains_active(
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,
@@ -209,7 +253,7 @@ async fn observed_inject_emits_user_input_before_codex_stream_that_precedes_resp
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,
@@ -321,7 +365,7 @@ async fn observed_inject_suppresses_matching_codex_user_message_echo() {
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,
@@ -429,7 +473,7 @@ async fn observed_inject_final_usage_limit_returns_provider_limit() {
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,
@@ -510,7 +554,7 @@ async fn accepted_then_final_usage_limit_settles_store_error_without_delivery() 
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,
@@ -557,6 +601,8 @@ async fn accepted_then_final_usage_limit_settles_store_error_without_delivery() 
             provenance: Provenance {
                 from: "alex".into(),
                 kind: Kind::Human,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,
@@ -708,7 +754,7 @@ async fn observed_inject_retrying_usage_limit_waits_for_later_terminal_completio
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,
@@ -813,7 +859,7 @@ async fn observed_prompt_emits_initial_prompt_before_codex_stream_and_suppresses
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,
@@ -908,12 +954,123 @@ async fn observed_prompt_emits_initial_prompt_before_codex_stream_and_suppresses
 }
 
 #[tokio::test]
+async fn observed_prompt_requires_native_user_message_receipt_before_success() {
+    let dir = tempdir("observed-prompt-native-receipt");
+    let script = serde_json::to_string(&serde_json::json!([
+        {
+            "method": "turn/started",
+            "params": {
+                "threadId": "THREAD_ID",
+                "turn": {"id": "t1"}
+            }
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "THREAD_ID",
+                "turnId": "t1",
+                "item": {
+                    "type": "userMessage",
+                    "id": "um1",
+                    "content": [{"type": "text", "text": "must reach native context"}]
+                }
+            }
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "THREAD_ID",
+                "turn": {"id": "t1"}
+            }
+        }
+    ]))
+    .expect("script serializes");
+    let srv = CodexAppServer::start(SupervisorOpts {
+        codex_exe: FAKE_BIN.to_string(),
+        session_dir: dir.clone(),
+        codex_home: Some(dir.join("codex-home")),
+        model: None,
+        bus_mcp: None,
+        cwd: None,
+        env: vec![
+            ("FAKE_CODEX_SCRIPT".into(), script),
+            ("FAKE_CODEX_REPLY_BEFORE_NOTIFICATIONS".into(), "1".into()),
+            ("FAKE_CODEX_NOTIFICATION_DELAY_MS".into(), "400".into()),
+        ],
+    })
+    .await
+    .expect("fake app-server should start");
+
+    let client = Arc::new(
+        CodexAppServerClient::connect(srv.socket(), "nexus")
+            .await
+            .expect("nexus client should connect"),
+    );
+    let thread = client
+        .thread_start()
+        .await
+        .expect("thread_start should succeed");
+
+    let session = SessionId("s_codex_observed_prompt_native_receipt".into());
+    let transport = CodexAppServerTransport::new();
+    transport.bind(session.clone(), client.clone(), thread);
+    let sink = Arc::new(RecSink::default());
+    let forwarder = spawn_codex_forwarder(
+        session.clone(),
+        client,
+        sink.clone(),
+        Arc::new(AutoApprove),
+        transport.turn_tracker(),
+    );
+
+    let accepted_event = WsEvent::AgentUpdate {
+        session_id: session.clone(),
+        kind: AgentUpdateKind::UserInput,
+        data: serde_json::json!({
+            "text": "must reach native context",
+            "source": "session_prompt",
+            "clientMessageId": "cm-native-receipt",
+        }),
+    };
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(250),
+        transport.prompt_observed(
+            &session,
+            "must reach native context".to_string(),
+            sink.clone(),
+            accepted_event,
+        ),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "turn/start acknowledgement without item/completed userMessage must not complete an observed prompt"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        sink.0.lock().await.iter().all(|event| !matches!(
+            event,
+            WsEvent::AgentUpdate {
+                kind: AgentUpdateKind::UserInput,
+                ..
+            }
+        )),
+        "a native receipt arriving after prompt cancellation must not publish stale user input"
+    );
+
+    forwarder.abort();
+    srv.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn prompt_returns_after_acceptance_and_holds_boundary_until_turn_completion() {
     let dir = tempdir("prompt-accepted");
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,
@@ -1015,7 +1172,7 @@ async fn direct_prompt_suppresses_matching_codex_user_message_echo() {
     let srv = CodexAppServer::start(SupervisorOpts {
         codex_exe: FAKE_BIN.to_string(),
         session_dir: dir.clone(),
-        codex_home: None,
+        codex_home: Some(dir.join("codex-home")),
         model: None,
         bus_mcp: None,
         cwd: None,

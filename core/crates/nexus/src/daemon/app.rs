@@ -114,6 +114,8 @@ use crate::harness_registry::harness_registry_by_id;
 const PENDING_RESPAWN_BASE_BACKOFF_MS: i64 = 30_000;
 const PENDING_RESPAWN_MAX_BACKOFF_MS: i64 = 5 * 60_000;
 const PENDING_RESPAWN_TOMBSTONE_FAILURES: u32 = 3;
+pub(crate) const PROMPT_DEFERRED_FOR_SHUTDOWN: &str =
+    "daemon shutdown won before harness prompt acceptance; retry on next boot";
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +255,10 @@ pub struct AppState {
     /// persistent identity capsule is still being materialized.
     runtime_identity_ready: Arc<AtomicBool>,
     runtime_identity_ready_notify: Arc<Notify>,
+    /// One-way fence for graceful daemon shutdown. Once raised, command lanes finish only the
+    /// dispatch boundary they already own and refuse every later claim; newly accepted rows remain
+    /// pending for the next daemon instead of becoming ambiguous during transport teardown.
+    command_worker_shutting_down: Arc<AtomicBool>,
     /// The concrete agent service (present only on the [`AppState::wire`] path). The daemon's launch
     /// orchestration calls [`nexus_agent::Agent::open_session_for`] on it to bind the adapter under a
     /// daemon-chosen session id. `None` on the mock-port [`AppState::new`] seam → launch falls back
@@ -322,9 +328,49 @@ impl AppState {
             runtime_revive_gate: RuntimeReviveGate::default(),
             runtime_identity_ready: Arc::new(AtomicBool::new(true)),
             runtime_identity_ready_notify: Arc::new(Notify::new()),
+            command_worker_shutting_down: Arc::new(AtomicBool::new(false)),
             agent_concrete: None,
             pty: None,
         }
+    }
+
+    pub(crate) async fn begin_command_worker_shutdown(&self) {
+        let _ingress_and_claim_fence = self.store.write_lock().lock_owned().await;
+        self.command_worker_shutting_down
+            .store(true, Ordering::Release);
+        self.store.notify_command_intent_inserted();
+    }
+
+    pub(crate) fn command_worker_is_shutting_down(&self) -> bool {
+        self.command_worker_shutting_down.load(Ordering::Acquire)
+    }
+
+    /// Linearize permission to enter the external prompt-acceptance boundary against shutdown.
+    ///
+    /// If shutdown owns the write fence first, the command worker receives a precise internal
+    /// signal and returns the still-unaccepted claim to `pending`. If the prompt owns the fence
+    /// first, its tracked session actor owns the handshake and the ordinary graceful drain waits
+    /// for it. The global store fence is released before external I/O so one slow provider cannot
+    /// block unrelated ingress or command claims.
+    pub(crate) async fn prompt_observed_before_shutdown(
+        &self,
+        session: &SessionId,
+        text: String,
+        events: Arc<dyn EventSink>,
+        accepted_event: WsEvent,
+    ) -> Result<(), ContractError> {
+        {
+            let _acceptance_permit = self.store.write_lock().lock_owned().await;
+            if self.command_worker_is_shutting_down() {
+                return Err(ContractError {
+                    code: nexus_contracts::codes::INTERNAL_ERROR,
+                    message: PROMPT_DEFERRED_FOR_SHUTDOWN.into(),
+                });
+            }
+        }
+        self.agent
+            .prompt_observed(session, text, events, accepted_event)
+            .await
     }
 
     /// Heartbeat freshness window used by daemon-side stale-session reapers.

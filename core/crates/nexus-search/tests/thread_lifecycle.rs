@@ -59,6 +59,9 @@ fn caller(name: &str) -> Caller {
         name: name.to_string(),
         project: "p_demo".to_string(),
         tier: Tier::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 
@@ -76,6 +79,8 @@ async fn insert_thread_msg(store: &Store, id: &str, thread_id: &str, body: &str)
             provenance: Provenance {
                 from: "ben".to_string(),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
                 thread: Some("backend".to_string()),
                 topic: None,
                 stamp: None,

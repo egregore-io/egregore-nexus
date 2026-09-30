@@ -31,6 +31,8 @@ fn reg(name: &str, client_key: &str) -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Agent,
         kind: Some(Kind::Agent),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }

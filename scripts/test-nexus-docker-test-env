@@ -38,6 +38,7 @@ for default in 6 8g 1024 4551; do
 done
 grep -Fq 'binutils' "$SCRIPT_DIR/../tools/docker/nexus-test.Dockerfile"
 NPM_CONFIG_CACHE="$TMP/npm-cache" "$SCRIPT_DIR/test-nexus-v015-scoped-registry"
+"$SCRIPT_DIR/test-nexus-v015-stage-harnesses"
 
 # Preserve standalone topology and read-only host credential mounts.
 for token in \
@@ -48,7 +49,8 @@ for token in \
   'NEXUS_GATEWAY_DB=file:/tmp/nexus-home/gateway.db' \
   'NEXUS_STREAM_DB_PATH=/dev/shm/nexus-stream.db' \
   'NEXUS_GATEWAY_BIN=/work/egregore-nexus/gateway/scripts/nexus-gateway.mjs' \
-  'add_mount_if_dir run_args "$HOME/.codex" /host-auth/.codex ro'; do
+  'add_mount_if_dir run_args "$HOST_CODEX_HOME" /host-auth/.codex ro' \
+  '*/codex-sessions/*/codex-home' 'HOST_CODEX_HOME=$HOME/.codex'; do
   grep -Fq -- "$token" "$TARGET"
 done
 if grep -Eq '/work/(egregore-lens|egregore-v2|pactree)|/tmp/nexus-lab-bin|NEXUS_V015_RUN_ID' "$TARGET"; then
@@ -220,9 +222,10 @@ DOCKER_FAKE_RUNNING=true DOCKER_FAKE_LOG="$TMP/nexus-args.log" \
   "$TARGET" nexus -- members --include-offline
 grep -Fq "$id /tmp/nexus-target/debug/nexus members --include-offline" "$TMP/nexus-args.log"
 
-# Exercise historical normal creation and read-only credential mounts without executing
+# Exercise normal creation and machine credential selection without executing
 # any setup payload: the first mocked Docker exec deliberately stops the run.
-mkdir -p "$TMP/create-bin" "$TMP/home/.codex"
+mkdir -p "$TMP/create-bin" "$TMP/home/.codex" "$TMP/machine-codex" \
+  "$TMP/home/.nexus/codex-sessions/example/codex-home"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'printf "%s\n" "$*" >>"$DOCKER_FAKE_LOG"' \
@@ -235,8 +238,12 @@ printf '%s\n' \
   '  *) exit 97 ;;' \
   'esac' >"$TMP/create-bin/docker"
 chmod +x "$TMP/create-bin/docker"
-for credential in unset; do
-  codex_home=""; expected="$TMP/home/.codex"
+for credential in machine legacy unset; do
+  case "$credential" in
+    machine) codex_home="$TMP/machine-codex"; expected="$codex_home" ;;
+    legacy) codex_home="$TMP/home/.nexus/codex-sessions/example/codex-home"; expected="$TMP/home/.codex" ;;
+    unset) codex_home=""; expected="$TMP/home/.codex" ;;
+  esac
   set +e
   HOME="$TMP/home" CODEX_HOME="$codex_home" \
     DOCKER_FAKE_LOG="$TMP/create-$credential.log" \
@@ -256,6 +263,4 @@ for credential in unset; do
 done
 
 bash -n "$TARGET"
-grep -Fq "xvfb" "$SCRIPT_DIR/../tools/docker/nexus-test.Dockerfile"
-grep -Fq "python3-venv" "$SCRIPT_DIR/../tools/docker/nexus-test.Dockerfile"
 echo 'standalone Docker test environment contract: ok'

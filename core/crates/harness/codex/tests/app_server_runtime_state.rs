@@ -68,7 +68,7 @@ async fn bridge_launch_persists_runtime_state_and_rollout_discovery_updates_thre
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: None,
@@ -116,6 +116,49 @@ async fn bridge_launch_persists_runtime_state_and_rollout_discovery_updates_thre
     let _ = std::fs::remove_dir_all(&session_dir);
 }
 
+#[tokio::test]
+async fn bridge_launch_persists_explicit_machine_home_without_session_copy() {
+    let store = store().await;
+    let repo = CodexRuntimeStateRepo::new(&store);
+    let session_dir = tempdir("machine-home");
+    let expected = session_dir.join("operator-codex-home");
+    let bridge = CodexBridge::new();
+    let session = SessionId("s_codex_machine_home".into());
+
+    bridge
+        .launch_with_options(
+            session.clone(),
+            SupervisorOpts {
+                codex_exe: FAKE_BIN.to_string(),
+                session_dir: session_dir.clone(),
+                codex_home: Some(expected.clone()),
+                model: None,
+                bus_mcp: None,
+                cwd: None,
+                env: vec![],
+            },
+            Arc::new(Sink) as Arc<dyn EventSink>,
+            BridgeLaunchOptions {
+                runtime_store: Some(store.clone()),
+                create_thread_if_missing: true,
+                ..BridgeLaunchOptions::default()
+            },
+        )
+        .await
+        .expect("bridge launch");
+
+    let launched = repo
+        .find_by_runtime_id(&session)
+        .await
+        .unwrap()
+        .expect("runtime state");
+    assert_eq!(launched.codex_home, Some(expected));
+    assert!(!session_dir.join("codex-home").exists());
+
+    assert!(bridge.kill(&session));
+    let _ = std::fs::remove_dir_all(&session_dir);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn bridge_adoption_updates_runtime_state_as_adopted_without_owner_pid() {
@@ -132,7 +175,7 @@ async fn bridge_adoption_updates_runtime_state_as_adopted_without_owner_pid() {
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: None,
@@ -153,7 +196,7 @@ async fn bridge_adoption_updates_runtime_state_as_adopted_without_owner_pid() {
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: None,
@@ -196,7 +239,7 @@ async fn forced_fresh_bridge_launch_does_not_adopt_stale_app_server_socket() {
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: None,
@@ -225,7 +268,7 @@ async fn forced_fresh_bridge_launch_does_not_adopt_stale_app_server_socket() {
             SupervisorOpts {
                 codex_exe: FAKE_BIN.to_string(),
                 session_dir: session_dir.clone(),
-                codex_home: None,
+                codex_home: Some(session_dir.join("codex-home")),
                 model: None,
                 bus_mcp: None,
                 cwd: None,

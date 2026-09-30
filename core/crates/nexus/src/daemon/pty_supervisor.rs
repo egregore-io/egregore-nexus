@@ -770,7 +770,7 @@ impl PtySupervisor {
             })?;
             let bell = bell
                 .ok_or_else(|| PtyError::Spawn("hermes gateway launch requires a bell".into()))?;
-            let profile = hermes_gateway_profile(session, launch_label);
+            let profile = hermes_gateway_profile(session, launch_label)?;
             write_hermes_gateway_profile(&profile)
                 .map_err(|e| PtyError::Spawn(format!("write Hermes gateway profile: {e}")))?;
             env.push((
@@ -926,7 +926,7 @@ impl PtySupervisor {
             })?;
             let bell = bell
                 .ok_or_else(|| PtyError::Spawn("hermes gateway launch requires a bell".into()))?;
-            let profile = hermes_gateway_profile(session, launch_label);
+            let profile = hermes_gateway_profile(session, launch_label)?;
             write_hermes_gateway_profile(&profile)
                 .map_err(|e| PtyError::Spawn(format!("write Hermes gateway profile: {e}")))?;
             env.push((
@@ -2168,7 +2168,10 @@ fn with_nexus_cli_path(mut env: Vec<(String, String)>, nexus_exe: &str) -> Vec<(
     env
 }
 
-fn hermes_gateway_profile(session: &SessionId, name: &str) -> HermesGatewayProfile {
+fn hermes_gateway_profile(
+    session: &SessionId,
+    name: &str,
+) -> Result<HermesGatewayProfile, PtyError> {
     let safe_name: String = name
         .chars()
         .map(|c| {
@@ -2180,29 +2183,80 @@ fn hermes_gateway_profile(session: &SessionId, name: &str) -> HermesGatewayProfi
         })
         .collect();
     let base = std::env::temp_dir().join(format!("nexus-hermes-gateway-{}-{safe_name}", session.0));
-    HermesGatewayProfile {
-        home: base.join("home"),
-        source_home: default_hermes_source_home(),
+    let source_home = default_hermes_source_home().map_err(PtyError::Spawn)?;
+    Ok(HermesGatewayProfile {
+        // The provider recognizes <root>/profiles/<name> as a profile and reads missing state
+        // from <root>/auth.json. The profile remains runtime-isolated without copying credentials.
+        home: source_home
+            .join("profiles")
+            .join(format!("nexus-{}-{safe_name}", session.0)),
+        source_home,
         bridge_socket: base.join("bridge.sock"),
         bridge_token: format!("nexus-hermes-{}", session.0),
         nexus_name: name.to_string(),
         session_id: session.clone(),
-    }
+    })
 }
 
-fn default_hermes_source_home() -> PathBuf {
-    if let Ok(home) = std::env::var("NEXUS_HERMES_SOURCE_HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home);
+fn default_hermes_source_home() -> Result<PathBuf, String> {
+    let source_override = std::env::var_os("NEXUS_HERMES_SOURCE_HOME").map(PathBuf::from);
+    let hermes_home = std::env::var_os("HERMES_HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_machine_hermes_home(
+        source_override.as_deref(),
+        hermes_home.as_deref(),
+        home.as_deref(),
+    )
+}
+
+pub(crate) fn resolve_machine_hermes_home(
+    source_override: Option<&Path>,
+    hermes_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if let Some(source) = source_override.filter(|path| !path.as_os_str().is_empty()) {
+        if !source.is_absolute() {
+            return Err(format!(
+                "NEXUS_HERMES_SOURCE_HOME must be absolute, got {}",
+                source.display()
+            ));
         }
+        return Ok(source.to_path_buf());
     }
-    if let Ok(home) = std::env::var("HERMES_HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home);
+
+    if let Some(selected) = hermes_home.filter(|path| !path.as_os_str().is_empty()) {
+        if !selected.is_absolute() {
+            return Err(format!(
+                "machine HERMES_HOME must be absolute, got {}",
+                selected.display()
+            ));
         }
+        if selected
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "profiles")
+        {
+            return selected
+                .parent()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .ok_or_else(|| format!("invalid provider profile path {}", selected.display()));
+        }
+        return Ok(selected.to_path_buf());
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".hermes")
+
+    let home = home
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| {
+            "cannot resolve machine HERMES_HOME: neither HERMES_HOME nor HOME is set".to_string()
+        })?;
+    if !home.is_absolute() {
+        return Err(format!(
+            "machine HOME must be absolute to resolve HERMES_HOME, got {}",
+            home.display()
+        ));
+    }
+    Ok(home.join(".hermes"))
 }
 
 fn append_claude_settings_arg(args: &mut Vec<String>, paths: &ClaudeNativeBridgePaths) {

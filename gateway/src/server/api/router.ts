@@ -12,10 +12,11 @@
 // The router holds NO business logic and never writes the DB — those invariants
 // live in the handlers (each a thin translator). This file only routes, guards,
 // and maps errors.
-import type { ApiRequest, ApiResponse, ApiDeps, Handler } from "./http";
+import type { ApiRequest, ApiResponse, ApiDeps, Handler, HandlerCtx } from "./http";
 import { fail, GatewayError, ok, ValidationError } from "./http";
 import * as h from "./handlers";
 import { COMMAND_KINDS } from "@server/command/ingress";
+import { HOOK_EVENTS } from "@server/hooks/events";
 
 export type { ApiRequest, ApiResponse, ApiDeps, ReadDbGetter } from "./http";
 
@@ -54,7 +55,7 @@ type ProjectedRoute = Omit<Route, "handler">;
 // Breadth is cheap here: adding a daemon capability is one row + one thin
 // handler. Order matters only for overlap; patterns are
 // disjoint by design (static segments distinguish e.g. `/agents/:id` from
-// `/agents/:id/role`, longest-static wins via specificity sort below).
+// `/agents/:id/metadata`, longest-static wins via specificity sort below).
 const ROUTES: Route[] = [
   // health (unauthenticated probe)
   // Health exercises the canonical Gateway store. Legacy fixtures may still inject the old read
@@ -114,8 +115,6 @@ const ROUTES: Route[] = [
   { method: "POST", pattern: "/agents/:id/credentials", projection: { command: COMMAND_KINDS.agentCredentialCreate, status: 201 }, handler: h.postAgentCredential },
   { method: "DELETE", pattern: "/agents/:id/credentials/:credentialId", projection: { command: COMMAND_KINDS.agentCredentialRevoke }, handler: h.deleteAgentCredential },
   { method: "DELETE", pattern: "/agents/:id", projection: { commands: [COMMAND_KINDS.adminRemove, COMMAND_KINDS.adminEvict, COMMAND_KINDS.adminDelete] }, handler: h.deleteAgent },
-  { method: "POST", pattern: "/agents/:id/role", projection: { command: COMMAND_KINDS.adminAssignRole }, handler: h.postAgentRole },
-  { method: "POST", pattern: "/agents/:id/project", projection: { command: COMMAND_KINDS.adminAssignProject }, handler: h.postAgentProject },
   { method: "POST", pattern: "/agents/:id/tier", projection: { command: COMMAND_KINDS.adminGrantTier }, handler: h.postAgentTier },
   { method: "POST", pattern: "/agents/:id/access", projection: { command: COMMAND_KINDS.agentGrantAccess }, handler: h.postAgentAccess },
   { method: "DELETE", pattern: "/agents/:id/access/:principal", projection: { command: COMMAND_KINDS.agentRevokeAccess }, handler: h.deleteAgentAccess },
@@ -147,6 +146,8 @@ const ROUTES: Route[] = [
   { method: "POST", pattern: "/admin/channel", projection: { command: COMMAND_KINDS.adminChannel }, handler: h.postAdminChannel },
   { method: "POST", pattern: "/admin/route", projection: { command: COMMAND_KINDS.adminRoute }, handler: h.postAdminRoute },
   { method: "POST", pattern: "/admin/monitor", projection: { command: COMMAND_KINDS.adminMonitor }, handler: h.postAdminMonitor },
+  { method: "POST", pattern: "/admin/transport/secrets", projection: { command: "gateway.transport.secret.set" }, handler: h.postTransportSecret },
+  { method: "DELETE", pattern: "/admin/transport/secrets/:key", projection: { command: "gateway.transport.secret.rm" }, handler: h.deleteTransportSecret },
 
   // ── notification sources ──
   { method: "GET", pattern: "/sources", projection: { read: "source.list" }, handler: h.getSources },
@@ -183,10 +184,21 @@ function restPath(pattern: string): string {
   return `${PREFIX}${pattern}`.replace(/:([A-Za-z0-9_]+)/g, "{$1}");
 }
 
-async function getCapabilities() {
+async function getCapabilities({ deps }: HandlerCtx) {
   return ok({
     version: 1,
     principle: "REST is a projection of the daemon command/read spine",
+    protocol: {
+      gateway: "0.1.6",
+      surfaces: {
+        eventsLane: { version: 1, replay: "afterSeq-ring" },
+        sessionLane: { version: 1, replay: "cursor" },
+        threadDmRead: { version: 1, replay: "durable-cursor" },
+        notify: { version: 1, idempotency: true },
+        hooks: { version: 1, events: [...HOOK_EVENTS] },
+        transports: { version: 1, providers: [...(deps.transportStates?.() ?? [])] },
+      },
+    },
     routes: restCapabilityRoutes(),
   });
 }

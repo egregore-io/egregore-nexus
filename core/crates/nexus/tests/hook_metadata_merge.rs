@@ -28,6 +28,9 @@ fn admin() -> Caller {
         name: "Nexus Gateway".into(),
         project: "default".into(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 

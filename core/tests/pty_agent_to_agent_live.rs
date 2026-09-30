@@ -93,6 +93,9 @@ async fn launch_claude(state: &AppState, name: &str) -> SessionId {
         name: "operator".into(),
         project: PROJECT.into(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     let resp: SpawnResponse = call(
         state,
@@ -124,6 +127,9 @@ fn caller_for(name: &str, session: &SessionId) -> Caller {
         name: name.into(),
         project: PROJECT.into(),
         tier: Tier::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 

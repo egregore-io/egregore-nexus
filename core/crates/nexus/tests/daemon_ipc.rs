@@ -9,12 +9,12 @@ use nexus::daemon::{command_worker, daemon_ipc, AppState};
 use nexus_common::config::GatewayProjectionDeliveryMode;
 use nexus_common::Config;
 use nexus_contracts::{
-    AgentId, DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, HistoryRequest, Kind,
+    AgentId, DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, HistoryRequest, Kind, Locality,
     MemberListRequest, RegisterRequest, RegisterResponse, SearchMode, SearchRequest, SessionId,
     ThreadId, Tier, Whoami, DAEMON_IPC_PROTOCOL_VERSION,
 };
 use nexus_store::repos::{
-    Agents, CommandIntents, NewAgent, NewSession, Sessions, Sources, Threads,
+    Agents, CommandIntents, DaemonState, NewAgent, NewSession, Sessions, Sources, Threads,
 };
 use nexus_store::Store;
 
@@ -35,6 +35,8 @@ fn register_request() -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Agent,
         kind: Some(Kind::Agent),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -170,20 +172,31 @@ async fn reconnecting_command_cannot_reuse_an_id_for_a_different_payload() {
 }
 
 #[tokio::test]
-async fn enqueue_call_returns_a_durable_receipt_without_waiting_for_execution() {
+async fn gateway_transport_enqueue_returns_a_principal_bound_durable_receipt() {
     let state = state().await;
     let request = DaemonIpcRequest {
         version: DAEMON_IPC_PROTOCOL_VERSION,
         token: "boot-token".into(),
-        request_id: "rpc-prompt-enqueue".into(),
-        caller: None,
+        request_id: "rpc-external-enqueue".into(),
+        caller: Some(DaemonIpcCaller {
+            name: Some("outside".into()),
+            project: "default".into(),
+            session_id: Some("transport:telegram".into()),
+            agent_id: None,
+            runtime_id: Some("transport:telegram".into()),
+            client_key: None,
+            kind: Kind::Human,
+            locality: Locality::External,
+            access: Some("guest".into()),
+            principal_id: Some("x_external_abc".into()),
+            tier: Tier::Agent,
+        }),
         call: DaemonIpcCall::Enqueue {
-            command_id: "cmd-prompt-enqueue".into(),
-            kind: nexus_store::command_kinds::harness::PROMPT.into(),
+            command_id: "cmd-external-enqueue".into(),
+            kind: nexus_store::command_kinds::message_post::SEND.into(),
             params: serde_json::json!({
-                "name": "ipc-agent",
-                "text": "queued while active",
-                "clientMessageId": "client-prompt-1"
+                "to": {"verb": "dm", "name": "ipc-agent"},
+                "body": "queued while active"
             }),
             idempotency_key: Some("client-prompt-1".into()),
         },
@@ -198,21 +211,259 @@ async fn enqueue_call_returns_a_durable_receipt_without_waiting_for_execution() 
     assert!(response.error.is_none(), "{:?}", response.error);
     assert_eq!(
         response.result.as_ref().unwrap()["commandId"],
-        "cmd-prompt-enqueue"
+        "cmd-external-enqueue"
     );
     assert_eq!(response.result.as_ref().unwrap()["status"], "pending");
     assert_eq!(response.result.as_ref().unwrap()["revision"], 1);
-    assert_eq!(response.result.as_ref().unwrap()["seq"], 1);
+    assert_eq!(response.result.as_ref().unwrap()["seq"], 0);
     assert_eq!(
         response.result.as_ref().unwrap()["sessionId"],
         serde_json::Value::Null
     );
     let row = CommandIntents::new(&state.store)
-        .get("cmd-prompt-enqueue")
+        .get("cmd-external-enqueue")
         .await
         .unwrap()
         .expect("durable queued row");
     assert_eq!(row.status, "pending");
+    assert_eq!(row.caller_principal_id.as_deref(), Some("x_external_abc"));
+    assert_eq!(row.caller_kind.as_deref(), Some("external.human"));
+}
+
+#[tokio::test]
+async fn gateway_transport_principal_bypass_rejects_every_near_miss() {
+    let state = state().await;
+    let caller = DaemonIpcCaller {
+        name: Some("outside".into()),
+        project: "default".into(),
+        session_id: Some("transport:telegram".into()),
+        agent_id: None,
+        runtime_id: Some("transport:telegram".into()),
+        client_key: None,
+        kind: Kind::Human,
+        locality: Locality::External,
+        access: Some("guest".into()),
+        principal_id: Some("x_external_abc".into()),
+        tier: Tier::Agent,
+    };
+    let mut cases = Vec::new();
+    let mut changed = caller.clone();
+    changed.access = Some("admin".into());
+    cases.push((
+        "wrong access",
+        changed,
+        nexus_store::command_kinds::message_post::SEND,
+    ));
+    let mut changed = caller.clone();
+    changed.principal_id = Some("h_local".into());
+    cases.push((
+        "wrong principal",
+        changed,
+        nexus_store::command_kinds::message_post::SEND,
+    ));
+    let mut changed = caller.clone();
+    changed.runtime_id = Some("transport:other".into());
+    cases.push((
+        "wrong runtime",
+        changed,
+        nexus_store::command_kinds::message_post::SEND,
+    ));
+    let mut changed = caller.clone();
+    changed.agent_id = Some("a_intruder".into());
+    cases.push((
+        "agent shaped",
+        changed,
+        nexus_store::command_kinds::message_post::SEND,
+    ));
+    let mut changed = caller.clone();
+    changed.client_key = Some("unregistered".into());
+    cases.push((
+        "client keyed",
+        changed,
+        nexus_store::command_kinds::message_post::SEND,
+    ));
+    cases.push((
+        "wrong command",
+        caller,
+        nexus_store::command_kinds::thread::CREATE,
+    ));
+
+    for (index, (label, caller, kind)) in cases.into_iter().enumerate() {
+        let command_id = format!("cmd-external-rejected-{index}");
+        let response = daemon_ipc::handle_request(
+            &state,
+            "boot-token",
+            DaemonIpcRequest {
+                version: DAEMON_IPC_PROTOCOL_VERSION,
+                token: "boot-token".into(),
+                request_id: format!("rpc-external-rejected-{index}"),
+                caller: Some(caller),
+                call: DaemonIpcCall::Enqueue {
+                    command_id: command_id.clone(),
+                    kind: kind.into(),
+                    params: serde_json::json!({
+                        "to": {"verb": "dm", "name": "ipc-agent"},
+                        "body": "must not enqueue"
+                    }),
+                    idempotency_key: None,
+                },
+            },
+        )
+        .await;
+        assert_eq!(
+            response.error.expect(label).code,
+            nexus_contracts::codes::UNAUTHORIZED,
+            "{label}"
+        );
+        assert!(
+            CommandIntents::new(&state.store)
+                .get(&command_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "{label}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_prompt_enqueue_is_atomically_bounded_and_retry_safe() {
+    let state = state().await;
+    CommandIntents::new(&state.store)
+        .insert_pending(nexus_store::repos::NewCommandIntent {
+            command_id: "cmd-capacity-foreign-metadata".into(),
+            kind: nexus_store::command_kinds::harness::PROMPT.into(),
+            project: "foreign-metadata".into(),
+            caller_name: "foreign-caller".into(),
+            caller_session_id: None,
+            caller_agent_id: None,
+            caller_runtime_id: None,
+            caller_client_key: None,
+            caller_principal_id: None,
+            caller_kind: Some("human".into()),
+            caller_tier: Some("admin".into()),
+            idempotency_key: Some("cm-capacity-foreign-metadata".into()),
+            request_json: serde_json::json!({
+                "name": "bounded",
+                "agentId": "a_bounded",
+                "text": "project metadata cannot partition capacity",
+                "clientMessageId": "cm-capacity-foreign-metadata"
+            })
+            .to_string(),
+            created_at: 1,
+        })
+        .await
+        .unwrap();
+    let request = |index: usize, target: &str| DaemonIpcRequest {
+        version: DAEMON_IPC_PROTOCOL_VERSION,
+        token: "boot-token".into(),
+        request_id: format!("rpc-capacity-{target}-{index}"),
+        caller: None,
+        call: DaemonIpcCall::Enqueue {
+            command_id: format!("cmd-capacity-{target}-{index}"),
+            kind: nexus_store::command_kinds::harness::PROMPT.into(),
+            params: serde_json::json!({
+                "name": target,
+                "agentId": format!("a_{target}"),
+                "text": format!("queued input {index}"),
+                "clientMessageId": format!("cm-capacity-{target}-{index}")
+            }),
+            idempotency_key: Some(format!("cm-capacity-{target}-{index}")),
+        },
+    };
+
+    let responses =
+        futures::future::join_all((0..128).map(|index| {
+            daemon_ipc::handle_request(&state, "boot-token", request(index, "bounded"))
+        }))
+        .await;
+    let accepted = responses
+        .iter()
+        .filter(|response| response.error.is_none())
+        .count();
+    let full = responses
+        .iter()
+        .filter(|response| {
+            response.error.as_ref().map(|error| error.code)
+                == Some(nexus_contracts::codes::COMMAND_QUEUE_FULL)
+        })
+        .count();
+    assert_eq!(accepted, 99);
+    assert_eq!(full, 29);
+
+    let accepted_index = responses
+        .iter()
+        .position(|response| response.error.is_none())
+        .expect("one capacity probe must be accepted");
+    let mut retry = request(accepted_index, "bounded");
+    retry.request_id = "rpc-capacity-retry".into();
+    let retry = daemon_ipc::handle_request(&state, "boot-token", retry).await;
+    assert!(
+        retry.error.is_none(),
+        "an accepted command retry must remain accepted"
+    );
+    assert_eq!(
+        retry.result.unwrap()["commandId"],
+        format!("cmd-capacity-bounded-{accepted_index}")
+    );
+
+    let other = daemon_ipc::handle_request(&state, "boot-token", request(0, "independent")).await;
+    assert!(
+        other.error.is_none(),
+        "capacity must be isolated by stable target"
+    );
+
+    let mut rows = state
+        .store
+        .conn
+        .query(
+            "SELECT COUNT(*) FROM command_intents WHERE kind = 'harness.prompt' \
+             AND status = 'pending' AND json_extract(request_json, '$.agentId') = 'a_bounded'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+        100
+    );
+}
+
+#[tokio::test]
+async fn shutdown_fence_rejects_new_enqueue_before_durable_acceptance() {
+    let state = state().await;
+    command_worker::begin_shutdown(&state).await;
+    let request = DaemonIpcRequest {
+        version: DAEMON_IPC_PROTOCOL_VERSION,
+        token: "boot-token".into(),
+        request_id: "rpc-after-shutdown-fence".into(),
+        caller: None,
+        call: DaemonIpcCall::Enqueue {
+            command_id: "cmd-after-shutdown-fence".into(),
+            kind: nexus_store::command_kinds::harness::PROMPT.into(),
+            params: serde_json::json!({
+                "name": "ipc-agent",
+                "text": "must retry against the next daemon",
+                "clientMessageId": "client-after-shutdown-fence"
+            }),
+            idempotency_key: Some("client-after-shutdown-fence".into()),
+        },
+    };
+
+    let response = daemon_ipc::handle_request(&state, "boot-token", request).await;
+    let error = response
+        .error
+        .expect("post-fence ingress must fail before durable acceptance");
+    assert_eq!(error.code, nexus_contracts::codes::INTERNAL_ERROR);
+    assert!(error.message.contains("shutting down"));
+    assert!(
+        CommandIntents::new(&state.store)
+            .get("cmd-after-shutdown-fence")
+            .await
+            .unwrap()
+            .is_none(),
+        "a rejected post-fence command must leave no durable row"
+    );
 }
 
 #[tokio::test]
@@ -258,6 +509,9 @@ async fn query_call_routes_inside_daemon_without_creating_command_row() {
             runtime_id: Some("local-operator".into()),
             client_key: None,
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Admin,
         }),
         call: DaemonIpcCall::Query {
@@ -299,6 +553,9 @@ async fn local_daemon_status_query_reads_store_inside_owner_process() {
             runtime_id: Some("local-operator".into()),
             client_key: None,
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Admin,
         }),
         call: DaemonIpcCall::Query {
@@ -336,6 +593,9 @@ async fn local_operator_can_show_and_hot_apply_gateway_delivery_mode() {
         runtime_id: Some("local-operator".into()),
         client_key: None,
         kind: Kind::Human,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
         tier: Tier::Admin,
     };
     let query = |request_id: &str, method: &str, params: serde_json::Value| DaemonIpcRequest {
@@ -407,6 +667,9 @@ async fn local_gateway_read_executes_select_inside_the_daemon_and_rejects_writes
         runtime_id: Some("local-operator".into()),
         client_key: None,
         kind: Kind::Human,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
         tier: Tier::Admin,
     };
     let query = DaemonIpcRequest {
@@ -479,6 +742,9 @@ async fn legacy_gateway_export_is_bounded_typed_and_cursor_paginated() {
             runtime_id: Some("local-operator".into()),
             client_key: None,
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Admin,
         }),
         call: DaemonIpcCall::Query {
@@ -529,8 +795,8 @@ async fn local_queue_mutation_executes_atomically_inside_the_daemon_owner() {
         .store
         .conn
         .execute(
-            "INSERT INTO sessions (session_id, agent_id, name, agent, transport, project, created_at) \
-             VALUES ('s_queue', 'a_queue', 'queue-agent', 'codex', 'codex-appserver', 'runtime-label', 1)",
+            "INSERT INTO sessions (session_id, agent_id, name, agent, kind, transport, project, created_at) \
+             VALUES ('s_queue', 'a_queue', 'queue-agent', 'codex', 'agent', 'codex-appserver', 'runtime-label', 1)",
             (),
         )
         .await
@@ -555,6 +821,7 @@ async fn local_queue_mutation_executes_atomically_inside_the_daemon_owner() {
             caller_agent_id: None,
             caller_runtime_id: Some("local-operator".into()),
             caller_client_key: None,
+            caller_principal_id: None,
             caller_kind: Some("human".into()),
             caller_tier: Some("admin".into()),
             idempotency_key: Some("cm_queue_redirect".into()),
@@ -581,6 +848,9 @@ async fn local_queue_mutation_executes_atomically_inside_the_daemon_owner() {
             runtime_id: Some("local-operator".into()),
             client_key: None,
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Admin,
         }),
         call: DaemonIpcCall::Query {
@@ -687,6 +957,9 @@ async fn authenticated_daemon_query_treats_the_registered_session_agent_id_as_ex
                 runtime_id: None,
                 client_key: Some("ck_registered_missing_owner".into()),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
                 tier: Tier::Agent,
             }),
             call: DaemonIpcCall::Query {
@@ -717,8 +990,8 @@ async fn local_queue_read_returns_typed_snapshot_and_transitions_without_raw_sto
         .store
         .conn
         .execute(
-            "INSERT INTO sessions (session_id, agent_id, name, agent, transport, project, created_at) \
-             VALUES ('s_queue_read', 'a_queue_read', 'queue-reader', 'codex', \
+            "INSERT INTO sessions (session_id, agent_id, name, agent, kind, transport, project, created_at) \
+             VALUES ('s_queue_read', 'a_queue_read', 'queue-reader', 'codex', 'agent', \
              'codex-appserver', 'default', 1)",
             (),
         )
@@ -734,6 +1007,7 @@ async fn local_queue_read_returns_typed_snapshot_and_transitions_without_raw_sto
             caller_agent_id: None,
             caller_runtime_id: Some("local-operator".into()),
             caller_client_key: None,
+            caller_principal_id: None,
             caller_kind: Some("human".into()),
             caller_tier: Some("admin".into()),
             idempotency_key: Some("cm_queue_read".into()),
@@ -756,6 +1030,9 @@ async fn local_queue_read_returns_typed_snapshot_and_transitions_without_raw_sto
         runtime_id: Some("local-operator".into()),
         client_key: None,
         kind: Kind::Human,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
         tier: Tier::Admin,
     };
     let read = |request_id: &str, params: serde_json::Value| DaemonIpcRequest {
@@ -887,6 +1164,9 @@ async fn local_human_read_settlement_updates_only_the_authenticated_session_rows
             runtime_id: Some("local-operator".into()),
             client_key: None,
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Admin,
         }),
         call: DaemonIpcCall::Query {
@@ -937,6 +1217,9 @@ async fn legacy_mcp_identity_resolution_runs_inside_daemon_store_owner() {
             runtime_id: Some("local-operator".into()),
             client_key: None,
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Admin,
         }),
         call: DaemonIpcCall::Query {
@@ -977,6 +1260,9 @@ async fn registered_query_caller_is_canonicalized_by_client_key_after_rename() {
             runtime_id: Some(registered.session_id.0.clone()),
             client_key: Some("client-ipc-agent".into()),
             kind: Kind::Agent,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Agent,
         }),
         call: DaemonIpcCall::Query {
@@ -990,6 +1276,98 @@ async fn registered_query_caller_is_canonicalized_by_client_key_after_rename() {
     let whoami: Whoami = serde_json::from_value(response.result.unwrap()).unwrap();
     assert_eq!(whoami.name.as_deref(), Some("ipc-agent"));
     assert_eq!(whoami.session_id, registered.session_id);
+}
+
+#[tokio::test]
+async fn registered_human_command_caller_does_not_resolve_through_same_name_agent() {
+    let state = state().await;
+    DaemonState::new(&state.store)
+        .set_boot_epoch("boot_same_name_human", 1)
+        .await
+        .unwrap();
+    Agents::new(&state.store)
+        .create(NewAgent {
+            agent_id: "a_same_name_agent".into(),
+            project: "default".into(),
+            name: Some("Operator".into()),
+            default_harness: Some("other".into()),
+            role: None,
+            tier: Some("admin".into()),
+            owner: None,
+        })
+        .await
+        .unwrap();
+    let registered = state
+        .identity
+        .register(RegisterRequest {
+            agent_id: None,
+            name: Some("Operator".into()),
+            harness: hid("other"),
+            harness_session_id: "hs_gateway_human".into(),
+            project: "default".into(),
+            client_key: "gateway-human-client".into(),
+            runtime_credential: None,
+            tier: Tier::Admin,
+            kind: Some(Kind::Human),
+            locality: Locality::Local,
+            access: Some("admin".into()),
+            role: None,
+            cwd: None,
+        })
+        .await
+        .unwrap();
+
+    let response = daemon_ipc::handle_request(
+        &state,
+        "boot-token",
+        DaemonIpcRequest {
+            version: DAEMON_IPC_PROTOCOL_VERSION,
+            token: "boot-token".into(),
+            request_id: "rpc-same-name-human".into(),
+            caller: Some(DaemonIpcCaller {
+                name: Some("Operator".into()),
+                project: "default".into(),
+                session_id: Some(registered.session_id.0.clone()),
+                agent_id: None,
+                runtime_id: Some(registered.session_id.0.clone()),
+                client_key: Some("gateway-human-client".into()),
+                kind: Kind::Human,
+                locality: Locality::Local,
+                access: Some("admin".into()),
+                principal_id: Some("h_gateway_human".into()),
+                tier: Tier::Admin,
+            }),
+            call: DaemonIpcCall::Enqueue {
+                command_id: "cmd-same-name-human".into(),
+                kind: nexus_store::command_kinds::message_post::SEND.into(),
+                params: serde_json::json!({
+                    "to": {"verb": "dm", "name": "ipc-agent"},
+                    "body": "human caller remains bound to its exact client-key session"
+                }),
+                idempotency_key: None,
+            },
+        },
+    )
+    .await;
+
+    assert!(response.error.is_none(), "{:?}", response.error);
+    let row = CommandIntents::new(&state.store)
+        .get("cmd-same-name-human")
+        .await
+        .unwrap()
+        .expect("durable human command row");
+    assert_eq!(row.caller_name, "Operator");
+    assert_eq!(
+        row.caller_session_id.as_deref(),
+        Some(registered.session_id.0.as_str())
+    );
+    assert_eq!(row.caller_agent_id, None);
+    assert_eq!(
+        row.caller_client_key.as_deref(),
+        Some("gateway-human-client")
+    );
+    assert_eq!(row.caller_principal_id.as_deref(), Some("h_gateway_human"));
+    assert_eq!(row.caller_kind.as_deref(), Some("local.human"));
 }
 
 #[tokio::test]
@@ -1059,6 +1437,9 @@ async fn registered_query_caller_prefers_the_authenticated_session_agent_id_over
                 runtime_id: Some("s_stable_ipc".into()),
                 client_key: Some("ck_stable_ipc".into()),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
                 tier: Tier::Agent,
             }),
             call: DaemonIpcCall::Query {
@@ -1151,6 +1532,9 @@ async fn wsl_ambient_whoami_resolves_renamed_agent_by_stable_identity() {
                 runtime_id: None,
                 client_key: Some(ambient.client_key),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
                 tier: Tier::Agent,
             }),
             call: DaemonIpcCall::Query {
@@ -1226,6 +1610,9 @@ async fn unnamed_registered_query_caller_resolves_whoami_by_stable_agent_id() {
                 runtime_id: None,
                 client_key: Some(client_key.into()),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
                 tier: Tier::Agent,
             }),
             call: DaemonIpcCall::Query {
@@ -1265,6 +1652,9 @@ async fn bounded_binary_frame_roundtrips_over_one_local_connection() {
             runtime_id: Some("local-operator".into()),
             client_key: None,
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Admin,
         }),
         call: DaemonIpcCall::Query {
@@ -1312,6 +1702,9 @@ async fn unix_listener_publishes_boot_manifest_and_serves_real_client() {
             runtime_id: Some("local-operator".into()),
             client_key: None,
             kind: Kind::Human,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
             tier: Tier::Admin,
         }),
         call: DaemonIpcCall::Query {
@@ -1339,6 +1732,9 @@ async fn unix_listener_publishes_boot_manifest_and_serves_real_client() {
                 runtime_id: Some("local-operator".into()),
                 client_key: None,
                 kind: Kind::Human,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
                 tier: Tier::Admin,
             }),
             call: DaemonIpcCall::Query {

@@ -21,7 +21,8 @@ import type {
   CommandIntentSender,
   GatewayCallerIdentity,
 } from "@server/api/http";
-import { Kind, Tier } from "@shared/types";
+import { Kind, Locality, Tier } from "@shared/types";
+import { dottedEntityKind } from "@server/identity/entityKind";
 import { beginIngress, settleIngress, type GatewayIngressRow } from "@server/store/repos/ingress";
 
 export const COMMAND_KINDS = {
@@ -137,7 +138,10 @@ interface CommandCallerRow {
   agentId?: string;
   runtimeId?: string;
   clientKey?: string;
-  kind: string;
+  kind: Kind;
+  locality: Locality;
+  access?: string;
+  principalId?: string;
   tier: string;
 }
 
@@ -349,6 +353,8 @@ async function registerHumanCaller(
         clientKey,
         tier: caller.tier ?? Tier.Admin,
         kind: Kind.Human,
+        locality: caller.locality ?? Locality.Local,
+        ...(caller.access ? { access: caller.access } : {}),
       },
       daemonCaller(callerRow(caller)),
       {
@@ -385,7 +391,12 @@ async function submitThroughGatewayIngress<T>(input: GatewayIngressSubmission<T>
   const begun = await beginIngress(input.db, {
     idempotencyKey: key,
     commandId: input.commandId,
-    request: { kind: input.kind, params: input.req },
+    request: {
+      kind: input.kind,
+      params: input.req,
+      caller: gatewayCallerEvidence(input.caller),
+    },
+    callerPrincipalId: input.caller.principalId,
     now: input.now(),
   });
   if (!begun.created) {
@@ -417,8 +428,21 @@ async function submitThroughGatewayIngress<T>(input: GatewayIngressSubmission<T>
 }
 
 function ingressScope(input: GatewayIngressSubmission<unknown>): string {
-  const principal = input.caller.clientKey ?? input.caller.sessionId ?? input.caller.agentId ?? input.caller.name;
+  const principal = input.caller.principalId ?? input.caller.clientKey ?? input.caller.sessionId ??
+    input.caller.agentId ?? input.caller.name;
   return `${input.kind}:${principal}:${input.idempotencyKey}`;
+}
+
+function gatewayCallerEvidence(caller: CommandCallerRow): Record<string, unknown> {
+  return {
+    name: caller.name,
+    project: caller.project,
+    kind: dottedEntityKind(caller.locality, caller.kind),
+    ...(caller.access ? { access: caller.access } : {}),
+    ...(caller.principalId ? { principalId: caller.principalId } : {}),
+    ...(caller.sessionId ? { sessionId: caller.sessionId } : {}),
+    ...(caller.agentId ? { agentId: caller.agentId } : {}),
+  };
 }
 
 function isTerminalDaemonRejection(error: unknown): boolean {
@@ -463,9 +487,9 @@ async function insertCommandIntent(
       sql:
         "INSERT INTO command_intents " +
         "(command_id, kind, status, project, caller_name, caller_session_id, " +
-        "caller_agent_id, caller_runtime_id, caller_client_key, caller_kind, caller_tier, " +
+        "caller_agent_id, caller_runtime_id, caller_client_key, caller_principal_id, caller_kind, caller_tier, " +
         "idempotency_key, request_json, result_json, error_json, attempts, created_at, claimed_at, started_at, lease_until, " +
-        "completed_at) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, " +
+        "completed_at) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, 0, ?, " +
         "NULL, NULL, NULL, NULL) " +
         "RETURNING command_id, status, created_at, revision, " +
         "(SELECT session_id FROM command_intent_events e WHERE e.command_id = command_intents.command_id " +
@@ -481,7 +505,8 @@ async function insertCommandIntent(
         insert.commandCaller.agentId ?? null,
         insert.commandCaller.runtimeId ?? insert.commandCaller.sessionId ?? null,
         insert.commandCaller.clientKey ?? null,
-        insert.commandCaller.kind,
+        insert.commandCaller.principalId ?? null,
+        dottedEntityKind(insert.commandCaller.locality, insert.commandCaller.kind),
         insert.commandCaller.tier,
         insert.idempotencyKey ?? null,
         JSON.stringify(insert.req),
@@ -573,6 +598,9 @@ function callerRow(caller: GatewayCallerIdentity | undefined): CommandCallerRow 
     runtimeId: caller.runtimeId ?? caller.sessionId,
     clientKey: caller.clientKey,
     kind: caller.kind ?? Kind.Human,
+    locality: caller.locality ?? Locality.Local,
+    access: caller.access,
+    principalId: caller.principalId,
     tier: caller.tier ?? Tier.Admin,
   };
 }
@@ -586,6 +614,9 @@ function daemonCaller(caller: CommandCallerRow): DaemonIpcCaller {
     ...(caller.runtimeId ? { runtimeId: caller.runtimeId } : {}),
     ...(caller.clientKey ? { clientKey: caller.clientKey } : {}),
     kind: caller.kind as DaemonIpcCaller["kind"],
+    locality: caller.locality,
+    ...(caller.access ? { access: caller.access } : {}),
+    ...(caller.principalId ? { principalId: caller.principalId } : {}),
     tier: caller.tier as DaemonIpcCaller["tier"],
   };
 }
@@ -598,10 +629,12 @@ function gatewayIpcError(error: unknown): unknown {
     ? 400
     : error.code === -32001
       ? 401
-      : error.code === -32003
-        ? 404
-        : error.code === -32004
-          ? 403
+    : error.code === -32003
+      ? 404
+      : error.code === -32004
+        ? 403
+        : error.code === -32010
+          ? 429
           : 502;
   return new GatewayError(status, error.message);
 }

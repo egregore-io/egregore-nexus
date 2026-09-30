@@ -7,6 +7,7 @@
 use libsql::params;
 
 use nexus_common::NexusError;
+use nexus_contracts::entity_kind;
 
 use crate::error::{store_err, store_msg};
 use crate::repos::sessions::{get_opt_int, get_opt_text, get_text};
@@ -26,6 +27,11 @@ pub struct CommandIntentRow {
     pub caller_agent_id: Option<String>,
     pub caller_runtime_id: Option<String>,
     pub caller_client_key: Option<String>,
+    pub caller_principal_id: Option<String>,
+    /// Boot epoch in which the daemon resolved this caller against a live registered session.
+    /// `None` is intentionally fail-closed across restart; direct repository producers cannot
+    /// manufacture the authority granted by daemon IPC acceptance.
+    pub caller_validated_boot_epoch: Option<String>,
     pub caller_kind: Option<String>,
     pub caller_tier: Option<String>,
     pub idempotency_key: Option<String>,
@@ -73,6 +79,7 @@ pub struct NewCommandIntent {
     pub caller_agent_id: Option<String>,
     pub caller_runtime_id: Option<String>,
     pub caller_client_key: Option<String>,
+    pub caller_principal_id: Option<String>,
     pub caller_kind: Option<String>,
     pub caller_tier: Option<String>,
     pub idempotency_key: Option<String>,
@@ -94,16 +101,37 @@ impl<'a> CommandIntents<'a> {
     /// Insert a new pending command intent. The command id is caller-provided so submitters can
     /// poll the same row for completion.
     pub async fn insert_pending(&self, row: NewCommandIntent) -> Result<(), NexusError> {
+        self.insert_pending_with_caller_validation(row, None).await
+    }
+
+    /// Insert a new pending command whose caller was resolved by the daemon in `boot_epoch`.
+    /// The marker is written in the same SQLite statement as the command acceptance boundary.
+    pub async fn insert_pending_with_validated_caller(
+        &self,
+        row: NewCommandIntent,
+        boot_epoch: &str,
+    ) -> Result<(), NexusError> {
+        self.insert_pending_with_caller_validation(row, Some(boot_epoch))
+            .await
+    }
+
+    async fn insert_pending_with_caller_validation(
+        &self,
+        mut row: NewCommandIntent,
+        caller_validated_boot_epoch: Option<&str>,
+    ) -> Result<(), NexusError> {
+        normalize_caller_kind(&mut row)?;
         self
             .store
             .identity_conn()
             .execute(
-                "INSERT INTO command_intents (command_id, kind, status, project, caller_name, \
+                 "INSERT INTO command_intents (command_id, kind, status, project, caller_name, \
                  caller_session_id, caller_agent_id, caller_runtime_id, caller_client_key, \
-                 caller_kind, caller_tier, idempotency_key, request_json, result_json, \
+                 caller_principal_id, caller_validated_boot_epoch, caller_kind, caller_tier, \
+                 idempotency_key, request_json, result_json, \
                  error_json, attempts, created_at, claimed_at, started_at, lease_until, completed_at) VALUES \
-                 (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, NULL, 0, \
-                 ?13, NULL, NULL, NULL, NULL)",
+                 (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+                 NULL, NULL, 0, ?15, NULL, NULL, NULL, NULL)",
                 params![
                     row.command_id,
                     row.kind,
@@ -113,6 +141,8 @@ impl<'a> CommandIntents<'a> {
                     row.caller_agent_id,
                     row.caller_runtime_id,
                     row.caller_client_key,
+                    row.caller_principal_id,
+                    caller_validated_boot_epoch,
                     row.caller_kind,
                     row.caller_tier,
                     row.idempotency_key,
@@ -134,21 +164,174 @@ impl<'a> CommandIntents<'a> {
         &self,
         row: NewCommandIntent,
     ) -> Result<String, NexusError> {
+        self.insert_pending_or_resume_with_caller_validation(row, None)
+            .await
+    }
+
+    /// Insert or resume a command accepted after daemon-side caller validation.
+    pub async fn insert_pending_or_resume_with_validated_caller(
+        &self,
+        row: NewCommandIntent,
+        boot_epoch: &str,
+    ) -> Result<String, NexusError> {
+        self.insert_pending_or_resume_with_caller_validation(row, Some(boot_epoch))
+            .await
+    }
+
+    async fn insert_pending_or_resume_with_caller_validation(
+        &self,
+        mut row: NewCommandIntent,
+        caller_validated_boot_epoch: Option<&str>,
+    ) -> Result<String, NexusError> {
+        normalize_caller_kind(&mut row)?;
         let command_id = row.command_id.clone();
         if let Some(existing) = self.get(&command_id).await? {
-            return matching_existing_command(&existing, &row, "command id");
+            return matching_existing_command_with_validation(
+                &existing,
+                &row,
+                "command id",
+                caller_validated_boot_epoch.is_some(),
+            );
         }
         if row.idempotency_key.is_some() {
-            return self.insert_pending_idempotent(row).await;
+            return self
+                .insert_pending_idempotent_with_caller_validation(row, caller_validated_boot_epoch)
+                .await;
         }
 
-        match self.insert_pending(row.clone()).await {
+        match self
+            .insert_pending_with_caller_validation(row.clone(), caller_validated_boot_epoch)
+            .await
+        {
             Ok(()) => Ok(command_id),
             Err(err) if is_unique_constraint(&err) => match self.get(&command_id).await? {
-                Some(existing) => matching_existing_command(&existing, &row, "command id"),
+                Some(existing) => matching_existing_command_with_validation(
+                    &existing,
+                    &row,
+                    "command id",
+                    caller_validated_boot_epoch.is_some(),
+                ),
                 None => Err(err),
             },
             Err(err) => Err(err),
+        }
+    }
+
+    /// Insert one session prompt under a caller-held ingress serialization boundary.
+    /// Existing command/idempotency retries remain resumable even when the target is full;
+    /// only a genuinely new pending row consumes capacity.
+    pub async fn insert_pending_or_resume_bounded_session_prompt(
+        &self,
+        row: NewCommandIntent,
+        max_pending: i64,
+    ) -> Result<String, NexusError> {
+        self.insert_pending_or_resume_bounded_session_prompt_with_caller_validation(
+            row,
+            max_pending,
+            None,
+        )
+        .await
+    }
+
+    /// Bounded prompt insertion after daemon-side caller validation.
+    pub async fn insert_pending_or_resume_bounded_session_prompt_with_validated_caller(
+        &self,
+        row: NewCommandIntent,
+        max_pending: i64,
+        boot_epoch: &str,
+    ) -> Result<String, NexusError> {
+        self.insert_pending_or_resume_bounded_session_prompt_with_caller_validation(
+            row,
+            max_pending,
+            Some(boot_epoch),
+        )
+        .await
+    }
+
+    async fn insert_pending_or_resume_bounded_session_prompt_with_caller_validation(
+        &self,
+        mut row: NewCommandIntent,
+        max_pending: i64,
+        caller_validated_boot_epoch: Option<&str>,
+    ) -> Result<String, NexusError> {
+        normalize_caller_kind(&mut row)?;
+        if max_pending <= 0 {
+            return Err(NexusError::Invalid(
+                "session command queue capacity must be positive".into(),
+            ));
+        }
+        if row.kind != crate::command_kinds::harness::PROMPT {
+            return self
+                .insert_pending_or_resume_with_caller_validation(row, caller_validated_boot_epoch)
+                .await;
+        }
+        if let Some(existing) = self.get(&row.command_id).await? {
+            return matching_existing_command_with_validation(
+                &existing,
+                &row,
+                "command id",
+                caller_validated_boot_epoch.is_some(),
+            );
+        }
+        if let Some(idempotency_key) = row.idempotency_key.as_deref() {
+            if let Some(existing_id) = self
+                .find_idempotent_command(
+                    &row.project,
+                    &row.kind,
+                    &row.caller_name,
+                    row.caller_session_id.as_deref(),
+                    row.caller_client_key.as_deref(),
+                    idempotency_key,
+                )
+                .await?
+            {
+                let existing = self.get(&existing_id).await?.ok_or_else(|| {
+                    store_msg(format!("idempotent command disappeared: {existing_id}"))
+                })?;
+                return matching_existing_command_with_validation(
+                    &existing,
+                    &row,
+                    "idempotency key",
+                    caller_validated_boot_epoch.is_some(),
+                );
+            }
+        }
+        if self.pending_session_prompt_count(&row).await? >= max_pending {
+            return Err(NexusError::CommandQueueFull);
+        }
+        self.insert_pending_or_resume_with_caller_validation(row, caller_validated_boot_epoch)
+            .await
+    }
+
+    async fn pending_session_prompt_count(
+        &self,
+        row: &NewCommandIntent,
+    ) -> Result<i64, NexusError> {
+        let request: serde_json::Value =
+            serde_json::from_str(&row.request_json).map_err(store_msg)?;
+        let agent_id = request.get("agentId").and_then(serde_json::Value::as_str);
+        let name = request.get("name").and_then(serde_json::Value::as_str);
+        if agent_id.is_none() && name.is_none() {
+            return Err(NexusError::Invalid(
+                "session prompt target requires name or agentId".into(),
+            ));
+        }
+        let mut rows = self
+            .store
+            .identity_conn()
+            .query(
+                "SELECT COUNT(*) FROM command_intents WHERE kind = ?1 AND status = 'pending' \
+                 AND ((?2 IS NOT NULL AND json_extract(request_json, '$.agentId') = ?2) \
+                 OR (?2 IS NULL AND \
+                 json_extract(request_json, '$.agentId') IS NULL AND \
+                 json_extract(request_json, '$.name') = ?3))",
+                params![crate::command_kinds::harness::PROMPT, agent_id, name],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            Some(count) => Ok(get_opt_int(&count, 0)?.unwrap_or_default()),
+            None => Ok(0),
         }
     }
 
@@ -159,6 +342,16 @@ impl<'a> CommandIntents<'a> {
         &self,
         row: NewCommandIntent,
     ) -> Result<String, NexusError> {
+        self.insert_pending_idempotent_with_caller_validation(row, None)
+            .await
+    }
+
+    async fn insert_pending_idempotent_with_caller_validation(
+        &self,
+        mut row: NewCommandIntent,
+        caller_validated_boot_epoch: Option<&str>,
+    ) -> Result<String, NexusError> {
+        normalize_caller_kind(&mut row)?;
         let command_id = row.command_id.clone();
         let project = row.project.clone();
         let kind = row.kind.clone();
@@ -181,10 +374,18 @@ impl<'a> CommandIntents<'a> {
                 let existing = self.get(&existing_id).await?.ok_or_else(|| {
                     store_msg(format!("idempotent command disappeared: {existing_id}"))
                 })?;
-                return matching_existing_command(&existing, &row, "idempotency key");
+                return matching_existing_command_with_validation(
+                    &existing,
+                    &row,
+                    "idempotency key",
+                    caller_validated_boot_epoch.is_some(),
+                );
             }
         }
-        match self.insert_pending(row.clone()).await {
+        match self
+            .insert_pending_with_caller_validation(row.clone(), caller_validated_boot_epoch)
+            .await
+        {
             Ok(()) => return Ok(command_id),
             Err(err) if idempotency_key.is_some() && is_unique_constraint(&err) => {}
             Err(err) => return Err(err),
@@ -205,7 +406,12 @@ impl<'a> CommandIntents<'a> {
             .get(&existing_id)
             .await?
             .ok_or_else(|| store_msg(format!("idempotent command disappeared: {existing_id}")))?;
-        matching_existing_command(&existing, &row, "idempotency key")
+        matching_existing_command_with_validation(
+            &existing,
+            &row,
+            "idempotency key",
+            caller_validated_boot_epoch.is_some(),
+        )
     }
 
     async fn find_idempotent_command(
@@ -317,6 +523,9 @@ impl<'a> CommandIntents<'a> {
                     .has_pending_initial_prompt(&candidate, target.as_ref())
                     .await?
                 || self
+                    .has_older_unsettled_delivery(&candidate, target.as_ref())
+                    .await?
+                || self
                     .has_claimed_prompt_for_target(now, &candidate, target.as_ref())
                     .await?
             {
@@ -351,6 +560,9 @@ impl<'a> CommandIntents<'a> {
             if target.as_ref().map(|row| row.session_id.0.as_str()) != Some(target_session_id)
                 || self
                     .has_pending_initial_prompt(&candidate, target.as_ref())
+                    .await?
+                || self
+                    .has_older_unsettled_delivery(&candidate, target.as_ref())
                     .await?
                 || self
                     .has_claimed_prompt_for_target(now, &candidate, target.as_ref())
@@ -507,6 +719,47 @@ impl<'a> CommandIntents<'a> {
                  ((?1 IS NOT NULL AND agent_id = ?1) OR (?2 IS NOT NULL AND session_id = ?2)) \
                  LIMIT 1",
                 params![agent_id, session_id],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(rows.next().await.map_err(store_err)?.is_some())
+    }
+
+    /// Preserve accepted ordering across daemon restart.
+    ///
+    /// The split daemon restores durable delivery obligations into its boot-scoped inbox after
+    /// command ingress becomes available. A prompt accepted after one of those messages must stay
+    /// queued until the older recipient obligation settles; otherwise the prompt worker can start
+    /// a native turn first and the restored bus delivery is appended to that same native turn.
+    async fn has_older_unsettled_delivery(
+        &self,
+        command: &CommandIntentRow,
+        target: Option<&SessionRow>,
+    ) -> Result<bool, NexusError> {
+        if !self.store.has_split_authority() {
+            return Ok(false);
+        }
+        let request: serde_json::Value =
+            serde_json::from_str(&command.request_json).map_err(store_msg)?;
+        let agent_id = request
+            .get("agentId")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| target.and_then(|row| row.agent_id.as_deref()));
+        let runtime_id = target.map(|row| row.session_id.0.as_str());
+        if agent_id.is_none() && runtime_id.is_none() {
+            return Ok(false);
+        }
+        let mut rows = self
+            .store
+            .identity_conn()
+            .query(
+                "SELECT 1 FROM delivery_obligations
+                 WHERE state NOT IN ('delivered', 'rejected')
+                   AND created_at <= ?1
+                   AND ((?2 IS NOT NULL AND recipient_agent_id = ?2)
+                     OR (?3 IS NOT NULL AND recipient_runtime_id = ?3))
+                 LIMIT 1",
+                params![command.created_at, agent_id, runtime_id],
             )
             .await
             .map_err(store_err)?;
@@ -771,6 +1024,34 @@ impl<'a> CommandIntents<'a> {
             )
             .await
             .map_err(store_err)?;
+        Ok(updated > 0)
+    }
+
+    /// Return one current, unfinished claim to the durable pending queue when daemon shutdown
+    /// wins before the command crosses its external acceptance boundary.
+    ///
+    /// The claim timestamp is the ownership token: a stale worker cannot release a row that a
+    /// newer daemon has already reclaimed. Keep `attempts` unchanged so the durable row records
+    /// that this daemon owned the claim even though it never reached the external provider.
+    pub async fn release_claim_for_shutdown_retry(
+        &self,
+        command_id: &str,
+        claimed_at: i64,
+    ) -> Result<bool, NexusError> {
+        let updated = self
+            .store
+            .identity_conn()
+            .execute(
+                "UPDATE command_intents SET status = 'pending', revision = revision + 1, \
+                 claimed_at = NULL, started_at = NULL, lease_until = NULL \
+                 WHERE command_id = ?1 AND status = 'claimed' AND claimed_at = ?2",
+                params![command_id, claimed_at],
+            )
+            .await
+            .map_err(store_err)?;
+        if updated > 0 {
+            self.store.events().command_intent_inserted().signal();
+        }
         Ok(updated > 0)
     }
 
@@ -1071,7 +1352,8 @@ impl<'a> CommandIntents<'a> {
         }
     }
 
-    /// Reap claimed rows left in-flight when the daemon performs an explicit lifecycle shutdown.
+    /// Reap claimed rows whose dispatch boundary did not finish within the daemon's bounded
+    /// graceful drain. These rows are externally ambiguous and must not be replayed automatically.
     pub async fn reap_claimed_for_shutdown(&self, now: i64) -> Result<u64, NexusError> {
         let error_json = r#"{"message":"daemon shutdown"}"#;
         let updated = self
@@ -1141,16 +1423,19 @@ enum ClaimFilter<'a> {
 }
 
 const COLUMNS: &str = "command_id, kind, status, project, caller_name, caller_session_id, \
-     caller_agent_id, caller_runtime_id, caller_client_key, caller_kind, caller_tier, \
+     caller_agent_id, caller_runtime_id, caller_client_key, caller_principal_id, \
+     caller_validated_boot_epoch, caller_kind, caller_tier, \
      idempotency_key, request_json, result_json, error_json, attempts, revision, created_at, claimed_at, started_at, lease_until, \
      completed_at";
 
 const SELECT: &str = "SELECT command_id, kind, status, project, caller_name, caller_session_id, \
-     caller_agent_id, caller_runtime_id, caller_client_key, caller_kind, caller_tier, \
+     caller_agent_id, caller_runtime_id, caller_client_key, caller_principal_id, \
+     caller_validated_boot_epoch, caller_kind, caller_tier, \
      idempotency_key, request_json, result_json, error_json, attempts, revision, created_at, claimed_at, started_at, lease_until, \
      completed_at FROM command_intents";
 
 fn row_to_command_intent(row: &libsql::Row) -> Result<CommandIntentRow, NexusError> {
+    let caller_kind = canonical_caller_kind(get_opt_text(row, 11)?)?;
     Ok(CommandIntentRow {
         command_id: get_text(row, 0)?,
         kind: get_text(row, 1)?,
@@ -1161,20 +1446,37 @@ fn row_to_command_intent(row: &libsql::Row) -> Result<CommandIntentRow, NexusErr
         caller_agent_id: get_opt_text(row, 6)?,
         caller_runtime_id: get_opt_text(row, 7)?,
         caller_client_key: get_opt_text(row, 8)?,
-        caller_kind: get_opt_text(row, 9)?,
-        caller_tier: get_opt_text(row, 10)?,
-        idempotency_key: get_opt_text(row, 11)?,
-        request_json: get_text(row, 12)?,
-        result_json: get_opt_text(row, 13)?,
-        error_json: get_opt_text(row, 14)?,
-        attempts: get_opt_int(row, 15)?.unwrap_or(0),
-        revision: get_opt_int(row, 16)?.unwrap_or(1),
-        created_at: get_opt_int(row, 17)?.unwrap_or(0),
-        claimed_at: get_opt_int(row, 18)?,
-        started_at: get_opt_int(row, 19)?,
-        lease_until: get_opt_int(row, 20)?,
-        completed_at: get_opt_int(row, 21)?,
+        caller_principal_id: get_opt_text(row, 9)?,
+        caller_validated_boot_epoch: get_opt_text(row, 10)?,
+        caller_kind,
+        caller_tier: get_opt_text(row, 12)?,
+        idempotency_key: get_opt_text(row, 13)?,
+        request_json: get_text(row, 14)?,
+        result_json: get_opt_text(row, 15)?,
+        error_json: get_opt_text(row, 16)?,
+        attempts: get_opt_int(row, 17)?.unwrap_or(0),
+        revision: get_opt_int(row, 18)?.unwrap_or(1),
+        created_at: get_opt_int(row, 19)?.unwrap_or(0),
+        claimed_at: get_opt_int(row, 20)?,
+        started_at: get_opt_int(row, 21)?,
+        lease_until: get_opt_int(row, 22)?,
+        completed_at: get_opt_int(row, 23)?,
     })
+}
+
+fn normalize_caller_kind(row: &mut NewCommandIntent) -> Result<(), NexusError> {
+    row.caller_kind = canonical_caller_kind(row.caller_kind.take())?;
+    Ok(())
+}
+
+fn canonical_caller_kind(value: Option<String>) -> Result<Option<String>, NexusError> {
+    value
+        .map(|value| {
+            entity_kind::parse(&value)
+                .map(|(locality, kind)| entity_kind::dotted(locality, kind))
+                .ok_or_else(|| NexusError::Invalid(format!("unknown stored caller kind {value:?}")))
+        })
+        .transpose()
 }
 
 fn is_unique_constraint(err: &NexusError) -> bool {
@@ -1193,6 +1495,7 @@ fn matching_existing_command(
         && existing.caller_agent_id == requested.caller_agent_id
         && existing.caller_runtime_id == requested.caller_runtime_id
         && existing.caller_client_key == requested.caller_client_key
+        && existing.caller_principal_id == requested.caller_principal_id
         && existing.caller_kind == requested.caller_kind
         && existing.caller_tier == requested.caller_tier
         && existing.idempotency_key == requested.idempotency_key
@@ -1204,6 +1507,21 @@ fn matching_existing_command(
             "{identity} already belongs to a different command request"
         )))
     }
+}
+
+fn matching_existing_command_with_validation(
+    existing: &CommandIntentRow,
+    requested: &NewCommandIntent,
+    identity: &str,
+    require_validated_caller: bool,
+) -> Result<String, NexusError> {
+    let command_id = matching_existing_command(existing, requested, identity)?;
+    if require_validated_caller && existing.caller_validated_boot_epoch.is_none() {
+        return Err(NexusError::Invalid(format!(
+            "{identity} belongs to a command without daemon-validated caller authority"
+        )));
+    }
+    Ok(command_id)
 }
 
 fn matching_idempotent_kind(existing: &str, requested: &str) -> bool {

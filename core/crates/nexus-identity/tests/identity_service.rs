@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use nexus_common::{hash_runtime_credential, now, Config, NexusError};
 use nexus_contracts::admin::{AdminAssignRequest, AdminRenameRequest};
-use nexus_contracts::enums::{Kind, Presence, Tier};
+use nexus_contracts::enums::{Kind, Locality, Presence, Tier};
 use nexus_contracts::events::WsEvent;
 use nexus_contracts::ids::{AgentId, SessionId, ThreadId};
 use nexus_contracts::ports::{Caller, EventSink, IdentityPort};
@@ -94,6 +94,8 @@ fn req(name: &str, client_key: &str) -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Agent,
         kind: None,
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -199,6 +201,9 @@ async fn caller_for(store: &Store, name: &str) -> Caller {
         name: row_name,
         project: row.project,
         tier: Tier::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 
@@ -209,6 +214,9 @@ fn caller(tier: Tier) -> Caller {
         name: "agent".into(),
         project: "p".into(),
         tier,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 
@@ -270,6 +278,9 @@ async fn whoami_prefers_the_authenticated_session_agent_id_over_a_reused_name() 
         name: "stale-name".into(),
         project: "stale-project-metadata".into(),
         tier: Tier::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
 
     let who = identity.whoami(&caller).await.unwrap();
@@ -310,6 +321,9 @@ async fn whoami_rejects_an_ambiguous_agent_fallback_for_an_idless_session() {
         name: "ambiguous-fossil".into(),
         project: "p_demo".into(),
         tier: Tier::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
 
     let error = identity.whoami(&caller).await.unwrap_err();
@@ -435,7 +449,7 @@ async fn human_registration_never_materializes_an_agent_identity_or_runtime() {
         .await
         .unwrap()
         .expect("human session remains durable");
-    assert_eq!(row.kind, "human");
+    assert_eq!(row.kind, "local.human");
     assert_eq!(row.agent_id, None);
 
     for table in ["agents", "agent_runtimes"] {
@@ -469,6 +483,9 @@ async fn human_registration_never_materializes_an_agent_identity_or_runtime() {
         name: "operator".into(),
         project: "p_demo".into(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     assert_eq!(identity.whoami(&human).await.unwrap().agent_id, None);
     assert!(
@@ -487,6 +504,45 @@ async fn human_registration_never_materializes_an_agent_identity_or_runtime() {
             .is_empty(),
         "the agent roster must not include durable human principals"
     );
+}
+
+#[tokio::test]
+async fn external_human_registration_round_trips_locality_and_access_in_member_directory() {
+    let (identity, store, _sink) = fixture().await;
+    let mut request = req("outside", "ck_external_human");
+    request.kind = Some(Kind::Human);
+    request.locality = Locality::External;
+    request.access = Some("guest".into());
+    request.tier = Tier::Admin;
+
+    let registered = identity.register(request).await.unwrap();
+    let directory = identity
+        .members(
+            &caller(Tier::Admin),
+            MemberListRequest {
+                project: None,
+                include_offline: Some(true),
+                include_dead: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+    let member = directory
+        .members
+        .iter()
+        .find(|member| member.session_id == registered.session_id)
+        .expect("external human is projected into the global member directory");
+    assert_eq!(member.locality, Locality::External);
+    assert_eq!(member.access.as_deref(), Some("guest"));
+    assert_eq!(member.agent_id, None);
+
+    let row = Sessions::new(&store)
+        .find_by_session_id(&registered.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.kind, "external.human");
+    assert_eq!(row.access().unwrap().as_deref(), Some("guest"));
 }
 
 #[tokio::test]
@@ -521,6 +577,9 @@ async fn human_resume_scrubs_a_persisted_stale_agent_binding() {
         name: "browser-user".into(),
         project: "p_demo".into(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     assert_eq!(
         identity.whoami(&persisted_human).await.unwrap().agent_id,
@@ -537,7 +596,7 @@ async fn human_resume_scrubs_a_persisted_stale_agent_binding() {
         .await
         .unwrap()
         .expect("human session survives the compatibility scrub");
-    assert_eq!(row.kind, "human");
+    assert_eq!(row.kind, "local.human");
     assert_eq!(row.agent_id, None);
     assert!(AgentRuntimes::new(&store)
         .find_by_runtime_id(&registered.session_id.0)
@@ -559,6 +618,9 @@ async fn human_resume_scrubs_a_persisted_stale_agent_binding() {
         name: "browser-user".into(),
         project: "p_demo".into(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
     let who = identity.whoami(&caller).await.unwrap();
     assert_eq!(who.agent_id, None);
@@ -585,14 +647,16 @@ async fn a_human_registration_cannot_resume_an_agent_session_by_client_key() {
     let error = identity.register(human).await.unwrap_err();
 
     assert_eq!(error.code, nexus_contracts::codes::INVALID_PARAMS);
-    assert!(error.message.contains("belongs to session kind agent"));
+    assert!(error
+        .message
+        .contains("belongs to session kind local.agent"));
     let after = Sessions::new(&store)
         .find_by_session_id(&agent.session_id)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(after.name, before.name);
-    assert_eq!(after.kind, "agent");
+    assert_eq!(after.kind, "local.agent");
     assert_eq!(after.client_key, before.client_key);
     assert!(Sessions::new(&store)
         .find_by_name_any_project("browser-user")
@@ -1034,6 +1098,9 @@ async fn rename_cross_project_group_aliases_by_stable_id(identity: &Identity, st
         name: "olive".into(),
         project: row.project,
         tier: Tier::Agent,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     };
 
     identity
@@ -2250,6 +2317,9 @@ fn tier_guard_blocks_agent_from_admin() {
     let agent = caller(Tier::Agent);
     let admin = Caller {
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
         ..agent.clone()
     };
 
@@ -2433,6 +2503,9 @@ async fn staged_caller_claims_its_first_name_when_free() {
                 name: String::new(),
                 project: "p_demo".into(),
                 tier: Tier::Agent,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
             },
             RenameRequest {
                 name: "selby".into(),
@@ -2474,6 +2547,9 @@ async fn staged_caller_cannot_claim_a_taken_name() {
                 name: String::new(),
                 project: "p_demo".into(),
                 tier: Tier::Agent,
+                locality: Default::default(),
+                access: None,
+                principal_id: None,
             },
             RenameRequest {
                 name: "olive".into(),

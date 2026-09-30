@@ -51,6 +51,8 @@ fn register_request(
         runtime_credential: None,
         tier,
         kind: Some(kind),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -84,6 +86,7 @@ fn create_thread_intent(
         caller_agent_id: None,
         caller_runtime_id: None,
         caller_client_key,
+        caller_principal_id: None,
         caller_kind: Some("human".into()),
         caller_tier: Some("admin".into()),
         idempotency_key: None,
@@ -207,6 +210,9 @@ fn caller_for_session(
         name: name.into(),
         project: "default".into(),
         tier,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 
@@ -357,6 +363,7 @@ async fn command_worker_identity_attach_records_event_for_operator_command() {
             caller_agent_id: None,
             caller_runtime_id: Some("local-operator".to_string()),
             caller_client_key: None,
+            caller_principal_id: None,
             caller_kind: Some("human".to_string()),
             caller_tier: Some("admin".to_string()),
             idempotency_key: None,
@@ -524,6 +531,7 @@ async fn authenticated_command_refreshes_active_runtime_presence() {
             caller_agent_id: registered.agent_id.as_ref().map(|id| id.0.clone()),
             caller_runtime_id: Some(registered.session_id.0.clone()),
             caller_client_key: Some("ck_active_agent".to_string()),
+            caller_principal_id: None,
             caller_kind: Some("agent".to_string()),
             caller_tier: Some("agent".to_string()),
             idempotency_key: None,
@@ -726,6 +734,9 @@ async fn command_worker_rejects_runtime_client_key_after_credential_revoke() {
             name: "operator".into(),
             project: "default".into(),
             tier: Tier::Admin,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         }),
         revoke,
     )
@@ -818,6 +829,7 @@ async fn rename_keeps_mcp_and_cli_env_writes_live_and_canonically_attributed() {
         caller_agent_id: None,
         caller_runtime_id: None,
         caller_client_key: Some("ck_rename_continuity".into()),
+        caller_principal_id: None,
         caller_kind: Some("agent".into()),
         caller_tier: Some("agent".into()),
         idempotency_key: None,
@@ -1129,6 +1141,7 @@ async fn command_worker_accepts_web_gateway_row_with_registered_key() {
             caller_agent_id: registered.agent_id.as_ref().map(|id| id.0.clone()),
             caller_runtime_id: Some(registered.session_id.0),
             caller_client_key: Some("ck_web_human".into()),
+            caller_principal_id: None,
             caller_kind: Some("human".into()),
             caller_tier: Some("admin".into()),
             idempotency_key: None,

@@ -418,7 +418,7 @@ impl AppState {
         // standing up the drainer. If it did NOT (errored bind / dead connection), DON'T spawn the
         // loop — the member row remains and a future wake re-drives `ensure_live`, keeping the message
         // re-driveable instead of burning the one attach re-ring on a dead adapter.
-        if row.kind == "agent" {
+        if row.is_agent() {
             if !agent.is_live(&session) {
                 tracing::warn!(
                     target: "nexus::launch",
@@ -542,7 +542,7 @@ impl AppState {
                 }
                 let sessions = Sessions::new(&this.store);
                 if let Ok(Some(row)) = sessions.find_by_session_id(&sid).await {
-                    if row.kind == "agent" && !Self::is_externally_drained_session(&row) {
+                    if row.is_agent() && !Self::is_externally_drained_session(&row) {
                         tracing::info!(
                             target: "nexus::revive",
                             name = %row.display_name(),
@@ -670,7 +670,7 @@ impl AppState {
             else {
                 continue;
             };
-            if row.kind != "agent" {
+            if !row.is_agent() {
                 continue;
             }
             if Self::is_externally_drained_session(&row) {
@@ -737,7 +737,7 @@ impl AppState {
             let Ok(Some(target)) = target else {
                 return;
             };
-            if target.kind != "agent" {
+            if !target.is_agent() {
                 return;
             }
 
@@ -817,7 +817,7 @@ impl AppState {
             let Ok(Some(row)) = row else {
                 continue;
             };
-            if row.kind != "agent" {
+            if !row.is_agent() {
                 continue;
             }
             self.wake_dm_agent(
@@ -851,7 +851,7 @@ impl AppState {
         let Ok(Some(target)) = target else {
             return;
         };
-        if target.kind != "agent"
+        if !target.is_agent()
             || Self::is_externally_drained_session(&target)
             || self
                 .inbox_subscription_owns_delivery(&target.session_id)
@@ -896,7 +896,7 @@ impl AppState {
             }
             // Only agents have an ACP session to wake; skip operator/app members.
             match sessions.find_by_name_any_project(&name).await {
-                Ok(Some(m)) if m.kind == "agent" && !Self::is_externally_drained_session(&m) => {
+                Ok(Some(m)) if m.is_agent() && !Self::is_externally_drained_session(&m) => {
                     if self.inbox_subscription_owns_delivery(&m.session_id).await {
                         continue;
                     }

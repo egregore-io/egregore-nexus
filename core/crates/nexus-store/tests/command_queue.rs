@@ -12,8 +12,8 @@ async fn store() -> Store {
     store
         .conn
         .execute(
-            "INSERT INTO sessions (session_id, agent_id, name, agent, project, created_at) \
-             VALUES ('s_otto', 'a_otto', 'otto', 'codex', 'default', 1)",
+            "INSERT INTO sessions (session_id, agent_id, name, agent, kind, project, created_at) \
+             VALUES ('s_otto', 'a_otto', 'otto', 'codex', 'agent', 'default', 1)",
             (),
         )
         .await
@@ -31,6 +31,7 @@ fn prompt(command_id: &str, created_at: i64) -> NewCommandIntent {
         caller_agent_id: None,
         caller_runtime_id: Some("local-operator".into()),
         caller_client_key: None,
+        caller_principal_id: None,
         caller_kind: Some("human".into()),
         caller_tier: Some("admin".into()),
         idempotency_key: Some(format!("cm_{command_id}")),
@@ -316,6 +317,7 @@ async fn split_store_snapshot_reads_runtime_from_transport_and_queue_from_identi
             caller_agent_id: None,
             caller_runtime_id: Some("local-operator".into()),
             caller_client_key: None,
+            caller_principal_id: None,
             caller_kind: Some("human".into()),
             caller_tier: Some("admin".into()),
             idempotency_key: Some("cm_split".into()),
@@ -425,6 +427,7 @@ async fn terminal_command_events_preserve_kind_and_authenticated_caller_for_ever
                 caller_agent_id: None,
                 caller_runtime_id: Some("s_human".into()),
                 caller_client_key: Some("nexus_ck_human".into()),
+                caller_principal_id: None,
                 caller_kind: Some("human".into()),
                 caller_tier: Some("admin".into()),
                 idempotency_key: Some(client_message_id.clone()),
@@ -482,7 +485,7 @@ async fn terminal_command_events_preserve_kind_and_authenticated_caller_for_ever
         assert_eq!(event.caller_name, "Operator");
         assert_eq!(event.caller_session_id.as_deref(), Some("s_human"));
         assert_eq!(event.caller_agent_id, None);
-        assert_eq!(event.caller_kind.as_deref(), Some("human"));
+        assert_eq!(event.caller_kind.as_deref(), Some("local.human"));
         assert!(event
             .client_message_id
             .as_deref()

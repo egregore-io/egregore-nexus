@@ -195,7 +195,8 @@ impl<'a> CodexRuntimeStateRepo<'a> {
         };
         NativeThreadBindings::new(self.store)
             .claim(NewNativeThreadBinding {
-                harness: "codex".into(),
+                provider: "codex".into(),
+                kind: "harness".into(),
                 native_thread_id: codex_thread_id.to_string(),
                 agent_id,
                 project: row.project,

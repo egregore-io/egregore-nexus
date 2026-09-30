@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use libsql::params;
 use nexus_common::{new_message_id, new_thread_id, now, NexusError};
+use nexus_contracts::entity_kind;
 use nexus_contracts::enums::{Kind, Scope, Tier};
 use nexus_contracts::events::WsEvent;
 use nexus_contracts::hooks::{
@@ -908,12 +909,8 @@ impl Bus {
                 .map_err(|error| NexusError::Store(error.to_string()))?,
             None => "agent".to_string(),
         };
-        let kind = match raw.as_str() {
-            "human" => Kind::Human,
-            "notification" => Kind::Notification,
-            "app" => Kind::App,
-            _ => Kind::Agent,
-        };
+        let (_, kind) = entity_kind::parse(&raw)
+            .ok_or_else(|| NexusError::Invalid(format!("unknown session entity kind: {raw}")))?;
         self.sender_kinds
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1071,6 +1068,8 @@ impl Bus {
         let provenance = nexus_contracts::Provenance {
             from: "nexus".to_string(),
             kind: nexus_contracts::Kind::Notification,
+            locality: Default::default(),
+            access: None,
             thread: Some(thread_name.to_string()),
             topic: None,
             stamp: None,

@@ -18,6 +18,8 @@ use serde_json::json;
 /// The compiled fake harness binary. `CARGO_BIN_EXE_<name>` is injected by Cargo because the
 /// harness is a `[[bin]]` of this crate, so it is always built before these tests run.
 const FAKE_HARNESS: &str = env!("CARGO_BIN_EXE_fake_acp_agent");
+const CLAUDE_INTERRUPTED_HANDOFF: &str =
+    "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null";
 
 /// Concatenate the reply text from a drained stream — i.e. the `text` of every `Text`-kind event,
 /// in order. The full-stream pass-through also relays thinking / tool-call / plan events; the
@@ -67,6 +69,18 @@ fn fake_prompt_error_command(data: serde_json::Value) -> HarnessCommand {
         args: vec![],
         cwd: None,
         env: vec![("FAKE_ACP_PROMPT_ERROR_DATA".to_string(), data.to_string())],
+    }
+}
+
+fn fake_prompt_error_message_command(message: &str) -> HarnessCommand {
+    HarnessCommand {
+        program: FAKE_HARNESS.to_string(),
+        args: vec![],
+        cwd: None,
+        env: vec![(
+            "FAKE_ACP_PROMPT_ERROR_MESSAGE".to_string(),
+            message.to_string(),
+        )],
     }
 }
 
@@ -139,6 +153,50 @@ async fn engine_open_inject_stream_round_trip() {
     assert_eq!(
         chunks2,
         vec!["echo: ".to_string(), "second turn".to_string()]
+    );
+}
+
+/// Real Codex ACP can coalesce a complete assistant reply into one large
+/// `AgentMessageChunk`. The Nexus session stream still exposes bounded, ordered deltas, and
+/// concatenating them preserves the exact UTF-8 provider reply.
+#[tokio::test]
+async fn engine_normalizes_one_coalesced_reply_into_bounded_text_deltas() {
+    let original = "αβγδ progressive reply line\n".repeat(64);
+    let mut command = fake_command();
+    command
+        .env
+        .push(("FAKE_ACP_REPLY".to_string(), "coalesced".to_string()));
+    command
+        .env
+        .push(("FAKE_ACP_REPLY_BODY".to_string(), original.clone()));
+    let engine = AcpEngine::new();
+    engine
+        .spawn_and_initialize(&command)
+        .await
+        .expect("spawn + ACP initialize against a coalescing bridge");
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .expect("session/new");
+
+    engine
+        .inject("produce one coalesced reply".to_string())
+        .await
+        .expect("session/prompt turn completes");
+
+    let chunks = reply_chunks(engine.take_updates());
+    assert!(
+        chunks.len() >= 2,
+        "one coalesced ACP reply must become multiple bounded Nexus deltas"
+    );
+    assert!(
+        chunks.iter().all(|chunk| chunk.len() <= 512),
+        "every normalized delta must honor the byte ceiling"
+    );
+    assert_eq!(
+        chunks.concat(),
+        original,
+        "delta normalization must preserve the exact UTF-8 reply"
     );
 }
 
@@ -375,6 +433,159 @@ async fn engine_preserves_structured_acp_server_error_as_retryable_provider_fail
     assert_eq!(error.reason, "server_error");
     assert_eq!(error.source, "claude.acp.prompt_error");
     assert!(error.retryable);
+}
+
+/// Claude's ACP bridge can append an interrupt-and-send replacement prompt, return this exact
+/// bridge diagnostic for the cancelled request, and then stream the replacement model turn. The
+/// durable delivery must wait for that causal model output instead of recording an error or
+/// retrying the prompt that is already present in Claude's transcript.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_observed_interrupted_handoff_settles_only_after_model_output() {
+    let engine = AcpEngine::for_harness(HarnessId::new("claude").unwrap());
+    let mut command =
+        fake_prompt_error_message_command(&format!("Internal error: {CLAUDE_INTERRUPTED_HANDOFF}"));
+    command.env.extend([
+        (
+            "FAKE_ACP_PROMPT_ERROR_THEN_REPLY_MS".to_string(),
+            "50".to_string(),
+        ),
+        ("FAKE_ACP_REPLY".to_string(), "bare".to_string()),
+        ("FAKE_ACP_REPLY_BODY".to_string(), "r".to_string()),
+    ]);
+    engine
+        .spawn_and_initialize(&command)
+        .await
+        .expect("spawn + initialize");
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .expect("session/new");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        engine.inject_with_accepted_event(
+            "interrupt-and-send replacement".to_string(),
+            Some(StreamEvent {
+                kind: AgentUpdateKind::UserInput,
+                data: json!({"text": "accepted input"}),
+            }),
+        ),
+    )
+    .await
+    .expect("Claude replacement handoff must settle after model output")
+    .expect("causal replacement model output proves recipient delivery");
+
+    assert_eq!(
+        reply_text(engine.take_updates()),
+        "r",
+        "the replacement output remains available to the relay"
+    );
+}
+
+/// The same diagnostic without a subsequent model event is not delivery evidence. Keep the
+/// obligation pending for the engine's existing completion timeout; never accept the diagnostic
+/// itself as success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_observed_interrupted_handoff_without_model_output_stays_unsettled() {
+    let engine = AcpEngine::for_harness(HarnessId::new("claude").unwrap());
+    let command = fake_prompt_error_command(json!(CLAUDE_INTERRUPTED_HANDOFF));
+    engine
+        .spawn_and_initialize(&command)
+        .await
+        .expect("spawn + initialize");
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .expect("session/new");
+
+    let mut delivery = Box::pin(engine.inject_with_accepted_event(
+        "replacement with no model output".to_string(),
+        Some(StreamEvent::text("accepted input")),
+    ));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), &mut delivery)
+            .await
+            .is_err(),
+        "the bridge diagnostic alone must not settle or fail the durable delivery"
+    );
+}
+
+/// `session/cancel` is a notification: a bridge may accept it but leave the cancelled
+/// `session/prompt` request unanswered until a replacement prompt arrives. Nexus must release its
+/// local prompt serialization boundary at the accepted cancel, otherwise the replacement can
+/// never be sent and the session remains deaf until the ten-minute turn timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_cancel_releases_unanswered_prompt_for_the_replacement_turn() {
+    let marker = std::env::temp_dir().join(format!(
+        "nexus-acp-cancel-handoff-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let engine = Arc::new(AcpEngine::for_harness(HarnessId::new("claude").unwrap()));
+    let command = HarnessCommand {
+        program: FAKE_HARNESS.to_string(),
+        args: vec![],
+        cwd: None,
+        env: vec![(
+            "FAKE_ACP_NO_TURN_END_ONCE".to_string(),
+            marker.display().to_string(),
+        )],
+    };
+    engine
+        .spawn_and_initialize(&command)
+        .await
+        .expect("spawn + initialize");
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .expect("session/new");
+
+    let first_engine = Arc::clone(&engine);
+    let first = tokio::spawn(async move {
+        first_engine
+            .inject_with_accepted_event(
+                "turn that the bridge never answers".to_string(),
+                Some(StreamEvent::text("accepted first input")),
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !marker.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first prompt must reach the fake ACP bridge");
+
+    engine
+        .cancel_active_turn()
+        .await
+        .expect("session/cancel must be accepted");
+    tokio::time::timeout(std::time::Duration::from_secs(2), first)
+        .await
+        .expect("accepted cancel must release the unanswered local prompt")
+        .expect("first inject task must join")
+        .expect("an intentionally cancelled accepted prompt is a closed turn");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        engine.inject_with_accepted_event(
+            "replacement must not wait ten minutes".to_string(),
+            Some(StreamEvent::text("accepted replacement input")),
+        ),
+    )
+    .await
+    .expect("replacement prompt must cross the released serialization boundary")
+    .expect("the replacement turn must complete");
+    assert!(
+        reply_text(engine.take_updates()).contains("replacement must not wait ten minutes"),
+        "the completed replacement output must remain available to the relay"
+    );
+
+    let _ = std::fs::remove_file(marker);
 }
 
 #[tokio::test]
@@ -619,6 +830,110 @@ async fn observed_engine_inject_rejects_quiescence_without_terminal_response() {
     assert!(
         matches!(error, InjectError::CompletionTimeout { ref source, .. } if source == "opencode.acp.turn_completion"),
         "missing terminal response must remain typed completion_timeout, got {error:?}"
+    );
+
+    std::env::remove_var("NEXUS_ACP_TURN_TIMEOUT_SECS");
+    std::env::remove_var("NEXUS_ACP_QUIESCENCE_MS");
+}
+
+/// The pinned codex-acp bridge can render a complete model reply and then leave
+/// `session/prompt` unanswered. A durable observed delivery may settle only after a real Codex
+/// model event from this turn reaches quiescence; the synthetic accepted-input event alone is
+/// insufficient. Other ACP harnesses retain the strict terminal-response rule above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_observed_engine_settles_rendered_reply_via_quiescence() {
+    std::env::set_var("NEXUS_ACP_TURN_TIMEOUT_SECS", "2");
+    std::env::set_var("NEXUS_ACP_QUIESCENCE_MS", "100");
+
+    let engine = AcpEngine::for_harness(HarnessId::new("codex").unwrap());
+    let cmd = HarnessCommand {
+        program: FAKE_HARNESS.to_string(),
+        args: vec![],
+        cwd: None,
+        env: vec![
+            ("FAKE_ACP_NO_TURN_END".to_string(), "1".to_string()),
+            ("FAKE_ACP_REPLY".to_string(), "bare".to_string()),
+            (
+                "FAKE_ACP_REPLY_BODY".to_string(),
+                "codex-rendered-reply".to_string(),
+            ),
+        ],
+    };
+    engine
+        .spawn_and_initialize(&cmd)
+        .await
+        .expect("spawn + initialize");
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .expect("session/new");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        engine.inject_with_accepted_event(
+            "Codex must visibly receive this delivery".to_string(),
+            Some(StreamEvent {
+                kind: AgentUpdateKind::UserInput,
+                data: json!({"text": "accepted input"}),
+            }),
+        ),
+    )
+    .await
+    .expect("Codex observed delivery must settle after rendered output goes quiet")
+    .expect("rendered Codex output is recipient-side delivery evidence");
+
+    assert_eq!(
+        reply_text(engine.take_updates()),
+        "codex-rendered-reply",
+        "the rendered reply must remain available to the stream relay"
+    );
+
+    std::env::remove_var("NEXUS_ACP_TURN_TIMEOUT_SECS");
+    std::env::remove_var("NEXUS_ACP_QUIESCENCE_MS");
+}
+
+/// Codex's observed-delivery fallback must never treat the synthetic accepted-input event as model
+/// output. Without a fresh renderable event, a missing `session/prompt` response remains a typed
+/// completion timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_observed_engine_rejects_quiescence_without_real_model_output() {
+    std::env::set_var("NEXUS_ACP_TURN_TIMEOUT_SECS", "1");
+    std::env::set_var("NEXUS_ACP_QUIESCENCE_MS", "100");
+
+    let engine = AcpEngine::for_harness(HarnessId::new("codex").unwrap());
+    let cmd = HarnessCommand {
+        program: FAKE_HARNESS.to_string(),
+        args: vec![],
+        cwd: None,
+        env: vec![
+            ("FAKE_ACP_NO_TURN_END".to_string(), "1".to_string()),
+            ("FAKE_ACP_REPLY".to_string(), "bare".to_string()),
+            ("FAKE_ACP_REPLY_BODY".to_string(), String::new()),
+        ],
+    };
+    engine
+        .spawn_and_initialize(&cmd)
+        .await
+        .expect("spawn + initialize");
+    engine
+        .new_session(None, &LaunchCtx::default())
+        .await
+        .expect("session/new");
+
+    let error = engine
+        .inject_with_accepted_event(
+            "accepted input without a model reply".to_string(),
+            Some(StreamEvent::text("accepted input")),
+        )
+        .await
+        .expect_err("the synthetic accepted-input event alone must not prove completion");
+    assert!(
+        matches!(
+            error,
+            AdapterInjectError::CompletionTimeout { ref origin }
+                if origin == "codex.acp.turn_completion"
+        ),
+        "missing Codex model output must remain a typed completion timeout, got {error:?}"
     );
 
     std::env::remove_var("NEXUS_ACP_TURN_TIMEOUT_SECS");

@@ -15,8 +15,8 @@ use serde::Serialize;
 
 use nexus_common::now;
 use nexus_contracts::{
-    codes, validate_send_request, Ack, ContractError, DaemonIpcCall, DaemonIpcCaller,
-    DaemonIpcRequest, Kind, NotifySendRequest, RegisterRequest, SendRequest, Tier,
+    codes, entity_kind, validate_send_request, Ack, ContractError, DaemonIpcCall, DaemonIpcCaller,
+    DaemonIpcRequest, Kind, Locality, NotifySendRequest, RegisterRequest, SendRequest, Tier,
     DAEMON_IPC_PROTOCOL_VERSION,
 };
 use nexus_store::command_kinds;
@@ -59,6 +59,9 @@ struct StoreCaller {
     runtime_id: Option<String>,
     client_key: Option<String>,
     kind: Kind,
+    locality: Locality,
+    access: Option<String>,
+    principal_id: Option<String>,
     tier: Tier,
 }
 
@@ -134,6 +137,9 @@ impl StoreClient {
                 runtime_id: None,
                 client_key,
                 kind,
+                locality: Locality::Local,
+                access: None,
+                principal_id: None,
                 tier,
             },
         )
@@ -331,7 +337,11 @@ impl StoreClient {
                         caller_agent_id: self.caller.agent_id.clone(),
                         caller_runtime_id: self.caller.runtime_id.clone(),
                         caller_client_key: self.caller.client_key.clone(),
-                        caller_kind: Some(kind_token(self.caller.kind).to_string()),
+                        caller_principal_id: None,
+                        caller_kind: Some(entity_kind::dotted(
+                            self.caller.locality,
+                            self.caller.kind,
+                        )),
                         caller_tier: Some(tier_token(self.caller.tier).to_string()),
                         idempotency_key: idempotency_key.clone(),
                         request_json: request_json.clone(),
@@ -350,7 +360,11 @@ impl StoreClient {
                         caller_agent_id: self.caller.agent_id.clone(),
                         caller_runtime_id: self.caller.runtime_id.clone(),
                         caller_client_key: self.caller.client_key.clone(),
-                        caller_kind: Some(kind_token(self.caller.kind).to_string()),
+                        caller_principal_id: None,
+                        caller_kind: Some(entity_kind::dotted(
+                            self.caller.locality,
+                            self.caller.kind,
+                        )),
                         caller_tier: Some(tier_token(self.caller.tier).to_string()),
                         idempotency_key: None,
                         request_json: request_json.clone(),
@@ -505,6 +519,9 @@ impl StoreCaller {
             runtime_id: Some(LOCAL_OPERATOR_SESSION_ID.to_string()),
             client_key: None,
             kind: Kind::Human,
+            locality: Locality::Local,
+            access: None,
+            principal_id: None,
             tier: Tier::Admin,
         }
     }
@@ -525,6 +542,9 @@ impl StoreCaller {
             runtime_id: None,
             client_key: Some(identity.client_key),
             kind: identity.kind.unwrap_or(Kind::Agent),
+            locality: identity.locality,
+            access: identity.access,
+            principal_id: None,
             tier: identity.tier,
         }
     }
@@ -545,11 +565,15 @@ impl StoreCaller {
             return Ok(self);
         };
 
+        let (locality, kind) = row.entity_kind().map_err(store_err)?;
+        let access = row.access().map_err(store_err)?;
         self.name = row.display_name();
         self.project = row.project;
         self.agent_id = row.agent_id.or(self.agent_id);
         self.client_key = row.client_key.or(self.client_key);
-        self.kind = kind_from_store(row.kind.as_str());
+        self.kind = kind;
+        self.locality = locality;
+        self.access = access;
         self.tier = tier_from_store(row.tier.as_str());
         Ok(self)
     }
@@ -563,6 +587,9 @@ impl StoreCaller {
             runtime_id: self.runtime_id.clone(),
             client_key: self.client_key.clone(),
             kind: self.kind,
+            locality: self.locality,
+            access: self.access.clone(),
+            principal_id: self.principal_id.clone(),
             tier: self.tier,
         }
     }
@@ -602,24 +629,6 @@ fn ipc_err(e: std::io::Error) -> ContractError {
     ContractError {
         code: codes::INTERNAL_ERROR,
         message: format!("daemon IPC error: {e}"),
-    }
-}
-
-fn kind_token(kind: Kind) -> &'static str {
-    match kind {
-        Kind::Agent => "agent",
-        Kind::Human => "human",
-        Kind::Notification => "notification",
-        Kind::App => "app",
-    }
-}
-
-fn kind_from_store(kind: &str) -> Kind {
-    match kind {
-        "human" => Kind::Human,
-        "notification" => Kind::Notification,
-        "app" => Kind::App,
-        _ => Kind::Agent,
     }
 }
 

@@ -135,4 +135,6 @@ pub mod codes {
     pub const HOOK_GATEWAY_UNAVAILABLE: i32 = -32008;
     /// The selected delivery timing cannot be honored by the target harness.
     pub const DELIVERY_TIMING_UNSUPPORTED: i32 = -32009;
+    /// The durable per-session prompt queue reached its bounded pending-row capacity.
+    pub const COMMAND_QUEUE_FULL: i32 = -32010;
 }

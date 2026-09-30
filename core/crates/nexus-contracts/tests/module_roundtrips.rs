@@ -944,6 +944,8 @@ mod message {
             provenance: Provenance {
                 from: "dylan".into(),
                 kind: Kind::Agent,
+                locality: Default::default(),
+                access: None,
                 thread: Some("backend".into()),
                 topic: None,
                 stamp: Some(ProvenanceStamp {
@@ -982,6 +984,8 @@ mod message {
             provenance: Provenance {
                 from: "erin".into(),
                 kind: Kind::Human,
+                locality: Default::default(),
+                access: None,
                 thread: None,
                 topic: None,
                 stamp: None,
@@ -1144,6 +1148,8 @@ mod register {
             runtime_credential: Some("secret".into()),
             tier: Tier::Agent,
             kind: None,
+            locality: Default::default(),
+            access: None,
             role: None,
             cwd: None,
         };
@@ -1201,6 +1207,8 @@ mod register {
                 name: Some("ben".into()),
                 session_id: SessionId("s_ben".into()),
                 agent: Some("claude".into()),
+                locality: Default::default(),
+                access: None,
                 role: Some("backend".into()),
                 presence: Presence::Busy,
                 current_work: Some("auth refactor".into()),
@@ -1350,6 +1358,7 @@ mod rpc {
         assert_eq!(codes::INVALID_PARAMS, -32602);
         assert_eq!(codes::INTERNAL_ERROR, -32603);
         assert_eq!(codes::ACTIVE_TURN_REQUIRED, -32006);
+        assert_eq!(codes::COMMAND_QUEUE_FULL, -32010);
     }
 }
 

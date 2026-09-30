@@ -23,15 +23,13 @@ function identity(
 
 function ownedBy(
   name: string,
-  project = "default",
+  _project = "default",
   attrs: Partial<AgentOwnerRow> = {},
 ): AgentOwnerRow {
   return {
     agentId: "a_target",
     name: "target",
-    project,
     ownerName: name,
-    ownerProject: project,
     ownerSessionId: `s_${name}`,
     ...attrs,
   };
@@ -51,7 +49,7 @@ describe("canObserveAgentSession", () => {
     expect(canObserveAgentSession(undefined, identity("operator"))).toBe(true);
     expect(
       canObserveAgentSession(
-        { agentId: "a_target", name: "target", project: "default" },
+        { agentId: "a_target", name: "target" },
         identity("operator"),
       ),
     ).toBe(true);
@@ -173,8 +171,6 @@ describe("canObserveAgentSession", () => {
     const humanAdmin = identity("operator", "default", { kind: Kind.Human, tier: Tier.Admin });
     expect(canObserveAgentSession(ownedBy("owner", "default", { tier: "admin" }), humanAdmin))
       .toBe(true);
-    expect(canObserveAgentSession(ownedBy("owner", "default", { role: "lead" }), humanAdmin))
-      .toBe(true);
     expect(
       canObserveAgentSession(
         ownedBy("owner", "default", { sessionKind: "human", sessionTier: "admin" }),
@@ -190,8 +186,6 @@ describe("canObserveAgentSession", () => {
     });
     expect(canObserveAgentSession(ownedBy("owner"), agentAdmin)).toBe(true);
     expect(canObserveAgentSession(ownedBy("owner", "default", { tier: "admin" }), agentAdmin))
-      .toBe(false);
-    expect(canObserveAgentSession(ownedBy("owner", "default", { role: "lead" }), agentAdmin))
       .toBe(false);
     expect(canObserveAgentSession(ownedBy("owner", "default", { sessionKind: "human" }), agentAdmin))
       .toBe(false);

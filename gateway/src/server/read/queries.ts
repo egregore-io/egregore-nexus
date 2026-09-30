@@ -57,7 +57,6 @@ export interface MemberRow {
   agent?: string;
   /** Registration kind: `agent` | `human` | `app` | `notification`. Humans are not DM targets. */
   kind?: string;
-  role?: string;
   tier?: string;
   presence: string;
   currentWork?: string;
@@ -165,9 +164,7 @@ export interface WhoamiRow {
   agentId?: string;
   name: string;
   sessionId: string;
-  role?: string;
   tier: string;
-  project: string;
   presence: string;
 }
 
@@ -187,9 +184,7 @@ export interface AgentRuntimeRow {
 export interface AgentSummaryRow {
   agentId: string;
   name: string;
-  project: string;
   defaultHarness?: string;
-  role?: string;
   tier?: string;
   disabled: boolean;
   activeRuntime?: AgentRuntimeRow;
@@ -198,15 +193,11 @@ export interface AgentSummaryRow {
 export interface AgentOwnerRow {
   agentId: string;
   name: string;
-  project: string;
-  role?: string;
   tier?: string;
   ownerName?: string;
-  ownerProject?: string;
   ownerSessionId?: string;
   ownerAgentId?: string;
   sessionKind?: string;
-  sessionRole?: string;
   sessionTier?: string;
 }
 
@@ -291,7 +282,6 @@ export async function listMembers(
       sessionId: sessions.sessionId,
       agent: sessions.agent,
       kind: sessions.kind,
-      role: sessions.role,
       tier: sessions.tier,
       presence: sessions.presence,
       lastHeartbeat: sessions.lastHeartbeat,
@@ -314,7 +304,6 @@ export async function listMembers(
         agentId: opt(r.agentId),
         agent: kind === "agent" ? opt(r.agent) : undefined,
         kind,
-        role: opt(r.role),
         tier: opt(r.tier),
         presence: r.effectivePresence,
         currentWork: opt(r.currentWork),
@@ -410,9 +399,7 @@ async function agentByIdOrName(
   const columns = {
     agentId: agents.agentId,
     name: agents.name,
-    project: agents.project,
     defaultHarness: agents.defaultHarness,
-    role: agents.role,
     tier: agents.tier,
     disabledAt: agents.disabledAt,
   };
@@ -435,9 +422,7 @@ async function agentByIdOrName(
   return {
     agentId: row.agentId,
     name: row.name ?? "",
-    project: row.project ?? "",
     defaultHarness: opt(row.defaultHarness),
-    role: opt(row.role),
     tier: opt(row.tier),
     disabled: row.disabledAt !== null,
   };
@@ -451,11 +436,8 @@ export async function agentOwnerByName(
   const columns = {
     agentId: agents.agentId,
     name: agents.name,
-    project: agents.project,
-    role: agents.role,
     tier: agents.tier,
     ownerName: agents.ownerName,
-    ownerProject: agents.ownerProject,
     ownerSessionId: agents.ownerSessionId,
     ownerAgentId: agents.ownerAgentId,
   };
@@ -480,7 +462,6 @@ export async function agentOwnerByName(
   if (!row) return undefined;
   const sessionColumns = {
     sessionKind: sessions.kind,
-    sessionRole: sessions.role,
     sessionTier: sessions.tier,
   };
   let sessionRows = await db
@@ -506,15 +487,11 @@ export async function agentOwnerByName(
   return {
     agentId: row.agentId,
     name: row.name ?? "",
-    project: row.project ?? "",
-    role: opt(row.role),
     tier: opt(row.tier),
     ownerName: opt(row.ownerName),
-    ownerProject: opt(row.ownerProject),
     ownerSessionId: opt(row.ownerSessionId),
     ownerAgentId: opt(row.ownerAgentId),
     sessionKind: opt(session?.sessionKind),
-    sessionRole: opt(session?.sessionRole),
     sessionTier: opt(session?.sessionTier),
   };
 }
@@ -1288,9 +1265,7 @@ export async function whoamiRow(
       agentId: sessions.agentId,
       name: sessions.name,
       sessionId: sessions.sessionId,
-      role: sessions.role,
       tier: sessions.tier,
-      project: sessions.project,
       presence: sessions.presence,
       lastHeartbeat: sessions.lastHeartbeat,
     })
@@ -1310,9 +1285,7 @@ export async function whoamiRow(
     agentId: opt(r.agentId),
     name: r.name ?? "",
     sessionId: r.sessionId,
-    role: opt(r.role),
     tier: r.tier ?? "agent",
-    project: r.project ?? "",
     presence: effectivePresence(r.presence, r.lastHeartbeat, opts),
   };
 }

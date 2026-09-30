@@ -225,6 +225,9 @@ mod tests {
             name: name.into(),
             project: "nexus".into(),
             tier,
+            locality: Default::default(),
+            access: None,
+            principal_id: None,
         }
     }
 

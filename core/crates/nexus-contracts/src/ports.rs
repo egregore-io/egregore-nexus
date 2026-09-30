@@ -205,13 +205,21 @@ pub type InjectResult<T> = Result<T, InjectError>;
 ///
 /// `agent_id` is the durable identity. `session` is the active runtime. During migration,
 /// `agent_id` remains optional so old session-only rows can still be resolved.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct Caller {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
     pub session: SessionId,
     pub name: String,
     pub project: String,
     pub tier: crate::enums::Tier,
+    #[serde(default)]
+    pub locality: crate::enums::Locality,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
 }
 
 /// A message whose target, policy, and `before_send` hook have been accepted but whose durable

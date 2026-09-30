@@ -741,28 +741,32 @@ class LiveGate:
         self.scenario_status["after-receipt-signature"] = "pass"
 
     def verify_idempotent_retry(self) -> None:
+        def hook_work_snapshot() -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+            with self.gateway_db() as db:
+                evaluations = db.execute(
+                    "SELECT * FROM hook_pipeline_evaluations ORDER BY rowid"
+                ).fetchall()
+                executions = db.execute(
+                    "SELECT * FROM hook_handler_executions ORDER BY rowid"
+                ).fetchall()
+            return evaluations, executions
+
         request = {
             "to": {"verb": "post", "thread": "hooks-practical"},
             "body": self.marker("gateway-rest", "after_tool_loop", "REST boundary"),
             "idempotencyKey": "hooks-rest-1",
         }
+        before = hook_work_snapshot()
         duplicate = self.http_json("POST", "/api/v1/messages", request)
         message_id = self.message_ids["gateway-rest"]
         if required_message_id(duplicate) != message_id:
             raise GateFailure("REST idempotent retry returned a different message")
-        with self.gateway_db() as db:
-            evaluations = db.execute(
-                "SELECT COUNT(*) FROM hook_pipeline_evaluations WHERE message_id = ?",
-                (message_id,),
-            ).fetchone()[0]
-            executions = db.execute(
-                "SELECT COUNT(*) FROM hook_handler_executions WHERE evaluation_id IN "
-                "(SELECT evaluation_id FROM hook_pipeline_evaluations WHERE message_id = ?)",
-                (message_id,),
-            ).fetchone()[0]
-        if (evaluations, executions) != (2, 6):
+        after = hook_work_snapshot()
+        if after != before:
             raise GateFailure(
-                f"idempotent retry duplicated hook work: evaluations={evaluations}, executions={executions}"
+                "idempotent retry changed hook work: "
+                f"evaluations={len(before[0])}->{len(after[0])}, "
+                f"executions={len(before[1])}->{len(after[1])}"
             )
         self.scenario_status["idempotent-retry"] = "pass"
 

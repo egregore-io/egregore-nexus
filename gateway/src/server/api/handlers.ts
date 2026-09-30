@@ -21,8 +21,6 @@ import {
   sendSchema,
   spawnSchema,
   agentCredentialCreateSchema,
-  assignRoleSchema,
-  assignProjectSchema,
   grantTierSchema,
   agentAccessGrantSchema,
   agentOwnerTransferSchema,
@@ -38,6 +36,7 @@ import {
   channelSchema,
   routeForwardSchema,
   monitorSchema,
+  transportSecretSchema,
   routeRuleSchema,
   sourceRegisterSchema,
   sourcePushSchema,
@@ -92,11 +91,17 @@ import { longPollCanonicalPage } from "@server/messagePost/longPoll";
 import { gatewayChangeBus } from "@server/store/changeBus";
 import {
   Kind,
+  Locality,
   Tier,
   type Ack,
   type NotifySendRequest,
   type SendRequest,
 } from "@shared/types";
+import { dottedEntityKind } from "@server/identity/entityKind";
+import {
+  removeTransportSecret,
+  setTransportSecret,
+} from "@server/transport/secrets";
 
 /** Maximum time an authorized read may wait for its best-effort human delivery receipt. */
 const HUMAN_READ_RECEIPT_TIMEOUT_MS = 250;
@@ -284,11 +289,17 @@ export const getProjects: Handler = async ({ deps }) =>
 export const getWhoami: Handler = async ({ req }) => {
   const caller = req.caller;
   if (!caller) return fail(401, "not logged in", "unauthorized");
+  const kind = caller.kind ?? Kind.Human;
+  const locality = caller.locality ?? Locality.Local;
   return ok({
     name: caller.name,
     ...(caller.agentId ? { agentId: caller.agentId } : {}),
     sessionId: caller.sessionId ?? "",
-    kind: caller.kind ?? Kind.Human,
+    kind,
+    locality,
+    entityKind: dottedEntityKind(locality, kind),
+    ...(caller.access ? { access: caller.access } : {}),
+    ...(caller.principalId ? { principalId: caller.principalId } : {}),
     tier: caller.tier ?? Tier.Agent,
     project: caller.project,
     presence: "online",
@@ -525,7 +536,7 @@ export const patchThreadMetadata: Handler = async (ctx) =>
 export const patchAgentMetadata: Handler = async (ctx) =>
   patchMetadata(ctx, "agent", ctx.params.id!);
 
-// --- agents (admin spawn/remove/assign-role) ---
+// --- agents (admin spawn/remove; presentation labels use opaque metadata) ---
 
 export const getAgent: Handler = async ({ deps, params, req }) => {
   const row = deps.canonicalDb ? await canonicalAgentShow(await deps.canonicalDb(), params.id!, {
@@ -621,30 +632,6 @@ export const deleteAgent: Handler = async ({ deps, params, req }) => {
       COMMAND_KINDS.adminRemove,
       { ...target, kill },
       req.caller,
-    ),
-  );
-};
-
-export const postAgentRole: Handler = async ({ deps, params, ...rest }) => {
-  const { role } = parseBody({ deps, params, ...rest }, assignRoleSchema);
-  const target = agentCommandTarget(params.id!);
-  return ok(
-    await requireCommands(deps).submit(
-      COMMAND_KINDS.adminAssignRole,
-      { ...target, role },
-      rest.req.caller,
-    ),
-  );
-};
-
-export const postAgentProject: Handler = async ({ deps, params, ...rest }) => {
-  const { project } = parseBody({ deps, params, ...rest }, assignProjectSchema);
-  const target = agentCommandTarget(params.id!);
-  return ok(
-    await requireCommands(deps).submit(
-      COMMAND_KINDS.adminAssignProject,
-      { ...target, project },
-      rest.req.caller,
     ),
   );
 };
@@ -977,6 +964,17 @@ export const postAdminMonitor: Handler = async ({ deps, ...rest }) => {
       rest.req.caller,
     ),
   );
+};
+
+export const postTransportSecret: Handler = async ({ deps, ...rest }) => {
+  if (!deps.canonicalDb) throw new GatewayError(503, "canonical Gateway store is unavailable");
+  const body = parseBody({ deps, ...rest }, transportSecretSchema);
+  return ok(await setTransportSecret(await deps.canonicalDb(), body.key, body.value));
+};
+
+export const deleteTransportSecret: Handler = async ({ deps, params }) => {
+  if (!deps.canonicalDb) throw new GatewayError(503, "canonical Gateway store is unavailable");
+  return ok(await removeTransportSecret(await deps.canonicalDb(), params.key ?? ""));
 };
 
 // --- notification source management ---

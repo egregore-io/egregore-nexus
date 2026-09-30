@@ -1,8 +1,8 @@
 //! Hermes headed gateway bridge.
 //!
 //! Headed Hermes is not driven by tmux keystrokes. Nexus launches `hermes gateway run` with an
-//! isolated `HERMES_HOME` that contains the Nexus gateway platform plugin, then talks to that
-//! plugin over a launch-local socket. Delivery is one-at-a-time and acked only after the plugin
+//! runtime profile under the machine Hermes root that contains the Nexus gateway platform plugin,
+//! then talks to that plugin over a launch-local socket. Delivery is one-at-a-time and acked only after the plugin
 //! surfaces the message into the gateway turn; streaming comes back as `agent_update` frames.
 //! The generated profile also gives Hermes a model-facing Nexus identity hint, so a fresh launch
 //! knows its assigned bus name/session before it has seen thread traffic.
@@ -39,7 +39,7 @@ const TURN_COMPLETION_TIMEOUT: Duration = Duration::from_secs(600);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HermesGatewayProfile {
     pub home: PathBuf,
-    /// Operator Hermes profile used only as a source for provider config/auth during launch.
+    /// Machine Hermes root used as the source for provider config and Hermes' global auth fallback.
     pub source_home: PathBuf,
     pub bridge_socket: PathBuf,
     pub bridge_token: String,
@@ -59,7 +59,6 @@ pub fn write_hermes_gateway_profile(profile: &HermesGatewayProfile) -> Result<()
         hermes_config_yaml(&profile.source_home)?,
     )
     .map_err(|e| NexusError::Store(format!("write Hermes config.yaml: {e}")))?;
-    copy_hermes_auth_store(&profile.source_home, &profile.home)?;
     install_bus_skill_in_home(&profile.home)
         .map_err(|e| NexusError::Store(format!("install Hermes nexus-bus skill: {e}")))?;
     fs::write(plugin_dir.join("plugin.yaml"), PLUGIN_YAML)
@@ -120,18 +119,6 @@ fn inherited_hermes_config_yaml(source_home: &Path) -> Result<String, NexusError
     let rendered = serde_yaml::to_string(&inherited)
         .map_err(|e| NexusError::Store(format!("render Hermes inherited config: {e}")))?;
     Ok(rendered.trim_start_matches("---\n").to_string())
-}
-
-fn copy_hermes_auth_store(source_home: &Path, target_home: &Path) -> Result<(), NexusError> {
-    let source_auth = source_home.join("auth.json");
-    if !source_auth.is_file() {
-        return Ok(());
-    }
-    fs::create_dir_all(target_home)
-        .map_err(|e| NexusError::Store(format!("create Hermes profile home: {e}")))?;
-    fs::copy(&source_auth, target_home.join("auth.json"))
-        .map_err(|e| NexusError::Store(format!("copy Hermes auth.json: {e}")))?;
-    Ok(())
 }
 
 fn plugin_init(profile: &HermesGatewayProfile) -> String {

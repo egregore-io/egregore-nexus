@@ -87,6 +87,8 @@ fn human_register(name: &str, client_key: &str) -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Admin,
         kind: Some(Kind::Human),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -103,6 +105,8 @@ fn agent_register(name: &str, client_key: &str) -> RegisterRequest {
         runtime_credential: None,
         tier: Tier::Agent,
         kind: Some(Kind::Agent),
+        locality: Default::default(),
+        access: None,
         role: None,
         cwd: None,
     }
@@ -124,6 +128,7 @@ fn command_intent(
         caller_agent_id: caller.agent_id.as_ref().map(|id| id.0.clone()),
         caller_runtime_id: Some(caller.session_id.0.clone()),
         caller_client_key: Some("ck_operator".into()),
+        caller_principal_id: None,
         caller_kind: Some("human".into()),
         caller_tier: Some("admin".into()),
         idempotency_key: None,

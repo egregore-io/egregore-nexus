@@ -34,6 +34,9 @@ pub(crate) fn system_caller(req: &NotifyRequest) -> Caller {
         name: req.source.clone(),
         project: NOTIFY_PROJECT.into(),
         tier: Tier::Admin,
+        locality: Default::default(),
+        access: None,
+        principal_id: None,
     }
 }
 
