@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.1.6] - Unreleased
+
+### Fixed
+
+- Keep the original send progressing while a mid-turn message waits for native input access,
+  preventing a queue deadlock. Bound queued input waits without replaying uncertain submissions.
+- The Webconsole live-agent counter and roster recognize the defined scoped member kinds,
+  including `local.agent`, instead of excluding online agents with those kinds.
+- Immediate bus messages use headed Claude's native input queue without Ctrl-C while work is
+  active. Delivery waits for the native input receipt, not the original turn's completion.
+  Explicit redirect commands and requested turn-boundary delivery remain unchanged.
+- Headed Claude submit receipts accept the single newline appended by terminal input, while
+  retaining exact user content and owner/session/record checks. Matching receipts can complete
+  delivery without the false timeout that blocked subsequent messages. Existing failed deliveries
+  are not automatically replayed.
+
+### Added
+
+- Subagent identity on the supported headed observation paths: child and unresolved output is
+  separated from the owner's `agent.update` stream before parent publication. Child
+  observations use `child_agent.update` on a bounded, volatile, epoch-scoped child lane
+  keyed by owner session, harness, native root and native child identity, with the resolution
+  the native evidence supports (`root_verified`, `lineage_verified`, `unresolved`) and never an
+  inferred one. Claude subagent transcripts, OpenCode child sessions (plugin, bound to the
+  launch-captured root), Codex child threads and Hermes descendant sessions are carried; each
+  Claude/Hermes reader keeps bounded per-pass work and durable per-child cursors; consumed
+  cursors halt with unknown coverage after a daemon restart. Plugin/app-server streams are
+  live-only. This does not guarantee complete capture or durable delivery. New owner-authorized IPC
+  method `agent.child_streams` with an epoch-bearing cursor (`cursorStatus: boot_mismatch`
+  after a restart, never a silent empty page). Config keys `child_stream_max_rows_per_session`,
+  `child_stream_max_bytes_per_session`, `child_stream_max_lanes_per_session`,
+  `child_stream_max_unresolved_lanes_per_session`. See `docs/child-streams.md`.
+
 ## [0.1.6-beta.5] - Unreleased
 
 ### Changed

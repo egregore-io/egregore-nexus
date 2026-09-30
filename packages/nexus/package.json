@@ -1,6 +1,6 @@
 {
   "name": "@egregore/nexus",
-  "version": "0.1.6-beta.5",
+  "version": "0.1.6",
   "private": false,
   "os": [
     "linux",
@@ -30,8 +30,8 @@
     "access": "public"
   },
   "dependencies": {
-    "@egregore/nexus-cli": "0.1.6-beta.5",
-    "@egregore/nexus-gateway": "0.1.6-beta.5"
+    "@egregore/nexus-cli": "0.1.6",
+    "@egregore/nexus-gateway": "0.1.6"
   },
   "repository": {
     "type": "git",

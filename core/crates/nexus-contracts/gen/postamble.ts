@@ -54,6 +54,7 @@ export type WsEventWire =
 	| { type: "message.created"; messageId: MessageId }
 	| { type: "message.delivered"; messageId: MessageId; recipient: SessionId }
 	| { type: "agent.update"; sessionId: SessionId; kind: "text" | "thinking" | "tool_call" | "plan" | "commands" | "turn_end" | "user_input"; data: unknown }
+	| { type: "child_agent.update"; sessionId: SessionId; child: ChildStream; kind: "text" | "thinking" | "tool_call" | "plan" | "commands" | "turn_end" | "user_input"; sourceRef: string; data: unknown }
 	| { type: "agent.status"; sessionId: SessionId; presence: Presence; paused: boolean }
 	| { type: "agent.spawned"; sessionId: SessionId; name: string; agentId?: string | null }
 	| { type: "agent.removed"; sessionId: SessionId; name: string }

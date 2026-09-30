@@ -89,6 +89,30 @@ fn load_script() -> Vec<Value> {
     }
 }
 
+/// Per-thread script sequences from `FAKE_CODEX_THREAD_SCRIPTS`: a JSON object keyed by
+/// threadId whose values are arrays of scripts; the n-th `turn/start` on that thread, counted
+/// across every connection of this fake, broadcasts the n-th script, the last one repeating.
+/// Threads without an entry use `FAKE_CODEX_SCRIPT` / the default.
+fn thread_script_for(thread_id: &str) -> Option<Vec<Value>> {
+    static TURN_COUNTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    > = std::sync::OnceLock::new();
+    let raw = std::env::var("FAKE_CODEX_THREAD_SCRIPTS").ok()?;
+    let table: Value = serde_json::from_str(&raw).expect("FAKE_CODEX_THREAD_SCRIPTS: invalid JSON");
+    let sequences = table.get(thread_id)?.as_array()?;
+    if sequences.is_empty() {
+        return None;
+    }
+    let mut counts = TURN_COUNTS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap();
+    let n = counts.entry(thread_id.to_string()).or_insert(0);
+    let script = sequences[(*n).min(sequences.len() - 1)].as_array()?.clone();
+    *n += 1;
+    Some(script)
+}
+
 /// Build a JSON-RPC notification frame string.
 fn notification_frame(method: &str, params: &Value) -> String {
     serde_json::to_string(&json!({ "jsonrpc": "2.0", "method": method, "params": params })).unwrap()
@@ -369,6 +393,7 @@ where
                         );
                     }
 
+                    let script = thread_script_for(&thread_id).unwrap_or_else(|| (*script).clone());
                     for entry in script.iter() {
                         let m = entry
                             .get("method")

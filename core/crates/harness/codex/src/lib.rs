@@ -19,7 +19,9 @@ pub use app_server::bridge::{
 };
 pub use app_server::client::CodexAppServerClient;
 pub use app_server::forwarder::{
-    spawn_codex_forwarder, spawn_codex_forwarder_with_tool_observations, CodexToolObservationSink,
+    notification_thread_identity, route_notification, spawn_codex_forwarder,
+    spawn_codex_forwarder_scoped, spawn_codex_forwarder_with_tool_observations, CodexThreadScope,
+    CodexToolObservationSink, LineageResolver, NotificationRoute, ThreadIdentity,
 };
 pub use app_server::jsonrpc::{CodexRpcError, JsonRpc, Notification};
 pub use app_server::supervisor::{BusMcp, CodexAppServer, SupervisorOpts};

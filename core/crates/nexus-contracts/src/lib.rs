@@ -66,6 +66,7 @@ pub mod ack;
 pub mod admin;
 pub mod agents;
 pub mod batch;
+pub mod child_streams;
 pub mod daemon_ipc;
 pub mod entity_kind;
 pub mod enums;
@@ -116,14 +117,18 @@ pub use batch::{
     InboxSubscriptionNextResponse, InboxSubscriptionStatusResponse, InboxUnsubscribeRequest,
     NexusBatch,
 };
+pub use child_streams::{
+    ChildCursorStatus, ChildLaneCursor, ChildLaneSummary, ChildSessionLoss, ChildStreamCursor,
+    ChildStreamPage, ChildStreamRow, ChildStreamsRequest, ChildStreamsResponse,
+};
 pub use daemon_ipc::{
     DaemonIpcCall, DaemonIpcCaller, DaemonIpcRequest, DaemonIpcResponse,
     DAEMON_IPC_PROTOCOL_VERSION,
 };
 pub use enums::{AgentAccessRole, DeliveryState, Kind, Locality, Presence, Scope, Tier};
 pub use events::{
-    AgentUpdateKind, DeveloperEventEnvelope, DeveloperEventKind, DeveloperToolCallPhase,
-    ToolCallData, WsEvent,
+    AgentUpdateKind, ChildResolution, ChildStream, DeveloperEventEnvelope, DeveloperEventKind,
+    DeveloperToolCallPhase, ToolCallData, WsEvent,
 };
 pub use gateway_projection::{
     GatewayProjectionAck, GatewayProjectionEffect, GatewayProjectionEvent, GatewayProjectionKind,

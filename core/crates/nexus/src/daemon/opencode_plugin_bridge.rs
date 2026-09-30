@@ -25,6 +25,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use nexus_agent::adapter::opencode::{native, telemetry::OpenCodeTelemetry};
 use nexus_agent::adapter::NativeModelReporting;
+use nexus_contracts::events::ChildStream;
 use nexus_contracts::events::{AgentUpdateKind, WsEvent};
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::EventSink;
@@ -136,7 +137,26 @@ impl OpenCodePluginBridge {
     }
 
     /// Bind only the exact root read from this launch's ready handshake; never a model event.
+    /// Bind the native root child events must name. Immutable: a second call with the same
+    /// root is a no-op that returns true, a different root or an empty one is refused, and a
+    /// dead bridge binds nothing.
+    pub fn bind_child_root(&self, root: &str) -> bool {
+        if !self.state.alive.load(Ordering::SeqCst) || root.trim().is_empty() {
+            return false;
+        }
+        let mut bound = self.state.child_root.lock().unwrap();
+        match bound.as_deref() {
+            Some(existing) => existing == root,
+            None => {
+                *bound = Some(root.to_string());
+                true
+            }
+        }
+    }
+
     pub fn bind_model_root(&self, root: &str) -> bool {
+        // The launch handshake binds one root for every lane this bridge publishes.
+        self.bind_child_root(root);
         let mut reporter = self.state.model.lock().unwrap();
         let Some(model) = reporter.as_mut() else {
             return false;
@@ -203,6 +223,7 @@ impl OpenCodePluginBridge {
             notify: Notify::new(),
             alive: AtomicBool::new(true),
             model: Mutex::new(model),
+            child_root: Mutex::new(None),
         });
         let app = Router::new()
             .route("/turn/next", get(next_turn))
@@ -211,6 +232,7 @@ impl OpenCodePluginBridge {
             .route("/turn/:id/complete", post(complete_turn))
             .route("/turn/:id/error", post(error_turn))
             .route("/event", post(plugin_event))
+            .route("/child", post(plugin_child_event))
             .route("/model", post(plugin_model))
             .with_state(state.clone());
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -413,6 +435,10 @@ struct BridgeState {
     notify: Notify,
     alive: AtomicBool,
     model: Mutex<Option<ModelReporter>>,
+    /// The immutable native root this bridge publishes children for, bound once by the
+    /// launch handshake (`bind_child_root`, also set by `bind_model_root`). Child events name
+    /// their root in the body, and the route accepts only this one.
+    child_root: Mutex<Option<String>>,
 }
 
 struct ModelReporter {
@@ -806,6 +832,64 @@ async fn plugin_event(
         .emit(WsEvent::AgentUpdate {
             session_id: state.session_id.clone(),
             kind: body.kind,
+            data: body.data,
+        })
+        .await;
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// One native child stream update from the plugin: a subagent session's part, status or idle,
+/// attributed by the plugin (harness-owned) and routed to the child lane, never the parent's.
+#[derive(Debug, Deserialize)]
+struct PluginChildEvent {
+    child: ChildStream,
+    kind: AgentUpdateKind,
+    #[serde(rename = "sourceRef")]
+    source_ref: String,
+    #[serde(default)]
+    data: Value,
+}
+
+async fn plugin_child_event(
+    State(state): State<Arc<BridgeState>>,
+    headers: HeaderMap,
+    Json(body): Json<PluginChildEvent>,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if body.child.harness != nexus_harness_opencode::HARNESS_ID
+        || body.child.root.is_empty()
+        || body.source_ref.is_empty()
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    // Child publication is bound to the launch-captured root, never to the caller's claim.
+    let bound = state.child_root.lock().unwrap().clone();
+    match bound.as_deref() {
+        None => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "root_unbound" })),
+            )
+                .into_response();
+        }
+        Some(root) if root != body.child.root => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "root_mismatch" })),
+            )
+                .into_response();
+        }
+        Some(_) => {}
+    }
+    state
+        .events
+        .emit(WsEvent::ChildAgentUpdate {
+            session_id: state.session_id.clone(),
+            child: body.child,
+            kind: body.kind,
+            source_ref: body.source_ref,
             data: body.data,
         })
         .await;

@@ -177,8 +177,10 @@ waits for that binding and does not fall back to name-only HTTP while unbound.
 Binding identifies transport/routing, not native admission or lifecycle exclusion.
 This contract does not establish Lens carrier integration. See [composer delivery](composer-delivery.md).
 
-Explicitly sends additional input to an active native Codex turn. This route enqueues
-`harness.steer`, waits for the daemon-written final result, and does not reuse the normal
+Explicitly sends additional input to an active turn. What happens depends on the backend: native
+Codex steer adds the text to the running turn; a backend that supports interrupt-and-send interrupts
+the turn and starts a new one with the text; a backend with neither rejects the request. This route
+enqueues `harness.steer`, waits for the daemon-written final result, and does not reuse the normal
 `harness.prompt` boundary queue. `clientMessageId` is both carried to the runtime and used as the
 command-ingress idempotency key.
 
@@ -198,18 +200,20 @@ A successful response is status `201`:
   "ok": true,
   "result": {
     "accepted": true,
-    "delivery": "steered",         // or "fallback_started"
+    "delivery": "steered",         // or "interrupted_and_started"
     "turnId": "turn_7"             // optional native Codex turn id
   }
 }
 ```
 
-`steered` means Codex accepted the text into the active turn. `fallback_started` means that turn
-ended during delivery and Codex accepted the text as a fresh turn instead. A command that is only
+`steered` means Codex accepted the text into the active turn. `interrupted_and_started` means the
+backend interrupted the running turn and started a new one carrying the text. If the active Codex
+turn is absent or ends before the steer lands, the route returns `409` (`ACTIVE_TURN_REQUIRED`) and a
+new turn needs an explicit prompt; nothing falls back automatically (`fallback_started` is decode-only
+for old clients and is never emitted). Native receipt of the text is not proof the model consumed it.
+A command that is only
 claimed is not acknowledged as accepted; the route waits for `done` or returns the command error or
-timeout. The fallback is a distinct `turn/start`, not an atomic handoff against a co-owned Codex
-TUI. Non-Codex transports reject explicit steering rather than silently treating it as a normal
-prompt.
+timeout.
 
 ## Endpoints
 
@@ -632,9 +636,11 @@ recipients woken from
 The optional `before` cursor is applied independently to both backing sources and each source is
 limited before the newest-first merge, keeping one page bounded even when either table is large.
 The daemon computes the wake set from those committed delivery rows, not from a later subscription
-snapshot. Offline resumable agent subscribers are revived after commit. Durable-dead or
-unreachable subscribers settle to terminal `target_dead` / `target_unreachable` errors and are not
-retried unless an operator explicitly requeues the delivery.
+snapshot. Offline resumable agent subscribers are revived after commit. A transient bootstrap failure before
+native injection is retried: the first two non-dead failures are retained and re-driven, the third
+settles the delivery. Dead or missing runtimes settle immediately to terminal `target_dead` /
+`target_unreachable`. Once terminal, a delivery is not retried unless an operator explicitly requeues
+it, and attempted native input is never replayed.
 
 ### Other common bodies
 

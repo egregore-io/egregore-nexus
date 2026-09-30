@@ -22,6 +22,7 @@ connects only to the Gateway.
 - [ACP activity pass-through](acp-passthrough.md) — normalized activity from structured harness
   events.
 - [Tool-call contract](tool-call-contract.md) — the canonical C-TOOL event shape.
+- [Child streams](child-streams.md) — subagent identity: how child records are attributed, bounded, and looked up.
 - [Message hooks](hooks.md) — Gateway-owned `before_send` and `after_receipt` local programs,
   delivery timing, and signed audit provenance.
 - [Extending Nexus](extending-nexus.md) — public extension seams and delivery-shaping patterns.
@@ -29,15 +30,15 @@ connects only to the Gateway.
 
 ## Operate and release
 
-- [Distribution](distribution.md) — Cargo/npm artifacts, targets, lifecycle, and recovery.
+- [Distribution](distribution.md) — npm artifacts, targets, lifecycle, and recovery.
 - [Release recovery](release-recovery.md) — evidence generation and Cargo/npm withdrawal.
 - [Database baselines](database-baselines.md) — the fresh v0.1.0 store boundary and pre-release
   archive procedure.
 - [Debugging](debugging.md) — daemon, Gateway, store, identity, and harness diagnostics.
 - [Release regression](release-regression.md) — deterministic, resurrection, endurance, and
   rollback gates.
-- [Windows validation](windows-validation.md) — native CI gates and a reusable Windows
-  validation recipe.
+- [Windows validation](windows-validation.md) — native CI gates, a broader validation recipe,
+  and Windows transport security.
 
 ## Terminology
 

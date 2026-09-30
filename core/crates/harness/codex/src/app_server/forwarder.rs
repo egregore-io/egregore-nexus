@@ -27,10 +27,11 @@
 //! For an unrecognised server→client request (`id: Some(_)` + unknown method),
 //! the forwarder responds with `{}` to avoid leaving codex hanging.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use nexus_contracts::events::WsEvent;
+use nexus_contracts::events::{ChildResolution, ChildStream, WsEvent};
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::EventSink;
 use nexus_contracts::AgentUpdateKind;
@@ -39,6 +40,7 @@ use serde_json::{json, Value};
 use tokio::time::{Duration, Instant};
 
 use super::approvals::ApprovalHandler;
+use super::bridge::{thread_spawn_meta, ThreadSpawnMeta};
 use super::client::CodexAppServerClient;
 use super::protocol::method;
 use super::provider_limit::{turn_error_is_structured_hold, turn_error_will_retry};
@@ -97,6 +99,372 @@ fn is_approval_method(m: &str) -> bool {
     )
 }
 
+/// Which native thread the forwarder attributes to the owner session, and where subagent rollout
+/// metas can be read for the other threads that share the app-server process.
+///
+/// Attribution is positive only: a notification reaches the parent's `agent.update` lane when its
+/// `threadId` equals the bound main thread. Another thread goes to a child lane. A notification
+/// without a thread id goes to the unresolved lane; absence of identity is never parent evidence.
+#[derive(Clone, Default)]
+pub struct CodexThreadScope {
+    /// The bound main thread. `None` binds nothing: every notification is then unresolved.
+    pub main_thread_id: Option<String>,
+    /// `CODEX_HOME/sessions` root holding rollout files, for reading `thread_spawn` lineage of
+    /// other threads. `None` disables lineage: foreign threads stay unresolved.
+    pub rollout_root: Option<PathBuf>,
+    /// Lineage lookup override. `None` uses the bounded rollout scan; fixtures inject a held or
+    /// scripted resolver to pin that the parent's forwarding never waits on it.
+    pub lineage: Option<LineageResolver>,
+}
+
+impl std::fmt::Debug for CodexThreadScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodexThreadScope")
+            .field("main_thread_id", &self.main_thread_id)
+            .field("rollout_root", &self.rollout_root)
+            .field("lineage", &self.lineage.as_ref().map(|_| "custom"))
+            .finish()
+    }
+}
+
+/// A lineage lookup: the `thread_spawn` meta of a thread under a rollout root. Runs on the
+/// blocking pool; must be bounded on its own.
+pub type LineageResolver =
+    Arc<dyn Fn(&std::path::Path, &str) -> Option<ThreadSpawnMeta> + Send + Sync>;
+
+impl CodexThreadScope {
+    /// Scope bound by the bridge to the thread it resumed or started for the session.
+    pub fn bound(main_thread_id: impl Into<String>, rollout_root: Option<PathBuf>) -> Self {
+        CodexThreadScope {
+            main_thread_id: Some(main_thread_id.into()),
+            rollout_root,
+            lineage: None,
+        }
+    }
+
+    /// Replace the lineage lookup (fixtures only in practice).
+    pub fn with_lineage_resolver(mut self, resolver: LineageResolver) -> Self {
+        self.lineage = Some(resolver);
+        self
+    }
+
+    /// Scope derived from the threads the client attached through its own requests: the first
+    /// attached thread is the one the caller bound. Protocol-owned evidence, no inference.
+    pub fn from_client(client: &CodexAppServerClient) -> Self {
+        CodexThreadScope {
+            main_thread_id: client.attached_threads().into_iter().next(),
+            rollout_root: None,
+            lineage: None,
+        }
+    }
+}
+
+/// Where one notification belongs, decided from its thread id and the scope alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotificationRoute {
+    /// The bound main thread: the parent's own stream.
+    Main,
+    /// Another thread in the same process: a child lane keyed by that thread id.
+    Child(String),
+    /// No positive ownership evidence: the unresolved lane, carrying the thread id when the
+    /// notification had one but nothing was bound to compare it against.
+    Unresolved { thread: Option<String> },
+}
+
+/// Native thread identity of one notification, in the shape the protocol owns for its method.
+///
+/// Runtime notifications (`item/*`, `turn/*`, `error`, `thread/tokenUsage/updated`,
+/// `thread/compacted`) carry a flat `threadId`; only `thread/started` nests it as `thread.id`.
+/// Any other shape, a non-string, an empty string, or a conflict between the two shapes is not
+/// identity. Nothing is inferred from the shape the method does not own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadIdentity {
+    Valid(String),
+    Missing,
+    Malformed,
+}
+
+/// Extract the protocol-owned thread identity of a notification. Pure.
+pub fn notification_thread_identity(method: &str, params: &Value) -> ThreadIdentity {
+    let flat = params.get("threadId");
+    let nested = params.get("thread").and_then(|t| t.get("id"));
+    let (owned, foreign) = if method == method::THREAD_STARTED {
+        (nested, flat)
+    } else {
+        (flat, nested)
+    };
+    let Some(owned) = owned else {
+        return ThreadIdentity::Missing;
+    };
+    let Some(id) = owned.as_str().filter(|id| !id.is_empty()) else {
+        return ThreadIdentity::Malformed;
+    };
+    match foreign {
+        Some(other) if other.as_str() != Some(id) => ThreadIdentity::Malformed,
+        _ => ThreadIdentity::Valid(id.to_string()),
+    }
+}
+
+/// Route a notification. Pure: the main thread must match exactly in the protocol-owned shape;
+/// a missing or malformed identity never maps to the parent.
+pub fn route_notification(
+    scope: &CodexThreadScope,
+    method: &str,
+    params: &Value,
+) -> NotificationRoute {
+    match (
+        notification_thread_identity(method, params),
+        scope.main_thread_id.as_deref(),
+    ) {
+        (ThreadIdentity::Valid(thread), Some(main)) if thread == main => NotificationRoute::Main,
+        (ThreadIdentity::Valid(thread), Some(_)) => NotificationRoute::Child(thread),
+        (ThreadIdentity::Valid(thread), None) => NotificationRoute::Unresolved {
+            thread: Some(thread),
+        },
+        (ThreadIdentity::Missing | ThreadIdentity::Malformed, _) => {
+            NotificationRoute::Unresolved { thread: None }
+        }
+    }
+}
+
+/// Bounded number of parent hops walked through rollout metas when verifying lineage.
+const MAX_LINEAGE_HOPS: usize = 8;
+/// Retry a missing rollout meta after this many lookups of the same thread.
+const LINEAGE_RETRY_EVERY: u32 = 64;
+
+/// Threads a forwarder remembers lineage for (hits and misses together). Beyond this the
+/// forwarder stops looking: further foreign threads stay unresolved, never parent.
+const MAX_LINEAGE_CACHE: usize = 256;
+/// Minimum spacing between two rollout lookups of one forwarder.
+const LINEAGE_LOOKUP_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Per-forwarder, bounded lineage cache. Lineage enrichment never sits on the parent's forward
+/// loop: an identity is built from what the cache knows right now, and at most one bounded
+/// lookup is outstanding on the blocking pool at any time; its result is folded in on a later
+/// notification without waiting. A child's first events may therefore be unresolved and later
+/// ones lineage-verified.
+struct ChildLineage {
+    metas: HashMap<String, ThreadSpawnMeta>,
+    misses: HashMap<String, u32>,
+    pending: Option<(String, std::sync::mpsc::Receiver<Option<ThreadSpawnMeta>>)>,
+    last_lookup: Option<Instant>,
+    resolver: LineageResolver,
+}
+
+impl ChildLineage {
+    fn new(resolver: LineageResolver) -> Self {
+        ChildLineage {
+            metas: HashMap::new(),
+            misses: HashMap::new(),
+            pending: None,
+            last_lookup: None,
+            resolver,
+        }
+    }
+
+    fn known(&self) -> usize {
+        self.metas.len() + self.misses.len()
+    }
+
+    /// Fold a finished lookup into the cache. Never waits.
+    fn poll_pending(&mut self) {
+        let Some((thread, rx)) = self.pending.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Some(meta)) => {
+                self.metas.insert(thread.clone(), meta);
+                self.misses.remove(&thread);
+            }
+            Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                *self.misses.entry(thread).or_insert(0) += 1;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => self.pending = Some((thread, rx)),
+        }
+    }
+
+    /// Start at most one outstanding lookup for `thread`, subject to the cache size, the retry
+    /// cadence of earlier misses and the lookup interval. Never waits.
+    fn request(&mut self, root: &std::path::Path, thread: &str) {
+        if self.pending.is_some() || self.metas.contains_key(thread) {
+            return;
+        }
+        let known = self.known();
+        match self.misses.get_mut(thread) {
+            Some(count) => {
+                *count += 1;
+                if !count.is_multiple_of(LINEAGE_RETRY_EVERY) {
+                    return;
+                }
+            }
+            None if known >= MAX_LINEAGE_CACHE => return,
+            None => {}
+        }
+        if self
+            .last_lookup
+            .is_some_and(|at| at.elapsed() < LINEAGE_LOOKUP_INTERVAL)
+        {
+            return;
+        }
+        self.last_lookup = Some(Instant::now());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let resolver = self.resolver.clone();
+        let root = root.to_path_buf();
+        let thread_owned = thread.to_string();
+        tokio::task::spawn_blocking(move || {
+            let _ = tx.send(resolver(&root, &thread_owned));
+        });
+        self.pending = Some((thread.to_string(), rx));
+    }
+
+    /// Identity of a foreign thread from what the cache knows now. Lineage is verified only when
+    /// the declared parent chain walks to the bound main thread through cached metas; a missing
+    /// hop requests a lookup and leaves the lane unresolved with the parent recorded.
+    fn identity(
+        &mut self,
+        scope: &CodexThreadScope,
+        thread: &str,
+        generation: &str,
+    ) -> ChildStream {
+        self.poll_pending();
+        let root = scope.main_thread_id.clone().unwrap_or_default();
+        let locator = format!("codex:thread/{thread}@{generation}");
+        let unresolved = |root: String| ChildStream {
+            harness: "codex".into(),
+            root,
+            id: Some(thread.to_string()),
+            locator: locator.clone(),
+            parent: None,
+            parent_ref: None,
+            depth: None,
+            resolution: ChildResolution::Unresolved,
+            evidence: None,
+        };
+        let Some(rollout_root) = scope.rollout_root.as_deref() else {
+            return unresolved(root);
+        };
+        let Some(meta) = self.metas.get(thread).cloned() else {
+            self.request(rollout_root, thread);
+            return unresolved(root);
+        };
+        let mut verified = false;
+        let mut cursor = meta.parent_thread_id.clone();
+        for _ in 0..MAX_LINEAGE_HOPS {
+            if Some(cursor.as_str()) == scope.main_thread_id.as_deref() {
+                verified = true;
+                break;
+            }
+            match self.metas.get(&cursor).cloned() {
+                Some(next) => cursor = next.parent_thread_id,
+                None => {
+                    self.request(rollout_root, &cursor);
+                    break;
+                }
+            }
+        }
+        ChildStream {
+            harness: "codex".into(),
+            root,
+            id: Some(thread.to_string()),
+            locator,
+            parent: Some(meta.parent_thread_id),
+            parent_ref: None,
+            depth: Some(meta.depth),
+            resolution: if verified {
+                ChildResolution::LineageVerified
+            } else {
+                ChildResolution::Unresolved
+            },
+            evidence: Some("rollout_meta.thread_spawn".into()),
+        }
+    }
+}
+
+/// Route one notification; when it is not the main thread's, emit it on the child lane and
+/// report `true` so the caller skips every parent path (tool observations, turn authority,
+/// accepted-input echo, text coalescing). Identical for the buffered and unbuffered seats.
+#[allow(clippy::too_many_arguments)]
+async fn divert_foreign(
+    session: &SessionId,
+    events: &dyn EventSink,
+    scope: &CodexThreadScope,
+    lineage: &mut ChildLineage,
+    generation: &str,
+    seq: &mut u64,
+    method: &str,
+    params: &Value,
+) -> bool {
+    let route = route_notification(scope, method, params);
+    if route == NotificationRoute::Main {
+        return false;
+    }
+    forward_foreign(
+        session, events, scope, lineage, generation, seq, route, method, params,
+    )
+    .await;
+    true
+}
+
+/// Emit one foreign (child or unresolved) notification into the child lane. Never touches the
+/// parent's text buffer, tool observations or turn tracker.
+#[allow(clippy::too_many_arguments)]
+async fn forward_foreign(
+    session: &SessionId,
+    events: &dyn EventSink,
+    scope: &CodexThreadScope,
+    lineage: &mut ChildLineage,
+    generation: &str,
+    seq: &mut u64,
+    route: NotificationRoute,
+    method: &str,
+    params: &Value,
+) {
+    let Some(ev) = translate_codex(method, params) else {
+        return;
+    };
+    *seq += 1;
+    let (child, source_ref) = match route {
+        NotificationRoute::Child(thread) => {
+            let child = lineage.identity(scope, &thread, generation);
+            let source_ref = format!("codex:{thread}@{generation}#{seq}");
+            (child, source_ref)
+        }
+        NotificationRoute::Unresolved { thread } => {
+            let child = ChildStream {
+                harness: "codex".into(),
+                root: scope.main_thread_id.clone().unwrap_or_default(),
+                id: thread.clone(),
+                locator: format!("codex:{method}@{generation}#{seq}"),
+                parent: None,
+                parent_ref: None,
+                depth: None,
+                resolution: ChildResolution::Unresolved,
+                evidence: None,
+            };
+            let source = thread.unwrap_or_else(|| method.to_string());
+            (child, format!("codex:{source}@{generation}#{seq}"))
+        }
+        NotificationRoute::Main => return,
+    };
+    events
+        .emit(WsEvent::ChildAgentUpdate {
+            session_id: session.clone(),
+            child,
+            kind: ev.kind,
+            source_ref,
+            data: ev.data,
+        })
+        .await;
+}
+
+fn forwarder_generation() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{nanos}", std::process::id())
+}
+
 /// Spawn a task that reads `client`'s notification stream, translates every
 /// codex notification via [`translate_codex`], coalesces consecutive `Text`
 /// deltas with a fixed-deadline window, and emits the resulting
@@ -140,11 +508,47 @@ pub fn spawn_codex_forwarder_with_tool_observations(
     turn_tracker: CodexTurnTracker,
     tool_observations: Option<Arc<dyn CodexToolObservationSink>>,
 ) -> tokio::task::JoinHandle<()> {
+    let scope = CodexThreadScope::from_client(&client);
+    spawn_codex_forwarder_scoped(
+        session,
+        client,
+        events,
+        approvals,
+        turn_tracker,
+        tool_observations,
+        scope,
+    )
+}
+
+/// Spawn a Codex forwarder with explicit thread attribution.
+///
+/// Only notifications on `scope.main_thread_id` reach the parent's `agent.update` lane, its tool
+/// observations and its turn tracker. Notifications on another thread are emitted as
+/// `child_agent.update` with lineage read from that thread's rollout meta under
+/// `scope.rollout_root`; notifications without a thread id are emitted as unresolved. Foreign
+/// notifications never flush or extend the parent's coalesced text and never settle its turn.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_codex_forwarder_scoped(
+    session: SessionId,
+    client: Arc<CodexAppServerClient>,
+    events: Arc<dyn EventSink>,
+    approvals: Arc<dyn ApprovalHandler>,
+    turn_tracker: CodexTurnTracker,
+    tool_observations: Option<Arc<dyn CodexToolObservationSink>>,
+    scope: CodexThreadScope,
+) -> tokio::task::JoinHandle<()> {
     let origin = client.origin_tracker();
     let native_ingress = origin.is_some();
     let turn_tracker = origin.unwrap_or(turn_tracker);
     tokio::spawn(async move {
         let mut notes = client.notifications();
+        let generation = forwarder_generation();
+        let resolver: LineageResolver = scope
+            .lineage
+            .clone()
+            .unwrap_or_else(|| Arc::new(thread_spawn_meta));
+        let mut lineage = ChildLineage::new(resolver);
+        let mut foreign_seq: u64 = 0;
         // Accumulated Text delta — None means no text is buffered.
         let mut text_buf: Option<BufferedText> = None;
         // Fixed flush deadline — set once when the FIRST Text delta is
@@ -200,6 +604,23 @@ pub fn spawn_codex_forwarder_with_tool_observations(
                             if let Err(e) = client.respond(id, result).await {
                                 tracing::warn!("codex forwarder: respond failed: {e}");
                             }
+                            continue;
+                        }
+
+                        // Positive attribution first: a foreign notification is diverted to the child lane
+                        // before any parent path runs; the buffered text stays exactly as it is.
+                        if divert_foreign(
+                            &session,
+                            events.as_ref(),
+                            &scope,
+                            &mut lineage,
+                            &generation,
+                            &mut foreign_seq,
+                            &n.method,
+                            &n.params,
+                        )
+                        .await
+                        {
                             continue;
                         }
 
@@ -324,6 +745,23 @@ pub fn spawn_codex_forwarder_with_tool_observations(
                     if let Err(e) = client.respond(id, result).await {
                         tracing::warn!("codex forwarder: respond failed: {e}");
                     }
+                    continue;
+                }
+
+                // Positive attribution first: a foreign notification is diverted to the child lane
+                // before any parent path runs; the buffered text stays exactly as it is.
+                if divert_foreign(
+                    &session,
+                    events.as_ref(),
+                    &scope,
+                    &mut lineage,
+                    &generation,
+                    &mut foreign_seq,
+                    &n.method,
+                    &n.params,
+                )
+                .await
+                {
                     continue;
                 }
 

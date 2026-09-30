@@ -717,6 +717,42 @@ mod events {
     }
 
     #[test]
+    fn child_agent_update_is_a_separate_tagged_event_with_harness_identity() {
+        use nexus_contracts::{ChildResolution, ChildStream};
+        let ev = WsEvent::ChildAgentUpdate {
+            session_id: SessionId("s_01".into()),
+            child: ChildStream {
+                harness: "claude".into(),
+                root: "ses_root".into(),
+                id: Some("agent-abc".into()),
+                locator: "claude:subagents/agent-abc.jsonl#0".into(),
+                parent: None,
+                parent_ref: None,
+                depth: None,
+                resolution: ChildResolution::RootVerified,
+                evidence: Some("subagents_dir+sessionId+agentId".into()),
+            },
+            kind: AgentUpdateKind::Text,
+            source_ref: "claude:agent-abc@uuid-first#512".into(),
+            data: serde_json::json!({ "text": "child says" }),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["type"], "child_agent.update");
+        assert_ne!(json["type"], "agent.update");
+        assert_eq!(json["sessionId"], "s_01");
+        assert_eq!(json["kind"], "text");
+        assert_eq!(json["sourceRef"], "claude:agent-abc@uuid-first#512");
+        assert_eq!(json["child"]["harness"], "claude");
+        assert_eq!(json["child"]["root"], "ses_root");
+        assert_eq!(json["child"]["id"], "agent-abc");
+        assert_eq!(json["child"]["parent"], serde_json::Value::Null);
+        assert_eq!(json["child"]["depth"], serde_json::Value::Null);
+        assert_eq!(json["child"]["resolution"], "root_verified");
+        let back: WsEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
     fn agent_update_text_and_tool_call_kinds() {
         let text = WsEvent::AgentUpdate {
             session_id: SessionId("s_01".into()),

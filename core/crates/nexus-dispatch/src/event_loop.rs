@@ -2,8 +2,8 @@
 //! park on the [`Bell`], on wake consult the [`WakePolicy`], and while not held drain the whole
 //! pending queue as one batch → build the session-visible bus input event → inject it as a single
 //! turn (via the [`AgentTurnExecutionPort`]) with that event emitted at the transport accepted
-//! boundary → while awaiting completion, admit newly rung batches through non-destructive native
-//! steer when the adapter supports it → on **observed** normal-turn completion mark its rows
+//! boundary → while awaiting completion, admit newly rung batches through the native input queue
+//! or non-destructive native steer when supported → on **observed** normal-turn completion mark its rows
 //! delivered → emit `message.delivered` → drain again to absorb arrivals that could not be steered
 //! (the turn-end window, §2.4) → re-park. If the bounded completion await elapses (the completion
 //! signal was lost) the original batch is **dead-lettered** to the non-delivered `error` state,
@@ -12,8 +12,9 @@
 //! Invariants:
 //! - **Single consumer per session.** Exactly one loop task per session; it runs one turn at a
 //!   time, so per-agent serialization is structural.
-//! - **One in-flight turn.** Native steer appends a mid-turn batch to that same turn; it never starts
-//!   a concurrent turn. Transports without non-destructive steer keep turn-end coalescing.
+//! - **Native scheduling.** Queued inputs settle at their native acceptance boundary; this does not
+//!   complete the original turn. Native steer appends to that turn. Other transports keep their
+//!   explicit interrupt or boundary policy; Nexus never starts concurrent native turns itself.
 //! - **Crash-safety.** A missed bell is re-driven because the row is still `pending`; the loop
 //!   re-rings its own bell on [`spawn`](EventLoop::spawn) to drive anything already queued at
 //!   attach time.
@@ -33,7 +34,7 @@ use nexus_store::Store;
 use tokio::task::JoinHandle;
 
 use crate::bell::Bell;
-use crate::delivery_timing::{delivery_action, DeliveryAction};
+use crate::delivery_timing::{delivery_action_with_native_queue, DeliveryAction};
 use crate::drain::InboxDrainer;
 use crate::wake_policy::{AgentState, WakeDecision, WakePolicy};
 
@@ -202,11 +203,21 @@ async fn run(session: SessionId, deps: LoopDeps) {
             );
 
             let turn_active = has_active_turn(&session, &deps);
-            match delivery_action(
+            match delivery_action_with_native_queue(
                 timing,
                 turn_active,
                 deps.turn_exec.steer_capability(&session),
+                deps.turn_exec.accepts_prompt_while_busy(&session),
             ) {
+                DeliveryAction::NativeQueue => {
+                    if !claim_batch(&session, &deps, &inbox, &batch).await {
+                        break;
+                    }
+                    if queue_claimed_batch(&session, &deps, &inbox, &batch).await {
+                        continue;
+                    }
+                    break;
+                }
                 DeliveryAction::WaitForTurnBoundary
                 | DeliveryAction::WaitForFinalTurnCompletion => {
                     if let Err(error) = deps.turn_exec.wait_for_turn_completion(&session).await {
@@ -253,23 +264,30 @@ async fn run(session: SessionId, deps: LoopDeps) {
             // nor left `pending` to re-inject the same rows on every future bell (the "repeating
             // batch" storm). Only the `Ok(Ok(()))` arm (observed completion) marks delivered.
             let accepted_event = bus_user_input_event(&session, &batch);
-            let turn = deps.turn_exec.inject_turn_observed(
+            let mut turn = Some(Box::pin(deps.turn_exec.inject_turn_observed(
                 &session,
                 &batch,
                 deps.events.clone(),
                 accepted_event,
-            );
-            tokio::pin!(turn);
+            )));
             let completion_timeout = tokio::time::sleep(deps.completion_timeout);
             tokio::pin!(completion_timeout);
             let mut redrive_after_interrupt = false;
-            let stop_after_turn = loop {
+            let mut pending_handoff = None;
+            let mut stop_after_turn = None;
+            loop {
+                // An admitted handoff owns its claim through settlement even if the original
+                // completes first. Both futures stay in this task and are dropped on teardown.
+                if stop_after_turn.is_some() && pending_handoff.is_none() {
+                    break;
+                }
                 tokio::select! {
                     // Prefer a terminal completion when it races the bell. The post-completion
                     // drain can then start the newly queued batch normally instead of attempting a
                     // steer against a turn that is already gone.
                     biased;
-                    result = &mut turn => {
+                    result = async { turn.as_mut().expect("active turn").await }, if turn.is_some() => {
+                        turn = None;
                         match result {
                             Ok(()) => {
                                 tracing::info!(
@@ -279,18 +297,18 @@ async fn run(session: SessionId, deps: LoopDeps) {
                                     "turn injected; marking delivered"
                                 );
                                 mark_batch_delivered(&session, &deps, &inbox, &batch).await;
-                                break false;
+                                stop_after_turn = Some(false);
                             }
                             Err(error) => {
                                 handle_inject_error(&session, &deps, &inbox, &batch, error).await;
-                                if redrive_after_interrupt {
-                                    deps.bell.ring(&session);
-                                }
-                                break true;
+                                stop_after_turn = Some(true);
                             }
                         }
                     }
-                    _ = &mut completion_timeout => {
+                    _ = &mut completion_timeout, if turn.is_some() => {
+                        // Drop only the timed-out transport future, releasing any input lock.
+                        // The handoff and its durable claim/settlement are not cancelled here.
+                        turn = None;
                         tracing::warn!(
                             target: "nexus_dispatch::loop",
                             session = %session,
@@ -300,15 +318,13 @@ async fn run(session: SessionId, deps: LoopDeps) {
                              FAILED, not delivered (completion signal lost?)"
                         );
                         mark_batch_timeout(&session, &deps, &inbox, &batch).await;
-                        if redrive_after_interrupt {
-                            deps.bell.ring(&session);
-                        }
-                        break true;
+                        stop_after_turn = Some(true);
                     }
-                    _ = deps.bell.wait(&session) => {
-                        // The current completion future stays alive while the new durable batch is
-                        // admitted into the active turn. Dropping it here can block delivery for
-                        // the full completion timeout.
+                    redrive = async { pending_handoff.as_mut().expect("active handoff").await }, if pending_handoff.is_some() => {
+                        redrive_after_interrupt = redrive;
+                        pending_handoff = None;
+                    }
+                    _ = deps.bell.wait(&session), if turn.is_some() && pending_handoff.is_none() => {
                         if redrive_after_interrupt {
                             // An interruption was already attempted. Keep later arrivals at the
                             // same notified boundary without repeating even a refused cancel.
@@ -316,13 +332,19 @@ async fn run(session: SessionId, deps: LoopDeps) {
                                 tracing::error!(%error, session = %session, "mid-turn coalesce after interrupt failed");
                             }
                         } else {
-                            redrive_after_interrupt =
-                                handle_pending_during_active_turn(&session, &deps, &inbox).await;
+                            // Awaiting this inline can deadlock on a mutex owned by `turn`.
+                            // Poll one handoff beside it; later bells remain coalesced.
+                            pending_handoff = Some(Box::pin(
+                                handle_pending_during_active_turn(&session, &deps, &inbox)
+                            ));
                         }
                     }
                 }
-            };
-            if stop_after_turn {
+            }
+            if stop_after_turn == Some(true) {
+                if redrive_after_interrupt {
+                    deps.bell.ring(&session);
+                }
                 break;
             }
             // Loop: re-drain to pick up anything that arrived during the turn (coalescing).
@@ -443,6 +465,12 @@ async fn handle_pending_during_active_turn(
     deps: &LoopDeps,
     inbox: &Inbox<'_>,
 ) -> bool {
+    // A stale or lifecycle bell is not permission to bypass an operator/provider hold.
+    if WakePolicy::should_wake(deps.registry.get(session), nexus_contracts::Kind::Agent)
+        == WakeDecision::Hold
+    {
+        return false;
+    }
     if let Err(error) = inbox.mark_notified(session).await {
         tracing::error!(%error, %session, "mid-turn mark_notified failed");
         return false;
@@ -465,7 +493,18 @@ async fn handle_pending_during_active_turn(
     };
     let timing = timed_batch.timing;
     let batch = timed_batch.batch;
-    match delivery_action(timing, true, deps.turn_exec.steer_capability(session)) {
+    match delivery_action_with_native_queue(
+        timing,
+        true,
+        deps.turn_exec.steer_capability(session),
+        deps.turn_exec.accepts_prompt_while_busy(session),
+    ) {
+        DeliveryAction::NativeQueue => {
+            if claim_batch(session, deps, inbox, &batch).await {
+                queue_claimed_batch(session, deps, inbox, &batch).await;
+            }
+            false
+        }
         DeliveryAction::NativeSteer => {
             if claim_batch(session, deps, inbox, &batch).await {
                 let _ = steer_claimed_batch(session, deps, inbox, &batch).await;
@@ -513,6 +552,38 @@ async fn interrupt_and_redrive_notified_batch(
         return true;
     }
     true
+}
+
+async fn queue_claimed_batch(
+    session: &SessionId,
+    deps: &LoopDeps,
+    inbox: &Inbox<'_>,
+    batch: &NexusBatch,
+) -> bool {
+    let accepted_event = bus_user_input_event(session, batch);
+    let text = render_injected_turn_for(batch, &session.0);
+    // Bound input-lock acquisition, the write and its receipt together. Durable settlement
+    // stays outside the cancelled transport future and an uncertain write is never retried.
+    match tokio::time::timeout(
+        deps.completion_timeout,
+        deps.turn_exec
+            .prompt_observed(session, text, deps.events.clone(), accepted_event),
+    )
+    .await
+    {
+        Ok(Ok(())) => {
+            mark_batch_delivered(session, deps, inbox, batch).await;
+            true
+        }
+        Ok(Err(error)) => {
+            handle_inject_error(session, deps, inbox, batch, InjectError::Contract(error)).await;
+            false
+        }
+        Err(_) => {
+            mark_batch_timeout(session, deps, inbox, batch).await;
+            false
+        }
+    }
 }
 
 async fn steer_claimed_batch(

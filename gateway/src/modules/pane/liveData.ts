@@ -18,6 +18,7 @@ import type {
 import type { Face, PresenceValue } from "@shared/ui";
 import { gatewayFetch } from "@app/gatewayClient";
 import { qk } from "@shared/queryKeys";
+import { isAgentMember } from "@shared/entityKind";
 import type {
   MemberRow,
   NotificationRow,
@@ -64,10 +65,6 @@ async function getJson<T>(path: string): Promise<T> {
 /** Coerce any presence string to a render-safe value (default offline). */
 function presenceOf(v: string | undefined): PresenceValue {
   return v === "online" || v === "busy" ? v : "offline";
-}
-
-function isAgentMember(m: MemberRow): boolean {
-  return m.kind === "agent" || (m.kind === undefined && Boolean(m.agent));
 }
 
 const glyphOf = (name: string): string =>

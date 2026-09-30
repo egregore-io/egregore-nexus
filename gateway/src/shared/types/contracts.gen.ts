@@ -649,6 +649,167 @@ export interface ChannelRequest {
 	source?: string;
 }
 
+/** Position in the lane enumeration: the full ordering key, valid only under `epoch`. */
+export interface ChildLaneCursor {
+	/** The daemon boot epoch the cursor was taken under. */
+	epoch: string;
+	childKey: string;
+	harness: string;
+	root: string;
+}
+
+/** How much native evidence established a child stream's relationship to its captured root. */
+export enum ChildResolution {
+	/** Root affiliation proven by native ids; immediate parent and depth unknown. */
+	RootVerified = "root_verified",
+	/** Root affiliation and the immediate parent chain to the root proven by native lineage. */
+	LineageVerified = "lineage_verified",
+	/**
+	 * No native evidence of root ownership. `parent` may still carry a native parent id the
+	 * source declared; that alone does not make the stream a verified descendant.
+	 */
+	Unresolved = "unresolved",
+}
+
+/**
+ * Harness-owned identity of one native child stream that shares a Nexus owner session with its
+ * captured root: a subagent, a delegated session, a sub-thread. Every value is a native id, a
+ * native lineage fact, or absent. Nothing is inferred from names, text or time.
+ */
+export interface ChildStream {
+	/** The harness id that attributed the stream. */
+	harness: string;
+	/**
+	 * The owner session's captured native root at observation time: its native session or
+	 * main thread id as the harness records it.
+	 */
+	root: string;
+	/**
+	 * Native child id when the source carries one (agentId, child sessionID, threadId, child
+	 * session id). `None` for unresolved observations without a native id.
+	 */
+	id?: string;
+	/**
+	 * Synthetic observation locator, `<harness>:<source>#<occurrence>`, unique within one owner
+	 * session and one daemon epoch. Provenance only; never a native id.
+	 */
+	locator: string;
+	/** Immediate native parent, only from native lineage evidence. */
+	parent?: string;
+	/**
+	 * Parent-side native reference to the spawning call (a task call id), only when observed
+	 * by id.
+	 */
+	parentRef?: string;
+	/** Depth below the root, only from native lineage evidence. */
+	depth?: number;
+	resolution: ChildResolution;
+	/**
+	 * Native evidence that established `resolution`, as a fixed tag such as
+	 * `subagents_dir+sessionId+agentId`, `session.created.parentID`,
+	 * `rollout_meta.thread_spawn`, `sessions.parent_session_id`.
+	 */
+	evidence?: string;
+}
+
+/** One lane's identity plus its live and lost accounting. */
+export interface ChildLaneSummary {
+	child: ChildStream;
+	childKey: string;
+	epoch: string;
+	firstSeenId: number;
+	liveFirstId?: number;
+	liveLastId?: number;
+	liveRows: number;
+	liveBytes: number;
+	evictedThrough: number;
+	evictedRows: number;
+	evictedBytes: number;
+	refusedRows: number;
+	/**
+	 * What part of the native source the harness pass declared this lane covers; JSON null
+	 * when nothing was declared.
+	 */
+	coverage?: any;
+}
+
+/** Owner-level loss summary: what tombstone compaction removed from the lane table. */
+export interface ChildSessionLoss {
+	epoch: string;
+	compactedLanes: number;
+	evictedRows: number;
+	evictedBytes: number;
+	refusedRows: number;
+	updatedAt: number;
+}
+
+/** Position in one owner session's child lane, valid only under `epoch`. */
+export interface ChildStreamCursor {
+	/** The daemon boot epoch the cursor was taken under. */
+	epoch: string;
+	/** Continue after this lane row id. */
+	afterId: number;
+}
+
+/** One row of the child lane. */
+export interface ChildStreamRow {
+	id: number;
+	epoch: string;
+	child: ChildStream;
+	kind: string;
+	sourceRef: string;
+	data: any;
+	bytes: number;
+	createdAt: number;
+}
+
+/** One SQL-limited page of lane rows. */
+export interface ChildStreamPage {
+	rows: ChildStreamRow[];
+	/** Pass back as `cursor.afterId` for the next page; absent when this page was the last. */
+	nextAfterId?: number;
+}
+
+/** `agent.child_streams` parameters. */
+export interface ChildStreamsRequest {
+	/** The owner session whose child lane is read. */
+	session: SessionId;
+	harness?: string;
+	root?: string;
+	/** Narrow rows to one lane by its child key (`n:<native id>` or `l:<locator>`). */
+	child?: string;
+	cursor?: ChildStreamCursor;
+	/** Rows per page (default 200, at most 1000). */
+	limit?: number;
+	lanesAfter?: ChildLaneCursor;
+	/** Lanes per page (default 100, at most 1000). */
+	lanesLimit?: number;
+}
+
+/**
+ * How the request's cursors (rows and lanes) related to the current daemon boot. A mismatch
+ * on either resets both to the start.
+ */
+export enum ChildCursorStatus {
+	/** No cursor was given; the page starts at the lane's beginning. */
+	Fresh = "fresh",
+	/** The cursor belongs to the current boot and was honored. */
+	Valid = "valid",
+	/** The cursor belongs to another boot; the page starts at the lane's beginning. */
+	BootMismatch = "boot_mismatch",
+}
+
+/** `agent.child_streams` result. */
+export interface ChildStreamsResponse {
+	/** The current daemon boot epoch; cursors taken from this page carry it. */
+	epoch: string;
+	cursorStatus: ChildCursorStatus;
+	lanes: ChildLaneSummary[];
+	lanesNextAfter?: ChildLaneCursor;
+	page: ChildStreamPage;
+	sessionLoss?: ChildSessionLoss;
+}
+
 /** Compare-and-set revision for one command in a multi-row reorder. */
 export interface CommandExpectedRevision {
 	commandId: string;
@@ -2316,6 +2477,7 @@ export type WsEventWire =
 	| { type: "message.created"; messageId: MessageId }
 	| { type: "message.delivered"; messageId: MessageId; recipient: SessionId }
 	| { type: "agent.update"; sessionId: SessionId; kind: "text" | "thinking" | "tool_call" | "plan" | "commands" | "turn_end" | "user_input"; data: unknown }
+	| { type: "child_agent.update"; sessionId: SessionId; child: ChildStream; kind: "text" | "thinking" | "tool_call" | "plan" | "commands" | "turn_end" | "user_input"; sourceRef: string; data: unknown }
 	| { type: "agent.status"; sessionId: SessionId; presence: Presence; paused: boolean }
 	| { type: "agent.spawned"; sessionId: SessionId; name: string; agentId?: string | null }
 	| { type: "agent.removed"; sessionId: SessionId; name: string }

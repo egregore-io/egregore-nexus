@@ -3,6 +3,8 @@
 pub mod storage;
 /// Self-contained native serve/attach launcher; bytes copied into each captured runtime.
 pub const SERVE_SOURCE: &str = include_str!("serve.mjs");
+/// The harness id OpenCode runtimes and their children are attributed under.
+pub const HARNESS_ID: &str = "opencode";
 
 use nexus_harness_core::{
     native_harness_program, Harness, HarnessError, HeadedRuntimeKind, NativeProcessPlatform,

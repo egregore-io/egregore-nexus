@@ -53,6 +53,88 @@ CREATE TABLE IF NOT EXISTS mem.stream_events (
 CREATE INDEX IF NOT EXISTS mem.idx_stream_events_session_id
   ON stream_events(session_id, id);
 
+-- Native child streams (subagents, delegated sessions, sub-threads) that share an owner session
+-- with their captured root. Attributed by the harness managing code; never merged into
+-- stream_events. Bounded per owner session; every eviction, refusal and compaction is accounted.
+CREATE TABLE IF NOT EXISTS mem.child_stream_events (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  harness    TEXT NOT NULL,
+  root       TEXT NOT NULL,
+  child_key  TEXT NOT NULL,
+  epoch      TEXT NOT NULL,
+  child      TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  source_ref TEXT NOT NULL,
+  data       TEXT NOT NULL,
+  bytes      INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS mem.idx_child_stream_events_lane
+  ON child_stream_events(session_id, harness, root, child_key, id);
+
+CREATE INDEX IF NOT EXISTS mem.idx_child_stream_events_session
+  ON child_stream_events(session_id, id);
+
+CREATE TABLE IF NOT EXISTS mem.child_stream_lanes (
+  session_id      TEXT NOT NULL,
+  harness         TEXT NOT NULL,
+  root            TEXT NOT NULL,
+  child_key       TEXT NOT NULL,
+  epoch           TEXT NOT NULL,
+  child           TEXT NOT NULL,
+  unresolved      INTEGER NOT NULL,
+  first_seen_id   INTEGER NOT NULL,
+  evicted_through INTEGER NOT NULL DEFAULT 0,
+  evicted_rows    INTEGER NOT NULL DEFAULT 0,
+  evicted_bytes   INTEGER NOT NULL DEFAULT 0,
+  refused_rows    INTEGER NOT NULL DEFAULT 0,
+  coverage        TEXT NOT NULL DEFAULT '',
+  updated_at      INTEGER NOT NULL,
+  PRIMARY KEY (session_id, harness, root, child_key)
+);
+
+CREATE TABLE IF NOT EXISTS mem.child_stream_session_loss (
+  session_id      TEXT PRIMARY KEY,
+  epoch           TEXT NOT NULL,
+  compacted_lanes INTEGER NOT NULL DEFAULT 0,
+  evicted_rows    INTEGER NOT NULL DEFAULT 0,
+  evicted_bytes   INTEGER NOT NULL DEFAULT 0,
+  refused_rows    INTEGER NOT NULL DEFAULT 0,
+  updated_at      INTEGER NOT NULL
+);
+
+-- Loss bookkeeping rides on the delete itself, inside the same statement, so it is exactly as
+-- atomic as the delete: a row that is not deleted is never counted, a deleted row is counted once.
+CREATE TRIGGER IF NOT EXISTS mem.child_stream_events_account_delete
+AFTER DELETE ON child_stream_events
+BEGIN
+  UPDATE child_stream_lanes SET
+    evicted_through = MAX(evicted_through, OLD.id),
+    evicted_rows = evicted_rows + 1,
+    evicted_bytes = evicted_bytes + OLD.bytes
+  WHERE session_id = OLD.session_id AND harness = OLD.harness
+    AND root = OLD.root AND child_key = OLD.child_key;
+END;
+
+CREATE TRIGGER IF NOT EXISTS mem.child_stream_lanes_account_delete
+AFTER DELETE ON child_stream_lanes
+WHEN OLD.child_key NOT LIKE 's:%'
+BEGIN
+  INSERT OR IGNORE INTO child_stream_session_loss
+    (session_id, epoch, compacted_lanes, evicted_rows, evicted_bytes, refused_rows, updated_at)
+  VALUES (OLD.session_id, OLD.epoch, 0, 0, 0, 0, OLD.updated_at);
+  UPDATE child_stream_session_loss SET
+    compacted_lanes = compacted_lanes + 1,
+    evicted_rows = evicted_rows + OLD.evicted_rows,
+    evicted_bytes = evicted_bytes + OLD.evicted_bytes,
+    refused_rows = refused_rows + OLD.refused_rows,
+    epoch = OLD.epoch,
+    updated_at = MAX(updated_at, OLD.updated_at)
+  WHERE session_id = OLD.session_id;
+END;
+
 CREATE TABLE IF NOT EXISTS mem.stream_raw (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id TEXT NOT NULL,

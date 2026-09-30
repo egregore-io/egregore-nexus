@@ -55,7 +55,7 @@ name core/crates/nexus/src/daemon/claude_native_forwarder.rs|20
 name core/crates/nexus/src/daemon/claude_resume_harvest.rs|23
 name core/crates/nexus/src/daemon/harness_launch.rs|2
 name core/crates/nexus/src/daemon/hermes_gateway.rs|49
-name core/crates/nexus/src/daemon/hermes_native_forwarder.rs|28
+name core/crates/nexus/src/daemon/hermes_native_forwarder.rs|26
 name core/crates/nexus/src/daemon/lifecycle.rs|3
 name core/crates/nexus/src/daemon/opencode_native_forwarder.rs|19
 name core/crates/nexus/src/daemon/opencode_plugin_bridge.rs|34

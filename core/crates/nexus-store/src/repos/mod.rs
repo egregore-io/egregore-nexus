@@ -11,6 +11,7 @@ pub mod agent_groups;
 pub mod agent_runtimes;
 pub mod agent_session_messages;
 pub mod agents;
+pub mod child_stream_events;
 pub mod command_intents;
 pub mod command_queue;
 pub mod daemon_state;
@@ -43,6 +44,12 @@ pub use agent_session_messages::{
     AgentSessionMessageRow, AgentSessionMessages, AgentSessionTurnRow, NewAgentSessionMessage,
 };
 pub use agents::{AgentOwner, AgentRef, Agents, NewAgent};
+pub use child_stream_events::{
+    child_key, AppendOutcome, ChildStreamBounds, ChildStreamEventRow, ChildStreamEvents,
+    LaneCursor, LaneFilter, LaneMutation, LanePage, LaneSummary, Page as ChildStreamPage,
+    RefusedBy, SessionLoss, MAX_CHILD_JSON_BYTES, MAX_COVERAGE_BYTES, MAX_KEY_BYTES,
+    MAX_SOURCE_REF_BYTES, REFUSED_SENTINEL_KEY,
+};
 pub use command_intents::{
     CommandIntentDepth, CommandIntentReceipt, CommandIntentRow, CommandIntents, NewCommandIntent,
     PromptCommandOutcome,

@@ -245,3 +245,172 @@ fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
     }
     panic!("function body end")
 }
+
+mod hermes_tool_output_contract {
+    use super::*;
+    use nexus_agent::adapter::hermes::native::{
+        translate_message_row, HermesForwardState, HermesMessageRow,
+    };
+
+    const CALL_ID: &str = "call_hermes_output_contract";
+
+    fn input() -> Value {
+        json!({ "command": "printf hello", "timeout": 10 })
+    }
+
+    fn native_events(result: &str) -> Vec<(AgentUpdateKind, Value)> {
+        let opening = HermesMessageRow {
+            id: 1,
+            session_id: "hermes_output_contract_fixture".to_string(),
+            role: "assistant".to_string(),
+            content: None,
+            tool_call_id: None,
+            tool_calls: Some(json!([{
+                "id": CALL_ID,
+                "type": "function",
+                "function": { "name": "terminal", "arguments": input().to_string() },
+            }])),
+            tool_name: None,
+            timestamp: 1.0,
+            finish_reason: Some("tool_calls".to_string()),
+            active: true,
+        };
+        let terminal = HermesMessageRow {
+            id: 2,
+            role: "tool".to_string(),
+            content: Some(result.to_string()),
+            tool_call_id: Some(CALL_ID.to_string()),
+            tool_calls: None,
+            tool_name: Some("terminal".to_string()),
+            timestamp: 2.0,
+            finish_reason: None,
+            ..opening.clone()
+        };
+        let mut state = HermesForwardState::default();
+        let mut events = translate_message_row(&opening, &mut state);
+        events.extend(translate_message_row(&terminal, &mut state));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, AgentUpdateKind::ToolCall);
+        assert_eq!(events[0].data["status"], "in_progress");
+        assert_eq!(events[1].kind, AgentUpdateKind::ToolCall);
+        assert_eq!(events[1].data["id"], CALL_ID);
+        assert_eq!(events[1].data["status"], "completed");
+        events
+            .into_iter()
+            .map(|event| (event.kind, event.data))
+            .collect()
+    }
+
+    async fn materialized_tool(events: &[(AgentUpdateKind, Value)]) -> Value {
+        let store = migrated().await;
+        let session = SessionId("s_hermes_output_contract_fixture".to_string());
+        let streams = StreamEvents::new(&store);
+        for (kind, data) in events {
+            let kind_json = serde_json::to_value(kind).unwrap();
+            let id = streams
+                .append(&session, kind_json.as_str().unwrap(), &data.to_string())
+                .await
+                .unwrap();
+            materialize_agent_update(&store, &session, id, *kind, data)
+                .await
+                .unwrap();
+        }
+        let end = streams.append(&session, "turn_end", "{}").await.unwrap();
+        materialize_agent_update(&store, &session, end, AgentUpdateKind::TurnEnd, &json!({}))
+            .await
+            .unwrap();
+
+        let messages = AgentSessionMessages::new(&store)
+            .messages_for_session(&session, 20)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "assistant");
+        assert_eq!(messages[0].status, "final");
+        let content: Value = serde_json::from_str(&messages[0].content_json).unwrap();
+        let blocks = content["blocks"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "opening and result must merge by call id");
+        let block = blocks[0].clone();
+        assert_eq!(block["type"], "tool_call");
+        assert_eq!(block["id"], CALL_ID);
+        assert_eq!(block["tool"], "terminal");
+        assert_eq!(block["input"], input());
+        assert_eq!(block["status"], "completed");
+        block
+    }
+
+    async fn assert_native_output(result: &str, expected: &str) {
+        let events = native_events(result);
+        let block = materialized_tool(&events).await;
+        assert_eq!(
+            block.get("output"),
+            Some(&json!(expected)),
+            "native tool result must survive the durable fold; emitted result: {}",
+            events[1].1,
+        );
+    }
+
+    #[tokio::test]
+    async fn native_text_result_survives_materialization() {
+        assert_native_output("hello\n", "hello\n").await;
+    }
+
+    #[tokio::test]
+    async fn native_empty_result_remains_explicit_after_materialization() {
+        assert_native_output("", "").await;
+    }
+
+    #[tokio::test]
+    async fn native_json_result_survives_materialization() {
+        let result = json!({ "stdout": "hello\n", "exit_code": 0, "lines": ["hello"] });
+        assert_native_output(
+            &result.to_string(),
+            &serde_json::to_string_pretty(&result).unwrap(),
+        )
+        .await;
+    }
+
+    fn canonical_events(result_key: &str, output: Option<Value>) -> Vec<(AgentUpdateKind, Value)> {
+        let mut terminal = json!({ "id": CALL_ID, "status": "completed" });
+        if let Some(output) = output {
+            terminal[result_key] = output;
+        }
+        vec![
+            (
+                AgentUpdateKind::ToolCall,
+                json!({
+                    "id": CALL_ID,
+                    "tool": "terminal",
+                    "title": "terminal",
+                    "input": input(),
+                    "status": "in_progress",
+                }),
+            ),
+            (AgentUpdateKind::ToolCall, terminal),
+        ]
+    }
+
+    #[tokio::test]
+    async fn canonical_result_keys_preserve_text_empty_and_json_outputs() {
+        let structured = json!({ "stdout": "hello\n", "exit_code": 0, "lines": ["hello"] });
+        for key in ["output", "content"] {
+            for (result, expected) in [
+                (json!("hello\n"), "hello\n".to_string()),
+                (json!(""), String::new()),
+                (
+                    structured.clone(),
+                    serde_json::to_string_pretty(&structured).unwrap(),
+                ),
+            ] {
+                let block = materialized_tool(&canonical_events(key, Some(result))).await;
+                assert_eq!(block.get("output"), Some(&json!(expected)), "key: {key}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_absent_result_does_not_invent_empty_output() {
+        let block = materialized_tool(&canonical_events("output", None)).await;
+        assert!(block.get("output").is_none());
+    }
+}

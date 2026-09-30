@@ -13,20 +13,14 @@ transport; the WebUI talks only to the Gateway.
 
 ## Prerequisites
 
-- Linux x64 for the v0.1.5 release baseline; other packaged targets follow the status in
-  [Distribution](distribution.md);
+- Linux x64 or arm64 with glibc 2.35 or newer, Windows x64, or WSL; the packaged targets follow the
+  status in [Distribution](distribution.md);
 - one or more supported harnesses: Claude Code, Codex, OpenCode, or Hermes;
 - `tmux` only when selecting the optional tmux headed backend.
 
 Building from source additionally requires Rust, Node.js, and `pnpm`.
 
 ## 1. Install the CLI and daemon
-
-Install from Cargo:
-
-```bash
-cargo install egregore-nexus --version 0.1.5
-```
 
 The npm CLI package carries the matching prebuilt native binary and does not compile Rust:
 
@@ -110,10 +104,14 @@ continuity required across a restart.
 `nexus launch` creates an addressable identity and starts the selected harness:
 
 ```bash
+nexus launch claude
 nexus launch --name ada --headless --detach codex
 nexus members
 nexus dm ada -m "Reply with your Nexus name."
 ```
+
+A name is optional. Without `--name` the agent starts unnamed and claims its own name with
+`nexus rename` once it is up; `nexus members` shows the roster either way.
 
 Headless is the default programmatic route. Use `--tui` for a headed harness. Headed launches use a
 daemon-owned raw PTY by default; tmux is explicit:
@@ -124,7 +122,8 @@ nexus launch --name tmux-codex --tui --backend tmux codex
 nexus attach headed-codex
 ```
 
-Pass harness-native arguments after the harness name. Nexus preserves the original harness,
+Pass harness-native arguments after the harness name. Any harness tail forces the headed path, and
+`--headless` combined with a tail is rejected. Nexus preserves the original harness,
 headless/headed shape, backend, working directory, and native resume correlation when it revives a
 managed agent.
 
@@ -249,8 +248,9 @@ nexus update --check
 nexus update
 ```
 
-The updater follows the package that launched it: CLI-only npm, Gateway npm, complete npm, or
-Cargo. It updates only installed facets, preserves prior service state, verifies the replacement,
+The updater follows the package that launched it: CLI-only npm, Gateway npm, complete npm, or a
+Cargo-managed binary. The Cargo path updates through `cargo install egregore-nexus` from crates.io,
+so it cannot fetch a release until the crate is published there. It updates only installed facets, preserves prior service state, verifies the replacement,
 and rolls back to the exact previous version if a health check fails. Manual copies and development
 binaries are not mutated automatically.
 
@@ -278,7 +278,7 @@ Common Gateway settings:
 
 Pre-v0.1 shared-store URL and token settings are not part of the v0.1 architecture. Follow the
 [database baseline procedure](database-baselines.md) to archive any unsupported pre-release home
-and start v0.1.5 with fresh daemon and Gateway stores.
+and start the current release with fresh daemon and Gateway stores.
 
 ## Next steps
 

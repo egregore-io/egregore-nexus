@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 const guard = globalThis.__nexusOpenCodePlugin ??= {};
 
@@ -44,6 +44,33 @@ export const nexus = async () => {
   let telemetryBytes = 0;
   let telemetryStopped = false;
   let telemetryRoot;
+  // Child sessions. Ancestry comes only from native `session.created` parentID links (never
+  // from names, text or timing) and is bounded; task refs come from the root's own task parts.
+  // Every child event carries a source ref within this plugin instance's generation.
+  // Every child map is bounded and evicts its oldest entry; each eviction has a visible
+  // consequence rather than a silent one: an evicted ancestry entry makes later events
+  // unresolved, an evicted role makes later text carry role "unknown", an evicted active
+  // session gets a forced turn_end, and an evicted text prior makes the next update a
+  // snapshot instead of a delta. Text priors are kept as length plus digest, never the text.
+  const MAX_CHILD_ENTRIES = 256;
+  const MAX_CHILD_ROLES = 1024;
+  const MAX_CHILD_TEXT_PARTS = 512;
+  // A native id is retained or referenced only as a nonempty string within this byte cap;
+  // anything else (a number, an object, an oversized string) is malformed and never becomes a
+  // map key, a child id or a source ref component.
+  const MAX_NATIVE_ID_BYTES = 512;
+  const nativeId = value =>
+    typeof value === "string" && value.length > 0 && Buffer.byteLength(value) <= MAX_NATIVE_ID_BYTES
+      ? value
+      : undefined;
+  const nativeRole = value => (value === "user" || value === "assistant" ? value : undefined);
+  const ancestry = new Map();
+  const childRefs = new Map();
+  const childRoles = new Map();
+  const childActive = new Map();
+  const childTextPriors = new Map();
+  const childGeneration = `${process.pid.toString(36)}-${Date.now().toString(36)}`;
+  let childSequence = 0;
 
   async function bridge(path, init = {}, timeoutMs = 30_000) {
     const res = await fetch(`${bridgeUrl}${path}`, {
@@ -142,6 +169,178 @@ export const nexus = async () => {
 
   function ours(id) {
     return Boolean(id && telemetryRoot && id === telemetryRoot);
+  }
+
+  // Insert or refresh, evicting the oldest entry past `limit`; returns the evicted key.
+  function remember(map, key, value, limit = MAX_CHILD_ENTRIES) {
+    if (map.has(key)) map.delete(key);
+    map.set(key, value);
+    if (map.size > limit) {
+      const oldest = map.keys().next().value;
+      map.delete(oldest);
+      return oldest;
+    }
+    return undefined;
+  }
+
+  // Follow native parentID links toward the captured root. Verified only when the chain
+  // reaches the root; depth is then the hop count. Bounded by the ancestry map itself.
+  function lineage(id) {
+    const seen = new Set();
+    let cursor = id;
+    let hops = 0;
+    while (cursor && !seen.has(cursor) && hops <= MAX_CHILD_ENTRIES) {
+      if (cursor === telemetryRoot) return { verified: true, depth: hops };
+      seen.add(cursor);
+      const entry = ancestry.get(cursor);
+      if (!entry) return { verified: false };
+      cursor = entry.parentID;
+      hops += 1;
+    }
+    return { verified: false };
+  }
+
+  function childStream(id) {
+    const child = { harness: "opencode", root: telemetryRoot ?? "", id, locator: `opencode:session/${id}` };
+    const entry = ancestry.get(id);
+    if (entry?.parentID) child.parent = entry.parentID;
+    const ref = childRefs.get(id);
+    if (ref) child.parentRef = ref;
+    const line = lineage(id);
+    if (line.verified) {
+      child.depth = line.depth;
+      child.resolution = "lineage_verified";
+      child.evidence = "session.created.parentID chain to root";
+    } else {
+      child.resolution = "unresolved";
+    }
+    return child;
+  }
+
+  // A part whose session id is missing or malformed cannot be attributed to any child: it
+  // goes to one unresolved lane per root under a fixed locator, with the native message and
+  // part ids only in the source ref and the provenance ("missing" or "malformed") in the
+  // data. No id or role is invented for it.
+  function unidentifiedStream() {
+    return {
+      harness: "opencode",
+      root: telemetryRoot ?? "",
+      locator: "opencode:unidentified",
+      resolution: "unresolved",
+    };
+  }
+
+  async function postChild(child, id, kind, data, source) {
+    const sequence = ++childSequence;
+    const sourceRef = `opencode:${id ?? "-"}/${source.messageID ?? "-"}/${source.partID ?? "-"}@${childGeneration}#${sequence}`;
+    try {
+      await bridge("/child", {
+        method: "POST",
+        body: JSON.stringify({ child, kind, sourceRef, data }),
+      }, 10_000);
+    } catch (error) {
+      log(`child bridge failed: ${error.message}`);
+    }
+  }
+
+  async function emitChild(id, kind, data = {}, source = {}) {
+    if (kind !== "turn_end") {
+      const evicted = remember(childActive, id, true);
+      if (evicted !== undefined && evicted !== id) {
+        // Bounded active-session tracking: the evicted session is closed visibly.
+        await postChild(childStream(evicted), evicted, "turn_end", { reason: "child_state_evicted" }, {});
+      }
+    }
+    await postChild(childStream(id), id, kind, data, source);
+  }
+
+  async function endChildTurn(id) {
+    if (!id || !childActive.has(id)) return;
+    childActive.delete(id);
+    await emitChild(id, "turn_end", {});
+  }
+
+  // Child text priors are (length, digest) per exact session/message/part key, so a part of
+  // any size costs O(1) memory. A snapshot that extends a known prior yields a delta; a part
+  // with no known prior (first sight, or evicted) yields the whole snapshot marked as such.
+  function childTextUpdate(id, messageID, partID, part) {
+    // Absent or nonstring text is no observation; an explicit empty string is a snapshot.
+    const text = typeof part.text === "string" ? part.text : typeof part.content === "string" ? part.content : undefined;
+    if (text === undefined) return undefined;
+    // Without proven part identity there is no prior to relate to: every observation is an
+    // independent snapshot and nothing is cached under a shared key.
+    if (!id || !messageID || !partID) return { text, delivery: "snapshot" };
+    // Injective key: the tuple encoded as JSON, never a delimiter-joined string.
+    const key = JSON.stringify([id, messageID, partID]);
+    const digest = value => createHash("sha1").update(value).digest("base64");
+    const prior = childTextPriors.get(key);
+    remember(childTextPriors, key, { len: text.length, digest: digest(text) }, MAX_CHILD_TEXT_PARTS);
+    if (prior && text.length >= prior.len && digest(text.slice(0, prior.len)) === prior.digest) {
+      const delta = text.slice(prior.len);
+      return delta ? { text: delta, delivery: "delta" } : undefined;
+    }
+    // No prior (first sight, or evicted), or a snapshot that does not extend the prior: the
+    // whole snapshot, marked as such. An explicit empty string replaces earlier text the same
+    // way, so nothing downstream is left stale.
+    return { text, delivery: "snapshot" };
+  }
+
+  // C-TOOL v1 (docs/tool-call-contract.md): `tool` = the registered machine name,
+  // `input` = the structured args value; keys are omitted when absent, never null-padded.
+  function toolPayload(part) {
+    const toolName = String(part.tool ?? part.name ?? "tool");
+    const payload = {
+      id: String(part.callID ?? part.toolCallID ?? part.toolCallId ?? part.id ?? "tool"),
+      tool: toolName,
+      title: toolName,
+      status: (part.state?.status ?? part.status) === "error"
+        ? "failed" : (part.state?.status ?? part.status ?? "in_progress"),
+    };
+    const input = part.input ?? part.arguments ?? part.state?.input;
+    if (input != null) payload.input = input;
+    const output = part.output ?? part.result ?? part.state?.output;
+    const error = part.state?.error;
+    if (payload.status === "failed" && error != null) payload.content = error;
+    else if (output != null) payload.content = output;
+    return payload;
+  }
+
+  // A part of a session that is not the root: a child lane event, verified when native
+  // ancestry reaches the root and unresolved otherwise. Never the parent lane, never
+  // silently dropped: a missing session id goes to the unidentified unresolved lane and an
+  // unknown role is carried as "unknown".
+  async function observeChildPart(id, part, identity) {
+    if (!telemetryRoot) {
+      log("child part observed before the root is known; not attributable");
+      return;
+    }
+    const messageID = nativeId(part.messageID ?? part.messageId);
+    const partID = nativeId(part.id);
+    const source = { messageID, partID };
+    const type = part.type;
+    const send = (kind, data) => id
+      ? emitChild(id, kind, data, source)
+      : postChild(unidentifiedStream(), undefined, kind, { ...data, identity }, source);
+    if (type === "text" || type === "reasoning") {
+      const update = childTextUpdate(id, messageID, partID, part);
+      if (!update) return;
+      const role = (messageID && (roles.get(messageID) ?? childRoles.get(messageID))) ?? "unknown";
+      const data = { ...update };
+      if (partID ?? messageID) data.itemId = partID ?? messageID;
+      if (messageID) data.nativeMessageId = messageID;
+      if (type === "reasoning") await send("thinking", data);
+      else if (role === "user") await send("user_input", data);
+      else await send("text", role === "assistant" ? data : { ...data, role: "unknown" });
+      return;
+    }
+    if (type === "tool") {
+      await send("tool_call", toolPayload(part));
+      return;
+    }
+    if (type === "step-finish") {
+      if (id) await endChildTurn(id);
+      else await send("turn_end", {});
+    }
   }
 
   const sessionReady = (async () => {
@@ -374,7 +573,13 @@ export const nexus = async () => {
   }
 
   async function observePart(part) {
-    if (!ours(part.sessionID ?? part.sessionId)) return;
+    const rawSession = part.sessionID ?? part.sessionId;
+    const partSession = nativeId(rawSession);
+    if (!ours(partSession)) {
+      const identity = partSession ? undefined : rawSession == null ? "missing" : "malformed";
+      await observeChildPart(partSession, part, identity);
+      return;
+    }
     // A revoked/uncertain command receipt does not revoke this root's native
     // display. Preserve ordering when available, then continue actual output.
     if (activeTurn?.receipt) {
@@ -404,22 +609,19 @@ export const nexus = async () => {
       return;
     }
     if (type === "tool") {
-      // C-TOOL v1 (docs/tool-call-contract.md): `tool` = the registered machine name,
-      // `input` = the structured args value; keys are omitted when absent, never null-padded.
-      const toolName = String(part.tool ?? part.name ?? "tool");
-      const payload = {
-        id: String(part.callID ?? part.toolCallID ?? part.toolCallId ?? part.id ?? "tool"),
-        tool: toolName,
-        title: toolName,
-        status: (part.state?.status ?? part.status) === "error"
-          ? "failed" : (part.state?.status ?? part.status ?? "in_progress"),
-      };
-      const input = part.input ?? part.arguments ?? part.state?.input;
-      if (input != null) payload.input = input;
-      const output = part.output ?? part.result ?? part.state?.output;
-      const error = part.state?.error;
-      if (payload.status === "failed" && error != null) payload.content = error;
-      else if (output != null) payload.content = output;
+      const payload = toolPayload(part);
+      // A root task part names the child session it spawned: the only native link from a
+      // parent tool call to a child session. The call stays in the parent lane.
+      const spawned = nativeId(part.state?.metadata?.sessionId ?? part.state?.metadata?.sessionID);
+      // The child's parent ref is provenance: it needs the original call id to be a
+      // well-formed native id. Otherwise the ref is omitted, never coerced or truncated. The
+      // parent lane's own tool payload keeps its existing coercion.
+      const callId = nativeId(part.callID ?? part.toolCallID ?? part.toolCallId ?? part.id);
+      if (spawned && spawned !== telemetryRoot && callId) {
+        const messageID = nativeId(part.messageID ?? part.messageId) ?? "-";
+        const partID = nativeId(part.id) ?? "-";
+        remember(childRefs, spawned, `opencode:${messageID}/${partID}/${callId}`);
+      }
       await emit("tool_call", payload);
       return;
     }
@@ -478,12 +680,22 @@ export const nexus = async () => {
     },
     event: async ({ event }) => {
       switch (event.type) {
-        case "session.created":
-          if (!event.properties?.info?.parentID && event.properties?.info?.id) sessionID = event.properties.info.id;
+        case "session.created": {
+          const info = event.properties?.info ?? {};
+          const created = nativeId(info.id);
+          const parent = nativeId(info.parentID);
+          if (!info.parentID && created) sessionID = created;
+          // Native ancestry: a child session names its parent at creation. Only well-formed
+          // ids are retained.
+          if (parent && created) remember(ancestry, created, { parentID: parent });
           break;
+        }
         case "message.updated": {
           const info = event.properties?.info ?? {};
           if (ours(info.sessionID) && info.id && info.role) roles.set(info.id, info.role);
+          else if (nativeId(info.sessionID) && nativeId(info.id) && nativeRole(info.role)) {
+            remember(childRoles, info.id, info.role, MAX_CHILD_ROLES);
+          }
           const receipt = ours(info.sessionID) ? observeUserReceipt(info) : undefined;
           // Capture before any asynchronous lookup; same-ID older responses cannot overwrite newer.
           const sequence = ++telemetrySequence;
@@ -509,7 +721,10 @@ export const nexus = async () => {
           await observePart(event.properties?.part ?? {});
           break;
         case "session.status":
-          if (!ours(event.properties?.sessionID)) return;
+          if (!ours(event.properties?.sessionID)) {
+            if (event.properties?.status?.type === "idle") await endChildTurn(event.properties?.sessionID);
+            return;
+          }
           if (event.properties?.status?.type === "busy") {
             busy = true;
             nativeBusy = true;
@@ -523,7 +738,10 @@ export const nexus = async () => {
           }
           break;
         case "session.idle":
-          if (!ours(event.properties?.sessionID)) return;
+          if (!ours(event.properties?.sessionID)) {
+            await endChildTurn(event.properties?.sessionID);
+            return;
+          }
           nativeBusy = false;
           await completeActiveTurn();
           break;

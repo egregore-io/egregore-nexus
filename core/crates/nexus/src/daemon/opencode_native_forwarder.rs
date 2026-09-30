@@ -282,16 +282,33 @@ async fn discover_latest_session_id(
         return Ok(None);
     }
     let db = Store::open(&path_to_text(db_path)).await?;
+    // Only a root session may be bound as the runtime's root: a child session (parent_id set)
+    // sharing the directory is never the owner. Stores that predate the parent_id column fall
+    // back to the unfiltered query.
     let rows = db
         .conn
         .query(
             "SELECT id FROM session
-             WHERE directory = ?1
+             WHERE directory = ?1 AND parent_id IS NULL
              ORDER BY time_updated DESC, time_created DESC
              LIMIT 1",
             params![path_to_text(launch_cwd)],
         )
         .await;
+    let rows = match rows {
+        Err(error) if is_missing_column(&error) => {
+            db.conn
+                .query(
+                    "SELECT id FROM session
+                     WHERE directory = ?1
+                     ORDER BY time_updated DESC, time_created DESC
+                     LIMIT 1",
+                    params![path_to_text(launch_cwd)],
+                )
+                .await
+        }
+        other => other,
+    };
     let mut rows = match rows {
         Ok(rows) => rows,
         Err(error) if is_missing_table(&error) => return Ok(None),
@@ -324,4 +341,8 @@ fn store_err(e: libsql::Error) -> NexusError {
 
 fn is_missing_table(error: &libsql::Error) -> bool {
     error.to_string().contains("no such table")
+}
+
+fn is_missing_column(error: &libsql::Error) -> bool {
+    error.to_string().contains("no such column")
 }

@@ -18,6 +18,8 @@ use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::EventSink;
 use nexus_contracts::WsEvent;
 use nexus_dispatch::Bell;
+use nexus_harness_hermes::{is_missing_column, run_child_pass, HARNESS_ID};
+pub use nexus_harness_hermes::{HermesChildCursor, HermesChildStreamsRepo};
 use nexus_store::repos::{
     IdentitySessions, NativeThreadBindings, NewNativeThreadBinding, Sessions,
 };
@@ -64,6 +66,19 @@ pub struct HermesForwarderStats {
     pub thinking_events: usize,
     pub tool_call_events: usize,
     pub turn_end_events: usize,
+    /// `child_agent.update` events emitted for descendant sessions. Never parent activity.
+    pub child_events: usize,
+    /// Child passes or child sessions that failed; the parent pass is unaffected.
+    pub child_errors: usize,
+    /// Discovery cuts that may hide unregistered descendants right now: a parent's child page
+    /// that was full (resumed by keyset next pass), the per-pass registration cap, and known
+    /// sessions at the depth limit whose children are never explored. Non-zero means this pass
+    /// was not a complete enumeration.
+    pub child_discovery_truncated: usize,
+    /// Known sessions at some depth that were not explored this pass because more of them exist
+    /// than the per-level frontier bound; they rotate in on later passes. Non-zero means
+    /// exploration below them is spread over passes, not skipped.
+    pub child_discovery_deferred: usize,
 }
 
 impl HermesForwarderStats {
@@ -296,7 +311,7 @@ impl<'a> HermesRuntimeStateRepo<'a> {
         };
         NativeThreadBindings::new(self.store)
             .claim(NewNativeThreadBinding {
-                provider: "hermes".into(),
+                provider: HARNESS_ID.into(),
                 kind: "harness".into(),
                 native_thread_id: hermes_session_id.to_string(),
                 agent_id,
@@ -385,7 +400,7 @@ pub async fn forward_once_with_tool_observations(
         read_message_rows(&state.hermes_db_path, &hermes_session_id, state.message_id).await?;
 
     let mut translate_state =
-        HermesForwardState::from_cursor(Some(hermes_session_id), state.message_id);
+        HermesForwardState::from_cursor(Some(hermes_session_id.clone()), state.message_id);
     let mut stats = HermesForwarderStats::default();
     let adapter = HermesNativeAdapter;
     for row in &rows {
@@ -412,10 +427,24 @@ pub async fn forward_once_with_tool_observations(
     }
     repo.set_cursor(&session, translate_state.last_message_id)
         .await?;
+
+    // The child pass runs after the parent's cursor is committed, inside the harness crate,
+    // and never fails the parent's pass: the daemon only merges its generic statistics.
+    let child = run_child_pass(
+        &store,
+        &session,
+        events.as_ref(),
+        &state.hermes_db_path,
+        &hermes_session_id,
+    )
+    .await;
+    stats.child_events += child.child_events;
+    stats.child_errors += child.child_errors;
+    stats.child_discovery_truncated += child.child_discovery_truncated;
+    stats.child_discovery_deferred += child.child_discovery_deferred;
     Ok(stats)
 }
 
-/// Spawn a poll loop that forwards Hermes native DB rows into `events`.
 pub fn spawn_hermes_native_forwarder(
     store: Arc<Store>,
     session: SessionId,
@@ -501,29 +530,33 @@ async fn read_message_rows(
     };
     let mut out = Vec::new();
     while let Some(row) = rows.next().await.map_err(store_err)? {
-        let tool_calls_raw: Option<String> = row.get(5).map_err(store_err)?;
-        let tool_calls = tool_calls_raw
-            .as_deref()
-            .filter(|raw| !raw.trim().is_empty())
-            .map(|raw| {
-                serde_json::from_str(raw)
-                    .map_err(|e| NexusError::Store(format!("invalid Hermes tool_calls JSON: {e}")))
-            })
-            .transpose()?;
-        out.push(HermesMessageRow {
-            id: row.get(0).map_err(store_err)?,
-            session_id: row.get(1).map_err(store_err)?,
-            role: row.get(2).map_err(store_err)?,
-            content: row.get(3).map_err(store_err)?,
-            tool_call_id: row.get(4).map_err(store_err)?,
-            tool_calls,
-            tool_name: row.get(6).map_err(store_err)?,
-            timestamp: row.get(7).map_err(store_err)?,
-            finish_reason: row.get(8).map_err(store_err)?,
-            active: row.get::<Option<i64>>(9).map_err(store_err)?.unwrap_or(1) != 0,
-        });
+        out.push(message_row(&row)?);
     }
     Ok(out)
+}
+
+fn message_row(row: &libsql::Row) -> Result<HermesMessageRow, NexusError> {
+    let tool_calls_raw: Option<String> = row.get(5).map_err(store_err)?;
+    let tool_calls = tool_calls_raw
+        .as_deref()
+        .filter(|raw| !raw.trim().is_empty())
+        .map(|raw| {
+            serde_json::from_str(raw)
+                .map_err(|e| NexusError::Store(format!("invalid Hermes tool_calls JSON: {e}")))
+        })
+        .transpose()?;
+    Ok(HermesMessageRow {
+        id: row.get(0).map_err(store_err)?,
+        session_id: row.get(1).map_err(store_err)?,
+        role: row.get(2).map_err(store_err)?,
+        content: row.get(3).map_err(store_err)?,
+        tool_call_id: row.get(4).map_err(store_err)?,
+        tool_calls,
+        tool_name: row.get(6).map_err(store_err)?,
+        timestamp: row.get(7).map_err(store_err)?,
+        finish_reason: row.get(8).map_err(store_err)?,
+        active: row.get::<Option<i64>>(9).map_err(store_err)?.unwrap_or(1) != 0,
+    })
 }
 
 async fn discover_latest_session_id(
@@ -538,17 +571,36 @@ async fn discover_latest_session_id(
     }
     let cwd = path_to_text(launch_cwd);
     let db = Store::open(&path_to_text(db_path)).await?;
+    // Only a root session may be bound as the runtime's root: a child session
+    // (parent_session_id set) sharing the cwd is never the owner. Stores that predate the
+    // column fall back to the unfiltered query.
     let rows = db
         .conn
         .query(
             "SELECT id FROM sessions
-             WHERE cwd = ?1
-                OR json_extract(COALESCE(model_config, '{}'), '$.cwd') = ?1
+             WHERE (cwd = ?1
+                OR json_extract(COALESCE(model_config, '{}'), '$.cwd') = ?1)
+               AND parent_session_id IS NULL
              ORDER BY COALESCE(ended_at, started_at) DESC, started_at DESC
              LIMIT 1",
-            params![cwd],
+            params![cwd.clone()],
         )
         .await;
+    let rows = match rows {
+        Err(error) if is_missing_column(&error) => {
+            db.conn
+                .query(
+                    "SELECT id FROM sessions
+                     WHERE cwd = ?1
+                        OR json_extract(COALESCE(model_config, '{}'), '$.cwd') = ?1
+                     ORDER BY COALESCE(ended_at, started_at) DESC, started_at DESC
+                     LIMIT 1",
+                    params![cwd],
+                )
+                .await
+        }
+        other => other,
+    };
     let mut rows = match rows {
         Ok(rows) => rows,
         Err(error) if is_missing_table(&error) => return Ok(None),

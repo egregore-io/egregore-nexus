@@ -235,6 +235,13 @@ pub struct Store {
     /// share this store handle. This is separate from `write_lock`: presence paths use repository
     /// autocommit writes and may emit asynchronously before releasing this guard.
     presence_transition_lock: Arc<Mutex<()>>,
+    /// Serializes every mutation of the volatile child stream lane (`mem.child_stream_*`) so
+    /// admission counts, bound enforcement and loss accounting never interleave across tasks.
+    /// It is not a SQL transaction: unrelated writers on the shared connection are untouched.
+    child_lane_gate: Arc<Mutex<()>>,
+    /// The daemon's configured child lane bounds, set once at wiring so every writer of the lane
+    /// (the sink and the harness passes) admits through the same bounds.
+    child_stream_bounds: Arc<std::sync::OnceLock<crate::repos::ChildStreamBounds>>,
     // Keep the database handle alive for the lifetime of the connection (in-memory dbs are
     // dropped with their `Database`).
     _db: Arc<libsql::Database>,
@@ -335,6 +342,8 @@ impl Store {
             events: StoreEventBus::new(),
             write_lock: Arc::new(Mutex::new(())),
             presence_transition_lock: Arc::new(Mutex::new(())),
+            child_lane_gate: Arc::new(Mutex::new(())),
+            child_stream_bounds: Arc::new(std::sync::OnceLock::new()),
             _db: db,
         })
     }
@@ -359,6 +368,8 @@ impl Store {
             events: StoreEventBus::new(),
             write_lock: transport.write_lock.clone(),
             presence_transition_lock: transport.presence_transition_lock.clone(),
+            child_lane_gate: transport.child_lane_gate.clone(),
+            child_stream_bounds: transport.child_stream_bounds.clone(),
             _db: transport._db.clone(),
         }
     }
@@ -527,6 +538,27 @@ impl Store {
     /// (the materializer): acquire this BEFORE issuing a raw `BEGIN` on [`Store::conn`].
     pub fn write_lock(&self) -> Arc<Mutex<()>> {
         self.write_lock.clone()
+    }
+
+    /// The child stream lane's mutation gate (see the field). Held by every lane mutation for
+    /// its whole admission-insert-account sequence.
+    pub(crate) fn child_lane_gate(&self) -> Arc<Mutex<()>> {
+        self.child_lane_gate.clone()
+    }
+
+    /// Record the daemon's configured child lane bounds once; later calls keep the first value.
+    /// Returns the effective bounds.
+    pub fn configure_child_stream_bounds(
+        &self,
+        bounds: crate::repos::ChildStreamBounds,
+    ) -> crate::repos::ChildStreamBounds {
+        let _ = self.child_stream_bounds.set(bounds);
+        self.child_stream_bounds()
+    }
+
+    /// The configured child lane bounds, or the defaults before the daemon configured them.
+    pub fn child_stream_bounds(&self) -> crate::repos::ChildStreamBounds {
+        self.child_stream_bounds.get().copied().unwrap_or_default()
     }
 
     /// In-process write topics for daemon-local wakeups.

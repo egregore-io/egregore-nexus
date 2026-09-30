@@ -183,8 +183,7 @@ function eventsForBlock(row: MaterializedRow, block: MaterializedBlock): AgentUp
     const input =
       block.input !== undefined ? block.input : parseJsonMaybe(asString(block.argsJson));
     if (input !== undefined && input !== null) data.input = input;
-    const output = asString(block.output);
-    if (output) data.content = output;
+    if (typeof block.output === "string") data.content = block.output;
     return [update(row.sessionId, "tool_call", data)];
   }
   return [];

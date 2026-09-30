@@ -198,6 +198,12 @@ fn insert_opt(obj: &mut serde_json::Map<String, Value>, key: &str, v: Option<&Va
     }
 }
 
+/// Apply the shared C-TOOL sanitization policy to native adapter input/output before emission.
+/// Recursively replaces strings over 8 KiB or inline base64 data URIs with `"[omitted]"`.
+pub fn sanitize_tool_value(value: Value) -> Value {
+    sanitized(value)
+}
+
 /// Recursively replace any string > [`MAX_FIELD_BYTES`] or a `data:…;base64,` blob with [`OMITTED`].
 /// Pure — returns a cleaned copy. Walks objects + arrays so a nested `raw_output.result` base64
 /// image is caught wherever it sits (mirrors AionCore `translate.rs:66-69`, generalized to any

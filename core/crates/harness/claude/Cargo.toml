@@ -23,6 +23,8 @@ time = { workspace = true, features = ["parsing"] }
 same-file = "1.0.6"
 sha2 = { workspace = true }
 libsql = { workspace = true }
+tracing = { workspace = true }
+libc = "0.2"
 # Normal deps because the cross-crate fake ACP binary is a binary target.
 agent-client-protocol = { workspace = true }
 tokio-util = { workspace = true }

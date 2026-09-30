@@ -1,7 +1,9 @@
 # Session composer delivery
 
-An ordinary session Send uses `harness.prompt`: the daemon queues it until the
-target can accept a new turn. A client must not choose strict steer merely because
+An ordinary session Send uses `harness.prompt`. Admission depends on the backend: a
+backend with an opted-in native input queue (headed Claude) accepts the text during
+ongoing work without interrupting it, while other backends queue it until the target
+can accept a new turn. A client must not choose strict steer merely because
 its activity display says the agent is busy. That display can be stale by the time
 the request arrives. Explicit steer remains a separate active-turn operation.
 
@@ -9,7 +11,8 @@ Native automatic delivery is unsupported. Gateway prompt
 ingress and daemon prompt ingress reject non-null `delivery` and `modelSelection`
 options rather than silently discard them and send an ordinary prompt. Clients
 must preserve configured intent or report unsupported operation. Omitted options
-retain the existing boundary-prompt behavior; no WebSocket activity is required
+retain the default admission for that backend (native queue where supported, boundary
+prompt otherwise); no WebSocket activity is required
 to decide how ordinary Send is delivered.
 
 Steer dispatch applies the same validation before reviving or calling a harness.
@@ -234,8 +237,9 @@ Programmatic input registrations retain their owner, native session and eligible
 hook offset. The same record provenance flows into asynchronous accepted-input
 matching. A fresh owner's valid SessionStart can establish its pending identity;
 foreign or historical same-text records cannot consume that registration.
-The observed prompt still requires its matching acceptance callback to finish
-and its required terminal fact. Submit and Stop in one poll pass cannot return
+A native-queued prompt is admitted once its matching acceptance callback finishes;
+that admission is input acceptance, not a terminal fact. A completion-bound send-turn
+delivery still requires its terminal fact. Submit and Stop in one poll pass cannot return
 success while acceptance presentation is blocked. Terminal-only output does not
 substitute for the input receipt, and timeout cleanup does not retract a write.
 

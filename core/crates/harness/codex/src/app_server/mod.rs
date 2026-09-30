@@ -15,9 +15,14 @@ pub mod turn_completion;
 
 pub use approvals::{ApprovalHandler, AutoApprove};
 pub use bridge::{latest_rollout_thread_id, BridgeLaunchOptions, CodexBridge, ThreadDiscovered};
+pub use bridge::{
+    thread_spawn_meta, thread_spawn_meta_with_budget, RolloutScanBudget, ThreadSpawnMeta,
+};
 pub use client::CodexAppServerClient;
 pub use forwarder::{
-    spawn_codex_forwarder, spawn_codex_forwarder_with_tool_observations, CodexToolObservationSink,
+    notification_thread_identity, route_notification, spawn_codex_forwarder,
+    spawn_codex_forwarder_scoped, spawn_codex_forwarder_with_tool_observations, CodexThreadScope,
+    CodexToolObservationSink, LineageResolver, NotificationRoute, ThreadIdentity,
 };
 pub use jsonrpc::{CodexRpcError, JsonRpc, Notification};
 pub use protocol::method;

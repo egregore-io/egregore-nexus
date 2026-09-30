@@ -11,13 +11,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nexus_common::NexusError;
-use nexus_contracts::events::WsEvent;
+use nexus_contracts::events::{ChildResolution, ChildStream, WsEvent};
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::EventSink;
-use nexus_store::repos::ProducerIdentities;
+use nexus_store::repos::{ChildStreamEvents, DaemonState, LaneMutation, ProducerIdentities};
 use nexus_store::Store;
 use nexus_transcript::ToolCallObservation;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::native::bridge::ClaudeNativeBridgePaths;
 use crate::native::codec::{
@@ -30,7 +30,21 @@ use crate::native::transcript::{
     parse_hook_record, parse_transcript_value, AssistantText, ClaudeHookRecord, ClaudeToolUpdate,
     TranscriptRecord,
 };
-use crate::storage::{ClaudeRuntimeState, ClaudeRuntimeStateRepo};
+use crate::storage::{
+    ClaudeChildCursor, ClaudeChildStreamsRepo, ClaudeRuntimeState, ClaudeRuntimeStateRepo,
+};
+
+/// Subagent transcript files one child pass will serve; the rest are served by later passes,
+/// least recently served first, so every file is reached.
+const MAX_CHILD_FILES_PER_PASS: usize = 32;
+/// Directory entries one pass will list per owned session's `subagents/` directory.
+const MAX_CHILD_DIR_ENTRIES: usize = 1024;
+/// Bytes one pass will read from one subagent file, starting at its cursor.
+const MAX_CHILD_BYTES_PER_FILE_PASS: u64 = 256 * 1024;
+/// Records one pass will forward from one subagent file.
+const MAX_CHILD_RECORDS_PER_FILE_PASS: usize = 256;
+/// Bytes of a subagent file's first line read to establish its source generation.
+const MAX_CHILD_META_LINE_BYTES: u64 = 64 * 1024;
 
 /// Counts returned from one forwarder pass.
 ///
@@ -46,6 +60,12 @@ pub struct ClaudeForwarderStats {
     pub tool_call_events: usize,
     pub turn_end_events: usize,
     pub compaction_events: usize,
+    /// `child_agent.update` events emitted for subagent records (main-transcript sidechain rows
+    /// and tailed `subagents/` files). Never counted as parent activity.
+    pub child_events: usize,
+    /// Child passes that failed (read or cursor errors). The parent's pass, cursors and stats
+    /// are unaffected; the child pass retries next time.
+    pub child_errors: usize,
 }
 
 /// Observation-only sink for Claude native tool-call phases.
@@ -225,11 +245,26 @@ pub async fn forward_once_with_observations(
         );
     }
     let transcript_cursor = transcript_read.cursor;
-    let transcript_values: Vec<_> = transcript_read
-        .values
+    // Sidechain rows never enter the parent path: they are the subagent's, even when Claude
+    // writes them into the root transcript. They go to the child lane with their native marks.
+    let (transcript_values, sidechain_values): (Vec<_>, Vec<_>) =
+        transcript_read.values.into_iter().partition(|(value, _)| {
+            parse_transcript_value(value).is_none_or(|record| record.sidechain.is_none())
+        });
+    let transcript_values: Vec<_> = transcript_values
         .into_iter()
         .map(|(value, _)| value)
         .collect();
+    let current_root = owned_sessions.last().cloned();
+    emit_main_transcript_sidechain(
+        &session,
+        events.as_ref(),
+        &transcript_path,
+        current_root.as_deref(),
+        &sidechain_values,
+        &mut stats,
+    )
+    .await;
     emit_transcript_records(
         &session,
         events.as_ref(),
@@ -249,6 +284,27 @@ pub async fn forward_once_with_observations(
         Some(message_cursor),
     )
     .await?;
+
+    // The child pass runs after the parent's cursors are committed and never fails the parent's
+    // pass: its errors are counted and logged, and it retries on the next pass.
+    if let Err(error) = forward_child_streams(
+        &store,
+        &session,
+        events.as_ref(),
+        &owned_sessions,
+        &transcript_path,
+        &mut stats,
+    )
+    .await
+    {
+        stats.child_errors += 1;
+        tracing::warn!(
+            target: "nexus::claude_child_streams",
+            session = %session,
+            error = %error,
+            "Claude child stream pass failed; parent pass unaffected"
+        );
+    }
 
     Ok(stats)
 }
@@ -685,6 +741,756 @@ async fn emit_claude_event(session: &SessionId, events: &dyn EventSink, event: C
             data: event.data,
         })
         .await;
+}
+
+/// Child lane identity of a Claude subagent transcript. Root affiliation is proven by the file
+/// living under the owned session's `subagents/` directory and each record carrying that
+/// `sessionId` and its own `agentId`; immediate parent and depth are never claimed.
+fn claude_child_stream(
+    root: &str,
+    agent_id: &str,
+    generation: &str,
+    resolution: ChildResolution,
+    evidence: Option<&str>,
+) -> ChildStream {
+    ChildStream {
+        harness: "claude".into(),
+        root: root.into(),
+        id: Some(agent_id.into()),
+        locator: format!("claude:subagents/agent-{agent_id}.jsonl@{generation}"),
+        parent: None,
+        parent_ref: None,
+        depth: None,
+        resolution,
+        evidence: evidence.map(str::to_owned),
+    }
+}
+
+/// The renderable events of one subagent record: user text, assistant text, tool updates and
+/// the assistant's stop boundary. Compaction markers of a child are not forwarded.
+fn child_events_for(record: &TranscriptRecord, value: &Value) -> Vec<ClaudeNativeEvent> {
+    let mut out = Vec::new();
+    if let Some(text) = user_row_text(value) {
+        out.push(user_input_event(text, None));
+    }
+    let text = concat_assistant_text(&record.assistant_text);
+    if !text.is_empty() {
+        out.push(text_event(text));
+    }
+    for update in &record.tool_updates {
+        out.push(tool_event(update));
+    }
+    if let Some(boundary) = &record.boundary {
+        out.push(turn_boundary_event(boundary));
+    }
+    out
+}
+
+/// Text of a transcript `user` row: a string content or its `text` blocks. Tool results are
+/// tool updates, not user text.
+fn user_row_text(value: &Value) -> Option<String> {
+    if value.get("type").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    let content = value.pointer("/message/content")?;
+    if let Some(text) = content.as_str() {
+        return (!text.is_empty()).then(|| text.to_owned());
+    }
+    let text = content
+        .as_array()?
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("");
+    (!text.is_empty()).then_some(text)
+}
+
+/// The `uuid` of a subagent file's first record, read within a bounded first line; empty when
+/// unavailable. Names the source generation in every `source_ref` of that file.
+/// What opening a registered child path yielded.
+enum ChildOpen {
+    Regular(std::fs::File),
+    /// The path names something other than a regular file; `&str` says what.
+    NotRegular(&'static str),
+}
+
+/// Open a registered child path for reading and keep the handle only when it is a regular
+/// file, so every later check reads that file. On Unix the open carries
+/// `O_NONBLOCK | O_NOFOLLOW`: a FIFO opens at once even with no writer and is then rejected
+/// by `fstat`, and a symlink fails the open itself. On other platforms the open is a plain
+/// `File::open`, which follows a symlink to a regular target; the regular-file check still
+/// applies to whatever was opened. Non-blocking and no-follow are Unix guarantees only.
+fn open_regular_child_file(path: &Path) -> Result<ChildOpen, NexusError> {
+    #[cfg(unix)]
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let opened = std::fs::File::open(path);
+    let file = match opened {
+        Ok(file) => file,
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Ok(ChildOpen::NotRegular("symlink"));
+        }
+        Err(error) => {
+            return Err(NexusError::Internal(format!(
+                "open claude child file {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let file_type = file
+        .metadata()
+        .map_err(|e| {
+            NexusError::Internal(format!("stat claude child file {}: {e}", path.display()))
+        })?
+        .file_type();
+    if file_type.is_file() {
+        return Ok(ChildOpen::Regular(file));
+    }
+    #[cfg(unix)]
+    let kind = {
+        use std::os::unix::fs::FileTypeExt;
+        if file_type.is_fifo() {
+            "fifo"
+        } else if file_type.is_socket() {
+            "socket"
+        } else if file_type.is_char_device() || file_type.is_block_device() {
+            "device"
+        } else if file_type.is_dir() {
+            "directory"
+        } else {
+            "other"
+        }
+    };
+    #[cfg(not(unix))]
+    let kind = if file_type.is_dir() {
+        "directory"
+    } else {
+        "other"
+    };
+    Ok(ChildOpen::NotRegular(kind))
+}
+
+/// What a child file's first line says about its source generation.
+#[derive(Debug, PartialEq, Eq)]
+enum Generation {
+    /// The first record's `uuid`.
+    Ready(String),
+    /// The file is empty or its first line is not complete yet.
+    Pending,
+    /// The first line is complete but has no `uuid`, is not JSON, or is longer than
+    /// [`MAX_CHILD_META_LINE_BYTES`].
+    Unverifiable,
+}
+
+/// Read the first line of an already opened file within the meta-line budget. The handle is
+/// the one the caller keeps for the rest of the pass, so the line comes from the same inode
+/// the read will use.
+fn first_record_generation(file: &mut std::fs::File) -> Result<Generation, NexusError> {
+    use std::io::{BufRead, Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| NexusError::Internal(format!("seek claude child file: {e}")))?;
+    let mut first = String::new();
+    std::io::BufReader::new(file.by_ref().take(MAX_CHILD_META_LINE_BYTES))
+        .read_line(&mut first)
+        .map_err(|e| NexusError::Internal(format!("read claude child file: {e}")))?;
+    if !first.ends_with('\n') {
+        if first.len() as u64 >= MAX_CHILD_META_LINE_BYTES {
+            return Ok(Generation::Unverifiable);
+        }
+        return Ok(Generation::Pending);
+    }
+    Ok(serde_json::from_str::<Value>(first.trim_end())
+        .ok()
+        .and_then(|value| value.get("uuid")?.as_str().map(str::to_owned))
+        .filter(|uuid| !uuid.is_empty())
+        .map_or(Generation::Unverifiable, Generation::Ready))
+}
+
+/// The main transcript's generation for sidechain rows found in it: its first record uuid,
+/// empty when unavailable.
+fn first_record_uuid(path: &Path) -> String {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    match first_record_generation(&mut file) {
+        Ok(Generation::Ready(uuid)) => uuid,
+        _ => String::new(),
+    }
+}
+
+/// The record recorded as the cursor's anchor still starts at `anchor_offset`, ends exactly at
+/// `cursor`, and carries `anchor_uuid`. This is bounded detection of a changed anchor record
+/// (it catches a file truncated and regrown past the cursor), not proof that every earlier
+/// byte is unchanged.
+fn anchor_intact(file: &mut std::fs::File, cursor: &ClaudeChildCursor) -> Result<bool, NexusError> {
+    if cursor.cursor <= 0 {
+        return Ok(true);
+    }
+    let read = read_child_records(
+        file,
+        cursor.anchor_offset,
+        (cursor.cursor - cursor.anchor_offset).max(0) as u64,
+        1,
+    )?;
+    let Some((value, _)) = read.records.first() else {
+        return Ok(false);
+    };
+    let uuid = value
+        .get("uuid")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Ok(read.end == cursor.cursor && uuid == cursor.anchor_uuid)
+}
+
+/// One bounded read of a subagent file.
+struct ChildRead {
+    /// Complete records in order with the byte offset each one ends at.
+    records: Vec<(Value, u64)>,
+    /// Offset after the last complete record (the cursor to store).
+    end: i64,
+    /// Offset of a record that is not JSON, when the read stopped on one. A record that is
+    /// merely incomplete (still being written, or cut by the byte budget) is not malformed.
+    malformed_at: Option<i64>,
+}
+
+/// A bounded read of an opened subagent file from `cursor`: at most `max_bytes` are read and
+/// at most `max_records` complete records returned with their end offsets; a partial record
+/// at the end stays for the next pass. Consumed prefixes are never re-read.
+fn read_child_records(
+    file: &mut std::fs::File,
+    cursor: i64,
+    max_bytes: u64,
+    max_records: usize,
+) -> Result<ChildRead, NexusError> {
+    use std::io::{Read, Seek, SeekFrom};
+    let start = u64::try_from(cursor.max(0)).unwrap_or(0);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| NexusError::Internal(format!("seek claude child file: {e}")))?;
+    let mut buf = Vec::new();
+    file.by_ref()
+        .take(max_bytes)
+        .read_to_end(&mut buf)
+        .map_err(|e| NexusError::Internal(format!("read claude child file: {e}")))?;
+    let mut records = Vec::new();
+    let mut consumed = 0usize;
+    let mut malformed_at = None;
+    let mut stream = serde_json::Deserializer::from_slice(&buf).into_iter::<Value>();
+    while records.len() < max_records {
+        match stream.next() {
+            Some(Ok(value)) => {
+                consumed = stream.byte_offset();
+                records.push((value, start + consumed as u64));
+            }
+            Some(Err(error)) => {
+                if !error.is_eof() {
+                    malformed_at = Some((start + consumed as u64) as i64);
+                }
+                break;
+            }
+            None => break,
+        }
+    }
+    Ok(ChildRead {
+        records,
+        end: (start + consumed as u64) as i64,
+        malformed_at,
+    })
+}
+
+/// Sidechain rows found in the root transcript: emitted on the child lane, never the parent's.
+/// Root affiliation is the row's own `sessionId` equal to the owned root plus its `agentId`.
+async fn emit_main_transcript_sidechain(
+    session: &SessionId,
+    events: &dyn EventSink,
+    transcript_path: &Path,
+    current_root: Option<&str>,
+    values: &[(Value, u64)],
+    stats: &mut ClaudeForwarderStats,
+) {
+    if values.is_empty() {
+        return;
+    }
+    let generation = first_record_uuid(transcript_path);
+    for (value, end_offset) in values {
+        let Some(record) = parse_transcript_value(value) else {
+            continue;
+        };
+        let Some(mark) = record.sidechain.as_ref() else {
+            continue;
+        };
+        let root = current_root.unwrap_or_default();
+        let agent_id = mark.agent_id.clone().unwrap_or_default();
+        let verified = !agent_id.is_empty()
+            && current_root.is_some()
+            && record.session_id.as_deref() == current_root;
+        let child = if verified {
+            claude_child_stream(
+                root,
+                &agent_id,
+                &generation,
+                ChildResolution::RootVerified,
+                Some("main_transcript_sidechain+sessionId+agentId"),
+            )
+        } else {
+            ChildStream {
+                harness: "claude".into(),
+                root: root.into(),
+                id: (!agent_id.is_empty()).then(|| agent_id.clone()),
+                locator: format!("claude:transcript.jsonl@{generation}#{end_offset}"),
+                parent: None,
+                parent_ref: None,
+                depth: None,
+                resolution: ChildResolution::Unresolved,
+                evidence: None,
+            }
+        };
+        let source_ref = format!("claude:transcript@{generation}#{end_offset}");
+        for event in child_events_for(&record, value) {
+            events
+                .emit(WsEvent::ChildAgentUpdate {
+                    session_id: session.clone(),
+                    child: child.clone(),
+                    kind: event.kind,
+                    source_ref: source_ref.clone(),
+                    data: event.data,
+                })
+                .await;
+            stats.child_events += 1;
+        }
+    }
+}
+
+/// Declare bounded unknown coverage for a child file under the current epoch, carrying the
+/// cursor's own resolution rather than one inferred from the file name. `Applied` means the
+/// declaration is visible on the lane; `Refused` means the lane bounds refused it and the caller
+/// must not record the cursor as halted under this epoch.
+async fn declare_child_coverage(
+    store: &Store,
+    session: &SessionId,
+    epoch: &str,
+    cursor: &ClaudeChildCursor,
+    reason: &str,
+    extra: Value,
+) -> Result<LaneMutation, NexusError> {
+    let resolution = if cursor.resolution == "root_verified" {
+        ChildResolution::RootVerified
+    } else {
+        ChildResolution::Unresolved
+    };
+    let evidence =
+        (resolution == ChildResolution::RootVerified).then_some("subagents_dir+sessionId+agentId");
+    let child = claude_child_stream(
+        &cursor.native_session_id,
+        &cursor.agent_id,
+        &cursor.generation,
+        resolution,
+        evidence,
+    );
+    let mut coverage = json!({
+        "generation": cursor.generation,
+        "from": cursor.cursor,
+        "unknown_before": true,
+        "reason": reason,
+    });
+    if let (Some(target), Some(source)) = (coverage.as_object_mut(), extra.as_object()) {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    ChildStreamEvents::new(store)
+        .set_coverage(
+            session,
+            epoch,
+            &child,
+            &coverage,
+            &store.child_stream_bounds(),
+        )
+        .await
+}
+
+/// Tail every owned session's `subagents/agent-*.jsonl` into the child lane behind durable,
+/// epoch-scoped cursors.
+///
+/// Discovery is a rotating window: each pass inspects at most [`MAX_CHILD_DIR_ENTRIES`]
+/// directory entries starting where the previous window ended (durable per owned session),
+/// wrapping to the start once the directory is exhausted, and registers each new file with an
+/// untouched cursor. Complete coverage relies on the directory's readdir order being stable
+/// while it is unchanged; entries the window skips are walked but not inspected. Scheduling is
+/// one SQL page: the [`MAX_CHILD_FILES_PER_PASS`] cursors served least recently, each marked
+/// as attempted before any file work so a failing file loses its place in the rotation. Per
+/// file the pass reads at most [`MAX_CHILD_BYTES_PER_FILE_PASS`] bytes and
+/// [`MAX_CHILD_RECORDS_PER_FILE_PASS`] records from one opened handle, never re-reading a
+/// consumed prefix. Continuity is judged on that same handle before the cursor is used:
+/// epoch, length, first-record generation and the anchor record; any failure declares bounded
+/// unknown coverage with the exact reason and halts the cursor, adopting no replay or skip
+/// policy. A halted cursor re-declares its coverage under every later epoch so a fresh
+/// volatile lane always shows it.
+///
+/// Scheduling covers every cursor registered under this runtime, including cursors of roots
+/// the runtime owned earlier (`owned_sessions` only drives discovery for this pass). Those
+/// cursors stay eligible and their events keep the root recorded on the cursor; the pass never
+/// relabels them as the current root. This is broader than current-root-only tailing.
+async fn forward_child_streams(
+    store: &Store,
+    session: &SessionId,
+    events: &dyn EventSink,
+    owned_sessions: &[String],
+    transcript_path: &Path,
+    stats: &mut ClaudeForwarderStats,
+) -> Result<(), NexusError> {
+    let Some(project_dir) = transcript_path.parent() else {
+        return Ok(());
+    };
+    let epoch = match DaemonState::new(store).boot_epoch().await? {
+        Some(epoch) if !epoch.is_empty() => epoch,
+        _ => return Ok(()),
+    };
+    let repo = ClaudeChildStreamsRepo::new(store);
+
+    // Discovery window per owned session: register new files, never inspect more than the
+    // window, remember where the next pass continues.
+    for native in owned_sessions {
+        let dir = project_dir.join(native).join("subagents");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let skip = repo.discovery_skip(session, native).await?;
+        let mut inspected = 0usize;
+        let mut exhausted = true;
+        let mut found: Vec<(String, PathBuf)> = Vec::new();
+        for entry in entries.skip(skip) {
+            if inspected == MAX_CHILD_DIR_ENTRIES {
+                exhausted = false;
+                break;
+            }
+            inspected += 1;
+            let Ok(entry) = entry else {
+                continue;
+            };
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let path = entry.path();
+            let Some(agent_id) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("agent-"))
+                .and_then(|n| n.strip_suffix(".jsonl"))
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            found.push((agent_id, path));
+        }
+        let next_skip = if exhausted { 0 } else { skip + inspected };
+        repo.set_discovery_skip(session, native, next_skip).await?;
+        let ids: Vec<String> = found.iter().map(|(id, _)| id.clone()).collect();
+        let known = repo.known_agent_ids(session, native, &ids).await?;
+        for (agent_id, path) in found {
+            if known.contains(&agent_id) {
+                continue;
+            }
+            repo.insert_if_absent(&ClaudeChildCursor {
+                runtime_id: session.clone(),
+                native_session_id: native.clone(),
+                agent_id,
+                path,
+                epoch: epoch.clone(),
+                generation: String::new(),
+                cursor: 0,
+                halted: false,
+                halt_reason: String::new(),
+                resolution: "unresolved".into(),
+                served_at: 0,
+                anchor_offset: 0,
+                anchor_uuid: String::new(),
+                updated_at: 0,
+            })
+            .await?;
+        }
+    }
+
+    // Scheduling: one page of the least recently served cursors, each marked as attempted
+    // before any file work.
+    let served_at = nexus_common::now();
+    let batch = repo
+        .least_recently_served(session, MAX_CHILD_FILES_PER_PASS)
+        .await?;
+    for cursor in &batch {
+        repo.mark_attempt(
+            session,
+            &cursor.native_session_id,
+            &cursor.agent_id,
+            served_at,
+        )
+        .await?;
+    }
+    for mut cursor in batch {
+        cursor.served_at = served_at;
+        let agent_id = cursor.agent_id.clone();
+        // One file's failure never blocks the others in this pass; it is counted and retried.
+        if let Err(error) =
+            serve_child_file(store, &repo, session, events, &epoch, cursor, stats).await
+        {
+            stats.child_errors += 1;
+            tracing::warn!(
+                target: "nexus::claude_child_streams",
+                session = %session, agent_id = %agent_id, error = %error,
+                "Claude child file pass failed; retried next pass"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// One subagent file's share of a pass: re-declare a halted cursor under a new epoch, judge
+/// continuity on one opened handle, then forward a bounded slice of records from that same
+/// handle and persist the cursor.
+async fn serve_child_file(
+    store: &Store,
+    repo: &ClaudeChildStreamsRepo<'_>,
+    session: &SessionId,
+    events: &dyn EventSink,
+    epoch: &str,
+    mut cursor: ClaudeChildCursor,
+    stats: &mut ClaudeForwarderStats,
+) -> Result<(), NexusError> {
+    let native = cursor.native_session_id.clone();
+    let agent_id = cursor.agent_id.clone();
+    let path = cursor.path.clone();
+
+    // A halted cursor re-declares its coverage under every later epoch; it never advances.
+    if cursor.halted {
+        if cursor.epoch != epoch {
+            let reason = cursor.halt_reason.clone();
+            if declare_child_coverage(store, session, epoch, &cursor, &reason, json!({})).await?
+                == LaneMutation::Applied
+            {
+                cursor.epoch = epoch.to_string();
+            }
+        }
+        repo.upsert(&cursor).await?;
+        return Ok(());
+    }
+
+    // The handle used for every check and for the read: a replacement of the path after this
+    // point is not seen until the next pass opens the new file.
+    let mut file = match open_regular_child_file(&path)? {
+        ChildOpen::Regular(file) => file,
+        ChildOpen::NotRegular(kind) => {
+            // The registered path no longer names a regular file (a FIFO, a symlink, a
+            // directory): rejected at the open boundary without blocking, and declared.
+            let reason = "source_not_regular";
+            if declare_child_coverage(
+                store,
+                session,
+                epoch,
+                &cursor,
+                reason,
+                json!({ "kind": kind }),
+            )
+            .await?
+                == LaneMutation::Applied
+            {
+                cursor.epoch = epoch.to_string();
+                cursor.halted = true;
+                cursor.halt_reason = reason.to_string();
+            }
+            repo.upsert(&cursor).await?;
+            return Ok(());
+        }
+    };
+    let file_len = file
+        .metadata()
+        .map_err(|e| {
+            NexusError::Internal(format!("stat claude child file {}: {e}", path.display()))
+        })?
+        .len() as i64;
+    let consumed = cursor.cursor > 0 || !cursor.generation.is_empty();
+
+    // A cursor that never consumed anything has nothing behind it to replay or skip: it simply
+    // continues under the current epoch.
+    if !consumed && cursor.epoch != epoch {
+        cursor.epoch = epoch.to_string();
+    }
+
+    // Continuity, in this order: a consumed cursor from another epoch, a consumed file that got
+    // shorter, then the first record, then the anchor. A pending first line only defers a
+    // cursor that never consumed anything.
+    let generation = first_record_generation(&mut file)?;
+    let halt: Option<(&str, Value)> = if consumed && cursor.epoch != epoch {
+        Some(("daemon_restart_policy_undecided", json!({})))
+    } else if consumed && file_len < cursor.cursor {
+        Some(("source_truncated", json!({ "current_len": file_len })))
+    } else {
+        match &generation {
+            Generation::Pending if !consumed => {
+                // Empty, or the first line is still being written: nothing to judge yet.
+                repo.upsert(&cursor).await?;
+                return Ok(());
+            }
+            Generation::Pending => Some((
+                "source_rewritten",
+                json!({ "first_line": "incomplete", "current_len": file_len }),
+            )),
+            Generation::Unverifiable => Some(("generation_unverifiable", json!({}))),
+            Generation::Ready(current) if consumed && &cursor.generation != current => Some((
+                "source_replaced",
+                json!({ "previous_generation": cursor.generation, "current_generation": current }),
+            )),
+            Generation::Ready(_) if consumed && !anchor_intact(&mut file, &cursor)? => Some((
+                "source_rewritten",
+                json!({ "anchor_offset": cursor.anchor_offset, "anchor_uuid": cursor.anchor_uuid }),
+            )),
+            Generation::Ready(_) => None,
+        }
+    };
+    if let Some((reason, extra)) = halt {
+        if declare_child_coverage(store, session, epoch, &cursor, reason, extra).await?
+            == LaneMutation::Applied
+        {
+            cursor.epoch = epoch.to_string();
+            cursor.halted = true;
+            cursor.halt_reason = reason.to_string();
+        } else {
+            tracing::warn!(
+                target: "nexus::claude_child_streams",
+                session = %session, agent_id = %agent_id, reason,
+                "child coverage declaration refused by the lane bounds; retried next pass"
+            );
+        }
+        repo.upsert(&cursor).await?;
+        return Ok(());
+    }
+    if let Generation::Ready(current) = &generation {
+        if cursor.generation.is_empty() {
+            cursor.generation = current.clone();
+        }
+    }
+
+    let read = read_child_records(
+        &mut file,
+        cursor.cursor,
+        MAX_CHILD_BYTES_PER_FILE_PASS,
+        MAX_CHILD_RECORDS_PER_FILE_PASS,
+    )?;
+    if read.records.is_empty()
+        && read.malformed_at.is_none()
+        && file_len - cursor.cursor >= MAX_CHILD_BYTES_PER_FILE_PASS as i64
+    {
+        // A single record larger than one pass's read budget can never be forwarded; say so
+        // instead of stalling silently.
+        let reason = "record_exceeds_pass_budget";
+        if declare_child_coverage(
+            store,
+            session,
+            epoch,
+            &cursor,
+            reason,
+            json!({ "budget": MAX_CHILD_BYTES_PER_FILE_PASS }),
+        )
+        .await?
+            == LaneMutation::Applied
+        {
+            cursor.halted = true;
+            cursor.halt_reason = reason.to_string();
+        }
+        repo.upsert(&cursor).await?;
+        return Ok(());
+    }
+    // Bounded detection of an in-place change between the checks and the read on the same
+    // handle: the generation and the anchor must still agree, and the file must still reach
+    // the end of what was read. Otherwise nothing is emitted and the next pass judges it.
+    let still_same = first_record_generation(&mut file)? == generation
+        && anchor_intact(&mut file, &cursor)?
+        && file
+            .metadata()
+            .map(|m| m.len() as i64 >= read.end)
+            .unwrap_or(false);
+    if !still_same {
+        repo.upsert(&cursor).await?;
+        return Ok(());
+    }
+
+    let mut record_start = cursor.cursor;
+    for (value, end_offset) in &read.records {
+        let end = *end_offset as i64;
+        if let Some(record) = parse_transcript_value(value) {
+            let agrees = record
+                .sidechain
+                .as_ref()
+                .and_then(|mark| mark.agent_id.as_deref())
+                == Some(agent_id.as_str())
+                && record.session_id.as_deref() == Some(native.as_str());
+            let (resolution, evidence) = if agrees {
+                (
+                    ChildResolution::RootVerified,
+                    Some("subagents_dir+sessionId+agentId"),
+                )
+            } else {
+                (ChildResolution::Unresolved, None)
+            };
+            let child =
+                claude_child_stream(&native, &agent_id, &cursor.generation, resolution, evidence);
+            cursor.resolution = if agrees {
+                "root_verified"
+            } else {
+                "unresolved"
+            }
+            .into();
+            let source_ref = format!("claude:{agent_id}@{}#{end}", cursor.generation);
+            for event in child_events_for(&record, value) {
+                events
+                    .emit(WsEvent::ChildAgentUpdate {
+                        session_id: session.clone(),
+                        child: child.clone(),
+                        kind: event.kind,
+                        source_ref: source_ref.clone(),
+                        data: event.data,
+                    })
+                    .await;
+                stats.child_events += 1;
+            }
+        }
+        cursor.anchor_offset = record_start;
+        cursor.anchor_uuid = value
+            .get("uuid")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        record_start = end;
+    }
+    cursor.cursor = read.end.max(cursor.cursor);
+    if let Some(offset) = read.malformed_at {
+        // What parsed before the malformed record was forwarded; the file cannot be followed
+        // past it, and that is declared rather than left as a silent stall.
+        let reason = "source_malformed";
+        if declare_child_coverage(
+            store,
+            session,
+            epoch,
+            &cursor,
+            reason,
+            json!({ "malformed_at": offset }),
+        )
+        .await?
+            == LaneMutation::Applied
+        {
+            cursor.halted = true;
+            cursor.halt_reason = reason.to_string();
+        }
+    }
+    repo.upsert(&cursor).await?;
+    Ok(())
 }
 
 fn concat_assistant_text(items: &[AssistantText]) -> String {

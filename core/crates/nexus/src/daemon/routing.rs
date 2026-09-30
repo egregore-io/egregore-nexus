@@ -847,6 +847,15 @@ async fn route_request_inner(
                 .map_err(|e| contract_to_rpc(&e))?;
             Ok(serde_json::to_value(out).unwrap())
         }
+        "agent.child_streams" => {
+            let c = require(caller)?;
+            let r: nexus_contracts::ChildStreamsRequest = parse(p)?;
+            let out = state
+                .child_streams(c, r)
+                .await
+                .map_err(|e| contract_to_rpc(&e))?;
+            Ok(serde_json::to_value(out).unwrap())
+        }
         "agent.runtime.list" => {
             let c = require(caller)?;
             let r: AgentRuntimeListRequest = parse(p)?;

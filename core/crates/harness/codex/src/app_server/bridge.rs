@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::approvals::AutoApprove;
 use super::client::CodexAppServerClient;
-use super::forwarder::{spawn_codex_forwarder_with_tool_observations, CodexToolObservationSink};
+use super::forwarder::{spawn_codex_forwarder_scoped, CodexThreadScope, CodexToolObservationSink};
 use super::jsonrpc::CodexRpcError;
 use super::supervisor::{resolve_machine_codex_home_from_env, CodexAppServer, SupervisorOpts};
 use super::transport::CodexAppServerTransport;
@@ -728,13 +728,16 @@ async fn create_and_bind_thread(
                 ))
             })?;
     }
-    let forwarder = spawn_codex_forwarder_with_tool_observations(
+    // A freshly created thread has no rollout yet and this path knows no rollout root: foreign
+    // threads stay unresolved here, never parent.
+    let forwarder = spawn_codex_forwarder_scoped(
         session.clone(),
         client.clone(),
         events,
         Arc::new(AutoApprove),
         attempt.0.owner.clone(),
         tool_observations,
+        CodexThreadScope::bound(thread_id.clone(), None),
     );
     let mut map = handles.lock().unwrap();
     let Some(handle) = map.get_mut(&session) else {
@@ -910,13 +913,14 @@ async fn bind_thread(
             );
         }
     }
-    let forwarder = spawn_codex_forwarder_with_tool_observations(
+    let forwarder = spawn_codex_forwarder_scoped(
         discovery_session.clone(),
         client.clone(),
         events,
         Arc::new(AutoApprove),
         attempt.0.owner.clone(),
         tool_observations,
+        CodexThreadScope::bound(thread_id.clone(), Some(rollout_root.clone())),
     );
 
     let mut map = handles.lock().unwrap();
@@ -1250,6 +1254,147 @@ pub fn rollout_is_subagent(path: &Path) -> bool {
 /// Newest MAIN-thread rollout under `root` — sub-agent rollouts are never candidates.
 pub fn newest_rollout(root: &Path) -> Option<PathBuf> {
     newest_rollout_matching(root, |path| !rollout_is_subagent(path))
+}
+
+/// Native lineage a sub-agent rollout declares in its meta line:
+/// `payload.source.subagent.thread_spawn = {parent_thread_id, depth, ...}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadSpawnMeta {
+    pub parent_thread_id: String,
+    pub depth: u32,
+}
+
+/// The `thread_spawn` lineage of `thread_id`, read from its rollout meta under `root`, when a
+/// rollout for that thread exists and declares one. No inference: a main-thread rollout or a
+/// missing rollout yields `None`.
+pub fn thread_spawn_meta(root: &Path, thread_id: &str) -> Option<ThreadSpawnMeta> {
+    thread_spawn_meta_with_budget(root, thread_id, &RolloutScanBudget::default())
+}
+
+/// [`thread_spawn_meta`] with an explicit scan budget.
+pub fn thread_spawn_meta_with_budget(
+    root: &Path,
+    thread_id: &str,
+    budget: &RolloutScanBudget,
+) -> Option<ThreadSpawnMeta> {
+    let path = find_rollout_for_thread_bounded(root, thread_id, budget)?;
+    let meta = rollout_meta_bounded(&path)?;
+    let spawn = meta
+        .get("payload")?
+        .get("source")?
+        .get("subagent")?
+        .get("thread_spawn")?;
+    let parent_thread_id = spawn
+        .get("parent_thread_id")?
+        .as_str()
+        .filter(|id| !id.is_empty())?
+        .to_string();
+    let depth = u32::try_from(spawn.get("depth")?.as_u64()?).ok()?;
+    Some(ThreadSpawnMeta {
+        parent_thread_id,
+        depth,
+    })
+}
+
+/// Work a lineage lookup may spend before giving up: directory entries visited (files,
+/// directories and anything else), rollout files opened, and directories queued at once. Every
+/// visited entry spends budget, so a tree of many directories or non-matching files ends the
+/// lookup instead of being traversed for free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RolloutScanBudget {
+    pub entries: usize,
+    pub files: usize,
+    pub queued_dirs: usize,
+}
+
+impl Default for RolloutScanBudget {
+    fn default() -> Self {
+        RolloutScanBudget {
+            entries: 4096,
+            files: 512,
+            queued_dirs: 256,
+        }
+    }
+}
+
+/// Bytes of a rollout's first line a lineage lookup will read.
+pub const MAX_META_LINE_BYTES: u64 = 64 * 1024;
+
+/// Bounded search for the rollout whose meta names `thread_id`. Only regular files are opened
+/// (a FIFO or device named like a rollout is skipped, never waited on); symlinks are skipped;
+/// every visited entry spends `budget.entries`, every opened rollout spends `budget.files`, and
+/// directories beyond `budget.queued_dirs` are not queued.
+fn find_rollout_for_thread_bounded(
+    root: &Path,
+    thread_id: &str,
+    budget: &RolloutScanBudget,
+) -> Option<PathBuf> {
+    let mut entries_left = budget.entries;
+    let mut files_left = budget.files;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entries_left == 0 {
+                return None;
+            }
+            entries_left -= 1;
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if stack.len() < budget.queued_dirs {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let is_rollout = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"));
+            if !is_rollout {
+                continue;
+            }
+            if files_left == 0 {
+                return None;
+            }
+            files_left -= 1;
+            if rollout_meta_bounded(&path)
+                .and_then(|meta| meta.get("payload")?.get("id")?.as_str().map(str::to_owned))
+                .as_deref()
+                == Some(thread_id)
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// The first line of a rollout, capped at [`MAX_META_LINE_BYTES`]; a longer line is not meta.
+fn rollout_meta_bounded(path: &Path) -> Option<serde_json::Value> {
+    use std::io::Read;
+    if !std::fs::symlink_metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let mut first = String::new();
+    std::io::BufReader::new(file.take(MAX_META_LINE_BYTES))
+        .read_line(&mut first)
+        .ok()?;
+    if !first.ends_with('\n') {
+        return None;
+    }
+    serde_json::from_str(first.trim_end()).ok()
 }
 
 fn rollout_with_thread_id(root: &Path, thread_id: &str) -> Option<PathBuf> {

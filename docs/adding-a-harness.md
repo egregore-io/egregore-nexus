@@ -281,7 +281,7 @@ Never point it at an operator's live Nexus home.
 | Claude Code | yes | raw PTY or tmux | native hook/transcript forwarder |
 | Codex | yes | app-server-backed TUI | app-server notifications |
 | OpenCode | yes | native plugin + raw PTY or tmux viewer | native plugin events |
-| Hermes | yes | raw PTY or tmux | generic PTY fallback |
+| Hermes | yes | gateway bridge with a tmux viewer | gateway bridge events |
 
 This table describes the adapters shipped with Nexus. It does not make the identifier set closed.
 

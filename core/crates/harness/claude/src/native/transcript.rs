@@ -85,6 +85,18 @@ pub struct TranscriptRecord {
     pub boundary: Option<TurnBoundary>,
     /// Compaction marker recovered from pre/post compact hook records or transcript summaries.
     pub compaction: Option<CompactionMarker>,
+    /// Native sidechain marks (`isSidechain`, `agentId`, `parentUuid`) when the record belongs
+    /// to a subagent rather than the root conversation. `None` for root records.
+    pub sidechain: Option<SidechainMark>,
+}
+
+/// Native marks Claude Code writes on subagent transcript records. `agent_id` is the native
+/// subagent id (also the file name under `subagents/`); `parent_uuid` links records inside one
+/// file and is not agent ancestry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidechainMark {
+    pub agent_id: Option<String>,
+    pub parent_uuid: Option<String>,
 }
 
 /// One user prompt submitted into a Claude native session.
@@ -218,6 +230,7 @@ pub fn parse_transcript_value(value: &Value) -> Option<TranscriptRecord> {
     let tool_updates = tool_updates(payload, event.as_deref());
     let boundary = boundary(payload, event.as_deref());
     let compaction = compaction(payload, event.as_deref());
+    let sidechain = sidechain_mark(payload);
 
     if session_id.is_none()
         && transcript_path.is_none()
@@ -243,6 +256,7 @@ pub fn parse_transcript_value(value: &Value) -> Option<TranscriptRecord> {
         tool_updates,
         boundary,
         compaction,
+        sidechain,
     })
 }
 
@@ -251,6 +265,29 @@ fn wrapped_payload(value: &Value) -> &Value {
         .get("payload")
         .filter(|payload| payload.is_object())
         .unwrap_or(value)
+}
+
+/// The native sidechain marks of a transcript record: present when `isSidechain` is `true` or
+/// `agentId` is a non-empty string. Root records (`isSidechain: false`, no agent id) yield
+/// `None`.
+fn sidechain_mark(value: &Value) -> Option<SidechainMark> {
+    let flagged = value.get("isSidechain").and_then(Value::as_bool) == Some(true);
+    let agent_id = value
+        .get("agentId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
+    if !flagged && agent_id.is_none() {
+        return None;
+    }
+    Some(SidechainMark {
+        agent_id,
+        parent_uuid: value
+            .get("parentUuid")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned),
+    })
 }
 
 fn event_name(value: &Value, payload: &Value) -> Option<String> {

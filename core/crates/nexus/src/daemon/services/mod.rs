@@ -1,4 +1,5 @@
 //! Focused daemon services extracted from the AppState composition root.
+pub mod child_streams;
 pub mod fleet_events;
 pub mod identity_admin;
 pub mod loop_wiring;

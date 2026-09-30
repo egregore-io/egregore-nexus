@@ -451,6 +451,77 @@ describe("agent session materialized projection", () => {
 
   // --- C-TOOL v1 (docs/tool-call-contract.md): replay must be lossless ------
 
+  it.each([
+    { label: "completed nonempty output", status: "completed", output: "ok" },
+    { label: "completed empty output", status: "completed", output: "" },
+    { label: "failed nonempty output", status: "failed", output: "native error" },
+    { label: "failed empty output", status: "failed", output: "" },
+    { label: "completed absent output", status: "completed", output: undefined },
+    { label: "completed null output", status: "completed", output: null },
+    { label: "failed absent output", status: "failed", output: undefined },
+    { label: "absent status and output", status: undefined, output: undefined },
+  ])("preserves $label through legacy materialized replay", async ({ status, output }) => {
+    const toolCall = {
+      id: "tc_output",
+      tool: "shell",
+      input: { command: "true" },
+      ...(status === undefined ? {} : { status }),
+      ...(output === undefined ? {} : { output }),
+    };
+    const expectedResults = typeof output !== "string" ? [] : [{
+      type: EventType.TOOL_CALL_RESULT,
+      messageId: "tc_output:result",
+      toolCallId: "tc_output",
+      content: output,
+      role: "tool",
+      status,
+      append: false,
+    }];
+
+    // The mapper already distinguishes an explicit empty result from no result.
+    // Replay must preserve that distinction, even when the enclosing turn is final.
+    const direct = acpToAguiEvents({
+      type: "agent.update",
+      sessionId: "s_output",
+      kind: "tool_call",
+      data: toolCall,
+    }, newBracket());
+    expect(direct.events.filter((event) => event.type === EventType.TOOL_CALL_RESULT))
+      .toEqual(expectedResults);
+
+    const db = await createStore();
+    try {
+      await db.batch([
+        {
+          sql: "INSERT INTO agent_session_turns VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          args: ["turn_output", "s_output", "final", 1, 2, 100, 120, 120],
+        },
+        {
+          sql: "INSERT INTO agent_session_messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          args: [
+            "m_output", "s_output", "turn_output", 0, "assistant", null,
+            JSON.stringify({ schema: 1, blocks: [{ type: "tool_call", ...toolCall }] }),
+            "final", 1, 2, 100, 120, 120,
+          ],
+        },
+      ]);
+
+      // Exercise the actual materialized projection -> AG-UI mapper composition.
+      const snapshot = await loadAgentSessionSnapshot("s_output", "output", { client: db });
+      expect(snapshot.events.filter((event) => event.type === EventType.TOOL_CALL_START))
+        .toEqual([{
+          type: EventType.TOOL_CALL_START,
+          toolCallId: "tc_output",
+          toolCallName: "shell",
+          streamEventId: 1,
+        }]);
+      expect(snapshot.events.filter((event) => event.type === EventType.TOOL_CALL_RESULT))
+        .toEqual(expectedResults.map((result) => ({ ...result, streamEventId: 1 })));
+    } finally {
+      db.close();
+    }
+  });
+
   it("replays tool blocks with the canonical name and single-encoded structured args", async () => {
     const db = await createStore();
     await db.batch([

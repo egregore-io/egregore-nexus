@@ -14,7 +14,7 @@ Run `nexus --help` or `nexus <command> --help` for the exact installed command g
 |---|---|
 | `--json` | Emit machine-readable JSON. It may appear before or after the subcommand. |
 | `-q`, `--quiet` | Suppress non-essential human output. |
-| `--version` | Print `nexus 0.1.5` and exit. |
+| `--version` | Print the installed version and exit. |
 
 A command error is written to stderr and exits nonzero. Authorization is enforced by the daemon or
 Gateway, never inferred by the CLI.
@@ -58,6 +58,7 @@ normal users should use `nexus launch`.
 ## Launch, resume, and attach
 
 ```bash
+nexus launch claude
 nexus launch --name ada --headless --detach codex
 nexus launch --name bea --tui codex
 nexus launch --name cy --tui --backend tmux claude
@@ -67,13 +68,15 @@ nexus attach bea
 
 Important launch rules:
 
+- A name is optional. Without `--name` the agent starts unnamed and claims its own name with
+  `nexus rename` once it is up.
 - In a non-interactive shell, launch defaults to headless. In an interactive terminal, Nexus
   offers the headed path unless `--headless` is explicit.
 - `--tui` selects a headed runtime. Its default backend is daemon-owned raw PTY; `--backend tmux`
   is explicit.
 - `--detach` returns after the runtime is addressable instead of attaching the terminal.
 - Nexus launch flags precede the harness name. Arguments after the harness name belong to the
-  harness.
+  harness, and any such tail forces the headed path; `--headless` with a tail is rejected.
 - `--initial-prompt` is fresh-launch only and cannot be combined with a resume/reuse tail.
 - Managed revival preserves the durable Nexus identity, harness, mode, backend, working directory,
   and exact native resume correlation where the harness exposes one.
@@ -85,6 +88,9 @@ nexus launch --name resumed-codex --tui --detach codex resume <thread-id>
 nexus launch --name resumed-claude --tui --detach claude --resume <session-id>
 nexus launch --name resumed-opencode --tui --detach opencode --session <session-id>
 ```
+
+A resume tail selects the headed path on its own; `--headless` with `codex resume` is rejected with
+`codex resume requires a headed launch`.
 
 `nexus attach <name-or-session>` attaches only to a headed runtime. `nexus resume` revives without
 taking over the terminal.
@@ -290,7 +296,10 @@ nexus update
 nexus --json update --check
 ```
 
-The updater acts only on the npm or Cargo installation that launched it. It acquires one exclusive
+The updater acts only on the npm or Cargo installation that launched it; a Cargo installation is one
+whose binary lives under `CARGO_HOME/bin` (`$HOME/.cargo` when `CARGO_HOME` is unset) with `cargo`
+on `PATH`, and manual or development binaries are refused with
+`UNMANAGED_INSTALL`. It acquires one exclusive
 lock, resolves an exact target version, snapshots daemon/Gateway/Webconsole runtime state, updates
 only installed facets, rewrites native service definitions, and restores only services that were
 running. A failed verification rolls back to the exact prior version and prints a recovery command.

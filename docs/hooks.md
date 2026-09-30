@@ -6,7 +6,7 @@ Nexus Gateway can run local programs at the canonical message boundary. A hook r
 versioned JSON document on standard input and must return one JSON object on standard output. The
 same protocol works with shell scripts, JavaScript, Python, or a native executable.
 
-v0.1.5 exposes two events:
+Nexus exposes two events:
 
 - `before_send` runs before Nexus accepts a new logical message. It may change message text,
   summary, mentions, developer metadata, or delivery timing, and it may reject the send.
@@ -131,14 +131,14 @@ pass_env = []
 
 | Field | Required | Meaning |
 |---|---:|---|
-| `version` | yes | Manifest version. v0.1.5 accepts `1`. |
+| `version` | yes | Manifest version. Accepts `1`. |
 | `id` | yes | Unique ID matching `[a-z0-9][a-z0-9._-]{0,63}`. |
 | `event` | yes | `before_send` or `after_receipt`. |
 | `order` | no | Numeric pipeline order, default `0`. Equal values sort by hook ID. |
 | `timeout_ms` | no | Wall-clock deadline, default `1000`; allowed range `1..30000`. |
 | `on_failure` | no | `continue` or `reject`, default `continue`. `reject` is valid only for `before_send`. |
 | `enabled` | no | Whether the hook participates, default `true`. |
-| `handler.kind` | yes | `local` in v0.1.5. |
+| `handler.kind` | yes | `local`. |
 | `handler.entry` | yes | Regular, non-symlink file resolved relative to the manifest. |
 | `handler.entrypoint` | no | Logical function/command name recorded in provenance, default `main`. |
 | `handler.run` | yes | Non-empty argv array. Every `{entry}` token expands to the resolved entry path. |

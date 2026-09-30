@@ -2,21 +2,24 @@
 
 [← Nexus docs](README.md)
 
-Nexus 0.1.6-beta.5 has three runtime facets and three public npm entry packages. Cargo crates, npm
-packages, native binaries, and release evidence all use that one canonical version.
+This source tree targets Nexus 0.1.6 (see `VERSION`); the npm registry carries whichever release was
+last published, so check it for what is installable today. Nexus has three runtime facets and three
+public npm entry packages, and npm packages, native binaries, and release evidence share one canonical
+version. The Cargo crates are not published to crates.io today; the CLI and daemon are distributed
+through npm or built from source.
 
 ## Artifact map
 
 | Facet | Package | Command | Responsibility |
 |---|---|---|---|
 | Complete install | npm `@egregore/nexus` | `nexus`, `nexus-gateway`, `nexus-webui` | Installs every Nexus facet |
-| CLI and daemon | npm `@egregore/nexus-cli` or Cargo crate `egregore-nexus` | `nexus` | Identity, routing, wake, runtime lifecycle, delivery settlement |
+| CLI and daemon | npm `@egregore/nexus-cli` | `nexus` | Identity, routing, wake, runtime lifecycle, delivery settlement |
 | Gateway + WebUI | npm `@egregore/nexus-gateway` | `nexus`, `nexus-gateway`, `nexus-webui` | CLI/daemon plus REST, WebSocket, MCP, AG-UI, history, search, edge auth, browser UI |
 
 The npm CLI never compiles Rust. One `@egregore/nexus-cli` tarball contains the prebuilt binaries
-for Linux x64/arm64 glibc, Windows x64, and WSL. macOS is unsupported in beta.5.
+for Linux x64/arm64 glibc, Windows x64, and WSL. macOS is unsupported in this release.
 Its launcher selects the matching
-file locally. An explicit `NEXUS_NATIVE_BIN` takes precedence; Cargo-installed binaries remain a
+file locally. An explicit `NEXUS_NATIVE_BIN` takes precedence; a locally built binary installed with Cargo remains a
 fallback. When no matching binary exists, the launcher prints an actionable installation error.
 
 Linux x64 and arm64 prebuilt binaries require glibc 2.35 or newer, including WSL's
@@ -29,7 +32,6 @@ prebuilt baseline; use a compatible distribution or build from source.
 ## Installation
 
 ```bash
-cargo install egregore-nexus
 npm install --global @egregore/nexus          # everything
 npm install --global @egregore/nexus-cli      # CLI + daemon only
 npm install --global @egregore/nexus-gateway
@@ -106,7 +108,10 @@ nexus update
 
 Automatic update is available only to a managed npm or Cargo installation. The npm launcher marks
 whether the active installation is CLI-only, Gateway, or complete; the updater changes only those
-facets. Cargo updates only the native CLI and daemon. Manual and development binaries print the
+facets. A Cargo-managed binary (one under `CARGO_HOME/bin`, defaulting to `$HOME/.cargo/bin`, with `cargo` on
+`PATH`) is updated through `cargo install
+egregore-nexus` from crates.io and covers only the native CLI and daemon; that path cannot succeed
+until the crate is published. Manual and development binaries print the
 package-manager recovery path instead of guessing ownership.
 
 Updates use an exclusive lock, exact versions, bounded command output, service-state snapshots,
@@ -116,7 +121,7 @@ operator can inspect the structured receipt under the Nexus home after completio
 
 ## Platform matrix
 
-The beta.5 release targets Linux and Windows/WSL. macOS artifacts are not included;
+This release targets Linux and Windows/WSL. macOS artifacts are not included;
 npm platform declarations reject macOS installation rather than using stale binaries.
 
 | Platform | Native CLI/daemon | Gateway/WebUI | Headed harness note |
@@ -125,8 +130,8 @@ npm platform declarations reject macOS installation rather than using stale bina
 | Linux arm64 | Release baseline | Release baseline | native build, tests, packaging, and command smoke; provider binaries remain external |
 | Windows x64 | Release baseline | Release baseline | named-pipe IPC/projection/attach, Task Scheduler lifecycle, native package and Gateway gates |
 | WSL | Release baseline | Release baseline | Linux package plus stable-identity and systemd handoff gates |
-| macOS x64 | Unsupported in beta.5 | Not offered by this install | deferred |
-| macOS arm64 | Unsupported in beta.5 | Not offered by this install | deferred |
+| macOS x64 | Unsupported | Not offered by this install | deferred |
+| macOS arm64 | Unsupported | Not offered by this install | deferred |
 
 Harness executables are external prerequisites. Nexus adapter support is maintained separately per
 harness but released and documented uniformly.
@@ -140,16 +145,16 @@ native Windows runner.
 
 Every published package must:
 
-- report version `0.1.5` and license `Apache-2.0`;
+- report the version in `VERSION` (`0.1.6` for this source tree) and license `Apache-2.0`;
 - contain no source-checkout or operator-local path dependency;
 - contain no credentials, OAuth state, runtime database, logs, screenshots, or captured model
   output;
-- install in a clean home without invoking a compiler, except the explicit Cargo install path;
+- install in a clean home without invoking a compiler;
 - expose successful, side-effect-free `--help` and `--version` behavior where applicable;
 - ship with checksums, an SBOM, provenance metadata, and a documented rollback or yank action.
 
-Cargo crates are packaged in dependency order with exact `=0.1.5` internal runtime dependencies.
-Test-only crates remain unpublished. npm packages are packed and installed from their tarballs in
+The Rust workspace pins exact internal runtime dependency versions; its crates are not published
+to crates.io. npm packages are packed and installed from their tarballs in
 isolated directories before publication.
 
 ## Release gate
@@ -168,15 +173,15 @@ source revision.
 
 ## Pre-release reset and post-publication recovery
 
-Before installing 0.1.5 over a development build with an unsupported pre-release schema:
+Before installing a release over a development build with an unsupported pre-release schema:
 
 1. stop the old Gateway and daemon;
 2. archive the old Nexus home, including database WAL/SHM files when present;
-3. start 0.1.5 with a fresh Nexus home;
+3. start the release with a fresh Nexus home;
 4. retain the archive until the new installation passes smoke checks.
 
-After publication, recovery uses package-manager-native controls: yank affected Cargo crates,
-deprecate affected npm versions, and publish a corrective version. Only a prior public version may
+After publication, recovery uses package-manager-native controls: deprecate affected npm
+versions and publish a corrective version. Only a prior public version may
 be restored to an npm dist-tag. The annotated release tag is never moved.
 
 Use the exact withdrawal commands and versioned artifact-evidence procedure in

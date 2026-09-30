@@ -1,5 +1,47 @@
 # Windows validation
 
+## Native Windows gate
+
+The public [native-artifact workflow](../.github/workflows/npm-native-artifacts.yml)
+is the release-blocking Windows gate. Its `win32-x64-msvc` job runs on a native
+Windows runner, checks harness command contracts and the named-pipe listener,
+runs the Gateway daemon-push relay tests, builds the native binary, and exercises
+the packaged launcher and command surface. It runs on pushes to `main` and can
+also be started with the workflow's manual dispatch. These targeted checks do not
+claim full source-suite or scheduled-task lifecycle coverage.
+
+For broader native validation, the checked-in
+[Windows recipe](../testing/windows/nexus.toml) records the source-gate sequence:
+Gateway dependency installation, Rust workspace tests and release build, repeated
+native teardown tests, npm launcher smoke, Gateway typechecking and both builds,
+the full Gateway test suite, Webconsole command-shim lifecycle, and
+[packed CLI lifecycle](../testing/windows/core-lifecycle.ps1) checks. The recipe
+declares the native executable, CLI tarball, headless Gateway package, and WebUI
+distribution as artifacts. This repository does not provide a standalone recipe
+runner; the recipe is a reference for reproducing those checks on native Windows.
+
+## Reproducing the checks
+
+Use a disposable native Windows environment with Git for Windows, the MSVC Rust
+toolchain and Windows build tools, Node.js 24, pnpm 11, and PowerShell. Follow the
+workflow for its exact setup and commands. Dependency installation requires
+network access; live provider variants additionally depend on provider availability.
+
+For the broader recipe, adapt its `C:\w` workspace, cache, artifact, and isolated
+`NEXUS_HOME` paths to the validation environment. Its release step expects a
+captured source revision in `.git/egregore-source.json`; an ordinary checkout does
+not supply that metadata. Record the exact checkout revision and arrange the
+equivalent build provenance before running that step. Preserve command ordering,
+exit-status checks, concurrency limits, and test assertions when adapting paths.
+
+The packed lifecycle fixture installs and removes the `EgregoreNexusDaemon`
+scheduled task, starts and stops actual processes, and writes test state. It
+refuses a pre-existing task and belongs in a disposable environment, not a
+maintainer's active Nexus installation. Local validation is not permission to
+publish an untested Windows target: source tests, release compilation, and actual
+package/lifecycle smokes must still pass, with failures and unavailable checks
+reported explicitly.
+
 The Rust test and release steps expose Git for Windows' `usr\bin` tools explicitly: the
 current `libsql-ffi` build script invokes `cp.exe`, which is not on a normal PowerShell PATH.
 The recipe checks for it before invoking Cargo and appends its directory after MSVC tools so
@@ -7,21 +49,6 @@ Git's unrelated `link.exe` cannot shadow the native linker. This does not change
 Gateway tests likewise receive Git's actual `sh.exe`; they build the Webconsole assets before
 the packed-install test consumes them. JavaScript fixtures launch Node directly instead of asking
 Windows to execute Unix npm shebang shims.
-
-The public native-artifact workflow is the release-blocking Windows gate. It runs the Rust and
-Gateway contracts on a native Windows runner, including daemon IPC, daemon-to-Gateway projection,
-package selection, and command smoke. External provider availability still determines which live
-harness variants can run on a given Windows machine.
-
-For broader validation, follow the source-gate recipe in a disposable native Windows environment.
-This repository does not bundle a recipe runner. Adapt workspace and artifact paths to that
-environment and retain exact source provenance, command ordering, exit checks, and assertions.
-Source tests, release compilation, and package/lifecycle checks must pass before publication.
-
-The canonical recipe is [`testing/windows/nexus.toml`](../testing/windows/nexus.toml). It runs
-Rust formatting, Gateway dependency installation, Rust compilation/tests and a release build,
-then Gateway typechecking, both builds, and tests. It returns `nexus.exe`, the headless
-Gateway package, and the WebUI distribution as declared artifacts.
 
 ## Windows transport security
 

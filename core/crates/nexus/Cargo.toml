@@ -29,6 +29,7 @@ nexus-harness-claude = { workspace = true }
 nexus-harness-core = { workspace = true }
 nexus-harness-codex = { workspace = true }
 nexus-harness-opencode = { workspace = true }
+nexus-harness-hermes = { workspace = true }
 nexus-search = { workspace = true }
 nexus-notify = { workspace = true }
 nexus-admin = { workspace = true }

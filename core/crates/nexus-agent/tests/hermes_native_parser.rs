@@ -235,7 +235,8 @@ fn hermes_message_rows_emit_session_updates_without_terminal_chrome() {
     assert_eq!(updates[2].kind, AgentUpdateKind::ToolCall);
     assert_eq!(updates[2].data["id"], "call_1");
     assert_eq!(updates[2].data["status"], "completed");
-    assert_eq!(updates[2].data["rawOutput"]["output"], "/tmp\n");
+    assert_eq!(updates[2].data["output"]["output"], "/tmp\n");
+    assert!(updates[2].data.get("rawOutput").is_none());
     assert_eq!(updates[3].kind, AgentUpdateKind::Text);
     assert_eq!(updates[3].data["text"], "done");
     assert_eq!(updates[4].kind, AgentUpdateKind::TurnEnd);
@@ -335,4 +336,183 @@ fn hermes_native_visible_rate_limit_text_remains_plain_text() {
         updates[0].data["text"],
         "provider says rate_limit in visible text"
     );
+}
+
+mod c_tool_sanitization {
+    use super::*;
+    use serde_json::Value;
+
+    const MAX_FIELD_BYTES: usize = 8 * 1024;
+
+    fn nested_payload(text: &str) -> Value {
+        json!({
+            "command": "fixture",
+            "nested": [{ "payload": text, "small": "keep", "number": 7,
+                "flag": true, "none": null }],
+            "array": [1, false, null, "keep"]
+        })
+    }
+
+    fn assert_structure_and_small_values(value: &Value) {
+        assert!(value.is_object(), "tool values must stay structured");
+        assert_eq!(value["command"], "fixture");
+        assert!(value["nested"].is_array());
+        assert!(value["nested"][0].is_object());
+        assert_eq!(value["nested"][0]["small"], "keep");
+        assert_eq!(value["nested"][0]["number"], 7);
+        assert_eq!(value["nested"][0]["flag"], true);
+        assert_eq!(value["nested"][0].get("none"), Some(&Value::Null));
+        assert_eq!(value["array"], json!([1, false, null, "keep"]));
+    }
+
+    fn emitted_input(arguments: Value) -> Value {
+        let updates = translate_message_row(
+            &row(
+                1,
+                "assistant",
+                None,
+                Some(json!([{
+                    "id": "call_sanitize",
+                    "type": "function",
+                    "function": { "name": "terminal", "arguments": arguments }
+                }])),
+                None,
+                None,
+                Some("tool_calls"),
+            ),
+            &mut HermesForwardState::default(),
+        );
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].kind, AgentUpdateKind::ToolCall);
+        assert_eq!(updates[0].data["id"], "call_sanitize");
+        assert_eq!(updates[0].data["tool"], "terminal");
+        assert_eq!(updates[0].data["status"], "in_progress");
+        updates[0].data.get("input").expect("emitted input").clone()
+    }
+
+    fn emitted_result(content: &str) -> Value {
+        let updates = translate_message_row(
+            &row(
+                2,
+                "tool",
+                Some(content),
+                None,
+                Some("call_sanitize"),
+                Some("terminal"),
+                None,
+            ),
+            &mut HermesForwardState::default(),
+        );
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].kind, AgentUpdateKind::ToolCall);
+        assert_eq!(updates[0].data["id"], "call_sanitize");
+        assert_eq!(updates[0].data["status"], "completed");
+        // This tests emitted bytes, independently of the separate rawOutput key defect.
+        updates[0]
+            .data
+            .get("output")
+            .or_else(|| updates[0].data.get("rawOutput"))
+            .expect("emitted result under its actual key")
+            .clone()
+    }
+
+    fn assert_input_sanitized(text: &str) {
+        let payload = nested_payload(text);
+        let emitted = [
+            emitted_input(payload.clone()),
+            emitted_input(json!(payload.to_string())),
+        ];
+        let sanitized = emitted.map(|value| {
+            assert_structure_and_small_values(&value);
+            value["nested"][0]["payload"].as_str() == Some("[omitted]")
+        });
+        assert_eq!(
+            sanitized,
+            [true; 2],
+            "structured and JSON-string arguments must sanitize before emission ({} input bytes)",
+            text.len()
+        );
+    }
+
+    fn assert_result_sanitized(text: &str) {
+        let nested = emitted_result(&nested_payload(text).to_string());
+        let plain = emitted_result(text);
+        assert_structure_and_small_values(&nested);
+        assert_eq!(
+            [
+                nested["nested"][0]["payload"].as_str() == Some("[omitted]"),
+                plain.as_str() == Some("[omitted]")
+            ],
+            [true; 2],
+            "parsed JSON and raw-string results must sanitize before emission ({} input bytes)",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn hermes_input_omits_oversized_ascii_before_emission() {
+        assert_input_sanitized(&"a".repeat(MAX_FIELD_BYTES + 1));
+    }
+
+    #[test]
+    fn hermes_input_uses_utf8_bytes_not_character_count() {
+        let text = format!("{}a", "é".repeat(MAX_FIELD_BYTES / 2));
+        assert_eq!(text.len(), MAX_FIELD_BYTES + 1);
+        assert!(text.chars().count() < MAX_FIELD_BYTES);
+        assert_input_sanitized(&text);
+    }
+
+    #[test]
+    fn hermes_input_omits_small_inline_base64_before_emission() {
+        assert_input_sanitized("data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn hermes_result_omits_oversized_ascii_before_emission() {
+        assert_result_sanitized(&"a".repeat(MAX_FIELD_BYTES + 1));
+    }
+
+    #[test]
+    fn hermes_result_uses_utf8_bytes_not_character_count() {
+        let text = format!("{}a", "é".repeat(MAX_FIELD_BYTES / 2));
+        assert_eq!(text.len(), MAX_FIELD_BYTES + 1);
+        assert!(text.chars().count() < MAX_FIELD_BYTES);
+        assert_result_sanitized(&text);
+    }
+
+    #[test]
+    fn hermes_result_omits_small_inline_base64_before_emission() {
+        assert_result_sanitized("data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn hermes_preserves_exact_byte_boundary_and_small_structured_controls() {
+        for text in [
+            "small text".to_string(),
+            "a".repeat(MAX_FIELD_BYTES),
+            "é".repeat(MAX_FIELD_BYTES / 2),
+            "aGVsbG8=".to_string(),
+            "data:text/plain,hello".to_string(),
+            "literal data:image/png;base64,AAAA".to_string(),
+        ] {
+            let expected = nested_payload(&text);
+            for emitted in [
+                emitted_input(expected.clone()),
+                emitted_input(json!(expected.to_string())),
+                emitted_result(&expected.to_string()),
+            ] {
+                assert_structure_and_small_values(&emitted);
+                assert!(
+                    emitted == expected,
+                    "safe structured fixture must survive unchanged ({} text bytes)",
+                    text.len()
+                );
+            }
+            assert!(
+                emitted_result(&text).as_str() == Some(text.as_str()),
+                "safe raw result must survive unchanged ({} text bytes)",
+                text.len()
+            );
+        }
+    }
 }

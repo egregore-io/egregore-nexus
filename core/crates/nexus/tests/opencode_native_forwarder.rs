@@ -506,3 +506,146 @@ fn assert_agent_update(event: &WsEvent, expected_kind: AgentUpdateKind, expected
         other => panic!("expected agent.update, got {other:?}"),
     }
 }
+
+/// Root discovery never binds a child session: with the store's `parent_id` column present, a
+/// newer child session sharing the launch directory is skipped and the root (parent_id NULL)
+/// is bound, so the forwarder reads the root's rows.
+#[tokio::test]
+async fn discovery_binds_the_root_session_not_a_newer_child_in_the_same_directory() {
+    let nexus_store = Arc::new(Store::open(":memory:").await.unwrap());
+    nexus_store.migrate().await.unwrap();
+    let session = SessionId("s_opencode_discovery_root".into());
+    let db_path = temp_db_path("discovery-root");
+    seed_opencode_db_with_child(&db_path).await;
+    OpenCodeRuntimeStateRepo::new(&nexus_store)
+        .upsert_launch(OpenCodeRuntimeLaunch {
+            runtime_id: session.clone(),
+            opencode_db_path: db_path.clone().into(),
+            opencode_session_id: None,
+            launch_cwd: "/tmp/nexus-opencode".into(),
+            plugin_bridge_pid: Some(4321),
+            viewer_backend: "pty".into(),
+        })
+        .await
+        .unwrap();
+    let sink = CaptureSink::default();
+
+    let stats = forward_once(nexus_store.clone(), session.clone(), Arc::new(sink.clone()))
+        .await
+        .unwrap();
+
+    let launch = OpenCodeRuntimeStateRepo::new(&nexus_store)
+        .find_by_runtime_id(&session)
+        .await
+        .unwrap()
+        .expect("launch row");
+    assert_eq!(
+        launch.opencode_session_id.as_deref(),
+        Some("ses_native"),
+        "the root is bound even though the child is newer"
+    );
+    assert_eq!(stats.user_input_events, 1);
+    assert_eq!(stats.text_events, 1);
+    let events = sink.events.lock().unwrap().clone();
+    assert_agent_update(&events[0], AgentUpdateKind::UserInput, "hello");
+    assert_agent_update(&events[1], AgentUpdateKind::Text, "hi back");
+    for event in &events {
+        if let WsEvent::AgentUpdate { data, .. } = event {
+            assert!(
+                !data.to_string().contains("child only"),
+                "child rows never reach the parent lane: {data}"
+            );
+        }
+    }
+}
+
+/// Like `seed_opencode_db`, with a `parent_id` column, a child session that is newer than the
+/// root in the same directory, and one event row that belongs to the child.
+async fn seed_opencode_db_with_child(path: &str) {
+    let db = Store::open(path).await.unwrap();
+    db.conn
+        .execute_batch(
+            "
+            CREATE TABLE event (
+                id TEXT PRIMARY KEY,
+                aggregate_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                type TEXT NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                parent_id TEXT,
+                directory TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL
+            );
+            INSERT INTO session (id, parent_id, directory, time_created, time_updated)
+                VALUES ('ses_native', NULL, '/tmp/nexus-opencode', 1, 2);
+            INSERT INTO session (id, parent_id, directory, time_created, time_updated)
+                VALUES ('ses_child', 'ses_native', '/tmp/nexus-opencode', 3, 9);
+            ",
+        )
+        .await
+        .unwrap();
+    // OpenCode aggregates a session's events under that session's id: the child's rows live
+    // under `ses_child`, the root's under `ses_native`.
+    for (aggregate, seq, event_type, data) in [
+        (
+            "ses_native",
+            1,
+            "message.updated.1",
+            json!({ "sessionID": "ses_native", "info": { "id": "msg_user", "role": "user" } }),
+        ),
+        (
+            "ses_native",
+            2,
+            "message.part.updated.1",
+            json!({ "sessionID": "ses_native", "part": { "id": "part_user", "messageID": "msg_user", "type": "text", "text": "hello" } }),
+        ),
+        (
+            "ses_child",
+            3,
+            "message.updated.1",
+            json!({ "sessionID": "ses_child", "info": { "id": "msg_child", "role": "assistant" } }),
+        ),
+        (
+            "ses_child",
+            4,
+            "message.part.updated.1",
+            json!({ "sessionID": "ses_child", "part": { "id": "part_child", "messageID": "msg_child", "type": "text", "text": "child only" } }),
+        ),
+        (
+            "ses_native",
+            5,
+            "message.updated.1",
+            json!({ "sessionID": "ses_native", "info": { "id": "msg_agent", "role": "assistant" } }),
+        ),
+        (
+            "ses_native",
+            6,
+            "message.part.updated.1",
+            json!({ "sessionID": "ses_native", "part": { "id": "part_agent", "messageID": "msg_agent", "type": "text", "text": "hi back" } }),
+        ),
+        (
+            "ses_native",
+            7,
+            "message.part.updated.1",
+            json!({ "sessionID": "ses_native", "part": { "id": "part_done", "messageID": "msg_agent", "type": "step-finish", "reason": "stop" } }),
+        ),
+    ] {
+        db.conn
+            .execute(
+                "INSERT INTO event (id, aggregate_id, seq, type, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                libsql::params![
+                    format!("evt_{seq}"),
+                    aggregate,
+                    seq,
+                    event_type,
+                    data.to_string()
+                ],
+            )
+            .await
+            .unwrap();
+    }
+}

@@ -109,6 +109,16 @@ pub struct Config {
     pub gateway_projection: GatewayProjectionBacklogConfig,
     /// Availability policy for the blocking Gateway-owned `before_send` hook boundary.
     pub hook_gateway_mode: HookGatewayMode,
+    /// Bounded volatile child lane (native subagent streams): rows retained per owner session.
+    pub child_stream_max_rows_per_session: u32,
+    /// Bytes retained per owner session, counting data plus child identity, source reference
+    /// and key.
+    pub child_stream_max_bytes_per_session: u64,
+    /// Lane records (verified or not, across root replacements) kept per owner session before
+    /// tombstones compact into the session loss summary.
+    pub child_stream_max_lanes_per_session: u32,
+    /// Distinct unresolved lanes per owner session before new unresolved observations are refused.
+    pub child_stream_max_unresolved_lanes_per_session: u32,
 }
 
 impl Default for Config {
@@ -127,6 +137,10 @@ impl Default for Config {
             launch_backend: None,
             gateway_projection: GatewayProjectionBacklogConfig::default(),
             hook_gateway_mode: HookGatewayMode::Optional,
+            child_stream_max_rows_per_session: 2048,
+            child_stream_max_bytes_per_session: 4 * 1024 * 1024,
+            child_stream_max_lanes_per_session: 256,
+            child_stream_max_unresolved_lanes_per_session: 64,
         }
     }
 }

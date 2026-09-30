@@ -11,52 +11,66 @@ Generate the release evidence from the exact clean candidate checkout and the fi
 directory:
 
 ```bash
+RELEASE_VERSION=$(tr -d '\n' < VERSION)
 scripts/nexus-v010-release-evidence \
-  --artifacts output/v0.1.5/artifacts \
-  --output output/v0.1.5/evidence \
+  --artifacts "output/v${RELEASE_VERSION}/artifacts" \
+  --output "output/v${RELEASE_VERSION}/evidence" \
   --revision "$(git rev-parse HEAD)"
 ```
 
-Publish only when `SHA256SUMS`, `nexus-0.1.5.cdx.json`, and
-`nexus-0.1.5.intoto.jsonl` all name the same complete artifact set. The annotated `v0.1.5` tag must
-point at the revision recorded in the provenance statement.
+Publish only when `SHA256SUMS`, `nexus-${RELEASE_VERSION}.cdx.json`, and
+`nexus-${RELEASE_VERSION}.intoto.jsonl` all name the same complete artifact set. The annotated
+`v${RELEASE_VERSION}` tag must point at the revision recorded in the provenance statement.
+
+The source `VERSION` is not evidence that a version was published. Before withdrawing anything,
+identify the actual affected published version and packages from the release manifest and
+publication records; do not infer them from the current checkout.
 
 ## Withdraw a Cargo release
 
-Yank the application first, followed by its internal crates in reverse dependency order. Yanking
-prevents new dependency resolution without deleting the immutable crate archive:
+Yank the affected published application first. Set `AFFECTED_VERSION` to its actual published
+version before running this example. Yanking prevents new dependency resolution without deleting
+the immutable crate archive. The guard requires a successful read and an exact SemVer version;
+blank input, ranges, wildcards, and surrounding whitespace perform no withdrawal:
 
 ```bash
-cargo yank --vers 0.1.5 egregore-nexus
-cargo yank --vers 0.1.5 nexus-pty
-cargo yank --vers 0.1.5 nexus-harness-codex
-cargo yank --vers 0.1.5 nexus-harness-claude
-cargo yank --vers 0.1.5 nexus-harness-core
-cargo yank --vers 0.1.5 nexus-admin
-cargo yank --vers 0.1.5 nexus-identity
-cargo yank --vers 0.1.5 nexus-search
-cargo yank --vers 0.1.5 nexus-dispatch
-cargo yank --vers 0.1.5 nexus-bus
-cargo yank --vers 0.1.5 nexus-agent
-cargo yank --vers 0.1.5 nexus-acp-stream
-cargo yank --vers 0.1.5 egregore-nexus-notify
-cargo yank --vers 0.1.5 nexus-store
-cargo yank --vers 0.1.5 egregore-nexus-common
-cargo yank --vers 0.1.5 nexus-transcript
-cargo yank --vers 0.1.5 nexus-contracts
+SEMVER_CORE='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+SEMVER_PRERELEASE='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+SEMVER_BUILD='[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*'
+SEMVER_PATTERN="^${SEMVER_CORE}(-${SEMVER_PRERELEASE}(\.${SEMVER_PRERELEASE})*)?(\+${SEMVER_BUILD})?$"
+if IFS= read -r -p 'Actual affected published version: ' AFFECTED_VERSION &&
+   [[ $AFFECTED_VERSION =~ $SEMVER_PATTERN ]]; then
+  cargo yank --vers "$AFFECTED_VERSION" egregore-nexus
+else
+  printf '%s\n' 'No withdrawal performed: enter an exact published SemVer version.' >&2
+fi
 ```
 
+Then use the affected release manifest to identify its internal crates and their versions. Yank
+only those actually published, in reverse dependency order (dependents before dependencies),
+using the same guarded example with each confirmed crate name and its exact published version.
 If a crate was never published, skip it and record that fact in the release incident. Do not move
 or delete the source tag.
 
 ## Withdraw npm releases
 
-Deprecate every affected public package with the same corrective-version instruction:
+Deprecate every affected public package with the same corrective-version instruction. Set
+`AFFECTED_VERSION` to the actual published version being withdrawn, and run only the commands
+for packages confirmed published at that version. The same exact-version guard applies here:
 
 ```bash
-npm deprecate @egregore/nexus@0.1.5 "Withdrawn; install the announced corrective release"
-npm deprecate @egregore/nexus-cli@0.1.5 "Withdrawn; install the announced corrective release"
-npm deprecate @egregore/nexus-gateway@0.1.5 "Withdrawn; install the announced corrective release"
+SEMVER_CORE='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+SEMVER_PRERELEASE='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+SEMVER_BUILD='[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*'
+SEMVER_PATTERN="^${SEMVER_CORE}(-${SEMVER_PRERELEASE}(\.${SEMVER_PRERELEASE})*)?(\+${SEMVER_BUILD})?$"
+if IFS= read -r -p 'Actual affected published version: ' AFFECTED_VERSION &&
+   [[ $AFFECTED_VERSION =~ $SEMVER_PATTERN ]]; then
+  npm deprecate "@egregore/nexus@$AFFECTED_VERSION" "Withdrawn; install the announced corrective release"
+  npm deprecate "@egregore/nexus-cli@$AFFECTED_VERSION" "Withdrawn; install the announced corrective release"
+  npm deprecate "@egregore/nexus-gateway@$AFFECTED_VERSION" "Withdrawn; install the announced corrective release"
+else
+  printf '%s\n' 'No withdrawal performed: enter an exact published SemVer version.' >&2
+fi
 ```
 
 Publish a corrected public version, verify its clean install and evidence, and only then move the

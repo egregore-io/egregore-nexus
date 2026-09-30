@@ -1,5 +1,11 @@
 use super::*;
 
+#[path = "claude_receipt_suffix.rs"]
+mod claude_receipt_suffix;
+
+#[path = "claude_bus_queue.rs"]
+mod claude_bus_queue;
+
 #[cfg(unix)]
 #[path = "opencode_revival.rs"]
 mod opencode_revival;

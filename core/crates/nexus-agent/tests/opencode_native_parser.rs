@@ -519,3 +519,173 @@ fn opencode_tool_rows_emit_tool_call_observations() {
 
     assert!(adapter.tool_call_observations(&non_tool).is_empty());
 }
+
+// These fixtures cover only the legacy native DB observer, not the plugin or ACP lanes.
+mod c_tool_sanitization {
+    use super::*;
+    use serde_json::Value;
+
+    const MAX_FIELD_BYTES: usize = 8 * 1024;
+
+    fn nested_payload(text: &str) -> Value {
+        json!({
+            "command": "fixture",
+            "nested": [{ "payload": text, "small": "keep", "number": 7,
+                "flag": true, "none": null }],
+            "array": [1, false, null, "keep"]
+        })
+    }
+
+    fn assert_structure_and_small_values(value: &Value) {
+        assert!(value.is_object(), "tool values must stay structured");
+        assert_eq!(value["command"], "fixture");
+        assert!(value["nested"].is_array());
+        assert!(value["nested"][0].is_object());
+        assert_eq!(value["nested"][0]["small"], "keep");
+        assert_eq!(value["nested"][0]["number"], 7);
+        assert_eq!(value["nested"][0]["flag"], true);
+        assert_eq!(value["nested"][0].get("none"), Some(&Value::Null));
+        assert_eq!(value["array"], json!([1, false, null, "keep"]));
+    }
+
+    fn emitted_tool(state: Value) -> Value {
+        let updates = translate_event_row(
+            &row(
+                1,
+                "message.part.updated.1",
+                json!({
+                    "sessionID": "ses_native",
+                    "part": {
+                        "id": "prt_sanitize",
+                        "sessionID": "ses_native",
+                        "messageID": "msg_assistant",
+                        "type": "tool",
+                        "callID": "call_sanitize",
+                        "tool": "bash",
+                        "state": state
+                    }
+                }),
+            ),
+            &mut OpenCodeForwardState::default(),
+        );
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].kind, AgentUpdateKind::ToolCall);
+        assert_eq!(updates[0].data["id"], "call_sanitize");
+        assert_eq!(updates[0].data["tool"], "bash");
+        updates[0].data.clone()
+    }
+
+    fn emitted_input(input: Value) -> Value {
+        let data = emitted_tool(json!({ "status": "running", "input": input }));
+        assert_eq!(data["status"], "in_progress");
+        data.get("input").expect("emitted input").clone()
+    }
+
+    fn emitted_result(output: Value, from_metadata: bool) -> Value {
+        let state = if from_metadata {
+            json!({ "status": "completed", "metadata": { "output": output } })
+        } else {
+            json!({ "status": "completed", "output": output })
+        };
+        let data = emitted_tool(state);
+        assert_eq!(data["status"], "completed");
+        data.get("output").expect("emitted output").clone()
+    }
+
+    fn assert_input_sanitized(text: &str) {
+        let emitted = emitted_input(nested_payload(text));
+        assert_structure_and_small_values(&emitted);
+        assert!(
+            emitted["nested"][0]["payload"].as_str() == Some("[omitted]"),
+            "legacy DB input must sanitize before emission ({} input bytes)",
+            text.len()
+        );
+    }
+
+    fn assert_result_sanitized(text: &str) {
+        let sanitized = [false, true].map(|from_metadata| {
+            let nested = emitted_result(nested_payload(text), from_metadata);
+            let plain = emitted_result(json!(text), from_metadata);
+            assert_structure_and_small_values(&nested);
+            [
+                nested["nested"][0]["payload"].as_str() == Some("[omitted]"),
+                plain.as_str() == Some("[omitted]"),
+            ]
+        });
+        assert_eq!(
+            sanitized,
+            [[true; 2]; 2],
+            "legacy DB direct/metadata nested/plain output must sanitize ({} input bytes)",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn legacy_db_input_omits_oversized_ascii_before_emission() {
+        assert_input_sanitized(&"a".repeat(MAX_FIELD_BYTES + 1));
+    }
+
+    #[test]
+    fn legacy_db_input_uses_utf8_bytes_not_character_count() {
+        let text = format!("{}a", "é".repeat(MAX_FIELD_BYTES / 2));
+        assert_eq!(text.len(), MAX_FIELD_BYTES + 1);
+        assert!(text.chars().count() < MAX_FIELD_BYTES);
+        assert_input_sanitized(&text);
+    }
+
+    #[test]
+    fn legacy_db_input_omits_small_inline_base64_before_emission() {
+        assert_input_sanitized("data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn legacy_db_result_omits_oversized_ascii_before_emission() {
+        assert_result_sanitized(&"a".repeat(MAX_FIELD_BYTES + 1));
+    }
+
+    #[test]
+    fn legacy_db_result_uses_utf8_bytes_not_character_count() {
+        let text = format!("{}a", "é".repeat(MAX_FIELD_BYTES / 2));
+        assert_eq!(text.len(), MAX_FIELD_BYTES + 1);
+        assert!(text.chars().count() < MAX_FIELD_BYTES);
+        assert_result_sanitized(&text);
+    }
+
+    #[test]
+    fn legacy_db_result_omits_small_inline_base64_before_emission() {
+        assert_result_sanitized("data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn legacy_db_preserves_exact_byte_boundary_and_small_structured_controls() {
+        for text in [
+            "small text".to_string(),
+            "a".repeat(MAX_FIELD_BYTES),
+            "é".repeat(MAX_FIELD_BYTES / 2),
+            "aGVsbG8=".to_string(),
+            "data:text/plain,hello".to_string(),
+            "literal data:image/png;base64,AAAA".to_string(),
+        ] {
+            let expected = nested_payload(&text);
+            for emitted in [
+                emitted_input(expected.clone()),
+                emitted_result(expected.clone(), false),
+                emitted_result(expected.clone(), true),
+            ] {
+                assert_structure_and_small_values(&emitted);
+                assert!(
+                    emitted == expected,
+                    "safe structured fixture must survive unchanged ({} text bytes)",
+                    text.len()
+                );
+            }
+            for from_metadata in [false, true] {
+                assert!(
+                    emitted_result(json!(text), from_metadata).as_str() == Some(text.as_str()),
+                    "safe raw result must survive unchanged ({} text bytes)",
+                    text.len()
+                );
+            }
+        }
+    }
+}

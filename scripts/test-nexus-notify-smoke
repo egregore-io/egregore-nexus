@@ -3,18 +3,53 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import json
 import os
+import runpy
 import subprocess
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parent.parent
 COMMAND = ROOT / "scripts" / "nexus-notify-smoke"
+
+
+class NotificationHelpTests(unittest.TestCase):
+    def test_help_discloses_side_effects_without_cli_network_or_state_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_tmp:
+            home = Path(raw_tmp)
+            output = io.StringIO()
+            with (
+                patch.dict(os.environ, {"HOME": str(home)}, clear=True),
+                patch("sys.argv", [str(COMMAND), "--help"]),
+                patch("subprocess.run", side_effect=AssertionError("CLI invoked")) as cli,
+                patch("urllib.request.urlopen", side_effect=AssertionError("network invoked")) as network,
+                patch("socket.socket", side_effect=AssertionError("socket opened")) as socket,
+                redirect_stdout(output),
+            ):
+                runpy.run_path(str(COMMAND), run_name="__main__")
+            cli.assert_not_called()
+            network.assert_not_called()
+            socket.assert_not_called()
+            self.assertEqual(list(home.iterdir()), [], "help must not write operator state")
+            help_text = output.getvalue()
+            for disclosure in (
+                "maintainer utility",
+                "not an isolated test",
+                "$HOME/.nexus/nexus-endurance-smoke.json",
+                "NEXUS_NOTIFY_STATE",
+                "registers or rotates source credentials",
+                "installed Nexus Gateway",
+                "NEXUS_GATEWAY_URL",
+            ):
+                self.assertIn(disclosure, help_text)
 
 
 class CaptureHandler(BaseHTTPRequestHandler):
@@ -76,6 +111,7 @@ class NotificationSmokeTests(unittest.TestCase):
             env = os.environ | {
                 "CAPTURE": str(capture),
                 "HOME": str(tmp),
+                "NEXUS_NOTIFY_STATE": str(tmp / ".nexus" / "nexus-endurance-smoke.json"),
                 "PATH": f"{tmp}:{os.environ['PATH']}",
                 "NEXUS_GATEWAY_URL": f"http://127.0.0.1:{self.server.server_port}",
             }

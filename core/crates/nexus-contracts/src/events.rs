@@ -191,6 +191,57 @@ impl ToolCallData {
     }
 }
 
+/// How much native evidence established a child stream's relationship to its captured root.
+#[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildResolution {
+    /// Root affiliation proven by native ids; immediate parent and depth unknown.
+    RootVerified,
+    /// Root affiliation and the immediate parent chain to the root proven by native lineage.
+    LineageVerified,
+    /// No native evidence of root ownership. `parent` may still carry a native parent id the
+    /// source declared; that alone does not make the stream a verified descendant.
+    Unresolved,
+}
+
+/// Harness-owned identity of one native child stream that shares a Nexus owner session with its
+/// captured root: a subagent, a delegated session, a sub-thread. Every value is a native id, a
+/// native lineage fact, or absent. Nothing is inferred from names, text or time.
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChildStream {
+    /// The harness id that attributed the stream.
+    pub harness: String,
+    /// The owner session's captured native root at observation time: its native session or
+    /// main thread id as the harness records it.
+    pub root: String,
+    /// Native child id when the source carries one (agentId, child sessionID, threadId, child
+    /// session id). `None` for unresolved observations without a native id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Synthetic observation locator, `<harness>:<source>#<occurrence>`, unique within one owner
+    /// session and one daemon epoch. Provenance only; never a native id.
+    pub locator: String,
+    /// Immediate native parent, only from native lineage evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Parent-side native reference to the spawning call (a task call id), only when observed
+    /// by id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_ref: Option<String>,
+    /// Depth below the root, only from native lineage evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<u32>,
+    pub resolution: ChildResolution,
+    /// Native evidence that established `resolution`, as a fixed tag such as
+    /// `subagents_dir+sessionId+agentId`, `session.created.parentID`,
+    /// `rollout_meta.thread_spawn`, `sessions.parent_session_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+}
+
 /// The canonical event stream. `#[serde(tag = "type")]` puts the dotted name in a `type` field.
 ///
 /// This is an internally-tagged (`type`) serde union. typeshare 1.13 cannot emit internally-tagged
@@ -219,6 +270,21 @@ pub enum WsEvent {
     AgentUpdate {
         session_id: SessionId,
         kind: AgentUpdateKind,
+        data: serde_json::Value,
+    },
+
+    /// One update of a native child stream (a subagent, delegated session or sub-thread that
+    /// shares this Nexus session with its captured root), attributed by the harness managing
+    /// code and routed away from the parent's `agent.update` lane. Additive: `agent.update`
+    /// consumers never see these, so the parent's transcript and turn state are untouched.
+    #[serde(rename = "child_agent.update", rename_all = "camelCase")]
+    ChildAgentUpdate {
+        session_id: SessionId,
+        child: ChildStream,
+        kind: AgentUpdateKind,
+        /// Harness-owned occurrence reference, `<harness>:<source id>@<source generation>#<occurrence>`.
+        /// Identifies an occurrence within that source generation; not a continuity proof.
+        source_ref: String,
         data: serde_json::Value,
     },
 

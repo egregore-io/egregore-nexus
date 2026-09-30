@@ -1,5 +1,36 @@
 use nexus_contracts::{DeliveryTiming, SteerCapability};
-use nexus_dispatch::{delivery_action, DeliveryAction};
+use nexus_dispatch::{delivery_action, delivery_action_with_native_queue, DeliveryAction};
+
+#[test]
+fn native_queue_is_opt_in_and_never_overrides_explicit_boundary_timing() {
+    for capability in [
+        SteerCapability::None,
+        SteerCapability::NativeSteer,
+        SteerCapability::InterruptAndSend,
+    ] {
+        for active in [false, true] {
+            for timing in [
+                DeliveryTiming::Interrupt,
+                DeliveryTiming::YieldTurn,
+                DeliveryTiming::AfterToolLoop,
+            ] {
+                assert_eq!(
+                    delivery_action_with_native_queue(timing, active, capability, false),
+                    delivery_action(timing, active, capability)
+                );
+                let expected = if active && timing == DeliveryTiming::Interrupt {
+                    DeliveryAction::NativeQueue
+                } else {
+                    delivery_action(timing, active, capability)
+                };
+                assert_eq!(
+                    delivery_action_with_native_queue(timing, active, capability, true),
+                    expected
+                );
+            }
+        }
+    }
+}
 
 #[test]
 fn idle_targets_start_normally_for_every_public_timing() {

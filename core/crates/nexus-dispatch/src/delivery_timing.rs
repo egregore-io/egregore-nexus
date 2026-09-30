@@ -9,6 +9,7 @@ use nexus_contracts::{DeliveryTiming, SteerCapability};
 pub enum DeliveryAction {
     StartTurn,
     NativeSteer,
+    NativeQueue,
     InterruptAndSend,
     WaitForTurnBoundary,
     WaitForFinalTurnCompletion,
@@ -24,8 +25,23 @@ pub fn delivery_action(
     turn_active: bool,
     capability: SteerCapability,
 ) -> DeliveryAction {
+    delivery_action_with_native_queue(timing, turn_active, capability, false)
+}
+
+/// Immediate mail prefers a backend-owned input queue over interrupting native work.
+/// Explicit boundary timing remains authoritative; queuing is input acceptance, not completion.
+pub fn delivery_action_with_native_queue(
+    timing: DeliveryTiming,
+    turn_active: bool,
+    capability: SteerCapability,
+    accepts_queue: bool,
+) -> DeliveryAction {
     if !turn_active {
         return DeliveryAction::StartTurn;
+    }
+
+    if timing == DeliveryTiming::Interrupt && accepts_queue {
+        return DeliveryAction::NativeQueue;
     }
 
     match timing {

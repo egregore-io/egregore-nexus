@@ -1,0 +1,19 @@
+[package]
+name = "nexus-harness-hermes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+publish = ["crates-io"]
+description = "Hermes native child-session discovery, decoding and cursor storage for Nexus."
+
+[dependencies]
+nexus-agent = { workspace = true }
+nexus-common = { workspace = true }
+nexus-contracts = { workspace = true }
+nexus-store = { workspace = true }
+libsql = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

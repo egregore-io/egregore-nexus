@@ -8,7 +8,10 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use nexus_contracts::{EventSink, GatewayProjectionEffect, Notification, WsEvent, JSONRPC_VERSION};
-use nexus_store::repos::{AgentAccessGrants, AgentRuntimes, Agents, IdentitySessions, Sessions};
+use nexus_store::repos::{
+    AgentAccessGrants, AgentRuntimes, Agents, AppendOutcome, ChildStreamBounds, ChildStreamEvents,
+    DaemonState, IdentitySessions, Sessions,
+};
 use nexus_store::Store;
 
 use crate::daemon::transcript_archive::archive_codex_once;
@@ -25,6 +28,11 @@ pub struct WsSink {
     /// `mem.stream_events`, then materializes compact durable `/agent` history rows on `turn_end`.
     /// `None` on the mock/test seam (no DB) means broadcast-only, no persistence.
     store: Option<Arc<Store>>,
+    /// Per-owner-session bounds of the volatile child lane (`mem.child_stream_events`).
+    child_stream_bounds: ChildStreamBounds,
+    /// The daemon boot epoch, captured once from the store's daemon state. Child lane rows are
+    /// recorded only under this captured authority, never under a placeholder.
+    boot_epoch: Arc<std::sync::OnceLock<String>>,
 }
 
 impl WsSink {
@@ -35,6 +43,38 @@ impl WsSink {
             tx,
             gateway_stream: None,
             store,
+            child_stream_bounds: ChildStreamBounds::default(),
+            boot_epoch: Arc::new(std::sync::OnceLock::new()),
+        }
+    }
+
+    /// Replace the default child lane bounds with the daemon's configured values.
+    pub fn with_child_stream_bounds(mut self, bounds: ChildStreamBounds) -> Self {
+        self.child_stream_bounds = bounds;
+        self
+    }
+
+    /// The boot epoch this daemon recorded, captured once. `None` until the daemon state holds
+    /// one (or when the read fails): the child lane then records nothing rather than something
+    /// under a reusable placeholder.
+    async fn captured_boot_epoch(&self, store: &Store) -> Option<String> {
+        if let Some(epoch) = self.boot_epoch.get() {
+            return Some(epoch.clone());
+        }
+        match DaemonState::new(store).boot_epoch().await {
+            Ok(Some(epoch)) if !epoch.is_empty() => {
+                let _ = self.boot_epoch.set(epoch.clone());
+                Some(epoch)
+            }
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(
+                    target: "nexus::child_streams",
+                    error = %e,
+                    "boot epoch read failed; child stream update not recorded"
+                );
+                None
+            }
         }
     }
 
@@ -385,6 +425,64 @@ impl EventSink for WsSink {
     }
 
     async fn emit(&self, event: WsEvent) {
+        // CHILD STREAMS → BOUNDED LANE: a harness-attributed native child update never touches
+        // the parent's stream lane, the gateway projection, the materializer or the archive. It
+        // is appended to the volatile child lane under the current boot epoch, then broadcast
+        // like any other event. Refusals and store failures are logged, never redirected.
+        if let (
+            Some(store),
+            WsEvent::ChildAgentUpdate {
+                session_id,
+                child,
+                kind,
+                source_ref,
+                data,
+            },
+        ) = (&self.store, &event)
+        {
+            let kind_str = serde_json::to_value(kind)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            match self.captured_boot_epoch(store).await {
+                None => {
+                    tracing::warn!(
+                        target: "nexus::child_streams",
+                        session = %session_id, harness = %child.harness, root = %child.root,
+                        "child stream update not recorded: boot epoch unavailable (live broadcast still sent)"
+                    );
+                }
+                Some(epoch) => match ChildStreamEvents::new(store)
+                    .append(
+                        session_id,
+                        &epoch,
+                        child,
+                        &kind_str,
+                        source_ref,
+                        &data.to_string(),
+                        &self.child_stream_bounds,
+                    )
+                    .await
+                {
+                    Ok(AppendOutcome::Stored(_)) => {}
+                    Ok(AppendOutcome::Refused(by)) => {
+                        tracing::warn!(
+                            target: "nexus::child_streams",
+                            session = %session_id, harness = %child.harness, root = %child.root,
+                            locator = %child.locator, refused_by = ?by,
+                            "child stream update refused by a lane bound (live broadcast still sent)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "nexus::child_streams",
+                            session = %session_id, error = %e,
+                            "failed to buffer child_agent.update in mem.child_stream_events (live broadcast still sent)"
+                        );
+                    }
+                },
+            }
+        }
         // STREAM → STORE: append every `agent.update` to the volatile stream lane, then fold a
         // finalized turn into `/agent` history at `turn_end`. Failures are logged but do not block
         // live delivery.

@@ -1,8 +1,5 @@
 # Contributing to Nexus
 
-Nexus is a local-first transport for messages and notifications between humans and agent
-harnesses. Keep changes aligned with the boundaries below.
-
 ## Architecture invariants
 
 - The daemon is the lightweight transport authority. It owns durable agent identity, runtime

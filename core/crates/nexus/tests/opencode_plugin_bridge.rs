@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use nexus::daemon::opencode_plugin_bridge::{
     write_opencode_plugin_files, OpenCodePluginBridge, OpenCodePluginBridgeOptions,
 };
-use nexus_contracts::events::{AgentUpdateKind, WsEvent};
+use nexus_contracts::events::{AgentUpdateKind, ChildResolution, ChildStream, WsEvent};
 use nexus_contracts::ids::SessionId;
 use nexus_contracts::ports::EventSink;
 use nexus_pty::HarnessInput;
@@ -1710,4 +1710,733 @@ impl BridgeHttpExt for OpenCodePluginBridge {
             .unwrap_or(Value::Null);
         (status, body)
     }
+}
+
+/// The generated plugin against the real bridge: a child session named by a native
+/// `session.created` parentID link streams into the child lane as `LineageVerified` with its
+/// parent, depth and the root task part that spawned it; a nested child carries depth 2; a
+/// session with no native ancestry is `Unresolved`; the root's own text and its task call stay
+/// in the parent lane; nothing of any child reaches the parent lane.
+#[tokio::test]
+async fn generated_plugin_streams_children_into_the_child_lane_through_the_real_bridge() {
+    if !node_available() {
+        eprintln!("[skip] node is not available");
+        return;
+    }
+    let sink = Arc::new(CaptureSink::default());
+    let session = SessionId("s_opencode_children".into());
+    let bridge = OpenCodePluginBridge::start(
+        session.clone(),
+        sink.clone(),
+        OpenCodePluginBridgeOptions {
+            turn_timeout: Duration::from_secs(2),
+        },
+    )
+    .await
+    .expect("bridge starts");
+    assert!(
+        bridge.bind_child_root("root"),
+        "the launch handshake binds the root"
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let files = write_opencode_plugin_files(tmp.path(), &session).unwrap();
+    let driver = tmp.path().join("children.mjs");
+    std::fs::write(&driver, r#"
+import {pathToFileURL} from 'node:url';
+const bridgeUrl = process.env.NEXUS_OPENCODE_BRIDGE_URL;
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (url, init = {}) => {
+  if (url === `${bridgeUrl}/turn/next`) return new Promise(() => {});
+  if (url.startsWith(bridgeUrl)) return realFetch(url, init);
+  if (url === `${bridgeUrl}/model`) return new Response(null, {status:204});
+  throw new Error(`unexpected fixture fetch ${url}`);
+};
+const hooks = await (await import(pathToFileURL(process.argv[2]).href)).nexus();
+const ev = (type, properties) => hooks.event({event:{type, properties}});
+const part = (sessionID, messageID, value) => ev('message.part.updated', {part:{sessionID, messageID, ...value}});
+const message = (sessionID, id, role) => ev('message.updated', {info:{sessionID, id, role}});
+
+// Root turn: text, then a task call that names the child it spawned.
+await message('root', 'rm1', 'assistant');
+await part('root', 'rm1', {id:'rp1', type:'text', text:'root thinks aloud'});
+await part('root', 'rm1', {id:'rp2', type:'tool', tool:'task', callID:'call-task', state:{status:'running', input:{description:'explore'}, metadata:{sessionId:'child-a'}}});
+// The child is created with a native parent link, streams, calls a tool, then goes idle.
+await ev('session.created', {info:{id:'child-a', parentID:'root'}});
+await message('child-a', 'cm1', 'user');
+await part('child-a', 'cm1', {id:'cp0', type:'text', text:'explore the repo'});
+await message('child-a', 'cm2', 'assistant');
+await part('child-a', 'cm2', {id:'cp1', type:'reasoning', text:'child reasoning'});
+await part('child-a', 'cm2', {id:'cp2', type:'text', text:'child says hello'});
+await part('child-a', 'cm2', {id:'cp3', type:'tool', tool:'bash', callID:'call-child', state:{status:'completed', input:{command:'ls'}, output:'child output'}});
+await ev('session.status', {sessionID:'child-a', status:{type:'idle'}});
+// A nested child of child-a.
+await ev('session.created', {info:{id:'child-b', parentID:'child-a'}});
+await message('child-b', 'nm1', 'assistant');
+await part('child-b', 'nm1', {id:'np1', type:'text', text:'nested says hi'});
+await ev('session.idle', {sessionID:'child-b'});
+// A session nobody linked: unresolved, and an idle for a session that never streamed is nothing.
+await message('stranger', 'sm1', 'assistant');
+await part('stranger', 'sm1', {id:'sp1', type:'text', text:'who am i'});
+await ev('session.idle', {sessionID:'silent'});
+// The root finishes its task call and its turn.
+await part('root', 'rm1', {id:'rp2', type:'tool', tool:'task', callID:'call-task', state:{status:'completed', input:{description:'explore'}, metadata:{sessionId:'child-a'}, output:'child summary'}});
+await part('root', 'rm1', {id:'rp3', type:'step-finish'});
+await hooks.dispose();
+"#).unwrap();
+    // The bridge is served by this test's runtime, so node must be awaited, not blocked on.
+    let output = tokio::process::Command::new("node")
+        .arg(&driver)
+        .arg(&files.plugin_path)
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("NEXUS_OPENCODE_BRIDGE_URL", bridge.endpoint().base_url())
+        .env("NEXUS_OPENCODE_BRIDGE_TOKEN", bridge.endpoint().token())
+        .env("NEXUS_OPENCODE_SERVER_URL", "http://native.invalid")
+        .env("OPENCODE_SERVER_PASSWORD", "fixture")
+        .env("NEXUS_OPENCODE_SESSION_ID", "root")
+        .env("NEXUS_NAME", "children-fixture")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = sink.events();
+    let parent: Vec<(AgentUpdateKind, serde_json::Value)> = events
+        .iter()
+        .filter_map(|e| match e {
+            WsEvent::AgentUpdate { kind, data, .. } => Some((*kind, data.clone())),
+            _ => None,
+        })
+        .collect();
+    let children: Vec<(ChildStream, AgentUpdateKind, String, serde_json::Value)> = events
+        .iter()
+        .filter_map(|e| match e {
+            WsEvent::ChildAgentUpdate {
+                session_id,
+                child,
+                kind,
+                source_ref,
+                data,
+            } => {
+                assert_eq!(session_id, &session);
+                Some((child.clone(), *kind, source_ref.clone(), data.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Parent lane: the root's text, its task call (running, completed) and its turn end.
+    assert_eq!(
+        parent.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+        vec![
+            AgentUpdateKind::Text,
+            AgentUpdateKind::ToolCall,
+            AgentUpdateKind::ToolCall,
+            AgentUpdateKind::TurnEnd,
+        ],
+        "{parent:?}"
+    );
+    assert_eq!(parent[0].1["text"], "root thinks aloud");
+    assert_eq!(parent[1].1["id"], "call-task");
+    assert_eq!(parent[2].1["content"], "child summary");
+    for (_, data) in &parent {
+        let text = data.to_string();
+        assert!(
+            !text.contains("child says hello")
+                && !text.contains("child reasoning")
+                && !text.contains("nested says hi")
+                && !text.contains("who am i")
+                && !text.contains("child output"),
+            "child content leaked into the parent lane: {text}"
+        );
+    }
+
+    // Child lane, child-a: user input, reasoning, text, tool, turn end; lineage verified at
+    // depth 1 with the root as parent and the task part as parent ref.
+    let a: Vec<_> = children
+        .iter()
+        .filter(|(c, ..)| c.id.as_deref() == Some("child-a"))
+        .collect();
+    assert_eq!(
+        a.iter().map(|(_, k, ..)| *k).collect::<Vec<_>>(),
+        vec![
+            AgentUpdateKind::UserInput,
+            AgentUpdateKind::Thinking,
+            AgentUpdateKind::Text,
+            AgentUpdateKind::ToolCall,
+            AgentUpdateKind::TurnEnd,
+        ],
+        "{a:?}"
+    );
+    for (child, _, source_ref, _) in &a {
+        assert_eq!(child.harness, "opencode");
+        assert_eq!(child.root, "root");
+        assert_eq!(child.parent.as_deref(), Some("root"));
+        assert_eq!(
+            child.parent_ref.as_deref(),
+            Some("opencode:rm1/rp2/call-task")
+        );
+        assert_eq!(child.depth, Some(1));
+        assert_eq!(child.resolution, ChildResolution::LineageVerified);
+        assert_eq!(
+            child.evidence.as_deref(),
+            Some("session.created.parentID chain to root")
+        );
+        assert_eq!(child.locator, "opencode:session/child-a");
+        assert!(source_ref.starts_with("opencode:child-a/"), "{source_ref}");
+    }
+    assert_eq!(a[0].3["text"], "explore the repo");
+    assert_eq!(a[1].3["text"], "child reasoning");
+    assert_eq!(a[2].3["text"], "child says hello");
+    assert_eq!(a[3].3["id"], "call-child");
+    assert_eq!(a[3].3["content"], "child output");
+    assert!(
+        a[0].2.starts_with("opencode:child-a/cm1/cp0@"),
+        "{}",
+        a[0].2
+    );
+    let sequences: Vec<u64> = children
+        .iter()
+        .map(|(_, _, r, _)| r.rsplit('#').next().unwrap().parse().unwrap())
+        .collect();
+    assert!(
+        sequences.windows(2).all(|w| w[0] < w[1]),
+        "source refs are strictly increasing: {sequences:?}"
+    );
+
+    // Nested child: depth 2, parent child-a, no task ref (nobody's task part named it).
+    let b: Vec<_> = children
+        .iter()
+        .filter(|(c, ..)| c.id.as_deref() == Some("child-b"))
+        .collect();
+    assert_eq!(
+        b.iter().map(|(_, k, ..)| *k).collect::<Vec<_>>(),
+        vec![AgentUpdateKind::Text, AgentUpdateKind::TurnEnd]
+    );
+    assert_eq!(b[0].0.parent.as_deref(), Some("child-a"));
+    assert_eq!(b[0].0.parent_ref, None);
+    assert_eq!(b[0].0.depth, Some(2));
+    assert_eq!(b[0].0.resolution, ChildResolution::LineageVerified);
+
+    // Unlinked session: unresolved, no parent, no depth, no evidence.
+    let stranger: Vec<_> = children
+        .iter()
+        .filter(|(c, ..)| c.id.as_deref() == Some("stranger"))
+        .collect();
+    assert_eq!(stranger.len(), 1);
+    assert_eq!(stranger[0].1, AgentUpdateKind::Text);
+    assert_eq!(stranger[0].0.resolution, ChildResolution::Unresolved);
+    assert_eq!(stranger[0].0.parent, None);
+    assert_eq!(stranger[0].0.depth, None);
+    assert_eq!(stranger[0].0.evidence, None);
+    assert_eq!(stranger[0].0.root, "root");
+    // The idle of a session that never streamed produced nothing.
+    assert!(children
+        .iter()
+        .all(|(c, ..)| c.id.as_deref() != Some("silent")));
+    assert_eq!(children.len(), 5 + 2 + 1, "{children:?}");
+}
+
+#[tokio::test]
+async fn child_route_is_bound_to_the_captured_root_and_rejects_everything_else() {
+    let sink = Arc::new(CaptureSink::default());
+    let bridge = OpenCodePluginBridge::start(
+        SessionId("s_opencode_child_route".into()),
+        sink.clone(),
+        OpenCodePluginBridgeOptions {
+            turn_timeout: Duration::from_secs(2),
+        },
+    )
+    .await
+    .expect("bridge starts");
+    let child = |harness: &str, root: &str| {
+        json!({
+            "child": { "harness": harness, "root": root, "id": "c1", "locator": "opencode:session/c1", "resolution": "lineage_verified", "parent": root, "depth": 1 },
+            "kind": "text",
+            "sourceRef": "opencode:c1/m/p@g#1",
+            "data": { "text": "hi" }
+        })
+    };
+    // Before the launch handshake binds a root, no claimed root is accepted.
+    let (status, body) = bridge
+        .http_json(
+            "POST",
+            "/child",
+            Some(child("opencode", "root")),
+            bridge.endpoint().token(),
+        )
+        .await;
+    assert_eq!(status, 409, "prebind");
+    assert_eq!(body["error"], "root_unbound");
+
+    assert!(bridge.bind_child_root("root"));
+    assert!(
+        bridge.bind_child_root("root"),
+        "rebinding the same root is a no-op"
+    );
+    assert!(!bridge.bind_child_root("other"), "the root is immutable");
+    assert!(!bridge.bind_child_root(""), "an empty root binds nothing");
+
+    for (body, label) in [
+        (child("claude", "root"), "foreign harness"),
+        (child("opencode", ""), "empty root"),
+        (
+            json!({ "child": { "harness": "opencode", "root": "root", "locator": "opencode:session/c1", "resolution": "unresolved" }, "kind": "text", "sourceRef": "", "data": {} }),
+            "empty source ref",
+        ),
+    ] {
+        let (status, _) = bridge
+            .http_json("POST", "/child", Some(body), bridge.endpoint().token())
+            .await;
+        assert_eq!(status, 400, "{label}");
+    }
+    // A nonempty root that is not the bound one is refused, however verified it claims to be.
+    let (status, body) = bridge
+        .http_json(
+            "POST",
+            "/child",
+            Some(child("opencode", "elsewhere")),
+            bridge.endpoint().token(),
+        )
+        .await;
+    assert_eq!(status, 409, "wrong root");
+    assert_eq!(body["error"], "root_mismatch");
+    let (status, _) = bridge
+        .http_json(
+            "POST",
+            "/child",
+            Some(child("opencode", "root")),
+            "wrong-token",
+        )
+        .await;
+    assert_eq!(status, 401);
+    // The matched root is accepted and is the only event that reached the sink.
+    let (status, _) = bridge
+        .http_json(
+            "POST",
+            "/child",
+            Some(child("opencode", "root")),
+            bridge.endpoint().token(),
+        )
+        .await;
+    assert_eq!(status, 204);
+    let events = sink.events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(
+        matches!(&events[0], WsEvent::ChildAgentUpdate { child, kind: AgentUpdateKind::Text, source_ref, .. }
+        if child.id.as_deref() == Some("c1") && child.root == "root" && source_ref == "opencode:c1/m/p@g#1")
+    );
+}
+
+/// Bounded plugin child state with visible consequences, and no silent drops: a part with no
+/// session id goes to the unidentified unresolved lane; a text whose message role was never
+/// announced, or whose role entry was evicted, carries role "unknown"; the oldest active child
+/// is closed with a forced turn_end when the active bound is exceeded; a text part whose prior
+/// was evicted is delivered as a snapshot instead of a delta.
+#[tokio::test]
+async fn generated_plugin_bounds_child_state_visibly_and_never_drops_unattributed_parts() {
+    if !node_available() {
+        eprintln!("[skip] node is not available");
+        return;
+    }
+    let sink = Arc::new(CaptureSink::default());
+    let session = SessionId("s_opencode_child_bounds".into());
+    let bridge = OpenCodePluginBridge::start(
+        session.clone(),
+        sink.clone(),
+        OpenCodePluginBridgeOptions {
+            turn_timeout: Duration::from_secs(2),
+        },
+    )
+    .await
+    .expect("bridge starts");
+    assert!(bridge.bind_child_root("root"));
+    let tmp = tempfile::tempdir().unwrap();
+    let files = write_opencode_plugin_files(tmp.path(), &session).unwrap();
+    let driver = tmp.path().join("bounds.mjs");
+    std::fs::write(&driver, r#"
+import {pathToFileURL} from 'node:url';
+const bridgeUrl = process.env.NEXUS_OPENCODE_BRIDGE_URL;
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (url, init = {}) => {
+  if (url === `${bridgeUrl}/turn/next`) return new Promise(() => {});
+  if (url.startsWith(bridgeUrl)) return realFetch(url, init);
+  throw new Error(`unexpected fixture fetch ${url}`);
+};
+const hooks = await (await import(pathToFileURL(process.argv[2]).href)).nexus();
+const ev = (type, properties) => hooks.event({event:{type, properties}});
+const part = (sessionID, messageID, value) => ev('message.part.updated', {part:{sessionID, messageID, ...value}});
+const message = (sessionID, id, role) => ev('message.updated', {info:{sessionID, id, role}});
+
+// A part with no session id at all.
+await ev('message.part.updated', {part:{messageID:'m0', id:'p0', type:'text', text:'no session here'}});
+// Malformed session ids: a number and an object are never ids.
+await ev('message.part.updated', {part:{sessionID:123, messageID:'mm1', id:'pm1', type:'text', text:'numeric session'}});
+await ev('message.part.updated', {part:{sessionID:{}, messageID:'mm2', id:'pm2', type:'text', text:'object session'}});
+// A linked child whose message role was never announced, then a part with nonstring
+// message and part ids that must not become keys or refs.
+await ev('session.created', {info:{id:'child-x', parentID:'root'}});
+await part('child-x', 'mx', {id:'px', type:'text', text:'role never announced'});
+await part('child-x', 42, {id:{bad:true}, type:'text', text:'weird ids'});
+// A linked child whose first message role is evicted by 1024 later ones.
+await ev('session.created', {info:{id:'child-y', parentID:'root'}});
+await message('child-y', 'my-first', 'assistant');
+for (let i = 0; i < 1024; i++) await message('child-y', `my-${i}`, 'assistant');
+await part('child-y', 'my-first', {id:'py-first', type:'text', text:'role evicted'});
+await part('child-y', 'my-1023', {id:'py-last', type:'text', text:'role known'});
+// 256 more distinct children push the two above out of the active bound, oldest first.
+for (let i = 0; i < 256; i++) {
+  const sid = `e${String(i).padStart(3, '0')}`;
+  await message(sid, `${sid}-m`, 'assistant');
+  await part(sid, `${sid}-m`, {id:`${sid}-p`, type:'text', text:`text ${i}`});
+}
+// 513 parts in one session evict the first part's text prior; the last one keeps its prior.
+await message('t', 'tm', 'assistant');
+for (let i = 0; i < 513; i++) await part('t', 'tm', {id:`tp${String(i).padStart(3, '0')}`, type:'text', text:'a'});
+await part('t', 'tm', {id:'tp000', type:'text', text:'ab'});
+await part('t', 'tm', {id:'tp512', type:'text', text:'ab'});
+// An explicit empty replacement is a snapshot; repeating it is silent; a non-prefix
+// replacement is a snapshot.
+await part('t', 'tm', {id:'tp003', type:'text', text:''});
+await part('t', 'tm', {id:'tp003', type:'text', text:''});
+await part('t', 'tm', {id:'tp004', type:'text', text:'zz'});
+await hooks.dispose();
+"#).unwrap();
+    let output = tokio::process::Command::new("node")
+        .arg(&driver)
+        .arg(&files.plugin_path)
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("NEXUS_OPENCODE_BRIDGE_URL", bridge.endpoint().base_url())
+        .env("NEXUS_OPENCODE_BRIDGE_TOKEN", bridge.endpoint().token())
+        .env("NEXUS_OPENCODE_SERVER_URL", "http://native.invalid")
+        .env("OPENCODE_SERVER_PASSWORD", "fixture")
+        .env("NEXUS_OPENCODE_SESSION_ID", "root")
+        .env("NEXUS_NAME", "bounds-fixture")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = sink.events();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, WsEvent::AgentUpdate { .. })),
+        "nothing reached the parent lane"
+    );
+    let children: Vec<(ChildStream, AgentUpdateKind, String, serde_json::Value)> = events
+        .iter()
+        .filter_map(|e| match e {
+            WsEvent::ChildAgentUpdate {
+                child,
+                kind,
+                source_ref,
+                data,
+                ..
+            } => Some((child.clone(), *kind, source_ref.clone(), data.clone())),
+            _ => None,
+        })
+        .collect();
+
+    // No or malformed session id: the unidentified unresolved lane, native ids only in the
+    // source ref, the provenance in the data, nothing invented.
+    let unidentified: Vec<_> = children
+        .iter()
+        .filter(|(c, ..)| c.locator == "opencode:unidentified")
+        .collect();
+    assert_eq!(unidentified.len(), 3, "{unidentified:?}");
+    for (child, kind, _, _) in &unidentified {
+        assert_eq!(child.id, None);
+        assert_eq!(child.resolution, ChildResolution::Unresolved);
+        assert_eq!(child.root, "root");
+        assert_eq!(*kind, AgentUpdateKind::Text);
+    }
+    assert_eq!(unidentified[0].3["text"], "no session here");
+    assert_eq!(unidentified[0].3["identity"], "missing");
+    assert_eq!(unidentified[0].3["role"], "unknown");
+    assert!(
+        unidentified[0].2.starts_with("opencode:-/m0/p0@"),
+        "{}",
+        unidentified[0].2
+    );
+    assert_eq!(unidentified[1].3["text"], "numeric session");
+    assert_eq!(unidentified[1].3["identity"], "malformed");
+    assert!(
+        unidentified[1].2.starts_with("opencode:-/mm1/pm1@"),
+        "{}",
+        unidentified[1].2
+    );
+    assert_eq!(unidentified[2].3["text"], "object session");
+    assert_eq!(unidentified[2].3["identity"], "malformed");
+
+    // A role never announced is carried as unknown, on a lineage-verified child.
+    let x: Vec<_> = children
+        .iter()
+        .filter(|(c, k, ..)| c.id.as_deref() == Some("child-x") && *k == AgentUpdateKind::Text)
+        .collect();
+    assert_eq!(x.len(), 2);
+    assert_eq!(x[0].0.resolution, ChildResolution::LineageVerified);
+    assert_eq!(x[0].3["role"], "unknown");
+    assert_eq!(x[0].3["delivery"], "snapshot");
+    // Nonstring message and part ids are neither keys nor refs, and nothing is invented.
+    assert_eq!(x[1].3["text"], "weird ids");
+    assert_eq!(x[1].3["role"], "unknown");
+    assert_eq!(x[1].3.get("itemId"), None);
+    assert_eq!(x[1].3.get("nativeMessageId"), None);
+    assert!(x[1].2.starts_with("opencode:child-x/-/-@"), "{}", x[1].2);
+
+    // An evicted role is unknown; a role still remembered is not.
+    let y: Vec<_> = children
+        .iter()
+        .filter(|(c, k, ..)| c.id.as_deref() == Some("child-y") && *k == AgentUpdateKind::Text)
+        .collect();
+    assert_eq!(y.len(), 2);
+    assert_eq!(y[0].3["text"], "role evicted");
+    assert_eq!(y[0].3["role"], "unknown");
+    assert_eq!(y[1].3["text"], "role known");
+    assert_eq!(y[1].3.get("role"), None);
+
+    // Active-session bound: the oldest active children are closed visibly, in order.
+    let forced: Vec<&str> = children
+        .iter()
+        .filter(|(_, k, _, d)| {
+            *k == AgentUpdateKind::TurnEnd && d["reason"] == "child_state_evicted"
+        })
+        .map(|(c, ..)| c.id.as_deref().unwrap())
+        .collect();
+    assert_eq!(forced, vec!["child-x", "child-y", "e000"], "{forced:?}");
+    let e000_text = children
+        .iter()
+        .position(|(c, k, ..)| c.id.as_deref() == Some("e000") && *k == AgentUpdateKind::Text)
+        .unwrap();
+    let e000_end = children
+        .iter()
+        .position(|(c, k, _, d)| {
+            c.id.as_deref() == Some("e000")
+                && *k == AgentUpdateKind::TurnEnd
+                && d["reason"] == "child_state_evicted"
+        })
+        .unwrap();
+    assert!(e000_text < e000_end);
+
+    // Text prior bound: an evicted prior yields a snapshot, a live prior yields a delta.
+    let t: Vec<_> = children
+        .iter()
+        .filter(|(c, k, ..)| c.id.as_deref() == Some("t") && *k == AgentUpdateKind::Text)
+        .collect();
+    assert_eq!(t.len(), 517, "{}", t.len());
+    assert_eq!(t[0].3["delivery"], "snapshot");
+    assert_eq!(t[513].3["itemId"], "tp000");
+    assert_eq!(t[513].3["delivery"], "snapshot");
+    assert_eq!(t[513].3["text"], "ab");
+    assert_eq!(t[514].3["itemId"], "tp512");
+    assert_eq!(t[514].3["delivery"], "delta");
+    assert_eq!(t[514].3["text"], "b");
+    // Explicit empty replacement reaches the lane once; the non-prefix replacement is a
+    // snapshot.
+    assert_eq!(t[515].3["itemId"], "tp003");
+    assert_eq!(t[515].3["delivery"], "snapshot");
+    assert_eq!(t[515].3["text"], "");
+    assert_eq!(t[516].3["itemId"], "tp004");
+    assert_eq!(t[516].3["delivery"], "snapshot");
+    assert_eq!(t[516].3["text"], "zz");
+}
+
+/// Text stays faithful without shared-prior inference, and child provenance is never
+/// manufactured: an empty replacement is delivered after its prior was evicted, a first
+/// explicit empty is a snapshot and a repeated known empty is silent; observations without
+/// proven part identity are independent snapshots, never suppressed or turned into deltas;
+/// a task part yields a parent ref only when its original call id is a well-formed native id,
+/// kept exactly (multibyte included) and otherwise omitted, while the parent lane's own tool
+/// payload keeps its coercion.
+#[tokio::test]
+async fn generated_plugin_keeps_text_faithful_without_shared_prior_inference_and_omits_unavailable_refs(
+) {
+    if !node_available() {
+        eprintln!("[skip] node is not available");
+        return;
+    }
+    let sink = Arc::new(CaptureSink::default());
+    let session = SessionId("s_opencode_child_faithful".into());
+    let bridge = OpenCodePluginBridge::start(
+        session.clone(),
+        sink.clone(),
+        OpenCodePluginBridgeOptions {
+            turn_timeout: Duration::from_secs(2),
+        },
+    )
+    .await
+    .expect("bridge starts");
+    assert!(bridge.bind_child_root("root"));
+    let tmp = tempfile::tempdir().unwrap();
+    let files = write_opencode_plugin_files(tmp.path(), &session).unwrap();
+    let driver = tmp.path().join("faithful.mjs");
+    std::fs::write(&driver, r#"
+import {pathToFileURL} from 'node:url';
+const bridgeUrl = process.env.NEXUS_OPENCODE_BRIDGE_URL;
+const realFetch = globalThis.fetch;
+globalThis.fetch = async (url, init = {}) => {
+  if (url === `${bridgeUrl}/turn/next`) return new Promise(() => {});
+  if (url.startsWith(bridgeUrl)) return realFetch(url, init);
+  throw new Error(`unexpected fixture fetch ${url}`);
+};
+const hooks = await (await import(pathToFileURL(process.argv[2]).href)).nexus();
+const ev = (type, properties) => hooks.event({event:{type, properties}});
+const part = (sessionID, messageID, value) => ev('message.part.updated', {part:{sessionID, messageID, ...value}});
+const message = (sessionID, id, role) => ev('message.updated', {info:{sessionID, id, role}});
+
+// Proven identity: an empty replacement after eviction, a first explicit empty, a repeated
+// known empty.
+await ev('session.created', {info:{id:'c', parentID:'root'}});
+await message('c', 'cm', 'assistant');
+await part('c', 'cm', {id:'A', type:'text', text:'hello'});
+for (let i = 0; i < 512; i++) await part('c', 'cm', {id:`k${i}`, type:'text', text:'x'});
+await part('c', 'cm', {id:'A', type:'text', text:''});
+await part('c', 'cm', {id:'B', type:'text', text:''});
+await part('c', 'cm', {id:'B', type:'text', text:''});
+// Unproven part identity under the same child: independent snapshots.
+await part('c', 42, {id:{bad:true}, type:'text', text:'same'});
+await part('c', 43, {id:{bad:true}, type:'text', text:'same'});
+await part('c', 44, {id:{bad:true}, type:'text', text:'same text longer'});
+// Task parts on the root with call ids of every shape; only well-formed ones become refs.
+const task = (sid, callID, pid) => part('root', 'rm', {id:pid, type:'tool', tool:'task', callID, state:{status:'running', metadata:{sessionId:sid}}});
+await task('r1', 123, 'rp1');
+await task('r2', {}, 'rp2');
+await task('r3', 'x'.repeat(600), 'rp3');
+await task('r4', 'é'.repeat(200), 'rp4');
+await task('r5', 'ы'.repeat(300), 'rp5');
+for (const sid of ['r1', 'r2', 'r3', 'r4', 'r5']) {
+  await ev('session.created', {info:{id:sid, parentID:'root'}});
+  await message(sid, `${sid}-m`, 'assistant');
+  await part(sid, `${sid}-m`, {id:`${sid}-p`, type:'text', text:'hi'});
+}
+await hooks.dispose();
+"#).unwrap();
+    let output = tokio::process::Command::new("node")
+        .arg(&driver)
+        .arg(&files.plugin_path)
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("NEXUS_OPENCODE_BRIDGE_URL", bridge.endpoint().base_url())
+        .env("NEXUS_OPENCODE_BRIDGE_TOKEN", bridge.endpoint().token())
+        .env("NEXUS_OPENCODE_SERVER_URL", "http://native.invalid")
+        .env("OPENCODE_SERVER_PASSWORD", "fixture")
+        .env("NEXUS_OPENCODE_SESSION_ID", "root")
+        .env("NEXUS_NAME", "faithful-fixture")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let events = sink.events();
+    let children: Vec<(ChildStream, AgentUpdateKind, String, serde_json::Value)> = events
+        .iter()
+        .filter_map(|e| match e {
+            WsEvent::ChildAgentUpdate {
+                child,
+                kind,
+                source_ref,
+                data,
+                ..
+            } => Some((child.clone(), *kind, source_ref.clone(), data.clone())),
+            _ => None,
+        })
+        .collect();
+    let c_text: Vec<_> = children
+        .iter()
+        .filter(|(c, k, ..)| c.id.as_deref() == Some("c") && *k == AgentUpdateKind::Text)
+        .collect();
+    let by_item = |item: &str| -> Vec<&serde_json::Value> {
+        c_text
+            .iter()
+            .filter(|(_, _, _, d)| d["itemId"] == item)
+            .map(|(_, _, _, d)| d)
+            .collect()
+    };
+    // A: hello, then the empty replacement after its prior was evicted.
+    let a = by_item("A");
+    assert_eq!(a.len(), 2, "{a:?}");
+    assert_eq!(a[0]["text"], "hello");
+    assert_eq!(a[0]["delivery"], "snapshot");
+    assert_eq!(a[1]["text"], "");
+    assert_eq!(a[1]["delivery"], "snapshot");
+    // B: a first explicit empty once; the repeated known empty is silent.
+    let b = by_item("B");
+    assert_eq!(b.len(), 1, "{b:?}");
+    assert_eq!(b[0]["text"], "");
+    assert_eq!(b[0]["delivery"], "snapshot");
+    // Unproven identity: three independent snapshots with distinct increasing sequences.
+    let unproven: Vec<_> = c_text
+        .iter()
+        .filter(|(_, _, _, d)| d.get("itemId").is_none())
+        .collect();
+    assert_eq!(unproven.len(), 3, "{unproven:?}");
+    assert_eq!(unproven[0].3["text"], "same");
+    assert_eq!(unproven[1].3["text"], "same");
+    assert_eq!(unproven[2].3["text"], "same text longer");
+    assert!(unproven
+        .iter()
+        .all(|(_, _, _, d)| d["delivery"] == "snapshot"));
+    let seqs: Vec<u64> = unproven
+        .iter()
+        .map(|(_, _, r, _)| r.rsplit('#').next().unwrap().parse().unwrap())
+        .collect();
+    assert!(seqs[0] < seqs[1] && seqs[1] < seqs[2], "{seqs:?}");
+
+    // Parent refs: only the well-formed multibyte call id within the cap yields one, exactly.
+    let parent_ref = |sid: &str| -> Option<String> {
+        children
+            .iter()
+            .find(|(c, k, ..)| c.id.as_deref() == Some(sid) && *k == AgentUpdateKind::Text)
+            .unwrap_or_else(|| panic!("child {sid} streamed"))
+            .0
+            .parent_ref
+            .clone()
+    };
+    assert_eq!(parent_ref("r1"), None, "numeric call id");
+    assert_eq!(parent_ref("r2"), None, "object call id");
+    assert_eq!(parent_ref("r3"), None, "oversized call id");
+    assert_eq!(
+        parent_ref("r4"),
+        Some(format!("opencode:rm/rp4/{}", "é".repeat(200))),
+        "multibyte call id within the byte cap is kept exactly"
+    );
+    assert_eq!(
+        parent_ref("r5"),
+        None,
+        "multibyte call id over the byte cap is omitted, not truncated"
+    );
+    for sid in ["r1", "r2", "r3", "r4", "r5"] {
+        let (child, ..) = children
+            .iter()
+            .find(|(c, ..)| c.id.as_deref() == Some(sid))
+            .unwrap();
+        assert_eq!(child.parent.as_deref(), Some("root"));
+        assert_eq!(child.resolution, ChildResolution::LineageVerified);
+    }
+    // The parent lane's own tool payload keeps its existing coercion.
+    let parent_tools: Vec<&serde_json::Value> = events
+        .iter()
+        .filter_map(|e| match e {
+            WsEvent::AgentUpdate {
+                kind: AgentUpdateKind::ToolCall,
+                data,
+                ..
+            } => Some(data),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(parent_tools.len(), 5);
+    assert_eq!(parent_tools[0]["id"], "123");
+    assert_eq!(parent_tools[3]["id"], "é".repeat(200));
 }

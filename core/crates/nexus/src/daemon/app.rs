@@ -523,7 +523,10 @@ impl AppState {
         // dozens of `session/update` chunks in a few ms — observed codex bursts of 30+ in 3ms) plus
         // many agents streaming at once, so a momentarily-behind observer doesn't trip
         // `RecvError::Lagged` (which silently SKIPS missed events → "dropped" stream).
-        let mut ws = WsSink::new(16_384, Some(store.clone()));
+        let mut ws = WsSink::new(16_384, Some(store.clone()))
+            .with_child_stream_bounds(store.configure_child_stream_bounds(
+                nexus_store::repos::ChildStreamBounds::from(config),
+            ));
         if let Some(gateway_stream) = gateway_stream {
             ws = ws.with_gateway_stream(gateway_stream);
         }
@@ -575,7 +578,10 @@ impl AppState {
     ) -> Self {
         use nexus_identity::Identity;
 
-        let ws = WsSink::new(16_384, Some(store.clone()));
+        let ws = WsSink::new(16_384, Some(store.clone()))
+            .with_child_stream_bounds(store.configure_child_stream_bounds(
+                nexus_store::repos::ChildStreamBounds::from(config),
+            ));
         let events: Arc<dyn EventSink> = Arc::new(ws.clone());
 
         let model_reporting = Arc::new(ModelReporting::new(store.clone(), events.clone()));
@@ -632,7 +638,10 @@ impl AppState {
 
         // (1) Build the shared event sink + identity ONCE — every service in the assembly, including
         // the ACP Agent, shares these exact instances. Do NOT build a second WsSink.
-        let mut ws = WsSink::new(16_384, Some(store.clone()));
+        let mut ws = WsSink::new(16_384, Some(store.clone()))
+            .with_child_stream_bounds(store.configure_child_stream_bounds(
+                nexus_store::repos::ChildStreamBounds::from(config),
+            ));
         if let Some(gateway_stream) = gateway_stream {
             ws = ws.with_gateway_stream(gateway_stream);
         }
@@ -1041,6 +1050,15 @@ impl AppState {
         self.identity_admin
             .revoke_agent_credential(caller, req)
             .await
+    }
+
+    /// `agent.child_streams`: owner-authorized lookup of one session's child lane.
+    pub async fn child_streams(
+        &self,
+        caller: &Caller,
+        req: nexus_contracts::ChildStreamsRequest,
+    ) -> Result<nexus_contracts::ChildStreamsResponse, ContractError> {
+        super::services::child_streams::lookup(&self.store, caller, req).await
     }
 
     pub async fn list_agent_runtimes(

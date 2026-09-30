@@ -9,8 +9,11 @@ The invariants your extension must respect:
 - **No orchestrator.** The bus never coordinates; your controller does, as a peer.
 - **Context hygiene.** An agent's context holds only what is addressed to it. Extensions that
   gate delivery *strengthen* this invariant; never build one that leaks unaddressed traffic in.
-- **Metadata is yours.** Nexus stores metadata on agents, sessions, messages, and threads and
-  **never interprets it**. It is the sanctioned place for extension state and policy flags.
+- **Metadata is yours, with two reserved names.** Nexus stores metadata on agents, sessions,
+  messages, and threads and leaves your keys uninterpreted. Two namespaces are system-owned:
+  `_nexus` on messages carries hook provenance and cannot be edited by hooks, and `nexusAclAudit`
+  on agents records ACL audit events (it grants nothing). Prefix extension keys with your own
+  namespace. Metadata is the sanctioned place for extension state and policy flags.
 - **Identity is possession of a credential.** Your controller is just another registered
   principal — an agent identity (client key + optional runtime credential) or an operator.
 
@@ -23,10 +26,10 @@ The invariants your extension must respect:
 
 | Surface | Direction | What it gives you |
 |---|---|---|
-| **Metadata bags** | read/write | Free-form JSON on agents (`nexus launch --meta '<json>'`, `PATCH /api/v1/agents/{id}/metadata`), sessions, messages, threads. Daemon-ignored by design. |
-| **Events lane** (WS) | read | Durable `sys.*` developer-event topics over `/api/agui/ws`: `{"t":"subscribe","topic":"sys.agent.lifecycle","afterSeq":N}`. Ring replay on reconnect — never poll. Topics: `sys.agent.lifecycle`, `sys.fleet.status`, `sys.thread.<name>`. |
+| **Metadata bags** | read/write | Free-form JSON on agents (`nexus launch --meta '<json>'`, `PATCH /api/v1/agents/{id}/metadata`), sessions, messages, threads. Uninterpreted apart from the reserved `_nexus` and `nexusAclAudit` namespaces. |
+| **Events lane** (WS) | read | Developer-event topics over `/api/agui/ws`: `{"t":"subscribe","topic":"sys.thread.<name>","afterSeq":N}`. Supported topics: `sys.thread.*` and `sys.dm.*` (served from persisted messages, cursor-resumable), `sys.fleet.status` (live presence and lifecycle from an in-memory ring of 512 events by default; every fleet replay ends with an ordered `developer.event` marked `lifecycle=resync`, which tells you to reconcile from the current state rather than assume continuity, and `subscribe.gap` is sent only when your cursor is older than the ring), and tool-call topics (their own ring, 256 events by default, same gap signal). `sys.agent.lifecycle` is not a subscribable topic; use `sys.fleet.status` for lifecycle reconciliation. |
 | **Observe / AG-UI** (WS) | read/write | Per-session streams (`?session=<name>&afterId=<cursor>`) and input frames (`{"t":"input",...}` acked by `input.ack` / rejected by `input.err`, correlated on `clientMessageId`). |
-| **REST projection** | read/write | Everything the daemon exposes, discoverable at `GET /api/v1/capabilities`. |
+| **REST projection** | read/write | The supported routes enumerated at `GET /api/v1/capabilities`. It is a projection of the daemon, not its whole IPC surface: child-stream lookup is IPC-only and `POST /api/v1/routing-rules` returns `501`. |
 | **Sources** (inbound webhooks) | write | Named ingress with HMAC over the raw body: `POST /api/v1/sources/{name}/push`. Verified payloads land on the Pub monitor feed; they reach an agent only via a standing route rule (`admin route`) or a one-shot forward. |
 | **Message hooks** | read/write | Local shell, JavaScript, Python, or native programs at `before_send` and `after_receipt`. They can transform message fields, add metadata, select named delivery timing, reject before acceptance, and run receipt side effects. See [Message hooks](hooks.md). |
 | **CLI as automation** | read/write | Register your controller as an agent; `nexus listen --json` is the same drain loop real agents use. |
@@ -47,17 +50,20 @@ metadata).
 2. Register your controller as its own agent and join it to the thread. It drains normally
    (`nexus listen --json`) or watches read-only via the events lane.
 3. When a message matches your rule — the `--mention` field, or a convention in message
-   metadata — **DM the target**. DMs always deliver, and the target's context only ever
-   contains addressed mail.
+   metadata — **DM the target**. A DM reaches its recipient without thread membership, and the target's
+   context only ever contains addressed mail. The DM is still subject to the recipient's pause
+   state, delivery failures, and the delivery TTL.
 
-Properties: no TTL concerns (mail is only ever addressed when wanted), no special tiers, and
+Properties: no unwanted recipient obligations (mail is only ever addressed when wanted), no special
+tiers, and
 the coordination lives in an agent — the shape the no-orchestrator design wants.
 
 ### Recipe 2 — pause-gate (hold and release)
 
 The wake policy is absolute about pause: **`Paused → Hold`, unconditionally** — even a
 human's message holds ("a human resumes, they do not punch through"). Held mail stays
-durably `pending` and re-drives on resume; nothing is lost.
+`pending` and re-drives on resume only while the delivery TTL (30 minutes by default) has not
+expired; expired mail settles to a terminal error and needs an explicit requeue.
 
 1. The target sits `paused` by default (`nexus status paused` — pause/resume is the
    self-status surface, so your controller acts with the agent's own credential, which you
@@ -77,8 +83,14 @@ dropped; landing in Pub never by itself pushes to an agent.
 
 ### Recipe 4 — custom monitor / dashboard
 
-Subscribe the events lane with `afterSeq` cursors per topic. Reconnects replay the gap from
-the server-side ring — your consumer never misses events and never polls.
+Subscribe the events lane with `afterSeq` cursors per topic. Message topics (`sys.thread.*`,
+`sys.dm.*`) resume from persisted rows. `sys.fleet.status` replays from an in-memory ring of 512 events and tool-call topics from a ring of
+256 (defaults). Every fleet replay, including after a daemon reboot, delivers the replayed events first and then an
+ordered `developer.event` marked `lifecycle=resync`. That marker is a signal to reconcile your presence
+and lifecycle view from the current state, not a snapshot in itself; a cursor from an earlier boot
+epoch is accepted and answered the same way.
+`subscribe.gap` arrives only when your cursor is older than the ring. Treat these lanes as live
+signals, not lossless history. Nothing polls.
 
 ### Recipe 5 — canonical message policy
 
@@ -97,7 +109,7 @@ message-ID-aware local automation. Hooks do not see token streams or agent-sessi
 - **Outbound webhooks**: `sessions.callback_url` is a dormant schema column; there is no
   push-to-URL hook runner. The events lane is the outbound story. If your extension needs HTTP
   push, run a small events-lane consumer that forwards. A future callback runner can reuse the
-  message-hook invocation protocol, but it is not shipped in v0.1.5.
+  message-hook invocation protocol, but it is not shipped in this release.
 - **Routing rules over REST**: `POST /api/v1/routing-rules` is a deliberate `501`; rules are
   created via `admin route`. The read side (`GET /api/v1/routing-rules`) works.
 

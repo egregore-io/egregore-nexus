@@ -4,7 +4,7 @@
 //! pure row-to-`agent.update` translation used by the daemon-side forwarder; it deliberately does no
 //! process management and never reads terminal output.
 
-use nexus_acp_stream::StreamEvent;
+use nexus_acp_stream::{sanitize_tool_value, StreamEvent};
 use nexus_contracts::AgentUpdateKind;
 use nexus_transcript::{ToolCallObservation, ToolCallPhase};
 use serde::{Deserialize, Serialize};
@@ -271,7 +271,10 @@ fn translate_tool_calls(tool_calls: &Value) -> Vec<StreamEvent> {
             data.insert("kind".to_string(), json!("tool"));
             data.insert("status".to_string(), json!("in_progress"));
             if let Some(arguments) = function.get("arguments").or_else(|| call.get("arguments")) {
-                data.insert("input".to_string(), parse_jsonish(arguments));
+                data.insert(
+                    "input".to_string(),
+                    sanitize_tool_value(parse_jsonish(arguments)),
+                );
             }
             Some(StreamEvent {
                 kind: AgentUpdateKind::ToolCall,
@@ -323,8 +326,11 @@ fn translate_tool_result_row(row: &HermesMessageRow) -> Vec<StreamEvent> {
     data.insert("title".to_string(), json!(title));
     data.insert("kind".to_string(), json!("tool"));
     data.insert("status".to_string(), json!("completed"));
-    if let Some(content) = row.content.as_deref().filter(|text| !text.is_empty()) {
-        data.insert("rawOutput".to_string(), parse_jsonish_str(content));
+    if let Some(content) = row.content.as_deref() {
+        data.insert(
+            "output".to_string(),
+            sanitize_tool_value(parse_jsonish_str(content)),
+        );
     }
     vec![StreamEvent {
         kind: AgentUpdateKind::ToolCall,

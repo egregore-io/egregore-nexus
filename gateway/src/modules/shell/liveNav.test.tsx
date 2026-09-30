@@ -112,6 +112,25 @@ function renderShell(initialPath = "/") {
 }
 
 describe("shell — rendered from LIVE read-view data (no seed)", () => {
+  it.each(["local.agent", "external.agent", "trusted.agent"])(
+    "counts online and busy %s members but not offline members",
+    async (kind) => {
+      vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
+        if (String(input).includes("/api/v1/members")) {
+          return Promise.resolve(new Response(JSON.stringify([
+            { name: "online", agentId: "a_online", sessionId: "s_online", kind, presence: "online" },
+            { name: "busy", agentId: "a_busy", sessionId: "s_busy", kind, presence: "busy" },
+            { name: "offline", agentId: "a_offline", sessionId: "s_offline", kind, presence: "offline" },
+            { name: "human", agentId: "a_human", sessionId: "s_human", kind: "human", agent: "claude", presence: "online" },
+          ]), { status: 200 }));
+        }
+        return fakeFetch(input);
+      }));
+      renderShell();
+      expect(await screen.findByText(/2 agents live/)).toBeInTheDocument();
+    },
+  );
+
   it("renders real channels (named threads) in the rail", async () => {
     renderShell();
     const rail = await screen.findByRole("navigation", { name: "Primary" });

@@ -27,6 +27,7 @@ use nexus_harness_claude::native::model_reporting::{
     CapturedClaudeResponseSource, ClaudeResponseModel, ClaudeTranscriptCheckpoint,
     ClaudeTranscriptRead,
 };
+use nexus_harness_claude::native::receipt::matches_submitted_prompt;
 use nexus_harness_claude::native::transcript::ClaudeHookRecord;
 use nexus_harness_claude::storage::ClaudeRuntimeStateRepo;
 use nexus_pty::TurnAcceptanceObserver;
@@ -897,7 +898,10 @@ impl ClaudeHookObservationSink for ClaudeTurnCompletion {
                             && p.native_session == record.session_id
                             && p.after_offset < record.end_offset
                             && p.receipt.is_none()
-                            && Some(&p.text) == record.prompt.as_ref()
+                            && record
+                                .prompt
+                                .as_deref()
+                                .is_some_and(|prompt| matches_submitted_prompt(&p.text, prompt))
                     }) {
                         pending.receipt = Some(record.clone());
                     }

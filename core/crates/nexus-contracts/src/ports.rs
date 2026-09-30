@@ -638,9 +638,10 @@ pub trait AgentTurnExecutionPort: Send + Sync {
         Vec::new()
     }
 
-    /// This exact backend owns a native operator-input queue. The daemon may dispatch a
-    /// prompt during native work, while retaining per-session command/input serialization.
-    /// Bus delivery and all non-opted-in backends retain boundary admission.
+    /// This exact backend owns a native input queue. The daemon may submit prompts and immediate
+    /// bus mail during native work, retaining per-session input serialization without interruption.
+    /// Opted-in backends must implement `prompt_observed` with native receipt acceptance, not just
+    /// a terminal write. Explicit boundary-timed mail and non-opted-in backends keep their policy.
     fn accepts_prompt_while_busy(&self, _recipient: &SessionId) -> bool {
         false
     }

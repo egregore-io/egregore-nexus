@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use nexus_acp_stream::StreamEvent;
+use nexus_acp_stream::{sanitize_tool_value, StreamEvent};
 use nexus_contracts::AgentUpdateKind;
 pub use nexus_harness_telemetry::OPENCODE_PLUGIN_SOURCE as PLUGIN_SOURCE;
 use nexus_transcript::{ToolCallObservation, ToolCallPhase};
@@ -339,10 +339,10 @@ fn translate_tool_part(part: &Value) -> Vec<StreamEvent> {
     data.insert("kind".to_string(), json!("tool"));
     data.insert("status".to_string(), json!(status));
     if let Some(input) = state.get("input").filter(|value| !value.is_null()) {
-        data.insert("input".to_string(), input.clone());
+        data.insert("input".to_string(), sanitize_tool_value(input.clone()));
     }
     if let Some(output) = tool_output(state) {
-        data.insert("output".to_string(), output);
+        data.insert("output".to_string(), sanitize_tool_value(output));
     }
 
     vec![StreamEvent {

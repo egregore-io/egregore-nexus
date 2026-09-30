@@ -662,3 +662,377 @@ impl<'a> ClaudeRuntimeStateRepo<'a> {
         Ok(false)
     }
 }
+
+/// One tailed Claude subagent transcript (`<project>/<native session>/subagents/agent-<id>.jsonl`)
+/// and where this runtime's child pass stopped in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeChildCursor {
+    pub runtime_id: SessionId,
+    pub native_session_id: String,
+    pub agent_id: String,
+    pub path: PathBuf,
+    /// Daemon boot epoch the cursor was last advanced under.
+    pub epoch: String,
+    /// Source generation: the file's first record uuid; empty until the first read.
+    pub generation: String,
+    /// Byte offset after the last record forwarded.
+    pub cursor: i64,
+    /// Set once the pass declared bounded unknown coverage for this file (restart, source
+    /// replacement, truncation, unverifiable generation) and stopped advancing it; the
+    /// declaration is repeated under every later daemon epoch while halted.
+    pub halted: bool,
+    /// Why the cursor halted (`daemon_restart_policy_undecided`, `source_replaced`,
+    /// `source_truncated`, `generation_unverifiable`), empty while tailing.
+    pub halt_reason: String,
+    /// Resolution of the last record forwarded from this file (`root_verified` or
+    /// `unresolved`); coverage declarations carry it instead of inferring one from the name.
+    pub resolution: String,
+    /// When the file was last served by a pass; passes serve the least recently served first.
+    pub served_at: i64,
+    /// Start offset and uuid of the last record forwarded: a pass re-reads that one record and
+    /// checks it still ends at `cursor` before trusting the cursor (truncate-and-regrow shows
+    /// up here even when the file is longer than the cursor again).
+    pub anchor_offset: i64,
+    pub anchor_uuid: String,
+    pub updated_at: i64,
+}
+
+/// Repo for the Claude child stream cursors. Durable, next to `claude_runtime_state`.
+pub struct ClaudeChildStreamsRepo<'a> {
+    store: &'a Store,
+}
+
+impl<'a> ClaudeChildStreamsRepo<'a> {
+    pub fn new(store: &'a Store) -> Self {
+        Self { store }
+    }
+
+    /// Create the cursor table if this store predates Claude child streams.
+    pub async fn ensure_schema(&self) -> Result<(), NexusError> {
+        self.store
+            .conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS claude_child_streams (
+                    runtime_id TEXT NOT NULL,
+                    native_session_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    epoch TEXT NOT NULL,
+                    generation TEXT NOT NULL DEFAULT '',
+                    cursor INTEGER NOT NULL DEFAULT 0,
+                    halted INTEGER NOT NULL DEFAULT 0,
+                    halt_reason TEXT NOT NULL DEFAULT '',
+                    resolution TEXT NOT NULL DEFAULT 'unresolved',
+                    served_at INTEGER NOT NULL DEFAULT 0,
+                    anchor_offset INTEGER NOT NULL DEFAULT 0,
+                    anchor_uuid TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (runtime_id, native_session_id, agent_id)
+                )",
+                (),
+            )
+            .await
+            .map_err(store_err)?;
+        self.store
+            .conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS claude_child_discovery (
+                    runtime_id TEXT NOT NULL,
+                    native_session_id TEXT NOT NULL,
+                    next_skip INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (runtime_id, native_session_id)
+                )",
+                (),
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    pub async fn find(
+        &self,
+        runtime_id: &SessionId,
+        native_session_id: &str,
+        agent_id: &str,
+    ) -> Result<Option<ClaudeChildCursor>, NexusError> {
+        self.ensure_schema().await?;
+        let mut rows = self
+            .store
+            .conn
+            .query(
+                "SELECT runtime_id, native_session_id, agent_id, path, epoch, generation, cursor, halted, halt_reason, resolution, served_at, anchor_offset, anchor_uuid, updated_at
+                 FROM claude_child_streams
+                 WHERE runtime_id = ?1 AND native_session_id = ?2 AND agent_id = ?3",
+                params![
+                    runtime_id.0.clone(),
+                    native_session_id.to_string(),
+                    agent_id.to_string()
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            Some(row) => Ok(Some(child_cursor_from_row(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Where the next pass's directory window starts for this owned session (0 at first).
+    pub async fn discovery_skip(
+        &self,
+        runtime_id: &SessionId,
+        native_session_id: &str,
+    ) -> Result<usize, NexusError> {
+        self.ensure_schema().await?;
+        let mut rows = self
+            .store
+            .conn
+            .query(
+                "SELECT next_skip FROM claude_child_discovery
+                 WHERE runtime_id = ?1 AND native_session_id = ?2",
+                params![runtime_id.0.clone(), native_session_id.to_string()],
+            )
+            .await
+            .map_err(store_err)?;
+        match rows.next().await.map_err(store_err)? {
+            Some(row) => Ok(usize::try_from(row.get::<i64>(0).map_err(store_err)?).unwrap_or(0)),
+            None => Ok(0),
+        }
+    }
+
+    pub async fn set_discovery_skip(
+        &self,
+        runtime_id: &SessionId,
+        native_session_id: &str,
+        next_skip: usize,
+    ) -> Result<(), NexusError> {
+        self.ensure_schema().await?;
+        self.store
+            .conn
+            .execute(
+                "INSERT INTO claude_child_discovery (runtime_id, native_session_id, next_skip, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(runtime_id, native_session_id) DO UPDATE SET
+                    next_skip = excluded.next_skip, updated_at = excluded.updated_at",
+                params![
+                    runtime_id.0.clone(),
+                    native_session_id.to_string(),
+                    i64::try_from(next_skip).unwrap_or(i64::MAX),
+                    now()
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Which of `agent_ids` already have a cursor row for this owned session. Queried in
+    /// bounded chunks so a discovery window never builds an unbounded statement.
+    pub async fn known_agent_ids(
+        &self,
+        runtime_id: &SessionId,
+        native_session_id: &str,
+        agent_ids: &[String],
+    ) -> Result<std::collections::HashSet<String>, NexusError> {
+        self.ensure_schema().await?;
+        let mut known = std::collections::HashSet::new();
+        for chunk in agent_ids.chunks(256) {
+            let placeholders = (0..chunk.len())
+                .map(|i| format!("?{}", i + 3))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT agent_id FROM claude_child_streams
+                 WHERE runtime_id = ?1 AND native_session_id = ?2 AND agent_id IN ({placeholders})"
+            );
+            let mut values: Vec<libsql::Value> = Vec::with_capacity(chunk.len() + 2);
+            values.push(runtime_id.0.clone().into());
+            values.push(native_session_id.to_string().into());
+            values.extend(chunk.iter().map(|id| libsql::Value::from(id.clone())));
+            let mut rows = self
+                .store
+                .conn
+                .query(&sql, values)
+                .await
+                .map_err(store_err)?;
+            while let Some(row) = rows.next().await.map_err(store_err)? {
+                known.insert(get_text(&row, 0)?);
+            }
+        }
+        Ok(known)
+    }
+
+    /// Register a discovered file with an untouched cursor unless a row already exists.
+    pub async fn insert_if_absent(&self, cursor: &ClaudeChildCursor) -> Result<(), NexusError> {
+        self.ensure_schema().await?;
+        let ts = now();
+        self.store
+            .conn
+            .execute(
+                "INSERT OR IGNORE INTO claude_child_streams
+                    (runtime_id, native_session_id, agent_id, path, epoch, generation, cursor, halted,
+                     halt_reason, resolution, served_at, anchor_offset, anchor_uuid, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)",
+                params![
+                    cursor.runtime_id.0.clone(),
+                    cursor.native_session_id.clone(),
+                    cursor.agent_id.clone(),
+                    path_to_text(&cursor.path),
+                    cursor.epoch.clone(),
+                    cursor.generation.clone(),
+                    cursor.cursor,
+                    i64::from(cursor.halted),
+                    cursor.halt_reason.clone(),
+                    cursor.resolution.clone(),
+                    cursor.served_at,
+                    cursor.anchor_offset,
+                    cursor.anchor_uuid.clone(),
+                    ts
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// The `limit` cursors served least recently (then by owned session and agent id): one
+    /// SQL page, never the whole table.
+    pub async fn least_recently_served(
+        &self,
+        runtime_id: &SessionId,
+        limit: usize,
+    ) -> Result<Vec<ClaudeChildCursor>, NexusError> {
+        self.ensure_schema().await?;
+        let mut rows = self
+            .store
+            .conn
+            .query(
+                "SELECT runtime_id, native_session_id, agent_id, path, epoch, generation, cursor, halted, halt_reason, resolution, served_at, anchor_offset, anchor_uuid, updated_at
+                 FROM claude_child_streams WHERE runtime_id = ?1
+                 ORDER BY served_at ASC, native_session_id ASC, agent_id ASC
+                 LIMIT ?2",
+                params![runtime_id.0.clone(), i64::try_from(limit).unwrap_or(i64::MAX)],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(child_cursor_from_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    /// Record that a pass is about to attempt this file. Independent of whether the attempt
+    /// then succeeds, so a persistently failing file loses its place in the rotation.
+    pub async fn mark_attempt(
+        &self,
+        runtime_id: &SessionId,
+        native_session_id: &str,
+        agent_id: &str,
+        served_at: i64,
+    ) -> Result<(), NexusError> {
+        self.ensure_schema().await?;
+        self.store
+            .conn
+            .execute(
+                "UPDATE claude_child_streams SET served_at = ?4, updated_at = ?4
+                 WHERE runtime_id = ?1 AND native_session_id = ?2 AND agent_id = ?3",
+                params![
+                    runtime_id.0.clone(),
+                    native_session_id.to_string(),
+                    agent_id.to_string(),
+                    served_at
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    /// Every child cursor of a runtime, in agent id order.
+    pub async fn list(&self, runtime_id: &SessionId) -> Result<Vec<ClaudeChildCursor>, NexusError> {
+        self.ensure_schema().await?;
+        let mut rows = self
+            .store
+            .conn
+            .query(
+                "SELECT runtime_id, native_session_id, agent_id, path, epoch, generation, cursor, halted, halt_reason, resolution, served_at, anchor_offset, anchor_uuid, updated_at
+                 FROM claude_child_streams WHERE runtime_id = ?1
+                 ORDER BY native_session_id ASC, agent_id ASC",
+                params![runtime_id.0.clone()],
+            )
+            .await
+            .map_err(store_err)?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.map_err(store_err)? {
+            out.push(child_cursor_from_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    /// Insert or replace the cursor's path, epoch, generation, offset and halted flag.
+    pub async fn upsert(&self, cursor: &ClaudeChildCursor) -> Result<(), NexusError> {
+        self.ensure_schema().await?;
+        let ts = now();
+        self.store
+            .conn
+            .execute(
+                "INSERT INTO claude_child_streams
+                    (runtime_id, native_session_id, agent_id, path, epoch, generation, cursor, halted,
+                     halt_reason, resolution, served_at, anchor_offset, anchor_uuid, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
+                 ON CONFLICT(runtime_id, native_session_id, agent_id) DO UPDATE SET
+                    path = excluded.path,
+                    epoch = excluded.epoch,
+                    generation = excluded.generation,
+                    cursor = excluded.cursor,
+                    halted = excluded.halted,
+                    halt_reason = excluded.halt_reason,
+                    resolution = excluded.resolution,
+                    served_at = excluded.served_at,
+                    anchor_offset = excluded.anchor_offset,
+                    anchor_uuid = excluded.anchor_uuid,
+                    updated_at = excluded.updated_at",
+                params![
+                    cursor.runtime_id.0.clone(),
+                    cursor.native_session_id.clone(),
+                    cursor.agent_id.clone(),
+                    path_to_text(&cursor.path),
+                    cursor.epoch.clone(),
+                    cursor.generation.clone(),
+                    cursor.cursor,
+                    i64::from(cursor.halted),
+                    cursor.halt_reason.clone(),
+                    cursor.resolution.clone(),
+                    cursor.served_at,
+                    cursor.anchor_offset,
+                    cursor.anchor_uuid.clone(),
+                    ts
+                ],
+            )
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+}
+
+fn child_cursor_from_row(row: &libsql::Row) -> Result<ClaudeChildCursor, NexusError> {
+    Ok(ClaudeChildCursor {
+        runtime_id: SessionId(get_text(row, 0)?),
+        native_session_id: get_text(row, 1)?,
+        agent_id: get_text(row, 2)?,
+        path: PathBuf::from(get_text(row, 3)?),
+        epoch: get_text(row, 4)?,
+        generation: get_text(row, 5)?,
+        cursor: row.get::<i64>(6).map_err(store_err)?,
+        halted: row.get::<i64>(7).map_err(store_err)? != 0,
+        halt_reason: get_text(row, 8)?,
+        resolution: get_text(row, 9)?,
+        served_at: row.get::<i64>(10).map_err(store_err)?,
+        anchor_offset: row.get::<i64>(11).map_err(store_err)?,
+        anchor_uuid: get_text(row, 12)?,
+        updated_at: row.get::<i64>(13).map_err(store_err)?,
+    })
+}

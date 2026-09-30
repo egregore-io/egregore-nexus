@@ -25,6 +25,11 @@ use super::turn_completion::CodexTurnTracker;
 pub struct CodexAppServerClient {
     rpc: JsonRpc,
     origin: Mutex<Option<CodexTurnTracker>>,
+    /// Threads this connection attached itself to through its own `thread/start` or
+    /// `thread/resume` requests, in attach order. Protocol-owned evidence of which threads this
+    /// client asked for; the first one is the thread the caller bound as the session's main
+    /// thread.
+    attached: Mutex<Vec<String>>,
 }
 
 /// Extract a thread id from a `thread/start` or `thread/resume` result.
@@ -79,11 +84,24 @@ impl CodexAppServerClient {
         Ok(Self {
             rpc,
             origin: Mutex::new(tracker),
+            attached: Mutex::new(Vec::new()),
         })
     }
 
     pub(super) fn origin_tracker(&self) -> Option<CodexTurnTracker> {
         self.origin.lock().unwrap().clone()
+    }
+
+    /// Threads this connection attached through its own requests, in attach order.
+    pub fn attached_threads(&self) -> Vec<String> {
+        self.attached.lock().unwrap().clone()
+    }
+
+    fn remember_attached(&self, thread_id: &str) {
+        let mut attached = self.attached.lock().unwrap();
+        if !attached.iter().any(|known| known == thread_id) {
+            attached.push(thread_id.to_string());
+        }
     }
 
     pub(super) fn install_tracker(&self, tracker: CodexTurnTracker) -> bool {
@@ -145,6 +163,7 @@ impl CodexAppServerClient {
         let thread = thread_id_from_result(&result).ok_or_else(|| {
             CodexRpcError::Decode(format!("thread/start response missing thread.id: {result}"))
         })?;
+        self.remember_attached(&thread);
         if self
             .origin_tracker()
             .is_some_and(|origin| !origin.observe_setup_model(&thread, &result))
@@ -174,6 +193,7 @@ impl CodexAppServerClient {
         let result = self
             .request_setup(method::THREAD_RESUME, thread_resume_params(thread_id, cwd))
             .await?;
+        self.remember_attached(thread_id);
         if self
             .origin_tracker()
             .is_some_and(|origin| !origin.observe_setup_model(thread_id, &result))
