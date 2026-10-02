@@ -1,0 +1,29 @@
+name: Harness request or report
+description: Ask for a new agent harness, or report what happened when you tried one.
+title: "Harness: "
+labels: ["harness", "needs-triage"]
+body:
+  - type: input
+    id: tool
+    attributes:
+      label: Agent CLI
+      description: Name, version, and a link.
+    validations:
+      required: true
+  - type: dropdown
+    id: acp
+    attributes:
+      label: Does it speak ACP over stdio?
+      options: ["Yes", "No", "Not sure"]
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you tried
+      description: If you wrote a manifest under `~/.nexus/harnesses/`, paste it and the launch command.
+      render: toml
+  - type: textarea
+    id: result
+    attributes:
+      label: What happened

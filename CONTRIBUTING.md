@@ -1,5 +1,31 @@
 # Contributing to Nexus
 
+## How to open a pull request
+
+1. Fork this repository and clone your fork. Core contributors can use a branch in this repository.
+2. Create a short-lived branch from the latest `main`. Use a descriptive name such as
+   `fix/launch-banner` or `feat/cursor-harness`.
+3. Make one focused change. Add relevant tests and update the documentation and changelog for
+   user-visible changes. Regenerate TypeScript contracts if a Rust contract changes.
+4. Run the checks under [Verification](#verification). Record the commands and results in your PR.
+5. Push your branch and open a pull request against `egregore-io/egregore-nexus`, targeting `main`.
+   Use a title that describes the change.
+6. Fill in the PR template: explain the problem, what changes, and how you verified it. Describe
+   compatibility and architecture changes when relevant. Link an existing issue if there is one.
+7. For fork PRs, enable "Allow edits by maintainers". Address review comments on the same branch.
+   A maintainer squash-merges the approved PR, then the branch is deleted.
+
+For larger changes, open a draft PR early so review can happen as the work develops.
+
+## Git workflow
+
+- `main` is the only long-lived branch and stays releasable.
+- All changes land through pull requests. Keep each PR to one concern; split large features into
+  small PRs that can be reviewed independently.
+- Pull requests are squash-merged. Do not push directly to `main` or rewrite published history.
+- Long-running private work rebases onto each release tag and lands through small PRs.
+- Releases are annotated tags on `main`: `vX.Y.Z`, or `vX.Y.Z-beta.N` for a prerelease.
+
 ## Architecture invariants
 
 - The daemon is the lightweight transport authority. It owns durable agent identity, runtime
@@ -60,6 +86,18 @@ Release-oriented scripts must implement a successful, side-effect-free `--help`.
 endurance tests belong in the disposable Docker validator; never point them at an operator's live
 Nexus home.
 
+## Review
+
+- Routine changes need one maintainer approval. For paths listed in `.github/CODEOWNERS`, that
+  approval must come from a listed owner.
+- The core team is three people. Expect a first response within a week; a pull request with no
+  activity for sixty days may be closed and can be reopened.
+- Tick "Allow edits by maintainers" on your pull request. For small remaining fixes we may push to
+  your branch rather than ask for another round.
+- You are responsible for every line you submit, whatever tools helped write it. A change its
+  author cannot explain in review is closed.
+
 ## Commits
 
-Use an imperative subject and keep each commit to one concern. Keep commit messages focused on the change and its rationale.
+Use an imperative subject and keep each commit to one concern. Keep commit messages focused on the change and its rationale. Do not add tool, model, or session attribution
+trailers; the author of record is the person who opens the pull request.

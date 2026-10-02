@@ -1,0 +1,5 @@
+# For these paths, the required approval must come from a listed owner.
+/core/crates/nexus-contracts/  @earldennison @arjaynotorio1
+/core/crates/nexus-identity/   @earldennison @arjaynotorio1
+/scripts/                      @earldennison @arjaynotorio1
+/.github/                      @earldennison @arjaynotorio1

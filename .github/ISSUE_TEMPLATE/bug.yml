@@ -1,0 +1,37 @@
+name: Bug report
+description: Something in Nexus does not behave as documented.
+title: "Bug: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Nexus version
+      description: Output of `nexus --version`.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform and harness
+      placeholder: "Linux x64 / Claude Code headed"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output from `nexus daemon logs` or the Gateway. Remove anything private.
+      render: shell
