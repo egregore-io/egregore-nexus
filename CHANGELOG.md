@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.1.6] - Unreleased
+## [0.1.6] - 2026-10-01
 
 ### Fixed
 
@@ -33,7 +33,7 @@
   `child_stream_max_bytes_per_session`, `child_stream_max_lanes_per_session`,
   `child_stream_max_unresolved_lanes_per_session`. See `docs/child-streams.md`.
 
-## [0.1.6-beta.5] - Unreleased
+## [0.1.6-beta.5] - 2026-09-17
 
 ### Changed
 
@@ -202,7 +202,9 @@
 - Launch Windows Gateway and Webconsole `.cmd` shims without hand-built command
   quoting, including npm installations under paths containing spaces.
 
-## [0.1.6-beta.2] - Unreleased
+## [0.1.6-beta.2] - 2026-07-22
+
+Source candidate milestone; the date records the version checkpoint, not a verified npm publication.
 
 ### Changed
 
@@ -272,7 +274,9 @@
 - Forward Gateway WebSocket upgrades through the packaged Webconsole so fleet updates and
   existing agent-session connections no longer fail with HTTP 502.
 
-## [0.1.5] - Unreleased
+## [0.1.5] - 2026-07-22
+
+Source release milestone; the date records the release tag, not a verified npm publication.
 
 ### Added
 
@@ -315,7 +319,7 @@
 - Preserved all existing Claude Code, Codex, OpenCode, and Hermes wire spellings and runtime
   behavior while moving harness-specific dispatch behind the new adapter boundary.
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-07-16
 
 ### Added
 
