@@ -13,7 +13,35 @@ type PackageJson = {
   scripts: Record<string, string>;
 };
 
+function regressionJob(name: string): string {
+  const workflow = readFileSync(join(root, "../.github/workflows/main-regression.yml"), "utf8");
+  const job = workflow.split(`\n  ${name}:\n`)[1];
+  expect(job, `missing ${name} regression job`).toBeDefined();
+  return job!.split(/\n  [a-zA-Z][\w-]*:\n/)[0]!;
+}
+
 describe("gateway/webconsole package split", () => {
+  it("prepares locked Gateway dependencies before the Rust daemon integration gate", () => {
+    const job = regressionJob("rust");
+    const install = "pnpm --dir gateway install --frozen-lockfile";
+    expect(job).toContain("pnpm/action-setup@v4");
+    expect(job).toContain("actions/setup-node@v4");
+    expect(job).toContain(install);
+    expect(job.indexOf("pnpm/action-setup@v4")).toBeLessThan(job.indexOf(install));
+    expect(job.indexOf("actions/setup-node@v4")).toBeLessThan(job.indexOf(install));
+    expect(job.indexOf(install)).toBeLessThan(job.indexOf("scripts/check rust -p egregore-nexus"));
+  });
+
+  it("builds packed webconsole assets before the Gateway regression gate", () => {
+    const job = regressionJob("gateway");
+    const install = "pnpm --dir gateway install --frozen-lockfile";
+    const build = "pnpm --dir gateway webconsole:build";
+    expect(job).toContain(install);
+    expect(job).toContain(build);
+    expect(job.indexOf(install)).toBeLessThan(job.indexOf(build));
+    expect(job.indexOf(build)).toBeLessThan(job.indexOf("scripts/check gateway"));
+  });
+
   it("declares and delegates separate gateway and webconsole package surfaces", () => {
     const workspace = readFileSync(join(root, "pnpm-workspace.yaml"), "utf8");
     expect(workspace).toContain("- gateway");

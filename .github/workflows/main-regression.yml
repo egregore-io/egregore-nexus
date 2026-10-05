@@ -58,6 +58,16 @@ jobs:
             /usr/local/share/boost /usr/local/share/powershell \
             /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
           df -h /
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: gateway/pnpm-lock.yaml
+      - name: Install gateway deps for Rust integration fixtures
+        run: pnpm --dir gateway install --frozen-lockfile
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -94,6 +104,8 @@ jobs:
           cache-dependency-path: gateway/pnpm-lock.yaml
       - name: Install gateway deps
         run: pnpm --dir gateway install --frozen-lockfile
+      - name: Build packed webconsole assets
+        run: pnpm --dir gateway webconsole:build
       - name: Gateway gate
         run: scripts/check gateway
       - name: Web reconnect regressions
