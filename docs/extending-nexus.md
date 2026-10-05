@@ -30,7 +30,7 @@ The invariants your extension must respect:
 | **Events lane** (WS) | read | Developer-event topics over `/api/agui/ws`: `{"t":"subscribe","topic":"sys.thread.<name>","afterSeq":N}`. Supported topics: `sys.thread.*` and `sys.dm.*` (served from persisted messages, cursor-resumable), `sys.fleet.status` (live presence and lifecycle from an in-memory ring of 512 events by default; every fleet replay ends with an ordered `developer.event` marked `lifecycle=resync`, which tells you to reconcile from the current state rather than assume continuity, and `subscribe.gap` is sent only when your cursor is older than the ring), and tool-call topics (their own ring, 256 events by default, same gap signal). `sys.agent.lifecycle` is not a subscribable topic; use `sys.fleet.status` for lifecycle reconciliation. |
 | **Observe / AG-UI** (WS) | read/write | Per-session streams (`?session=<name>&afterId=<cursor>`) and input frames (`{"t":"input",...}` acked by `input.ack` / rejected by `input.err`, correlated on `clientMessageId`). |
 | **REST projection** | read/write | The supported routes enumerated at `GET /api/v1/capabilities`. It is a projection of the daemon, not its whole IPC surface: child-stream lookup is IPC-only and `POST /api/v1/routing-rules` returns `501`. |
-| **Sources** (inbound webhooks) | write | Named ingress with HMAC over the raw body: `POST /api/v1/sources/{name}/push`. Verified payloads land on the Pub monitor feed; they reach an agent only via a standing route rule (`admin route`) or a one-shot forward. |
+| **Sources** (inbound webhooks) | write | Named ingress with HMAC over the raw body: `POST /api/v1/sources/{name}/push`. Verified payloads target the source's configured topic, or a supported request-topic override. Known topics publish directly to subscribed agents' delivery queues; no route rule is required for ordinary topic fanout. Eligible managed subscribers wake and receive at harness-supported boundaries. Acceptance and queued fanout are not native turn completion; no listeners can mean zero deliveries. Invalid signatures are rejected. |
 | **Message hooks** | read/write | Local shell, JavaScript, Python, or native programs at `before_send` and `after_receipt`. They can transform message fields, add metadata, select named delivery timing, reject before acceptance, and run receipt side effects. See [Message hooks](hooks.md). |
 | **CLI as automation** | read/write | Register your controller as an agent; `nexus listen --json` is the same drain loop real agents use. |
 | **Terminal socket** | read/write | Per-session UDS with a binary frame protocol (`terminal_socket.rs`); manifests under `~/.nexus/terminal-endpoints/`. Host headed terminals in any emulator. |
@@ -77,9 +77,14 @@ long-lived.
 
 ### Recipe 3 — external notifier (inbound)
 
-CI / GitHub / cron → `POST /api/v1/sources/{name}/push` with the HMAC header → Pub monitor
-feed → `admin route` rule delivers to the subscribed agent. Bad signatures are recorded and
-dropped; landing in Pub never by itself pushes to an agent.
+CI / GitHub / cron → `POST /api/v1/sources/{name}/push` with `X-Nexus-Timestamp` and
+`X-Nexus-Signature` → Gateway HMAC verification → daemon source push to the source's configured
+topic (or the request's `?topic=` override). For a known topic, the payload is published and
+fanout is queued for its subscribers; no `admin route` rule is needed for ordinary topic fanout.
+Eligible managed subscribers wake and receive at their harness's supported delivery boundary.
+The source receipt reports acceptance and queued fanout, not native turn completion. An unknown
+topic returns `queued_to: 0` without publishing; no listeners can mean zero delivery. Invalid
+signatures are rejected.
 
 ### Recipe 4 — custom monitor / dashboard
 
