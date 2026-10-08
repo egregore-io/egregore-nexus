@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::daemon::harness_launch::harness_launch_spec;
-use crate::daemon::pty_supervisor::harness_agent_token;
 
 fn is_passive_test_program(program: &str) -> bool {
     program == "cat" || cfg!(windows) && program.eq_ignore_ascii_case("cmd.exe")
@@ -411,23 +410,8 @@ impl AppState {
             headed_runtime_kind(&req.kind)
         };
 
-        // Headed OpenCode runs through a native in-process plugin loaded by `opencode serve`; keep
-        // the project-local MCP config in the launch cwd as a compatible outbound tool surface for
-        // the attached TUI, but do NOT start the old SQLite event tailer for new launches. Streaming
-        // and delivery now ride the plugin bridge.
-        if headed_runtime == HeadedRuntimeKind::OpenCodePlugin {
-            if let Some(bus_name) = name.clone() {
-                let ctx = nexus_agent::LaunchCtx {
-                    cwd: Some(cwd.clone()),
-                    bus_name: Some(bus_name),
-                    bus_project: Some(project.clone()),
-                    bus_client_key: Some(client_key.clone()),
-                    bus_agent: Some(harness_agent_token(&req.kind).to_string()),
-                    ..Default::default()
-                };
-                nexus_agent::write_opencode_mcp_config(&cwd, &ctx);
-            }
-        }
+        // Headed OpenCode's serve/attach shim carries the captured identity in per-child config.
+        // Never write shared project opencode.json; streaming and delivery use the plugin bridge.
 
         // Hermes headed launch is gateway-native: `PtySupervisor::launch_headed_pty` builds an isolated
         // HERMES_HOME with the Nexus platform plugin and a Unix-socket bridge. Do not touch

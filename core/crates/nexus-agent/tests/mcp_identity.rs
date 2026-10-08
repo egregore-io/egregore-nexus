@@ -116,9 +116,8 @@ fn opencode_project_config_uses_verified_runtime_identity() {
     let dir = temp_dir("opencode");
     let cwd = dir.to_string_lossy().into_owned();
 
-    write_opencode_mcp_config(&cwd, &bus_ctx(Some(cwd.clone())));
-
-    let body = std::fs::read_to_string(dir.join("opencode.json")).unwrap();
+    let body = write_opencode_mcp_config(&cwd, &bus_ctx(Some(cwd.clone()))).unwrap();
+    assert!(!dir.join("opencode.json").exists());
     let value: serde_json::Value = serde_json::from_str(&body).unwrap();
     let command: Vec<String> = value["mcp"]["nexus-bus"]["command"]
         .as_array()

@@ -406,6 +406,12 @@ fn get_preserves_single_construction_and_every_launch_context_field() {
         bus_agent: Some("test-agent".into()),
         suppress_acp_mcp: true,
         model_reporting: None,
+        session_meta: Some(
+            serde_json::json!({"fixture":"launch-metadata"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ),
     };
 
     let adapter = registry.get(&harness(), ctx.clone()).unwrap();
@@ -420,6 +426,7 @@ fn get_preserves_single_construction_and_every_launch_context_field() {
     assert_eq!(actual.bus_client_key, ctx.bus_client_key);
     assert_eq!(actual.bus_agent, ctx.bus_agent);
     assert_eq!(actual.suppress_acp_mcp, ctx.suppress_acp_mcp);
+    assert_eq!(actual.session_meta, ctx.session_meta);
 }
 
 #[test]

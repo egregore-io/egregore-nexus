@@ -1061,7 +1061,7 @@ fn generated_assets_use_opencode_serve_attach_and_plugin_events() {
     assert!(serve.contains(
         "NEXUS_OPENCODE_PROMPT_AGENT: native.agent ?? (native.model ? \"nexus\" : \"\")"
     ));
-    assert!(serve.contains("delete tuiEnv.OPENCODE_CONFIG_CONTENT"));
+    assert!(serve.contains("tuiEnv.OPENCODE_CONFIG_CONTENT = JSON.stringify(tuiConfig)"));
 }
 
 #[test]

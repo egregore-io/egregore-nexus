@@ -15,8 +15,8 @@
 //!      server is the same `nexus mcp --as <name> --project <project> [--client-key <key>]
 //!      [--agent <agent>]` stdio command. Headless ACP launches pass that config through
 //!      `OPENCODE_CONFIG_CONTENT` so multiple daemon-owned agents can share a cwd without racing on
-//!      one `opencode.json`; headed compatibility callers may still write the project-local file via
-//!      [`write_opencode_mcp_config`]. opencode loads the `mcp` section over its own MCP channel,
+//!      one `opencode.json`. [`write_opencode_mcp_config`] is a compatibility accessor that
+//!      returns launch content without writing a file. opencode loads the `mcp` section over its own MCP channel,
 //!      NOT over ACP. The same config also sets a launch-local primary agent prompt that names the
 //!      Nexus bus identity; otherwise a fresh OpenCode ACP session may answer as generic "opencode"
 //!      instead of the daemon-owned agent name. Headless ACP launches also force `OPENCODE_DB` under
@@ -25,7 +25,7 @@
 //!      agent.
 //! The HEADED (TUI) launch builder (`nexus-pty::command::harness_command`) likewise gives opencode a
 //! BARE `opencode` (no claude `--mcp-config`, which opencode would usage-error on); its MCP comes
-//! from the same project config file.
+//! from the serve/attach child's launch-local configuration.
 //!
 //! The **real-binary spawn** ([`OpenCodeAdapter::new`] / the [`crate::AdapterRegistry`] built-in)
 //! is gated behind the `live` cargo feature: without `live`, `open_session` returns
@@ -53,6 +53,7 @@ pub struct OpenCodeAdapter {
     command: HarnessCommand,
     engine: AcpEngine,
     ctx: LaunchCtx,
+    preparation_error: Option<String>,
 }
 
 impl OpenCodeAdapter {
@@ -114,32 +115,26 @@ impl OpenCodeAdapter {
         // Install launch-local bootstrap into opencode's project cwd: the `nexus-bus` skill (under
         // `.opencode/skills`) and the bootstrap-register script. Headless ACP config is scoped to
         // this child process via OPENCODE_CONFIG_CONTENT below, so agents sharing a cwd cannot
-        // overwrite each other's identity prompt in one project-local opencode.json. Quarantine a
-        // malformed project config first: OpenCode still parses it before applying env config.
+        // overwrite each other's identity prompt in one project-local opencode.json. Existing
+        // project configuration, including malformed content, remains provider-owned.
         if let Some(cwd) = &ctx.cwd {
             super::skill::install(cwd);
-            quarantine_invalid_project_opencode_config(cwd);
         }
         // opencode rejects a stdio MCP server in ACP `session/new` (`-32602`), so suppress the
         // engine's stdio injection: the bus is wired via opencode's own config channel.
         ctx.suppress_acp_mcp = true;
         let mut command = opencode_command(ctx.cwd.clone());
         command.env = ctx.env.clone();
-        command
-            .env
-            .retain(|(key, _)| key != "OPENCODE_CONFIG_CONTENT");
-        if let Some(config_content) = opencode_mcp_config_content(&ctx) {
-            command
-                .env
-                .push(("OPENCODE_CONFIG_CONTENT".to_string(), config_content));
-        }
+        let preparation_error = add_launch_config(&mut command, &ctx).err();
         if let Some(cwd) = &ctx.cwd {
             if let Some(db_path) = launch_local_opencode_db(cwd, &ctx) {
                 command.env.retain(|(key, _)| key != "OPENCODE_DB");
                 command.env.push(("OPENCODE_DB".to_string(), db_path));
             }
         }
-        Self::with_command_and_context(command, ctx)
+        let mut adapter = Self::with_command_and_context(command, ctx);
+        adapter.preparation_error = preparation_error;
+        adapter
     }
 
     /// Construct an OpenCode adapter over an explicit [`HarnessCommand`] (the hermetic tests point
@@ -165,6 +160,7 @@ impl OpenCodeAdapter {
             )
             .with_reporting(ctx.model_reporting.clone()),
             ctx,
+            preparation_error: None,
         }
     }
 
@@ -172,6 +168,60 @@ impl OpenCodeAdapter {
     pub fn command(&self) -> &HarnessCommand {
         &self.command
     }
+}
+
+fn add_launch_config(command: &mut HarnessCommand, ctx: &LaunchCtx) -> Result<(), String> {
+    let Some(overlay) = opencode_mcp_config(ctx) else {
+        return Ok(());
+    };
+    let supplied = command
+        .env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "OPENCODE_CONFIG_CONTENT")
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var("OPENCODE_CONFIG_CONTENT").ok());
+    let mut config: Value = match supplied {
+        Some(value) => {
+            serde_json::from_str(&value).map_err(|_| "invalid OPENCODE_CONFIG_CONTENT JSON")?
+        }
+        None => serde_json::json!({}),
+    };
+    let object = config
+        .as_object_mut()
+        .ok_or("OPENCODE_CONFIG_CONTENT must be an object")?;
+    for key in ["agent", "mcp"] {
+        let entries = object
+            .entry(key)
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| format!("OPENCODE_CONFIG_CONTENT {key} must be an object"))?;
+        for (name, value) in overlay[key].as_object().unwrap() {
+            if key == "agent" {
+                let agent = entries
+                    .entry(name)
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                    .ok_or("OPENCODE_CONFIG_CONTENT Nexus agent must be an object")?;
+                for (field, value) in value.as_object().unwrap() {
+                    agent.insert(field.clone(), value.clone());
+                }
+            } else {
+                entries.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    object
+        .entry("$schema")
+        .or_insert_with(|| overlay["$schema"].clone());
+    object.insert("default_agent".into(), overlay["default_agent"].clone());
+    command
+        .env
+        .retain(|(key, _)| key != "OPENCODE_CONFIG_CONTENT");
+    command
+        .env
+        .push(("OPENCODE_CONFIG_CONTENT".into(), config.to_string()));
+    Ok(())
 }
 
 /// Resolve the exact subprocess to put **OpenCode** into ACP mode.
@@ -211,8 +261,8 @@ fn default_native_program() -> String {
         .into()
 }
 
-/// Write a project-local `opencode.json` into `cwd` wiring the `nexus-bus` MCP server the **opencode
-/// way** (a `mcp.<name>` local-command entry opencode reads from the working directory) and setting
+/// Return a launch-only config wiring the `nexus-bus` MCP server the **opencode
+/// way** (a `mcp.<name>` local-command entry) and setting
 /// a launch-local primary agent prompt that names the Nexus identity. This is how opencode gets both
 /// the bus tools and the durable "you are `<name>`" context — opencode rejects a stdio MCP server
 /// over ACP `session/new` and has no `--append-system-prompt` equivalent.
@@ -220,20 +270,12 @@ fn default_native_program() -> String {
 /// The server command mirrors the ACP/headed wiring exactly:
 /// `nexus mcp --as <name> --project <project> [--client-key <key>] [--agent <agent>]`.
 ///
-/// No-op (and no file written) unless the bus identity (`bus_name`/`bus_project`) is present, so
-/// test/admin paths without bus context don't drop a stray config file. Honors
+/// The legacy function name is retained for compatibility; it never writes a project file.
+/// Returns `None` unless the bus identity (`bus_name`/`bus_project`) is present. Honors
 /// `NEXUS_SKIP_AGENT_BOOTSTRAP_INSTALL` / `NEXUS_SKIP_AGENT_HOOK_INSTALL` (the MCP wiring is part
 /// of the launch-local bootstrap the hook flag governs).
-pub fn write_opencode_mcp_config(cwd: &str, ctx: &LaunchCtx) {
-    let Some(config) = opencode_mcp_config(ctx) else {
-        return;
-    };
-
-    let path = std::path::Path::new(cwd).join("opencode.json");
-    let _ = std::fs::write(
-        path,
-        serde_json::to_string_pretty(&config).unwrap_or_default(),
-    );
+pub fn write_opencode_mcp_config(_cwd: &str, ctx: &LaunchCtx) -> Option<String> {
+    opencode_mcp_config_content(ctx)
 }
 
 fn opencode_mcp_config_content(ctx: &LaunchCtx) -> Option<String> {
@@ -300,25 +342,6 @@ fn opencode_identity_prompt(name: &str, project: &str) -> String {
     )
 }
 
-fn quarantine_invalid_project_opencode_config(cwd: &str) {
-    let path = Path::new(cwd).join("opencode.json");
-    let Ok(body) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    if serde_json::from_str::<serde_json::Value>(&body).is_ok() {
-        return;
-    }
-
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let quarantine = Path::new(cwd).join(format!("opencode.json.invalid-nexus-{nanos}"));
-    if std::fs::rename(&path, quarantine).is_err() {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
 fn env_flag(name: &str) -> bool {
     std::env::var(name).ok().as_deref() == Some("1")
 }
@@ -380,6 +403,9 @@ fn safe_path_component(value: &str) -> String {
 #[async_trait]
 impl Adapter for OpenCodeAdapter {
     async fn open_session(&self) -> Result<(), NexusError> {
+        if let Some(error) = &self.preparation_error {
+            return Err(NexusError::Adapter(error.clone()));
+        }
         self.engine.spawn_and_initialize(&self.command).await?;
         self.engine
             .new_session(self.ctx.cwd.as_deref(), &self.ctx)
@@ -387,6 +413,9 @@ impl Adapter for OpenCodeAdapter {
     }
 
     async fn resume(&self, resume_key: &str) -> Result<(), NexusError> {
+        if let Some(error) = &self.preparation_error {
+            return Err(NexusError::Adapter(error.clone()));
+        }
         self.engine.spawn_and_initialize(&self.command).await?;
         self.engine
             .load_session(resume_key, self.ctx.cwd.as_deref(), &self.ctx)
@@ -454,6 +483,9 @@ impl Adapter for OpenCodeAdapter {
     }
 
     async fn new_session_only(&self) -> Result<(), NexusError> {
+        if let Some(error) = &self.preparation_error {
+            return Err(NexusError::Adapter(error.clone()));
+        }
         self.engine
             .new_session(self.ctx.cwd.as_deref(), &self.ctx)
             .await
@@ -610,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn opencode_adapter_quarantines_invalid_project_config() {
+    fn opencode_adapter_preserves_invalid_project_config() {
         let _env = EnvGuard::new(&[
             "NEXUS_SKIP_AGENT_BOOTSTRAP_INSTALL",
             "NEXUS_SKIP_AGENT_HOOK_INSTALL",
@@ -632,7 +664,10 @@ mod tests {
             ..Default::default()
         });
 
-        assert!(!dir.join("opencode.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("opencode.json")).unwrap(),
+            "{\"default_agent\":\"dean\"}\n{\"oops\":true}"
+        );
         let quarantined: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(Result::ok)
@@ -643,7 +678,7 @@ mod tests {
                     .starts_with("opencode.json.invalid-nexus-")
             })
             .collect();
-        assert_eq!(quarantined.len(), 1);
+        assert_eq!(quarantined.len(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

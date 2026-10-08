@@ -2,8 +2,8 @@
 //!
 //! `install(cwd)` writes the `nexus-bus` skill into
 //! `<cwd>/.claude/skills/nexus-bus/SKILL.md`, writes the bootstrap shell script into
-//! `<cwd>/.nexus/bootstrap-register.sh`, and writes the SessionStart hook into
-//! `<cwd>/.claude/settings.json`. All three operations are guarded by the same
+//! `<cwd>/.nexus/bootstrap-register.sh`. `launch_settings()` supplies the SessionStart hook
+//! as a launch-only overlay, never writing `<cwd>/.claude/settings.json`. Bootstrap operations use the same
 //! `NEXUS_SKIP_AGENT_*` env flags the shared bootstrap uses, in the same order.
 //!
 //! `SKILL_MD` is sourced from `skill.md` alongside this file so the markdown stays in one place
@@ -33,7 +33,6 @@ pub fn install(cwd: &str) {
     }
 
     write_script(cwd);
-    write_claude_hook(cwd);
 }
 
 /// Install only the model-facing bus contract for a daemon-owned headed Claude runtime.
@@ -78,26 +77,27 @@ fn write_script(cwd: &str) {
     }
 }
 
-fn write_claude_hook(cwd: &str) {
-    let dir = Path::new(cwd).join(".claude");
-    let _ = std::fs::create_dir_all(&dir);
-    let body = r#"{
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "startup|resume",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "./.nexus/bootstrap-register.sh"
-          }
-        ]
-      }
-    ]
-  }
-}
-"#;
-    let _ = std::fs::write(dir.join("settings.json"), body);
+/// Additional per-launch settings. Provider-managed user/project settings remain in their
+/// original layers, so existing hooks run once and no project settings file is rewritten.
+pub fn launch_settings() -> Option<serde_json::Value> {
+    if env_flag("NEXUS_SKIP_AGENT_BOOTSTRAP_INSTALL") || env_flag("NEXUS_SKIP_AGENT_HOOK_INSTALL") {
+        return None;
+    }
+    Some(serde_json::json!({
+    "hooks": {
+      "SessionStart": [
+        {
+          "matcher": "startup|resume",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "./.nexus/bootstrap-register.sh"
+            }
+          ]
+        }
+      ]
+    }
+      }))
 }
 
 const BOOTSTRAP_REGISTER_SH: &str = r#"#!/usr/bin/env bash

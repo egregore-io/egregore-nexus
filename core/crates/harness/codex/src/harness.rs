@@ -40,6 +40,7 @@ pub struct CodexAdapter {
     command: HarnessCommand,
     engine: AcpEngine,
     ctx: LaunchCtx,
+    preparation_error: Option<String>,
 }
 
 impl CodexAdapter {
@@ -97,7 +98,14 @@ impl CodexAdapter {
         }
         let mut command = codex_command(ctx.cwd.clone());
         command.env = ctx.env.clone();
-        Self::with_command_and_context(command, ctx)
+        let preparation_error = if ctx.cwd.is_some() {
+            add_launch_hooks(&mut command).err()
+        } else {
+            None
+        };
+        let mut adapter = Self::with_command_and_context(command, ctx);
+        adapter.preparation_error = preparation_error;
+        adapter
     }
 
     /// Construct a Codex adapter over an explicit [`HarnessCommand`] (the hermetic tests point
@@ -121,6 +129,7 @@ impl CodexAdapter {
             )
             .with_reporting(ctx.model_reporting.clone()),
             ctx,
+            preparation_error: None,
         }
     }
 
@@ -128,6 +137,49 @@ impl CodexAdapter {
     pub fn command(&self) -> &HarnessCommand {
         &self.command
     }
+}
+
+fn add_launch_hooks(command: &mut HarnessCommand) -> Result<(), String> {
+    let Some(additions) = skill::launch_hooks() else {
+        return Ok(());
+    };
+    let original = command
+        .env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "CODEX_CONFIG")
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var("CODEX_CONFIG").ok());
+    let mut config = match original {
+        Some(value) => serde_json::from_str::<serde_json::Value>(&value)
+            .map_err(|_| "invalid CODEX_CONFIG JSON".to_string())?,
+        None => serde_json::json!({}),
+    };
+    let object = config
+        .as_object_mut()
+        .ok_or("CODEX_CONFIG must be an object")?;
+    let hooks = object
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("CODEX_CONFIG hooks must be an object")?;
+    let starts = hooks
+        .entry("SessionStart")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or("CODEX_CONFIG SessionStart hooks must be an array")?;
+    starts.extend(
+        additions["SessionStart"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned(),
+    );
+    command.env.retain(|(key, _)| key != "CODEX_CONFIG");
+    command
+        .env
+        .push(("CODEX_CONFIG".into(), config.to_string()));
+    Ok(())
 }
 
 /// Resolve the exact subprocess to put **Codex** into ACP mode.
@@ -164,6 +216,9 @@ pub fn codex_command(cwd: Option<String>) -> HarnessCommand {
 #[async_trait]
 impl Adapter for CodexAdapter {
     async fn open_session(&self) -> Result<(), NexusError> {
+        if let Some(error) = &self.preparation_error {
+            return Err(NexusError::Adapter(error.clone()));
+        }
         self.engine.spawn_and_initialize(&self.command).await?;
         self.engine
             .new_session(self.ctx.cwd.as_deref(), &self.ctx)
@@ -171,6 +226,9 @@ impl Adapter for CodexAdapter {
     }
 
     async fn resume(&self, resume_key: &str) -> Result<(), NexusError> {
+        if let Some(error) = &self.preparation_error {
+            return Err(NexusError::Adapter(error.clone()));
+        }
         self.engine.spawn_and_initialize(&self.command).await?;
         self.engine
             .load_session(resume_key, self.ctx.cwd.as_deref(), &self.ctx)
@@ -246,6 +304,9 @@ impl Adapter for CodexAdapter {
     }
 
     async fn new_session_only(&self) -> Result<(), NexusError> {
+        if let Some(error) = &self.preparation_error {
+            return Err(NexusError::Adapter(error.clone()));
+        }
         // session/new on the already-connected engine (no re-spawn) — the resume-fail fallback.
         self.engine
             .new_session(self.ctx.cwd.as_deref(), &self.ctx)

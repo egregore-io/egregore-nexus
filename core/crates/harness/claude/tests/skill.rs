@@ -60,6 +60,37 @@ fn skill_md_contains_required_content() {
 }
 
 #[test]
+fn preservation_claude_bootstrap_never_writes_user_settings() {
+    let _lock = nexus_agent::adapter::bootstrap::SKIP_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _env = EnvGuard::clear();
+    for bytes in [
+        Some(
+            b"{\"permissions\":{\"deny\":[\"Edit\"]},\"hooks\":{\"SessionStart\":[]}}\n".as_slice(),
+        ),
+        Some(b"{invalid settings\n".as_slice()),
+        None,
+    ] {
+        let dir = temp_dir("preservation");
+        let path = dir.join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        if let Some(bytes) = bytes {
+            std::fs::write(&path, bytes).unwrap();
+        }
+        for _ in 0..2 {
+            nexus_harness_claude::skill::install(dir.to_str().unwrap());
+        }
+        assert_eq!(
+            std::fs::read(&path).ok().as_deref(),
+            bytes,
+            "project settings must remain byte-identical or absent"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
 fn claude_install_writes_session_start_hook_script_and_skill() {
     let _lock = nexus_agent::adapter::bootstrap::SKIP_ENV_LOCK
         .lock()
@@ -69,7 +100,10 @@ fn claude_install_writes_session_start_hook_script_and_skill() {
 
     nexus_harness_claude::skill::install(dir.to_str().unwrap());
 
-    let settings = std::fs::read_to_string(dir.join(".claude/settings.json")).unwrap();
+    let settings = nexus_harness_claude::skill::launch_settings()
+        .unwrap()
+        .to_string();
+    assert!(!dir.join(".claude/settings.json").exists());
     assert!(settings.contains("\"SessionStart\""));
     assert!(settings.contains("startup|resume"));
     assert!(settings.contains("./.nexus/bootstrap-register.sh"));

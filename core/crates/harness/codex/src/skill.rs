@@ -1,11 +1,10 @@
 //! Codex-specific `nexus-bus` skill + SessionStart hook bootstrap.
 //!
-//! `install(cwd)` is the exact equivalent of the old
-//! the legacy Codex bootstrap installer: it writes the `nexus-bus` skill into
+//! `install(cwd)` writes the `nexus-bus` skill into
 //! `<cwd>/.codex/skills/nexus-bus/SKILL.md`, writes the bootstrap shell script into
-//! `<cwd>/.nexus/bootstrap-register.sh`, and writes the SessionStart hook into
-//! `<cwd>/.codex/hooks.json`. All three operations are guarded by the same
-//! `NEXUS_SKIP_AGENT_*` env flags the shared bootstrap used, in the same order.
+//! `<cwd>/.nexus/bootstrap-register.sh`. `launch_hooks()` adds only Nexus's hook to the
+//! child configuration; project hooks remain in their original provider-managed layer.
+//! Bootstrap operations honor the `NEXUS_SKIP_AGENT_*` env flags.
 //!
 //! `SKILL_MD` is sourced from `skill.md` alongside this file so the markdown stays in one place
 //! and is never duplicated in a Rust string literal.
@@ -38,7 +37,6 @@ pub fn install(cwd: &str) {
     }
 
     write_script(cwd);
-    write_codex_hook(cwd);
 }
 
 /// Install only the model-facing bus skill for a daemon-owned Codex app-server runtime.
@@ -103,27 +101,31 @@ fn write_script(cwd: &str) {
     }
 }
 
-fn write_codex_hook(cwd: &str) {
-    let dir = Path::new(cwd).join(".codex");
-    let _ = std::fs::create_dir_all(&dir);
-    let body = r#"{
-  "hooks": {
-    "SessionStart": [
-      {
-        "matcher": "startup|resume",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "./.nexus/bootstrap-register.sh",
-            "statusMessage": "Registering Nexus session"
-          }
-        ]
-      }
-    ]
-  }
-}
-"#;
-    let _ = std::fs::write(dir.join("hooks.json"), body);
+/// Session-only Nexus registration hook. Existing project hooks are discovered by Codex
+/// separately and must not be copied into the session layer, which would run them twice.
+pub fn launch_hooks() -> Option<serde_json::Value> {
+    if env_flag("NEXUS_SKIP_AGENT_BOOTSTRAP_INSTALL") || env_flag("NEXUS_SKIP_AGENT_HOOK_INSTALL") {
+        return None;
+    }
+    Some(
+        serde_json::json!({
+        "hooks": {
+          "SessionStart": [
+            {
+              "matcher": "startup|resume",
+              "hooks": [
+                {
+                  "type": "command",
+                  "command": "./.nexus/bootstrap-register.sh",
+                  "statusMessage": "Registering Nexus session"
+                }
+              ]
+            }
+          ]
+        }
+          })["hooks"]
+            .clone(),
+    )
 }
 
 const BOOTSTRAP_REGISTER_SH: &str = r#"#!/usr/bin/env bash

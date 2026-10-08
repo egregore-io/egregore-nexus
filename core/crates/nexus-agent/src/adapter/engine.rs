@@ -786,12 +786,17 @@ pub struct LaunchCtx {
     /// the bus identity is present. Set by the OpenCode and Hermes adapters:
     /// opencode REJECTS a stdio MCP server in `session/new` (`-32602 Invalid params` → the session
     /// never opens, so the agent never comes online) and instead reads its MCP from OpenCode config
-    /// supplied outside ACP (`OPENCODE_CONFIG_CONTENT` for headless ACP, project config for headed
-    /// compatibility). claude/codex leave this `false` and keep getting the bus over ACP. Default
+    /// supplied outside ACP (`OPENCODE_CONFIG_CONTENT` for ACP and headed launches).
+    /// claude/codex leave this `false` and keep getting the bus over ACP. Default
     /// `false` (inject) for backward-compatible behavior.
     pub suppress_acp_mcp: bool,
     /// Captured prepared-factory reporting; absent for legacy/unobserved launches.
     pub model_reporting: Option<super::AdapterModelReporting>,
+    /// Provider-specific launch configuration for both fresh and resumed ACP sessions. This
+    /// carries only per-launch additions; it never grants permission to write project settings.
+    /// Bootstrap augmentation accepts inline object settings, not settings-file path
+    /// strings. Provider user/project files stay in their original settings sources.
+    pub session_meta: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Per-turn streaming state, shared between the SDK notification handler and [`AcpEngine::inject`].
@@ -2077,7 +2082,9 @@ fn resolve_cwd(cwd: Option<&str>) -> std::path::PathBuf {
 /// the nexus bus available over the standard MCP channel.
 pub fn build_new_session_request(cwd: Option<&str>, ctx: &LaunchCtx) -> NewSessionRequest {
     let root = resolve_cwd(cwd);
-    NewSessionRequest::new(root).mcp_servers(bus_mcp_servers(ctx))
+    NewSessionRequest::new(root)
+        .mcp_servers(bus_mcp_servers(ctx))
+        .meta(ctx.session_meta.clone())
 }
 
 /// Build `session/load` with the same launch-scoped Nexus MCP identity as `session/new`.
@@ -2090,6 +2097,7 @@ pub fn build_load_session_request(
 ) -> LoadSessionRequest {
     LoadSessionRequest::new(SessionId::new(resume_key), resolve_cwd(cwd))
         .mcp_servers(bus_mcp_servers(ctx))
+        .meta(ctx.session_meta.clone())
 }
 
 fn bus_mcp_servers(ctx: &LaunchCtx) -> Vec<SchemaMcpServer> {

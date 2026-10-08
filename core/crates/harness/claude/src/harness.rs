@@ -40,6 +40,7 @@ pub struct ClaudeAdapter {
     command: HarnessCommand,
     engine: AcpEngine,
     ctx: LaunchCtx,
+    preparation_error: Option<String>,
 }
 
 impl ClaudeAdapter {
@@ -95,16 +96,26 @@ impl ClaudeAdapter {
     /// Construct a Claude adapter that will spawn the **real** Claude Code ACP bridge for the
     /// given working directory. The exact invocation is [`claude_command`] (overridable via
     /// env).
-    pub fn new(ctx: LaunchCtx) -> Self {
+    /// Bootstrap augmentation of `session_meta.claudeCode.options.settings` accepts inline
+    /// objects only, not the upstream SDK's settings-file path form. Provider-managed settings
+    /// files remain in their normal layers, without copying their hooks into the overlay.
+    pub fn new(mut ctx: LaunchCtx) -> Self {
         // Install launch-local Nexus bootstrap files into Claude Code's project cwd: a SessionStart
         // hook that idempotently registers the daemon-minted session, plus the `nexus-bus` skill as
         // fallback/operator guidance. Scoped to this launch, not the user's global skills.
         if let Some(cwd) = &ctx.cwd {
             crate::skill::install(cwd);
         }
+        let preparation_error = if ctx.cwd.is_some() {
+            add_launch_settings(&mut ctx).err()
+        } else {
+            None
+        };
         let mut command = claude_command(ctx.cwd.clone());
         command.env = ctx.env.clone();
-        Self::with_command_and_context(command, ctx)
+        let mut adapter = Self::with_command_and_context(command, ctx);
+        adapter.preparation_error = preparation_error;
+        adapter
     }
 
     /// Construct a Claude adapter over an explicit [`HarnessCommand`] (the hermetic tests point
@@ -128,6 +139,7 @@ impl ClaudeAdapter {
             )
             .with_reporting(ctx.model_reporting.clone()),
             ctx,
+            preparation_error: None,
         }
     }
 
@@ -135,6 +147,72 @@ impl ClaudeAdapter {
     pub fn command(&self) -> &HarnessCommand {
         &self.command
     }
+}
+
+fn add_launch_settings(ctx: &mut LaunchCtx) -> Result<(), String> {
+    let Some(additions) = crate::skill::launch_settings() else {
+        return Ok(());
+    };
+    let raw = ctx
+        .env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "CLAUDE_MODEL_CONFIG")
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var("CLAUDE_MODEL_CONFIG").ok());
+    let model_config: serde_json::Value = match raw.filter(|value| !value.is_empty()) {
+        Some(value) => {
+            serde_json::from_str(&value).map_err(|_| "invalid CLAUDE_MODEL_CONFIG JSON")?
+        }
+        None => serde_json::json!({}),
+    };
+    let models = model_config
+        .as_object()
+        .ok_or("CLAUDE_MODEL_CONFIG must be an object")?;
+    let meta = ctx.session_meta.get_or_insert_with(Default::default);
+    let claude = meta
+        .entry("claudeCode")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("Claude launch metadata must be an object")?;
+    let options = claude
+        .entry("options")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("Claude launch options must be an object")?;
+    // The pinned bridge ignores its model-config fallback when settings are supplied.
+    // Preserve that fallback unless the caller already owns an explicit settings overlay.
+    if !options.contains_key("settings") {
+        let fallback: serde_json::Map<String, serde_json::Value> = models
+            .iter()
+            .filter(|(key, _)| matches!(key.as_str(), "modelOverrides" | "availableModels"))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        options.insert("settings".into(), fallback.into());
+    }
+    let settings = options
+        .get_mut("settings")
+        .unwrap()
+        .as_object_mut()
+        .ok_or("Claude launch settings must be an object")?;
+    let hooks = settings
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("Claude launch hooks must be an object")?;
+    let starts = hooks
+        .entry("SessionStart")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or("Claude launch SessionStart hooks must be an array")?;
+    starts.extend(
+        additions["hooks"]["SessionStart"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .cloned(),
+    );
+    Ok(())
 }
 
 /// Resolve the exact subprocess to put **Claude Code** into ACP mode.
@@ -172,6 +250,9 @@ pub fn claude_command(cwd: Option<String>) -> HarnessCommand {
 #[async_trait]
 impl Adapter for ClaudeAdapter {
     async fn open_session(&self) -> Result<(), NexusError> {
+        if let Some(error) = &self.preparation_error {
+            return Err(NexusError::Adapter(error.clone()));
+        }
         self.engine.spawn_and_initialize(&self.command).await?;
         self.engine
             .new_session(self.ctx.cwd.as_deref(), &self.ctx)
@@ -179,6 +260,9 @@ impl Adapter for ClaudeAdapter {
     }
 
     async fn resume(&self, resume_key: &str) -> Result<(), NexusError> {
+        if let Some(error) = &self.preparation_error {
+            return Err(NexusError::Adapter(error.clone()));
+        }
         self.engine.spawn_and_initialize(&self.command).await?;
         self.engine
             .load_session(resume_key, self.ctx.cwd.as_deref(), &self.ctx)
@@ -246,6 +330,9 @@ impl Adapter for ClaudeAdapter {
     }
 
     async fn new_session_only(&self) -> Result<(), NexusError> {
+        if let Some(error) = &self.preparation_error {
+            return Err(NexusError::Adapter(error.clone()));
+        }
         // session/new on the already-connected engine (no re-spawn) — the resume-fail fallback.
         self.engine
             .new_session(self.ctx.cwd.as_deref(), &self.ctx)

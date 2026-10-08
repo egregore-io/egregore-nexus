@@ -56,6 +56,21 @@ fn skill_md_contains_required_content() {
 }
 
 #[test]
+fn preservation_codex_bootstrap_never_writes_user_hooks() {
+    let _lock = SKIP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvGuard::clear();
+    for bytes in [Some(b"{\"hooks\":{\"SessionStart\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"echo user\"}]}]}}\n".as_slice()), Some(b"{invalid hooks\n".as_slice()), None] {
+        let dir = temp_dir("preservation");
+        let path = dir.join(".codex/hooks.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        if let Some(bytes) = bytes { std::fs::write(&path, bytes).unwrap(); }
+        for _ in 0..2 { install(dir.to_str().unwrap()); }
+        assert_eq!(std::fs::read(&path).ok().as_deref(), bytes, "project hooks must remain byte-identical or absent");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
 fn skill_md_guides_codex_deferred_mcp_and_stdin_posting() {
     assert!(SKILL_MD.contains("tool discovery/search"));
     assert!(SKILL_MD.contains("mcp__nexus_bus"));
@@ -146,7 +161,10 @@ fn codex_install_writes_session_start_hook_script_and_skill() {
 
     install(dir.to_str().unwrap());
 
-    let hooks = std::fs::read_to_string(dir.join(".codex/hooks.json")).unwrap();
+    let hooks = nexus_harness_codex::skill::launch_hooks()
+        .unwrap()
+        .to_string();
+    assert!(!dir.join(".codex/hooks.json").exists());
     assert!(hooks.contains("\"SessionStart\""));
     assert!(hooks.contains("startup|resume"));
     assert!(hooks.contains("./.nexus/bootstrap-register.sh"));

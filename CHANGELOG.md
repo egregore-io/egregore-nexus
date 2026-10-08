@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.7] - 2026-10-08
+
+### Fixed
+
+- Keep existing project `.claude/settings.json`, `.codex/hooks.json` and `opencode.json`
+  untouched during agent launch. Claude and Codex ACP add only the Nexus registration hook
+  through launch-local configuration; user hooks remain in their original settings layer.
+- Scope OpenCode MCP wiring to each ACP or headed serve/attach child, preserving caller
+  configuration and user permissions while replacing only the reserved Nexus identity entry.
+  The headed launcher no longer forces a blanket `permission: "allow"` policy.
+- Leave malformed project OpenCode configuration unchanged for OpenCode to diagnose, rather
+  than moving it away. Malformed inline launch configuration fails before native launch without
+  echoing configuration contents.
+
 ## [0.1.6] - 2026-10-01
 
 ### Fixed

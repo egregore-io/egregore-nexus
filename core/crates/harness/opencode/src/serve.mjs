@@ -142,11 +142,27 @@ async function main() {
     }
   }
 
-  const config = {
-    $schema: "https://opencode.ai/config.json",
-    permission: "allow",
-    plugin: [pluginPath],
-  };
+  let config;
+  try {
+    config = baseEnv.OPENCODE_CONFIG_CONTENT ? JSON.parse(baseEnv.OPENCODE_CONFIG_CONTENT) : {};
+  } catch {
+    throw new Error("invalid OPENCODE_CONFIG_CONTENT JSON");
+  }
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
+    throw new Error("OPENCODE_CONFIG_CONTENT must be an object");
+  }
+  if (config.plugin !== undefined && !Array.isArray(config.plugin)) {
+    throw new Error("OPENCODE_CONFIG_CONTENT plugin must be an array");
+  }
+  for (const field of ["mcp", "agent"]) {
+    if (config[field] !== undefined && (!config[field] || typeof config[field] !== "object" || Array.isArray(config[field]))) {
+      throw new Error(`OPENCODE_CONFIG_CONTENT ${field} must be an object`);
+    }
+  }
+  config.$schema ??= "https://opencode.ai/config.json";
+  config.plugin = [...(config.plugin ?? []).filter((entry) => entry !== pluginPath), pluginPath];
+  // User/project/global permissions remain provider-owned. Never replace an explicit deny
+  // with a launch-wide "allow" policy while adding transport wiring.
   // The project config is shared by all launches in a cwd. Never let its stale
   // caller key override the daemon-captured identity used by this server child.
   if (baseEnv.NEXUS_SKIP_AGENT_BOOTSTRAP_INSTALL !== "1" && baseEnv.NEXUS_SKIP_AGENT_HOOK_INSTALL !== "1") {
@@ -159,15 +175,29 @@ async function main() {
       throw new Error("captured Nexus MCP identity is incomplete");
     }
     config.mcp = {
+      ...config.mcp,
       "nexus-bus": {
         type: "local", enabled: true,
         command: [cli, "mcp", "--as", name, "--project", project, "--client-key", key, "--agent", agent],
       },
     };
+    const existing = config.agent?.nexus;
+    if (existing !== undefined && (!existing || typeof existing !== "object" || Array.isArray(existing))) {
+      throw new Error("OPENCODE_CONFIG_CONTENT Nexus agent must be an object");
+    }
+    config.agent = {
+      ...config.agent,
+      nexus: {
+        ...existing,
+        mode: "primary", description: "Nexus bus runtime identity",
+        prompt: `You are ${JSON.stringify(name)} on the Nexus bus in project ${JSON.stringify(project)}.\nMessages arrive through the nexus-bus MCP tools; use those tools to reply, DM, post, read, list members, and list threads.\nDo not claim another agent identity. If asked who you are, answer as ${JSON.stringify(name)}.`,
+      },
+    };
+    config.default_agent = "nexus";
   }
   if (native.model) {
     config.model = native.model;
-    config.agent = { nexus: { mode: "primary", model: native.model } };
+    config.agent = { ...config.agent, nexus: { ...config.agent?.nexus, mode: "primary", model: native.model } };
     config.default_agent = "nexus";
   }
   if (native.agent) config.default_agent = native.agent;
@@ -236,7 +266,10 @@ async function main() {
     OPENCODE_SERVER_PASSWORD: secret,
     ...(isolatedStore ? { OPENCODE_DB: dbPath } : {}),
   };
-  delete tuiEnv.OPENCODE_CONFIG_CONTENT;
+  // The attached client also needs the captured MCP identity. It must not start a second
+  // recorder plugin; retain caller plugins and all other launch settings, but remove ours.
+  const tuiConfig = { ...config, plugin: config.plugin.filter((entry) => entry !== pluginPath) };
+  tuiEnv.OPENCODE_CONFIG_CONTENT = JSON.stringify(tuiConfig);
   delete tuiEnv.NEXUS_OPENCODE_BRIDGE_URL;
   delete tuiEnv.NEXUS_OPENCODE_BRIDGE_TOKEN;
   delete tuiEnv.NEXUS_OPENCODE_PLUGIN_PATH;

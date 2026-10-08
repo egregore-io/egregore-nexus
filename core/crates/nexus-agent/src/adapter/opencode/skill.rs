@@ -11,8 +11,8 @@
 //! plugins), and in the headless ACP path the daemon mints + connects the session itself, so the
 //! script is the manual/operator fallback rather than an auto-fired hook. The **load-bearing** MCP
 //! wiring (the `nexus-bus` MCP server) is supplied separately by [`super::harness`] — headless ACP
-//! launches use per-process `OPENCODE_CONFIG_CONTENT`, while headed compatibility callers may still
-//! write project config. opencode REJECTS a stdio MCP server over ACP `session/new`, so the bus must
+//! and headed launches use per-process `OPENCODE_CONFIG_CONTENT`, never a shared project config
+//! write. opencode REJECTS a stdio MCP server over ACP `session/new`, so the bus must
 //! come from opencode's own config channel instead.
 //!
 //! All operations honor the same `NEXUS_SKIP_AGENT_*` env flags the shared bootstrap used, in the

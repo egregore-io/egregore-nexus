@@ -75,6 +75,40 @@ fn bus_ctx(cwd: Option<String>) -> LaunchCtx {
 }
 
 #[test]
+fn preservation_opencode_bootstrap_never_writes_user_config() {
+    let _lock = SKIP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvGuard::isolated(None, false);
+    for bytes in [Some(b"{\"permission\":{\"edit\":\"deny\"},\"agent\":{\"user-agent\":{\"mode\":\"primary\"}}}\n".as_slice()), Some(b"{invalid config\n".as_slice()), None] {
+        let dir = temp_dir("preservation");
+        let path = dir.join("opencode.json");
+        if let Some(bytes) = bytes { std::fs::write(&path, bytes).unwrap(); }
+        let cwd = dir.to_string_lossy().into_owned();
+        for _ in 0..2 { write_opencode_mcp_config(&cwd, &bus_ctx(Some(cwd.clone()))); }
+        assert_eq!(std::fs::read(&path).ok().as_deref(), bytes, "project config must remain byte-identical or absent");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn preservation_opencode_acp_never_quarantines_invalid_user_config() {
+    let _lock = SKIP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = EnvGuard::isolated(None, false);
+    let dir = temp_dir("preservation-invalid-acp");
+    let bytes = b"{invalid config\n";
+    let path = dir.join("opencode.json");
+    std::fs::write(&path, bytes).unwrap();
+    let cwd = dir.to_string_lossy().into_owned();
+    let _adapter = nexus_agent::adapter::opencode::OpenCodeAdapter::new(bus_ctx(Some(cwd)));
+    assert_eq!(std::fs::read(&path).ok().as_deref(), Some(bytes.as_slice()));
+    assert!(!std::fs::read_dir(&dir).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains("invalid-nexus")));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn opencode_command_defaults_to_opencode_acp() {
     std::env::remove_var("NEXUS_OPENCODE_ACP_CMD");
     std::env::remove_var("NEXUS_OPENCODE_ACP_ARGS");
@@ -99,9 +133,8 @@ fn opencode_writes_project_config_with_nexus_bus_mcp() {
     let dir = temp_dir("opencode-cfg");
     let cwd = dir.to_string_lossy().into_owned();
 
-    write_opencode_mcp_config(&cwd, &bus_ctx(Some(cwd.clone())));
-
-    let body = std::fs::read_to_string(dir.join("opencode.json")).unwrap();
+    let body = write_opencode_mcp_config(&cwd, &bus_ctx(Some(cwd.clone()))).unwrap();
+    assert!(!dir.join("opencode.json").exists());
     let v: serde_json::Value = serde_json::from_str(&body).unwrap();
     let server = &v["mcp"]["nexus-bus"];
     assert_eq!(server["type"], "local");

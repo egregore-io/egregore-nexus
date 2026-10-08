@@ -7,9 +7,80 @@ use nexus_agent::Adapter;
 use nexus_contracts::AgentUpdateKind;
 use nexus_harness_codex::{codex_command, CodexAdapter};
 
+#[test]
+fn preservation_codex_launch_config_keeps_user_inline_settings() {
+    let _lock = nexus_agent::adapter::bootstrap::SKIP_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let root = std::env::temp_dir().join(format!("nexus-codex-overlay-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let caller = serde_json::json!({"model":"user-model","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo user-hook"}]}]},"approval_policy":"on-request"});
+    let adapter = CodexAdapter::new(nexus_agent::LaunchCtx {
+        cwd: Some(root.to_string_lossy().into_owned()),
+        env: vec![("CODEX_CONFIG".into(), caller.to_string())],
+        ..Default::default()
+    });
+    let contents = adapter
+        .command()
+        .env
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "CODEX_CONFIG")
+        .unwrap()
+        .1
+        .clone();
+    let config: serde_json::Value = serde_json::from_str(&contents).unwrap();
+    assert_eq!(config["model"], "user-model");
+    assert_eq!(config["approval_policy"], "on-request");
+    let hooks = config["hooks"]["SessionStart"].as_array().unwrap();
+    assert_eq!(hooks.len(), 2);
+    assert_eq!(hooks[0], caller["hooks"]["SessionStart"][0]);
+    assert_eq!(
+        hooks[1]["hooks"][0]["command"],
+        "./.nexus/bootstrap-register.sh"
+    );
+    assert!(!root.join(".codex/hooks.json").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// The compiled fake harness binary. `CARGO_BIN_EXE_<name>` is injected by Cargo because the
 /// harness is a `[[bin]]` of this crate, so it is always built before these tests run.
 const FAKE_HARNESS: &str = env!("CARGO_BIN_EXE_codex_fake_acp_agent");
+
+#[tokio::test]
+async fn malformed_codex_launch_config_never_spawns_or_exposes_content() {
+    let root = std::env::temp_dir().join(format!(
+        "nexus-codex-invalid-config-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    for input in [
+        "{secret-fixture",
+        "null",
+        "[]",
+        "{\"hooks\":false}",
+        "{\"hooks\":{\"SessionStart\":false}}",
+    ] {
+        let adapter = CodexAdapter::new(nexus_agent::LaunchCtx {
+            cwd: Some(root.to_string_lossy().into_owned()),
+            env: vec![("CODEX_CONFIG".into(), input.into())],
+            ..Default::default()
+        });
+        for error in [
+            adapter.open_session().await.unwrap_err(),
+            adapter.resume("fixture").await.unwrap_err(),
+            adapter.new_session_only().await.unwrap_err(),
+        ] {
+            assert!(error.to_string().contains("CODEX_CONFIG"));
+            assert!(!error.to_string().contains("secret-fixture"));
+        }
+        assert!(adapter.runtime_process_ids().is_none());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
 
 static COMMAND_ENV_LOCK: Mutex<()> = Mutex::new(());
 const COMMAND_ENV_KEYS: [&str; 5] = [
