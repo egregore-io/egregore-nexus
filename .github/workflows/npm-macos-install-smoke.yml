@@ -1,0 +1,52 @@
+name: Experimental macOS registry install/version (runtime unqualified)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact expected version (must already be published)
+        required: true
+        default: '0.1.8'
+      selector:
+        description: Use exact before latest promotion; latest only after promotion
+        required: true
+        type: choice
+        options:
+          - exact
+          - latest
+
+permissions:
+  contents: read
+
+jobs:
+  registry-install:
+    name: Clean public registry ${{ inputs.selector }} (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install from public registry without source/native overrides
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+          INSTALL_SELECTOR: ${{ inputs.selector }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          node scripts/nexus-macos-npm-install-smoke.mjs --mode registry \
+            --version "$EXPECTED_VERSION" --selector "$INSTALL_SELECTOR" --arch "$EXPECTED_ARCH" \
+            --output "dist/macos-registry-$INSTALL_SELECTOR-$EXPECTED_ARCH.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-registry-${{ inputs.selector }}-${{ matrix.arch }}
+          path: dist/macos-registry-*.json
+          if-no-files-found: error

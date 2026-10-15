@@ -7,7 +7,11 @@ npm install --global @egregore/nexus
 ```
 
 This installs `nexus`, `nexus-gateway`, and `nexus-webui`. The native CLI is selected automatically
-for Linux, Windows, and WSL. The beta.5 npm release does not support macOS.
+for Linux, Windows, WSL, and experimental macOS x64/arm64. The macOS release gate is
+installation/version smoke only; runtime unqualified. This is not bus, launchd, provider,
+Gateway/WebUI, GUI signing or notarization qualification. Candidate and public-registry
+checks are separate; verify the published version/tag before installing. On macOS the bounded
+smoke command is `nexus --version`; lifecycle examples below are not macOS runtime guarantees.
 If npm's global command directory is missing from `PATH`, the
 installer prints one copyable shell command and does not edit your profile.
 

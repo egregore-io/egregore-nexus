@@ -35,6 +35,16 @@ jobs:
             runner: windows-latest
             rust_target: x86_64-pc-windows-msvc
             executable: nexus.exe
+          - target: darwin-arm64
+            support: experimental install/version only; runtime unqualified
+            runner: macos-15
+            rust_target: aarch64-apple-darwin
+            executable: nexus
+          - target: darwin-x64
+            support: experimental install/version only; runtime unqualified
+            runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            executable: nexus
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -61,6 +71,7 @@ jobs:
         shell: bash
         run: rustup target add "${{ matrix.rust_target }}"
       - name: Verify native harness command contracts
+        if: ${{ !startsWith(matrix.target, 'darwin-') }}
         shell: bash
         run: |
           cargo test --locked --manifest-path core/Cargo.toml \
@@ -108,8 +119,10 @@ jobs:
             --binary "core/target/${{ matrix.rust_target }}/release/${{ matrix.executable }}" \
             --output packages/nexus-cli
           node packages/nexus-cli/bin/nexus.mjs --version
-          node packages/nexus-cli/bin/nexus.mjs daemon install --help
-          node scripts/nexus-cli-command-surface-smoke.mjs packages/nexus-cli/bin/nexus.mjs
+          if [ "$RUNNER_OS" != macOS ]; then
+            node packages/nexus-cli/bin/nexus.mjs daemon install --help
+            node scripts/nexus-cli-command-surface-smoke.mjs packages/nexus-cli/bin/nexus.mjs
+          fi
       - name: Verify packaged Linux glibc baseline
         if: startsWith(matrix.target, 'linux-')
         run: node scripts/nexus-linux-abi.mjs packages/nexus-cli/native/${{ matrix.target }}/nexus
@@ -144,10 +157,14 @@ jobs:
         run: |
           chmod 755 \
             packages/nexus-cli/native/linux-x64-gnu/nexus \
-            packages/nexus-cli/native/linux-arm64-gnu/nexus
+            packages/nexus-cli/native/linux-arm64-gnu/nexus \
+            packages/nexus-cli/native/darwin-arm64/nexus \
+            packages/nexus-cli/native/darwin-x64/nexus
           test -x packages/nexus-cli/native/linux-x64-gnu/nexus
           test -x packages/nexus-cli/native/linux-arm64-gnu/nexus
           test -f packages/nexus-cli/native/win32-x64-msvc/nexus.exe
+          test -x packages/nexus-cli/native/darwin-arm64/nexus
+          test -x packages/nexus-cli/native/darwin-x64/nexus
       - name: Verify installer guidance
         run: node --test packages/nexus-cli/tests/*.test.mjs
       - name: Build Gateway and WebUI
@@ -163,6 +180,8 @@ jobs:
           test "$(find dist/npm -maxdepth 1 -name '*.tgz' -printf '.' | wc -c)" -eq 3
           tar -tf "dist/npm/egregore-nexus-cli-${VERSION}.tgz" >dist/npm-cli-contents.txt
           grep -q 'native/win32-x64-msvc/nexus.exe' dist/npm-cli-contents.txt
+          grep -q 'native/darwin-arm64/nexus' dist/npm-cli-contents.txt
+          grep -q 'native/darwin-x64/nexus' dist/npm-cli-contents.txt
       - name: Smoke complete umbrella install
         shell: bash
         run: |
@@ -191,3 +210,37 @@ jobs:
           path: dist/npm/*.tgz
           if-no-files-found: error
           retention-days: 1
+
+  macos-candidate-install:
+    name: Experimental Mac candidate install/version (${{ matrix.arch }}; runtime unqualified)
+    needs: npm-tarballs
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          name: nexus-npm
+          path: dist/npm
+      - name: Install exact assembled three tarballs and run installed version only
+        shell: bash
+        run: |
+          node scripts/nexus-macos-npm-install-smoke.mjs --mode candidate \
+            --version "$(tr -d '\r\n' < VERSION)" --arch "${{ matrix.arch }}" \
+            --tarballs dist/npm --output "dist/macos-candidate-${{ matrix.arch }}.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-candidate-install-${{ matrix.arch }}
+          path: dist/macos-candidate-${{ matrix.arch }}.json
+          if-no-files-found: error

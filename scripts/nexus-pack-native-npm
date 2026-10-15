@@ -172,6 +172,25 @@ if [[ "$TARGET" == darwin-* ]]; then
       exit 1
     fi
   fi
+  if [ "$(uname -s 2>/dev/null || true)" = Darwin ]; then
+    if ! command -v codesign >/dev/null 2>&1; then
+      echo "Darwin native npm packaging requires codesign for the final stripped binary" >&2
+      exit 1
+    fi
+    # Post-link stripping can invalidate Mach-O signatures. Preserve a valid
+    # signature; otherwise repair locally with ad-hoc signing, without an Apple
+    # account, Developer ID identity, timestamp service or notarization.
+    if ! codesign --verify --strict "$TMP/$EXECUTABLE" >/dev/null 2>&1; then
+      if ! codesign --force --sign - --timestamp=none "$TMP/$EXECUTABLE"; then
+        echo "Darwin native npm packaging failed to apply an ad-hoc signature" >&2
+        exit 1
+      fi
+    fi
+    if ! codesign --verify --strict "$TMP/$EXECUTABLE"; then
+      echo "Darwin native npm packaging final signature verification failed" >&2
+      exit 1
+    fi
+  fi
 fi
 
 if LC_ALL=C grep -aEq \

@@ -1,7 +1,10 @@
 # @egregore/nexus-cli
 
 The Nexus CLI and local transport daemon, with automatic native selection for Linux,
-Windows, and WSL. The beta.5 npm release does not support macOS.
+Windows, WSL, and experimental macOS x64/arm64. The macOS release gate is installation plus
+`nexus --version` only; runtime unqualified. It does not qualify bus, launchd, providers,
+GUI signing or notarization. Candidate and public exact-version/latest checks remain separate;
+the lifecycle examples below are not macOS runtime guarantees.
 
 ```bash
 npm install --global @egregore/nexus-cli

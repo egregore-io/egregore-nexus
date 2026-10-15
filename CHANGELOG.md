@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.8] - Unreleased
+
+### Added
+
+- Experimental macOS arm64/x64 npm installation packaging and candidate/clean-registry
+  install plus `nexus --version` gates. Runtime, bus, launchd, provider and GUI behavior
+  remain unqualified; ad-hoc signature verification is not Developer ID or notarization.
+- Native Mac artifact rows and all-five-target assembly within the existing three public
+  packages. Builds never publish automatically; public exact-version qualification must
+  precede manual `latest` promotion and bare-install checks.
+
 ## [0.1.7] - 2026-10-08
 
 ### Fixed

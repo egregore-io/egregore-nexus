@@ -2,7 +2,7 @@
 
 [← Nexus docs](README.md)
 
-This source tree targets Nexus 0.1.6 (see `VERSION`); the npm registry carries whichever release was
+This source tree targets Nexus 0.1.8 (see `VERSION`); the npm registry carries whichever release was
 last published, so check it for what is installable today. Nexus has three runtime facets and three
 public npm entry packages, and npm packages, native binaries, and release evidence share one canonical
 version. The Cargo crates are not published to crates.io today; the CLI and daemon are distributed
@@ -17,7 +17,7 @@ through npm or built from source.
 | Gateway + WebUI | npm `@egregore/nexus-gateway` | `nexus`, `nexus-gateway`, `nexus-webui` | CLI/daemon plus REST, WebSocket, MCP, AG-UI, history, search, edge auth, browser UI |
 
 The npm CLI never compiles Rust. One `@egregore/nexus-cli` tarball contains the prebuilt binaries
-for Linux x64/arm64 glibc, Windows x64, and WSL. macOS is unsupported in this release.
+for Linux x64/arm64 glibc, Windows x64, WSL, and experimental macOS x64/arm64.
 Its launcher selects the matching
 file locally. An explicit `NEXUS_NATIVE_BIN` takes precedence; a locally built binary installed with Cargo remains a
 fallback. When no matching binary exists, the launcher prints an actionable installation error.
@@ -39,6 +39,29 @@ npm install --global @egregore/nexus-gateway
 
 The Gateway package installs and exposes the CLI and carries the built WebUI. No public WebUI-only
 or platform-only package is published. All packages must install without a source checkout.
+
+### Experimental macOS installation
+
+macOS x64 and arm64 are **experimental; installation/version smoke tested, runtime unqualified**.
+This describes the release qualification boundary, not a claim that an unpublished candidate has
+already passed on a Mac. Candidate results, public exact-version results and public `latest`
+results are separate gates. Check the npm version/dist-tag and corresponding workflow results.
+After installing, the bounded smoke command is `nexus --version`. Do not infer working bus,
+launchd, agent/provider sessions, Gateway/WebUI runtime, GUI signing or notarization from it.
+The lifecycle commands below remain unqualified on macOS.
+
+The artifact workflow builds native `darwin-arm64` on `macos-15` and `darwin-x64` on
+`macos-15-intel`, strips and verifies (or repairs) the final ad-hoc signature, then assembles
+exactly three tarballs containing all five native targets. Candidate Mac jobs install these
+tarballs into fresh global prefixes/caches and execute only installed `nexus --version`.
+Ad-hoc signing uses no Apple account or Developer ID certificate and is not notarization.
+
+Publication is manual: candidate checks first; publish exact tarballs under the non-latest
+`macos-experimental` tag; run clean public-registry exact-version checks on both Macs; only then
+promote all three `latest` tags and run the bare umbrella install checks on both Macs.
+The separate `npm-macos-install-smoke` workflow selects `exact` or `latest`, asserts native host,
+Node and installed Mach-O architecture, and records package versions/integrities, binary SHA-256,
+and exact version output/exit. Neither workflow publishes packages or starts services.
 
 The CLI post-install hook is non-mutating. It stays silent when npm's global command directory is
 already on `PATH`; otherwise it prints one copyable Bash, Zsh, Fish, or user-scoped PowerShell
@@ -121,8 +144,8 @@ operator can inspect the structured receipt under the Nexus home after completio
 
 ## Platform matrix
 
-This release targets Linux and Windows/WSL. macOS artifacts are not included;
-npm platform declarations reject macOS installation rather than using stale binaries.
+Linux and Windows/WSL retain their existing release baseline. macOS packages are offered only
+for the experimental installation/version boundary; runtime unqualified.
 
 | Platform | Native CLI/daemon | Gateway/WebUI | Headed harness note |
 |---|---:|---:|---|
@@ -130,8 +153,8 @@ npm platform declarations reject macOS installation rather than using stale bina
 | Linux arm64 | Release baseline | Release baseline | native build, tests, packaging, and command smoke; provider binaries remain external |
 | Windows x64 | Release baseline | Release baseline | named-pipe IPC/projection/attach, Task Scheduler lifecycle, native package and Gateway gates |
 | WSL | Release baseline | Release baseline | Linux package plus stable-identity and systemd handoff gates |
-| macOS x64 | Unsupported | Not offered by this install | deferred |
-| macOS arm64 | Unsupported | Not offered by this install | deferred |
+| macOS x64 | Experimental install/version only | Runtime unqualified | provider/GUI/lifecycle unqualified |
+| macOS arm64 | Experimental install/version only | Runtime unqualified | provider/GUI/lifecycle unqualified |
 
 Harness executables are external prerequisites. Nexus adapter support is maintained separately per
 harness but released and documented uniformly.
@@ -145,7 +168,7 @@ native Windows runner.
 
 Every published package must:
 
-- report the version in `VERSION` (`0.1.6` for this source tree) and license `Apache-2.0`;
+- report the version in `VERSION` (`0.1.8` for this source tree) and license `Apache-2.0`;
 - contain no source-checkout or operator-local path dependency;
 - contain no credentials, OAuth state, runtime database, logs, screenshots, or captured model
   output;
@@ -158,6 +181,10 @@ to crates.io. npm packages are packed and installed from their tarballs in
 isolated directories before publication.
 
 ## Release gate
+
+The experimental macOS install-only qualification uses the candidate and clean-registry
+workflows above. The broader runtime gates below do not constitute a macOS runtime claim and
+are not prerequisites for that explicitly narrower installation/version experiment.
 
 The minimum artifact gate is:
 

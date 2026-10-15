@@ -1,10 +1,11 @@
 {
   "name": "@egregore/nexus-cli",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "private": false,
   "os": [
     "linux",
-    "win32"
+    "win32",
+    "darwin"
   ],
   "type": "module",
   "license": "Apache-2.0",

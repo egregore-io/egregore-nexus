@@ -24,9 +24,9 @@ test("unsupported libc and architectures fail closed", () => {
   assert.equal(platformTarget({ platform: "win32", arch: "arm64" }), undefined);
 });
 
-test("beta npm manifests explicitly limit installation to Linux and Windows", () => {
+test("npm manifests offer experimental native macOS without dropping Linux or Windows", () => {
   for (const path of ["../package.json", "../../nexus/package.json"]) {
     const manifest = JSON.parse(readFileSync(new URL(path, import.meta.url), "utf8"));
-    assert.deepEqual(manifest.os, ["linux", "win32"]);
+    assert.deepEqual(manifest.os, ["linux", "win32", "darwin"]);
   }
 });

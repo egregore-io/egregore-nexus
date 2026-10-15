@@ -68,7 +68,12 @@ npm install --global @egregore/nexus-cli       # native CLI + transport daemon
 npm install --global @egregore/nexus-gateway   # CLI + daemon + Gateway + Webconsole
 ```
 
-Prebuilt npm binaries cover Linux x64/arm64 (glibc 2.35 or newer), Windows x64, and WSL. The current published npm packages do not include macOS binaries. Installation does not compile Rust.
+Prebuilt npm binaries cover Linux x64/arm64 (glibc 2.35 or newer), Windows x64, and WSL.
+macOS x64/arm64 installation is experimental: the release gate is installation plus
+`nexus --version`; runtime, bus, launchd, providers and GUI remain unqualified. Candidate,
+public exact-version and public `latest` checks are separate; check the registry/workflow
+results rather than treating an unpublished candidate as released. Installation does not
+compile Rust. See [distribution boundaries](docs/distribution.md#experimental-macos-installation).
 
 Install and authenticate your chosen agent harness separately.
 

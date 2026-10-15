@@ -23,6 +23,7 @@ ENTRYPOINTS = (
     "scripts/nexus-load-gate",
     "scripts/nexus-notify-smoke",
     "scripts/nexus-pack-native-npm",
+    "scripts/nexus-macos-npm-install-smoke.mjs",
     "scripts/nexus-three-facet-package-smoke",
     "scripts/nexus-v01-release-validation",
     "scripts/nexus-v010-endurance-gate",

@@ -14,6 +14,20 @@ make_base_tools() {
     source=$(command -v "$tool")
     ln -s "$source" "$destination/$tool"
   done
+  cat >"$destination/codesign" <<'SH'
+#!/usr/bin/env sh
+printf 'codesign %s\n' "$*" >>"$NEXUS_TEST_TOOL_LOG"
+case "$1" in
+  --verify)
+    [ "${NEXUS_TEST_SIGN_MODE:-}" != verify-fail ] || exit 74
+    [ "${NEXUS_TEST_SIGN_MODE:-}" = valid ] || [ -f "$NEXUS_TEST_TOOL_LOG.signed" ] ;;
+  --force)
+    [ "${NEXUS_TEST_SIGN_MODE:-}" != sign-fail ] || exit 73
+    : >"$NEXUS_TEST_TOOL_LOG.signed" ;;
+  *) exit 75 ;;
+esac
+SH
+  chmod +x "$destination/codesign"
 }
 
 write_uname() {
@@ -137,10 +151,30 @@ cmp "$TMP/darwin-x64" "$TMP/darwin-x64.original"
 test "$(cat "$APPLE_STAGED")" = 'MACHO-SANITIZED'
 grep -Fq 'apple-strip -u -r' "$TMP/tool.log"
 grep -Fq 'apple-nm -a' "$TMP/tool.log"
+grep -Fq 'codesign --force --sign - --timestamp=none' "$TMP/tool.log"
+test "$(grep -c '^codesign --verify --strict' "$TMP/tool.log")" -eq 2
 if grep -Fq 'llvm-' "$TMP/tool.log"; then
   echo "Darwin host must prefer the Apple Mach-O tools" >&2
   exit 1
 fi
+
+for sign_mode in valid sign-fail verify-fail missing; do
+  make_base_tools "$TMP/sign-$sign_mode-tools"
+  write_uname "$TMP/sign-$sign_mode-tools" Darwin
+  cp "$TMP/apple-tools/xcrun" "$TMP/sign-$sign_mode-tools/xcrun"
+  if [ "$sign_mode" = missing ]; then rm "$TMP/sign-$sign_mode-tools/codesign"; fi
+  : >"$TMP/tool.log"; rm -f "$TMP/tool.log.signed"
+  if NEXUS_TEST_SIGN_MODE="$sign_mode" NEXUS_TEST_APPLE_TOOLS="$TMP/apple-xcode" \
+    pack_with_evidence "$TMP/sign-$sign_mode-tools" darwin-x64 "$TMP/darwin-x64" "$TMP/sign-$sign_mode-pack" \
+    >"$TMP/sign-$sign_mode.out" 2>"$TMP/sign-$sign_mode.err"; then
+    test "$sign_mode" = valid || { echo "$sign_mode signature failure must refuse publication" >&2; exit 1; }
+    if grep -Fq 'codesign --force' "$TMP/tool.log"; then echo "valid signature must not be replaced" >&2; exit 1; fi
+  else
+    test "$sign_mode" != valid
+    grep -Eq 'codesign|ad-hoc|signature' "$TMP/sign-$sign_mode.err"
+    test ! -e "$TMP/sign-$sign_mode-pack/native/darwin-x64/nexus"
+  fi
+done
 
 printf '%s\n' \
   'MACHO-RUST_SYMBOL /Users/private-builder/Projects/egregore-nexus' \

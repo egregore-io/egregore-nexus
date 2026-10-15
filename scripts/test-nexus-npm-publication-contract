@@ -35,8 +35,9 @@ fi
 grep -Fq '| Linux x64 | Release baseline |' "$ROOT/docs/distribution.md"
 grep -Fq '| Windows x64 | Release baseline |' "$ROOT/docs/distribution.md"
 grep -Fq '| WSL | Release baseline |' "$ROOT/docs/distribution.md"
-grep -Fq '| macOS x64 | Unsupported in beta.5 |' "$ROOT/docs/distribution.md"
-grep -Fq '| macOS arm64 | Unsupported in beta.5 |' "$ROOT/docs/distribution.md"
+grep -Fq '| macOS x64 | Experimental install/version only |' "$ROOT/docs/distribution.md"
+grep -Fq '| macOS arm64 | Experimental install/version only |' "$ROOT/docs/distribution.md"
+grep -Fq 'runtime unqualified' "$ROOT/docs/distribution.md"
 
 node - "$ROOT" <<'NODE'
 const fs = require("node:fs");
@@ -62,8 +63,10 @@ for (const pkg of packages) {
   }
 }
 const [all, cli, gateway] = packages;
-if (JSON.stringify(cli.os) !== JSON.stringify(["linux", "win32"])) {
-  throw new Error("@egregore/nexus-cli: beta.5 must reject unsupported macOS installs");
+for (const pkg of [all, cli]) {
+  if (JSON.stringify(pkg.os) !== JSON.stringify(["linux", "win32", "darwin"])) {
+    throw new Error(`${pkg.name}: native macOS installation must be offered explicitly`);
+  }
 }
 const expectedAll = {
   "@egregore/nexus-cli": version,
@@ -140,12 +143,25 @@ if grep -Fq 'release/v0.1.2-artifacts' "$WORKFLOW"; then
   echo "native artifacts must build from canonical main, not a release-only branch" >&2
   exit 1
 fi
-for target in linux-x64-gnu linux-arm64-gnu win32-x64-msvc; do
+for target in linux-x64-gnu linux-arm64-gnu win32-x64-msvc darwin-arm64 darwin-x64; do
   grep -q "$target" "$WORKFLOW"
 done
-if grep -Eq 'darwin-(x64|arm64)' "$WORKFLOW"; then
-  echo "beta.5 artifact workflow must not offer unsupported macOS binaries" >&2
-  exit 1
+grep -Fq 'runner: macos-15' "$WORKFLOW"
+grep -Fq 'runner: macos-15-intel' "$WORKFLOW"
+grep -Fq 'rust_target: aarch64-apple-darwin' "$WORKFLOW"
+grep -Fq 'rust_target: x86_64-apple-darwin' "$WORKFLOW"
+grep -Fq 'needs: npm-tarballs' "$WORKFLOW"
+grep -Fq -- '--mode candidate' "$WORKFLOW"
+for target in darwin-arm64 darwin-x64; do
+  grep -Fq "test -x packages/nexus-cli/native/$target/nexus" "$WORKFLOW"
+  grep -Fq "native/$target/nexus' dist/npm-cli-contents.txt" "$WORKFLOW"
+done
+REGISTRY_WORKFLOW="$ROOT/.github/workflows/npm-macos-install-smoke.yml"
+grep -Fq 'workflow_dispatch:' "$REGISTRY_WORKFLOW"
+grep -Fq -- '--mode registry' "$REGISTRY_WORKFLOW"
+grep -Fq -- '--selector' "$REGISTRY_WORKFLOW"
+if grep -Eq 'npm (publish|dist-tag)' "$REGISTRY_WORKFLOW"; then
+  echo "macOS registry smoke must not publish packages" >&2; exit 1
 fi
 
 STORE_MANIFEST="$ROOT/core/crates/nexus-store/Cargo.toml"
