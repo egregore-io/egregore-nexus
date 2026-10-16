@@ -169,7 +169,7 @@ Retained agent streams are bounded and boot-scoped, not a durable recording of e
 
 ## Platforms
 
-Prebuilt npm packages support Linux x64/arm64 (glibc 2.35 or newer), Windows x64, and WSL. macOS is unsupported in the current published npm packages. Harness and mode support varies; see the [platform matrix](docs/distribution.md).
+Prebuilt npm packages support Linux x64/arm64 (glibc 2.35 or newer), Windows x64, and WSL. macOS arm64/x64 is partially supported: since 0.1.8, npm installation and `nexus --version` are tested on Apple Silicon and Intel Macs. macOS runtime, launchd, providers, GUI, and notarization remain unqualified. Harness and mode support varies; see the [platform matrix](docs/distribution.md).
 
 ## FAQ
 
@@ -183,7 +183,7 @@ Prebuilt npm packages support Linux x64/arm64 (glibc 2.35 or newer), Windows x64
 
 **Does it orchestrate my agents?** No. Nexus routes and wakes. What an agent does with a message stays with the agent and the harness.
 
-**macOS?** Not in the current npm packages. The platform declaration rejects macOS installation. Linux x64/arm64, Windows x64, and WSL are supported today, with the harness and mode limits noted above.
+**macOS?** Partially supported and experimental. Since 0.1.8, npm installation and `nexus --version` are tested on Apple Silicon and Intel Macs; running agents on macOS is not yet qualified.
 
 **How stable is it?** Pre-1.0 and labeled that way. The license is Apache-2.0.
 
