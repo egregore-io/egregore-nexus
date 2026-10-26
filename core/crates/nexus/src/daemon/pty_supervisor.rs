@@ -1838,7 +1838,15 @@ impl PtySupervisor {
         let session_dir = std::path::PathBuf::from(state_dir)
             .join("codex-sessions")
             .join(session.0.as_str());
-        std::fs::create_dir_all(&session_dir)
+        let mut session_dir_builder = std::fs::DirBuilder::new();
+        session_dir_builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            session_dir_builder.mode(0o700);
+        }
+        session_dir_builder
+            .create(&session_dir)
             .map_err(|e| PtyError::Io(format!("create session_dir {session_dir:?}: {e}")))?;
 
         let opts = SupervisorOpts {

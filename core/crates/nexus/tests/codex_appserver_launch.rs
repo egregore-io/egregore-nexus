@@ -158,6 +158,144 @@ fn write_fake_codex_command(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 #[cfg(unix)]
+#[test]
+fn headed_codex_session_directory_is_private_under_shared_umask() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const FIXTURE: &str = "NEXUS_CODEX_DIRECTORY_MODE_FIXTURE";
+    let Some(root) = std::env::var_os(FIXTURE).map(std::path::PathBuf::from) else {
+        let root = tempfile::Builder::new()
+            .prefix("nx-mode-")
+            .tempdir()
+            .unwrap();
+        // Set umask before exec, never in the parallel test harness. This subprocess runs only
+        // this test, with fixture-owned homes and no inherited provider or Nexus configuration.
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", "umask 0002; exec \"$@\"", "codex-mode-test"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "headed_codex_session_directory_is_private_under_shared_umask",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", root.path().join("home"))
+            .env("CODEX_HOME", root.path().join("home/.codex"))
+            .env("NEXUS_HOME", root.path().join("nexus-home"))
+            .env("NEXUS_NO_AUTOSTART", "1")
+            .env(FIXTURE, root.path())
+            .output()
+            .expect("run isolated directory-mode regression");
+        assert!(
+            output.status.success(),
+            "isolated headed Codex launch failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    };
+
+    // Only the isolated subprocess reaches this guard. Kill every fixture-owned transport,
+    // then reap its direct children (including the raw-PTY viewer) even if an assertion panics.
+    struct OwnedLaunch(PtySupervisor);
+    impl Drop for OwnedLaunch {
+        fn drop(&mut self) {
+            self.0.kill_all();
+            let mut status = 0;
+            loop {
+                // SAFETY: waitpid(-1) waits only for this isolated test process's own children;
+                // all its fixture transports have just been killed, and no host daemon is used.
+                let result = unsafe { libc::waitpid(-1, &mut status, 0) };
+                if result < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    let bin = root.join("bin");
+    let cwd = root.join("work");
+    let state = root.join("state");
+    let parent = state.join("codex-sessions");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o775)).unwrap();
+    let fake_codex = bin.join("codex");
+    // exec keeps each fake to one directly owned child; there are no shell-loop descendants.
+    std::fs::write(
+        &fake_codex,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = app-server ]; then exec '{}' \"$@\"; fi\nexec sleep 300\n",
+            FAKE_BIN,
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _runtime = runtime.enter();
+
+    for (name, existing_mode, expected_mode) in [
+        ("new", None, 0o700),
+        ("existing-private", Some(0o700), 0o700),
+        ("existing-shared", Some(0o775), 0o775),
+    ] {
+        let session = SessionId(format!("s_{name}"));
+        let leaf = parent.join(&session.0);
+        if let Some(mode) = existing_mode {
+            std::fs::create_dir(&leaf).unwrap();
+            std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let owner = OwnedLaunch(PtySupervisor::new());
+        let launched = runtime.block_on(owner.0.launch_codex_appserver(
+            &session,
+            "a_directory_mode",
+            Some("directory-mode"),
+            "default",
+            "fixture-client-key",
+            "nexus",
+            cwd.to_str().unwrap(),
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            Arc::new(RecSink::default()),
+            fake_codex.to_str().unwrap(),
+            None,
+            state.to_str().unwrap(),
+            None,
+            Vec::new(),
+            &[],
+            None,
+            "pty",
+            None,
+        ));
+        let leaf_mode = std::fs::metadata(&leaf).unwrap().permissions().mode() & 0o777;
+        let parent_mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+        let backend = owner.0.pty_backend_kind(&session);
+        drop(owner);
+        launched.expect("actual headed Codex production launch with hermetic fake");
+        assert_eq!(backend, Some("raw"));
+        assert_eq!(
+            parent_mode, 0o775,
+            "preexisting parent must remain unchanged"
+        );
+        assert_eq!(
+            format!("{leaf_mode:04o}"),
+            format!("{expected_mode:04o}"),
+            "{name} session leaf mode under umask 0002",
+        );
+    }
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn fresh_headed_codex_launch_persists_discovered_thread_in_resurrection_capsule() {
     let root = std::env::temp_dir().join(format!(

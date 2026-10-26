@@ -11,6 +11,11 @@
   packages. Builds never publish automatically; public exact-version qualification must
   precede manual `latest` promotion and bare-install checks.
 
+### Fixed
+
+- Create new Unix Codex app-server session directories with private permissions,
+  allowing launch under a group-writable umask without changing existing directories.
+
 ## [0.1.7] - 2026-10-08
 
 ### Fixed
