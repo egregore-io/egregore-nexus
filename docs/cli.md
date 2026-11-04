@@ -78,6 +78,12 @@ Important launch rules:
 - Nexus launch flags precede the harness name. Arguments after the harness name belong to the
   harness, and any such tail forces the headed path; `--headless` with a tail is rejected.
 - `--initial-prompt` is fresh-launch only and cannot be combined with a resume/reuse tail.
+- Fresh headed Codex sends `Connected to Nexus.` as its initial user prompt before attaching
+  the viewer. `--initial-prompt` replaces that default; Nexus never sends both. This is a real
+  model turn, so native authentication and provider availability can affect startup. The viewer
+  waits for readable saved history on that same thread (up to 30 seconds after initial delivery);
+  failure stops startup without attaching or resending the prompt. Resume/revive and existing
+  sessions receive no boot prompt; headless ACP is unchanged. No thread name is set automatically.
 - Managed revival preserves the durable Nexus identity, harness, mode, backend, working directory,
   and exact native resume correlation where the harness exposes one.
 

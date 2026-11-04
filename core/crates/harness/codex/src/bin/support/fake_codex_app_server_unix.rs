@@ -213,8 +213,33 @@ where
         };
 
         let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+        if let Ok(path) = std::env::var("FAKE_CODEX_REQUEST_LOG") {
+            use std::io::Write as _;
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?,
+                "{req}"
+            )?;
+        }
 
         match method {
+            "thread/read" => {
+                let result = if let Ok(path) = std::env::var("FAKE_CODEX_SAVED_READ") {
+                    match std::fs::read_to_string(path) {
+                        Ok(raw) => serde_json::from_str::<Value>(&raw)?,
+                        Err(_) => {
+                            let _ =
+                                out_tx.send(error_frame(&id, "no rollout found for thread", None));
+                            continue;
+                        }
+                    }
+                } else {
+                    json!({"thread":{"id":req["params"]["threadId"],"path":"/fixture/rollout.jsonl","ephemeral":false,"turns":[{"id":"t1","items":[]}]}})
+                };
+                let _ = out_tx.send(response_frame(&id, result));
+            }
             "initialize" => {
                 static PROBE_GATE_USED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);

@@ -62,6 +62,47 @@ use crate::harness_registry::harness_registry_by_id;
 const OPENCODE_PLUGIN_READY_TIMEOUT: Duration = Duration::from_secs(75);
 const OPENCODE_PLUGIN_READY_POLL: Duration = Duration::from_millis(200);
 
+/// Dropping a fresh launch before viewer attachment retires only its captured native owner.
+struct PendingCodexViewer {
+    bridge: CodexBridge,
+    session: SessionId,
+    binding: Option<nexus_harness_codex::app_server::transport::CodexViewerReadiness>,
+}
+
+impl Drop for PendingCodexViewer {
+    fn drop(&mut self) {
+        if let Some(binding) = &self.binding {
+            self.bridge.kill_pending_viewer(&self.session, binding);
+        }
+    }
+}
+
+type CodexBeforeViewer<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>;
+
+#[derive(Debug, Clone, Copy)]
+enum CodexLaunchCleanup {
+    Session,
+    CapturedNative,
+}
+
+/// A headed launch failure retains its cleanup boundary across AppState bookkeeping awaits.
+/// After native capture, the pending-viewer guard exclusively owns physical retirement;
+/// session-addressed teardown could instead kill or release a replacement owner.
+#[derive(Debug, thiserror::Error)]
+#[error("{cause}")]
+pub struct CodexLaunchFailure {
+    #[source]
+    cause: PtyError,
+    cleanup: CodexLaunchCleanup,
+}
+
+impl CodexLaunchFailure {
+    pub fn requires_session_cleanup(&self) -> bool {
+        matches!(self.cleanup, CodexLaunchCleanup::Session)
+    }
+}
+
 fn opencode_viewer_backend_kind(viewer_backend: &str) -> Result<&'static str, PtyError> {
     match viewer_backend {
         "pty" => Ok("raw"),
@@ -1724,7 +1765,9 @@ impl PtySupervisor {
         on_thread_discovered: Option<ThreadDiscovered>,
         viewer_backend: &str,
         model_reporting: Option<nexus_agent::adapter::NativeModelReporting>,
-    ) -> Result<(), PtyError> {
+        before_viewer: Option<CodexBeforeViewer<'_>>,
+    ) -> Result<(), CodexLaunchFailure> {
+        let mut cleanup = CodexLaunchCleanup::Session;
         self.start_codex_appserver_session(
             session,
             agent_id,
@@ -1745,8 +1788,11 @@ impl PtySupervisor {
             false,
             viewer_backend,
             model_reporting,
+            before_viewer,
+            &mut cleanup,
         )
         .await
+        .map_err(|cause| CodexLaunchFailure { cause, cleanup })
     }
 
     /// REVIVE a headed codex app-server session under the SAME Nexus [`SessionId`]. A live
@@ -1777,6 +1823,7 @@ impl PtySupervisor {
         if !self.codex_bridge.has(session) {
             self.kill(session);
         }
+        let mut cleanup = CodexLaunchCleanup::Session;
         self.start_codex_appserver_session(
             session,
             agent_id,
@@ -1797,6 +1844,8 @@ impl PtySupervisor {
             false,
             viewer_backend,
             model_reporting,
+            None,
+            &mut cleanup,
         )
         .await
     }
@@ -1823,6 +1872,8 @@ impl PtySupervisor {
         force_fresh_app_server: bool,
         viewer_backend: &str,
         model_reporting: Option<nexus_agent::adapter::NativeModelReporting>,
+        before_viewer: Option<CodexBeforeViewer<'_>>,
+        cleanup: &mut CodexLaunchCleanup,
     ) -> Result<(), PtyError> {
         let launch_label = name.unwrap_or(agent_id);
         // The daemon has already reserved and registered this runtime. Install the model-facing
@@ -1886,20 +1937,63 @@ impl PtySupervisor {
             .bound_thread_id(session)
             .or(known_thread_id.clone());
 
+        // AppState owns prompt policy/delivery. Capture this native owner before allowing its
+        // ordinary initial turn, then prove saved history is readable before attaching the TUI.
+        let mut pending = PendingCodexViewer {
+            bridge: self.codex_bridge.clone(),
+            session: session.clone(),
+            binding: None,
+        };
+        if let Some(before_viewer) = before_viewer {
+            let binding = self
+                .codex_transport()
+                .capture_viewer_readiness(session)
+                .map_err(|e| PtyError::Spawn(e.message))?;
+            pending.binding = Some(binding);
+            *cleanup = CodexLaunchCleanup::CapturedNative;
+            pending
+                .binding
+                .as_ref()
+                .unwrap()
+                .run_initial_prompt(before_viewer)
+                .await
+                .map_err(PtyError::Spawn)?;
+            pending
+                .binding
+                .as_ref()
+                .unwrap()
+                .wait_saved(Duration::from_secs(30))
+                .await
+                .map_err(|e| PtyError::Spawn(e.message))?;
+        }
+        let tui_thread_id = pending
+            .binding
+            .as_ref()
+            .map(|binding| binding.thread_id().to_owned())
+            .or(tui_thread_id);
+
         let session_name = self.tmux_backend.session_name(session);
         if viewer_backend == "tmux" && force_fresh_app_server {
             self.tmux_backend.kill_if_exists(session);
         }
         if viewer_backend == "tmux" && self.tmux_backend.session_exists(session) {
-            let harness = self.tmux_backend.adopt(session, cwd)?;
             let tmux_socket = self.tmux_backend.socket_path_for_session(session);
-            self.bind_tmux_backend(session, harness)?;
             self.persist_codex_tmux_state(
                 session,
                 Some(&tmux_socket.to_string_lossy()),
                 &session_name,
             )
             .await?;
+            let adopt = || {
+                let harness = self.tmux_backend.adopt(session, cwd)?;
+                self.bind_tmux_backend(session, harness)
+            };
+            match &pending.binding {
+                Some(binding) => binding
+                    .with_current(adopt)
+                    .map_err(|e| PtyError::Spawn(e.message))??,
+                None => adopt()?,
+            }
         } else {
             // Launch the human TUI against the same local app-server endpoint.
             let sock_str = sock_path.to_string_lossy();
@@ -1924,22 +2018,41 @@ impl PtySupervisor {
             let args: Vec<String> = argv.into_iter().skip(1).collect();
             let env = codex_appserver_env(session, agent_id, name, project, client_key, nexus_exe);
             if viewer_backend == "tmux" {
-                let harness = self
-                    .tmux_backend
-                    .launch(session, &prog, &args, cwd, size, &env)?;
+                // Persist deterministic viewer metadata before spawning. There must be no await
+                // between the owner-fenced spawn/bind and disarming pending-launch cleanup.
+                let tmux_socket = self.tmux_backend.socket_path_for_session(session);
                 self.persist_codex_tmux_state(
                     session,
-                    Some(&harness.socket_path().to_string_lossy()),
-                    harness.session_name(),
+                    Some(&tmux_socket.to_string_lossy()),
+                    &session_name,
                 )
                 .await?;
-                self.bind_tmux_backend(session, harness)?;
+                let launch = || {
+                    let harness = self
+                        .tmux_backend
+                        .launch(session, &prog, &args, cwd, size, &env)?;
+                    self.bind_tmux_backend(session, harness)
+                };
+                match &pending.binding {
+                    Some(binding) => binding
+                        .with_current(launch)
+                        .map_err(|e| PtyError::Spawn(e.message))??,
+                    None => launch()?,
+                }
             } else {
                 self.clear_codex_tmux_state(session).await?;
-                self.launch_codex_remote_raw_pty(session, &prog, &args, cwd, size, &env)?;
+                let launch =
+                    || self.launch_codex_remote_raw_pty(session, &prog, &args, cwd, size, &env);
+                match &pending.binding {
+                    Some(binding) => binding
+                        .with_current(launch)
+                        .map_err(|e| PtyError::Spawn(e.message))??,
+                    None => launch()?,
+                }
             }
         }
 
+        pending.binding = None;
         Ok(())
     }
 

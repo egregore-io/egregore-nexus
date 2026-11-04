@@ -13,8 +13,9 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::jsonrpc::{CodexRpcError, JsonRpc, Notification};
 use super::protocol::{
-    initialize_params, method, thread_compact_params, thread_resume_params, thread_start_params,
-    turn_interrupt_params, turn_start_params, turn_steer_params,
+    initialize_params, method, thread_compact_params, thread_read_saved_params,
+    thread_resume_params, thread_start_params, turn_interrupt_params, turn_start_params,
+    turn_steer_params,
 };
 use super::turn_completion::CodexTurnTracker;
 
@@ -140,6 +141,15 @@ impl CodexAppServerClient {
             }
             None => self.rpc.request(method, params).await,
         }
+    }
+
+    /// Read saved thread history without attaching, changing setup ownership, or starting a turn.
+    /// Native includeTurns reads load history from the thread store even for a loaded thread;
+    /// a metadata-only read can succeed before a fresh thread has materialized.
+    pub async fn thread_read_saved(&self, thread_id: &str) -> Result<Value, CodexRpcError> {
+        self.rpc
+            .request(method::THREAD_READ, thread_read_saved_params(thread_id))
+            .await
     }
 
     /// Start a new thread and return its thread id.

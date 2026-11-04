@@ -56,6 +56,7 @@ pub mod method {
     pub const INITIALIZE: &str = "initialize";
     pub const THREAD_START: &str = "thread/start";
     pub const THREAD_RESUME: &str = "thread/resume";
+    pub const THREAD_READ: &str = "thread/read";
     pub const TURN_START: &str = "turn/start";
     /// Append user input to the currently active regular turn.
     pub const TURN_STEER: &str = "turn/steer";
@@ -141,6 +142,12 @@ pub fn thread_resume_params(thread_id: &str, cwd: Option<&str>) -> Value {
         params["cwd"] = Value::String(cwd.to_string());
     }
     params
+}
+
+/// Read persisted history rather than an in-memory metadata-only snapshot. This request does
+/// not attach to the thread and intentionally carries no permission or configuration overrides.
+pub fn thread_read_saved_params(thread_id: &str) -> Value {
+    json!({ "threadId": thread_id, "includeTurns": true })
 }
 
 /// Build params for `turn/start`.

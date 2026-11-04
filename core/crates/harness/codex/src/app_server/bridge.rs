@@ -290,6 +290,26 @@ impl CodexBridge {
         true
     }
 
+    /// Retire only the captured pending viewer's owner, never a replacement runtime binding.
+    pub fn kill_pending_viewer(
+        &self,
+        session: &SessionId,
+        binding: &super::transport::CodexViewerReadiness,
+    ) {
+        let mut handles = self.handles.lock().unwrap();
+        if !binding.is_current() {
+            return;
+        }
+        self.transport.unbind(session);
+        self.transport.unmark_live(session);
+        if let Some(mut handle) = handles.remove(session) {
+            if let Some(forwarder) = handle.forwarder.take() {
+                forwarder.abort();
+            }
+            handle.lifecycle.retire(handle.server);
+        }
+    }
+
     /// Remove every tracked session, abort all forwarders, unbind injection, and asynchronously
     /// shut down every app-server subprocess. Returns the number of handles removed.
     pub fn kill_all(&self) -> usize {

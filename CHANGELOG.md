@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Materialize fresh headed Codex threads with the initial user turn before attaching the viewer,
+  avoiding premature native resume failures. The default is `Connected to Nexus.`; an explicit
+  `--initial-prompt` replaces it. Startup now depends on that real model turn and bounded saved-history
+  readiness; existing/resumed sessions and headless ACP do not receive the default.
+
 ## [0.1.8] - Unreleased
 
 ### Added

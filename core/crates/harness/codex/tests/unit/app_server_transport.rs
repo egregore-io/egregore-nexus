@@ -5,6 +5,120 @@ use nexus_contracts::ids::SessionId;
 use std::sync::Arc;
 
 #[tokio::test]
+async fn saved_read_readiness_never_follows_replacement_and_bounds_stalled_rpc() {
+    use futures::{SinkExt, StreamExt};
+    use serde_json::json;
+    use tokio_tungstenite::tungstenite::Message;
+    let path = std::env::temp_dir().join(format!("codex-saved-read-{}.sock", uuid_for_test()));
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = tokio::spawn({
+        let entered = entered.clone();
+        let calls = calls.clone();
+        async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let entered = entered.clone();
+                let calls = calls.clone();
+                connections.spawn(async move {
+                    let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    while let Some(Ok(Message::Text(text))) = ws.next().await {
+                        let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        let Some(id) = request.get("id") else {
+                            continue;
+                        };
+                        calls.lock().unwrap().push(request["method"].clone());
+                        if request["method"] == "thread/read" {
+                            assert_eq!(request["params"]["includeTurns"], true);
+                            entered.notify_one();
+                            continue; // Never reply: the launch must still honor its one deadline.
+                        }
+                        ws.send(Message::Text(
+                            json!({"id":id,"result":{}}).to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                    }
+                });
+            }
+        }
+    });
+    let transport = CodexAppServerTransport::new();
+    let session = SessionId("saved-read-owner".into());
+    let first = Arc::new(CodexAppServerClient::connect(&path, "first").await.unwrap());
+    transport.bind(session.clone(), first, "same-thread".into());
+    let captured = transport.capture_viewer_readiness(&session).unwrap();
+    let waiting = captured.wait_saved(std::time::Duration::from_secs(30));
+    tokio::pin!(waiting);
+    tokio::select! {
+        _ = &mut waiting => panic!("read RPC is held"),
+        _ = entered.notified() => {}
+    }
+    let second = Arc::new(
+        CodexAppServerClient::connect(&path, "second")
+            .await
+            .unwrap(),
+    );
+    transport.bind(session.clone(), second, "same-thread".into());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiting)
+            .await
+            .unwrap()
+            .is_err()
+    );
+    let mut attached = false;
+    assert!(captured.with_current(|| attached = true).is_err());
+    assert!(
+        !attached,
+        "retired owner cannot spawn a viewer for its successor"
+    );
+    let boot = captured
+        .run_initial_prompt(transport.prompt(&session, "stale boot".into()))
+        .await;
+    assert!(
+        boot.is_err(),
+        "a stale ordinary boot callback must not deliver to the successor"
+    );
+    assert!(
+        !calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|method| method == "turn/start"),
+        "scoped boot sent no successor native request"
+    );
+    let current = transport.capture_viewer_readiness(&session).unwrap();
+    let error = current
+        .wait_saved(std::time::Duration::from_millis(20))
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("saved") && error.message.contains("same-thread"));
+    assert!(
+        current.is_current(),
+        "a read timeout does not revoke a successor"
+    );
+    transport
+        .prompt(&session, "ordinary successor prompt".into())
+        .await
+        .unwrap();
+    let methods = calls.lock().unwrap().clone();
+    assert_eq!(methods.iter().filter(|v| **v == "thread/read").count(), 2);
+    assert!(!methods
+        .iter()
+        .any(|v| v == "thread/resume" || v == "thread/name/set"));
+    assert_eq!(
+        methods.iter().filter(|v| **v == "turn/start").count(),
+        1,
+        "outside-scope successor prompt remains unchanged"
+    );
+    transport.unbind(&session);
+    server.abort();
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn revoked_during_initialize_cannot_admit_thread_setup() {
     use futures::{SinkExt, StreamExt};
     use serde_json::json;

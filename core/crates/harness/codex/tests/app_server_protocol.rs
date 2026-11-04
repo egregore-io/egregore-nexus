@@ -1,7 +1,19 @@
 use nexus_harness_codex::app_server::protocol::{
-    initialize_params, method, thread_compact_params, thread_id_of, thread_resume_params,
-    thread_start_params, turn_interrupt_params, turn_start_params, turn_steer_params,
+    initialize_params, method, thread_compact_params, thread_id_of, thread_read_saved_params,
+    thread_resume_params, thread_start_params, turn_interrupt_params, turn_start_params,
+    turn_steer_params,
 };
+
+#[test]
+fn saved_thread_read_requests_history_without_setup_or_permission_overrides() {
+    assert_eq!(method::THREAD_READ, "thread/read");
+    assert_eq!(
+        thread_read_saved_params("saved-thread"),
+        serde_json::json!({
+            "threadId":"saved-thread", "includeTurns":true
+        })
+    );
+}
 
 #[test]
 fn thread_resume_params_can_include_cwd_override() {

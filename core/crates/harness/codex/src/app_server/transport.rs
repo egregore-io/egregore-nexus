@@ -55,6 +55,109 @@ struct Binding {
     start_lock: Arc<AsyncMutex<()>>,
 }
 
+tokio::task_local! {
+    // Rejection fence only: ordinary delivery still resolves its normal transport. The scope
+    // stays on this awaited task and is not inherited by spawned or detached work.
+    static CODEX_BOOT_OWNER: (CodexAppServerTransport, SessionId, CodexTurnTracker);
+}
+
+/// Exact native owner captured before a fresh headed boot turn. Never follows a replacement
+/// binding with the same runtime or thread id across an await.
+pub struct CodexViewerReadiness {
+    transport: CodexAppServerTransport,
+    session: SessionId,
+    binding: Binding,
+}
+
+impl CodexViewerReadiness {
+    /// Await ordinary AppState boot delivery without creating detached work.
+    pub async fn run_initial_prompt<T>(&self, future: impl std::future::Future<Output = T>) -> T {
+        CODEX_BOOT_OWNER
+            .scope(
+                (
+                    self.transport.clone(),
+                    self.session.clone(),
+                    self.binding.tracker.clone(),
+                ),
+                future,
+            )
+            .await
+    }
+    /// Fence a synchronous viewer mutation with the same lock used to replace or retire owners.
+    pub fn with_current<T>(&self, f: impl FnOnce() -> T) -> PortResult<T> {
+        let sessions = self.transport.sessions.lock().unwrap();
+        let current = sessions.get(&self.session).is_some_and(|slot| {
+            slot.candidate.is_none()
+                && slot
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.tracker.same_owner(&self.binding.tracker))
+        });
+        if !current || self.binding.tracker.is_revoked() {
+            return Err(binding_revoked());
+        }
+        Ok(f())
+    }
+    pub fn is_current(&self) -> bool {
+        !self.binding.tracker.is_revoked()
+            && self
+                .transport
+                .owns_binding(&self.session, &self.binding.tracker)
+    }
+
+    pub fn thread_id(&self) -> &str {
+        &self.binding.thread_id
+    }
+
+    pub fn ensure_current(&self) -> PortResult<()> {
+        if self.is_current() {
+            Ok(())
+        } else {
+            Err(binding_revoked())
+        }
+    }
+
+    /// One deadline bounds all read attempts (including an unresponsive RPC). A matching,
+    /// non-ephemeral native thread with saved history and a rollout path is resumable by the TUI.
+    pub async fn wait_saved(&self, timeout: Duration) -> PortResult<()> {
+        self.ensure_current()?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut last = "saved history not readable".to_string();
+        loop {
+            let read = tokio::select! {
+                _ = self.binding.tracker.revoked() => return Err(binding_revoked()),
+                result = tokio::time::timeout_at(deadline, self.binding.client.thread_read_saved(self.thread_id())) => result,
+            };
+            self.ensure_current()?;
+            match read {
+                Ok(Ok(value)) => {
+                    let thread = &value["thread"];
+                    if thread["id"].as_str() == Some(self.thread_id())
+                        && thread["ephemeral"].as_bool() == Some(false)
+                        && thread["path"].as_str().is_some_and(|path| !path.is_empty())
+                        && thread["turns"]
+                            .as_array()
+                            .is_some_and(|turns| !turns.is_empty())
+                    {
+                        return Ok(());
+                    }
+                    last = "native saved-history response did not match the captured thread".into();
+                }
+                Ok(Err(error)) => last = error.to_string(),
+                Err(_) => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ContractError { code: -32004, message: format!(
+                    "timed out waiting for saved Codex history for thread {} (runtime {}): {last}", self.thread_id(), self.session.0) });
+            }
+            tokio::select! {
+                _ = self.binding.tracker.revoked() => return Err(binding_revoked()),
+                _ = tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_millis(100))) => {}
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct SessionSlot {
     binding: Option<Binding>,
@@ -106,6 +209,16 @@ fn os_pid_alive(pid: u32) -> bool {
 }
 
 impl CodexAppServerTransport {
+    pub fn capture_viewer_readiness(
+        &self,
+        session: &SessionId,
+    ) -> PortResult<CodexViewerReadiness> {
+        Ok(CodexViewerReadiness {
+            transport: self.clone(),
+            session: session.clone(),
+            binding: self.client_for(session)?,
+        })
+    }
     /// Execute without awaiting only when this exact captured reporting owner is still bound.
     pub fn with_current_model_binding<T>(
         &self,
@@ -731,7 +844,8 @@ impl CodexAppServerTransport {
 
     fn client_for(&self, recipient: &SessionId) -> PortResult<Binding> {
         let map = self.sessions.lock().unwrap();
-        map.get(recipient)
+        let binding = map
+            .get(recipient)
             .and_then(|slot| slot.binding.clone())
             .ok_or_else(|| ContractError {
                 code: -32004,
@@ -739,7 +853,19 @@ impl CodexAppServerTransport {
                     "no codex app-server client bound for session {}",
                     recipient.0
                 ),
+            })?;
+        let mismatched_boot_owner = CODEX_BOOT_OWNER
+            .try_with(|(transport, session, owner)| {
+                session != recipient
+                    || !Arc::ptr_eq(&transport.sessions, &self.sessions)
+                    || !owner.same_owner(&binding.tracker)
+                    || owner.is_revoked()
             })
+            .unwrap_or(false);
+        if mismatched_boot_owner {
+            return Err(binding_revoked());
+        }
+        Ok(binding)
     }
 }
 

@@ -93,6 +93,10 @@ nexus launch claude
 
 No name is required. An agent can choose its own name with `nexus rename <name>`. You can also launch Codex, OpenCode, or Hermes. Run `nexus members` in another terminal to see the available names and identities.
 
+Fresh headed Codex sends the real initial user turn `Connected to Nexus.` before opening its
+viewer; `--initial-prompt` replaces that default. See [launch rules](docs/cli.md) for startup and
+resume behavior.
+
 For a pair with explicit names:
 
 ```bash
