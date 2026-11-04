@@ -430,11 +430,17 @@ impl AppState {
                 req.role.clone(),
                 Some(cwd.clone()),
             );
-            let prepared = match req.initial_prompt.as_deref() {
+            // A fresh headed native thread is not resumable until its first real user turn.
+            // Explicit prompts replace the default, including retaining empty-template errors.
+            let initial_prompt = req
+                .initial_prompt
+                .as_deref()
+                .or_else(|| req.resume.is_none().then_some("Connected to Nexus."));
+            let prepared = match initial_prompt {
                 Some(template) => self.prepare_initial_prompt(&registered, template).await?,
                 None => None,
             };
-            if req.initial_prompt.is_some() {
+            if initial_prompt.is_some() {
                 self.register_prepared_initial_prompt_runtime(
                     &registered,
                     &client_key,
@@ -503,28 +509,35 @@ impl AppState {
                     Some(self.codex_thread_persistence_callback()),
                     req.resolved_backend(self.launch_backend_default()),
                     Some(model_observation.reporting()),
+                    prepared.map(|prepared| {
+                        Box::pin(async {
+                            self.deliver_prepared_initial_prompt(&registered, prepared)
+                                .await
+                                .map_err(|error| error.message)
+                        })
+                            as std::pin::Pin<
+                                Box<dyn std::future::Future<Output = Result<(), String>> + Send>,
+                            >
+                    }),
                 )
-                .await
-                .map_err(|e| nexus_contracts::ContractError {
+                .await;
+            if let Err(failure) = launch_result {
+                let session_cleanup = failure.requires_session_cleanup();
+                let error = nexus_contracts::ContractError {
                     code: -32004,
-                    message: format!("codex app-server launch failed: {e}"),
-                });
-            if let Err(error) = launch_result {
-                if req.initial_prompt.is_some() {
+                    message: format!("codex app-server launch failed: {failure}"),
+                };
+                if initial_prompt.is_some() {
                     self.mark_initial_prompt_failed(&registered, &error.message)
                         .await;
                 }
-                self.fail_initial_prompt_runtime(&registered).await;
-                return Err(error);
-            }
-            if let Some(prepared) = prepared {
-                if let Err(error) = self
-                    .deliver_prepared_initial_prompt(&registered, prepared)
-                    .await
-                {
+                // Native-captured failures already retire their exact owner in the supervisor.
+                // Never follow bookkeeping awaits with session-wide teardown in that category:
+                // a successor may already own the transport, presence and native state rows.
+                if session_cleanup {
                     self.fail_initial_prompt_runtime(&registered).await;
-                    return Err(error);
                 }
+                return Err(error);
             }
             self.wake_registered_runtime(&registered)
                 .await

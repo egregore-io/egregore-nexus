@@ -27,6 +27,263 @@ mod model_projection_artifacts {
 
 const FAKE_BIN: &str = env!("CARGO_BIN_EXE_nexus_fake_codex_app_server");
 
+/// Exercise AppState in a child so PATH/HOME and native probes never race another test.
+#[cfg(unix)]
+#[test]
+fn headed_codex_boot_precedes_saved_read_and_viewer() {
+    use std::os::unix::fs::PermissionsExt as _;
+    const FIXTURE: &str = "NEXUS_CODEX_BOOT_FIXTURE";
+    let Some(root) = std::env::var_os(FIXTURE).map(std::path::PathBuf::from) else {
+        for case in [
+            "replacement",
+            "default",
+            "override",
+            "resume",
+            "timeout",
+            "cancel",
+            "empty",
+        ] {
+            let root = tempfile::Builder::new()
+                .prefix("nx-boot-")
+                .tempdir()
+                .unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "headed_codex_boot_precedes_saved_read_and_viewer",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", root.path().join("home"))
+                .env("CODEX_HOME", root.path().join("home/.codex"))
+                .env("NEXUS_HOME", root.path().join("nexus-home"))
+                .env("NEXUS_NO_AUTOSTART", "1")
+                .env(FIXTURE, root.path())
+                .env("NEXUS_CODEX_BOOT_CASE", case)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    };
+    let case = std::env::var("NEXUS_CODEX_BOOT_CASE").unwrap();
+    // The child owns every process started here. Reap even on assertion failure; never signal
+    // a reused PID or a process that is not a direct child of this isolated fixture.
+    struct FixtureChildren(std::path::PathBuf);
+    impl Drop for FixtureChildren {
+        fn drop(&mut self) {
+            for name in ["viewer-pid", "backend-pid"] {
+                let Some(pid) = std::fs::read_to_string(self.0.join(name))
+                    .ok()
+                    .and_then(|v| v.trim().parse::<libc::pid_t>().ok())
+                else {
+                    continue;
+                };
+                let mut status = 0;
+                // SAFETY: waitpid verifies ownership before any signal; each fake execs in place.
+                unsafe {
+                    if libc::waitpid(pid, &mut status, libc::WNOHANG) == 0 {
+                        libc::kill(pid, libc::SIGKILL);
+                        while libc::waitpid(pid, &mut status, 0) < 0
+                            && std::io::Error::last_os_error().kind()
+                                == std::io::ErrorKind::Interrupted
+                        {}
+                    }
+                }
+            }
+        }
+    }
+    let _children = FixtureChildren(root.clone());
+    let bin = root.join("bin");
+    let work = root.join("work");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(root.join("home")).unwrap();
+    let saved = root.join("saved.json");
+    let requests = root.join("requests.jsonl");
+    let viewer = root.join("viewer");
+    let premature = root.join("premature");
+    let command = bin.join("codex");
+    let is_resume = case == "resume";
+    if is_resume {
+        let rollout = root.join("home/.codex/sessions/2026/11");
+        std::fs::create_dir_all(&rollout).unwrap();
+        std::fs::write(
+            rollout.join("rollout-resume.jsonl"),
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"fake-thread\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(&saved, "already materialized").unwrap();
+    }
+    let boot = if case == "override" {
+        "My explicit boot"
+    } else {
+        "Connected to Nexus."
+    };
+    let script = serde_json::json!([
+        {"method":"item/completed","params":{"threadId":"THREAD_ID","turnId":"t1","item":{"id":"u1","type":"userMessage","content":[{"type":"text","text":boot}]}}},
+        {"method":"item/agentMessage/delta","params":{"threadId":"THREAD_ID","turnId":"t1","itemId":"a1","delta":"ready"}},
+        {"method":"turn/completed","params":{"threadId":"THREAD_ID","turnId":"t1"}}
+    ]);
+    std::fs::write(&command, format!(
+        "#!/bin/sh\nif [ \"$1\" = app-server ]; then\n echo $$ > '{}'\n export FAKE_CODEX_REQUEST_LOG='{}' FAKE_CODEX_SAVED_READ='{}' FAKE_CODEX_SCRIPT='{}'\n exec '{}' \"$@\"\nfi\necho $$ > '{}'\nprintf '%s\\n' \"$@\" > '{}'\nif [ ! -f '{}' ]; then touch '{}'; exit 42; fi\nexec sleep 300\n",
+        root.join("backend-pid").display(), requests.display(), saved.display(), script, FAKE_BIN, root.join("viewer-pid").display(), viewer.display(), saved.display(), premature.display())).unwrap();
+    std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _path = EnvGuard::set("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let daemon = DaemonStore::open(root.join("nexus.db").to_str().unwrap()).await.unwrap();
+        let store = Arc::new(daemon.compatibility_store());
+        let state = Arc::new(AppState::wire_pty(store.clone(), &Config::default()));
+        state.wait_for_runtime_identity_ready().await.unwrap();
+        let worker = state.clone();
+        let cwd = work.to_string_lossy().into_owned();
+        let explicit = match case.as_str() {
+            "override" => Some("My explicit boot".to_string()),
+            "empty" => Some(String::new()),
+            _ => None,
+        };
+        let launch = tokio::spawn(async move {
+            worker.launch_agent_with_program(SpawnRequest {
+                kind: HarnessId::new("codex").unwrap(), name: Some("boot-fixture".into()),
+                identity_policy: None, cwd: Some(cwd), project: Some("default".into()),
+                role: None, initial_prompt: explicit, resume: is_resume.then(|| "fake-thread".into()), harness_args: vec![],
+                headless: false, backend: Some("pty".into()),
+            }, "default", "codex", None).await
+        });
+        if is_resume || case == "empty" {
+            let result = launch.await.unwrap();
+            if is_resume {
+                result.expect("explicit existing native resume succeeds without boot");
+                let log = std::fs::read_to_string(&requests).unwrap();
+                let calls: Vec<serde_json::Value> = log.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+                assert_eq!(calls.iter().filter(|v| v["method"] == "thread/resume").count(), 1);
+                assert!(!calls.iter().any(|v| ["turn/start", "thread/start", "thread/read", "thread/name/set"].contains(&v["method"].as_str().unwrap())));
+            } else {
+                assert!(result.unwrap_err().message.contains("initial prompt"));
+                assert!(!requests.exists(), "explicit empty prompt validation must not start native runtime");
+            }
+            state.teardown_owned_transports_for_shutdown().await;
+            return;
+        }
+        let read_seen = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if std::fs::read_to_string(&requests).unwrap_or_default().contains("thread/read") { break; }
+                if viewer.exists() { break; }
+                if launch.is_finished() { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await;
+        let early_viewer = viewer.exists();
+        if launch.is_finished() && !early_viewer && !std::fs::read_to_string(&requests).unwrap_or_default().contains("thread/read") {
+            let outcome = launch.await;
+            state.teardown_owned_transports_for_shutdown().await;
+            panic!("launch ended before the saved-history probe: {outcome:?}");
+        }
+        if early_viewer || read_seen.is_err() {
+            launch.abort(); let _ = launch.await;
+            state.teardown_owned_transports_for_shutdown().await;
+            assert!(!early_viewer, "viewer must not spawn before boot turn and readable saved history");
+            panic!("expected read-only saved-history probe after actual initial turn");
+        }
+        let row = Sessions::new(&store).find_by_name("default", "boot-fixture").await.unwrap().unwrap();
+        if case == "replacement" {
+            // A new owner of the same native thread supersedes this pending launch. The old
+            // AppState error path must not kill or release that successor by shared SessionId.
+            let supervisor = state.pty_supervisor().unwrap();
+            let transport = supervisor.codex_transport();
+            let repo = CodexRuntimeStateRepo::new(&store);
+            let before = repo.find_by_runtime_id(&row.session_id).await.unwrap().unwrap();
+            let client = Arc::new(CodexAppServerClient::connect(before.app_server_sock.as_ref().unwrap(), "successor-owner").await.unwrap());
+            transport.bind(row.session_id.clone(), client, "fake-thread".into());
+            let successor = transport.capture_viewer_readiness(&row.session_id).unwrap();
+            let error = launch.await.unwrap().unwrap_err();
+            assert!(error.message.contains("revoked"), "old launch rejects its retired owner: {}", error.message);
+            assert!(successor.is_current(), "actual AppState stale-launch cleanup must preserve the successor binding");
+            assert_eq!(repo.find_by_runtime_id(&row.session_id).await.unwrap(), Some(before.clone()), "stale launch must preserve successor Codex state");
+            let native = nexus_store::repos::NativeThreadBindings::new(&store).find("codex", "fake-thread").await.unwrap().unwrap();
+            assert!(native.released_at.is_none(), "stale launch must not release successor native ownership");
+            // SAFETY: signal 0 only observes this fixture's own native process.
+            assert_eq!(unsafe { libc::kill(before.app_server_pid.unwrap() as libc::pid_t, 0) }, 0, "successor native process must remain alive");
+            transport.prompt(&row.session_id, "ordinary successor prompt".into()).await.expect("normal unscoped successor prompt remains usable after old AppState error");
+            assert!(successor.is_current());
+            assert!(!viewer.exists(), "stale launch must never attach its viewer");
+            let log = std::fs::read_to_string(&requests).unwrap();
+            let calls: Vec<serde_json::Value> = log.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+            let turns: Vec<_> = calls.iter().filter(|v| v["method"] == "turn/start").collect();
+            assert_eq!(turns.len(), 2, "one boot plus the explicit successor usability control");
+            assert_eq!(turns[1]["params"]["input"][0]["text"], "ordinary successor prompt");
+            state.teardown_owned_transports_for_shutdown().await;
+            return;
+        }
+        if case == "cancel" {
+            launch.abort(); assert!(launch.await.unwrap_err().is_cancelled());
+            assert!(!viewer.exists());
+        } else if case == "timeout" {
+            let error = tokio::time::timeout(std::time::Duration::from_secs(35), launch).await.unwrap().unwrap().unwrap_err();
+            assert!(error.message.contains("saved") && error.message.contains("fake-thread"), "contextual readiness timeout: {}", error.message);
+            assert!(!viewer.exists());
+        } else {
+            // Metadata alone, a foreign thread, or an ephemeral response cannot open attach.
+            let valid = serde_json::json!({"thread":{"id":"fake-thread","path":"/fixture/rollout.jsonl","ephemeral":false,"turns":[{"id":"t1","items":[]}]}});
+            for invalid in [
+                serde_json::json!({"thread":{"id":"other-thread","path":"/fixture/rollout.jsonl","ephemeral":false,"turns":[{"id":"t1","items":[]}]}}),
+                serde_json::json!({"thread":{"id":"fake-thread","path":"/fixture/rollout.jsonl","ephemeral":false,"turns":[]}}),
+                serde_json::json!({"thread":{"id":"fake-thread","path":null,"ephemeral":false,"turns":[{"id":"t1","items":[]}]}}),
+                serde_json::json!({"thread":{"id":"fake-thread","path":"/fixture/rollout.jsonl","ephemeral":true,"turns":[{"id":"t1","items":[]}]}}),
+            ] {
+                let before = std::fs::read_to_string(&requests).unwrap().matches("thread/read").count();
+                std::fs::write(&saved, invalid.to_string()).unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    while std::fs::read_to_string(&requests).unwrap().matches("thread/read").count() < before + 2 {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }).await.unwrap();
+                assert!(!viewer.exists(), "invalid saved history must not unlock attach: {invalid}");
+            }
+            std::fs::write(&saved, valid.to_string()).unwrap();
+            let spawned = launch.await.unwrap().unwrap();
+            assert_eq!(spawned.session_id, row.session_id);
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while !viewer.exists() { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+            }).await.unwrap();
+            let argv = std::fs::read_to_string(&viewer).unwrap();
+            assert!(argv.contains("resume\n") && argv.contains("fake-thread\n"));
+            let before = std::fs::read_to_string(&requests).unwrap();
+            assert_eq!(state.ensure_codex_appserver_live("boot-fixture", "default").await.unwrap(), spawned.session_id);
+            assert_eq!(before, std::fs::read_to_string(&requests).unwrap(), "live reuse must not send a second boot turn");
+        }
+        if case == "cancel" || case == "timeout" {
+            let pid = std::fs::read_to_string(root.join("backend-pid")).unwrap().trim().parse::<libc::pid_t>().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                // SAFETY: signal 0 observes this fixture's recorded direct child, never mutates it.
+                while unsafe { libc::kill(pid, 0) } == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.expect("failed/canceled fresh launch must retire its owned native process before test teardown");
+        }
+        state.teardown_owned_transports_for_shutdown().await;
+        let log = std::fs::read_to_string(&requests).unwrap();
+        let calls: Vec<serde_json::Value> = log.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        let turns: Vec<_> = calls.iter().filter(|v| v["method"] == "turn/start").collect();
+        assert_eq!(turns.len(), 1, "one real initial user turn only");
+        assert_eq!(turns[0]["params"]["threadId"], "fake-thread");
+        assert_eq!(turns[0]["params"]["input"][0]["text"], if case == "override" { "My explicit boot" } else { "Connected to Nexus." });
+        assert!(calls.iter().filter(|v| v["method"] == "thread/read").all(|v| v["params"]["includeTurns"] == true));
+        assert_eq!(calls.iter().filter(|v| v["method"] == "thread/start").count(), 1);
+        assert_eq!(calls.iter().filter(|v| v["method"] == "thread/resume").count(), 0, "readiness is read-only");
+        assert!(!calls.iter().any(|v| v["method"] == "thread/name/set"), "boot must not name the thread");
+        assert!(!premature.exists());
+    });
+}
+
 async fn configured_frame(
     rx: &mut tokio::sync::broadcast::Receiver<GatewayStreamFrame>,
     session: &SessionId,
@@ -275,6 +532,7 @@ fn headed_codex_session_directory_is_private_under_shared_umask() {
             &[],
             None,
             "pty",
+            None,
             None,
         ));
         let leaf_mode = std::fs::metadata(&leaf).unwrap().permissions().mode() & 0o777;
@@ -793,6 +1051,7 @@ async fn codex_restart_adopts_live_app_server_without_spawning_a_duplicate() {
             &[],
             None,
             "pty",
+            None,
             None,
         )
         .await
