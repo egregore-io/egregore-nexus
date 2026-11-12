@@ -2,7 +2,7 @@
 
 [← Nexus docs](README.md)
 
-This source tree targets Nexus 0.1.8 (see `VERSION`); the npm registry carries whichever release was
+This source tree targets Nexus 0.1.9 (see `VERSION`); the npm registry carries whichever release was
 last published, so check it for what is installable today. Nexus has three runtime facets and three
 public npm entry packages, and npm packages, native binaries, and release evidence share one canonical
 version. The Cargo crates are not published to crates.io today; the CLI and daemon are distributed
@@ -168,7 +168,7 @@ native Windows runner.
 
 Every published package must:
 
-- report the version in `VERSION` (`0.1.8` for this source tree) and license `Apache-2.0`;
+- report the version in `VERSION` (`0.1.9` for this source tree) and license `Apache-2.0`;
 - contain no source-checkout or operator-local path dependency;
 - contain no credentials, OAuth state, runtime database, logs, screenshots, or captured model
   output;

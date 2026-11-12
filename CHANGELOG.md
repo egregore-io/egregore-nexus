@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.1.9] - 2026-11-12
 
 ### Fixed
 
@@ -8,8 +8,10 @@
   avoiding premature native resume failures. The default is `Connected to Nexus.`; an explicit
   `--initial-prompt` replaces it. Startup now depends on that real model turn and bounded saved-history
   readiness; existing/resumed sessions and headless ACP do not receive the default.
+- Create new Unix Codex app-server session directories with private permissions,
+  allowing launch under a group-writable umask without changing existing directories.
 
-## [0.1.8] - Unreleased
+## [0.1.8] - 2026-10-16
 
 ### Added
 
@@ -19,11 +21,6 @@
 - Native Mac artifact rows and all-five-target assembly within the existing three public
   packages. Builds never publish automatically; public exact-version qualification must
   precede manual `latest` promotion and bare-install checks.
-
-### Fixed
-
-- Create new Unix Codex app-server session directories with private permissions,
-  allowing launch under a group-writable umask without changing existing directories.
 
 ## [0.1.7] - 2026-10-08
 
