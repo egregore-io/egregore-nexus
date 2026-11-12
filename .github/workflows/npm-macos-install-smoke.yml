@@ -6,7 +6,7 @@ on:
       version:
         description: Exact expected version (must already be published)
         required: true
-        default: '0.1.8'
+        default: '0.1.9'
       selector:
         description: Use exact before latest promotion; latest only after promotion
         required: true
