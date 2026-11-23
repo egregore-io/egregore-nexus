@@ -82,21 +82,7 @@ wrappers = ["nexus", "nexus-acceptance"]
 # ----------------------------------------------------------------------------------------------
 [advisories]
 yanked = "warn"
-ignore = [
-    # bincode is the deliberately-chosen Rust-native socket codec (v4 rule 2). The advisory is
-    # "unmaintained", not a vulnerability; the 1.x wire format we use is stable and frozen.
-    "RUSTSEC-2025-0141",
-    # rustls-pemfile "unmaintained" — pulled in transitively by libsql's TLS stack (not used on the
-    # daemon's local libSQL path), no fix available short of a libsql bump.
-    "RUSTSEC-2025-0134",
-    # rustls-webpki advisories — all transitive via libsql → hyper-rustls → rustls → rustls-webpki.
-    # The daemon uses local file / :memory: libSQL and performs no remote-cert / CRL verification, so
-    # these certificate-validation paths are unreachable here. Resolved by a future libsql bump.
-    "RUSTSEC-2026-0049", # CRLs not authoritative by Distribution Point (faulty matching)
-    "RUSTSEC-2026-0098", # name constraints for URI names incorrectly accepted
-    "RUSTSEC-2026-0099", # name constraints accepted for wildcard-name certs
-    "RUSTSEC-2026-0104", # reachable panic in CRL parsing
-]
+ignore = []
 
 # ----------------------------------------------------------------------------------------------
 # Sources — only crates.io (no unknown registries / git sources).
